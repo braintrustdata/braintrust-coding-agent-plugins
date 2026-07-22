@@ -1,0 +1,13 @@
+[project]
+name = "braintrust-skill-evals"
+version = "0.1.0"
+description = "Evaluations for Braintrust skill"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.75.0",
+    "autoevals>=0.0.130",
+    "braintrust>=0.3.14",
+    "dotenv>=0.9.9",
+    "openai>=2.14.0",
+]

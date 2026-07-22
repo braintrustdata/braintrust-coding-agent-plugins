@@ -1,0 +1,22 @@
+# bt-daemon — shared Rust project for Braintrust coding-agent plugins.
+#
+# The empty [workspace] table makes THIS directory the Cargo workspace root, so
+# the crate is not absorbed by any parent manifest and the whole project can be
+# lifted into its own repo by copying bt-daemon/ verbatim. Keep the workspace
+# root here (not at the monorepo root) to preserve that portability.
+#
+# Placeholder for now; real crates/modules land here as the shared daemon and
+# per-agent tracing move from TypeScript to Rust.
+
+[package]
+name = "bt-daemon"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Shared daemon for Braintrust coding-agent plugins (placeholder)."
+publish = false
+
+[workspace]
+resolver = "2"
+
+[dependencies]

@@ -1,0 +1,4 @@
+# Copy to `publish.targets` (gitignored) or export as $PUBLISH_TARGETS.
+# One "plugin:repo" per line here, OR comma-separated in the env var.
+# repo may be a full git URL (ssh/https) or a bare owner/name slug.
+codex:git@github.com:braintrustdata/test-coding-agent-dist.git

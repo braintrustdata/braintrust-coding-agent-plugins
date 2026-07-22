@@ -1,0 +1,5 @@
+# Build output
+dist/
+
+# Local publish config (plugin:repo map). Do not commit real targets.
+publish.targets

@@ -1,0 +1,12 @@
+# Build each agent's tree and force-push it into its distribution repo.
+# Matrix: [claude, codex]. Cross-repo push uses a GitHub App token
+# (PLUGIN_DEPLOY_APP_ID / PLUGIN_DEPLOY_KEY) scoped per-job to one dist repo.
+# (placeholder — port from getsentry/sentry-for-ai/.github/workflows/deploy-plugins.yml)
+name: Deploy plugins
+on: { workflow_dispatch: {}, push: { branches: [main] } }
+jobs:
+  deploy:
+    strategy: { matrix: { agent: [claude, codex] } }
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "clone dist repo -> git rm -rf . -> build.sh -> validate.sh -> commit -> push (placeholder)"

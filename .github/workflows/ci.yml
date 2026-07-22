@@ -1,0 +1,5 @@
+# PR checks: build + validate all agents, run integration tests + evals. (placeholder)
+name: CI
+on: { pull_request: {} }
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [ { run: "echo build+validate all agents (placeholder)" } ] }
