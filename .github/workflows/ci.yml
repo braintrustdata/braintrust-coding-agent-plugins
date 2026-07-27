@@ -1,5 +1,24 @@
-# PR checks: build + validate all agents, run integration tests + evals. (placeholder)
+# CI: build every plugin and validate the built trees (`make test`).
 name: CI
-on: { pull_request: {} }
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
 jobs:
-  build: { runs-on: ubuntu-latest, steps: [ { run: "echo build+validate all agents (placeholder)" } ] }
+  test:
+    # Pin to a specific runner version so the workflow is reproducible.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Build and validate all plugins
+        run: make test

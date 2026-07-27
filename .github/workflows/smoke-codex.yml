@@ -1,0 +1,110 @@
+# End-to-end smoke test for the codex plugin against a deployed distribution repo.
+# Installs Codex + the plugin from the marketplace on Linux + both macOS arches,
+# runs a real `codex exec` session with tracing pointed at a local mock Braintrust
+# collector, and asserts at least one trace row was reported. This catches the
+# per-platform failure modes a source build can't (code signing, cross-compiled
+# binaries, marketplace install).
+#
+# Two entry points:
+#   - workflow_call: run by _release.yml after a deploy, against the repo it just
+#     published to.
+#   - workflow_dispatch: run manually against any dist repo (default: the test repo).
+#
+# Requires the OPENAI_API_KEY secret for `codex exec`; if it is unset the smoke is
+# skipped (with a warning) rather than failing. PUBLISH_TOKEN is used to clone a
+# private/internal dist repo.
+
+name: Smoke (codex)
+
+on:
+  workflow_call:
+    inputs:
+      dist_repo:
+        required: true
+        type: string
+    secrets:
+      PUBLISH_TOKEN:
+        required: true
+      OPENAI_API_KEY:
+        required: false
+  workflow_dispatch:
+    inputs:
+      dist_repo:
+        description: "Distribution repo to install from (owner/name)."
+        required: true
+        type: string
+        default: braintrustdata/test-coding-agent-dist
+
+permissions:
+  contents: read
+
+env:
+  PLUGIN_DIR: src/plugins/codex/content/plugins/trace-codex
+  MARKETPLACE: braintrust-codex-plugins
+
+jobs:
+  # Skip the (matrix) smoke cleanly when no OpenAI key is configured, instead of
+  # failing every release. Job-level `if` can't read secrets, so gate here.
+  guard:
+    runs-on: ubuntu-24.04
+    outputs:
+      has_key: ${{ steps.c.outputs.has_key }}
+    steps:
+      - id: c
+        env:
+          KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::OPENAI_API_KEY not set; skipping codex smoke test."
+          fi
+
+  smoke:
+    needs: guard
+    if: needs.guard.outputs.has_key == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, label: linux-x64 }
+          - { runner: macos-15, label: darwin-arm64 }
+          - { runner: macos-15-intel, label: darwin-x64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install plugin dependencies (for the mock collector)
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: pnpm install
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Install codex plugin from ${{ inputs.dist_repo }}
+        env:
+          # PUBLISH_TOKEN can read the (private/internal) dist repo; rewrite
+          # github.com clones to use it so `codex plugin marketplace add` (a git
+          # clone) authenticates.
+          GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          codex plugin marketplace add "${{ inputs.dist_repo }}"
+          codex plugin add "trace-codex@${MARKETPLACE}"
+
+      - name: Run smoke test (${{ matrix.label }})
+        working-directory: ${{ env.PLUGIN_DIR }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: sh scripts/smoke-test.sh

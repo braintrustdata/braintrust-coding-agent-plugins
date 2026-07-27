@@ -1,6 +1,11 @@
 # Braintrust Codex Plugins
 
-This repo is a monorepo of Braintrust [Codex plugins](https://developers.openai.com/codex/plugins)
+> **This repository is generated.** It is built from
+> [braintrustdata/braintrust-coding-agent-plugins](https://github.com/braintrustdata/braintrust-coding-agent-plugins).
+> Don't edit files here — make changes and file issues in that repository, and they
+> will be rebuilt into this one.
+
+Braintrust [Codex plugins](https://developers.openai.com/codex/plugins) — skills and session tracing.
 
 ## Quickstart
 

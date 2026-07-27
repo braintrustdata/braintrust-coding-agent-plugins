@@ -7,20 +7,19 @@
 #   plugins/braintrust-codex-plugin/   skills plugin (MCP + skills)
 #   plugins/trace-codex/               tracing plugin (TS event server + hooks)
 #
-# trace-codex ships as SOURCE only. The compiled `codex-hook` binary is not
-# committed; the launcher (bin/codex-hook.sh) downloads the matching binary from
-# the dist repo's GitHub Releases at runtime, and local dev installs build it
-# with `pnpm run build` (tsx/tsup + pkg). So this build is a content assembly,
-# not a compile.
+# By default this is a content assembly (a straight copy of content/). The seam
+# for injecting shared code later lives here.
 #
-# Everything deployable lives under content/. Today the assembly is a straight
-# copy; the seam is here for when the generic event-server code is extracted to
-# a shared location and injected into trace-codex at build time.
+# trace-codex ships its compiled hook binaries (bin/codex-hook-<os>-<arch>)
+# committed in the dist repo; the launcher execs the host's binary directly (no
+# download). Compiling those binaries is gated behind CODEX_BUILD_BINARIES=1 so
+# plain content builds (make test) stay fast and need no JS toolchain. publish.sh
+# sets the flag, so every real deploy ships fresh binaries.
 #
-# Optional env:
-#   CODEX_DIST_REPO   owner/name of the dist repo whose Releases host the
-#                     codex-hook binaries. When set, rewrites the launcher's
-#                     REPO= line so a fork/scratch repo resolves its own binaries.
+# Env:
+#   CODEX_BUILD_BINARIES=1   compile + embed the trace-codex binaries (needs
+#                            node + pnpm; pkg downloads base runtimes, so it can
+#                            cross-compile all targets from one host).
 #
 # Usage: build.sh <TARGET_DIR>   (TARGET_DIR is created if missing)
 
@@ -31,15 +30,36 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTENT_DIR="$SRC_DIR/content"
 
 mkdir -p "$TARGET_DIR"
-rsync -a --delete --exclude '.git' "$CONTENT_DIR/" "$TARGET_DIR/"
+rsync -a --delete --exclude '.git' --exclude 'node_modules' "$CONTENT_DIR/" "$TARGET_DIR/"
 
-# Point the runtime binary launcher at the dist repo we're deploying to, if
-# overridden (defaults to the braintrustdata/braintrust-codex-plugin baked into
-# the launcher).
-if [[ -n "${CODEX_DIST_REPO:-}" ]]; then
-  launcher="$TARGET_DIR/plugins/trace-codex/bin/codex-hook.sh"
-  sed -i.bak -E "s#^REPO=\"[^\"]*\"#REPO=\"${CODEX_DIST_REPO}\"#" "$launcher"
-  rm -f "$launcher.bak"
+if [[ "${CODEX_BUILD_BINARIES:-}" == "1" ]]; then
+  tc="$TARGET_DIR/plugins/trace-codex"
+  echo "Compiling trace-codex hook binaries (all platforms)..."
+  ( cd "$tc" && pnpm install && pnpm run build )
+
+  # Ad-hoc sign the macOS binaries: unsigned arm64 Mach-O executables are
+  # SIGKILLed by the kernel on Apple Silicon. `codesign` exists only on macOS;
+  # `rcodesign` is the cross-platform fallback (Linux). Linux binaries need no
+  # signature. This is why the codex build runs on a macOS CI runner.
+  for f in "$tc"/bin/codex-hook-darwin-*; do
+    [ -f "$f" ] || continue
+    if command -v codesign >/dev/null 2>&1 && codesign -s - -f "$f" >/dev/null 2>&1; then
+      continue
+    fi
+    if command -v rcodesign >/dev/null 2>&1 && rcodesign sign "$f" >/dev/null 2>&1; then
+      continue
+    fi
+    echo "warning: could not sign $f (no codesign/rcodesign); it will be killed on Apple Silicon" >&2
+  done
+
+  # Keep only the compiled binaries; drop build intermediates.
+  rm -rf "$tc/node_modules" "$tc/dist"
+  # The plugin .gitignore excludes the binaries (correct for the monorepo, wrong
+  # for the dist repo). Un-ignore them so the deploy actually commits them.
+  if [[ -f "$tc/.gitignore" ]]; then
+    grep -v -E '^bin/codex-hook' "$tc/.gitignore" > "$tc/.gitignore.tmp"
+    mv "$tc/.gitignore.tmp" "$tc/.gitignore"
+  fi
 fi
 
 echo "Built codex dist into $TARGET_DIR (content from $CONTENT_DIR)."

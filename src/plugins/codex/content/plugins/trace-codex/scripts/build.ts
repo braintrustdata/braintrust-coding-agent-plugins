@@ -8,20 +8,17 @@
 //      executable per target (it downloads/caches base binaries, so it can
 //      cross-compile every target from one host).
 //
-// The Codex hook command invokes a single, fixed-name binary:
-//   ${PLUGIN_ROOT}/bin/codex-hook
-// (no shell, no uname, no per-platform command string). So the build always
-// produces that fixed-name binary for the HOST platform.
-//
-// For distribution we additionally emit per-platform named binaries
-// (codex-hook-<os>-<arch>); the launcher downloads the matching one.
+// hooks.json invokes the shell launcher (bin/codex-hook.sh), which selects the
+// per-platform binary for the host. So the build emits one binary per target,
+// named codex-hook-<os>-<arch>; all of them are committed to the distribution
+// repo and the launcher execs the matching one (no download at runtime).
 //
 // Supported targets: macOS (arm64, x64) and Linux (x64, arm64). Windows is
 // not yet built but slots in cleanly (pkg target node22-win-x64 -> a
 // codex-hook.exe, referenced via a `commandWindows` entry in hooks.json).
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,9 +29,6 @@ const bin = (name: string): string => join(ROOT, "node_modules/.bin", name);
 
 /** Node runtime version pkg wraps into the produced binaries. */
 const NODE_RANGE = "node22";
-
-/** Fixed name the Codex hook command invokes. */
-const HOST_BINARY_NAME = "codex-hook";
 
 interface Target {
   /** pkg platform-arch selector, e.g. "macos-arm64". */
@@ -69,7 +63,19 @@ function bundle(): void {
 
 function compile(pkgPlatform: string, outfile: string): void {
   process.stderr.write(`building ${pkgPlatform} -> ${outfile}\n`);
-  run(bin("pkg"), [BUNDLE, "--targets", `${NODE_RANGE}-${pkgPlatform}`, "--output", outfile]);
+  // --no-bytecode/--public embed the (already-bundled) source instead of V8
+  // bytecode. Bytecode can't be generated for a foreign target without QEMU, so
+  // cross-compiled binaries would otherwise fail at runtime with
+  // "no source or bytecode for /snapshot/...". Embedding source works anywhere.
+  run(bin("pkg"), [
+    BUNDLE,
+    "--targets",
+    `${NODE_RANGE}-${pkgPlatform}`,
+    "--no-bytecode",
+    "--public",
+    "--output",
+    outfile,
+  ]);
 }
 
 function main(): void {
@@ -86,12 +92,6 @@ function main(): void {
     const outfile = join(OUT_DIR, `codex-hook-${target.suffix}`);
     compile(target.pkgPlatform, outfile);
   }
-
-  // Always provide the fixed-name host binary the hook command points at.
-  const hostNamed = join(OUT_DIR, `codex-hook-${hostSuffix}`);
-  const hostFixed = join(OUT_DIR, HOST_BINARY_NAME);
-  copyFileSync(hostNamed, hostFixed);
-  process.stderr.write(`host binary: ${hostFixed}\n`);
 
   process.stderr.write(`done: built ${targets.length} target(s)\n`);
 }

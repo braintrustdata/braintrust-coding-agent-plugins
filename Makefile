@@ -38,8 +38,7 @@ test: build
 		src/plugins/$$p/validate.sh "$(DIST)/$$p"; \
 	done
 
-# Deploy every plugin named in the PUBLISH_TARGETS map (env var or the local
-# publish.targets file). Fails if the map is unset.
+# Deploy every plugin named in the PUBLISH_TARGETS env var map. Fails if unset.
 publish:
 	@scripts/publish.sh
 
