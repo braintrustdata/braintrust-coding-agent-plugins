@@ -4,8 +4,8 @@
                            `build.sh`, `validate.sh`, `publish.sh`
 - `src/skills/*`           canonical skills (Agent Skills spec)
 - `scripts/publish.sh`     reads the PUBLISH_TARGETS map and deploys each plugin
-- `bt-daemon/`             shared Rust project (self-contained Cargo workspace;
-                           see its README). Placeholder for now.
+- `bt-daemon/`             shared Rust crate embedded by `bt`, with a
+                           feature-gated standalone binary; see its README.
 
 Build one agent locally:  `src/plugins/claude/build.sh /tmp/dist-claude`
 Validate it:              `src/plugins/claude/validate.sh /tmp/dist-claude`

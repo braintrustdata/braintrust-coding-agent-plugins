@@ -28,25 +28,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MARKETPLACE="braintrust-codex-plugins"
 
-# Default port the trace-codex event server listens on (see plugins/trace-codex
-# config.ts DEFAULT_PORT). Overridable via the same env var the plugin reads.
-EVENT_SERVER_PORT="${BRAINTRUST_EVENT_SERVER_PORT:-52734}"
-
-# Ask any running trace-codex event server to shut down. After a re-install the
-# cache holds a new build, but a server spawned from the OLD build may still be
-# running; it would refuse the new version (version mismatch) and block tracing
-# until its idle timeout. Shutting it down lets the next session boot a fresh
-# one. No server running is the normal case, so failures are ignored.
-shutdown_event_server() {
-  if ! command -v curl >/dev/null 2>&1; then
-    return 0
-  fi
-  if curl -fsS --max-time 2 -X POST \
-    "http://127.0.0.1:$EVENT_SERVER_PORT/shutdown" >/dev/null 2>&1; then
-    echo "  shut down running event server on port $EVENT_SERVER_PORT."
-  fi
-}
-
 # Plugin folders to install. Default: every folder under plugins/.
 if [ "$#" -gt 0 ]; then
   PLUGINS=("$@")
@@ -60,6 +41,10 @@ fi
 if ! command -v codex >/dev/null 2>&1; then
   echo "Error: 'codex' CLI not found. Install Codex CLI first." >&2
   exit 1
+fi
+if ! command -v bt >/dev/null 2>&1 && [ ! -x "${XDG_BIN_HOME:-$HOME/.local/bin}/bt" ]; then
+  echo "Installing the bt CLI required by trace-codex..."
+  curl -fsSL https://bt.dev/cli/install.sh | bash
 fi
 
 echo "Installing Braintrust Codex plugins from: $REPO_ROOT"
@@ -76,24 +61,6 @@ echo ""
 read_json_field() {
   # read_json_field <file> <field> -> first string value for that field
   grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
-}
-
-# Build a plugin's compiled assets if it has a build (build-on-install).
-build_plugin() {
-  plugin_src="$1"
-  if [ ! -f "$plugin_src/package.json" ]; then
-    return 0
-  fi
-  if ! grep -q '"build"' "$plugin_src/package.json"; then
-    return 0
-  fi
-  if ! command -v pnpm >/dev/null 2>&1; then
-    echo "Error: '$folder' needs pnpm to build, but 'pnpm' was not found." >&2
-    echo "       Install pnpm from https://pnpm.io/installation and re-run ./install.sh" >&2
-    exit 1
-  fi
-  echo "  building (pnpm)..."
-  ( cd "$plugin_src" && pnpm install --reporter=silent && BUILD_HOST_ONLY=1 pnpm run build )
 }
 
 for folder in "${PLUGINS[@]}"; do
@@ -115,18 +82,10 @@ for folder in "${PLUGINS[@]}"; do
   fi
 
   echo "Installing '$name' (v$version) from plugins/$folder..."
-  # Build compiled assets first so the marketplace copy includes them.
-  build_plugin "$plugin_src"
   # Remove any prior install so the copy is re-synced from the current files.
   codex plugin remove "$name@$MARKETPLACE" >/dev/null 2>&1 || true
   codex plugin add "$name" --marketplace "$MARKETPLACE" >/dev/null
   echo "  installed."
-
-  # trace-codex runs a long-lived background event server. Stop any stale one
-  # left over from a previous build so it doesn't linger with the old version.
-  if [ "$folder" = "trace-codex" ]; then
-    shutdown_event_server
-  fi
 done
 
 echo ""

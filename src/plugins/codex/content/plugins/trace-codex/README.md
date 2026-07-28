@@ -1,141 +1,65 @@
-# Braintrust Codex Tracing Plugin
+# Braintrust Codex tracing plugin
 
-A [Codex plugin](https://developers.openai.com/codex/plugins) that wires Codex lifecycle hooks as a foundation for sending Codex sessions to Braintrust as traces.
+An opt-in Codex plugin that sends lifecycle events to the shared Braintrust
+daemon built into the `bt` CLI. The daemon tails Codex rollout transcripts and
+creates a session → turn → LLM/tool trace without doing parsing or network
+delivery in the blocking hook process.
 
-## Quickstart
+## Setup
+
+Install the current `bt` CLI:
+
+```bash
+curl -fsSL https://bt.dev/cli/install.sh | bash
+bt auth login
+```
+
+Then install the plugin and enable tracing when starting Codex:
 
 ```bash
 codex plugin marketplace add braintrustdata/braintrust-codex-plugin
 codex plugin add trace-codex@braintrust-codex-plugins
-```
 
-Create an API key in Braintrust under **Settings > API keys**. The key must be available in the environment where Codex runs. Either export it in your current shell before starting Codex:
-
-```bash
-export BRAINTRUST_API_KEY="<your-braintrust-api-key>"
-# NOTE: tracing must be explicitly enabled
-# upon first run, codex will prompt for plugin permissions
 TRACE_TO_BRAINTRUST=true BRAINTRUST_PROJECT=my-coding-agent codex
 ```
 
-Or set it for only that Codex invocation:
-
-```bash
-BRAINTRUST_API_KEY="<your-braintrust-api-key>" TRACE_TO_BRAINTRUST=true BRAINTRUST_PROJECT=my-coding-agent codex
-```
-
-To upgrade:
-
-```bash
-codex plugin marketplace upgrade braintrust-codex-plugins
-```
-
-## Using the plugin in CI
-
-Tracing `codex exec` runs in CI works. A few notes:
-
-- **Block on flush.** Set `BRAINTRUST_FLUSH_ON_TURN_END=true` so the final spans are delivered before the job exits (a short-lived CI job can otherwise tear down before the background server's idle-drain flush fires).
-- **Trust the hooks non-interactively.** Pass `codex exec --dangerously-bypass-hook-trust` to skip the one-time interactive hook-trust prompt. (Only for plugins you trust.)
-
-GitHub Actions example:
-
-```yaml
-name: codex-traced
-on: [workflow_dispatch]
-
-jobs:
-  run:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex   # or your preferred install method
-
-      - name: Install the trace-codex plugin (pinned to a release tag)
-        # TODO: replace with desired version ---------------------------------vvvvvvvvvvvvvvvvvv
-        run: |
-          codex plugin marketplace add braintrustdata/braintrust-codex-plugin@trace-codex-v0.0.X
-          codex plugin add trace-codex@braintrust-codex-plugins
-
-      - name: Run a traced Codex session
-        env:
-          TRACE_TO_BRAINTRUST: "true"
-          BRAINTRUST_API_KEY: ${{ secrets.BRAINTRUST_API_KEY }}
-          BRAINTRUST_PROJECT: my-coding-agent # <--- TODO: replace with your project name
-          BRAINTRUST_FLUSH_ON_TURN_END: "true"
-        run: |
-          codex exec \
-            --skip-git-repo-check \
-            --dangerously-bypass-hook-trust \
-            --sandbox read-only \
-            "summarize the changes in this repo"
-```
-
-If your plugin release repo is private, also expose a token the launcher can use to download the binary (`GH_TOKEN` or `GITHUB_TOKEN`, or an authenticated `gh`).
+`BRAINTRUST_API_KEY` and the normal Braintrust URL/org environment variables
+also work; `bt` owns profile, OAuth, keychain, and token-refresh handling.
 
 ## Configuration
 
-There are two ways to configure the plugin. **Environment variables always win over the config file**
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `TRACE_TO_BRAINTRUST` | `false` | Master opt-in switch. |
+| `BRAINTRUST_PROJECT` | `codex` | Destination project resolved by `bt`. |
+| `BRAINTRUST_FLUSH_ON_TURN_END` | `false` | Flush after `Stop`; useful for short-lived CI jobs. |
+| `CODEX_PARENT_SPAN_ID` | unset | Attach the Codex session below this span. |
+| `CODEX_ROOT_SPAN_ID` | parent id | Existing trace root when attaching below a non-root span. |
+| `BRAINTRUST_ADDITIONAL_METADATA` | unset | JSON object merged into root metadata. |
 
-```
-cp ~/.codex/plugins/cache/braintrust-codex-plugins/trace-codex/<plugin-version>/config.json.example ~/.codex/plugins/data/trace-codex-braintrust-codex-plugins/config.json
-# now edit config.json with your desired settings
-```
+The hook is fail-open: tracing errors are written to stderr and never fail the
+Codex turn. If `bt` is missing, the launcher securely queues the current event,
+starts one best-effort background install with the official installer, and
+replays the event after installation. If the event cannot be queued, the
+installer still starts and only that event is skipped.
 
-Every setting can be provided as a `config.json` key or as an environment variable; **an environment variable always overrides config.json**
+Both `bin/codex-hook.sh` and `bin/codex-hook.cmd` forward the full hook
+configuration to `bt`. On Windows, the daemon uses a local named pipe.
 
-| `config.json` key    | Environment variable                  | Default            | Meaning                                                                                                                                      |
-|----------------------|---------------------------------------|--------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
-| `traceToBraintrust`  | `TRACE_TO_BRAINTRUST`                 | `false`            | Master switch. **When `false` or unset, no traces are reported** Set `true` to enable tracing.                                               |
-| `apiKey`             | `BRAINTRUST_API_KEY`                  | _(unset)_          | Braintrust API key.                                                                                                                          |
-| `project`            | `BRAINTRUST_PROJECT`                  | _(unset)_          | Project to log traces into.                                                                                                                  |
-| `apiUrl`             | `BRAINTRUST_API_URL`                  | api.braintrust.dev | Braintrust API URL.                                                                                                                          |
-| `additionalMetadata` | `BRAINTRUST_ADDITIONAL_METADATA`      | _(unset)_          | JSON object of extra metadata merged into the root span. Standard keys (`session_id`, `model`, `project`, etc.) take precedence on conflict. |
-| `parentSpanId`       | `CODEX_PARENT_SPAN_ID`                | _(unset)_          | Existing Braintrust span to attach the Codex session under. If `rootSpanId` is unset, this is also used as the trace root.                   |
-| `rootSpanId`         | `CODEX_ROOT_SPAN_ID`                  | _(unset)_          | Root span id for the existing trace. If `parentSpanId` is unset, this is also used as the parent.                                            |
-| `flushOnTurnEnd`     | `BRAINTRUST_FLUSH_ON_TURN_END`        | `false`            | When `true`, the hook blocks at each turn's end (the `Stop` event) until the server confirms all spans are flushed. Use in programmatic/CI runs to guarantee traces are delivered before Codex exits. |
-| `recordFile`         | `BRAINTRUST_EVENT_SERVER_RECORD_FILE` | _(unset)_          | If set, record every event to this NDJSON file (for `replay`).                                                                               |
+## CI
 
-### Add a Codex trace to an existing trace
-
-You can attach a Codex session to an existing Braintrust trace by passing `CODEX_PARENT_SPAN_ID`:
+Set `BRAINTRUST_FLUSH_ON_TURN_END=true` so the terminal hook waits for the
+session queue and SDK batch to drain before the job exits:
 
 ```bash
-TRACE_TO_BRAINTRUST=true CODEX_PARENT_SPAN_ID=your-parent-span-id codex
+BRAINTRUST_FLUSH_ON_TURN_END=true \
+TRACE_TO_BRAINTRUST=true \
+BRAINTRUST_PROJECT=ci-agents \
+codex exec --dangerously-bypass-hook-trust "summarize this repository"
 ```
 
-If the parent span is not the trace root, also pass `CODEX_ROOT_SPAN_ID`:
+Inspect the local daemon and its sessions with:
 
 ```bash
-TRACE_TO_BRAINTRUST=true CODEX_PARENT_SPAN_ID=parent-span-id CODEX_ROOT_SPAN_ID=root-span-id codex
+bt daemon status
 ```
-
-The Codex session and all its turns/tools will appear as children of your parent span in Braintrust.
-
-### Resuming sessions
-
-Note that when resuming a session, the original session's options will remain in effect.
-
-For example:
-
-```sh
-TRACE_TO_BRAINTRUST=true codex # first session enables braintrust
-TRACE_TO_BRAINTRUST=false codex resume abcde # the resumed session will still be traced because the original session was
-```
-
-The trace itself also survives the background server stopping. The server shuts down after the idle window (or on an explicit shutdown), but a session can outlive it — you might leave it open past the timeout, send another message after the server stopped, or `codex resume` later. The plugin snapshots each session's in-progress trace state under `$PLUGIN_DATA/state/` and restores it when the session continues, so later turns keep landing in the same trace instead of starting a new one. Stale snapshots age out automatically, and secrets (your API key) are never written to them.
-
-### Advanced Options
-
-Advanced plugin settings for debugging or developing the plugin
-
-
-| `config.json` key     | Environment variable                             | Default        | Meaning                                         |
-|-----------------------|--------------------------------------------------|----------------|-------------------------------------------------|
-| `port`                | `BRAINTRUST_EVENT_SERVER_PORT`                   | `52734`        | Loopback port for the server.                   |
-| `idleTimeoutMs`       | `BRAINTRUST_EVENT_SERVER_IDLE_TIMEOUT_MS`        | `300000`       | Idle shutdown window.                           |
-| `idleCheckIntervalMs` | `BRAINTRUST_EVENT_SERVER_IDLE_CHECK_INTERVAL_MS` | `30000`        | Idle watchdog cadence.                          |
-| _(none)_              | `BRAINTRUST_EVENT_SERVER_LOG_DIR`                | `$PLUGIN_DATA` | Directory for logs, pidfile, and `config.json`. |
-
-The config file is read by the hook client only at the moment it boots the background server (the running server keeps the config it started with). To pick up config changes, stop the server (or wait for it to idle out) so the next event re-boots it.

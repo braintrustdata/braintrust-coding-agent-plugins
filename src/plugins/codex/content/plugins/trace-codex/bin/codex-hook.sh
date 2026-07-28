@@ -1,164 +1,75 @@
 #!/bin/sh
-# Launcher for the trace-codex hook binary.
-#
-# hooks.json invokes this script (a fixed, platform-agnostic command). The real
-# binary is platform-specific and far too large to commit, so it is downloaded
-# on demand from the plugin's GitHub release and cached next to this script at
-# $PLUGIN_ROOT/bin/codex-hook.
-#
-# Because Codex wipes the versioned plugin cache ($PLUGIN_ROOT) on every
-# install/upgrade, a cached binary there is automatically invalidated on
-# upgrade: the next hook finds it missing and re-downloads the matching version.
-# This means the hot path is just "is the binary here? exec it" with no version
-# parsing, and upgrades self-heal with no manual step.
-#
-# Hard rule: never fail the Codex turn. Any error here logs to stderr and exits
-# 0 (Codex treats a 0 exit with no stdout as success).
+# Thin, fail-open Codex hook shim for the shared Braintrust daemon.
 
 set -u
 
-REPO="braintrustdata/braintrust-codex-plugin"
-
-# PLUGIN_ROOT is set by Codex to the installed plugin directory. Fall back to
-# this script's own directory's parent so the launcher is runnable standalone.
-SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
-ROOT="${PLUGIN_ROOT:-$(dirname "$SCRIPT_DIR")}"
-BIN="$ROOT/bin/codex-hook"
-
-# Fast path: the binary is already cached for this plugin version. Run it.
-if [ -x "$BIN" ]; then
-  exec "$BIN" "$@"
-fi
-
-# --- Slow path: download the matching binary, then exec it. ---
-
-log() { printf 'trace-codex launcher: %s\n' "$1" >&2; }
-
-# Map uname output to our release asset suffix (<os>-<arch>).
-os=$(uname -s 2>/dev/null || echo unknown)
-arch=$(uname -m 2>/dev/null || echo unknown)
-case "$os" in
-  Darwin) os_name=darwin ;;
-  Linux) os_name=linux ;;
-  *) log "unsupported OS '$os'; tracing disabled this session"; exit 0 ;;
-esac
-case "$arch" in
-  arm64 | aarch64) arch_name=arm64 ;;
-  x86_64 | amd64) arch_name=x64 ;;
-  *) log "unsupported arch '$arch'; tracing disabled this session"; exit 0 ;;
-esac
-suffix="$os_name-$arch_name"
-
-# Read the plugin version (single source of truth) from the manifest. Only on
-# this slow path, so no dependency (jq) and no parsing on the hot path.
-#
-# TRACE_CODEX_RELEASE_VERSION overrides the manifest version. This is intended
-# for testing (e.g. the smoke test pointing at an arbitrary published release);
-# normal installs leave it unset and use the manifest.
-manifest="$ROOT/.codex-plugin/plugin.json"
-version="${TRACE_CODEX_RELEASE_VERSION:-}"
-if [ -z "$version" ]; then
-  version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" 2>/dev/null | head -1)
-fi
-# Allow an optional leading 'v' on the override (v0.0.1 or 0.0.1).
-version="${version#v}"
-if [ -z "$version" ]; then
-  log "could not read plugin version from $manifest; tracing disabled this session"
-  exit 0
-fi
-
-tag="trace-codex-v$version"
-asset="codex-hook-$suffix"
-url="https://github.com/$REPO/releases/download/$tag/$asset"
-tmp="$BIN.download.$$"
-
-mkdir -p "$ROOT/bin" 2>/dev/null || {
-  log "could not create $ROOT/bin; tracing disabled this session"
-  exit 0
+log() { printf 'trace-codex: %s\n' "$1" >&2; }
+truthy() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1 | true | yes | on) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-# The release repo may be private, so the plain browser download URL 404s for
-# unauthenticated callers. Try authenticated paths first (gh CLI, then a token
-# from the environment via the GitHub API), then fall back to an unauthenticated
-# download for the public-repo case. The first method that produces a non-empty
-# file wins. Every method is best-effort and never fails the turn.
-ok=1
+# Tracing remains opt-in.
+truthy "${TRACE_TO_BRAINTRUST:-false}" || exit 0
 
-# 1) gh CLI: uses the same credentials Codex used to install the plugin, and
-#    transparently handles private repos. `gh release download` writes the asset
-#    to the path given by -O.
-if [ "$ok" -ne 0 ] && command -v gh >/dev/null 2>&1; then
-  if gh release download "$tag" \
-      --repo "$REPO" \
-      --pattern "$asset" \
-      --output "$tmp" \
-      --clobber >/dev/null 2>&1 && [ -s "$tmp" ]; then
-    ok=0
+# Build the eventual bt invocation before checking availability so a first-run
+# event can be replayed after the background installer completes.
+ROOT="${PLUGIN_ROOT:-$(CDPATH= cd "$(dirname "$0")/.." && pwd)}"
+version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$ROOT/.codex-plugin/plugin.json" 2>/dev/null | head -1)
+
+set -- daemon hook --source codex
+[ -z "$version" ] || set -- "$@" --source-version "$version"
+truthy "${BRAINTRUST_FLUSH_ON_TURN_END:-false}" && set -- "$@" --flush-on-turn-end
+[ -z "${CODEX_PARENT_SPAN_ID:-}" ] || set -- "$@" --parent-span-id "$CODEX_PARENT_SPAN_ID"
+[ -z "${CODEX_ROOT_SPAN_ID:-}" ] || set -- "$@" --root-span-id "$CODEX_ROOT_SPAN_ID"
+[ -z "${BRAINTRUST_ADDITIONAL_METADATA:-}" ] \
+  || set -- "$@" --additional-metadata "$BRAINTRUST_ADDITIONAL_METADATA"
+
+BT_BIN=$(command -v bt 2>/dev/null || true)
+if [ -z "$BT_BIN" ] && [ -x "${XDG_BIN_HOME:-$HOME/.local/bin}/bt" ]; then
+  BT_BIN="${XDG_BIN_HOME:-$HOME/.local/bin}/bt"
+fi
+if [ -z "$BT_BIN" ] && command -v curl >/dev/null 2>&1; then
+  # Never install synchronously in a blocking hook. Securely spool this event,
+  # then install and forward it in the detached child so a first SessionStart
+  # does not lose hook-only source/permission metadata.
+  umask 077
+  pending=$(mktemp "${TMPDIR:-/tmp}/trace-codex-event.XXXXXX" 2>/dev/null || true)
+  if [ -n "$pending" ] && cat >"$pending"; then
+    nohup sh -c '
+      pending=$1
+      shift
+      trap '"'"'rm -f "$pending"'"'"' 0
+      curl -fsSL --max-time 20 https://bt.dev/cli/install.sh | sh >/dev/null 2>&1 || exit 0
+      bt_bin=$(command -v bt 2>/dev/null || true)
+      if [ -z "$bt_bin" ] && [ -x "${XDG_BIN_HOME:-$HOME/.local/bin}/bt" ]; then
+        bt_bin="${XDG_BIN_HOME:-$HOME/.local/bin}/bt"
+      fi
+      [ -z "$bt_bin" ] || "$bt_bin" "$@" <"$pending" >/dev/null 2>&1
+    ' trace-codex-install "$pending" "$@" </dev/null >/dev/null 2>&1 &
+    log "bt CLI is unavailable; queued this event behind a background install"
   else
-    rm -f "$tmp" 2>/dev/null
+    [ -z "$pending" ] || rm -f "$pending"
+    nohup sh -c 'curl -fsSL --max-time 20 https://bt.dev/cli/install.sh | sh' \
+      </dev/null >/dev/null 2>&1 &
+    log "bt CLI is unavailable; started a background install but could not queue this event"
   fi
+  exit 0
 fi
-
-# 2) Token from the environment + GitHub API. The API asset endpoint with
-#    Accept: application/octet-stream returns the binary (or a redirect curl
-#    follows) for private repos when the token is authorized.
-token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-if [ "$ok" -ne 0 ] && [ -n "$token" ] && command -v curl >/dev/null 2>&1; then
-  api="https://api.github.com/repos/$REPO/releases/tags/$tag"
-  # Resolve the asset id from the release JSON, then download it by id via the
-  # API octet-stream endpoint. The asset's "id" precedes its "name" in the JSON,
-  # so split on commas and track the most recent "id" seen, emitting it when the
-  # matching "name" line appears. Avoids a jq dependency on this path.
-  asset_id=$(curl -fsSL \
-    -H "Authorization: Bearer $token" \
-    -H "Accept: application/vnd.github+json" \
-    "$api" 2>/dev/null \
-    | tr ',' '\n' \
-    | awk -v a="\"$asset\"" '
-        /"id"[[:space:]]*:/ { match($0, /[0-9]+/); id = substr($0, RSTART, RLENGTH) }
-        index($0, "\"name\"") && index($0, a) { print id; exit }
-      ')
-  if [ -n "$asset_id" ]; then
-    curl -fsSL \
-      -H "Authorization: Bearer $token" \
-      -H "Accept: application/octet-stream" \
-      "https://api.github.com/repos/$REPO/releases/assets/$asset_id" \
-      -o "$tmp" 2>/dev/null
-    if [ $? -eq 0 ] && [ -s "$tmp" ]; then
-      ok=0
-    else
-      rm -f "$tmp" 2>/dev/null
-    fi
-  fi
-fi
-
-# 3) Unauthenticated download (works when the repo/releases are public).
-if [ "$ok" -ne 0 ]; then
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$tmp" 2>/dev/null
-    ok=$?
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$tmp" 2>/dev/null
-    ok=$?
-  else
-    log "neither curl nor wget found; cannot download binary; tracing disabled this session"
-    exit 0
-  fi
-fi
-
-if [ "$ok" -ne 0 ] || [ ! -s "$tmp" ]; then
-  rm -f "$tmp" 2>/dev/null
-  log "failed to download $asset for $tag; tracing disabled this session"
+if [ -z "$BT_BIN" ]; then
+  log "bt CLI is unavailable; tracing disabled for this event"
   exit 0
 fi
 
-chmod +x "$tmp" 2>/dev/null
-# Atomic rename into place so a concurrent hook never sees a half-written file.
-mv -f "$tmp" "$BIN" 2>/dev/null || {
-  rm -f "$tmp" 2>/dev/null
-  log "could not install binary at $BIN; tracing disabled this session"
-  exit 0
-}
+# The standalone Codex plugin has historically exposed BRAINTRUST_PROJECT,
+# while bt's global project option uses BRAINTRUST_DEFAULT_PROJECT. Preserve
+# the documented plugin contract without overriding an explicit bt default.
+if [ -z "${BRAINTRUST_DEFAULT_PROJECT:-}" ] && [ -n "${BRAINTRUST_PROJECT:-}" ]; then
+  export BRAINTRUST_DEFAULT_PROJECT="$BRAINTRUST_PROJECT"
+fi
 
-log "downloaded codex-hook $version ($suffix)"
-exec "$BIN" "$@"
+"$BT_BIN" "$@" || log "bt daemon hook failed non-fatally"
+exit 0

@@ -1,22 +1,38 @@
-# bt-daemon — shared Rust project for Braintrust coding-agent plugins.
-#
-# The empty [workspace] table makes THIS directory the Cargo workspace root, so
-# the crate is not absorbed by any parent manifest and the whole project can be
-# lifted into its own repo by copying bt-daemon/ verbatim. Keep the workspace
-# root here (not at the monorepo root) to preserve that portability.
-#
-# Placeholder for now; real crates/modules land here as the shared daemon and
-# per-agent tracing move from TypeScript to Rust.
-
 [package]
 name = "bt-daemon"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Shared daemon for Braintrust coding-agent plugins (placeholder)."
 publish = false
+description = "Embeddable Braintrust coding-agent tracing daemon."
 
-[workspace]
-resolver = "2"
+[features]
+default = []
+# Standalone development/test binary. Production embeds the library in `bt`.
+cli = ["dep:tracing-subscriber"]
+
+[[bin]]
+name = "bt-daemon"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
+# Keep this pinned exactly, matching the dependency policy used by `bt`.
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "d33e806bf6ab9548d37355f6a5098a971ef150aa" }
+anyhow = "1"
+async-trait = "0.1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

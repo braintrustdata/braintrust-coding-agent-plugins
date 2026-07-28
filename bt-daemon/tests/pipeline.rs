@@ -1,0 +1,425 @@
+//! Phase 1 end-to-end: hook client → UDS → dispatch → journal → translate →
+//! debug sink. Runs the daemon in-process on a temp socket (no process
+//! spawning, so it's deterministic).
+
+use bt_daemon::wire::{BackendAuth, Envelope, FlushMode, SessionConfig};
+use bt_daemon::{
+    debug_serve_options, flush_session, forward_envelope, run_serve, run_status, shutdown_daemon,
+    HostInfo, ServeArgs, StatusArgs,
+};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+fn dummy_host() -> HostInfo {
+    // The daemon is started in-process, so the client never spawns; serve_argv
+    // is unused but must be non-empty.
+    HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "test".into(),
+    }
+}
+
+fn config_with_secret() -> SessionConfig {
+    SessionConfig {
+        auth: BackendAuth {
+            token: "sk-TOP-SECRET-abc123".into(),
+            api_url: Some("https://api.braintrust.dev".into()),
+            app_url: None,
+            org_name: Some("acme".into()),
+            org_id: None,
+        },
+        project: Some("codex".into()),
+        parent_span_id: None,
+        root_span_id: None,
+        flush_mode: FlushMode::FireAndForget,
+        additional_metadata: None,
+    }
+}
+
+fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
+    Envelope {
+        source: "debug".into(),
+        source_version: Some("0.0.0".into()),
+        session_id: session_id.into(),
+        event: event.into(),
+        ts_ms,
+        payload: serde_json::json!({ "session_id": session_id, "hook_event_name": event, "n": ts_ms }),
+        config: Some(config_with_secret()),
+    }
+}
+
+fn test_endpoint(tmp: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        tmp.join("d.sock")
+    }
+    #[cfg(windows)]
+    {
+        let _ = tmp;
+        PathBuf::from(format!(r"\\.\pipe\bt-daemon-test-{}", uuid::Uuid::new_v4()))
+    }
+}
+
+async fn wait_for(endpoint: &Path) {
+    for _ in 0..200 {
+        if let Ok(Some(_)) = run_status(StatusArgs {
+            socket: Some(endpoint.to_path_buf()),
+            session_id: None,
+        })
+        .await
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("daemon never answered at: {}", endpoint.display());
+}
+
+async fn wait_until_gone(endpoint: &Path) {
+    for _ in 0..1000 {
+        match run_status(StatusArgs {
+            socket: Some(endpoint.to_path_buf()),
+            session_id: None,
+        })
+        .await
+        {
+            Ok(Some(_)) => {}
+            // A Windows named pipe can still accept a client while the
+            // daemon is unwinding, then close before answering initialize.
+            // Either that or an unavailable endpoint means it is no longer
+            // serving status requests.
+            Ok(None) | Err(_) => return,
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("daemon still answered at: {}", endpoint.display());
+}
+
+/// Start an in-process daemon on a fresh temp socket/data dir. Returns
+/// (data_dir, socket, serve task handle, tempdir guard).
+async fn start_daemon() -> (
+    PathBuf,
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0, // disable the watchdog for the test
+    };
+    let opts = debug_serve_options("test", &data_dir);
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    (data_dir, socket, handle, tmp)
+}
+
+async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::JoinHandle<()> {
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+    };
+    let opts = debug_serve_options("test", &data_dir);
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    handle
+}
+
+async fn shutdown(socket: &Path) {
+    shutdown_daemon(socket).await.unwrap();
+}
+
+#[tokio::test]
+async fn events_are_ordered_journaled_and_emitted() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let host = dummy_host();
+    let session = "sess-1";
+
+    for (i, event) in ["SessionStart", "PostToolUse", "Stop"].iter().enumerate() {
+        let env = envelope(session, event, 1000 + i as i64);
+        forward_envelope(&env, &socket, &host, false).await.unwrap();
+    }
+
+    let flushed = flush_session(session, &socket, 5000).await.unwrap();
+    assert!(flushed.flushed, "flush did not complete: {flushed:?}");
+    assert_eq!(flushed.pending, 0);
+
+    // Journal: three events, in order, token redacted.
+    let journal = data_dir.join("journal").join("sess-1.ndjson");
+    let jtext = std::fs::read_to_string(&journal).unwrap();
+    let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        jlines.len(),
+        3,
+        "expected 3 journal lines, got {}",
+        jlines.len()
+    );
+    assert!(
+        !jtext.contains("sk-TOP-SECRET-abc123"),
+        "token leaked into journal!"
+    );
+    assert!(
+        jtext.contains("token_sha256_prefix"),
+        "journal missing auth fingerprint"
+    );
+
+    let events: Vec<String> = jlines
+        .iter()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(events, vec!["SessionStart", "PostToolUse", "Stop"]);
+
+    // Spans: debug translator emits a root once + one span per event = 4.
+    let spans = data_dir.join("spans").join("sess-1.ndjson");
+    let stext = std::fs::read_to_string(&spans).unwrap();
+    let slines: Vec<&str> = stext.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        slines.len(),
+        4,
+        "expected 4 span rows, got {}: {stext}",
+        slines.len()
+    );
+    // The span rows carry the raw payload but never the auth token.
+    assert!(
+        !stext.contains("sk-TOP-SECRET-abc123"),
+        "token leaked into spans!"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn distinct_sessions_are_isolated() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let host = dummy_host();
+
+    forward_envelope(&envelope("a", "SessionStart", 1), &socket, &host, false)
+        .await
+        .unwrap();
+    forward_envelope(&envelope("b", "SessionStart", 1), &socket, &host, false)
+        .await
+        .unwrap();
+    forward_envelope(&envelope("a", "Stop", 2), &socket, &host, false)
+        .await
+        .unwrap();
+
+    flush_session("a", &socket, 5000).await.unwrap();
+    flush_session("b", &socket, 5000).await.unwrap();
+
+    let a = std::fs::read_to_string(data_dir.join("journal").join("a.ndjson")).unwrap();
+    let b = std::fs::read_to_string(data_dir.join("journal").join("b.ndjson")).unwrap();
+    assert_eq!(a.lines().filter(|l| !l.trim().is_empty()).count(), 2);
+    assert_eq!(b.lines().filter(|l| !l.trim().is_empty()).count(), 1);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn status_reports_sessions_and_filters_by_session_id() {
+    let (_data_dir, socket, handle, _tmp) = start_daemon().await;
+    let host = dummy_host();
+    forward_envelope(
+        &envelope("visible", "SessionStart", 1),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    forward_envelope(&envelope("other", "SessionStart", 1), &socket, &host, false)
+        .await
+        .unwrap();
+
+    let all = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(all.daemon_version, "test");
+    assert_eq!(all.sessions.len(), 2);
+
+    let filtered = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("visible".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(filtered.sessions.len(), 1);
+    assert_eq!(filtered.sessions[0].session_id, "visible");
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+    wait_until_gone(&socket).await;
+}
+
+#[tokio::test]
+async fn a_second_server_detects_the_existing_daemon() {
+    let (data_dir, socket, first, _tmp) = start_daemon().await;
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_serve(args, debug_serve_options("rival", &data_dir)),
+    )
+    .await
+    .expect("rival server should resolve ownership promptly");
+    result.unwrap();
+
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status.daemon_version, "test");
+
+    shutdown(&socket).await;
+    first.await.unwrap();
+}
+
+#[tokio::test]
+async fn no_spawn_errors_when_daemon_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = test_endpoint(tmp.path());
+    let host = dummy_host();
+    let err = forward_envelope(&envelope("x", "y", 1), &socket, &host, true).await;
+    assert!(err.is_err(), "expected error with --no-spawn and no daemon");
+}
+
+#[tokio::test]
+async fn no_spawn_rejects_a_mismatched_daemon_version() {
+    let (_data_dir, socket, handle, _tmp) = start_daemon().await;
+    let host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "newer-client".into(),
+    };
+    let err = forward_envelope(&envelope("x", "y", 1), &socket, &host, true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("does not match client"));
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn spawn_on_demand_runs_the_real_standalone_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("spawned-data");
+    let socket = test_endpoint(tmp.path());
+    let host = HostInfo {
+        serve_argv: vec![
+            OsString::from(env!("CARGO_BIN_EXE_bt-daemon")),
+            OsString::from("serve"),
+            OsString::from("--debug-sink"),
+            OsString::from("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            OsString::from("--idle-timeout-secs"),
+            OsString::from("5"),
+        ],
+        version: env!("CARGO_PKG_VERSION").into(),
+    };
+
+    forward_envelope(
+        &envelope("spawned", "SessionStart", 1),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session("spawned", &socket, 5000).await.unwrap();
+    let spans = std::fs::read_to_string(data_dir.join("spans/spawned.ndjson")).unwrap();
+    assert_eq!(spans.lines().count(), 2);
+
+    shutdown(&socket).await;
+    wait_until_gone(&socket).await;
+}
+
+#[tokio::test]
+async fn restart_replays_journal_before_processing_new_events() {
+    let (data_dir, socket, first, _tmp) = start_daemon().await;
+    let host = dummy_host();
+    forward_envelope(
+        &envelope("resume", "SessionStart", 1),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session("resume", &socket, 5000).await.unwrap();
+    shutdown(&socket).await;
+    first.await.unwrap();
+
+    let second = start_daemon_at(data_dir.clone(), socket.clone()).await;
+    forward_envelope(&envelope("resume", "Stop", 2), &socket, &host, false)
+        .await
+        .unwrap();
+    flush_session("resume", &socket, 5000).await.unwrap();
+
+    let journal = std::fs::read_to_string(data_dir.join("journal/resume.ndjson")).unwrap();
+    assert_eq!(journal.lines().count(), 2);
+    let spans = std::fs::read_to_string(data_dir.join("spans/resume.ndjson")).unwrap();
+    assert_eq!(
+        spans.lines().count(),
+        5,
+        "first delivery (2) + replay repair (2) + resumed event (1)"
+    );
+
+    shutdown(&socket).await;
+    second.await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_boundary_journal_contains_a_self_contained_transcript_snapshot() {
+    let (data_dir, socket, handle, tmp) = start_daemon().await;
+    let transcript = tmp.path().join("claude.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"assistant","timestamp":"2026-07-29T00:00:00Z","message":{"id":"m1","model":"claude","content":[{"type":"text","text":"durable"}]}}"#,
+    )
+    .unwrap();
+    let mut env = envelope("claude-journal", "Stop", 1_775_000_000_000);
+    env.source = "claude-code".into();
+    env.payload = serde_json::json!({
+        "session_id":"claude-journal",
+        "hook_event_name":"Stop",
+        "transcript_path":transcript
+    });
+    forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    flush_session("claude-journal", &socket, 5000)
+        .await
+        .unwrap();
+
+    let journal = std::fs::read_to_string(data_dir.join("journal/claude-journal.ndjson")).unwrap();
+    assert!(journal.contains("_bt_transcript_snapshot"));
+    assert!(journal.contains("durable"));
+    assert!(!journal.contains("sk-TOP-SECRET-abc123"));
+    handle.abort();
+}

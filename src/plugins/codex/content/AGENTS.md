@@ -22,7 +22,8 @@ Key files for the tracing plugin (see [`plugins/trace-codex/AGENTS.md`](plugins/
 - `plugins/trace-codex/AGENTS.md` — architecture and contributor guide for this plugin
 - `plugins/trace-codex/.codex-plugin/plugin.json` — plugin manifest
 - `plugins/trace-codex/hooks/hooks.json` — lifecycle hook config
-- `plugins/trace-codex/src/` — the hook client + event server (compiled to `bin/codex-hook`)
+- `plugins/trace-codex/bin/codex-hook.*` — fail-open shims that invoke the
+  shared daemon through `bt daemon hook --source codex`
 
 ## Making changes
 

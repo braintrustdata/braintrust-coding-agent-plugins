@@ -1,20 +1,79 @@
 # bt-daemon
 
-Shared Rust project for Braintrust coding-agent plugins. **Placeholder name** —
-the real name is TBD.
+Shared Rust project for Braintrust coding-agent tracing plugins. A local,
+stateful daemon that plugin **hook shims** forward events to; it owns the
+event→trace state machine and sends spans to Braintrust out-of-band. See
+[`docs/protocol.md`](docs/protocol.md) for the wire contract.
 
-Long-term, the shared logic behind the per-agent tracing plugins (currently
-TypeScript, e.g. `trace-codex`) moves here to Rust. Right now it's a stub.
+> **Placeholder name** — the real name is TBD. The subcommand framing
+> (`serve` / `hook` / `status` / `replay`) should survive a rename.
 
-## Self-contained
+## Layout
 
-This directory is its own Cargo workspace root (see the empty `[workspace]`
-table in `Cargo.toml`), so it does not depend on anything else in the monorepo
-and can be moved to a standalone repo by copying `bt-daemon/` as-is.
+One self-contained Cargo crate, liftable to its own repo by copying
+`bt-daemon/` verbatim:
 
-## Build / run
+- `src/wire` — the wire protocol module: envelope types + JSON-RPC framing.
+- `src/translate` and `src/sink` — agent state machines and Braintrust output.
+- `src/lib.rs` — the embeddable library: clap `Args` + async entry points
+  (`run_serve`, `run_hook`, `run_status`, `run_replay`). This is what `bt`
+  depends on.
+- `src/main.rs` — the standalone **`bt-daemon` binary**, compiled only with
+  the `cli` feature for isolated testing/development. Env/flag static-token
+  auth only; not an end-user artifact.
+
+## Dual consumption
+
+The daemon core is credential-passive — it only ever *receives* a resolved
+`BackendAuth` with each session's config — so two front-ends share all core
+behavior. The `cli` feature only enables the standalone binary and its logging
+subscriber:
+
+1. **Embedded in `bt`** (production): `bt` fills `BackendAuth` from its profile
+   / OAuth / keychain auth.
+2. **Standalone binary** (testing): fills it from `BRAINTRUST_API_KEY` etc.
+
+## Build / test
 
 ```bash
 cd bt-daemon
-cargo run
+cargo test                                      # library + pipeline tests
+cargo test --features cli                       # also compile/test the CLI
+cargo build --features cli --bin bt-daemon      # standalone test binary
 ```
+
+CI runs the all-feature build, test suite, and Clippy on Linux, macOS, and
+Windows. The pipeline integration tests use Unix-domain sockets on Unix and
+real Windows named pipes on Windows.
+
+## Try it (standalone, debug sink)
+
+```bash
+export BT_DAEMON_SOCKET=/tmp/btd.sock BT_DAEMON_DATA_DIR=/tmp/btd
+cargo build --features cli --bin bt-daemon
+echo '{"session_id":"s1","hook_event_name":"SessionStart"}' | ./target/debug/bt-daemon hook --source debug
+echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./target/debug/bt-daemon hook --source debug
+./target/debug/bt-daemon status
+# journaled events:  $BT_DAEMON_DATA_DIR/journal/s1.ndjson
+# emitted span rows: $BT_DAEMON_DATA_DIR/spans/s1.ndjson
+```
+
+The first `hook` spawns the daemon detached; it idles out after 5 minutes.
+
+## Status
+
+Phases 0–5 are implemented: protocol, daemon lifecycle, Braintrust sink,
+Codex and Claude translators, `bt daemon` integration, and thin hook shims for
+both shipped plugins. Restart recovery replays the redacted journal with
+deterministic span ids. Claude lifecycle entries embed transcript snapshots, so
+recovery does not depend on mutable external paths. Explicit turn/session-end
+flushes are bounded, and sessions can target project logs or an experiment.
+
+Windows named-pipe transport, detached spawning, lifecycle handover, and
+cross-platform pipeline tests are implemented. The remaining host follow-ups
+are OpenCode and pi, which are not present in this monorepo.
+
+- The Braintrust sink pins `braintrust-sdk-rust` commit `d33e806`, which adds
+  deterministic span ids, `span_origin`/`span_attributes` passthrough, and
+  per-session credential isolation. This follows the same exact-revision Git
+  dependency policy as `bt`.

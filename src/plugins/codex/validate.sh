@@ -43,6 +43,10 @@ for rel in "${required[@]}"; do
   case "$rel" in *.json) check_json "$TARGET_DIR/$rel";; esac
 done
 
+grep -q "'daemon','hook','--source','codex'" \
+  "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.cmd" \
+  || fail "Codex Windows hook does not invoke bt daemon"
+
 # Every marketplace entry's source path must exist in the built tree.
 if command -v jq >/dev/null 2>&1; then
   while IFS= read -r p; do
