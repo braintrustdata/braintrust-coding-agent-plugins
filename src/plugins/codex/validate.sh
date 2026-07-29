@@ -46,6 +46,9 @@ done
 grep -q "'daemon','hook','--source','codex'" \
   "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.cmd" \
   || fail "Codex Windows hook does not invoke bt daemon"
+grep -Fq 'call "%BT_HOOK_BIN%" daemon hook --help' \
+  "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.cmd" \
+  || fail "Codex Windows hook does not return from bt.cmd compatibility check"
 grep -q 'daemon hook --source codex' \
   "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.sh" \
   || fail "Codex Unix hook does not invoke bt daemon"

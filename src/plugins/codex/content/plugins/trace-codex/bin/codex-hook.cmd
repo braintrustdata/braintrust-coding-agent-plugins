@@ -13,7 +13,7 @@ if not defined BT_HOOK_BIN (
   exit /b 0
 )
 
-"%BT_HOOK_BIN%" daemon hook --help >nul 2>&1
+call "%BT_HOOK_BIN%" daemon hook --help >nul 2>&1
 if errorlevel 1 (
   echo trace-codex: a daemon-capable bt CLI is unavailable; tracing disabled for this event.>&2
   exit /b 0
