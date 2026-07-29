@@ -135,19 +135,6 @@ impl AgentTestWorld {
         }
     }
 
-    pub fn expect_mock_inference(
-        &self,
-        scenario: IngestScenario,
-        name: impl Into<String>,
-        matcher: impl Fn(&Value) -> bool + Send + Sync + 'static,
-    ) -> IngestScenario {
-        if self.uses_mock_inference() {
-            scenario.expect(name, matcher)
-        } else {
-            scenario
-        }
-    }
-
     pub fn workspace(&self) -> PathBuf {
         let workspace = self.root.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("create agent workspace");
@@ -220,7 +207,10 @@ impl AgentTestWorld {
         }
         let mut last_error = String::new();
         for _ in 0..100 {
-            match self.collector.evaluate(scenario) {
+            match self
+                .collector
+                .evaluate(scenario, self.uses_mock_inference())
+            {
                 Ok(rows) => return rows,
                 Err(error) => last_error = error,
             }

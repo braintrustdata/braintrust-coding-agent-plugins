@@ -38,9 +38,14 @@ The world controls inference and ingest independently:
   Braintrust backend.
 
 This allows deterministic inference to drive real Braintrust ingest without
-paying for model inference. Tests always assert stable process behavior,
-provider request and response details only when inference is mocked, and
-captured row shapes only when ingest is mocked. Live ingest instead waits for
-the daemon to report emitted spans and fails on sink errors. Mock inference can
-add stricter row expectations to the same scenario without requiring a second
-test body.
+paying for model inference. Every test always asserts stable process behavior
+and successful trace delivery. With mock ingest, `IngestScenario::expect`
+declares baseline row shapes that are evaluated with both live and mock
+inference. `IngestScenario::expect_strict` adds deterministic row shapes that
+are evaluated in addition to the baseline when inference is mocked. With live
+ingest, where captured rows are not locally inspectable, the equivalent
+baseline is that the daemon reports emitted spans and no sink errors.
+
+Provider request sequences, exact model output, and injected provider failures
+are additional mock-inference assertions; they do not replace the baseline
+assertions.

@@ -12,6 +12,7 @@ type RowMatcher = dyn Fn(&Value) -> bool + Send + Sync + 'static;
 struct ExpectedRow {
     name: String,
     matcher: Arc<RowMatcher>,
+    strict: bool,
 }
 
 #[derive(Default)]
@@ -35,13 +36,34 @@ impl IngestScenario {
         self.expected.push(ExpectedRow {
             name: name.into(),
             matcher: Arc::new(matcher),
+            strict: false,
         });
         self
     }
 
-    pub fn evaluate(&self, rows: &[Value]) -> Result<(), String> {
+    /// Require an additional row shape when deterministic inference is in use.
+    /// Baseline expectations declared with [`Self::expect`] are always active.
+    pub fn expect_strict(
+        mut self,
+        name: impl Into<String>,
+        matcher: impl Fn(&Value) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.expected.push(ExpectedRow {
+            name: name.into(),
+            matcher: Arc::new(matcher),
+            strict: true,
+        });
+        self
+    }
+
+    pub fn evaluate(&self, rows: &[Value], include_strict: bool) -> Result<(), String> {
+        let active_expected = self
+            .expected
+            .iter()
+            .filter(|expected| include_strict || !expected.strict)
+            .collect::<Vec<_>>();
         let mut cursor = 0;
-        for (matched, expected) in self.expected.iter().enumerate() {
+        for (matched, expected) in active_expected.iter().enumerate() {
             let Some(offset) = rows[cursor..]
                 .iter()
                 .position(|row| (expected.matcher)(row))
@@ -50,7 +72,7 @@ impl IngestScenario {
                     "missing ingest shape {:?} after matching {} of {} shapes",
                     expected.name,
                     matched,
-                    self.expected.len()
+                    active_expected.len()
                 ));
             };
             cursor += offset + 1;
@@ -99,9 +121,13 @@ impl IngestMock {
         )
     }
 
-    pub fn evaluate(&self, scenario: &IngestScenario) -> Result<Vec<Value>, String> {
+    pub fn evaluate(
+        &self,
+        scenario: &IngestScenario,
+        include_strict: bool,
+    ) -> Result<Vec<Value>, String> {
         let rows = self.rows();
-        scenario.evaluate(&rows)?;
+        scenario.evaluate(&rows, include_strict)?;
         Ok(rows)
     }
 }
