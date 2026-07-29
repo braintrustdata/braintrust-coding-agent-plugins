@@ -11,7 +11,6 @@ use tokio::process::{Child, Command};
 #[cfg(windows)]
 use uuid::Uuid;
 
-const LEGACY_MODE_ENV: &str = "BT_AGENT_TEST_MODE";
 const INFERENCE_MODE_ENV: &str = "BT_AGENT_INFERENCE_MODE";
 const INGEST_MODE_ENV: &str = "BT_AGENT_INGEST_MODE";
 
@@ -23,11 +22,7 @@ pub enum TestBackendMode {
 
 impl TestBackendMode {
     fn from_env(name: &str) -> Self {
-        let value = std::env::var(name).or_else(|error| match error {
-            std::env::VarError::NotPresent => std::env::var(LEGACY_MODE_ENV),
-            _ => Err(error),
-        });
-        match value.as_deref() {
+        match std::env::var(name).as_deref() {
             Ok("live") => Self::Live,
             Ok("mock" | "deterministic") | Err(std::env::VarError::NotPresent) => Self::Mock,
             Ok(value) => panic!("{name} must be `mock` or `live`, got {value:?}"),

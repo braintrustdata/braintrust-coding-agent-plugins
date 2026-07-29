@@ -36,8 +36,6 @@ The world controls inference and ingest independently:
   the agent's normal provider.
 - `BT_AGENT_INGEST_MODE=mock|live` selects captured local ingest or the normal
   Braintrust backend.
-- `BT_AGENT_TEST_MODE=mock|live` remains a shorthand that supplies the default
-  for both settings when the more specific variable is absent.
 
 This allows deterministic inference to drive real Braintrust ingest without
 paying for model inference. Tests always assert stable process behavior,
