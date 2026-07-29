@@ -7,9 +7,9 @@
 # tracked tree with a fresh build, and commit+push only if something changed.
 # History is not preserved on the dist repo — it is a generated artifact.
 #
-# NOTE: this does NOT publish the trace-codex binaries. Those are attached to the
-# dist repo's GitHub Releases (tag trace-codex-v<version>) by a separate release
-# flow; the launcher downloads them at runtime. Porting that flow is a follow-up.
+# The deployed tracing plugin contains only fail-open platform launchers. The
+# shared Rust daemon is distributed as part of `bt`, so publishing this plugin
+# requires no Node toolchain or per-platform binary build.
 #
 # Env:
 #   DIST_REPO   (required) target dist repo. Either a full git URL
@@ -24,8 +24,7 @@ set -euo pipefail
 : "${DIST_REPO:?set DIST_REPO=<git-url|owner/name> (usually via PUBLISH_TARGETS)}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# owner/name slug — used to point the runtime binary launcher at this repo's
-# Releases. Strips ssh/https prefixes and a trailing .git.
+# owner/name slug, for log messages. Strips ssh/https prefixes and trailing .git.
 SLUG="$(printf '%s' "$DIST_REPO" | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##')"
 
 # Clone/push URL: use full URLs verbatim; build an https URL for a bare slug.
@@ -53,7 +52,7 @@ git -C "$WORKTREE" config user.email "41898282+github-actions[bot]@users.noreply
 echo "==> Rebuilding tree from source"
 # Clear tracked content (keep .git), then repopulate via the build script.
 git -C "$WORKTREE" rm -rfq --ignore-unmatch . >/dev/null 2>&1 || true
-CODEX_DIST_REPO="$SLUG" "$SRC_DIR/build.sh" "$WORKTREE"
+"$SRC_DIR/build.sh" "$WORKTREE"
 "$SRC_DIR/validate.sh" "$WORKTREE"
 
 git -C "$WORKTREE" add -A

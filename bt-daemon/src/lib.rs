@@ -17,6 +17,7 @@ mod dispatch;
 mod ids;
 mod journal;
 mod server;
+mod settings;
 mod sink;
 mod translate;
 mod transport;
@@ -129,6 +130,10 @@ pub async fn run_hook(
     mut config: SessionConfig,
     host: HostInfo,
 ) -> anyhow::Result<()> {
+    let settings = settings::SharedSettings::load();
+    if !settings.tracing_enabled() {
+        return Ok(());
+    }
     let payload = read_stdin_json()?;
 
     let session_id = json_str_field(&payload, &args.session_id_field)
@@ -139,8 +144,14 @@ pub async fn run_hook(
         .or_else(|| json_str_field(&payload, &args.event_field))
         .unwrap_or_default();
 
-    if args.flush_on_turn_end {
-        config.flush_mode = wire::FlushMode::FlushOnTurnEnd;
+    if let Some(project) = settings.project.filter(|project| !project.is_empty()) {
+        config.project = Some(project);
+    }
+    match settings.flush_on_turn_end {
+        Some(true) => config.flush_mode = wire::FlushMode::FlushOnTurnEnd,
+        Some(false) => config.flush_mode = wire::FlushMode::FireAndForget,
+        None if args.flush_on_turn_end => config.flush_mode = wire::FlushMode::FlushOnTurnEnd,
+        None => {}
     }
     if args.parent_span_id.is_some() {
         config.parent_span_id = args.parent_span_id.clone();
@@ -153,7 +164,9 @@ pub async fn run_hook(
         (None, Some(root)) => config.parent_span_id = Some(root),
         _ => {}
     }
-    if let Some(metadata) = &args.additional_metadata {
+    if let Some(metadata) = settings.additional_metadata {
+        config.additional_metadata = Some(serde_json::Value::Object(metadata));
+    } else if let Some(metadata) = &args.additional_metadata {
         let value: serde_json::Value = serde_json::from_str(metadata)
             .map_err(|e| anyhow::anyhow!("invalid --additional-metadata JSON: {e}"))?;
         if !value.is_object() {

@@ -3,10 +3,6 @@ REM Thin, fail-open Claude Code hook shim for the shared Braintrust daemon.
 REM Invokes: bt daemon hook --source claude-code
 setlocal EnableExtensions DisableDelayedExpansion
 
-set "TRACE_ENABLED="
-for %%V in (1 true yes on) do if /I "%TRACE_TO_BRAINTRUST%"=="%%V" set "TRACE_ENABLED=1"
-if not defined TRACE_ENABLED exit /b 0
-
 set "BT_HOOK_BIN="
 for /f "delims=" %%B in ('where bt 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
 if not defined BT_HOOK_BIN if exist "%USERPROFILE%\.local\bin\bt.exe" set "BT_HOOK_BIN=%USERPROFILE%\.local\bin\bt.exe"

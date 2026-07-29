@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 pub const SOCKET_ENV: &str = "BT_DAEMON_SOCKET";
 /// Env override for the data/journal directory.
 pub const DATA_DIR_ENV: &str = "BT_DAEMON_DATA_DIR";
+/// Env override for the shared non-credential daemon settings file.
+pub const SETTINGS_ENV: &str = "BT_DAEMON_CONFIG";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -75,6 +77,17 @@ pub fn data_dir(explicit: Option<&Path>) -> PathBuf {
     home().join(".braintrust").join("state").join("bt-daemon")
 }
 
+/// Resolve the shared settings file: explicit override → `$BT_DAEMON_CONFIG`
+/// → `<data_dir>/config.json`.
+pub fn settings_path(explicit: Option<&Path>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    std::env::var_os(SETTINGS_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir(None).join("config.json"))
+}
+
 /// Create `dir` (and parents) mode 0700 on unix.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -97,6 +110,10 @@ mod tests {
         let data = Path::new("custom-data");
         assert_eq!(socket_path(Some(socket)), socket);
         assert_eq!(data_dir(Some(data)), data);
+        assert_eq!(
+            settings_path(Some(Path::new("config.json"))),
+            Path::new("config.json")
+        );
     }
 
     #[test]

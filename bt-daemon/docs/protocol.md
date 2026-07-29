@@ -4,6 +4,13 @@ Status: **frozen for the prototype.** This is the contract between plugin shims
 (`hook` clients) and the daemon (`serve`), and between the embedded-in-`bt`
 front-end and the standalone test binary.
 
+All hook clients share one daemon-level, non-credential settings file. Its path
+is `$BT_DAEMON_CONFIG`, falling back to `<BT_DAEMON_DATA_DIR>/config.json` and
+then the platform default daemon state directory. The hook front-end applies
+`traceToBraintrust`, `project`, `flushOnTurnEnd`, and `additionalMetadata`
+before constructing `SessionConfig`. Authentication and backend URLs are
+resolved by `bt` and never read from this file.
+
 `PROTOCOL_VERSION = 1`.
 
 ## Transport

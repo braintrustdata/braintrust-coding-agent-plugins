@@ -33,6 +33,20 @@ subscriber:
    / OAuth / keychain auth.
 2. **Standalone binary** (testing): fills it from `BRAINTRUST_API_KEY` etc.
 
+## Shared plugin settings
+
+Codex, Claude Code, and future hook plugins read the same non-credential
+settings file through the embedded daemon. Set `BT_DAEMON_CONFIG` explicitly,
+or use `config.json` under `BT_DAEMON_DATA_DIR` (by default
+`~/.braintrust/state/bt-daemon/config.json` on Unix and
+`%LOCALAPPDATA%\Braintrust\bt-daemon\config.json` on Windows).
+
+See [`config.json.example`](config.json.example). Supported settings are
+`traceToBraintrust`, `project`, `flushOnTurnEnd`, and
+`additionalMetadata`. File values override plugin environment fallbacks.
+Credentials, auth tokens, organization selection, and backend URLs are not
+settings here; production resolves them through `bt`.
+
 ## Build / test
 
 ```bash

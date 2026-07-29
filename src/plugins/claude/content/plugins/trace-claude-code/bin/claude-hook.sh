@@ -11,8 +11,6 @@ truthy() {
   esac
 }
 
-truthy "${TRACE_TO_BRAINTRUST:-false}" || exit 0
-
 compatible_bt() {
   [ -n "${1:-}" ] && [ -x "$1" ] && "$1" daemon hook --help >/dev/null 2>&1
 }

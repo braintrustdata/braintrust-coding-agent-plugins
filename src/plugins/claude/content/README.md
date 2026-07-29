@@ -1,5 +1,10 @@
 # Braintrust Claude Code Marketplace
 
+> **This repository is generated.** It is built from
+> [braintrustdata/braintrust-coding-agent-plugins](https://github.com/braintrustdata/braintrust-coding-agent-plugins).
+> Don't edit files here — make changes and file issues in that repository, and they
+> will be rebuilt into this one.
+
 A Claude Code plugin marketplace for [Braintrust](https://braintrust.dev) integration - LLM evaluation, logging, observability, and session tracing.
 
 ## Prerequisites
@@ -43,7 +48,9 @@ claude plugin install trace-claude-code@braintrust-claude-plugin
 $HOME/.claude/plugins/marketplaces/braintrust-claude-plugin/plugins/trace-claude-code/setup.sh
 ```
 
-Traces are sent to the `claude-code` project by default.
+The setup script enables tracing in the daemon's shared non-credential
+`config.json`. The project selected there applies to every coding-agent plugin
+connected to the daemon.
 
 The tracing launchers live under `plugins/trace-claude-code/bin/` as
 `claude-hook.sh` and `claude-hook.cmd`. The Windows launcher forwards the same
@@ -51,16 +58,24 @@ configuration to `bt`, whose daemon uses a local named pipe on Windows.
 
 #### manual configuration
 
-Instead of running `setup.sh`, you can manually edit `~/.claude/settings.json` or your project's `.claude/settings.local.json`:
+Instead of running `setup.sh`, create the daemon's shared config at
+`$BT_DAEMON_CONFIG`, or at `config.json` inside `$BT_DAEMON_DATA_DIR` (by
+default `~/.braintrust/state/bt-daemon/config.json` on Unix):
 
 ```json
 {
-  "env": {
-    "TRACE_TO_BRAINTRUST": "true",
-    "BRAINTRUST_CC_PROJECT": "project-name-to-send-cc-traces-to"
-  }
+  "traceToBraintrust": true,
+  "project": "coding-agents",
+  "flushOnTurnEnd": false,
+  "additionalMetadata": {"team": "platform"}
 }
 ```
+
+This file intentionally contains no API keys, auth tokens, credentials, or
+backend URLs. Those come from the authenticated `bt` CLI. The legacy
+`TRACE_TO_BRAINTRUST`, `BRAINTRUST_CC_PROJECT`,
+`BRAINTRUST_FLUSH_ON_TURN_END`, and `BRAINTRUST_ADDITIONAL_METADATA`
+environment variables remain fallbacks for omitted shared settings.
 
 #### add claude code trace to an existing trace
 

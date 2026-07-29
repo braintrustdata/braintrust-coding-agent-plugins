@@ -1,0 +1,10 @@
+{
+  "_comment": "Shared by every coding-agent plugin connected to bt-daemon. Authentication and backend URLs are resolved by bt and do not belong here.",
+  "traceToBraintrust": true,
+  "project": "my-coding-agents",
+  "flushOnTurnEnd": false,
+  "additionalMetadata": {
+    "team": "platform",
+    "environment": "development"
+  }
+}

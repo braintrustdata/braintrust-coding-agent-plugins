@@ -10,9 +10,9 @@ truthy() {
     *) return 1 ;;
   esac
 }
-
-# Tracing remains opt-in.
-truthy "${TRACE_TO_BRAINTRUST:-false}" || exit 0
+compatible_bt() {
+  [ -n "${1:-}" ] && [ -x "$1" ] && "$1" daemon hook --help >/dev/null 2>&1
+}
 
 # Build the eventual bt invocation before checking availability so a first-run
 # event can be replayed after the background installer completes.
@@ -29,8 +29,12 @@ truthy "${BRAINTRUST_FLUSH_ON_TURN_END:-false}" && set -- "$@" --flush-on-turn-e
   || set -- "$@" --additional-metadata "$BRAINTRUST_ADDITIONAL_METADATA"
 
 BT_BIN=$(command -v bt 2>/dev/null || true)
-if [ -z "$BT_BIN" ] && [ -x "${XDG_BIN_HOME:-$HOME/.local/bin}/bt" ]; then
-  BT_BIN="${XDG_BIN_HOME:-$HOME/.local/bin}/bt"
+LOCAL_BT="${XDG_BIN_HOME:-$HOME/.local/bin}/bt"
+if ! compatible_bt "$BT_BIN" && compatible_bt "$LOCAL_BT"; then
+  BT_BIN="$LOCAL_BT"
+fi
+if ! compatible_bt "$BT_BIN"; then
+  BT_BIN=""
 fi
 if [ -z "$BT_BIN" ] && command -v curl >/dev/null 2>&1; then
   # Never install synchronously in a blocking hook. Securely spool this event,
@@ -50,17 +54,17 @@ if [ -z "$BT_BIN" ] && command -v curl >/dev/null 2>&1; then
       fi
       [ -z "$bt_bin" ] || "$bt_bin" "$@" <"$pending" >/dev/null 2>&1
     ' trace-codex-install "$pending" "$@" </dev/null >/dev/null 2>&1 &
-    log "bt CLI is unavailable; queued this event behind a background install"
+    log "a daemon-capable bt CLI is unavailable; queued this event behind a background install or upgrade"
   else
     [ -z "$pending" ] || rm -f "$pending"
     nohup sh -c 'curl -fsSL --max-time 20 https://bt.dev/cli/install.sh | sh' \
       </dev/null >/dev/null 2>&1 &
-    log "bt CLI is unavailable; started a background install but could not queue this event"
+    log "a daemon-capable bt CLI is unavailable; started a background install or upgrade but could not queue this event"
   fi
   exit 0
 fi
 if [ -z "$BT_BIN" ]; then
-  log "bt CLI is unavailable; tracing disabled for this event"
+  log "a daemon-capable bt CLI is unavailable; tracing disabled for this event"
   exit 0
 fi
 

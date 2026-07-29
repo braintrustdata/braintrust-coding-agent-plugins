@@ -1,0 +1,112 @@
+# Reusable release implementation. Not dispatchable on its own — called by
+# release.yml (production repos) and test-release.yml (the shared test repo),
+# which supply `dist_repo` and `record`.
+#
+# Always: bump each of the agent's plugin manifest versions
+# (.<agent>-plugin/plugin.json), build, and `make publish` to <dist_repo>.
+# When record=true (production): also commit the bump to main, tag
+# v<version>-<plugin>, and create a GitHub Release on the monorepo. Test runs
+# (record=false) skip those so they leave no trace on the monorepo and can be
+# re-run with the same version.
+
+name: _release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      plugin:
+        required: true
+        type: string
+      dist_repo:
+        required: true
+        type: string
+      record:
+        description: "Commit+tag+release on the monorepo (production) vs. deploy-only (test)."
+        required: true
+        type: boolean
+    secrets:
+      PUBLISH_TOKEN:
+        required: true
+      OPENAI_API_KEY:
+        description: "For the post-deploy codex smoke test; skipped if unset."
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.plugin }}-${{ inputs.dist_repo }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate inputs
+        id: vars
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"; version="${version#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version '${{ inputs.version }}' is not semver (MAJOR.MINOR.PATCH)."; exit 1
+          fi
+          tag="v$version-${{ inputs.plugin }}"
+          # Production releases must come from main and not reuse a tag.
+          if [ "${{ inputs.record }}" = "true" ]; then
+            if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+              echo "::error::Production releases must run on main (got '${{ github.ref }}')."; exit 1
+            fi
+            git fetch --tags --quiet
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "::error::tag $tag already exists."; exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag -> ${{ inputs.dist_repo }} (record=${{ inputs.record }})"
+
+      - name: Bump plugin manifest versions
+        run: python3 scripts/set-plugin-version.py "${{ inputs.plugin }}" "${{ steps.vars.outputs.version }}"
+
+      - name: Commit, tag, and release on the monorepo
+        if: ${{ inputs.record }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(${{ inputs.plugin }}): release v${{ steps.vars.outputs.version }}"
+          git tag "${{ steps.vars.outputs.tag }}"
+          git push origin HEAD:main
+          git push origin "${{ steps.vars.outputs.tag }}"
+          gh release create "${{ steps.vars.outputs.tag }}" \
+            --title "${{ steps.vars.outputs.tag }}" \
+            --generate-notes
+
+      - name: Deploy to distribution repo
+        env:
+          PUBLISH_TARGETS: "${{ inputs.plugin }}:${{ inputs.dist_repo }}"
+          GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+        run: make publish
+
+  # Post-deploy end-to-end smoke test (codex only): install the just-deployed
+  # plugin from the marketplace on Linux + both macOS arches and assert a real
+  # session traces. It's a verification, not a gate — the deploy already happened.
+  smoke:
+    needs: release
+    if: ${{ inputs.plugin == 'codex' }}
+    uses: ./.github/workflows/smoke-codex.yml
+    with:
+      dist_repo: ${{ inputs.dist_repo }}
+    secrets: inherit

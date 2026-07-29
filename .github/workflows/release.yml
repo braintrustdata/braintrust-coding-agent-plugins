@@ -1,0 +1,35 @@
+# Release a plugin to its PRODUCTION distribution repo:
+#   claude -> braintrustdata/braintrust-claude-plugin
+#   codex  -> braintrustdata/braintrust-codex-plugin
+#
+# Full flow: bump version -> commit to main -> tag v<version>-<plugin> ->
+# GitHub Release -> deploy. For a safe dry run, use test-release.yml (deploys to
+# the sandbox repo and skips the monorepo commit/tag/release).
+
+name: Release plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. v0.0.4"
+        required: true
+        type: string
+      plugin:
+        description: "Plugin bundle to release"
+        required: true
+        type: choice
+        options: [claude, codex]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: ./.github/workflows/_release.yml
+    with:
+      version: ${{ inputs.version }}
+      plugin: ${{ inputs.plugin }}
+      dist_repo: ${{ inputs.plugin == 'codex' && 'braintrustdata/braintrust-codex-plugin' || 'braintrustdata/braintrust-claude-plugin' }}
+      record: true
+    secrets: inherit

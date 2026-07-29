@@ -46,6 +46,18 @@ done
 grep -q "'daemon','hook','--source','codex'" \
   "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.cmd" \
   || fail "Codex Windows hook does not invoke bt daemon"
+grep -q 'daemon hook --source codex' \
+  "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.sh" \
+  || fail "Codex Unix hook does not invoke bt daemon"
+
+# The Rust daemon is the only tracing runtime shipped for Codex.
+for obsolete in package.json pnpm-lock.yaml src scripts; do
+  [[ ! -e "$TARGET_DIR/plugins/trace-codex/$obsolete" ]] \
+    || fail "obsolete Codex runtime was packaged: $obsolete"
+done
+if find "$TARGET_DIR/plugins/trace-codex/bin" -type f -name 'codex-hook-*-*' | grep -q .; then
+  fail "obsolete compiled Codex hook binary was packaged"
+fi
 
 # Every marketplace entry's source path must exist in the built tree.
 if command -v jq >/dev/null 2>&1; then
