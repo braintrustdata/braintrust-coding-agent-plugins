@@ -46,6 +46,13 @@ fn codex_tool_call(request: &OpenAiRequest) -> OpenAiTurn {
             json!({"command":codex_tool_command()}),
         );
     }
+    if names.contains(&"shell_command") {
+        return OpenAiTurn::tool_call(
+            "call_mock_1",
+            "shell_command",
+            json!({"command":codex_tool_command()}),
+        );
+    }
     panic!("Codex offered no supported shell tool; offered tools: {names:?}");
 }
 
@@ -267,11 +274,20 @@ fn request_helpers_recognize_tool_results_and_advertised_tools() {
     let openai = OpenAiRequest {
         body: json!({
             "input":[{"type":"function_call_output","call_id":"call-1"}],
-            "tools":[{"type":"function","name":"shell"}]
+            "tools":[{"type":"function","name":"shell_command"}]
         }),
     };
     assert!(openai.has_function_output("call-1"));
-    assert_eq!(openai.tool_names(), vec!["shell"]);
+    assert_eq!(openai.tool_names(), vec!["shell_command"]);
+    match codex_tool_call(&openai) {
+        OpenAiTurn::ToolCall {
+            name, arguments, ..
+        } => {
+            assert_eq!(name, "shell_command");
+            assert!(arguments["command"].is_string());
+        }
+        _ => panic!("expected a Codex tool call"),
+    }
 
     let anthropic = AnthropicRequest {
         body: json!({
