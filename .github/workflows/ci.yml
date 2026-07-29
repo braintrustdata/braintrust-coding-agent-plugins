@@ -42,7 +42,7 @@ jobs:
           rustup default stable
           rustup component add clippy rustfmt
       - name: Install latest coding agents
-        run: npm install --global @openai/codex@latest @anthropic-ai/claude-code@latest
+        run: npm install --global --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest
       - name: Report coding-agent versions
         run: |
           codex --version
