@@ -1,0 +1,176 @@
+use crate::support::trace_collector::TraceCollector;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tempfile::TempDir;
+use tokio::process::{Child, Command};
+
+pub struct AgentTestWorld {
+    root: TempDir,
+    collector: TraceCollector,
+    daemon: Child,
+    wrapper_dir: PathBuf,
+    socket: PathBuf,
+    data_dir: PathBuf,
+    config_path: PathBuf,
+}
+
+impl AgentTestWorld {
+    pub async fn start() -> Self {
+        let root = tempfile::tempdir().expect("create agent test root");
+        let collector = TraceCollector::start().await;
+        let wrapper_dir = root.path().join("bin");
+        let data_dir = root.path().join("daemon");
+        let socket = root.path().join("daemon.sock");
+        let config_path = data_dir.join("config.json");
+        std::fs::create_dir_all(&wrapper_dir).expect("create wrapper directory");
+        std::fs::create_dir_all(&data_dir).expect("create daemon data directory");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&json!({
+                "traceToBraintrust": true,
+                "project": "agent-e2e",
+                "flushOnTurnEnd": true,
+                "additionalMetadata": {"test_harness": true}
+            }))
+            .unwrap(),
+        )
+        .expect("write daemon config");
+
+        let daemon_binary = Path::new(env!("CARGO_BIN_EXE_bt-daemon"));
+        write_bt_wrapper(&wrapper_dir.join("bt"), daemon_binary);
+
+        let mut command = Command::new(daemon_binary);
+        command
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--idle-timeout-secs")
+            .arg("0")
+            .env("BRAINTRUST_API_URL", collector.base_url())
+            .env("BRAINTRUST_APP_URL", collector.base_url())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let daemon = command.spawn().expect("start daemon");
+
+        wait_for_path(&socket).await;
+        Self {
+            root,
+            collector,
+            daemon,
+            wrapper_dir,
+            socket,
+            data_dir,
+            config_path,
+        }
+    }
+
+    pub fn workspace(&self) -> PathBuf {
+        let workspace = self.root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create agent workspace");
+        workspace
+    }
+
+    pub fn temp_path(&self, name: &str) -> PathBuf {
+        self.root.path().join(name)
+    }
+
+    pub fn configure(&self, command: &mut Command) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut entries = vec![self.wrapper_dir.clone()];
+        entries.extend(std::env::split_paths(&path));
+        let combined = std::env::join_paths(entries).expect("construct test PATH");
+        command
+            .env("PATH", combined)
+            .env("BT_DAEMON_SOCKET", &self.socket)
+            .env("BT_DAEMON_DATA_DIR", &self.data_dir)
+            .env("BT_DAEMON_CONFIG", &self.config_path)
+            .env("BRAINTRUST_API_KEY", "test-key")
+            .env("BRAINTRUST_API_URL", self.collector.base_url())
+            .env("BRAINTRUST_APP_URL", self.collector.base_url())
+            .env("BRAINTRUST_PROJECT", "agent-e2e")
+            .env("BRAINTRUST_FLUSH_ON_TURN_END", "true")
+            .stdin(Stdio::null());
+    }
+
+    pub async fn output(&self, command: &mut Command) -> std::process::Output {
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command.spawn().expect("spawn agent command");
+        tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())
+            .await
+            .expect("agent command timed out")
+            .expect("wait for agent command")
+    }
+
+    pub async fn wait_for_trace_rows(&self) -> Vec<Value> {
+        for _ in 0..100 {
+            let rows = self.collector.rows();
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "daemon delivered no trace rows; {}; daemon files:\n{}",
+            self.collector.diagnostics(),
+            directory_contents(&self.data_dir)
+        );
+    }
+}
+
+impl Drop for AgentTestWorld {
+    fn drop(&mut self) {
+        let _ = self.daemon.start_kill();
+    }
+}
+
+fn write_bt_wrapper(path: &Path, daemon_binary: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = daemon ]; then shift; fi\nexec '{}' \"$@\"\n",
+        daemon_binary.display()
+    );
+    std::fs::write(path, script).expect("write bt test wrapper");
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("make bt wrapper executable");
+}
+
+async fn wait_for_path(path: &Path) {
+    for _ in 0..100 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("daemon endpoint was not created at {}", path.display());
+}
+
+fn directory_contents(root: &Path) -> String {
+    fn visit(path: &Path, output: &mut String) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, output);
+            } else {
+                let body = std::fs::read_to_string(&path).unwrap_or_else(|_| "<binary>".into());
+                output.push_str(&format!("{}:\n{}\n", path.display(), body));
+            }
+        }
+    }
+    let mut output = String::new();
+    visit(root, &mut output);
+    output
+}
