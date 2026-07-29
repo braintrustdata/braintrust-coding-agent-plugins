@@ -29,6 +29,15 @@ impl OpenAiRequest {
                 .any(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
         })
     }
+
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.body["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
