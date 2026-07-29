@@ -1,4 +1,3 @@
-use super::server::InferenceServer;
 use super::{decode_json_body, json_response, raw_response, sse, MockReply, RequestContext};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -146,12 +145,11 @@ struct MockState {
 }
 
 pub struct OpenAiMock {
-    server: InferenceServer,
     state: Arc<MockState>,
 }
 
 impl OpenAiMock {
-    pub async fn start<H>(handler: H) -> Self
+    pub fn new<H>(handler: H) -> Self
     where
         H: Fn(RequestContext, OpenAiRequest) -> MockReply<OpenAiTurn> + Send + Sync + 'static,
     {
@@ -160,27 +158,19 @@ impl OpenAiMock {
             requests: Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
         });
-        let router = Router::new()
+        Self { state }
+    }
+
+    pub fn router(&self) -> Router {
+        Router::new()
             .route("/v1/models", get(models))
             .route("/v1/responses", post(responses))
             .route("/backend-api/plugins/featured", get(featured_plugins))
-            .with_state(Arc::clone(&state));
-        Self {
-            server: InferenceServer::start(router).await,
-            state,
-        }
-    }
-
-    pub fn base_url(&self) -> &str {
-        self.server.uri()
+            .with_state(Arc::clone(&self.state))
     }
 
     pub fn requests(&self) -> Vec<OpenAiRequest> {
         self.state.requests.lock().expect("request lock").clone()
-    }
-
-    pub async fn shutdown(self) {
-        self.server.shutdown().await;
     }
 }
 

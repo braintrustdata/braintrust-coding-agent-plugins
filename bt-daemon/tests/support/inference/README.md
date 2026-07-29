@@ -7,18 +7,17 @@ protocol-faithful servers:
 - `AnthropicMock` implements the Anthropic Messages API surface used by
   Claude Code.
 
-Each public mock owns its HTTP listener and lifecycle. There is intentionally
-no separately exposed generic server: the useful abstraction is a
-programmatically controlled inference endpoint. The two providers share only
-private transport mechanics, request indexing, and transport outcomes.
-Request and response types remain provider-specific so a test cannot
-accidentally hide a wire-protocol incompatibility behind a common model
-abstraction.
+Each public mock owns its protocol routes, scenario closure, and captured
+requests, and exports an Axum `Router`. Callers can bind that router with the
+shared ephemeral test server or embed it in another Axum application. The two
+providers share request indexing and transport outcomes. Request and response
+types remain provider-specific so a test cannot accidentally hide a
+wire-protocol incompatibility behind a common model abstraction.
 
 Both mocks accept a thread-safe closure:
 
 ```rust,ignore
-let mock = OpenAiMock::start(|context, request| {
+let mock = OpenAiMock::new(|context, request| {
     match context.request_index {
         0 => MockReply::response(OpenAiTurn::tool_call(
             "call-1",
@@ -30,7 +29,8 @@ let mock = OpenAiMock::start(|context, request| {
         }
         index => panic!("unexpected request {index}: {}", request.body),
     }
-}).await;
+});
+let server = TestServer::start(mock.router()).await;
 ```
 
 `MockReply` supports normal provider responses, arbitrary HTTP errors, and raw
@@ -38,11 +38,12 @@ response bodies for malformed or truncated stream tests. Typed turn builders
 generate deterministic ids, token usage, and valid provider SSE sequences.
 Every inference request is captured for later assertions.
 
-The component does not depend on `bt-daemon`, the coding-agent runner, or the
-trace collector. The higher-level `support::agent_process` harness composes
-with it only from the integration test. This boundary is deliberate so the
-whole mock-inference component can later move into a reusable crate and serve
-any client that can target an OpenAI Responses or Anthropic Messages endpoint.
+The component does not depend on `bt-daemon`, the coding-agent runner, the
+ingest mock, or a particular listener implementation. The higher-level
+`support::agent_process` harness composes with it only from the integration
+test. This boundary is deliberate so the whole mock-inference component can
+later move into a reusable crate and serve any client that can target an
+OpenAI Responses or Anthropic Messages endpoint.
 
 `agent_integration.rs` runs real Codex and Claude Code processes against these
 mocks.

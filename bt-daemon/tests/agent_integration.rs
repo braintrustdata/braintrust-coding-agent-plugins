@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use support::agent_process::AgentTestWorld;
 use support::inference::{AnthropicMock, AnthropicTurn, MockReply, OpenAiMock, OpenAiTurn};
+use support::server::TestServer;
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -173,7 +174,7 @@ async fn codex_session_emits_traces() {
 }
 
 async fn run_codex_mock() {
-    let inference = OpenAiMock::start(|context, request| {
+    let inference = OpenAiMock::new(|context, request| {
         assert_eq!(request.model(), Some("mock-model"));
         match context.request_index {
             0 => {
@@ -211,8 +212,8 @@ async fn run_codex_mock() {
                 request.body
             ),
         }
-    })
-    .await;
+    });
+    let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
     let codex_home = world.temp_path("codex-home");
     std::fs::create_dir_all(&codex_home).unwrap();
@@ -220,9 +221,12 @@ async fn run_codex_mock() {
 
     let provider = format!(
         r#"model_providers.mock={{name="Mock",base_url="{}/v1",wire_api="responses",env_key="MOCK_API_KEY",request_max_retries=0,stream_max_retries=0,stream_idle_timeout_ms=5000}}"#,
-        inference.base_url()
+        inference_server.uri()
     );
-    let chatgpt_base_url = format!(r#"chatgpt_base_url="{}/backend-api""#, inference.base_url());
+    let chatgpt_base_url = format!(
+        r#"chatgpt_base_url="{}/backend-api""#,
+        inference_server.uri()
+    );
     let mut codex = codex_command(&world, &codex_home);
     codex
         .args([
@@ -308,7 +312,7 @@ async fn claude_session_emits_traces() {
 }
 
 async fn run_claude_mock() {
-    let inference = AnthropicMock::start(|context, request| match context.request_index {
+    let inference = AnthropicMock::new(|context, request| match context.request_index {
         0 => {
             assert_eq!(request.model(), Some("mock-model"));
             assert!(
@@ -344,8 +348,8 @@ async fn run_claude_mock() {
             "unexpected Claude inference request {index}: {}",
             request.body
         ),
-    })
-    .await;
+    });
+    let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
     let claude_config = world.temp_path("claude-config");
     let home = world.temp_path("home");
@@ -358,7 +362,7 @@ async fn run_claude_mock() {
         .arg("Run the deterministic command, then return the deterministic marker.")
         .env("HOME", &home)
         .env("CLAUDE_CONFIG_DIR", &claude_config)
-        .env("ANTHROPIC_BASE_URL", inference.base_url())
+        .env("ANTHROPIC_BASE_URL", inference_server.uri())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_AUTH_TOKEN", "test-key")
         .env("ANTHROPIC_DEFAULT_OPUS_MODEL", "mock-model")
@@ -379,7 +383,7 @@ async fn run_claude_mock() {
         .arg("Trigger the deterministic inference error.")
         .env("HOME", &home)
         .env("CLAUDE_CONFIG_DIR", &claude_config)
-        .env("ANTHROPIC_BASE_URL", inference.base_url())
+        .env("ANTHROPIC_BASE_URL", inference_server.uri())
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("ANTHROPIC_AUTH_TOKEN", "test-key")
         .env("ANTHROPIC_DEFAULT_OPUS_MODEL", "mock-model")

@@ -6,45 +6,6 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-
-struct CollectorServer {
-    uri: String,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl CollectorServer {
-    async fn start(router: Router) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind trace collector");
-        let address = listener.local_addr().expect("read trace collector address");
-        let (shutdown, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-        });
-        Self {
-            uri: format!("http://{address}"),
-            shutdown: Some(shutdown),
-            task,
-        }
-    }
-}
-
-impl Drop for CollectorServer {
-    fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        self.task.abort();
-    }
-}
 
 #[derive(Default)]
 struct CollectorState {
@@ -53,29 +14,24 @@ struct CollectorState {
     log_requests: AtomicUsize,
 }
 
-pub struct TraceCollector {
-    server: CollectorServer,
+pub struct IngestMock {
     state: Arc<CollectorState>,
 }
 
-impl TraceCollector {
-    pub async fn start() -> Self {
+impl IngestMock {
+    pub fn new() -> Self {
         let state = Arc::new(CollectorState::default());
-        let router = Router::new()
+        Self { state }
+    }
+
+    pub fn router(&self) -> Router {
+        Router::new()
             .route("/version", get(version))
             .route("/api/apikey/login", post(login))
             .route("/api/project/register", post(register_project))
             .route("/logs3", post(logs))
             .route("/logs3/overflow", post(logs))
-            .with_state(Arc::clone(&state));
-        Self {
-            server: CollectorServer::start(router).await,
-            state,
-        }
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.server.uri
+            .with_state(Arc::clone(&self.state))
     }
 
     pub fn rows(&self) -> Vec<Value> {

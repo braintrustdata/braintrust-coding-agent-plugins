@@ -1,4 +1,3 @@
-use super::server::InferenceServer;
 use super::{decode_json_body, json_response, raw_response, sse, MockReply, RequestContext};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -175,12 +174,11 @@ struct MockState {
 }
 
 pub struct AnthropicMock {
-    server: InferenceServer,
     state: Arc<MockState>,
 }
 
 impl AnthropicMock {
-    pub async fn start<H>(handler: H) -> Self
+    pub fn new<H>(handler: H) -> Self
     where
         H: Fn(RequestContext, AnthropicRequest) -> MockReply<AnthropicTurn> + Send + Sync + 'static,
     {
@@ -189,27 +187,19 @@ impl AnthropicMock {
             requests: Mutex::new(Vec::new()),
             next_index: AtomicUsize::new(0),
         });
-        let router = Router::new()
+        Self { state }
+    }
+
+    pub fn router(&self) -> Router {
+        Router::new()
             .route("/v1/models", get(models))
             .route("/v1/messages", post(messages))
             .route("/v1/messages/count_tokens", post(count_tokens))
-            .with_state(Arc::clone(&state));
-        Self {
-            server: InferenceServer::start(router).await,
-            state,
-        }
-    }
-
-    pub fn base_url(&self) -> &str {
-        self.server.uri()
+            .with_state(Arc::clone(&self.state))
     }
 
     pub fn requests(&self) -> Vec<AnthropicRequest> {
         self.state.requests.lock().expect("request lock").clone()
-    }
-
-    pub async fn shutdown(self) {
-        self.server.shutdown().await;
     }
 }
 

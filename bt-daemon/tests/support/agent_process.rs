@@ -1,4 +1,5 @@
-use crate::support::trace_collector::TraceCollector;
+use crate::support::ingest::IngestMock;
+use crate::support::server::TestServer;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -10,7 +11,8 @@ use uuid::Uuid;
 
 pub struct AgentTestWorld {
     root: TempDir,
-    collector: TraceCollector,
+    collector: IngestMock,
+    collector_server: TestServer,
     daemon: Child,
     wrapper_dir: PathBuf,
     socket: PathBuf,
@@ -21,7 +23,8 @@ pub struct AgentTestWorld {
 impl AgentTestWorld {
     pub async fn start() -> Self {
         let root = tempfile::tempdir().expect("create agent test root");
-        let collector = TraceCollector::start().await;
+        let collector = IngestMock::new();
+        let collector_server = TestServer::start(collector.router()).await;
         let wrapper_dir = root.path().join("bin");
         let data_dir = root.path().join("daemon");
         let socket = test_endpoint(root.path());
@@ -52,8 +55,8 @@ impl AgentTestWorld {
             .arg(&data_dir)
             .arg("--idle-timeout-secs")
             .arg("0")
-            .env("BRAINTRUST_API_URL", collector.base_url())
-            .env("BRAINTRUST_APP_URL", collector.base_url())
+            .env("BRAINTRUST_API_URL", collector_server.uri())
+            .env("BRAINTRUST_APP_URL", collector_server.uri())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -64,6 +67,7 @@ impl AgentTestWorld {
         Self {
             root,
             collector,
+            collector_server,
             daemon,
             wrapper_dir,
             socket,
@@ -93,8 +97,8 @@ impl AgentTestWorld {
             .env("BT_DAEMON_DATA_DIR", &self.data_dir)
             .env("BT_DAEMON_CONFIG", &self.config_path)
             .env("BRAINTRUST_API_KEY", "test-key")
-            .env("BRAINTRUST_API_URL", self.collector.base_url())
-            .env("BRAINTRUST_APP_URL", self.collector.base_url())
+            .env("BRAINTRUST_API_URL", self.collector_server.uri())
+            .env("BRAINTRUST_APP_URL", self.collector_server.uri())
             .env("BRAINTRUST_PROJECT", "agent-e2e")
             .env("BRAINTRUST_FLUSH_ON_TURN_END", "true")
             .stdin(Stdio::null());
@@ -175,6 +179,16 @@ fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
         "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0bt-wrapper.ps1\" %*\r\n",
     )
     .expect("write bt command wrapper");
+
+    // Claude Code, and some Codex releases, launch the portable `command`
+    // hook through Git Bash even on Windows. Git Bash does not resolve
+    // PATHEXT, so expose an extensionless shim in addition to bt.cmd.
+    let shell_binary = daemon_binary.to_string_lossy().replace('\\', "/");
+    let shell = format!(
+        "#!/bin/sh\nif [ \"$1\" = daemon ]; then shift; fi\nexec '{}' \"$@\"\n",
+        shell_binary
+    );
+    std::fs::write(directory.join("bt"), shell).expect("write bt Git Bash wrapper");
 }
 
 #[cfg(unix)]

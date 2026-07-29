@@ -1,6 +1,5 @@
 mod anthropic;
 mod openai;
-mod server;
 
 #[allow(unused_imports)]
 pub use anthropic::{AnthropicMock, AnthropicRequest, AnthropicTurn};

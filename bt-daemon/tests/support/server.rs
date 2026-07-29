@@ -2,22 +2,19 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-/// HTTP lifecycle owned by the mock-inference component. It stays private:
-/// consumers start an OpenAI or Anthropic mock, not a generic test server.
-pub(super) struct InferenceServer {
+/// Lifecycle wrapper for any ephemeral Axum test service.
+pub struct TestServer {
     uri: String,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
-impl InferenceServer {
-    pub(super) async fn start(router: Router) -> Self {
+impl TestServer {
+    pub async fn start(router: Router) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind mock inference server");
-        let address = listener
-            .local_addr()
-            .expect("read mock inference server address");
+            .expect("bind ephemeral test server");
+        let address = listener.local_addr().expect("read test server address");
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
@@ -33,11 +30,11 @@ impl InferenceServer {
         }
     }
 
-    pub(super) fn uri(&self) -> &str {
+    pub fn uri(&self) -> &str {
         &self.uri
     }
 
-    pub(super) async fn shutdown(mut self) {
+    pub async fn shutdown(mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -47,7 +44,7 @@ impl InferenceServer {
     }
 }
 
-impl Drop for InferenceServer {
+impl Drop for TestServer {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());

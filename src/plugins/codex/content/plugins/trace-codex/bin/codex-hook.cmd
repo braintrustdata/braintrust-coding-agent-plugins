@@ -4,7 +4,9 @@ REM Invokes: bt daemon hook --source codex
 setlocal EnableExtensions DisableDelayedExpansion
 
 set "BT_HOOK_BIN="
-for /f "delims=" %%B in ('where bt 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
+for /f "delims=" %%B in ('where bt.exe 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
+if not defined BT_HOOK_BIN for /f "delims=" %%B in ('where bt.cmd 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
+if not defined BT_HOOK_BIN for /f "delims=" %%B in ('where bt 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
 if not defined BT_HOOK_BIN if exist "%USERPROFILE%\.local\bin\bt.exe" set "BT_HOOK_BIN=%USERPROFILE%\.local\bin\bt.exe"
 if not defined BT_HOOK_BIN (
   echo trace-codex: bt CLI is unavailable; tracing disabled for this event.>&2

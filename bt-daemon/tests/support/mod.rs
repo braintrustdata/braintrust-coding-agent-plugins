@@ -2,4 +2,5 @@
 
 pub mod agent_process;
 pub mod inference;
-pub mod trace_collector;
+pub mod ingest;
+pub mod server;
