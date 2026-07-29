@@ -17,10 +17,12 @@ ingest router, starts the daemon, and provides the environment shared by agent
 processes.
 
 `agents` contains reusable adapters for real coding-agent CLIs. Each adapter
-owns agent installation, isolated configuration, standard invocation flags,
-mock-inference routing, and process output. Runs remain configurable with
-additional arguments and environment variables so scenarios can add inputs
-such as attachment paths without duplicating CLI setup.
+owns only agent installation and isolated configuration state. The daemon
+world is passed to each run as its execution context, avoiding any lifetime or
+ownership coupling between the two layers. Adapters provide standard
+invocation flags, mock-inference routing, and process output. Runs remain
+configurable with additional arguments and environment variables so scenarios
+can add inputs such as attachment paths without duplicating CLI setup.
 
 The integration test composes those pieces: it hosts an inference router,
 starts the daemon world, runs an agent, and evaluates the ingest scenario. This

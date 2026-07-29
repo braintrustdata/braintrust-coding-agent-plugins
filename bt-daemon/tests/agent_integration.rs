@@ -124,20 +124,26 @@ async fn run_codex_mock() {
     let codex = CodexAgent::install(&world).await;
 
     let output = codex
-        .run(CodexRun::mock(
-            "Run the deterministic command, then return the deterministic marker.",
-            inference_server.uri(),
-        ))
+        .run(
+            &world,
+            CodexRun::mock(
+                "Run the deterministic command, then return the deterministic marker.",
+                inference_server.uri(),
+            ),
+        )
         .await;
     output.assert_success();
     output.assert_contains("CODEX_MOCK_OK");
     assert_eq!(inference.requests().len(), 2);
 
     let failed = codex
-        .run(CodexRun::mock(
-            "Trigger the deterministic inference error.",
-            inference_server.uri(),
-        ))
+        .run(
+            &world,
+            CodexRun::mock(
+                "Trigger the deterministic inference error.",
+                inference_server.uri(),
+            ),
+        )
         .await;
     failed.assert_failure();
     failed.assert_contains("deterministic Codex inference failure");
@@ -159,9 +165,10 @@ async fn run_codex_live() {
     codex.seed_live_auth();
 
     codex
-        .run(CodexRun::live(
-            "Reply briefly to confirm this tracing integration test.",
-        ))
+        .run(
+            &world,
+            CodexRun::live("Reply briefly to confirm this tracing integration test."),
+        )
         .await
         .assert_success();
 
@@ -223,20 +230,26 @@ async fn run_claude_mock() {
     let claude = ClaudeAgent::new(&world);
 
     let output = claude
-        .run(ClaudeRun::mock(
-            "Run the deterministic command, then return the deterministic marker.",
-            inference_server.uri(),
-        ))
+        .run(
+            &world,
+            ClaudeRun::mock(
+                "Run the deterministic command, then return the deterministic marker.",
+                inference_server.uri(),
+            ),
+        )
         .await;
     output.assert_success();
     output.assert_contains("CLAUDE_MOCK_OK");
     assert_eq!(inference.requests().len(), 2);
 
     let failed = claude
-        .run(ClaudeRun::mock(
-            "Trigger the deterministic inference error.",
-            inference_server.uri(),
-        ))
+        .run(
+            &world,
+            ClaudeRun::mock(
+                "Trigger the deterministic inference error.",
+                inference_server.uri(),
+            ),
+        )
         .await;
     failed.assert_failure();
     failed.assert_contains("deterministic Claude inference failure");
@@ -257,9 +270,10 @@ async fn run_claude_live() {
     let claude = ClaudeAgent::new(&world);
 
     claude
-        .run(ClaudeRun::live(
-            "Reply briefly to confirm this tracing integration test.",
-        ))
+        .run(
+            &world,
+            ClaudeRun::live("Reply briefly to confirm this tracing integration test."),
+        )
         .await
         .assert_success();
 

@@ -4,8 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-pub struct ClaudeAgent<'a> {
-    world: &'a AgentTestWorld,
+pub struct ClaudeAgent {
     isolated_home: PathBuf,
     isolated_config: PathBuf,
 }
@@ -54,20 +53,19 @@ impl ClaudeRun {
     }
 }
 
-impl<'a> ClaudeAgent<'a> {
-    pub fn new(world: &'a AgentTestWorld) -> Self {
+impl ClaudeAgent {
+    pub fn new(world: &AgentTestWorld) -> Self {
         let isolated_home = world.temp_path("claude-home");
         let isolated_config = world.temp_path("claude-config");
         std::fs::create_dir_all(&isolated_home).expect("create Claude home");
         std::fs::create_dir_all(&isolated_config).expect("create Claude config");
         Self {
-            world,
             isolated_home,
             isolated_config,
         }
     }
 
-    pub async fn run(&self, run: ClaudeRun) -> AgentOutput {
+    pub async fn run(&self, world: &AgentTestWorld, run: ClaudeRun) -> AgentOutput {
         let session_id = Uuid::new_v4().to_string();
         let plugin = repository_root().join("src/plugins/claude/content/plugins/trace-claude-code");
         let mut command = command_from_env("CLAUDE_BIN", "claude");
@@ -82,12 +80,12 @@ impl<'a> ClaudeAgent<'a> {
                 "--plugin-dir",
             ])
             .arg(plugin)
-            .current_dir(self.world.workspace())
+            .current_dir(world.workspace())
             .env("ANTHROPIC_MAX_RETRIES", "0")
             .env("DISABLE_AUTOUPDATER", "1")
             .env("DISABLE_TELEMETRY", "1")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-        self.world.configure(&mut command);
+        world.configure(&mut command);
 
         if let Some(inference) = &run.inference {
             command
@@ -103,6 +101,6 @@ impl<'a> ClaudeAgent<'a> {
         }
         run.options.apply(&mut command);
         command.arg(run.prompt);
-        self.world.output(&mut command).await.into()
+        world.output(&mut command).await.into()
     }
 }

@@ -6,8 +6,7 @@ use tokio::process::Command;
 
 const TEST_MODE_ENV: &str = "BT_AGENT_TEST_MODE";
 
-pub struct CodexAgent<'a> {
-    world: &'a AgentTestWorld,
+pub struct CodexAgent {
     home: PathBuf,
 }
 
@@ -55,8 +54,8 @@ impl CodexRun {
     }
 }
 
-impl<'a> CodexAgent<'a> {
-    pub async fn install(world: &'a AgentTestWorld) -> Self {
+impl CodexAgent {
+    pub async fn install(world: &AgentTestWorld) -> Self {
         let home = world.temp_path("codex-home");
         std::fs::create_dir_all(&home).expect("create Codex home");
 
@@ -78,7 +77,7 @@ impl<'a> CodexAgent<'a> {
         world.configure(&mut add_plugin);
         AgentOutput::from(world.output(&mut add_plugin).await).assert_success();
 
-        Self { world, home }
+        Self { home }
     }
 
     pub fn seed_live_auth(&self) {
@@ -96,17 +95,17 @@ impl<'a> CodexAgent<'a> {
         std::fs::copy(source, self.home.join("auth.json")).expect("copy Codex live credentials");
     }
 
-    pub async fn run(&self, run: CodexRun) -> AgentOutput {
-        let mut command = self.command();
+    pub async fn run(&self, world: &AgentTestWorld, run: CodexRun) -> AgentOutput {
+        let mut command = self.command(world);
         if let Some(inference) = &run.inference {
             configure_mock_inference(&mut command, inference);
         }
         run.options.apply(&mut command);
         command.arg(run.prompt);
-        self.world.output(&mut command).await.into()
+        world.output(&mut command).await.into()
     }
 
-    fn command(&self) -> Command {
+    fn command(&self, world: &AgentTestWorld) -> Command {
         let mut command = command_from_env("CODEX_BIN", "codex");
         command
             .args([
@@ -118,9 +117,9 @@ impl<'a> CodexAgent<'a> {
                 "-c",
                 r#"approval_policy="never""#,
             ])
-            .current_dir(self.world.workspace())
+            .current_dir(world.workspace())
             .env("CODEX_HOME", &self.home);
-        self.world.configure(&mut command);
+        world.configure(&mut command);
         command
     }
 }
