@@ -201,16 +201,30 @@ impl AgentTestWorld {
         );
     }
 
-    pub async fn wait_for_ingest_scenario(&self, scenario: &IngestScenario) -> Vec<Value> {
-        if !self.uses_mock_ingest() {
-            return self.wait_for_live_ingest().await;
+    /// Wait for the stable trace-delivery invariant in every backend mode.
+    /// Mock ingest returns captured rows for ordinary assertions; live ingest
+    /// verifies daemon emission and sink health.
+    pub async fn wait_for_trace_delivery(&self) -> Vec<Value> {
+        if self.uses_mock_ingest() {
+            self.wait_for_trace_rows().await
+        } else {
+            self.wait_for_live_ingest().await
         }
+    }
+
+    /// Evaluate deterministic trace shapes only when both inference and ingest
+    /// are mocked. The closure keeps the mock scenario out of live-mode setup.
+    pub async fn assert_mock_ingest_scenario(
+        &self,
+        scenario: impl FnOnce() -> IngestScenario,
+    ) -> Vec<Value> {
+        if !self.uses_mock_inference() || !self.uses_mock_ingest() {
+            return Vec::new();
+        }
+        let scenario = scenario();
         let mut last_error = String::new();
         for _ in 0..100 {
-            match self
-                .collector
-                .evaluate(scenario, self.uses_mock_inference())
-            {
+            match self.collector.evaluate(&scenario) {
                 Ok(rows) => return rows,
                 Err(error) => last_error = error,
             }

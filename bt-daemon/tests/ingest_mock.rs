@@ -28,38 +28,10 @@ async fn ingest_router_captures_rows_and_matches_ordered_shapes() {
         .expect("tool result", |row| {
             row["span_attributes"]["type"] == "tool" && row["output"] == "deterministic"
         });
-    assert_eq!(ingest.evaluate(&scenario, true).unwrap().len(), 3);
+    assert_eq!(ingest.evaluate(&scenario).unwrap().len(), 3);
 
     let reversed = IngestScenario::new()
         .expect("tool first", |row| row["span_attributes"]["type"] == "tool")
         .expect("task later", |row| row["span_attributes"]["type"] == "task");
-    assert!(ingest.evaluate(&reversed, true).is_err());
-}
-
-#[tokio::test]
-async fn strict_shapes_are_additive_to_always_active_baseline_shapes() {
-    let ingest = IngestMock::new();
-    let server = TestServer::start(ingest.router()).await;
-
-    reqwest::Client::new()
-        .post(format!("{}/logs3", server.uri()))
-        .json(&json!({
-            "rows": [
-                {"span_attributes":{"type":"task"},"metadata":{"source":"codex"}}
-            ]
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    let scenario = IngestScenario::new()
-        .expect("baseline root task", |row| {
-            row["span_attributes"]["type"] == "task"
-        })
-        .expect_strict("deterministic tool result", |row| {
-            row["span_attributes"]["type"] == "tool"
-        });
-
-    assert!(ingest.evaluate(&scenario, false).is_ok());
-    assert!(ingest.evaluate(&scenario, true).is_err());
+    assert!(ingest.evaluate(&reversed).is_err());
 }

@@ -125,14 +125,25 @@ async fn codex_session_emits_traces() {
         })
         .await;
 
-    let scenario = IngestScenario::new()
-        .expect("Codex trace origin", |row| {
-            row_contains(row, &["braintrust.plugin.codex", "test_harness"])
+    let rows = world.wait_for_trace_delivery().await;
+    if world.uses_mock_ingest() {
+        assert!(
+            rows.iter()
+                .any(|row| { row_contains(row, &["braintrust.plugin.codex", "test_harness"]) }),
+            "Codex trace origin metadata was not emitted"
+        );
+    }
+    world
+        .assert_mock_ingest_scenario(|| {
+            IngestScenario::new()
+                .expect("Codex trace origin", |row| {
+                    row_contains(row, &["braintrust.plugin.codex", "test_harness"])
+                })
+                .expect("Codex tool output", |row| {
+                    row_contains(row, &[r#""type":"tool""#, "CODEX_TOOL_OK"])
+                })
         })
-        .expect_strict("Codex tool output", |row| {
-            row_contains(row, &[r#""type":"tool""#, "CODEX_TOOL_OK"])
-        });
-    world.wait_for_ingest_scenario(&scenario).await;
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -207,14 +218,25 @@ async fn claude_session_emits_traces() {
         })
         .await;
 
-    let scenario = IngestScenario::new()
-        .expect("Claude trace source", |row| {
-            row_contains(row, &[r#""source":"claude-code""#, "test_harness"])
+    let rows = world.wait_for_trace_delivery().await;
+    if world.uses_mock_ingest() {
+        assert!(
+            rows.iter()
+                .any(|row| { row_contains(row, &[r#""source":"claude-code""#, "test_harness"]) }),
+            "Claude trace source metadata was not emitted"
+        );
+    }
+    world
+        .assert_mock_ingest_scenario(|| {
+            IngestScenario::new()
+                .expect("Claude trace source", |row| {
+                    row_contains(row, &[r#""source":"claude-code""#, "test_harness"])
+                })
+                .expect("Claude tool output", |row| {
+                    row_contains(row, &[r#""type":"tool""#, "CLAUDE_TOOL_OK"])
+                })
         })
-        .expect_strict("Claude tool output", |row| {
-            row_contains(row, &[r#""type":"tool""#, "CLAUDE_TOOL_OK"])
-        });
-    world.wait_for_ingest_scenario(&scenario).await;
+        .await;
 }
 
 #[test]
