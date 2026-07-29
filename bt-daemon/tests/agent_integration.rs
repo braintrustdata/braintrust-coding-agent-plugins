@@ -239,6 +239,8 @@ async fn run_codex_mock() {
         .arg("Run the deterministic command, then return the deterministic marker.")
         .env("MOCK_API_KEY", "test-key");
     let output = world.output(&mut codex).await;
+    #[cfg(windows)]
+    eprintln!("Codex deterministic session:\n{}", output_text(&output));
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(
         output_text(&output).contains("CODEX_MOCK_OK"),
@@ -262,6 +264,11 @@ async fn run_codex_mock() {
         .arg("Trigger the deterministic inference error.")
         .env("MOCK_API_KEY", "test-key");
     let failed = world.output(&mut failing_codex).await;
+    #[cfg(windows)]
+    eprintln!(
+        "Codex deterministic error session:\n{}",
+        output_text(&failed)
+    );
     assert!(!failed.status.success(), "{}", output_text(&failed));
     assert!(
         output_text(&failed).contains("deterministic Codex inference failure"),
