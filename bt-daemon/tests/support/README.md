@@ -29,3 +29,20 @@ starts the daemon world, runs an agent, and evaluates the ingest scenario. This
 keeps both protocol mocks usable without coding agents, keeps the generic
 server unaware of either protocol, and lets new end-to-end scenarios focus on
 model behavior and expected trace shapes.
+
+The world controls inference and ingest independently:
+
+- `BT_AGENT_INFERENCE_MODE=mock|live` selects deterministic mock inference or
+  the agent's normal provider.
+- `BT_AGENT_INGEST_MODE=mock|live` selects captured local ingest or the normal
+  Braintrust backend.
+- `BT_AGENT_TEST_MODE=mock|live` remains a shorthand that supplies the default
+  for both settings when the more specific variable is absent.
+
+This allows deterministic inference to drive real Braintrust ingest without
+paying for model inference. Tests always assert stable process behavior,
+provider request and response details only when inference is mocked, and
+captured row shapes only when ingest is mocked. Live ingest instead waits for
+the daemon to report emitted spans and fails on sink errors. Mock inference can
+add stricter row expectations to the same scenario without requiring a second
+test body.

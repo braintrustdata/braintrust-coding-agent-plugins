@@ -53,14 +53,26 @@ each agent and runs them in the default `mock` mode on every host. This is
 intentionally unpinned so upstream compatibility breaks are visible
 immediately.
 
-The same agent tests can run without mock inference:
+The same agent tests can run without mock inference while continuing to use
+captured local ingest:
 
 ```console
-BT_AGENT_TEST_MODE=live cargo test --manifest-path bt-daemon/Cargo.toml \
+BT_AGENT_INFERENCE_MODE=live BT_AGENT_INGEST_MODE=mock \
+  cargo test --manifest-path bt-daemon/Cargo.toml \
   --all-features --test agent_integration -- --ignored --test-threads=1
 ```
 
-Live mode uses the normal provider endpoint/model and the agent's normal login
-or provider credentials. It validates only stable integration invariants such
-as trace delivery and origin metadata. Mock mode additionally validates exact
-request sequences, tool results, output content, and injected failures.
+Live inference uses the normal provider endpoint/model and the agent's normal
+login or provider credentials. It validates only stable integration invariants
+such as trace delivery and origin metadata. Mock inference additionally
+validates exact request sequences, tool results, output content, and injected
+failures.
+
+Inference and ingest selection are independent. To drive deterministic model
+behavior while reporting traces to the normal Braintrust backend:
+
+```console
+BT_AGENT_INFERENCE_MODE=mock BT_AGENT_INGEST_MODE=live \
+  cargo test --manifest-path bt-daemon/Cargo.toml \
+  --all-features --test agent_integration -- --ignored --test-threads=1
+```

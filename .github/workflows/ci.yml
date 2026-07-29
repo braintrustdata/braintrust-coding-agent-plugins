@@ -62,7 +62,8 @@ jobs:
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked
       - name: Test coding-agent integrations with deterministic inference
         env:
-          BT_AGENT_TEST_MODE: mock
+          BT_AGENT_INFERENCE_MODE: mock
+          BT_AGENT_INGEST_MODE: mock
           CODEX_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/codex${{ matrix.agent_suffix }}
           CLAUDE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/claude${{ matrix.agent_suffix }}
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1

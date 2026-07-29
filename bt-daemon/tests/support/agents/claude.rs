@@ -11,7 +11,7 @@ pub struct ClaudeAgent {
 
 pub struct ClaudeRun {
     prompt: OsString,
-    inference: Option<ClaudeInference>,
+    mock_inference: Option<ClaudeInference>,
     options: ProcessOptions,
 }
 
@@ -22,24 +22,21 @@ struct ClaudeInference {
 }
 
 impl ClaudeRun {
-    pub fn live(prompt: impl Into<OsString>) -> Self {
+    pub fn new(prompt: impl Into<OsString>) -> Self {
         Self {
             prompt: prompt.into(),
-            inference: None,
+            mock_inference: None,
             options: ProcessOptions::default(),
         }
     }
 
-    pub fn mock(prompt: impl Into<OsString>, base_url: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-            inference: Some(ClaudeInference {
-                base_url: base_url.into(),
-                model: "mock-model".into(),
-                api_key: "test-key".into(),
-            }),
-            options: ProcessOptions::default(),
-        }
+    pub fn mock_inference(mut self, base_url: impl Into<String>) -> Self {
+        self.mock_inference = Some(ClaudeInference {
+            base_url: base_url.into(),
+            model: "mock-model".into(),
+            api_key: "test-key".into(),
+        });
+        self
     }
 
     pub fn arg(mut self, value: impl Into<OsString>) -> Self {
@@ -87,7 +84,11 @@ impl ClaudeAgent {
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
         world.configure(&mut command);
 
-        if let Some(inference) = &run.inference {
+        if world.uses_mock_inference() {
+            let inference = run
+                .mock_inference
+                .as_ref()
+                .expect("mock Claude runs require a mock inference endpoint");
             command
                 .args(["--model", &inference.model])
                 .env("HOME", &self.isolated_home)

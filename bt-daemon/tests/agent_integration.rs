@@ -11,25 +11,6 @@ use support::inference::{
 use support::ingest::IngestScenario;
 use support::server::TestServer;
 
-const TEST_MODE_ENV: &str = "BT_AGENT_TEST_MODE";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AgentTestMode {
-    Mock,
-    Live,
-}
-
-impl AgentTestMode {
-    fn from_env() -> Self {
-        match std::env::var(TEST_MODE_ENV).as_deref() {
-            Ok("live") => Self::Live,
-            Ok("mock" | "deterministic") | Err(std::env::VarError::NotPresent) => Self::Mock,
-            Ok(value) => panic!("{TEST_MODE_ENV} must be `mock` or `live`, got {value:?}"),
-            Err(error) => panic!("could not read {TEST_MODE_ENV}: {error}"),
-        }
-    }
-}
-
 fn codex_tool_call(request: &OpenAiRequest) -> OpenAiTurn {
     let names = request.tool_names();
     if names.contains(&"exec_command") {
@@ -77,19 +58,12 @@ fn row_contains(row: &Value, fragments: &[&str]) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the Codex CLI installed on PATH"]
 async fn codex_session_emits_traces() {
-    match AgentTestMode::from_env() {
-        AgentTestMode::Mock => run_codex_mock().await,
-        AgentTestMode::Live => run_codex_live().await,
-    }
-}
-
-async fn run_codex_mock() {
     let inference = OpenAiMock::new(|context, request| {
         assert_eq!(request.model(), Some("mock-model"));
         match context.request_index {
             0 => {
                 assert!(
-                    request.contains_text("Run the deterministic command"),
+                    request.contains_text("CODEX_TOOL_OK"),
                     "unexpected Codex request: {}",
                     request.body
                 );
@@ -126,73 +100,48 @@ async fn run_codex_mock() {
     let output = codex
         .run(
             &world,
-            CodexRun::mock(
-                "Run the deterministic command, then return the deterministic marker.",
-                inference_server.uri(),
-            ),
+            CodexRun::new("Run the command `printf CODEX_TOOL_OK` and then reply briefly.")
+                .mock_inference(inference_server.uri()),
         )
         .await;
     output.assert_success();
-    output.assert_contains("CODEX_MOCK_OK");
-    assert_eq!(inference.requests().len(), 2);
+    world.when_mock_inference(|| {
+        output.assert_contains("CODEX_MOCK_OK");
+        assert_eq!(inference.requests().len(), 2);
+    });
 
-    let failed = codex
-        .run(
-            &world,
-            CodexRun::mock(
-                "Trigger the deterministic inference error.",
-                inference_server.uri(),
-            ),
-        )
-        .await;
-    failed.assert_failure();
-    failed.assert_contains("deterministic Codex inference failure");
-    assert_eq!(inference.requests().len(), 3);
-
-    let scenario = IngestScenario::new()
-        .expect("Codex trace origin", |row| {
-            row_contains(row, &["braintrust.plugin.codex", "test_harness"])
+    world
+        .when_mock_inference_async(|| async {
+            let failed = codex
+                .run(
+                    &world,
+                    CodexRun::new("Trigger the deterministic inference error.")
+                        .mock_inference(inference_server.uri()),
+                )
+                .await;
+            failed.assert_failure();
+            failed.assert_contains("deterministic Codex inference failure");
+            assert_eq!(inference.requests().len(), 3);
         })
-        .expect("Codex tool output", |row| {
-            row_contains(row, &[r#""type":"tool""#, "CODEX_TOOL_OK"])
-        });
-    assert!(!world.wait_for_ingest_scenario(&scenario).await.is_empty());
-}
-
-async fn run_codex_live() {
-    let world = AgentTestWorld::start().await;
-    let codex = CodexAgent::install(&world).await;
-    codex.seed_live_auth();
-
-    codex
-        .run(
-            &world,
-            CodexRun::live("Reply briefly to confirm this tracing integration test."),
-        )
-        .await
-        .assert_success();
+        .await;
 
     let scenario = IngestScenario::new().expect("Codex trace origin", |row| {
         row_contains(row, &["braintrust.plugin.codex", "test_harness"])
     });
-    assert!(!world.wait_for_ingest_scenario(&scenario).await.is_empty());
+    let scenario = world.expect_mock_inference(scenario, "Codex tool output", |row| {
+        row_contains(row, &[r#""type":"tool""#, "CODEX_TOOL_OK"])
+    });
+    world.wait_for_ingest_scenario(&scenario).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the Claude Code CLI installed on PATH"]
 async fn claude_session_emits_traces() {
-    match AgentTestMode::from_env() {
-        AgentTestMode::Mock => run_claude_mock().await,
-        AgentTestMode::Live => run_claude_live().await,
-    }
-}
-
-async fn run_claude_mock() {
     let inference = AnthropicMock::new(|context, request| match context.request_index {
         0 => {
             assert_eq!(request.model(), Some("mock-model"));
             assert!(
-                request.contains_text("Run the deterministic command"),
+                request.contains_text("CLAUDE_TOOL_OK"),
                 "unexpected Claude request: {}",
                 request.body
             );
@@ -232,55 +181,38 @@ async fn run_claude_mock() {
     let output = claude
         .run(
             &world,
-            ClaudeRun::mock(
-                "Run the deterministic command, then return the deterministic marker.",
-                inference_server.uri(),
-            ),
+            ClaudeRun::new("Run the command `printf CLAUDE_TOOL_OK` and then reply briefly.")
+                .mock_inference(inference_server.uri()),
         )
         .await;
     output.assert_success();
-    output.assert_contains("CLAUDE_MOCK_OK");
-    assert_eq!(inference.requests().len(), 2);
+    world.when_mock_inference(|| {
+        output.assert_contains("CLAUDE_MOCK_OK");
+        assert_eq!(inference.requests().len(), 2);
+    });
 
-    let failed = claude
-        .run(
-            &world,
-            ClaudeRun::mock(
-                "Trigger the deterministic inference error.",
-                inference_server.uri(),
-            ),
-        )
-        .await;
-    failed.assert_failure();
-    failed.assert_contains("deterministic Claude inference failure");
-    assert_eq!(inference.requests().len(), 3);
-
-    let scenario = IngestScenario::new()
-        .expect("Claude trace source", |row| {
-            row_contains(row, &[r#""source":"claude-code""#, "test_harness"])
+    world
+        .when_mock_inference_async(|| async {
+            let failed = claude
+                .run(
+                    &world,
+                    ClaudeRun::new("Trigger the deterministic inference error.")
+                        .mock_inference(inference_server.uri()),
+                )
+                .await;
+            failed.assert_failure();
+            failed.assert_contains("deterministic Claude inference failure");
+            assert_eq!(inference.requests().len(), 3);
         })
-        .expect("Claude tool output", |row| {
-            row_contains(row, &[r#""type":"tool""#, "CLAUDE_TOOL_OK"])
-        });
-    assert!(!world.wait_for_ingest_scenario(&scenario).await.is_empty());
-}
-
-async fn run_claude_live() {
-    let world = AgentTestWorld::start().await;
-    let claude = ClaudeAgent::new(&world);
-
-    claude
-        .run(
-            &world,
-            ClaudeRun::live("Reply briefly to confirm this tracing integration test."),
-        )
-        .await
-        .assert_success();
+        .await;
 
     let scenario = IngestScenario::new().expect("Claude trace source", |row| {
         row_contains(row, &[r#""source":"claude-code""#, "test_harness"])
     });
-    assert!(!world.wait_for_ingest_scenario(&scenario).await.is_empty());
+    let scenario = world.expect_mock_inference(scenario, "Claude tool output", |row| {
+        row_contains(row, &[r#""type":"tool""#, "CLAUDE_TOOL_OK"])
+    });
+    world.wait_for_ingest_scenario(&scenario).await;
 }
 
 #[test]
@@ -311,9 +243,4 @@ fn request_helpers_recognize_tool_results_and_advertised_tools() {
         }),
     };
     assert!(anthropic.has_tool_result("toolu-1"));
-}
-
-#[test]
-fn test_modes_remain_distinct() {
-    assert_ne!(AgentTestMode::Mock, AgentTestMode::Live);
 }

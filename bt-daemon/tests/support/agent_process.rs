@@ -1,6 +1,8 @@
 use crate::support::ingest::{IngestMock, IngestScenario};
 use crate::support::server::TestServer;
+use bt_daemon::{run_status, StatusArgs};
 use serde_json::{json, Value};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -9,7 +11,34 @@ use tokio::process::{Child, Command};
 #[cfg(windows)]
 use uuid::Uuid;
 
+const LEGACY_MODE_ENV: &str = "BT_AGENT_TEST_MODE";
+const INFERENCE_MODE_ENV: &str = "BT_AGENT_INFERENCE_MODE";
+const INGEST_MODE_ENV: &str = "BT_AGENT_INGEST_MODE";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestBackendMode {
+    Mock,
+    Live,
+}
+
+impl TestBackendMode {
+    fn from_env(name: &str) -> Self {
+        let value = std::env::var(name).or_else(|error| match error {
+            std::env::VarError::NotPresent => std::env::var(LEGACY_MODE_ENV),
+            _ => Err(error),
+        });
+        match value.as_deref() {
+            Ok("live") => Self::Live,
+            Ok("mock" | "deterministic") | Err(std::env::VarError::NotPresent) => Self::Mock,
+            Ok(value) => panic!("{name} must be `mock` or `live`, got {value:?}"),
+            Err(error) => panic!("could not read {name}: {error}"),
+        }
+    }
+}
+
 pub struct AgentTestWorld {
+    inference_mode: TestBackendMode,
+    ingest_mode: TestBackendMode,
     root: TempDir,
     collector: IngestMock,
     collector_server: TestServer,
@@ -22,6 +51,8 @@ pub struct AgentTestWorld {
 
 impl AgentTestWorld {
     pub async fn start() -> Self {
+        let inference_mode = TestBackendMode::from_env(INFERENCE_MODE_ENV);
+        let ingest_mode = TestBackendMode::from_env(INGEST_MODE_ENV);
         let root = tempfile::tempdir().expect("create agent test root");
         let collector = IngestMock::new();
         let collector_server = TestServer::start(collector.router()).await;
@@ -55,16 +86,21 @@ impl AgentTestWorld {
             .arg(&data_dir)
             .arg("--idle-timeout-secs")
             .arg("0")
-            .env("BRAINTRUST_API_URL", collector_server.uri())
-            .env("BRAINTRUST_APP_URL", collector_server.uri())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if ingest_mode == TestBackendMode::Mock {
+            command
+                .env("BRAINTRUST_API_URL", collector_server.uri())
+                .env("BRAINTRUST_APP_URL", collector_server.uri());
+        }
         let daemon = command.spawn().expect("start daemon");
 
         wait_for_daemon(daemon_binary, &socket).await;
         Self {
+            inference_mode,
+            ingest_mode,
             root,
             collector,
             collector_server,
@@ -73,6 +109,47 @@ impl AgentTestWorld {
             socket,
             data_dir,
             config_path,
+        }
+    }
+
+    pub fn uses_mock_inference(&self) -> bool {
+        self.inference_mode == TestBackendMode::Mock
+    }
+
+    pub fn uses_live_inference(&self) -> bool {
+        self.inference_mode == TestBackendMode::Live
+    }
+
+    pub fn uses_mock_ingest(&self) -> bool {
+        self.ingest_mode == TestBackendMode::Mock
+    }
+
+    pub fn when_mock_inference(&self, assertion: impl FnOnce()) {
+        if self.uses_mock_inference() {
+            assertion();
+        }
+    }
+
+    pub async fn when_mock_inference_async<F, Fut>(&self, operation: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        if self.uses_mock_inference() {
+            operation().await;
+        }
+    }
+
+    pub fn expect_mock_inference(
+        &self,
+        scenario: IngestScenario,
+        name: impl Into<String>,
+        matcher: impl Fn(&Value) -> bool + Send + Sync + 'static,
+    ) -> IngestScenario {
+        if self.uses_mock_inference() {
+            scenario.expect(name, matcher)
+        } else {
+            scenario
         }
     }
 
@@ -96,12 +173,15 @@ impl AgentTestWorld {
             .env("BT_DAEMON_SOCKET", &self.socket)
             .env("BT_DAEMON_DATA_DIR", &self.data_dir)
             .env("BT_DAEMON_CONFIG", &self.config_path)
-            .env("BRAINTRUST_API_KEY", "test-key")
-            .env("BRAINTRUST_API_URL", self.collector_server.uri())
-            .env("BRAINTRUST_APP_URL", self.collector_server.uri())
-            .env("BRAINTRUST_PROJECT", "agent-e2e")
             .env("BRAINTRUST_FLUSH_ON_TURN_END", "true")
             .stdin(Stdio::null());
+        if self.uses_mock_ingest() {
+            command
+                .env("BRAINTRUST_API_KEY", "test-key")
+                .env("BRAINTRUST_API_URL", self.collector_server.uri())
+                .env("BRAINTRUST_APP_URL", self.collector_server.uri())
+                .env("BRAINTRUST_PROJECT", "agent-e2e");
+        }
     }
 
     pub async fn output(&self, command: &mut Command) -> std::process::Output {
@@ -140,6 +220,9 @@ impl AgentTestWorld {
     }
 
     pub async fn wait_for_ingest_scenario(&self, scenario: &IngestScenario) -> Vec<Value> {
+        if !self.uses_mock_ingest() {
+            return self.wait_for_live_ingest().await;
+        }
         let mut last_error = String::new();
         for _ in 0..100 {
             match self.collector.evaluate(scenario) {
@@ -153,6 +236,42 @@ impl AgentTestWorld {
             self.collector.diagnostics(),
             directory_contents(&self.data_dir)
         );
+    }
+
+    async fn wait_for_live_ingest(&self) -> Vec<Value> {
+        let mut last_status = String::new();
+        for _ in 0..100 {
+            match run_status(StatusArgs {
+                socket: Some(self.socket.clone()),
+                session_id: None,
+            })
+            .await
+            {
+                Ok(Some(status)) => {
+                    last_status = format!("{:?}", status.sessions);
+                    let emitted = status
+                        .sessions
+                        .iter()
+                        .any(|session| session.spans_emitted > 0);
+                    let errors = status
+                        .sessions
+                        .iter()
+                        .filter_map(|session| session.last_error.as_deref())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        errors.is_empty(),
+                        "live ingest reported daemon sink errors: {errors:?}"
+                    );
+                    if emitted {
+                        return Vec::new();
+                    }
+                }
+                Ok(None) => last_status = "daemon not running".into(),
+                Err(error) => last_status = error.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("live ingest emitted no spans; last daemon status: {last_status}");
     }
 }
 
