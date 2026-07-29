@@ -5,6 +5,8 @@ use std::process::Stdio;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
+#[cfg(windows)]
+use uuid::Uuid;
 
 pub struct AgentTestWorld {
     root: TempDir,
@@ -22,7 +24,7 @@ impl AgentTestWorld {
         let collector = TraceCollector::start().await;
         let wrapper_dir = root.path().join("bin");
         let data_dir = root.path().join("daemon");
-        let socket = root.path().join("daemon.sock");
+        let socket = test_endpoint(root.path());
         let config_path = data_dir.join("config.json");
         std::fs::create_dir_all(&wrapper_dir).expect("create wrapper directory");
         std::fs::create_dir_all(&data_dir).expect("create daemon data directory");
@@ -39,7 +41,7 @@ impl AgentTestWorld {
         .expect("write daemon config");
 
         let daemon_binary = Path::new(env!("CARGO_BIN_EXE_bt-daemon"));
-        write_bt_wrapper(&wrapper_dir.join("bt"), daemon_binary);
+        write_bt_wrapper(&wrapper_dir, daemon_binary);
 
         let mut command = Command::new(daemon_binary);
         command
@@ -58,7 +60,7 @@ impl AgentTestWorld {
             .kill_on_drop(true);
         let daemon = command.spawn().expect("start daemon");
 
-        wait_for_path(&socket).await;
+        wait_for_daemon(daemon_binary, &socket).await;
         Self {
             root,
             collector,
@@ -111,9 +113,17 @@ impl AgentTestWorld {
     }
 
     pub async fn wait_for_trace_rows(&self) -> Vec<Value> {
+        self.wait_for_trace_rows_matching(|rows| !rows.is_empty())
+            .await
+    }
+
+    pub async fn wait_for_trace_rows_matching(
+        &self,
+        predicate: impl Fn(&[Value]) -> bool,
+    ) -> Vec<Value> {
         for _ in 0..100 {
             let rows = self.collector.rows();
-            if !rows.is_empty() {
+            if predicate(&rows) {
                 return rows;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -132,27 +142,72 @@ impl Drop for AgentTestWorld {
     }
 }
 
-fn write_bt_wrapper(path: &Path, daemon_binary: &Path) {
+#[cfg(unix)]
+fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
+    let path = directory.join("bt");
     let script = format!(
         "#!/bin/sh\nif [ \"$1\" = daemon ]; then shift; fi\nexec '{}' \"$@\"\n",
         daemon_binary.display()
     );
-    std::fs::write(path, script).expect("write bt test wrapper");
-    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    std::fs::write(&path, script).expect("write bt test wrapper");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).expect("make bt wrapper executable");
+    std::fs::set_permissions(&path, permissions).expect("make bt wrapper executable");
 }
 
-async fn wait_for_path(path: &Path) {
+#[cfg(windows)]
+fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
+    let powershell = directory.join("bt-wrapper.ps1");
+    let script = format!(
+        "$forward = @($args)\n\
+         if ($forward.Count -gt 0 -and $forward[0] -eq 'daemon') {{\n\
+           if ($forward.Count -eq 1) {{ $forward = @() }} else {{ $forward = @($forward[1..($forward.Count - 1)]) }}\n\
+         }}\n\
+         & '{}' @forward\n\
+         exit $LASTEXITCODE\n",
+        daemon_binary.display()
+    );
+    std::fs::write(&powershell, script).expect("write bt PowerShell wrapper");
+    std::fs::write(
+        directory.join("bt.cmd"),
+        "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0bt-wrapper.ps1\" %*\r\n",
+    )
+    .expect("write bt command wrapper");
+}
+
+#[cfg(unix)]
+fn test_endpoint(root: &Path) -> PathBuf {
+    root.join("daemon.sock")
+}
+
+#[cfg(windows)]
+fn test_endpoint(_root: &Path) -> PathBuf {
+    PathBuf::from(format!(
+        r"\\.\pipe\braintrust-bt-daemon-test-{}",
+        Uuid::new_v4()
+    ))
+}
+
+async fn wait_for_daemon(daemon_binary: &Path, endpoint: &Path) {
     for _ in 0..100 {
-        if path.exists() {
-            return;
+        let output = Command::new(daemon_binary)
+            .arg("status")
+            .arg("--socket")
+            .arg(endpoint)
+            .output()
+            .await;
+        if let Ok(output) = output {
+            if output.status.success()
+                && !String::from_utf8_lossy(&output.stdout).contains("not running")
+            {
+                return;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("daemon endpoint was not created at {}", path.display());
+    panic!("daemon endpoint was not ready at {}", endpoint.display());
 }
 
 fn directory_contents(root: &Path) -> String {

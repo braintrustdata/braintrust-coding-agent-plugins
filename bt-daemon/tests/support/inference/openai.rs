@@ -1,5 +1,5 @@
+use super::server::InferenceServer;
 use super::{decode_json_body, json_response, raw_response, sse, MockReply, RequestContext};
-use crate::support::server::TestServer;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -146,7 +146,7 @@ struct MockState {
 }
 
 pub struct OpenAiMock {
-    server: TestServer,
+    server: InferenceServer,
     state: Arc<MockState>,
 }
 
@@ -166,7 +166,7 @@ impl OpenAiMock {
             .route("/backend-api/plugins/featured", get(featured_plugins))
             .with_state(Arc::clone(&state));
         Self {
-            server: TestServer::start(router).await,
+            server: InferenceServer::start(router).await,
             state,
         }
     }

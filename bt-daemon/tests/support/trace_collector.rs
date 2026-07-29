@@ -1,4 +1,3 @@
-use crate::support::server::TestServer;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -7,6 +6,45 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+
+struct CollectorServer {
+    uri: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl CollectorServer {
+    async fn start(router: Router) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind trace collector");
+        let address = listener.local_addr().expect("read trace collector address");
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        Self {
+            uri: format!("http://{address}"),
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+}
+
+impl Drop for CollectorServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.abort();
+    }
+}
 
 #[derive(Default)]
 struct CollectorState {
@@ -16,7 +54,7 @@ struct CollectorState {
 }
 
 pub struct TraceCollector {
-    server: TestServer,
+    server: CollectorServer,
     state: Arc<CollectorState>,
 }
 
@@ -31,13 +69,13 @@ impl TraceCollector {
             .route("/logs3/overflow", post(logs))
             .with_state(Arc::clone(&state));
         Self {
-            server: TestServer::start(router).await,
+            server: CollectorServer::start(router).await,
             state,
         }
     }
 
     pub fn base_url(&self) -> &str {
-        self.server.uri()
+        &self.server.uri
     }
 
     pub fn rows(&self) -> Vec<Value> {

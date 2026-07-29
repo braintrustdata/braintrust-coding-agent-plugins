@@ -33,7 +33,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust
@@ -41,6 +41,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add clippy rustfmt
+      - name: Install latest coding agents
+        run: npm install --global @openai/codex@latest @anthropic-ai/claude-code@latest
+      - name: Report coding-agent versions
+        run: |
+          codex --version
+          claude --version
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --manifest-path bt-daemon/Cargo.toml -- --check
@@ -48,24 +54,9 @@ jobs:
         run: cargo build --manifest-path bt-daemon/Cargo.toml --all-features --locked
       - name: Test daemon
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked
+      - name: Test coding-agent integrations with deterministic inference
+        env:
+          BT_AGENT_TEST_MODE: mock
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
       - name: Lint daemon
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings
-
-  agent-e2e:
-    name: Latest agent E2E
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-      - name: Install latest Codex and Claude Code
-        run: npm install --global @openai/codex@latest @anthropic-ai/claude-code@latest
-      - name: Report agent versions
-        run: |
-          codex --version
-          claude --version
-      - name: Run real agents against deterministic inference
-        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_e2e -- --ignored --nocapture --test-threads=1

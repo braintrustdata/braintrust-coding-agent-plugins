@@ -1,15 +1,19 @@
 # Deterministic inference test support
 
-This directory contains two protocol-faithful, test-only inference servers:
+This directory is a self-contained mock-inference component with two
+protocol-faithful servers:
 
 - `OpenAiMock` implements the OpenAI Responses API surface used by Codex.
 - `AnthropicMock` implements the Anthropic Messages API surface used by
   Claude Code.
 
-They intentionally share only generic HTTP lifecycle, request indexing, and
-transport outcomes. Request and response types remain provider-specific so a
-test cannot accidentally hide a wire-protocol incompatibility behind a common
-model abstraction.
+Each public mock owns its HTTP listener and lifecycle. There is intentionally
+no separately exposed generic server: the useful abstraction is a
+programmatically controlled inference endpoint. The two providers share only
+private transport mechanics, request indexing, and transport outcomes.
+Request and response types remain provider-specific so a test cannot
+accidentally hide a wire-protocol incompatibility behind a common model
+abstraction.
 
 Both mocks accept a thread-safe closure:
 
@@ -34,14 +38,28 @@ response bodies for malformed or truncated stream tests. Typed turn builders
 generate deterministic ids, token usage, and valid provider SSE sequences.
 Every inference request is captured for later assertions.
 
-The modules do not depend on `bt-daemon`. The higher-level
-`support::agent_process` harness owns daemon, plugin, agent-process, and trace
-collector integration. This boundary is deliberate so the inference mocks and
-generic server handle can later move into a reusable crate without carrying
-Braintrust-specific concepts with them.
+The component does not depend on `bt-daemon`, the coding-agent runner, or the
+trace collector. The higher-level `support::agent_process` harness composes
+with it only from the integration test. This boundary is deliberate so the
+whole mock-inference component can later move into a reusable crate and serve
+any client that can target an OpenAI Responses or Anthropic Messages endpoint.
 
-`agent_e2e.rs` runs real Codex and Claude Code processes against these mocks.
-The tests are ignored in the normal Rust suite because they require agent
-executables, while the dedicated CI job installs the latest release of each
-agent on every run. This is intentionally unpinned so upstream compatibility
-breaks are visible immediately.
+`agent_integration.rs` runs real Codex and Claude Code processes against these
+mocks.
+The tests are ignored in a plain Rust run because they require agent
+executables. The core cross-platform CI matrix installs the latest release of
+each agent and runs them in the default `mock` mode on every host. This is
+intentionally unpinned so upstream compatibility breaks are visible
+immediately.
+
+The same agent tests can run without mock inference:
+
+```console
+BT_AGENT_TEST_MODE=live cargo test --manifest-path bt-daemon/Cargo.toml \
+  --all-features --test agent_integration -- --ignored --test-threads=1
+```
+
+Live mode uses the normal provider endpoint/model and the agent's normal login
+or provider credentials. It validates only stable integration invariants such
+as trace delivery and origin metadata. Mock mode additionally validates exact
+request sequences, tool results, output content, and injected failures.

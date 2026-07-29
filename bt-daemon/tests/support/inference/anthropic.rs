@@ -1,5 +1,5 @@
+use super::server::InferenceServer;
 use super::{decode_json_body, json_response, raw_response, sse, MockReply, RequestContext};
-use crate::support::server::TestServer;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -175,7 +175,7 @@ struct MockState {
 }
 
 pub struct AnthropicMock {
-    server: TestServer,
+    server: InferenceServer,
     state: Arc<MockState>,
 }
 
@@ -195,7 +195,7 @@ impl AnthropicMock {
             .route("/v1/messages/count_tokens", post(count_tokens))
             .with_state(Arc::clone(&state));
         Self {
-            server: TestServer::start(router).await,
+            server: InferenceServer::start(router).await,
             state,
         }
     }
