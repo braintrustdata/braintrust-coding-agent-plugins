@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use support::agent_process::AgentTestWorld;
 use support::inference::{AnthropicMock, AnthropicTurn, MockReply, OpenAiMock, OpenAiTurn};
+use support::ingest::IngestScenario;
 use support::server::TestServer;
 use tokio::process::Command;
 use uuid::Uuid;
@@ -153,15 +154,11 @@ fn claude_command(world: &AgentTestWorld) -> Command {
     command
 }
 
-async fn wait_for_trace_fragments(world: &AgentTestWorld, fragments: &[&str]) -> Vec<Value> {
-    world
-        .wait_for_trace_rows_matching(|rows| {
-            let serialized = serde_json::to_string(rows).expect("serialize trace rows");
-            fragments
-                .iter()
-                .all(|fragment| serialized.contains(fragment))
-        })
-        .await
+fn row_contains(row: &Value, fragments: &[&str]) -> bool {
+    let serialized = serde_json::to_string(row).expect("serialize trace row");
+    fragments
+        .iter()
+        .all(|fragment| serialized.contains(fragment))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -273,16 +270,14 @@ async fn run_codex_mock() {
     );
     assert_eq!(inference.requests().len(), 3);
 
-    let rows = wait_for_trace_fragments(
-        &world,
-        &[
-            "braintrust.plugin.codex",
-            "test_harness",
-            r#""type":"tool""#,
-            "CODEX_TOOL_OK",
-        ],
-    )
-    .await;
+    let scenario = IngestScenario::new()
+        .expect("Codex trace origin", |row| {
+            row_contains(row, &["braintrust.plugin.codex", "test_harness"])
+        })
+        .expect("Codex tool output", |row| {
+            row_contains(row, &[r#""type":"tool""#, "CODEX_TOOL_OK"])
+        });
+    let rows = world.wait_for_ingest_scenario(&scenario).await;
     assert!(!rows.is_empty());
 }
 
@@ -298,7 +293,10 @@ async fn run_codex_live() {
     let output = world.output(&mut codex).await;
     assert!(output.status.success(), "{}", output_text(&output));
 
-    let rows = wait_for_trace_fragments(&world, &["braintrust.plugin.codex", "test_harness"]).await;
+    let scenario = IngestScenario::new().expect("Codex trace origin", |row| {
+        row_contains(row, &["braintrust.plugin.codex", "test_harness"])
+    });
+    let rows = world.wait_for_ingest_scenario(&scenario).await;
     assert!(!rows.is_empty());
 }
 
@@ -398,16 +396,14 @@ async fn run_claude_mock() {
     );
     assert_eq!(inference.requests().len(), 3);
 
-    let rows = wait_for_trace_fragments(
-        &world,
-        &[
-            r#""source":"claude-code""#,
-            "test_harness",
-            r#""type":"tool""#,
-            "CLAUDE_TOOL_OK",
-        ],
-    )
-    .await;
+    let scenario = IngestScenario::new()
+        .expect("Claude trace source", |row| {
+            row_contains(row, &[r#""source":"claude-code""#, "test_harness"])
+        })
+        .expect("Claude tool output", |row| {
+            row_contains(row, &[r#""type":"tool""#, "CLAUDE_TOOL_OK"])
+        });
+    let rows = world.wait_for_ingest_scenario(&scenario).await;
     assert!(!rows.is_empty());
 }
 
@@ -418,8 +414,10 @@ async fn run_claude_live() {
     let output = world.output(&mut claude).await;
     assert!(output.status.success(), "{}", output_text(&output));
 
-    let rows =
-        wait_for_trace_fragments(&world, &[r#""source":"claude-code""#, "test_harness"]).await;
+    let scenario = IngestScenario::new().expect("Claude trace source", |row| {
+        row_contains(row, &[r#""source":"claude-code""#, "test_harness"])
+    });
+    let rows = world.wait_for_ingest_scenario(&scenario).await;
     assert!(!rows.is_empty());
 }
 

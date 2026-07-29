@@ -8,7 +8,9 @@ The test infrastructure has three independent layers:
   programmable scenarios, and captured inference requests. Each mock exports
   an Axum router and can be hosted or embedded by any caller.
 - `ingest` contains the mock Braintrust API and captured trace rows. It also
-  exports an Axum router and has no dependency on the server container.
+  exports an Axum router and has no dependency on the server container. Its
+  scenario builder matches named row shapes as an ordered subsequence,
+  independent of HTTP batching and unrelated SDK update rows.
 
 `agent_process` is the Braintrust-specific orchestration layer. It hosts the
 ingest router, starts the daemon, and configures coding-agent processes. The

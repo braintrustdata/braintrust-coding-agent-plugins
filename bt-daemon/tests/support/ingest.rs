@@ -7,6 +7,58 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+type RowMatcher = dyn Fn(&Value) -> bool + Send + Sync + 'static;
+
+struct ExpectedRow {
+    name: String,
+    matcher: Arc<RowMatcher>,
+}
+
+#[derive(Default)]
+pub struct IngestScenario {
+    expected: Vec<ExpectedRow>,
+}
+
+impl IngestScenario {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Require a row shape after all previously declared shapes. Unrelated
+    /// rows are ignored, so matching is independent of HTTP batching and
+    /// SDK-generated update rows.
+    pub fn expect(
+        mut self,
+        name: impl Into<String>,
+        matcher: impl Fn(&Value) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.expected.push(ExpectedRow {
+            name: name.into(),
+            matcher: Arc::new(matcher),
+        });
+        self
+    }
+
+    pub fn evaluate(&self, rows: &[Value]) -> Result<(), String> {
+        let mut cursor = 0;
+        for (matched, expected) in self.expected.iter().enumerate() {
+            let Some(offset) = rows[cursor..]
+                .iter()
+                .position(|row| (expected.matcher)(row))
+            else {
+                return Err(format!(
+                    "missing ingest shape {:?} after matching {} of {} shapes",
+                    expected.name,
+                    matched,
+                    self.expected.len()
+                ));
+            };
+            cursor += offset + 1;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct CollectorState {
     rows: Mutex<Vec<Value>>,
@@ -45,6 +97,12 @@ impl IngestMock {
             self.state.log_requests.load(Ordering::SeqCst),
             self.rows().len()
         )
+    }
+
+    pub fn evaluate(&self, scenario: &IngestScenario) -> Result<Vec<Value>, String> {
+        let rows = self.rows();
+        scenario.evaluate(&rows)?;
+        Ok(rows)
     }
 }
 

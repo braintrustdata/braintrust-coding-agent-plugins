@@ -1,4 +1,4 @@
-use crate::support::ingest::IngestMock;
+use crate::support::ingest::{IngestMock, IngestScenario};
 use crate::support::server::TestServer;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -134,6 +134,22 @@ impl AgentTestWorld {
         }
         panic!(
             "daemon delivered no trace rows; {}; daemon files:\n{}",
+            self.collector.diagnostics(),
+            directory_contents(&self.data_dir)
+        );
+    }
+
+    pub async fn wait_for_ingest_scenario(&self, scenario: &IngestScenario) -> Vec<Value> {
+        let mut last_error = String::new();
+        for _ in 0..100 {
+            match self.collector.evaluate(scenario) {
+                Ok(rows) => return rows,
+                Err(error) => last_error = error,
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "ingest scenario did not complete: {last_error}; {}; daemon files:\n{}",
             self.collector.diagnostics(),
             directory_contents(&self.data_dir)
         );
