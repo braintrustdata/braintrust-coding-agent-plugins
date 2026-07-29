@@ -2,7 +2,6 @@ use crate::support::ingest::{IngestMock, IngestScenario};
 use crate::support::server::TestServer;
 use bt_daemon::{run_status, StatusArgs};
 use serde_json::{json, Value};
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -119,22 +118,6 @@ impl AgentTestWorld {
         self.ingest_mode == TestBackendMode::Mock
     }
 
-    pub fn when_mock_inference(&self, assertion: impl FnOnce()) {
-        if self.uses_mock_inference() {
-            assertion();
-        }
-    }
-
-    pub async fn when_mock_inference_async<F, Fut>(&self, operation: F)
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        if self.uses_mock_inference() {
-            operation().await;
-        }
-    }
-
     pub fn workspace(&self) -> PathBuf {
         let workspace = self.root.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("create agent workspace");
@@ -212,19 +195,14 @@ impl AgentTestWorld {
         }
     }
 
-    /// Evaluate deterministic trace shapes only when both inference and ingest
-    /// are mocked. The closure keeps the mock scenario out of live-mode setup.
-    pub async fn assert_mock_ingest_scenario(
-        &self,
-        scenario: impl FnOnce() -> IngestScenario,
-    ) -> Vec<Value> {
-        if !self.uses_mock_inference() || !self.uses_mock_ingest() {
-            return Vec::new();
-        }
-        let scenario = scenario();
+    pub async fn wait_for_mock_ingest_scenario(&self, scenario: &IngestScenario) -> Vec<Value> {
+        assert!(
+            self.uses_mock_ingest(),
+            "ingest scenarios require mock ingest"
+        );
         let mut last_error = String::new();
         for _ in 0..100 {
-            match self.collector.evaluate(&scenario) {
+            match self.collector.evaluate(scenario) {
                 Ok(rows) => return rows,
                 Err(error) => last_error = error,
             }

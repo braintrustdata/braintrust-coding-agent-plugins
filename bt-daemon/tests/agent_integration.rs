@@ -105,25 +105,21 @@ async fn codex_session_emits_traces() {
         )
         .await;
     output.assert_success();
-    world.when_mock_inference(|| {
+    if world.uses_mock_inference() {
         output.assert_contains("CODEX_MOCK_OK");
         assert_eq!(inference.requests().len(), 2);
-    });
 
-    world
-        .when_mock_inference_async(|| async {
-            let failed = codex
-                .run(
-                    &world,
-                    CodexRun::new("Trigger the deterministic inference error.")
-                        .mock_inference(inference_server.uri()),
-                )
-                .await;
-            failed.assert_failure();
-            failed.assert_contains("deterministic Codex inference failure");
-            assert_eq!(inference.requests().len(), 3);
-        })
-        .await;
+        let failed = codex
+            .run(
+                &world,
+                CodexRun::new("Trigger the deterministic inference error.")
+                    .mock_inference(inference_server.uri()),
+            )
+            .await;
+        failed.assert_failure();
+        failed.assert_contains("deterministic Codex inference failure");
+        assert_eq!(inference.requests().len(), 3);
+    }
 
     let rows = world.wait_for_trace_delivery().await;
     if world.uses_mock_ingest() {
@@ -133,17 +129,16 @@ async fn codex_session_emits_traces() {
             "Codex trace origin metadata was not emitted"
         );
     }
-    world
-        .assert_mock_ingest_scenario(|| {
-            IngestScenario::new()
-                .expect("Codex trace origin", |row| {
-                    row_contains(row, &["braintrust.plugin.codex", "test_harness"])
-                })
-                .expect("Codex tool output", |row| {
-                    row_contains(row, &[r#""type":"tool""#, "CODEX_TOOL_OK"])
-                })
-        })
-        .await;
+    if world.uses_mock_inference() && world.uses_mock_ingest() {
+        let scenario = IngestScenario::new()
+            .expect("Codex trace origin", |row| {
+                row_contains(row, &["braintrust.plugin.codex", "test_harness"])
+            })
+            .expect("Codex tool output", |row| {
+                row_contains(row, &[r#""type":"tool""#, "CODEX_TOOL_OK"])
+            });
+        world.wait_for_mock_ingest_scenario(&scenario).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -198,25 +193,21 @@ async fn claude_session_emits_traces() {
         )
         .await;
     output.assert_success();
-    world.when_mock_inference(|| {
+    if world.uses_mock_inference() {
         output.assert_contains("CLAUDE_MOCK_OK");
         assert_eq!(inference.requests().len(), 2);
-    });
 
-    world
-        .when_mock_inference_async(|| async {
-            let failed = claude
-                .run(
-                    &world,
-                    ClaudeRun::new("Trigger the deterministic inference error.")
-                        .mock_inference(inference_server.uri()),
-                )
-                .await;
-            failed.assert_failure();
-            failed.assert_contains("deterministic Claude inference failure");
-            assert_eq!(inference.requests().len(), 3);
-        })
-        .await;
+        let failed = claude
+            .run(
+                &world,
+                ClaudeRun::new("Trigger the deterministic inference error.")
+                    .mock_inference(inference_server.uri()),
+            )
+            .await;
+        failed.assert_failure();
+        failed.assert_contains("deterministic Claude inference failure");
+        assert_eq!(inference.requests().len(), 3);
+    }
 
     let rows = world.wait_for_trace_delivery().await;
     if world.uses_mock_ingest() {
@@ -226,17 +217,16 @@ async fn claude_session_emits_traces() {
             "Claude trace source metadata was not emitted"
         );
     }
-    world
-        .assert_mock_ingest_scenario(|| {
-            IngestScenario::new()
-                .expect("Claude trace source", |row| {
-                    row_contains(row, &[r#""source":"claude-code""#, "test_harness"])
-                })
-                .expect("Claude tool output", |row| {
-                    row_contains(row, &[r#""type":"tool""#, "CLAUDE_TOOL_OK"])
-                })
-        })
-        .await;
+    if world.uses_mock_inference() && world.uses_mock_ingest() {
+        let scenario = IngestScenario::new()
+            .expect("Claude trace source", |row| {
+                row_contains(row, &[r#""source":"claude-code""#, "test_harness"])
+            })
+            .expect("Claude tool output", |row| {
+                row_contains(row, &[r#""type":"tool""#, "CLAUDE_TOOL_OK"])
+            });
+        world.wait_for_mock_ingest_scenario(&scenario).await;
+    }
 }
 
 #[test]
