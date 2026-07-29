@@ -76,7 +76,7 @@ If your plugin release repo is private, also expose a token the launcher can use
 
 ## Configuration
 
-There are two ways to configure the plugin. **Environment variables always win over the config file**
+There are two ways to configure the plugin, environment variables and a config file.
 
 ```
 cp ~/.codex/plugins/cache/braintrust-codex-plugins/trace-codex/<plugin-version>/config.json.example ~/.codex/plugins/data/trace-codex-braintrust-codex-plugins/config.json
