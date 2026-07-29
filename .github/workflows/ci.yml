@@ -5,7 +5,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -32,9 +31,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-24.04
+            agent_suffix: ""
+          - os: macos-latest
+            agent_suffix: ""
+          - os: windows-latest
+            agent_suffix: ".cmd"
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust
@@ -42,6 +47,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add clippy rustfmt
+      - name: Install latest coding agents
+        run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest
+      - name: Report coding-agent versions
+        run: |
+          npm exec --prefix "${{ runner.temp }}/coding-agents" -- codex --version
+          npm exec --prefix "${{ runner.temp }}/coding-agents" -- claude --version
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --manifest-path bt-daemon/Cargo.toml -- --check
@@ -49,5 +60,12 @@ jobs:
         run: cargo build --manifest-path bt-daemon/Cargo.toml --all-features --locked
       - name: Test daemon
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked
+      - name: Test coding-agent integrations with deterministic inference
+        env:
+          BT_AGENT_INFERENCE_MODE: mock
+          BT_AGENT_INGEST_MODE: mock
+          CODEX_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/codex${{ matrix.agent_suffix }}
+          CLAUDE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/claude${{ matrix.agent_suffix }}
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
       - name: Lint daemon
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings

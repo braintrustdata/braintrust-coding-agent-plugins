@@ -4,14 +4,16 @@ REM Invokes: bt daemon hook --source claude-code
 setlocal EnableExtensions DisableDelayedExpansion
 
 set "BT_HOOK_BIN="
-for /f "delims=" %%B in ('where bt 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
+for /f "delims=" %%B in ('where bt.exe 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
+if not defined BT_HOOK_BIN for /f "delims=" %%B in ('where bt.cmd 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
+if not defined BT_HOOK_BIN for /f "delims=" %%B in ('where bt 2^>nul') do if not defined BT_HOOK_BIN set "BT_HOOK_BIN=%%B"
 if not defined BT_HOOK_BIN if exist "%USERPROFILE%\.local\bin\bt.exe" set "BT_HOOK_BIN=%USERPROFILE%\.local\bin\bt.exe"
 if not defined BT_HOOK_BIN (
   echo trace-claude-code: bt CLI is unavailable; tracing disabled for this event.>&2
   exit /b 0
 )
 
-"%BT_HOOK_BIN%" daemon hook --help >nul 2>&1
+call "%BT_HOOK_BIN%" daemon hook --help >nul 2>&1
 if errorlevel 1 (
   echo trace-claude-code: a daemon-capable bt CLI is unavailable; tracing disabled for this event.>&2
   exit /b 0

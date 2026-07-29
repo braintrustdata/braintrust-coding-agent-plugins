@@ -46,6 +46,9 @@ done
 grep -q "'daemon','hook','--source','claude-code'" \
   "$TARGET_DIR/plugins/trace-claude-code/bin/claude-hook.cmd" \
   || fail "Claude Windows hook does not invoke bt daemon"
+grep -Fq 'call "%BT_HOOK_BIN%" daemon hook --help' \
+  "$TARGET_DIR/plugins/trace-claude-code/bin/claude-hook.cmd" \
+  || fail "Claude Windows hook does not return from bt.cmd compatibility check"
 grep -q 'daemon hook --source claude-code' \
   "$TARGET_DIR/plugins/trace-claude-code/bin/claude-hook.sh" \
   || fail "Claude Unix hook does not invoke bt daemon"
