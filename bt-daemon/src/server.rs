@@ -195,26 +195,59 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
             continue;
         }
         let response = match Message::from_line(&line) {
-            Ok(Message::Request(req)) => Some(handle_request(&daemon, req).await),
+            Ok(Message::Request(req)) => {
+                let request_id = req.id.clone();
+                let method = req.method.clone();
+                tracing::info!(
+                    request_id = ?request_id,
+                    method,
+                    "request received"
+                );
+                let response = handle_request(&daemon, req).await;
+                if let Some(error) = &response.error {
+                    tracing::warn!(
+                        request_id = ?request_id,
+                        method,
+                        error_code = error.code,
+                        error = %error.message,
+                        "request failed"
+                    );
+                } else {
+                    tracing::info!(
+                        request_id = ?request_id,
+                        method,
+                        "request completed"
+                    );
+                }
+                Some(response)
+            }
             Ok(Message::Notification(note)) => {
+                tracing::info!(method = %note.method, "notification received");
                 // Hot-path notifications (in-process clients): process, no reply.
                 if note.method == method::EVENT_LOG {
                     if let Some(params) = note.params {
-                        if let Ok(env) = serde_json::from_value::<Envelope>(params) {
-                            daemon.touch();
-                            if let Ok(session) = daemon.session_for(&env).await {
-                                let _ = session.append_and_enqueue(env).await;
+                        match serde_json::from_value::<Envelope>(params) {
+                            Ok(env) => {
+                                let _ = accept_event(&daemon, env).await;
                             }
+                            Err(error) => tracing::warn!(
+                                method = %note.method,
+                                error = %error,
+                                "notification parameters rejected"
+                            ),
                         }
                     }
                 }
                 None
             }
             Ok(Message::Response(_)) => None, // clients don't send us responses
-            Err(e) => Some(Response::err(
-                crate::wire::RequestId::Int(0),
-                RpcError::new(error_code::PARSE, format!("parse error: {e}")),
-            )),
+            Err(e) => {
+                tracing::warn!(error = %e, "request parse failed");
+                Some(Response::err(
+                    crate::wire::RequestId::Int(0),
+                    RpcError::new(error_code::PARSE, format!("parse error: {e}")),
+                ))
+            }
         };
 
         if let Some(resp) = response {
@@ -225,6 +258,32 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
         }
     }
     Ok(())
+}
+
+async fn accept_event(daemon: &Arc<Daemon>, env: Envelope) -> Result<(), String> {
+    let source = env.source.clone();
+    let event = env.event.clone();
+    let session_id = env.session_id.clone();
+    tracing::info!(source, event, session_id, "event received");
+    daemon.touch();
+
+    let result = async {
+        let session = daemon
+            .session_for(&env)
+            .await
+            .map_err(|error| format!("session init failed: {error}"))?;
+        session
+            .append_and_enqueue(env)
+            .await
+            .map_err(|error| format!("enqueue failed: {error}"))
+    }
+    .await;
+
+    match &result {
+        Ok(()) => tracing::info!(source, event, session_id, "event accepted"),
+        Err(error) => tracing::warn!(source, event, session_id, error, "event rejected"),
+    }
+    result
 }
 
 async fn handle_request(daemon: &Arc<Daemon>, req: Request) -> Response {
@@ -271,22 +330,12 @@ async fn handle_request(daemon: &Arc<Daemon>, req: Request) -> Response {
         }
         method::EVENT_LOG => {
             let env = parse!(Envelope);
-            daemon.touch();
-            match daemon.session_for(&env).await {
-                Ok(session) => match session.append_and_enqueue(env).await {
-                    Ok(()) => Response::ok(
-                        id,
-                        serde_json::to_value(EventLogResult { accepted: true }).unwrap(),
-                    ),
-                    Err(e) => Response::err(
-                        id,
-                        RpcError::new(error_code::INTERNAL, format!("enqueue failed: {e}")),
-                    ),
-                },
-                Err(e) => Response::err(
+            match accept_event(daemon, env).await {
+                Ok(()) => Response::ok(
                     id,
-                    RpcError::new(error_code::INTERNAL, format!("session init failed: {e}")),
+                    serde_json::to_value(EventLogResult { accepted: true }).unwrap(),
                 ),
+                Err(error) => Response::err(id, RpcError::new(error_code::INTERNAL, error)),
             }
         }
         method::SESSION_FLUSH => {
