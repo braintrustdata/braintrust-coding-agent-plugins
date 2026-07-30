@@ -1,4 +1,4 @@
-use super::{command_from_env, repository_root, AgentOutput, ProcessOptions};
+use super::{command_from_env, test_plugin, AgentOutput, ProcessOptions};
 use crate::support::agent_process::AgentTestWorld;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ impl ClaudeAgent {
 
     pub async fn run(&self, world: &AgentTestWorld, run: ClaudeRun) -> AgentOutput {
         let session_id = Uuid::new_v4().to_string();
-        let plugin = repository_root().join("src/plugins/claude/content/plugins/trace-claude-code");
+        let plugin = test_plugin::claude_plugin(world);
         let mut command = command_from_env("CLAUDE_BIN", "claude");
         command
             .args([

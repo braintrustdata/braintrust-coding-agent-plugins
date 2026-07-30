@@ -264,7 +264,7 @@ fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
 
     let path = directory.join("bt");
     let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = daemon ]; then shift; fi\nexec '{}' \"$@\"\n",
+        "#!/bin/sh\ncase \"$1\" in agents|daemon) shift;; esac\nexec '{}' \"$@\"\n",
         daemon_binary.display()
     );
     std::fs::write(&path, script).expect("write bt test wrapper");
@@ -278,7 +278,7 @@ fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
     let powershell = directory.join("bt-wrapper.ps1");
     let script = format!(
         "$forward = @($args)\n\
-         if ($forward.Count -gt 0 -and $forward[0] -eq 'daemon') {{\n\
+         if ($forward.Count -gt 0 -and @('agents', 'daemon') -contains $forward[0]) {{\n\
            if ($forward.Count -eq 1) {{ $forward = @() }} else {{ $forward = @($forward[1..($forward.Count - 1)]) }}\n\
          }}\n\
          & '{}' @forward\n\
@@ -297,7 +297,7 @@ fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
     // PATHEXT, so expose an extensionless shim in addition to bt.cmd.
     let shell_binary = daemon_binary.to_string_lossy().replace('\\', "/");
     let shell = format!(
-        "#!/bin/sh\nif [ \"$1\" = daemon ]; then shift; fi\nexec '{}' \"$@\"\n",
+        "#!/bin/sh\ncase \"$1\" in agents|daemon) shift;; esac\nexec '{}' \"$@\"\n",
         shell_binary
     );
     std::fs::write(directory.join("bt"), shell).expect("write bt Git Bash wrapper");

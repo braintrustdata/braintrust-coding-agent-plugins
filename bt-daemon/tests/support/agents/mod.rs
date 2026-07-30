@@ -1,5 +1,6 @@
 mod claude;
 mod codex;
+mod test_plugin;
 
 #[allow(unused_imports)]
 pub use claude::{ClaudeAgent, ClaudeRun};
@@ -79,13 +80,6 @@ fn command_from_env(name: &str, fallback: &str) -> Command {
     #[cfg(windows)]
     let fallback = format!("{fallback}.cmd");
     Command::new(fallback)
-}
-
-fn repository_root() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("repository root")
-        .to_path_buf()
 }
 
 fn configured_home(config_env: &str, directory: &str) -> Option<PathBuf> {
