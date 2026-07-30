@@ -35,34 +35,10 @@ required=(
   "plugins/braintrust/skills/troubleshoot-braintrust-mcp/SKILL.md"
   "plugins/trace-claude-code/.claude-plugin/plugin.json"
   "plugins/trace-claude-code/hooks/hooks.json"
-  "plugins/trace-claude-code/bin/claude-hook.sh"
-  "plugins/trace-claude-code/bin/claude-hook.cmd"
 )
 for rel in "${required[@]}"; do
   [[ -f "$TARGET_DIR/$rel" ]] || fail "missing $rel"
   case "$rel" in *.json) check_json "$TARGET_DIR/$rel";; esac
-done
-
-grep -q "'daemon','hook','--source','claude-code'" \
-  "$TARGET_DIR/plugins/trace-claude-code/bin/claude-hook.cmd" \
-  || fail "Claude Windows hook does not invoke bt daemon"
-grep -Fq 'call "%BT_HOOK_BIN%" daemon hook --help' \
-  "$TARGET_DIR/plugins/trace-claude-code/bin/claude-hook.cmd" \
-  || fail "Claude Windows hook does not return from bt.cmd compatibility check"
-grep -q 'daemon hook --source claude-code' \
-  "$TARGET_DIR/plugins/trace-claude-code/bin/claude-hook.sh" \
-  || fail "Claude Unix hook does not invoke bt daemon"
-
-# The Rust daemon is the only event processor. Shipping any of the legacy
-# per-event shell processors would reintroduce two competing trace models.
-legacy_hooks=(
-  common.sh session_start.sh user_prompt_submit.sh user_prompt_expansion.sh
-  post_tool_use.sh post_tool_use_failure.sh permission_denied.sh stop_hook.sh
-  session_end.sh worker.sh
-)
-for hook in "${legacy_hooks[@]}"; do
-  [[ ! -e "$TARGET_DIR/plugins/trace-claude-code/hooks/$hook" ]] \
-    || fail "obsolete Claude processor was packaged: hooks/$hook"
 done
 
 # Every marketplace entry's source path must exist in the built tree.

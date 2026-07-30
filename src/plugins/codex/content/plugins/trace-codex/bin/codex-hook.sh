@@ -1,79 +1,45 @@
 #!/bin/sh
-# Thin, fail-open Codex hook shim for the shared Braintrust daemon.
+# Launcher for the trace-codex hook binary.
+#
+# hooks.json invokes this script (a fixed, platform-agnostic command). The
+# platform-specific binaries ship in this plugin under bin/ as
+# codex-hook-<os>-<arch> (committed to the distribution repo at release time);
+# this launcher picks the one matching the host and execs it.
+#
+# (Older versions downloaded the binary from GitHub Releases to avoid committing
+# it to VCS. The binaries now ship in the dist repo, so there is no network
+# path and no version/tag parsing here.)
+#
+# Hard rule: never fail the Codex turn. Any problem logs to stderr and exits 0
+# (Codex treats a 0 exit with no stdout as success).
 
 set -u
 
-log() { printf 'trace-codex: %s\n' "$1" >&2; }
-truthy() {
-  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-    1 | true | yes | on) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-compatible_bt() {
-  [ -n "${1:-}" ] && [ -x "$1" ] && "$1" daemon hook --help >/dev/null 2>&1
-}
+log() { printf 'trace-codex launcher: %s\n' "$1" >&2; }
 
-# Build the eventual bt invocation before checking availability so a first-run
-# event can be replayed after the background installer completes.
-ROOT="${PLUGIN_ROOT:-$(CDPATH= cd "$(dirname "$0")/.." && pwd)}"
-version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-  "$ROOT/.codex-plugin/plugin.json" 2>/dev/null | head -1)
+# PLUGIN_ROOT is set by Codex to the installed plugin directory. Fall back to
+# this script's own parent so the launcher is runnable standalone.
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+ROOT="${PLUGIN_ROOT:-$(dirname "$SCRIPT_DIR")}"
 
-set -- daemon hook --source codex
-[ -z "$version" ] || set -- "$@" --source-version "$version"
-truthy "${BRAINTRUST_FLUSH_ON_TURN_END:-false}" && set -- "$@" --flush-on-turn-end
-[ -z "${CODEX_PARENT_SPAN_ID:-}" ] || set -- "$@" --parent-span-id "$CODEX_PARENT_SPAN_ID"
-[ -z "${CODEX_ROOT_SPAN_ID:-}" ] || set -- "$@" --root-span-id "$CODEX_ROOT_SPAN_ID"
-[ -z "${BRAINTRUST_ADDITIONAL_METADATA:-}" ] \
-  || set -- "$@" --additional-metadata "$BRAINTRUST_ADDITIONAL_METADATA"
+# Map uname output to our binary suffix (<os>-<arch>).
+os=$(uname -s 2>/dev/null || echo unknown)
+arch=$(uname -m 2>/dev/null || echo unknown)
+case "$os" in
+  Darwin) os_name=darwin ;;
+  Linux) os_name=linux ;;
+  *) log "unsupported OS '$os'; tracing disabled this session"; exit 0 ;;
+esac
+case "$arch" in
+  arm64 | aarch64) arch_name=arm64 ;;
+  x86_64 | amd64) arch_name=x64 ;;
+  *) log "unsupported arch '$arch'; tracing disabled this session"; exit 0 ;;
+esac
 
-BT_BIN=$(command -v bt 2>/dev/null || true)
-LOCAL_BT="${XDG_BIN_HOME:-$HOME/.local/bin}/bt"
-if ! compatible_bt "$BT_BIN" && compatible_bt "$LOCAL_BT"; then
-  BT_BIN="$LOCAL_BT"
-fi
-if ! compatible_bt "$BT_BIN"; then
-  BT_BIN=""
-fi
-if [ -z "$BT_BIN" ] && command -v curl >/dev/null 2>&1; then
-  # Never install synchronously in a blocking hook. Securely spool this event,
-  # then install and forward it in the detached child so a first SessionStart
-  # does not lose hook-only source/permission metadata.
-  umask 077
-  pending=$(mktemp "${TMPDIR:-/tmp}/trace-codex-event.XXXXXX" 2>/dev/null || true)
-  if [ -n "$pending" ] && cat >"$pending"; then
-    nohup sh -c '
-      pending=$1
-      shift
-      trap '"'"'rm -f "$pending"'"'"' 0
-      curl -fsSL --max-time 20 https://bt.dev/cli/install.sh | sh >/dev/null 2>&1 || exit 0
-      bt_bin=$(command -v bt 2>/dev/null || true)
-      if [ -z "$bt_bin" ] && [ -x "${XDG_BIN_HOME:-$HOME/.local/bin}/bt" ]; then
-        bt_bin="${XDG_BIN_HOME:-$HOME/.local/bin}/bt"
-      fi
-      [ -z "$bt_bin" ] || "$bt_bin" "$@" <"$pending" >/dev/null 2>&1
-    ' trace-codex-install "$pending" "$@" </dev/null >/dev/null 2>&1 &
-    log "a daemon-capable bt CLI is unavailable; queued this event behind a background install or upgrade"
-  else
-    [ -z "$pending" ] || rm -f "$pending"
-    nohup sh -c 'curl -fsSL --max-time 20 https://bt.dev/cli/install.sh | sh' \
-      </dev/null >/dev/null 2>&1 &
-    log "a daemon-capable bt CLI is unavailable; started a background install or upgrade but could not queue this event"
-  fi
-  exit 0
-fi
-if [ -z "$BT_BIN" ]; then
-  log "a daemon-capable bt CLI is unavailable; tracing disabled for this event"
+BIN="$ROOT/bin/codex-hook-$os_name-$arch_name"
+if [ ! -x "$BIN" ]; then
+  log "no binary at $BIN; tracing disabled this session"
   exit 0
 fi
 
-# The standalone Codex plugin has historically exposed BRAINTRUST_PROJECT,
-# while bt's global project option uses BRAINTRUST_DEFAULT_PROJECT. Preserve
-# the documented plugin contract without overriding an explicit bt default.
-if [ -z "${BRAINTRUST_DEFAULT_PROJECT:-}" ] && [ -n "${BRAINTRUST_PROJECT:-}" ]; then
-  export BRAINTRUST_DEFAULT_PROJECT="$BRAINTRUST_PROJECT"
-fi
-
-"$BT_BIN" "$@" || log "bt daemon hook failed non-fatally"
-exit 0
+exec "$BIN" "$@"

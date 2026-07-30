@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/session_start.sh",
             "async": false
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_submit.sh",
             "async": false
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use.sh",
             "async": false
           }
         ]
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/stop_hook.sh",
             "async": false
           }
         ]
@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/session_end.sh",
             "async": false
           }
         ]
@@ -61,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh Setup",
             "async": false
           }
         ]
@@ -72,7 +72,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_expansion.sh",
             "async": false
           }
         ]
@@ -84,7 +84,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh PreToolUse",
             "async": false
           }
         ]
@@ -96,7 +96,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh PermissionRequest",
             "async": false
           }
         ]
@@ -108,7 +108,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/permission_denied.sh",
             "async": false
           }
         ]
@@ -120,7 +120,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use_failure.sh",
             "async": false
           }
         ]
@@ -131,7 +131,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh PostToolBatch",
             "async": false
           }
         ]
@@ -143,7 +143,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh Notification",
             "async": false
           }
         ]
@@ -154,7 +154,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh MessageDisplay",
             "async": false
           }
         ]
@@ -166,7 +166,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh SubagentStart",
             "async": false
           }
         ]
@@ -178,7 +178,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh SubagentStop",
             "async": false
           }
         ]
@@ -189,7 +189,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh TaskCreated",
             "async": false
           }
         ]
@@ -200,7 +200,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh TaskCompleted",
             "async": false
           }
         ]
@@ -212,7 +212,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh StopFailure",
             "async": false
           }
         ]
@@ -223,7 +223,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh TeammateIdle",
             "async": false
           }
         ]
@@ -235,7 +235,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh InstructionsLoaded",
             "async": false
           }
         ]
@@ -247,7 +247,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh ConfigChange",
             "async": false
           }
         ]
@@ -258,7 +258,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh CwdChanged",
             "async": false
           }
         ]
@@ -269,7 +269,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh WorktreeCreate",
             "async": false
           }
         ]
@@ -280,7 +280,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh WorktreeRemove",
             "async": false
           }
         ]
@@ -292,7 +292,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh PreCompact",
             "async": false
           }
         ]
@@ -304,7 +304,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh PostCompact",
             "async": false
           }
         ]
@@ -316,7 +316,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh Elicitation",
             "async": false
           }
         ]
@@ -328,7 +328,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh ElicitationResult",
             "async": false
           }
         ]
@@ -340,7 +340,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/claude-hook.sh\"",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/record_event.sh FileChanged",
             "async": false
           }
         ]

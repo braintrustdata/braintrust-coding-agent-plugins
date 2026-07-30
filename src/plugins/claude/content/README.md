@@ -10,8 +10,7 @@ A Claude Code plugin marketplace for [Braintrust](https://braintrust.dev) integr
 ## Prerequisites
 
 - A [Braintrust account](https://braintrust.dev)
-- The [`bt` CLI](https://bt.dev/cli/install.sh), authenticated with `bt auth login`,
-  or `BRAINTRUST_API_KEY` exported in your environment
+- `BRAINTRUST_API_KEY` exported in your environment
 
 ## Installation
 
@@ -38,9 +37,7 @@ claude plugin install braintrust@braintrust-claude-plugin
 
 ### trace-claude-code
 
-Automatically traces Claude Code conversations to Braintrust through the
-shared local `bt` daemon. Captures sessions, turns, model calls, tool calls,
-subagents, tool failures, and permission denials as hierarchical traces.
+Automatically traces Claude Code conversations to Braintrust. Captures sessions, conversation turns, and tool calls as hierarchical traces.
 
 ```bash
 claude plugin install trace-claude-code@braintrust-claude-plugin
@@ -48,34 +45,22 @@ claude plugin install trace-claude-code@braintrust-claude-plugin
 $HOME/.claude/plugins/marketplaces/braintrust-claude-plugin/plugins/trace-claude-code/setup.sh
 ```
 
-The setup script enables tracing in the daemon's shared non-credential
-`config.json`. The project selected there applies to every coding-agent plugin
-connected to the daemon.
-
-The tracing launchers live under `plugins/trace-claude-code/bin/` as
-`claude-hook.sh` and `claude-hook.cmd`. The Windows launcher forwards the same
-configuration to `bt`, whose daemon uses a local named pipe on Windows.
+Traces are sent to the `claude-code` project by default.
 
 #### manual configuration
 
-Instead of running `setup.sh`, create the daemon's shared config at
-`$BT_DAEMON_CONFIG`, or at `config.json` inside `$BT_DAEMON_DATA_DIR` (by
-default `~/.braintrust/state/bt-daemon/config.json` on Unix):
+Instead of running `setup.sh`, you can manually edit `~/.claude/settings.json` or your project's `.claude/settings.local.json`:
 
 ```json
 {
-  "traceToBraintrust": true,
-  "project": "coding-agents",
-  "flushOnTurnEnd": false,
-  "additionalMetadata": {"team": "platform"}
+  "env": {
+    "TRACE_TO_BRAINTRUST": "true",
+    "BRAINTRUST_CC_PROJECT": "project-name-to-send-cc-traces-to",
+    "BRAINTRUST_API_KEY": "sk-yourkey",
+    "BRAINTRUST_DEBUG": "false"
+  }
 }
 ```
-
-This file intentionally contains no API keys, auth tokens, credentials, or
-backend URLs. Those come from the authenticated `bt` CLI. The legacy
-`TRACE_TO_BRAINTRUST`, `BRAINTRUST_CC_PROJECT`,
-`BRAINTRUST_FLUSH_ON_TURN_END`, and `BRAINTRUST_ADDITIONAL_METADATA`
-environment variables remain fallbacks for omitted shared settings.
 
 #### add claude code trace to an existing trace
 
@@ -93,12 +78,11 @@ claude --settings '{"env":{"CC_PARENT_SPAN_ID":"parent-span-id","CC_ROOT_SPAN_ID
 
 The Claude Code session and all its turns/tools will appear as children of your parent span in Braintrust.
 
-To route the session into an existing experiment instead of project logs, set
-`CC_EXPERIMENT_ID`.
+To attach claude code to an experiment's trace, specify CC_EXPERIMENT_ID as well:
 
-Set `BRAINTRUST_RECORD_DIR` to capture native hook events and transcript
-snapshots for a reproducible local fixture. The daemon also embeds transcript
-snapshots in its redacted recovery journal at lifecycle boundaries.
+```bash
+claude --settings '{"env":{"CC_PARENT_SPAN_ID":"parent-span-id","CC_ROOT_SPAN_ID":"root-span-id", "CC_EXPERIMENT_ID":"the-experiment-id"}}' -p "task"
+```
 
 #### token accounting
 
