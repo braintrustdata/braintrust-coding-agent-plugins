@@ -107,3 +107,97 @@ async fn imports_native_claude_transcript_with_multiple_turns_and_tools() {
             == Some(true)
     }));
 }
+
+#[tokio::test]
+async fn imports_non_monotonic_claude_records_into_their_native_turns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("claude.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"type":"user","uuid":"user-1","timestamp":"2026-01-01T00:00:01Z","sessionId":"claude-non-monotonic","cwd":"/tmp/demo","version":"2.0.0","message":{"role":"user","content":"first"}}),
+            json!({"type":"assistant","uuid":"assistant-1","parentUuid":"user-1","timestamp":"2026-01-01T00:00:02Z","sessionId":"claude-non-monotonic","isApiErrorMessage":true,"apiErrorStatus":404,"error":"model_not_found","message":{"id":"msg-1","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"model unavailable"}],"usage":{"input_tokens":0,"output_tokens":0}}}),
+            // Claude may append queue bookkeeping before conversation records
+            // whose native timestamps are earlier.
+            json!({"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:00:10Z","sessionId":"claude-non-monotonic","content":"third"}),
+            json!({"type":"queue-operation","operation":"dequeue","timestamp":"2026-01-01T00:00:10Z","sessionId":"claude-non-monotonic"}),
+            json!({"type":"user","uuid":"user-2","parentUuid":"assistant-1","timestamp":"2026-01-01T00:00:05Z","sessionId":"claude-non-monotonic","message":{"role":"user","content":[{"type":"text","text":"second"}]}}),
+            json!({"type":"assistant","uuid":"assistant-2","parentUuid":"user-2","timestamp":"2026-01-01T00:00:06Z","sessionId":"claude-non-monotonic","isApiErrorMessage":false,"message":{"id":"msg-2","model":"claude-test","role":"assistant","content":[{"type":"text","text":"second response"}],"usage":{"input_tokens":4,"output_tokens":2}}}),
+            json!({"type":"user","uuid":"user-3","parentUuid":"assistant-2","timestamp":"2026-01-01T00:00:11Z","sessionId":"claude-non-monotonic","message":{"role":"user","content":"third"}}),
+            json!({"type":"assistant","uuid":"assistant-3","parentUuid":"user-3","timestamp":"2026-01-01T00:00:12Z","sessionId":"claude-non-monotonic","isApiErrorMessage":true,"apiErrorStatus":429,"error":"rate_limit_error","message":{"id":"msg-3","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"rate limited"}],"usage":{"input_tokens":0,"output_tokens":0}}}),
+        ],
+    );
+
+    let output = tmp.path().join("spans");
+    import_transcript(&transcript, ImportSource::Claude, options(&output), None)
+        .await
+        .unwrap();
+
+    let rows = rows(&output.join("claude-non-monotonic.ndjson"));
+    assert_eq!(inserted(&rows, "task"), 4, "session and three turns");
+    assert_eq!(inserted(&rows, "llm"), 3);
+
+    let insert_named = |name: &str| {
+        rows.iter()
+            .filter_map(|op| op.get("Insert"))
+            .find(|row| row.get("name").and_then(Value::as_str) == Some(name))
+            .unwrap()
+    };
+    let turn_1 = insert_named("Turn 1");
+    let turn_2 = insert_named("Turn 2");
+    let turn_3 = insert_named("Turn 3");
+    let merged_turn = |turn: &Value| {
+        let span_id = turn.get("span_id").and_then(Value::as_str).unwrap();
+        rows.iter()
+            .filter_map(|op| op.get("Merge"))
+            .find(|row| row.get("span_id").and_then(Value::as_str) == Some(span_id))
+            .unwrap()
+    };
+    assert_eq!(
+        merged_turn(turn_1).get("end_ms").and_then(Value::as_i64),
+        Some(1_767_225_602_000)
+    );
+    assert_eq!(
+        merged_turn(turn_1).get("error").and_then(Value::as_str),
+        Some("model_not_found")
+    );
+    assert_eq!(
+        merged_turn(turn_2).get("end_ms").and_then(Value::as_i64),
+        Some(1_767_225_606_000)
+    );
+    assert!(merged_turn(turn_2).get("error").is_none());
+    assert_eq!(
+        merged_turn(turn_3).get("error").and_then(Value::as_str),
+        Some("rate_limit_error")
+    );
+    let llm = |request_id: &str| {
+        rows.iter()
+            .filter_map(|op| op.get("Insert"))
+            .find(|row| {
+                row.pointer("/metadata/request_id").and_then(Value::as_str) == Some(request_id)
+            })
+            .unwrap()
+    };
+    for (request_id, turn) in [("msg-1", turn_1), ("msg-2", turn_2), ("msg-3", turn_3)] {
+        assert_eq!(
+            llm(request_id)
+                .pointer("/parent_span_ids/0")
+                .and_then(Value::as_str),
+            turn.get("span_id").and_then(Value::as_str)
+        );
+    }
+    assert_eq!(
+        llm("msg-1").get("error").and_then(Value::as_str),
+        Some("model_not_found")
+    );
+    assert_eq!(
+        llm("msg-1")
+            .pointer("/metadata/api_error_status")
+            .and_then(Value::as_u64),
+        Some(404)
+    );
+    assert_eq!(
+        llm("msg-3").get("error").and_then(Value::as_str),
+        Some("rate_limit_error")
+    );
+}

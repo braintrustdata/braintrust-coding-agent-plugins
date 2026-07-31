@@ -136,21 +136,29 @@ pub(crate) fn transcript_envelopes(
 ) -> anyhow::Result<Vec<Envelope>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("read transcript {}", path.display()))?;
-    let records: Vec<Value> = contents
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            serde_json::from_str(line)
-                .with_context(|| format!("parse transcript {} line {}", path.display(), index + 1))
-        })
-        .collect::<anyhow::Result<_>>()?;
+    let mut records = Vec::new();
+    let mut record_end_offsets = Vec::new();
+    let mut offset = 0_u64;
+    for (index, line) in contents.split_inclusive('\n').enumerate() {
+        offset += line.len() as u64;
+        if line.trim().is_empty() {
+            continue;
+        }
+        records.push(
+            serde_json::from_str(line).with_context(|| {
+                format!("parse transcript {} line {}", path.display(), index + 1)
+            })?,
+        );
+        record_end_offsets.push(offset);
+    }
     if records.is_empty() {
         bail!("transcript {} is empty", path.display());
     }
     match source {
         ImportSource::Codex => codex_envelopes(path, &records),
-        ImportSource::Claude => claude_envelopes(path, &records),
+        ImportSource::Claude => {
+            claude_envelopes(path, &records, &record_end_offsets, contents.len() as u64)
+        }
     }
 }
 
@@ -235,7 +243,15 @@ fn codex_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelop
     Ok(events)
 }
 
-fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelope>> {
+fn claude_envelopes(
+    path: &Path,
+    records: &[Value],
+    record_end_offsets: &[u64],
+    transcript_len: u64,
+) -> anyhow::Result<Vec<Envelope>> {
+    if records.len() != record_end_offsets.len() {
+        bail!("Claude transcript record offsets do not match parsed records");
+    }
     let session_id = records
         .iter()
         .find_map(|record| string_at(record, "/sessionId"))
@@ -246,8 +262,7 @@ fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelo
     let cwd = records.iter().find_map(|record| string_at(record, "/cwd"));
     let (start_ms, end_ms) = timestamp_bounds(records);
     let transcript_path = path.to_string_lossy().into_owned();
-    let mut events = vec![envelope(
-        "claude-code",
+    let mut events = vec![claude_import_envelope(
         source_version.clone(),
         &session_id,
         "SessionStart",
@@ -259,6 +274,7 @@ fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelo
             "cwd": cwd,
             "source": "import"
         }),
+        0,
     )];
 
     let user_indexes: Vec<usize> = records
@@ -270,8 +286,16 @@ fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelo
         let next = user_indexes.get(turn + 1).copied().unwrap_or(records.len());
         let segment = &records[index..next];
         let turn_start = timestamp_ms(&records[index]).unwrap_or(start_ms);
+        // Claude can append queue bookkeeping ahead of older conversation
+        // records. Only message rows define the native turn's duration.
         let turn_end = segment
             .iter()
+            .filter(|record| {
+                matches!(
+                    record.get("type").and_then(Value::as_str),
+                    Some("user" | "assistant")
+                )
+            })
             .filter_map(timestamp_ms)
             .max()
             .unwrap_or(turn_start);
@@ -279,8 +303,7 @@ fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelo
             .pointer("/message/content")
             .cloned()
             .unwrap_or(Value::Null);
-        events.push(envelope(
-            "claude-code",
+        events.push(claude_import_envelope(
             source_version.clone(),
             &session_id,
             "UserPromptSubmit",
@@ -292,24 +315,31 @@ fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelo
                 "cwd": cwd,
                 "prompt": prompt
             }),
+            record_end_offsets[index],
         ));
-        events.push(envelope(
-            "claude-code",
+        let error = last_assistant_error(segment);
+        let stop_event = if error.is_some() {
+            "StopFailure"
+        } else {
+            "Stop"
+        };
+        events.push(claude_import_envelope(
             source_version.clone(),
             &session_id,
-            "Stop",
+            stop_event,
             turn_end,
             json!({
                 "session_id": session_id,
-                "hook_event_name": "Stop",
+                "hook_event_name": stop_event,
                 "transcript_path": transcript_path,
                 "cwd": cwd,
-                "last_assistant_message": last_assistant_text(segment)
+                "last_assistant_message": last_assistant_text(segment),
+                "error": error
             }),
+            record_end_offsets[next.saturating_sub(1)],
         ));
     }
-    events.push(envelope(
-        "claude-code",
+    events.push(claude_import_envelope(
         source_version,
         &session_id,
         "SessionEnd",
@@ -321,8 +351,30 @@ fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelo
             "cwd": cwd,
             "reason": "transcript_import"
         }),
+        transcript_len,
     ));
     Ok(events)
+}
+
+fn claude_import_envelope(
+    source_version: Option<String>,
+    session_id: &str,
+    event: &str,
+    ts_ms: i64,
+    mut payload: Value,
+    through_offset: u64,
+) -> Envelope {
+    if let Some(payload) = payload.as_object_mut() {
+        payload.insert("_bt_import_through_offset".into(), json!(through_offset));
+    }
+    envelope(
+        "claude-code",
+        source_version,
+        session_id,
+        event,
+        ts_ms,
+        payload,
+    )
 }
 
 fn envelope(
@@ -378,6 +430,23 @@ fn last_assistant_text(records: &[Value]) -> Option<Value> {
             .collect::<Vec<_>>()
             .join("\n");
         (!text.is_empty()).then(|| json!(text))
+    })
+}
+
+fn last_assistant_error(records: &[Value]) -> Option<String> {
+    records.iter().rev().find_map(|record| {
+        if record.get("type").and_then(Value::as_str) != Some("assistant")
+            || record.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true)
+        {
+            return None;
+        }
+        string_at(record, "/error")
+            .or_else(|| {
+                last_assistant_text(std::slice::from_ref(record))?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .or_else(|| Some("Claude API error".into()))
     })
 }
 

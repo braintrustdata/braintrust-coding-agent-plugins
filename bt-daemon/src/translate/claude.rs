@@ -795,6 +795,8 @@ struct LlmCall {
     cache_creation_5m_tokens: u64,
     cache_creation_1h_tokens: u64,
     cache_read_tokens: u64,
+    error: Option<String>,
+    api_error_status: Option<u64>,
 }
 
 impl LlmCall {
@@ -813,11 +815,35 @@ impl LlmCall {
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
             cache_read_tokens: 0,
+            error: None,
+            api_error_status: None,
         }
     }
 
     fn observe(&mut self, record: &Value) {
         self.end_ms = parse_timestamp_ms(record).unwrap_or(self.end_ms);
+        if record
+            .get("isApiErrorMessage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.error = string_field(record, "error")
+                .or_else(|| {
+                    record
+                        .pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .and_then(|content| {
+                            content.iter().find_map(|block| {
+                                (block.get("type").and_then(Value::as_str) == Some("text"))
+                                    .then(|| block.get("text").and_then(Value::as_str))
+                                    .flatten()
+                            })
+                        })
+                        .map(str::to_owned)
+                })
+                .or_else(|| Some("Claude API error".into()));
+            self.api_error_status = record.get("apiErrorStatus").and_then(Value::as_u64);
+        }
         let Some(message) = record.get("message") else {
             return;
         };
@@ -914,6 +940,12 @@ impl LlmCall {
             );
         }
         let output = self.output_message();
+        let mut metadata = Map::new();
+        metadata.insert("model".into(), json!(self.model));
+        metadata.insert("request_id".into(), json!(self.request_id));
+        if let Some(status) = self.api_error_status {
+            metadata.insert("api_error_status".into(), json!(status));
+        }
         SpanRow {
             span_id,
             root_span_id,
@@ -924,8 +956,9 @@ impl LlmCall {
             end_ms: Some(self.end_ms),
             input: Some(Value::Array(self.input)),
             output: Some(output),
-            metadata: Some(json!({ "model": self.model, "request_id": self.request_id })),
+            metadata: Some(Value::Object(metadata)),
             metrics: Some(Value::Object(metrics)),
+            error: self.error,
             ..Default::default()
         }
     }
@@ -1011,16 +1044,71 @@ fn read_buffered_until<R: std::io::Read>(
 }
 
 fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Value> {
+    let import_through_offset = event
+        .payload
+        .get("_bt_import_through_offset")
+        .and_then(Value::as_u64);
     let snapshot = event
         .payload
         .get("_bt_transcript_snapshot")
         .filter(|snapshot| snapshot.get("path").and_then(Value::as_str) == Some(path))
         .and_then(|snapshot| snapshot.get("contents"))
         .and_then(Value::as_str);
-    match snapshot {
-        Some(contents) => read_snapshot_until(contents, offset, event.ts_ms),
-        None => read_records_until(path, offset, event.ts_ms),
+    match (snapshot, import_through_offset) {
+        (Some(contents), Some(through)) => read_snapshot_through_offset(contents, offset, through),
+        (None, Some(through)) => read_records_through_offset(path, offset, through),
+        (Some(contents), None) => read_snapshot_until(contents, offset, event.ts_ms),
+        (None, None) => read_records_until(path, offset, event.ts_ms),
     }
+}
+
+fn read_records_through_offset(path: &str, offset: &mut u64, through: u64) -> Vec<Value> {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    if *offset > len {
+        *offset = 0;
+    }
+    if file.seek(SeekFrom::Start(*offset)).is_err() {
+        return Vec::new();
+    }
+    read_buffered_through_offset(&mut std::io::BufReader::new(file), offset, through.min(len))
+}
+
+fn read_snapshot_through_offset(contents: &str, offset: &mut u64, through: u64) -> Vec<Value> {
+    if *offset > contents.len() as u64 {
+        *offset = 0;
+    }
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(contents.as_bytes()));
+    if reader.seek(SeekFrom::Start(*offset)).is_err() {
+        return Vec::new();
+    }
+    read_buffered_through_offset(&mut reader, offset, through.min(contents.len() as u64))
+}
+
+fn read_buffered_through_offset<R: std::io::Read>(
+    reader: &mut std::io::BufReader<R>,
+    offset: &mut u64,
+    through: u64,
+) -> Vec<Value> {
+    let mut records = Vec::new();
+    let mut line = String::new();
+    while *offset < through {
+        line.clear();
+        let start = *offset;
+        let Ok(read) = reader.read_line(&mut line) else {
+            break;
+        };
+        if read == 0 || start + read as u64 > through {
+            break;
+        }
+        *offset += read as u64;
+        if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
+            records.push(value);
+        }
+    }
+    records
 }
 
 fn read_snapshot_until(contents: &str, offset: &mut u64, cutoff_ms: i64) -> Vec<Value> {
