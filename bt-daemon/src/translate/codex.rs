@@ -963,6 +963,9 @@ impl CodexTranslator {
             metadata: Some(json!({ "model": scope.model, "turn_id": turn_id, "compaction": true })),
             ..Default::default()
         }));
+        if let Some(replacement) = replacement {
+            scope.conversation_history = replacement;
+        }
         let _ = (turn_span, name);
         scope.open_llm = Some(OpenLlm {
             span_id,

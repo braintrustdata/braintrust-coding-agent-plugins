@@ -772,6 +772,57 @@ fn codex_compaction_relabels_turn_and_adds_compaction_llm() {
 }
 
 #[test]
+fn codex_compaction_replaces_history_for_following_llms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta", "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context", "payload": { "model": "gpt-5.5" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "discard me" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 10, "output_tokens": 2 } } } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "compacted", "payload": { "replacement_history": [{ "role": "user", "content": "compacted context" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:07Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 5, "output_tokens": 1 } } } }),
+        json!({ "timestamp": "2026-01-01T00:00:08Z", "type": "event_msg", "payload": { "type": "task_complete", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:09Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t2" } }),
+        json!({ "timestamp": "2026-01-01T00:00:10Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "after" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:11Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 6, "output_tokens": 1 } } } }),
+    ] {
+        append(&transcript, record);
+    }
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let rows = reduce(
+        translator
+            .handle(
+                &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    let following = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm
+                && row
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["turn_id"] == json!("t2"))
+        })
+        .unwrap();
+    let input = following.input.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(
+        input,
+        &[json!({ "role": "user", "content": "compacted context" })]
+    );
+}
+
+#[test]
 fn codex_subagent_nests_under_spawning_turn() {
     let tmp = tempfile::tempdir().unwrap();
     let main_t = tmp.path().join("main.jsonl");
