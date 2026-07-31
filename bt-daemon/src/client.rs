@@ -98,10 +98,14 @@ pub async fn ensure_daemon(
         anyhow::bail!("no daemon at {} and --no-spawn is set", socket.display());
     }
     spawn_daemon(host, socket)?;
-    for _ in 0..50 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
         tokio::time::sleep(Duration::from_millis(20)).await;
         if let Ok(s) = connect(socket).await {
             return Ok(s);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
     }
     anyhow::bail!("daemon did not come up at {}", socket.display())

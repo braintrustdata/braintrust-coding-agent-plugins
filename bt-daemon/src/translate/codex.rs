@@ -1478,7 +1478,7 @@ fn parse_ts(rec: &Value) -> Option<i64> {
 }
 
 fn read_new_lines(path: &str, offset: &mut u64, through_ms: Option<i64>) -> Vec<String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
         return Vec::new();
     };
@@ -1490,20 +1490,19 @@ fn read_new_lines(path: &str, offset: &mut u64, through_ms: Option<i64>) -> Vec<
     if f.seek(SeekFrom::Start(*offset)).is_err() {
         return Vec::new();
     }
-    let mut buf = String::new();
-    if f.read_to_string(&mut buf).is_err() {
-        return Vec::new();
-    }
-    let Some(last_nl) = buf.rfind('\n') else {
-        return Vec::new();
-    };
-    let complete = &buf[..=last_nl];
-    let mut consumed = 0usize;
+    let mut reader = BufReader::new(f);
     let mut lines = Vec::new();
-    for line_with_newline in complete.split_inclusive('\n') {
-        let line = line_with_newline.trim_end_matches(['\r', '\n']);
+    loop {
+        let mut line = String::new();
+        let Ok(bytes) = reader.read_line(&mut line) else {
+            break;
+        };
+        if bytes == 0 || !line.ends_with('\n') {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if let Some(limit) = through_ms {
-            if serde_json::from_str::<Value>(line)
+            if serde_json::from_str::<Value>(trimmed)
                 .ok()
                 .and_then(|record| parse_ts(&record))
                 .is_some_and(|timestamp| timestamp > limit)
@@ -1511,12 +1510,11 @@ fn read_new_lines(path: &str, offset: &mut u64, through_ms: Option<i64>) -> Vec<
                 break;
             }
         }
-        consumed += line_with_newline.len();
-        if !line.trim().is_empty() {
-            lines.push(line.to_string());
+        *offset += bytes as u64;
+        if !trimmed.trim().is_empty() {
+            lines.push(trimmed.to_string());
         }
     }
-    *offset += consumed as u64;
     lines
 }
 

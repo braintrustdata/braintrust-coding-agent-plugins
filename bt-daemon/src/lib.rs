@@ -400,7 +400,7 @@ pub async fn import_transcript(
         // Imports can contain tens of thousands of SDK log commands. Bound the
         // number queued between drains without serializing one network flush
         // for every native turn boundary.
-        const FLUSH_OPS: usize = 2_000;
+        const FLUSH_OPS: usize = 500;
         for chunk in ops.chunks(FLUSH_OPS) {
             live.sink.emit(chunk).await?;
             live.pending_ops += chunk.len();
