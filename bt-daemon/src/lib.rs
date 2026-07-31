@@ -16,6 +16,7 @@ mod client;
 mod dispatch;
 mod ids;
 mod journal;
+mod replay;
 mod server;
 mod settings;
 mod sink;
@@ -30,7 +31,7 @@ pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -110,8 +111,18 @@ pub struct StatusArgs {
 /// Arguments for `replay`.
 #[derive(Debug, Clone, Args)]
 pub struct ReplayArgs {
-    /// A journal NDJSON file to replay through the translators + sink.
+    /// A native Codex rollout or Claude Code transcript JSONL file.
     pub file: PathBuf,
+    /// Transcript producer. Inferred from the file when omitted.
+    #[arg(long, value_enum)]
+    pub source: Option<ReplaySource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ReplaySource {
+    Codex,
+    #[value(name = "claude", alias = "claude-code")]
+    Claude,
 }
 
 /// Run the daemon until shutdown.
@@ -326,12 +337,16 @@ pub async fn shutdown_daemon(socket: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Replay a journal file through the translators + sink (no daemon, no
-/// network unless the sink talks to one). Deterministic; used for fixture
-/// tests and translator-vs-translator diffing.
-pub async fn run_replay(args: ReplayArgs, opts: ServeOptions) -> anyhow::Result<()> {
+/// Import a native coding-agent transcript through the normal translators and
+/// sink. This is separate from daemon journal recovery: replay creates traces
+/// for a past session, while recovery rebuilds live correlation state.
+pub async fn run_replay(
+    args: ReplayArgs,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+) -> anyhow::Result<()> {
     use std::collections::HashMap;
-    let entries = journal::read_journal(&args.file).await?;
+    let entries = replay::transcript_envelopes(&args.file, args.source)?;
 
     struct Live {
         translator: Box<dyn AgentTranslator>,
@@ -340,8 +355,8 @@ pub async fn run_replay(args: ReplayArgs, opts: ServeOptions) -> anyhow::Result<
     }
     let mut sessions: HashMap<String, Live> = HashMap::new();
 
-    for redacted in entries {
-        let env = journal::envelope_from_redacted(redacted);
+    for mut env in entries {
+        env.config = config.clone();
         let sid = env.session_id.clone();
         let live = match sessions.get_mut(&sid) {
             Some(l) => l,

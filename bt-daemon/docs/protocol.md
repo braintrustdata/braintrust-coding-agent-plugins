@@ -225,12 +225,22 @@ replay the live credentials must be re-supplied.
 
 ## Durability & idempotence
 
+Journal recovery and explicit transcript replay are separate operations.
+Recovery consumes the daemon's auth-redacted event WAL to rebuild state and
+may idempotently re-emit rows under their original deterministic ids. The
+`replay` command instead consumes a native Codex rollout or Claude Code
+transcript and creates a trace for that past coding-agent session by routing
+synthetic lifecycle events through the regular translator.
+
 - **Journal (WAL).** Every accepted event is appended (auth-redacted) to
   `<data_dir>/journal/<session_id>.ndjson` before/at enqueue. `data_dir`
   defaults to `$XDG_STATE_HOME/braintrust/bt-daemon` or
   `$HOME/.braintrust/state/bt-daemon` on Unix, and
   `%LOCALAPPDATA%\Braintrust\bt-daemon` on Windows. On restart the daemon
-  rebuilds a session's state by replaying its journal through the translator.
+  rebuilds a session's unfinished correlation state by applying its journal to
+  a fresh translator. The resulting rows may be resubmitted to repair delivery
+  interrupted by a crash, but their deterministic ids target the same backend
+  rows and must never create duplicate spans.
   Journals are GC'd after 7 days.
 - **Deterministic span ids.** Translators derive span ids as UUIDv5 over stable
   keys (`session_id`, `turn_id`, `call_id`, …) so a replayed re-emit merges

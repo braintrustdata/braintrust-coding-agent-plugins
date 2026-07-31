@@ -74,12 +74,20 @@ echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./target/debug/bt-
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
 
+`replay <file>` has a different purpose from restart recovery. It imports a
+native Codex rollout JSONL or Claude Code transcript JSONL, synthesizes the
+agent lifecycle triggers that can be recovered from that file, and sends them
+through the normal translator and sink to create a trace for the past session.
+The producer is detected from the file or can be selected with `--source`.
+Hook-only facts absent from a native transcript are not invented.
+
 ## Status
 
 Phases 0–5 are implemented: protocol, daemon lifecycle, Braintrust sink,
 Codex and Claude translators, `bt daemon` integration, and thin hook shims for
 both shipped plugins. Restart recovery replays the redacted journal with
-deterministic span ids. Claude lifecycle entries embed transcript snapshots, so
+deterministic span ids, so resubmitted rows merge into the same spans instead
+of creating duplicates. Claude lifecycle entries embed transcript snapshots, so
 recovery does not depend on mutable external paths. Explicit turn/session-end
 flushes are bounded, and sessions can target project logs or an experiment.
 

@@ -360,7 +360,7 @@ async fn spawn_on_demand_runs_the_real_standalone_daemon() {
 }
 
 #[tokio::test]
-async fn restart_replays_journal_before_processing_new_events() {
+async fn restart_replays_journal_with_stable_span_ids_before_new_events() {
     let (data_dir, socket, first, _tmp) = start_daemon().await;
     let host = dummy_host();
     forward_envelope(
@@ -384,10 +384,34 @@ async fn restart_replays_journal_before_processing_new_events() {
     let journal = std::fs::read_to_string(data_dir.join("journal/resume.ndjson")).unwrap();
     assert_eq!(journal.lines().count(), 2);
     let spans = std::fs::read_to_string(data_dir.join("spans/resume.ndjson")).unwrap();
+    let rows: Vec<serde_json::Value> = spans
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     assert_eq!(
-        spans.lines().count(),
+        rows.len(),
         5,
-        "first delivery (2) + replay repair (2) + resumed event (1)"
+        "first delivery (2) + recovery replay (2) + resumed event (1)"
+    );
+    let span_id = |row: &serde_json::Value| {
+        row.get("Insert")
+            .or_else(|| row.get("Merge"))
+            .and_then(|body| body.get("span_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(span_id(&rows[2]), span_id(&rows[0]));
+    assert_eq!(span_id(&rows[3]), span_id(&rows[1]));
+    assert_ne!(span_id(&rows[4]), span_id(&rows[1]));
+    let unique_ids = rows
+        .iter()
+        .map(span_id)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        unique_ids.len(),
+        3,
+        "recovery must reuse both historical ids; only the new event gets a new id"
     );
 
     shutdown(&socket).await;

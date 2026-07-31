@@ -187,7 +187,9 @@ impl SessionActor {
         };
         // Rebuild translator state before accepting the first new event. Keep
         // the deterministic replay ops buffered until live credentials arrive;
-        // then re-emitting them repairs any rows lost by a prior crash.
+        // then re-emitting them repairs any rows lost by a prior crash. The
+        // stable span ids ensure these target existing rows rather than create
+        // duplicate spans.
         let mut replay_ops = Vec::new();
         for env in &self.replay {
             if let Some(cfg) = &env.config {

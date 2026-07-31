@@ -67,7 +67,7 @@ enum Command {
     },
     /// Print daemon/session status.
     Status(StatusArgs),
-    /// Replay a journal file through the translators + sink.
+    /// Import a native Codex or Claude Code transcript.
     Replay(ReplayArgs),
 }
 
@@ -174,7 +174,7 @@ async fn main() {
         Command::Replay(args) => {
             let data_dir = paths::data_dir(None);
             let opts = debug_serve_options(VERSION, &data_dir);
-            if let Err(e) = run_replay(args, opts).await {
+            if let Err(e) = run_replay(args, opts, None).await {
                 eprintln!("bt-daemon replay: {e}");
                 std::process::exit(1);
             }
