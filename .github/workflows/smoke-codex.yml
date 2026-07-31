@@ -1,18 +1,8 @@
-# End-to-end smoke test for the codex plugin against a deployed distribution repo.
-# Installs Codex + the plugin from the marketplace on Linux + both macOS arches,
-# runs a real `codex exec` session with tracing pointed at a local mock Braintrust
-# collector, and asserts at least one trace row was reported. This catches the
-# per-platform failure modes a source build can't (code signing, cross-compiled
-# binaries, marketplace install).
-#
-# Two entry points:
-#   - workflow_call: run by _release.yml after a deploy, against the repo it just
-#     published to.
-#   - workflow_dispatch: run manually against any dist repo (default: the test repo).
-#
-# Requires the OPENAI_API_KEY secret for `codex exec`; if it is unset the smoke is
-# skipped (with a warning) rather than failing. PUBLISH_TOKEN is used to clone a
-# private/internal dist repo.
+# Post-deploy end-to-end smoke test for the Codex plugin. It installs the
+# deployed marketplace, runs a real Codex session through the daemon-capable
+# `bt` CLI, and verifies that the Rust daemon sends span rows to a local mock
+# Braintrust backend. Credentials and backend URLs are supplied to `bt`; the
+# shared daemon config contains behavior settings only.
 
 name: Smoke (codex)
 
@@ -39,18 +29,15 @@ permissions:
   contents: read
 
 env:
-  PLUGIN_DIR: src/plugins/codex/content/plugins/trace-codex
   MARKETPLACE: braintrust-codex-plugins
 
 jobs:
-  # Skip the (matrix) smoke cleanly when no OpenAI key is configured, instead of
-  # failing every release. Job-level `if` can't read secrets, so gate here.
   guard:
     runs-on: ubuntu-24.04
     outputs:
-      has_key: ${{ steps.c.outputs.has_key }}
+      has_key: ${{ steps.check.outputs.has_key }}
     steps:
-      - id: c
+      - id: check
         env:
           KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -82,29 +69,46 @@ jobs:
         with:
           node-version: 22
 
-      - name: Enable pnpm
-        run: corepack enable
+      - name: Install Codex and bt CLIs
+        run: |
+          npm install -g @openai/codex
+          curl -fsSL https://bt.dev/cli/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install plugin dependencies (for the mock collector)
-        working-directory: ${{ env.PLUGIN_DIR }}
-        run: pnpm install
+      - name: Require daemon-capable bt
+        run: |
+          "$HOME/.local/bin/bt" daemon hook --help
 
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex
-
-      - name: Install codex plugin from ${{ inputs.dist_repo }}
+      - name: Install plugin from ${{ inputs.dist_repo }}
         env:
-          # PUBLISH_TOKEN can read the (private/internal) dist repo; rewrite
-          # github.com clones to use it so `codex plugin marketplace add` (a git
-          # clone) authenticates.
           GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
         run: |
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           codex plugin marketplace add "${{ inputs.dist_repo }}"
           codex plugin add "trace-codex@${MARKETPLACE}"
 
-      - name: Run smoke test (${{ matrix.label }})
-        working-directory: ${{ env.PLUGIN_DIR }}
+      - name: Run real traced Codex session (${{ matrix.label }})
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: sh scripts/smoke-test.sh
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BRAINTRUST_API_KEY: smoke-key
+          BRAINTRUST_API_URL: http://127.0.0.1:53999
+          BRAINTRUST_APP_URL: http://127.0.0.1:53999
+          BT_DAEMON_CONFIG: ${{ runner.temp }}/bt-daemon-config.json
+          MOCK_COLLECTOR_OUT: ${{ runner.temp }}/mock-summary.json
+        run: |
+          printf '%s\n' '{"traceToBraintrust":true,"project":"trace-codex-smoke","flushOnTurnEnd":true}' > "$BT_DAEMON_CONFIG"
+          python3 .github/scripts/mock-braintrust.py > "${{ runner.temp }}/mock-collector.log" 2>&1 &
+          collector_pid=$!
+          trap 'kill "$collector_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 50); do
+            curl -fsS http://127.0.0.1:53999/version >/dev/null && break
+            sleep 0.2
+          done
+          curl -fsS http://127.0.0.1:53999/version >/dev/null
+          codex exec \
+            --skip-git-repo-check \
+            --dangerously-bypass-hook-trust \
+            --sandbox read-only \
+            "say hi"
+          python3 -c 'import json, os; s=json.load(open(os.environ["MOCK_COLLECTOR_OUT"])); assert s["totalRows"] >= 1, s; print(s)'

@@ -43,10 +43,7 @@ concurrency:
 
 jobs:
   release:
-    # codex builds native macOS binaries that must be ad-hoc codesigned (only
-    # `codesign`, i.e. macOS, can do that), so it runs on a macOS runner. claude
-    # has no binaries, so it stays on cheaper Linux.
-    runs-on: ${{ inputs.plugin == 'codex' && 'macos-14' || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout monorepo
@@ -76,14 +73,6 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Releasing $tag -> ${{ inputs.dist_repo }} (record=${{ inputs.record }})"
-
-      - name: Set up Node (for building codex binaries)
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-
-      - name: Enable pnpm
-        run: corepack enable
 
       - name: Bump plugin manifest versions
         run: python3 scripts/set-plugin-version.py "${{ inputs.plugin }}" "${{ steps.vars.outputs.version }}"
