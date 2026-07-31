@@ -50,7 +50,7 @@ pub fn codex_marketplace(world: &AgentTestWorld) -> PathBuf {
     );
     write_json(
         &plugin.join("hooks/hooks.json"),
-        hook_config("bt agents hook --source codex --source-version test"),
+        hook_config("bt trace hook --source codex --source-version test"),
     );
     root
 }
@@ -67,7 +67,7 @@ pub fn claude_plugin(world: &AgentTestWorld) -> PathBuf {
     );
     write_json(
         &root.join("hooks/hooks.json"),
-        hook_config("bt agents hook --source claude-code --source-version test"),
+        hook_config("bt trace hook --source claude-code --source-version test"),
     );
     root
 }
