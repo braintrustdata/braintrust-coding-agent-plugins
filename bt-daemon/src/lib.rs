@@ -365,6 +365,7 @@ pub async fn import_transcript(
         translator: Box<dyn AgentTranslator>,
         sink: Box<dyn Sink>,
         ctx: SessionCtx,
+        pending_ops: usize,
     }
     let mut sessions: HashMap<String, Live> = HashMap::new();
 
@@ -385,6 +386,7 @@ pub async fn import_transcript(
                             session_id: sid.clone(),
                             config: None,
                         },
+                        pending_ops: 0,
                     },
                 );
                 sessions.get_mut(&sid).unwrap()
@@ -395,12 +397,17 @@ pub async fn import_transcript(
             live.ctx.config = Some(cfg.clone());
         }
         let ops = live.translator.handle(&env, &live.ctx)?;
-        live.sink.emit(&ops).await?;
-        // Imports can contain tens of thousands of SDK log commands. Drain at
-        // the native turn checkpoints so the bounded SDK queue cannot discard
-        // the tail of a long historical session.
-        if env.event == "ImportCheckpoint" {
-            live.sink.flush().await?;
+        // Imports can contain tens of thousands of SDK log commands. Bound the
+        // number queued between drains without serializing one network flush
+        // for every native turn boundary.
+        const FLUSH_OPS: usize = 2_000;
+        for chunk in ops.chunks(FLUSH_OPS) {
+            live.sink.emit(chunk).await?;
+            live.pending_ops += chunk.len();
+            if live.pending_ops >= FLUSH_OPS {
+                live.sink.flush().await?;
+                live.pending_ops = 0;
+            }
         }
     }
 
