@@ -396,6 +396,12 @@ pub async fn import_transcript(
         }
         let ops = live.translator.handle(&env, &live.ctx)?;
         live.sink.emit(&ops).await?;
+        // Imports can contain tens of thousands of SDK log commands. Drain at
+        // the native turn checkpoints so the bounded SDK queue cannot discard
+        // the tail of a long historical session.
+        if env.event == "ImportCheckpoint" {
+            live.sink.flush().await?;
+        }
     }
 
     for (_sid, mut live) in sessions {

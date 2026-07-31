@@ -271,6 +271,60 @@ fn codex_incremental_reads_advance_offset() {
 }
 
 #[test]
+fn codex_import_checkpoints_preserve_native_turn_boundaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let tpath = transcript.to_str().unwrap();
+    for value in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta", "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg", "payload": { "type": "task_complete", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t2" } }),
+    ] {
+        append(&transcript, value);
+    }
+
+    let reg = Registry::default_agents();
+    let mut translator = reg.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let first = translator
+        .handle(
+            &envelope(
+                "s",
+                "ImportCheckpoint",
+                tpath,
+                json!({ "_bt_import_through_ms": 1_767_225_603_000_i64 }),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    assert!(first
+        .iter()
+        .any(|op| matches!(op, SpanOp::Insert(row) if row.name == "turn: t1")));
+    assert!(!first
+        .iter()
+        .any(|op| matches!(op, SpanOp::Insert(row) if row.name == "turn: t2")));
+
+    let second = translator
+        .handle(
+            &envelope(
+                "s",
+                "ImportCheckpoint",
+                tpath,
+                json!({ "_bt_import_through_ms": 1_767_225_604_000_i64 }),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    assert!(second
+        .iter()
+        .any(|op| matches!(op, SpanOp::Insert(row) if row.name == "turn: t2")));
+}
+
+#[test]
 fn codex_stop_closes_turn_before_late_task_complete() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout.jsonl");

@@ -46,6 +46,10 @@ async fn imports_native_codex_rollout_through_codex_translator() {
             json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"command\":\"ls\"}"}}),
             json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"README.md"}}),
             json!({"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done"}}),
+            json!({"timestamp":"2026-01-01T00:00:08Z","type":"turn_context","payload":{"model":"gpt-test"}}),
+            json!({"timestamp":"2026-01-01T00:00:09Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}),
+            json!({"timestamp":"2026-01-01T00:00:10Z","type":"event_msg","payload":{"type":"user_message","message":"show status"}}),
+            json!({"timestamp":"2026-01-01T00:00:11Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","last_agent_message":"Clean"}}),
         ],
     );
 
@@ -55,12 +59,21 @@ async fn imports_native_codex_rollout_through_codex_translator() {
         .unwrap();
 
     let rows = rows(&output.join("codex-past.ndjson"));
-    assert_eq!(inserted(&rows, "task"), 2, "session and turn");
+    assert_eq!(inserted(&rows, "task"), 3, "session and two turns");
     assert_eq!(inserted(&rows, "tool"), 1);
     assert!(rows.iter().any(|row| row
         .pointer("/Insert/metadata/source")
         .and_then(Value::as_str)
         == Some("import")));
+    let turn_ids = rows
+        .iter()
+        .filter_map(|row| {
+            row.pointer("/Insert/metadata/turn_id")
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    assert!(turn_ids.contains(&"turn-1"));
+    assert!(turn_ids.contains(&"turn-2"));
 }
 
 #[tokio::test]

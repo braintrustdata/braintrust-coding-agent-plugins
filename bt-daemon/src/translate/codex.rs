@@ -162,7 +162,8 @@ impl AgentTranslator for CodexTranslator {
                 self.main_path.get_or_insert(path.clone());
                 self.ensure_main_scope(&path);
             }
-            self.catch_up(&path, event.ts_ms, &mut ops);
+            let import_through_ms = payload.get("_bt_import_through_ms").and_then(Value::as_i64);
+            self.catch_up(&path, event.ts_ms, import_through_ms, &mut ops);
         }
 
         // --- hook-specific handling (after catch-up) ---
@@ -194,7 +195,7 @@ impl AgentTranslator for CodexTranslator {
         // Re-read each scope to catch a late task_complete, then close dangling.
         let paths: Vec<String> = self.scopes.keys().cloned().collect();
         for path in paths {
-            self.catch_up(&path, 0, &mut ops);
+            self.catch_up(&path, 0, None, &mut ops);
             if let Some(mut scope) = self.scopes.remove(&path) {
                 self.close_dangling(&mut scope, None, &mut ops);
                 self.scopes.insert(path, scope);
@@ -280,11 +281,17 @@ impl CodexTranslator {
     }
 
     /// Read new transcript lines for `path` and process them against its scope.
-    fn catch_up(&mut self, path: &str, hook_ts: i64, ops: &mut Vec<SpanOp>) {
+    fn catch_up(
+        &mut self,
+        path: &str,
+        hook_ts: i64,
+        through_ms: Option<i64>,
+        ops: &mut Vec<SpanOp>,
+    ) {
         let Some(mut scope) = self.scopes.remove(path) else {
             return;
         };
-        let lines = read_new_lines(&scope.path, &mut scope.offset);
+        let lines = read_new_lines(&scope.path, &mut scope.offset, through_ms);
         for line in lines {
             if let Ok(rec) = serde_json::from_str::<Value>(&line) {
                 self.process_record(&mut scope, &rec, hook_ts, ops);
@@ -1467,7 +1474,7 @@ fn parse_ts(rec: &Value) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-fn read_new_lines(path: &str, offset: &mut u64) -> Vec<String> {
+fn read_new_lines(path: &str, offset: &mut u64, through_ms: Option<i64>) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
         return Vec::new();
@@ -1488,12 +1495,26 @@ fn read_new_lines(path: &str, offset: &mut u64) -> Vec<String> {
         return Vec::new();
     };
     let complete = &buf[..=last_nl];
-    *offset += complete.len() as u64;
-    complete
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|s| s.to_string())
-        .collect()
+    let mut consumed = 0usize;
+    let mut lines = Vec::new();
+    for line_with_newline in complete.split_inclusive('\n') {
+        let line = line_with_newline.trim_end_matches(['\r', '\n']);
+        if let Some(limit) = through_ms {
+            if serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|record| parse_ts(&record))
+                .is_some_and(|timestamp| timestamp > limit)
+            {
+                break;
+            }
+        }
+        consumed += line_with_newline.len();
+        if !line.trim().is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    *offset += consumed as u64;
+    lines
 }
 
 fn token_metrics(usage: &Value) -> Map<String, Value> {

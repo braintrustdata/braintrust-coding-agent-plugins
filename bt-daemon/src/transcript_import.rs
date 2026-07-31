@@ -174,34 +174,65 @@ fn codex_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelop
             .then(|| record.pointer("/payload/last_agent_message").cloned())
             .flatten()
     });
-    Ok(vec![
-        envelope(
+    let mut events = vec![envelope(
+        "codex",
+        source_version.clone(),
+        &session_id,
+        "SessionStart",
+        start_ms,
+        json!({
+            "session_id": session_id,
+            "hook_event_name": "SessionStart",
+            "transcript_path": transcript_path,
+            "source": "import",
+            "_bt_import_through_ms": start_ms
+        }),
+    )];
+    let mut checkpoints = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.pointer("/payload/type").and_then(Value::as_str),
+                Some("task_started" | "task_complete" | "turn_aborted")
+            )
+        })
+        .filter_map(timestamp_ms)
+        .collect::<Vec<_>>();
+    checkpoints.sort_unstable();
+    checkpoints.dedup();
+    for checkpoint_ms in checkpoints {
+        if checkpoint_ms <= start_ms || checkpoint_ms >= end_ms {
+            continue;
+        }
+        events.push(envelope(
             "codex",
             source_version.clone(),
             &session_id,
-            "SessionStart",
-            start_ms,
+            "ImportCheckpoint",
+            checkpoint_ms,
             json!({
                 "session_id": session_id,
-                "hook_event_name": "SessionStart",
+                "hook_event_name": "ImportCheckpoint",
                 "transcript_path": transcript_path,
-                "source": "import"
+                "_bt_import_through_ms": checkpoint_ms
             }),
-        ),
-        envelope(
-            "codex",
-            source_version,
-            &session_id,
-            "Stop",
-            end_ms,
-            json!({
-                "session_id": session_id,
-                "hook_event_name": "Stop",
-                "transcript_path": transcript_path,
-                "last_agent_message": last_message
-            }),
-        ),
-    ])
+        ));
+    }
+    events.push(envelope(
+        "codex",
+        source_version,
+        &session_id,
+        "Stop",
+        end_ms,
+        json!({
+            "session_id": session_id,
+            "hook_event_name": "Stop",
+            "transcript_path": transcript_path,
+            "last_agent_message": last_message,
+            "_bt_import_through_ms": end_ms
+        }),
+    ));
+    Ok(events)
 }
 
 fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelope>> {
@@ -448,5 +479,27 @@ mod tests {
         assert!(ambiguous
             .to_string()
             .contains("multiple Claude Code transcripts"));
+    }
+
+    #[test]
+    fn codex_import_adds_native_turn_checkpoints() {
+        let records = vec![
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"session-123"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}),
+            json!({"timestamp":"2026-01-01T00:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2"}}),
+        ];
+        let events = codex_envelopes(Path::new("rollout.jsonl"), &records).unwrap();
+
+        assert_eq!(events.first().unwrap().event, "SessionStart");
+        assert_eq!(events.last().unwrap().event, "Stop");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "ImportCheckpoint")
+                .count(),
+            3
+        );
     }
 }
