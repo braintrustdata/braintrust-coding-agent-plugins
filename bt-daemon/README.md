@@ -6,7 +6,7 @@ event→trace state machine and sends spans to Braintrust out-of-band. See
 [`docs/protocol.md`](docs/protocol.md) for the wire contract.
 
 > **Placeholder name** — the real name is TBD. The subcommand framing
-> (`serve` / `hook` / `status` / `replay`) should survive a rename.
+> (`serve` / `hook` / `status` / `import`) should survive a rename.
 
 ## Layout
 
@@ -16,7 +16,7 @@ One self-contained Cargo crate, liftable to its own repo by copying
 - `src/wire` — the wire protocol module: envelope types + JSON-RPC framing.
 - `src/translate` and `src/sink` — agent state machines and Braintrust output.
 - `src/lib.rs` — the embeddable library: clap `Args` + async entry points
-  (`run_serve`, `run_hook`, `run_status`, `run_replay`). This is what `bt`
+  (`run_serve`, `run_hook`, `run_status`, `run_import`). This is what `bt`
   depends on.
 - `src/main.rs` — the standalone **`bt-daemon` binary**, compiled only with
   the `cli` feature for isolated testing/development. Env/flag static-token
@@ -74,12 +74,12 @@ echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./target/debug/bt-
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
 
-`replay <file>` has a different purpose from restart recovery. It imports a
-native Codex rollout JSONL or Claude Code transcript JSONL, synthesizes the
-agent lifecycle triggers that can be recovered from that file, and sends them
-through the normal translator and sink to create a trace for the past session.
-The producer is detected from the file or can be selected with `--source`.
-Hook-only facts absent from a native transcript are not invented.
+`import <codex|claude> <session-id>` has a different purpose from restart
+recovery. It locates the native transcript in the selected agent's standard
+session store, synthesizes the lifecycle triggers that can be recovered from
+that transcript, and sends them through the normal translator and sink to
+create a trace for the past session. Hook-only facts absent from a native
+transcript are not invented.
 
 ## Status
 

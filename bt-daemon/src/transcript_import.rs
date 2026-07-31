@@ -1,12 +1,138 @@
 use crate::wire::Envelope;
-use crate::ReplaySource;
+use crate::ImportSource;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn resolve_transcript(
+    session_id: &str,
+    source: ImportSource,
+) -> anyhow::Result<PathBuf> {
+    validate_session_id(session_id)?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let roots = match source {
+        ImportSource::Codex => {
+            let codex_home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex"));
+            vec![
+                codex_home.join("sessions"),
+                codex_home.join("archived_sessions"),
+            ]
+        }
+        ImportSource::Claude => {
+            let claude_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".claude"));
+            vec![claude_home.join("projects")]
+        }
+    };
+    resolve_transcript_in(session_id, source, &roots)
+}
+
+fn resolve_transcript_in(
+    session_id: &str,
+    source: ImportSource,
+    roots: &[PathBuf],
+) -> anyhow::Result<PathBuf> {
+    validate_session_id(session_id)?;
+    let expected = match source {
+        ImportSource::Codex => format!("{session_id}.jsonl"),
+        ImportSource::Claude => format!("{session_id}.jsonl"),
+    };
+    let mut matches = Vec::new();
+    for root in roots {
+        find_matching_files(root, &expected, source, &mut matches);
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => {
+            let locations = roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "no {} transcript found for session {session_id}; searched {locations}",
+                source_name(source)
+            )
+        }
+        paths => {
+            let locations = paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "multiple {} transcripts found for session {session_id}: {locations}",
+                source_name(source)
+            )
+        }
+    }
+}
+
+fn find_matching_files(
+    directory: &Path,
+    expected_suffix: &str,
+    source: ImportSource,
+    matches: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            find_matching_files(&path, expected_suffix, source, matches);
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let is_match = match source {
+            // Codex prefixes rollout files with their timestamp. Claude names
+            // the main transcript exactly after the session id.
+            ImportSource::Codex => name.ends_with(expected_suffix),
+            ImportSource::Claude => name == expected_suffix,
+        };
+        if is_match {
+            matches.push(path);
+        }
+    }
+}
+
+fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("invalid session id {session_id:?}");
+    }
+    Ok(())
+}
+
+fn source_name(source: ImportSource) -> &'static str {
+    match source {
+        ImportSource::Codex => "Codex",
+        ImportSource::Claude => "Claude Code",
+    }
+}
 
 pub(crate) fn transcript_envelopes(
     path: &Path,
-    source: Option<ReplaySource>,
+    source: ImportSource,
 ) -> anyhow::Result<Vec<Envelope>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("read transcript {}", path.display()))?;
@@ -22,22 +148,9 @@ pub(crate) fn transcript_envelopes(
     if records.is_empty() {
         bail!("transcript {} is empty", path.display());
     }
-    match source.unwrap_or_else(|| detect_source(&records)) {
-        ReplaySource::Codex => codex_envelopes(path, &records),
-        ReplaySource::Claude => claude_envelopes(path, &records),
-    }
-}
-
-fn detect_source(records: &[Value]) -> ReplaySource {
-    if records.iter().any(|record| {
-        matches!(
-            record.get("type").and_then(Value::as_str),
-            Some("session_meta" | "turn_context" | "event_msg" | "response_item" | "compacted")
-        ) && record.get("payload").is_some()
-    }) {
-        ReplaySource::Codex
-    } else {
-        ReplaySource::Claude
+    match source {
+        ImportSource::Codex => codex_envelopes(path, &records),
+        ImportSource::Claude => claude_envelopes(path, &records),
     }
 }
 
@@ -72,7 +185,7 @@ fn codex_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelop
                 "session_id": session_id,
                 "hook_event_name": "SessionStart",
                 "transcript_path": transcript_path,
-                "source": "replay"
+                "source": "import"
             }),
         ),
         envelope(
@@ -113,7 +226,7 @@ fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelo
             "hook_event_name": "SessionStart",
             "transcript_path": transcript_path,
             "cwd": cwd,
-            "source": "replay"
+            "source": "import"
         }),
     )];
 
@@ -175,7 +288,7 @@ fn claude_envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelo
             "hook_event_name": "SessionEnd",
             "transcript_path": transcript_path,
             "cwd": cwd,
-            "reason": "transcript_replay"
+            "reason": "transcript_import"
         }),
     ));
     Ok(events)
@@ -261,6 +374,79 @@ fn file_session_id(path: &Path) -> String {
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .filter(|stem| !stem.is_empty())
-        .unwrap_or("replayed-session")
+        .unwrap_or("imported-session")
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_codex_rollout_by_session_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let transcript = root
+            .join("2026/07/31")
+            .join("rollout-2026-07-31T12-00-00-session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+
+        assert_eq!(
+            resolve_transcript_in("session-123", ImportSource::Codex, &[root]).unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn finds_only_exact_claude_session_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        let project = root.join("-tmp-project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("prefix-session-123.jsonl"), "{}\n").unwrap();
+        let transcript = project.join("session-123.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+
+        assert_eq!(
+            resolve_transcript_in("session-123", ImportSource::Claude, &[root]).unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_session_ids() {
+        let error = resolve_transcript_in(
+            "../session",
+            ImportSource::Codex,
+            &[PathBuf::from("unused")],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid session id"));
+    }
+
+    #[test]
+    fn reports_missing_and_ambiguous_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let missing = resolve_transcript_in(
+            "missing",
+            ImportSource::Claude,
+            &[first.clone(), second.clone()],
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("no Claude Code transcript"));
+
+        std::fs::write(first.join("duplicate.jsonl"), "{}\n").unwrap();
+        std::fs::write(second.join("duplicate.jsonl"), "{}\n").unwrap();
+        let ambiguous =
+            resolve_transcript_in("duplicate", ImportSource::Claude, &[first, second]).unwrap_err();
+        assert!(ambiguous
+            .to_string()
+            .contains("multiple Claude Code transcripts"));
+    }
 }

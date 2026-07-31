@@ -16,10 +16,10 @@ mod client;
 mod dispatch;
 mod ids;
 mod journal;
-mod replay;
 mod server;
 mod settings;
 mod sink;
+mod transcript_import;
 mod translate;
 mod transport;
 
@@ -108,18 +108,18 @@ pub struct StatusArgs {
     pub session_id: Option<String>,
 }
 
-/// Arguments for `replay`.
+/// Arguments for importing a past coding-agent session.
 #[derive(Debug, Clone, Args)]
-pub struct ReplayArgs {
-    /// A native Codex rollout or Claude Code transcript JSONL file.
-    pub file: PathBuf,
-    /// Transcript producer. Inferred from the file when omitted.
-    #[arg(long, value_enum)]
-    pub source: Option<ReplaySource>,
+pub struct ImportArgs {
+    /// Agent that produced the session.
+    #[arg(value_enum)]
+    pub source: ImportSource,
+    /// Codex or Claude Code session id shown by the agent's resume command.
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum ReplaySource {
+pub enum ImportSource {
     Codex,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
@@ -338,15 +338,28 @@ pub async fn shutdown_daemon(socket: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// Import a native coding-agent transcript through the normal translators and
-/// sink. This is separate from daemon journal recovery: replay creates traces
+/// sink. This is separate from daemon journal recovery: import creates traces
 /// for a past session, while recovery rebuilds live correlation state.
-pub async fn run_replay(
-    args: ReplayArgs,
+pub async fn run_import(
+    args: ImportArgs,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+) -> anyhow::Result<()> {
+    let file = transcript_import::resolve_transcript(&args.session_id, args.source)?;
+    import_transcript(&file, args.source, opts, config).await
+}
+
+/// Import a native transcript from a known path. Front-ends should normally
+/// expose [`run_import`] so users only need the agent's session id; this lower-
+/// level entry point is useful for embedding and isolated tests.
+pub async fn import_transcript(
+    file: &std::path::Path,
+    source: ImportSource,
     opts: ServeOptions,
     config: Option<SessionConfig>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
-    let entries = replay::transcript_envelopes(&args.file, args.source)?;
+    let entries = transcript_import::transcript_envelopes(file, source)?;
 
     struct Live {
         translator: Box<dyn AgentTranslator>,

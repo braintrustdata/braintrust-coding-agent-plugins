@@ -6,8 +6,8 @@
 
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
-    braintrust_serve_options, paths, run_hook, run_replay, run_serve, run_status,
-    BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo, Registry, ReplayArgs, ServeArgs,
+    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status,
+    BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo, ImportArgs, Registry, ServeArgs,
     ServeOptions, StatusArgs,
 };
 use clap::{Args, Parser, Subcommand};
@@ -67,8 +67,8 @@ enum Command {
     },
     /// Print daemon/session status.
     Status(StatusArgs),
-    /// Import a native Codex or Claude Code transcript.
-    Replay(ReplayArgs),
+    /// Import a past Codex or Claude Code session by its resume id.
+    Import(ImportArgs),
 }
 
 /// Static-token backend auth from env/flags (no profile resolution).
@@ -171,11 +171,11 @@ async fn main() {
                 std::process::exit(1);
             }
         },
-        Command::Replay(args) => {
+        Command::Import(args) => {
             let data_dir = paths::data_dir(None);
             let opts = debug_serve_options(VERSION, &data_dir);
-            if let Err(e) = run_replay(args, opts, None).await {
-                eprintln!("bt-daemon replay: {e}");
+            if let Err(e) = run_import(args, opts, None).await {
+                eprintln!("bt-daemon import: {e}");
                 std::process::exit(1);
             }
         }

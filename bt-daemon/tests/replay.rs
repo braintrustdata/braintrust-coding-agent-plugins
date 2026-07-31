@@ -1,4 +1,4 @@
-use bt_daemon::{run_replay, DebugSinkFactory, Registry, ReplayArgs, ServeOptions};
+use bt_daemon::{import_transcript, DebugSinkFactory, ImportSource, Registry, ServeOptions};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ fn inserted(rows: &[Value], span_type: &str) -> usize {
 }
 
 #[tokio::test]
-async fn replays_native_codex_rollout_through_codex_translator() {
+async fn imports_native_codex_rollout_through_codex_translator() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout.jsonl");
     write_jsonl(
@@ -50,16 +50,9 @@ async fn replays_native_codex_rollout_through_codex_translator() {
     );
 
     let output = tmp.path().join("spans");
-    run_replay(
-        ReplayArgs {
-            file: transcript,
-            source: None,
-        },
-        options(&output),
-        None,
-    )
-    .await
-    .unwrap();
+    import_transcript(&transcript, ImportSource::Codex, options(&output), None)
+        .await
+        .unwrap();
 
     let rows = rows(&output.join("codex-past.ndjson"));
     assert_eq!(inserted(&rows, "task"), 2, "session and turn");
@@ -67,11 +60,11 @@ async fn replays_native_codex_rollout_through_codex_translator() {
     assert!(rows.iter().any(|row| row
         .pointer("/Insert/metadata/source")
         .and_then(Value::as_str)
-        == Some("replay")));
+        == Some("import")));
 }
 
 #[tokio::test]
-async fn replays_native_claude_transcript_with_multiple_turns_and_tools() {
+async fn imports_native_claude_transcript_with_multiple_turns_and_tools() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("claude.jsonl");
     write_jsonl(
@@ -87,16 +80,9 @@ async fn replays_native_claude_transcript_with_multiple_turns_and_tools() {
     );
 
     let output = tmp.path().join("spans");
-    run_replay(
-        ReplayArgs {
-            file: transcript,
-            source: None,
-        },
-        options(&output),
-        None,
-    )
-    .await
-    .unwrap();
+    import_transcript(&transcript, ImportSource::Claude, options(&output), None)
+        .await
+        .unwrap();
 
     let rows = rows(&output.join("claude-past.ndjson"));
     assert_eq!(inserted(&rows, "task"), 3, "session and two turns");

@@ -225,12 +225,12 @@ replay the live credentials must be re-supplied.
 
 ## Durability & idempotence
 
-Journal recovery and explicit transcript replay are separate operations.
+Journal recovery and explicit transcript import are separate operations.
 Recovery consumes the daemon's auth-redacted event WAL to rebuild state and
 may idempotently re-emit rows under their original deterministic ids. The
-`replay` command instead consumes a native Codex rollout or Claude Code
-transcript and creates a trace for that past coding-agent session by routing
-synthetic lifecycle events through the regular translator.
+`import <codex|claude> <session-id>` command instead locates the selected
+agent's native transcript and creates a trace for that past coding-agent
+session by routing synthetic lifecycle events through the regular translator.
 
 - **Journal (WAL).** Every accepted event is appended (auth-redacted) to
   `<data_dir>/journal/<session_id>.ndjson` before/at enqueue. `data_dir`
