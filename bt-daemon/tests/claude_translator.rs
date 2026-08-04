@@ -220,6 +220,30 @@ fn claude_subagent_fixture_builds_nested_subagent_llms() {
 
 #[test]
 fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("README.md"), "test").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "initial"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://example.com/acme/app.git",
+    ]);
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", "s");
     let ctx = SessionCtx {
@@ -239,7 +263,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         .handle(
             &event(
                 "UserPromptSubmit",
-                json!({"session_id":"s","cwd":"/tmp/x","prompt":"go"}),
+                json!({"session_id":"s","cwd":repo,"prompt":"go"}),
             ),
             &ctx,
         )
@@ -296,6 +320,12 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
     assert!(tools
         .iter()
         .any(|row| row.error.as_deref() == Some("missing")));
+    assert!(rows.values().all(|row| {
+        let metadata = row.metadata.as_ref().and_then(Value::as_object).unwrap();
+        metadata.get("git_origin_url") == Some(&json!("https://example.com/acme/app.git"))
+            && metadata.get("git_branch") == Some(&json!("main"))
+            && metadata.contains_key("git_commit_sha")
+    }));
 }
 
 #[test]

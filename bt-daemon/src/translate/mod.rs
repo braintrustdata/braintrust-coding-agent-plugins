@@ -10,6 +10,7 @@
 mod claude;
 mod codex;
 mod debug;
+mod git;
 
 pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;
@@ -18,6 +19,7 @@ pub use debug::DebugTranslatorFactory;
 use crate::wire::{Envelope, SessionConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Braintrust span kinds we emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -118,8 +120,9 @@ impl Registry {
     /// as the fallback for unknown sources.
     pub fn default_agents() -> Self {
         let mut r = Registry::debug_only();
-        r.register(Box::new(ClaudeTranslatorFactory));
-        r.register(Box::new(CodexTranslatorFactory));
+        let git = Arc::new(git::GitMetadataCache::default());
+        r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
+        r.register(Box::new(CodexTranslatorFactory::new(git)));
         r
     }
 

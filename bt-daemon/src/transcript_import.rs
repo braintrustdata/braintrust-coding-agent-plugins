@@ -299,6 +299,10 @@ fn claude_envelopes(
             .filter_map(timestamp_ms)
             .max()
             .unwrap_or(turn_start);
+        let turn_cwd = segment
+            .iter()
+            .find_map(|record| string_at(record, "/cwd"))
+            .or_else(|| cwd.clone());
         let prompt = records[index]
             .pointer("/message/content")
             .cloned()
@@ -312,7 +316,7 @@ fn claude_envelopes(
                 "session_id": session_id,
                 "hook_event_name": "UserPromptSubmit",
                 "transcript_path": transcript_path,
-                "cwd": cwd,
+                "cwd": turn_cwd,
                 "prompt": prompt
             }),
             record_end_offsets[index],
@@ -332,7 +336,7 @@ fn claude_envelopes(
                 "session_id": session_id,
                 "hook_event_name": stop_event,
                 "transcript_path": transcript_path,
-                "cwd": cwd,
+                "cwd": turn_cwd,
                 "last_assistant_message": last_assistant_text(segment),
                 "error": error
             }),
