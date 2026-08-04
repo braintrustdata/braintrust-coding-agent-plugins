@@ -388,6 +388,7 @@ fn configured_ctx(session_id: &str, additional_metadata: Value) -> SessionCtx {
                 org_name: None,
                 org_id: None,
             },
+            destination: None,
             project: Some("team-project".into()),
             parent_span_id: None,
             root_span_id: None,

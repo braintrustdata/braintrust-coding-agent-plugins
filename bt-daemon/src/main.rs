@@ -98,6 +98,7 @@ impl AuthArgs {
                 org_name: self.org_name,
                 org_id: self.org_id,
             },
+            destination: None,
             project: self.project,
             parent_span_id: None,
             root_span_id: None,

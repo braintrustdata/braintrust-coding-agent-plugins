@@ -29,6 +29,7 @@ fn config_with_secret() -> SessionConfig {
             org_name: Some("acme".into()),
             org_id: None,
         },
+        destination: None,
         project: Some("codex".into()),
         parent_span_id: None,
         root_span_id: None,

@@ -1,6 +1,7 @@
 //! The `event.log` envelope and its session config, plus auth redaction for
 //! the journal.
 
+use braintrust_sdk_rust::SpanComponents;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -31,6 +32,10 @@ pub struct Envelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub auth: BackendAuth,
+    /// Typed destination for new front-ends. When present, this takes
+    /// precedence over the legacy project and span-attachment fields below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<TraceDestination>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,6 +46,60 @@ pub struct SessionConfig {
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
+}
+
+/// Where a session's root span should be logged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TraceDestination {
+    /// Project logs selected by stable id, display name, or both.
+    ProjectLogs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
+    },
+    /// An existing experiment.
+    Experiment { experiment_id: String },
+    /// A child of an exported Braintrust span.
+    ParentSpan { components: SpanComponents },
+}
+
+impl SessionConfig {
+    /// External parent/root ids used to shape translator rows. The sink keeps
+    /// the full destination components for object routing and propagation.
+    pub fn attached_span_ids(&self) -> (Option<String>, Option<String>) {
+        if let Some(TraceDestination::ParentSpan { components }) = &self.destination {
+            return (components.span_id.clone(), components.root_span_id.clone());
+        }
+        (self.parent_span_id.clone(), self.root_span_id.clone())
+    }
+}
+
+impl std::str::FromStr for TraceDestination {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (kind, id) = value.split_once(':').ok_or_else(|| {
+            "destination must be project_logs:<project-id> or experiment:<experiment-id>"
+                .to_string()
+        })?;
+        if id.is_empty() {
+            return Err("destination id must not be empty".to_string());
+        }
+        match kind {
+            "project_logs" => Ok(Self::ProjectLogs {
+                project_id: Some(id.to_string()),
+                project_name: None,
+            }),
+            "experiment" => Ok(Self::Experiment {
+                experiment_id: id.to_string(),
+            }),
+            _ => Err(format!(
+                "unsupported destination {kind:?}; expected project_logs or experiment"
+            )),
+        }
+    }
 }
 
 /// Backend credentials. `token` is an API key or an OAuth access token; the
@@ -118,6 +177,7 @@ impl Envelope {
             payload: self.payload.clone(),
             config: self.config.as_ref().map(|c| RedactedConfig {
                 auth: c.auth.fingerprint(),
+                destination: c.destination.clone(),
                 project: c.project.clone(),
                 parent_span_id: c.parent_span_id.clone(),
                 root_span_id: c.root_span_id.clone(),
@@ -146,6 +206,8 @@ pub struct RedactedEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedactedConfig {
     pub auth: AuthFingerprint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<TraceDestination>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,6 +240,7 @@ mod tests {
                     org_name: Some("acme".into()),
                     org_id: None,
                 },
+                destination: None,
                 project: Some("codex".into()),
                 parent_span_id: None,
                 root_span_id: None,
@@ -227,5 +290,23 @@ mod tests {
         });
         let cfg: SessionConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.flush_mode, FlushMode::FireAndForget);
+    }
+
+    #[test]
+    fn import_destination_references_are_typed() {
+        let project: TraceDestination = "project_logs:proj-123".parse().unwrap();
+        assert!(matches!(
+            project,
+            TraceDestination::ProjectLogs {
+                project_id: Some(ref id),
+                project_name: None
+            } if id == "proj-123"
+        ));
+        let experiment: TraceDestination = "experiment:exp-456".parse().unwrap();
+        assert!(matches!(
+            experiment,
+            TraceDestination::Experiment { ref experiment_id } if experiment_id == "exp-456"
+        ));
+        assert!("project:ambiguous".parse::<TraceDestination>().is_err());
     }
 }

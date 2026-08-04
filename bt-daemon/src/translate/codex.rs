@@ -40,6 +40,7 @@ impl TranslatorFactory for CodexTranslatorFactory {
         Box::new(CodexTranslator {
             session_id: session_id.to_string(),
             root_span_id: ids::span_id(session_id, "root"),
+            external_parent_span_id: None,
             root_opened: false,
             root_ended: false,
             source: None,
@@ -107,6 +108,7 @@ struct Scope {
 struct CodexTranslator {
     session_id: String,
     root_span_id: String,
+    external_parent_span_id: Option<String>,
     root_opened: bool,
     root_ended: bool,
     source: Option<String>,
@@ -128,6 +130,7 @@ impl AgentTranslator for CodexTranslator {
         let mut ops = Vec::new();
 
         if let Some(config) = &ctx.config {
+            self.external_parent_span_id = config.attached_span_ids().0;
             self.project = config.project.clone();
             self.additional_metadata = config
                 .additional_metadata
@@ -415,6 +418,7 @@ impl CodexTranslator {
                 ops.push(SpanOp::Insert(SpanRow {
                     span_id: self.root_span_id.clone(),
                     root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: self.external_parent_span_id.clone().into_iter().collect(),
                     name,
                     span_type: SpanType::Task,
                     start_ms: Some(ts),

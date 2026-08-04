@@ -31,6 +31,7 @@ pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 
+use braintrust_sdk_rust::SpanComponents;
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -116,6 +117,13 @@ pub struct ImportArgs {
     pub source: ImportSource,
     /// Codex or Claude Code session id shown by the agent's resume command.
     pub session_id: String,
+    /// Destination object reference, such as `project_logs:<project-id>` or
+    /// `experiment:<experiment-id>`.
+    #[arg(value_name = "DESTINATION", conflicts_with = "parent")]
+    pub destination: Option<wire::TraceDestination>,
+    /// Attach the imported session below an exported Braintrust span.
+    #[arg(long, value_name = "SPAN_COMPONENTS", conflicts_with = "destination")]
+    pub parent: Option<SpanComponents>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -343,8 +351,15 @@ pub async fn shutdown_daemon(socket: &std::path::Path) -> anyhow::Result<()> {
 pub async fn run_import(
     args: ImportArgs,
     opts: ServeOptions,
-    config: Option<SessionConfig>,
+    mut config: Option<SessionConfig>,
 ) -> anyhow::Result<()> {
+    let destination = args
+        .parent
+        .map(|components| wire::TraceDestination::ParentSpan { components })
+        .or(args.destination);
+    if let (Some(config), Some(destination)) = (&mut config, destination) {
+        config.destination = Some(destination);
+    }
     let file = transcript_import::resolve_transcript(&args.session_id, args.source)?;
     import_transcript(&file, args.source, opts, config).await
 }

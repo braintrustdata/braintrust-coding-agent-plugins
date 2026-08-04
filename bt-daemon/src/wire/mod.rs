@@ -11,7 +11,7 @@ mod rpc;
 
 pub use envelope::{
     AuthFingerprint, BackendAuth, Envelope, FlushMode, RedactedConfig, RedactedEnvelope,
-    SessionConfig,
+    SessionConfig, TraceDestination,
 };
 pub use methods::{
     method, Capabilities, ClientInfo, EventLogResult, FlushParams, FlushResult, InitializeParams,

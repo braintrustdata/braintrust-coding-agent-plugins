@@ -166,6 +166,11 @@ Used for version handover and by tests.
       "app_url": "https://www.braintrust.dev",
       "org_name": "acme"
     },
+    "destination": {
+      "type": "project_logs",
+      "project_id": "project-uuid",
+      "project_name": "codex"
+    },
     "project": "codex",
     "parent_span_id": null,
     "root_span_id": null,
@@ -194,6 +199,11 @@ Field notes:
   per session and only re-inits the Braintrust sink when it changes. `auth` is
   filled by `bt`'s `resolve_auth` when embedded, or from env/flags in the
   standalone binary. `flush_mode` ∈ `fire_and_forget` | `flush_on_turn_end`.
+  New front-ends set the typed `destination`: `project_logs` accepts a project
+  id and/or name, `experiment` accepts an experiment id, and `parent_span`
+  carries the complete exported `SpanComponents` object. The older `project`,
+  `parent_span_id`, `root_span_id`, and `_bt_experiment_id` fields remain
+  accepted when `destination` is absent.
 
 ### Redaction
 
@@ -228,9 +238,12 @@ replay the live credentials must be re-supplied.
 Journal recovery and explicit transcript import are separate operations.
 Recovery consumes the daemon's auth-redacted event WAL to rebuild state and
 may idempotently re-emit rows under their original deterministic ids. The
-`import <codex|claude> <session-id>` command instead locates the selected
-agent's native transcript and creates a trace for that past coding-agent
-session by routing synthetic lifecycle events through the regular translator.
+`import <codex|claude> <session-id> [project_logs:<project-id> |
+experiment:<experiment-id>]` command instead locates the selected agent's
+native transcript and creates a trace for that past coding-agent session by
+routing synthetic lifecycle events through the regular translator. `--parent
+<SpanComponents>` attaches it below an exported span and is mutually exclusive
+with an object destination.
 
 - **Journal (WAL).** Every accepted event is appended (auth-redacted) to
   `<data_dir>/journal/<session_id>.ndjson` before/at enqueue. `data_dir`
