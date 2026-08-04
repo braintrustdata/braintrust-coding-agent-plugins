@@ -135,6 +135,7 @@ fn config_from_redacted(c: RedactedConfig) -> SessionConfig {
             org_name,
             org_id: None,
         },
+        destination: c.destination,
         project: c.project,
         parent_span_id: c.parent_span_id,
         root_span_id: c.root_span_id,

@@ -117,7 +117,12 @@ impl ClaudeTranslator {
             return;
         }
         self.root_open = true;
-        if let Some(root) = ctx.config.as_ref().and_then(|c| c.root_span_id.as_ref()) {
+        let (parent_span_id, root_span_id) = ctx
+            .config
+            .as_ref()
+            .map(|config| config.attached_span_ids())
+            .unwrap_or_default();
+        if let Some(root) = root_span_id {
             self.root_span_id = root.clone();
         }
         let cwd = string_field(&event.payload, "cwd").unwrap_or_default();
@@ -155,12 +160,7 @@ impl ClaudeTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: ctx
-                .config
-                .as_ref()
-                .and_then(|c| c.parent_span_id.clone())
-                .into_iter()
-                .collect(),
+            parent_span_ids: parent_span_id.into_iter().collect(),
             name: format!("Claude Code: {workspace}"),
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),

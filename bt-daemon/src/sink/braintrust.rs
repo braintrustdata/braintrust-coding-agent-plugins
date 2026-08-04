@@ -11,7 +11,7 @@
 
 use super::{Sink, SinkFactory};
 use crate::translate::{SpanOp, SpanRow, SpanType};
-use crate::wire::SessionConfig;
+use crate::wire::{SessionConfig, TraceDestination};
 use braintrust_sdk_rust::{
     BraintrustClient, ParentSpanInfo, SpanHandle, SpanLog, SpanObjectType, SpanOrigin,
     SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
@@ -111,6 +111,7 @@ struct Creds {
     token: String,
     org_id: String,
     org_name: Option<String>,
+    destination: Option<TraceDestination>,
     project: Option<String>,
     experiment_id: Option<String>,
     parent_span_id: Option<String>,
@@ -135,14 +136,29 @@ struct BraintrustSink {
 
 impl BraintrustSink {
     fn project(&self, creds: &Creds) -> String {
+        if let Some(TraceDestination::ProjectLogs {
+            project_name: Some(project_name),
+            ..
+        }) = &creds.destination
+        {
+            return project_name.clone();
+        }
         creds.project.clone().unwrap_or_else(|| self.source.clone())
     }
 
-    fn parent_info(&self, row: &SpanRow, creds: &Creds, project: &str) -> ParentSpanInfo {
+    fn parent_info(
+        &self,
+        row: &SpanRow,
+        creds: &Creds,
+        project: &str,
+    ) -> anyhow::Result<ParentSpanInfo> {
         if row.parent_span_ids.is_empty() {
+            if let Some(destination) = &creds.destination {
+                return root_destination(destination, project);
+            }
             // Session root: attach under an external trace if the shim supplied
             // one, else land it directly in the project's logs.
-            match (&creds.parent_span_id, &creds.root_span_id) {
+            Ok(match (&creds.parent_span_id, &creds.root_span_id) {
                 (Some(p), Some(r)) => full_span(creds, project, p.clone(), r.clone()),
                 _ if creds.experiment_id.is_some() => ParentSpanInfo::Experiment {
                     object_id: creds.experiment_id.clone().unwrap(),
@@ -150,17 +166,14 @@ impl BraintrustSink {
                 _ => ParentSpanInfo::ProjectName {
                     project_name: project.to_string(),
                 },
-            }
+            })
         } else {
-            full_span(
+            Ok(full_span(
                 creds,
                 project,
                 row.parent_span_ids[0].clone(),
-                creds
-                    .root_span_id
-                    .clone()
-                    .unwrap_or_else(|| row.root_span_id.clone()),
-            )
+                destination_root(creds).unwrap_or_else(|| row.root_span_id.clone()),
+            ))
         }
     }
 
@@ -186,7 +199,7 @@ impl BraintrustSink {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("session has no credentials/config yet"))?;
         let project = self.project(creds);
-        let parent = self.parent_info(row, creds, &project);
+        let parent = self.parent_info(row, creds, &project)?;
 
         let mut builder = client
             .span_builder_with_credentials(creds.token.clone(), creds.org_id.clone())
@@ -255,6 +268,7 @@ impl Sink for BraintrustSink {
             token: config.auth.token.clone(),
             org_id: config.auth.org_id.clone().unwrap_or_default(),
             org_name: config.auth.org_name.clone(),
+            destination: config.destination.clone(),
             project: config.project.clone(),
             experiment_id: config
                 .additional_metadata
@@ -297,6 +311,18 @@ fn full_span(
     span_id: String,
     root_span_id: String,
 ) -> ParentSpanInfo {
+    if let Some(destination) = &creds.destination {
+        let components = destination_components(destination, project);
+        return ParentSpanInfo::FullSpan {
+            object_type: components.object_type,
+            object_id: components.object_id,
+            compute_object_metadata_args: components.compute_object_metadata_args,
+            span_id,
+            root_span_id,
+            span_parents: None,
+            propagated_event: components.propagated_event,
+        };
+    }
     if let Some(experiment_id) = &creds.experiment_id {
         return ParentSpanInfo::FullSpan {
             object_type: SpanObjectType::Experiment,
@@ -321,6 +347,85 @@ fn full_span(
         root_span_id,
         span_parents: None,
         propagated_event: None,
+    }
+}
+
+fn root_destination(
+    destination: &TraceDestination,
+    project: &str,
+) -> anyhow::Result<ParentSpanInfo> {
+    Ok(match destination {
+        TraceDestination::ProjectLogs {
+            project_id: Some(object_id),
+            ..
+        } => ParentSpanInfo::ProjectLogs {
+            object_id: object_id.clone(),
+        },
+        TraceDestination::ProjectLogs {
+            project_name: Some(project_name),
+            ..
+        } => ParentSpanInfo::ProjectName {
+            project_name: project_name.clone(),
+        },
+        TraceDestination::ProjectLogs { .. } => ParentSpanInfo::ProjectName {
+            project_name: project.to_string(),
+        },
+        TraceDestination::Experiment { experiment_id } => ParentSpanInfo::Experiment {
+            object_id: experiment_id.clone(),
+        },
+        TraceDestination::ParentSpan { components } => components
+            .to_parent_span_info_resolving_metadata()
+            .map_err(|error| anyhow::anyhow!("invalid parent span destination: {error}"))?,
+    })
+}
+
+fn destination_root(creds: &Creds) -> Option<String> {
+    match &creds.destination {
+        Some(TraceDestination::ParentSpan { components }) => components.root_span_id.clone(),
+        _ => creds.root_span_id.clone(),
+    }
+}
+
+struct DestinationComponents {
+    object_type: SpanObjectType,
+    object_id: Option<String>,
+    compute_object_metadata_args: Option<Map<String, Value>>,
+    propagated_event: Option<Map<String, Value>>,
+}
+
+fn destination_components(destination: &TraceDestination, project: &str) -> DestinationComponents {
+    match destination {
+        TraceDestination::ProjectLogs {
+            project_id,
+            project_name,
+        } => {
+            let mut args = Map::new();
+            if let Some(project_id) = project_id {
+                args.insert("project_id".into(), Value::String(project_id.clone()));
+            }
+            args.insert(
+                "project_name".into(),
+                Value::String(project_name.as_deref().unwrap_or(project).to_string()),
+            );
+            DestinationComponents {
+                object_type: SpanObjectType::ProjectLogs,
+                object_id: project_id.clone(),
+                compute_object_metadata_args: Some(args),
+                propagated_event: None,
+            }
+        }
+        TraceDestination::Experiment { experiment_id } => DestinationComponents {
+            object_type: SpanObjectType::Experiment,
+            object_id: Some(experiment_id.clone()),
+            compute_object_metadata_args: None,
+            propagated_event: None,
+        },
+        TraceDestination::ParentSpan { components } => DestinationComponents {
+            object_type: components.object_type,
+            object_id: components.object_id.clone(),
+            compute_object_metadata_args: components.compute_object_metadata_args.clone(),
+            propagated_event: components.propagated_event.clone(),
+        },
     }
 }
 

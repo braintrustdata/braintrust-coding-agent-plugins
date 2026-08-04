@@ -2,7 +2,8 @@
 //! wiremock stand-in for the Braintrust backend (the endpoints the SDK hits
 //! with `skip_login`: GET /version, POST /api/project/register, POST /logs3).
 
-use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig, TraceDestination};
 use bt_daemon::{
     BraintrustSinkConfig, BraintrustSinkFactory, SinkFactory, SpanOp, SpanRow, SpanType,
 };
@@ -19,6 +20,7 @@ fn session_config(base: &str) -> SessionConfig {
             org_name: Some("acme".into()),
             org_id: None,
         },
+        destination: None,
         project: Some("my-project".into()),
         parent_span_id: None,
         root_span_id: None,
@@ -209,6 +211,52 @@ async fn attached_trace_children_keep_the_external_root() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exported_parent_preserves_object_root_and_propagated_event() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("sess-parent", "codex").unwrap();
+    let mut config = session_config(&base);
+    let mut components = SpanComponents::new(SpanObjectType::Experiment);
+    components.object_id = Some("exp-parent".into());
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    components.propagated_event = Some(serde_json::Map::from_iter([(
+        "tenant".into(),
+        json!("acme"),
+    )]));
+    config.destination = Some(TraceDestination::ParentSpan { components });
+    sink.configure(&config);
+    sink.emit(&[SpanOp::Insert(row(
+        "session-root",
+        "daemon-internal-root",
+        &["external-parent"],
+        "codex",
+        SpanType::Task,
+        1,
+        Some(2),
+    ))])
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+
+    let bodies = logs3_bodies(&server).await;
+    for expected in [
+        "exp-parent",
+        "external-root",
+        "external-parent",
+        "tenant",
+        "acme",
+    ] {
+        assert!(bodies.contains(expected), "{expected} absent: {bodies}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn braintrust_sink_delivers_spans_to_collector() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -318,7 +366,10 @@ async fn experiment_sessions_use_experiment_object_type_and_id() {
     });
     let mut sink = factory.create("sess-exp", "claude-code").unwrap();
     let mut config = session_config(&base);
-    config.additional_metadata = Some(json!({"_bt_experiment_id":"exp-42"}));
+    config.destination = Some(TraceDestination::Experiment {
+        experiment_id: "exp-42".into(),
+    });
+    config.additional_metadata = Some(json!({"_bt_experiment_id":"legacy-exp"}));
     sink.configure(&config);
     sink.emit(&[
         SpanOp::Insert(row(
@@ -346,6 +397,10 @@ async fn experiment_sessions_use_experiment_object_type_and_id() {
 
     let bodies = logs3_bodies(&server).await;
     assert!(bodies.contains("exp-42"), "experiment id absent: {bodies}");
+    assert!(
+        !bodies.contains("legacy-exp"),
+        "legacy routing overrode typed destination: {bodies}"
+    );
     assert!(
         !bodies.contains("\"project_id\""),
         "experiment spans were routed as project logs: {bodies}"

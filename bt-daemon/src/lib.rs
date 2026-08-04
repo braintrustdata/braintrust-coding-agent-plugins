@@ -31,6 +31,7 @@ pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 
+use braintrust_sdk_rust::SpanComponents;
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -116,6 +117,13 @@ pub struct ImportArgs {
     pub source: ImportSource,
     /// Codex or Claude Code session id shown by the agent's resume command.
     pub session_id: String,
+    /// Destination object reference, such as `project_logs:<project-id>` or
+    /// `experiment:<experiment-id>`.
+    #[arg(value_name = "DESTINATION", conflicts_with = "parent")]
+    pub destination: Option<wire::TraceDestination>,
+    /// Attach the imported session below an exported Braintrust span.
+    #[arg(long, value_name = "SPAN_COMPONENTS", conflicts_with = "destination")]
+    pub parent: Option<SpanComponents>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -343,10 +351,31 @@ pub async fn shutdown_daemon(socket: &std::path::Path) -> anyhow::Result<()> {
 pub async fn run_import(
     args: ImportArgs,
     opts: ServeOptions,
-    config: Option<SessionConfig>,
+    mut config: Option<SessionConfig>,
 ) -> anyhow::Result<()> {
+    let destination = args
+        .parent
+        .map(|components| wire::TraceDestination::ParentSpan { components })
+        .or(args.destination);
+    apply_import_destination(&mut config, destination)?;
     let file = transcript_import::resolve_transcript(&args.session_id, args.source)?;
     import_transcript(&file, args.source, opts, config).await
+}
+
+fn apply_import_destination(
+    config: &mut Option<SessionConfig>,
+    destination: Option<wire::TraceDestination>,
+) -> anyhow::Result<()> {
+    if let Some(destination) = destination {
+        let config = config.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "import destination requires a resolved Braintrust session configuration; \
+                 use `bt trace import` instead of the standalone `bt-daemon import` command"
+            )
+        })?;
+        config.destination = Some(destination);
+    }
+    Ok(())
 }
 
 /// Import a native transcript from a known path. Front-ends should normally
@@ -499,5 +528,20 @@ mod tests {
     #[test]
     fn clock_returns_a_positive_epoch_timestamp() {
         assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn import_destination_without_session_config_fails_fast() {
+        let mut config = None;
+        let destination = wire::TraceDestination::ProjectLogs {
+            project_id: Some("project-id".to_string()),
+            project_name: None,
+        };
+
+        let error = apply_import_destination(&mut config, Some(destination)).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("import destination requires a resolved Braintrust session configuration"));
     }
 }
