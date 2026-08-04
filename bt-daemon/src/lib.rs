@@ -33,6 +33,7 @@ pub use translate::{
 
 use braintrust_sdk_rust::SpanComponents;
 use clap::{Args, ValueEnum};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +88,10 @@ pub struct HookArgs {
     /// JSON object merged into root-span metadata.
     #[arg(long)]
     pub additional_metadata: Option<String>,
+    /// Marks the hook definition injected by `run`; inherited plugin hooks do
+    /// not carry this flag and are suppressed for the managed child.
+    #[arg(long, hide = true)]
+    pub managed_run_hook: bool,
 }
 
 /// Arguments for `status`.
@@ -114,10 +119,43 @@ pub struct ImportArgs {
     /// Attach the imported session below an exported Braintrust span.
     #[arg(long, value_name = "SPAN_COMPONENTS", conflicts_with = "destination")]
     pub parent: Option<SpanComponents>,
+    /// Keep following the transcript until Ctrl-C, importing new turns as the
+    /// coding-agent session grows.
+    #[arg(long)]
+    pub attach: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ImportSource {
+    Codex,
+    #[value(name = "claude", alias = "claude-code")]
+    Claude,
+}
+
+/// Arguments for launching a coding agent under transcript-based tracing.
+#[derive(Debug, Clone, Args)]
+#[command(trailing_var_arg = true)]
+pub struct RunArgs {
+    /// Coding agent to launch.
+    #[arg(value_enum)]
+    pub source: RunSource,
+    /// Arguments forwarded verbatim to the coding agent.
+    #[arg(allow_hyphen_values = true)]
+    pub agent_args: Vec<OsString>,
+}
+
+/// Front-end command used by a managed agent run to forward one hook payload.
+///
+/// The standalone binary uses `[bt-daemon, hook]`; the embedded `bt` front-end
+/// uses its own equivalent prefix. `run_traced` appends `--source <agent>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHookCommand {
+    pub program: OsString,
+    pub args: Vec<OsString>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RunSource {
     Codex,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
@@ -139,6 +177,12 @@ pub async fn run_hook(
     mut route: SessionRoute,
     host: HostInfo,
 ) -> anyhow::Result<()> {
+    // A managed run injects its own hook definitions. Suppress an inherited
+    // Braintrust plugin hook for the same child, but allow the injected hook
+    // process, which carries the second marker.
+    if std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook {
+        return Ok(());
+    }
     let settings = settings::SharedSettings::load();
     if !settings.tracing_enabled() {
         return Ok(());
@@ -322,7 +366,173 @@ pub async fn run_import(
         .or(args.destination);
     apply_import_destination(&mut config, destination)?;
     let file = transcript_import::resolve_transcript(&args.session_id, args.source)?;
-    import_transcript(&file, args.source, opts, config).await
+    if args.attach {
+        attach_transcript(&file, args.source, opts, config).await
+    } else {
+        import_transcript(&file, args.source, opts, config).await
+    }
+}
+
+/// Launch a coding agent with inherited stdio and inject Braintrust hooks for
+/// this invocation, without requiring the tracing plugin to be installed or
+/// enabled globally.
+pub async fn run_traced(
+    args: RunArgs,
+    hook_command: RunHookCommand,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let executable = match args.source {
+        RunSource::Codex => "codex",
+        RunSource::Claude => "claude",
+    };
+    let injected_args = managed_run_args(args.source, &hook_command)?;
+    let mut child = tokio::process::Command::new(executable)
+        .args(injected_args)
+        .args(args.agent_args)
+        .env("_BT_TRACE_MANAGED_RUN", "1")
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("failed to launch {executable}: {error}"))?;
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+
+    tokio::select! {
+        status = child.wait() => Ok(status?),
+        result = &mut interrupt => {
+            result?;
+            child.start_kill()?;
+            Ok(child.wait().await?)
+        }
+    }
+}
+
+fn managed_run_args(
+    source: RunSource,
+    hook_command: &RunHookCommand,
+) -> anyhow::Result<Vec<OsString>> {
+    let source_name = match source {
+        RunSource::Codex => "codex",
+        RunSource::Claude => "claude",
+    };
+    let unix_command = managed_hook_shell_command(hook_command, source_name, false)?;
+    let windows_command = managed_hook_shell_command(hook_command, source_name, true)?;
+    match source {
+        RunSource::Codex => Ok(codex_managed_run_args(&unix_command, &windows_command)),
+        RunSource::Claude => Ok(claude_managed_run_args(if cfg!(windows) {
+            &windows_command
+        } else {
+            &unix_command
+        })?),
+    }
+}
+
+fn managed_hook_shell_command(
+    hook_command: &RunHookCommand,
+    source: &str,
+    windows: bool,
+) -> anyhow::Result<String> {
+    let mut argv = Vec::with_capacity(hook_command.args.len() + 4);
+    argv.push(hook_command.program.clone());
+    argv.extend(hook_command.args.iter().cloned());
+    argv.push(OsString::from("--source"));
+    argv.push(OsString::from(source));
+    argv.push(OsString::from("--managed-run-hook"));
+    let mut rendered = Vec::with_capacity(argv.len());
+    for arg in argv {
+        let arg = arg
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("managed hook command contains non-Unicode argv"))?;
+        rendered.push(if windows {
+            quote_windows_command_arg(&arg)
+        } else {
+            quote_unix_shell_arg(&arg)
+        });
+    }
+    Ok(rendered.join(" "))
+}
+
+fn quote_unix_shell_arg(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
+}
+
+fn quote_windows_command_arg(arg: &str) -> String {
+    format!("\"{}\"", arg.replace('\\', "/").replace('"', "\"\""))
+}
+
+const CODEX_RUN_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+    "SessionEnd",
+];
+
+const CLAUDE_RUN_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "Setup",
+    "UserPromptSubmit",
+    "UserPromptExpansion",
+    "PreToolUse",
+    "PermissionRequest",
+    "PermissionDenied",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PostToolBatch",
+    "PreCompact",
+    "PostCompact",
+    "Notification",
+    "MessageDisplay",
+    "SubagentStart",
+    "SubagentStop",
+    "TaskCreated",
+    "TaskCompleted",
+    "Stop",
+    "StopFailure",
+    "SessionEnd",
+];
+
+fn codex_managed_run_args(unix_command: &str, windows_command: &str) -> Vec<OsString> {
+    let unix_command = serde_json::to_string(unix_command).expect("serialize hook command");
+    let windows_command =
+        serde_json::to_string(windows_command).expect("serialize Windows hook command");
+    let mut args = vec![
+        OsString::from("--enable"),
+        OsString::from("hooks"),
+        OsString::from("--dangerously-bypass-hook-trust"),
+    ];
+    for event in CODEX_RUN_HOOK_EVENTS {
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(format!(
+            "hooks.{event}=[{{hooks=[{{type=\"command\",command={unix_command},commandWindows={windows_command}}}]}}]"
+        )));
+    }
+    args
+}
+
+fn claude_managed_run_args(command: &str) -> anyhow::Result<Vec<OsString>> {
+    let hook = serde_json::json!({
+        "hooks": [{
+            "hooks": [{
+                "type": "command",
+                "command": command,
+                "async": false
+            }]
+        }]
+    });
+    let hooks = CLAUDE_RUN_HOOK_EVENTS
+        .iter()
+        .map(|event| ((*event).to_string(), hook.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    Ok(vec![
+        OsString::from("--settings"),
+        OsString::from(serde_json::to_string(
+            &serde_json::json!({ "hooks": hooks }),
+        )?),
+    ])
 }
 
 fn apply_import_destination(
@@ -350,65 +560,111 @@ pub async fn import_transcript(
     opts: ServeOptions,
     config: Option<SessionConfig>,
 ) -> anyhow::Result<()> {
-    use std::collections::HashMap;
     let entries = transcript_import::transcript_envelopes(file, source)?;
+    let mut processor = ImportProcessor::new(opts, config);
+    processor.process(entries).await?;
+    processor.finish().await
+}
 
-    struct Live {
-        translator: Box<dyn AgentTranslator>,
-        sink: Box<dyn Sink>,
-        ctx: SessionCtx,
-        pending_ops: usize,
+async fn attach_transcript(
+    file: &std::path::Path,
+    source: ImportSource,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+) -> anyhow::Result<()> {
+    let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
+    let mut processor = ImportProcessor::new(opts, config);
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        processor.process(tail.poll(false)?).await?;
+        tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+        }
     }
-    let mut sessions: HashMap<String, Live> = HashMap::new();
+    processor.process(tail.poll(true)?).await?;
+    processor.finish().await
+}
 
-    for mut env in entries {
-        env.config = config.clone();
-        let sid = env.session_id.clone();
-        let live = match sessions.get_mut(&sid) {
-            Some(l) => l,
-            None => {
-                let translator = opts.translators.create(&env.source, &sid);
-                let sink = opts.sink_factory.create(&sid, &env.source)?;
-                sessions.insert(
-                    sid.clone(),
-                    Live {
-                        translator,
-                        sink,
-                        ctx: SessionCtx {
-                            session_id: sid.clone(),
-                            config: None,
+struct ImportLive {
+    translator: Box<dyn AgentTranslator>,
+    sink: Box<dyn Sink>,
+    ctx: SessionCtx,
+    pending_ops: usize,
+}
+
+struct ImportProcessor {
+    sessions: std::collections::HashMap<String, ImportLive>,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+}
+
+impl ImportProcessor {
+    fn new(opts: ServeOptions, config: Option<SessionConfig>) -> Self {
+        Self {
+            sessions: std::collections::HashMap::new(),
+            opts,
+            config,
+        }
+    }
+
+    async fn process(&mut self, entries: Vec<Envelope>) -> anyhow::Result<()> {
+        for mut env in entries {
+            env.config = self.config.clone();
+            let sid = env.session_id.clone();
+            let live = match self.sessions.get_mut(&sid) {
+                Some(live) => live,
+                None => {
+                    let translator = self.opts.translators.create(&env.source, &sid);
+                    let sink = self.opts.sink_factory.create(&sid, &env.source)?;
+                    self.sessions.insert(
+                        sid.clone(),
+                        ImportLive {
+                            translator,
+                            sink,
+                            ctx: SessionCtx {
+                                session_id: sid.clone(),
+                                config: None,
+                            },
+                            pending_ops: 0,
                         },
-                        pending_ops: 0,
-                    },
-                );
-                sessions.get_mut(&sid).unwrap()
+                    );
+                    self.sessions.get_mut(&sid).unwrap()
+                }
+            };
+            if let Some(cfg) = &env.config {
+                live.sink.configure(cfg);
+                live.ctx.config = Some(cfg.clone());
             }
-        };
-        if let Some(cfg) = &env.config {
-            live.sink.configure(cfg);
-            live.ctx.config = Some(cfg.clone());
-        }
-        let ops = live.translator.handle(&env, &live.ctx)?;
-        // Imports can contain tens of thousands of SDK log commands. Bound the
-        // number queued between drains without serializing one network flush
-        // for every native turn boundary.
-        const FLUSH_OPS: usize = 500;
-        for chunk in ops.chunks(FLUSH_OPS) {
-            live.sink.emit(chunk).await?;
-            live.pending_ops += chunk.len();
-            if live.pending_ops >= FLUSH_OPS {
-                live.sink.flush().await?;
-                live.pending_ops = 0;
+            let ops = live.translator.handle(&env, &live.ctx)?;
+            // Imports can contain tens of thousands of SDK log commands. Bound the
+            // number queued between drains without serializing one network flush
+            // for every native turn boundary.
+            const FLUSH_OPS: usize = 500;
+            for chunk in ops.chunks(FLUSH_OPS) {
+                live.sink.emit(chunk).await?;
+                live.pending_ops += chunk.len();
+                if live.pending_ops >= FLUSH_OPS {
+                    live.sink.flush().await?;
+                    live.pending_ops = 0;
+                }
             }
         }
+        Ok(())
     }
 
-    for (_sid, mut live) in sessions {
-        let ops = live.translator.flush(&live.ctx)?;
-        live.sink.emit(&ops).await?;
-        live.sink.flush().await?;
+    async fn finish(self) -> anyhow::Result<()> {
+        for (_sid, mut live) in self.sessions {
+            let ops = live.translator.flush(&live.ctx)?;
+            live.sink.emit(&ops).await?;
+            live.sink.flush().await?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Build a Phase-1 debug [`ServeOptions`]: debug translator registry + a debug
@@ -508,5 +764,65 @@ mod tests {
         assert!(error
             .to_string()
             .contains("import destination requires a resolved Braintrust session configuration"));
+    }
+
+    fn test_run_hook_command() -> RunHookCommand {
+        RunHookCommand {
+            program: OsString::from("/opt/Braintrust CLI/bt"),
+            args: vec![OsString::from("agents"), OsString::from("hook")],
+        }
+    }
+
+    #[test]
+    fn codex_managed_run_injects_live_hooks() {
+        let args = managed_run_args(RunSource::Codex, &test_run_hook_command()).unwrap();
+        assert_eq!(args[0], "--enable");
+        assert_eq!(args[1], "hooks");
+        assert_eq!(args[2], "--dangerously-bypass-hook-trust");
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "-c").count(),
+            CODEX_RUN_HOOK_EVENTS.len()
+        );
+        let config = args
+            .iter()
+            .find_map(|arg| {
+                let arg = arg.to_str()?;
+                arg.starts_with("hooks.SessionStart=").then_some(arg)
+            })
+            .unwrap();
+        assert!(config.contains("--managed-run-hook"));
+        assert!(config.contains("agents"));
+        assert!(config.contains("hook"));
+        assert!(config.contains("--source"));
+        assert!(config.contains("codex"));
+        assert!(!config.contains("transcript"));
+    }
+
+    #[test]
+    fn claude_managed_run_injects_live_hooks() {
+        let args = managed_run_args(RunSource::Claude, &test_run_hook_command()).unwrap();
+        assert_eq!(args[0], "--settings");
+        let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap()).unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), CLAUDE_RUN_HOOK_EVENTS.len());
+        let command = hooks["SessionStart"]["hooks"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("--managed-run-hook"));
+        assert!(command.contains("agents"));
+        assert!(command.contains("hook"));
+        assert!(command.contains("--source"));
+        assert!(command.contains("claude"));
+        assert!(!command.contains("transcript"));
+    }
+
+    #[test]
+    fn managed_hook_commands_quote_frontend_paths() {
+        let hook = test_run_hook_command();
+        let unix = managed_hook_shell_command(&hook, "codex", false).unwrap();
+        assert!(unix.contains("'/opt/Braintrust CLI/bt' 'agents' 'hook' '--source' 'codex'"));
+        let windows = managed_hook_shell_command(&hook, "claude", true).unwrap();
+        assert!(windows
+            .contains("\"/opt/Braintrust CLI/bt\" \"agents\" \"hook\" \"--source\" \"claude\""));
     }
 }

@@ -6,7 +6,7 @@ event→trace state machine and sends spans to Braintrust out-of-band. See
 [`docs/protocol.md`](docs/protocol.md) for the wire contract.
 
 > **Placeholder name** — the real name is TBD. The subcommand framing
-> (`serve` / `hook` / `status` / `import`) should survive a rename.
+> (`serve` / `hook` / `status` / `import` / `run`) should survive a rename.
 
 ## Layout
 
@@ -16,7 +16,7 @@ One self-contained Cargo crate, liftable to its own repo by copying
 - `src/wire` — the wire protocol module: envelope types + JSON-RPC framing.
 - `src/translate` and `src/sink` — agent state machines and Braintrust output.
 - `src/lib.rs` — the embeddable library: clap `Args` + async entry points
-  (`run_serve`, `run_hook`, `run_status`, `run_import`). This is what `bt`
+  (`run_serve`, `run_hook`, `run_status`, `run_import`, `run_traced`). This is what `bt`
   depends on.
 - `src/main.rs` — the standalone **`bt-daemon` binary**, compiled only with
   the `cli` feature for isolated testing/development. Env/flag static-token
@@ -83,6 +83,13 @@ session store, synthesizes the lifecycle triggers that can be recovered from
 that transcript, and sends them through the normal translator and sink to
 create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
+
+Add `--attach` to keep following an active Codex or Claude transcript until
+Ctrl-C. `run <codex|claude> [ARGS...]` launches the selected agent with
+inherited stdio and injects live Braintrust hooks for that invocation, so it
+does not depend on the tracing plugin being installed or enabled. Managed runs
+suppress inherited Braintrust plugin hooks to avoid logging the same session
+twice; the injected hooks still use the normal daemon translator and sink.
 
 ## Status
 
