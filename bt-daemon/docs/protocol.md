@@ -248,6 +248,8 @@ launches the selected agent with inherited stdio and injects live hook
 configuration for that invocation, so it works without plugin setup. A private
 inherited environment marker makes installed Braintrust plugin hooks no-op for
 that managed child, while a private hook flag authorizes the injected hook process.
+Codex does not bypass hook trust: the user reviews the injected hook once through
+`/hooks`, and Codex reuses its hash-based trust while the definition is unchanged.
 The resulting native hook events follow the regular journal, translator, and
 sink path; transcript tailing remains specific to `import --attach`.
 

@@ -499,11 +499,7 @@ fn codex_managed_run_args(unix_command: &str, windows_command: &str) -> Vec<OsSt
     let unix_command = serde_json::to_string(unix_command).expect("serialize hook command");
     let windows_command =
         serde_json::to_string(windows_command).expect("serialize Windows hook command");
-    let mut args = vec![
-        OsString::from("--enable"),
-        OsString::from("hooks"),
-        OsString::from("--dangerously-bypass-hook-trust"),
-    ];
+    let mut args = vec![OsString::from("--enable"), OsString::from("hooks")];
     for event in CODEX_RUN_HOOK_EVENTS {
         args.push(OsString::from("-c"));
         args.push(OsString::from(format!(
@@ -778,7 +774,9 @@ mod tests {
         let args = managed_run_args(RunSource::Codex, &test_run_hook_command()).unwrap();
         assert_eq!(args[0], "--enable");
         assert_eq!(args[1], "hooks");
-        assert_eq!(args[2], "--dangerously-bypass-hook-trust");
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert_eq!(
             args.iter().filter(|arg| *arg == "-c").count(),
             CODEX_RUN_HOOK_EVENTS.len()

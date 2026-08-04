@@ -90,6 +90,9 @@ inherited stdio and injects live Braintrust hooks for that invocation, so it
 does not depend on the tracing plugin being installed or enabled. Managed runs
 suppress inherited Braintrust plugin hooks to avoid logging the same session
 twice; the injected hooks still use the normal daemon translator and sink.
+Codex applies its normal hook-review flow, so the first run requires trusting
+the injected Braintrust hook through `/hooks`; later runs reuse that trust while
+the hook definition remains unchanged.
 
 ## Status
 
