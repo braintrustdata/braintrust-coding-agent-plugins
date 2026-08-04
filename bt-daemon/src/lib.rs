@@ -132,7 +132,7 @@ pub enum ImportSource {
     Claude,
 }
 
-/// Arguments for launching a coding agent under transcript-based tracing.
+/// Arguments for launching a coding agent with invocation-local live hooks.
 #[derive(Debug, Clone, Args)]
 #[command(trailing_var_arg = true)]
 pub struct RunArgs {
