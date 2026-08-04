@@ -499,7 +499,16 @@ fn root_preserves_config_input_and_git_metadata() {
         json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
                 "payload": { "id": "s", "cwd": repo, "cli_version": "1.2.3" } }),
         json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context",
-                "payload": { "model": "gpt-5.5" } }),
+                "payload": { "model": "gpt-5.5", "cwd": repo } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+                "payload": { "type": "message", "role": "assistant",
+                             "content": [{ "type": "output_text", "text": "working" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+                "payload": { "type": "token_count", "info": { "last_token_usage": {
+                    "input_tokens": 1, "output_tokens": 1
+                } } } }),
     ] {
         append(&transcript, record);
     }
@@ -534,6 +543,12 @@ fn root_preserves_config_input_and_git_metadata() {
     assert_eq!(root.input.as_ref().unwrap()["model"], json!("gpt-5.5"));
     assert_eq!(root.input.as_ref().unwrap()["source"], json!("resume"));
     assert_eq!(root.input.as_ref().unwrap()["cwd"], json!(repo));
+    assert!(rows.values().all(|row| {
+        let metadata = row.metadata.as_ref().and_then(Value::as_object).unwrap();
+        metadata.get("git_origin_url") == Some(&json!("https://example.com/acme/app.git"))
+            && metadata.get("git_branch") == Some(&json!("main"))
+            && metadata.get("git_commit_sha") == Some(&json!(commit))
+    }));
 }
 
 #[test]

@@ -6,6 +6,7 @@
 //! the hook timestamp; this is essential when replaying a journal against a
 //! transcript that already contains the completed session.
 
+use super::git::GitMetadataCache;
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -13,8 +14,17 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Seek, SeekFrom};
 use std::process::Command;
+use std::sync::Arc;
 
-pub struct ClaudeTranslatorFactory;
+pub struct ClaudeTranslatorFactory {
+    git: Arc<GitMetadataCache>,
+}
+
+impl ClaudeTranslatorFactory {
+    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
+        Self { git }
+    }
+}
 
 impl TranslatorFactory for ClaudeTranslatorFactory {
     fn source(&self) -> &str {
@@ -22,13 +32,14 @@ impl TranslatorFactory for ClaudeTranslatorFactory {
     }
 
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(ClaudeTranslator::new(session_id))
+        Box::new(ClaudeTranslator::new(session_id, self.git.clone()))
     }
 }
 
 struct Turn {
     id: String,
     number: u32,
+    cwd: Option<String>,
 }
 
 #[derive(Default)]
@@ -67,10 +78,13 @@ struct ClaudeTranslator {
     pending_skills: Vec<String>,
     claude_version: Option<String>,
     claude_version_logged: bool,
+    git: Arc<GitMetadataCache>,
+    current_cwd: Option<String>,
+    last_turn_cwd: Option<String>,
 }
 
 impl ClaudeTranslator {
-    fn new(session_id: &str) -> Self {
+    fn new(session_id: &str, git: Arc<GitMetadataCache>) -> Self {
         let root = ids::span_id(session_id, "root");
         Self {
             session_id: session_id.to_string(),
@@ -92,6 +106,9 @@ impl ClaudeTranslator {
             pending_skills: Vec::new(),
             claude_version: None,
             claude_version_logged: false,
+            git,
+            current_cwd: None,
+            last_turn_cwd: None,
         }
     }
 
@@ -113,7 +130,6 @@ impl ClaudeTranslator {
             .unwrap_or_default();
         // Internal routing settings must never appear as user metadata.
         metadata.retain(|key, _| !key.starts_with("_bt_"));
-        metadata.extend(git_metadata(&cwd));
         metadata.insert("session_id".into(), json!(self.session_id));
         metadata.insert("workspace".into(), json!(cwd));
         metadata.insert("source".into(), json!("claude-code"));
@@ -202,6 +218,7 @@ impl ClaudeTranslator {
         self.turn = Some(Turn {
             id,
             number: self.turn_count,
+            cwd: self.current_cwd.clone(),
         });
     }
 
@@ -470,6 +487,7 @@ impl ClaudeTranslator {
     }
 
     fn flush_previous_turn_rows(&mut self, ops: &mut Vec<SpanOp>) {
+        let op_start = ops.len();
         let (Some(path), Some(parent)) = (self.main_transcript.clone(), self.last_turn_id.clone())
         else {
             return;
@@ -487,6 +505,8 @@ impl ClaudeTranslator {
         let parsed = parse_transcript(&previous_rows, std::mem::take(&mut self.main_history));
         self.main_history = parsed.history.clone();
         self.emit_parsed(parsed, "main", &parent, ops);
+        self.git
+            .enrich_rows(self.last_turn_cwd.as_deref(), &mut ops[op_start..]);
     }
 
     fn stop_turn(&mut self, event: &Envelope, error: Option<String>, ops: &mut Vec<SpanOp>) {
@@ -512,6 +532,7 @@ impl ClaudeTranslator {
             error,
             ..Default::default()
         }));
+        self.last_turn_cwd = self.turn.as_ref().and_then(|turn| turn.cwd.clone());
         self.last_turn_id = Some(turn_id);
         self.turn = None;
         self.pending_skills.clear();
@@ -583,6 +604,9 @@ impl ClaudeTranslator {
 impl AgentTranslator for ClaudeTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let mut ops = Vec::new();
+        if let Some(cwd) = string_field(&event.payload, "cwd") {
+            self.current_cwd = Some(cwd);
+        }
         self.tail_main(event);
         self.ensure_root(event, ctx, &mut ops);
         if !self.claude_version_logged {
@@ -596,10 +620,13 @@ impl AgentTranslator for ClaudeTranslator {
                 }));
             }
         }
+        self.git.enrich_rows(self.current_cwd.as_deref(), &mut ops);
+        let mut event_op_start = ops.len();
         match event.event.as_str() {
             "SessionStart" => {}
             "UserPromptSubmit" => {
                 self.flush_previous_turn_rows(&mut ops);
+                event_op_start = ops.len();
                 self.open_turn(event, &mut ops);
             }
             "UserPromptExpansion" => self.record_skill(event, &mut ops),
@@ -636,6 +663,8 @@ impl AgentTranslator for ClaudeTranslator {
             "SessionEnd" => self.end_session(event, &mut ops),
             _ => {}
         }
+        self.git
+            .enrich_rows(self.current_cwd.as_deref(), &mut ops[event_op_start..]);
         Ok(ops)
     }
 
@@ -1275,35 +1304,6 @@ fn command_output(cwd: &str, command: &str, args: &[&str]) -> Option<String> {
     }
     let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
     (!value.is_empty()).then_some(value)
-}
-
-fn git_metadata(cwd: &str) -> Map<String, Value> {
-    if cwd.is_empty() {
-        return Map::new();
-    }
-    let mut metadata = Map::new();
-    if let Some(mut origin) = command_output(cwd, "git", &["remote", "get-url", "origin"]) {
-        if let Some(scheme) = origin.find("://") {
-            let start = scheme + 3;
-            let end = origin[start..]
-                .find('/')
-                .map(|offset| start + offset)
-                .unwrap_or(origin.len());
-            if let Some(at) = origin[start..end].rfind('@') {
-                origin = format!("{}{}", &origin[..start], &origin[start + at + 1..]);
-            }
-        }
-        metadata.insert("git_origin_url".into(), json!(origin));
-    }
-    if let Some(branch) =
-        command_output(cwd, "git", &["symbolic-ref", "--quiet", "--short", "HEAD"])
-    {
-        metadata.insert("git_branch".into(), json!(branch));
-    }
-    if let Some(commit) = command_output(cwd, "git", &["rev-parse", "HEAD"]) {
-        metadata.insert("git_commit_sha".into(), json!(commit));
-    }
-    metadata
 }
 
 fn tool_span_name(tool: &str, input: &Value) -> String {

@@ -17,6 +17,7 @@
 //! `flush()`. Native turn ids keep those late records correlated even when a
 //! newer turn has already started.
 
+use super::git::GitMetadataCache;
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -24,13 +25,20 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 const MISSING_TOOL_OUTPUT_ERROR: &str = "Tool output missing before turn ended";
 
-pub struct CodexTranslatorFactory;
+pub struct CodexTranslatorFactory {
+    git: Arc<GitMetadataCache>,
+}
+
+impl CodexTranslatorFactory {
+    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
+        Self { git }
+    }
+}
 
 impl TranslatorFactory for CodexTranslatorFactory {
     fn source(&self) -> &str {
@@ -54,6 +62,7 @@ impl TranslatorFactory for CodexTranslatorFactory {
             spawn_turn_by_agent_id: HashMap::new(),
             compaction_trigger_by_turn: HashMap::new(),
             compaction_spans: HashSet::new(),
+            git: self.git.clone(),
         })
     }
 }
@@ -91,6 +100,7 @@ struct Scope {
     /// Whether this scope's session/root span has been emitted.
     root_created: bool,
     model: Option<String>,
+    current_cwd: Option<String>,
     open_turns: Vec<OpenTurn>,
     conversation_history: Vec<Value>,
     open_llm: Option<OpenLlm>,
@@ -120,6 +130,7 @@ struct CodexTranslator {
     spawn_turn_by_agent_id: HashMap<String, String>,
     compaction_trigger_by_turn: HashMap<String, String>,
     compaction_spans: HashSet<String>,
+    git: Arc<GitMetadataCache>,
 }
 
 impl AgentTranslator for CodexTranslator {
@@ -307,9 +318,15 @@ impl CodexTranslator {
         hook_ts: i64,
         ops: &mut Vec<SpanOp>,
     ) {
+        let op_start = ops.len();
         let ts = parse_ts(rec).unwrap_or(hook_ts);
         let ty = rec.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = rec.get("payload").cloned().unwrap_or(Value::Null);
+        if matches!(ty, "session_meta" | "turn_context") {
+            if let Some(cwd) = str_field(&payload, "cwd") {
+                scope.current_cwd = Some(cwd);
+            }
+        }
 
         match ty {
             "session_meta" => self.open_root(scope, &payload, ts, ops),
@@ -363,6 +380,8 @@ impl CodexTranslator {
             "compacted" => self.on_compacted(scope, rec, &payload, ts, ops),
             _ => {}
         }
+        let cwd = scope.current_cwd.as_deref().or(self.root_cwd.as_deref());
+        self.git.enrich_rows(cwd, &mut ops[op_start..]);
     }
 
     fn open_root(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
@@ -405,11 +424,6 @@ impl CodexTranslator {
                 }
                 if let Some(project) = &self.project {
                     md.insert("project".into(), json!(project));
-                }
-                if let Some(cwd) = &cwd {
-                    for (key, value) in git_metadata(cwd) {
-                        md.insert(key, value);
-                    }
                 }
                 scope.root_created = true;
                 ops.push(SpanOp::Insert(SpanRow {
@@ -1082,6 +1096,7 @@ impl Scope {
             turn_parent_span_id,
             root_created: false,
             model: None,
+            current_cwd: None,
             open_turns: Vec::new(),
             conversation_history: Vec::new(),
             open_llm: None,
@@ -1396,49 +1411,6 @@ fn explicit_skill_metadata(names: &[String]) -> Option<Value> {
             "loaded_skills": names.iter().map(|name| json!({ "name": name })).collect::<Vec<_>>(),
         })
     })
-}
-
-fn git_metadata(cwd: &str) -> Map<String, Value> {
-    fn git(cwd: &str, args: &[&str]) -> Option<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(args)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
-        (!value.is_empty()).then_some(value)
-    }
-    fn redact_remote(remote: String) -> String {
-        let Some(scheme) = remote.find("://") else {
-            return remote;
-        };
-        let authority_start = scheme + 3;
-        let authority_end = remote[authority_start..]
-            .find('/')
-            .map(|offset| authority_start + offset)
-            .unwrap_or(remote.len());
-        if let Some(at) = remote[authority_start..authority_end].rfind('@') {
-            let at = authority_start + at;
-            return format!("{}{}", &remote[..authority_start], &remote[at + 1..]);
-        }
-        remote
-    }
-    let mut metadata = Map::new();
-    if let Some(origin) = git(cwd, &["remote", "get-url", "origin"]) {
-        metadata.insert("git_origin_url".into(), json!(redact_remote(origin)));
-    }
-    if let Some(branch) = git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        metadata.insert("git_branch".into(), json!(branch));
-    }
-    if let Some(commit) = git(cwd, &["rev-parse", "HEAD"]) {
-        metadata.insert("git_commit_sha".into(), json!(commit));
-    }
-    metadata
 }
 
 fn compaction_output(replacement: Option<&Vec<Value>>) -> Value {
