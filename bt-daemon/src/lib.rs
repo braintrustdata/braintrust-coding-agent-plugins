@@ -366,11 +366,7 @@ pub async fn run_import(
         .or(args.destination);
     apply_import_destination(&mut config, destination)?;
     let file = transcript_import::resolve_transcript(&args.session_id, args.source)?;
-    if args.attach {
-        attach_transcript(&file, args.source, opts, config).await
-    } else {
-        import_transcript(&file, args.source, opts, config).await
-    }
+    import_transcript(&file, args.source, opts, config, args.attach).await
 }
 
 /// Launch a coding agent with inherited stdio and inject Braintrust hooks for
@@ -555,34 +551,26 @@ pub async fn import_transcript(
     source: ImportSource,
     opts: ServeOptions,
     config: Option<SessionConfig>,
-) -> anyhow::Result<()> {
-    let entries = transcript_import::transcript_envelopes(file, source)?;
-    let mut processor = ImportProcessor::new(opts, config);
-    processor.process(entries).await?;
-    processor.finish().await
-}
-
-async fn attach_transcript(
-    file: &std::path::Path,
-    source: ImportSource,
-    opts: ServeOptions,
-    config: Option<SessionConfig>,
+    attach: bool,
 ) -> anyhow::Result<()> {
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
     let mut processor = ImportProcessor::new(opts, config);
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut finalizing = !attach;
     loop {
-        processor.process(tail.poll(false)?).await?;
+        processor.process(tail.poll(finalizing)?).await?;
+        if finalizing {
+            break;
+        }
         tokio::select! {
             result = &mut shutdown => {
                 result?;
-                break;
+                finalizing = true;
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
         }
     }
-    processor.process(tail.poll(true)?).await?;
     processor.finish().await
 }
 
