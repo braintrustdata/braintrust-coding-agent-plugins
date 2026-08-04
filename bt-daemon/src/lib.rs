@@ -357,11 +357,25 @@ pub async fn run_import(
         .parent
         .map(|components| wire::TraceDestination::ParentSpan { components })
         .or(args.destination);
-    if let (Some(config), Some(destination)) = (&mut config, destination) {
-        config.destination = Some(destination);
-    }
+    apply_import_destination(&mut config, destination)?;
     let file = transcript_import::resolve_transcript(&args.session_id, args.source)?;
     import_transcript(&file, args.source, opts, config).await
+}
+
+fn apply_import_destination(
+    config: &mut Option<SessionConfig>,
+    destination: Option<wire::TraceDestination>,
+) -> anyhow::Result<()> {
+    if let Some(destination) = destination {
+        let config = config.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "import destination requires a resolved Braintrust session configuration; \
+                 use `bt trace import` instead of the standalone `bt-daemon import` command"
+            )
+        })?;
+        config.destination = Some(destination);
+    }
+    Ok(())
 }
 
 /// Import a native transcript from a known path. Front-ends should normally
@@ -514,5 +528,20 @@ mod tests {
     #[test]
     fn clock_returns_a_positive_epoch_timestamp() {
         assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn import_destination_without_session_config_fails_fast() {
+        let mut config = None;
+        let destination = wire::TraceDestination::ProjectLogs {
+            project_id: Some("project-id".to_string()),
+            project_name: None,
+        };
+
+        let error = apply_import_destination(&mut config, Some(destination)).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("import destination requires a resolved Braintrust session configuration"));
     }
 }
