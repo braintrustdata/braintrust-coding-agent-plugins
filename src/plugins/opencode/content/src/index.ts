@@ -87,7 +87,7 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
 
   // Add tracing hooks if enabled
   if (config.tracingEnabled) {
-    const tracingHooks = createDaemonTracingHooks(input, (message, extra) => {
+    const tracingHooks = createDaemonTracingHooks(input, config, (message, extra) => {
       client.app
         .log({ body: { service: "braintrust-trace", level: "warn", message, extra } })
         .catch(() => {})

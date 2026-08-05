@@ -90,7 +90,8 @@ impl AgentTestWorld {
             command
                 .env("BRAINTRUST_API_KEY", "test-key")
                 .env("BRAINTRUST_API_URL", collector_server.uri())
-                .env("BRAINTRUST_APP_URL", collector_server.uri());
+                .env("BRAINTRUST_APP_URL", collector_server.uri())
+                .env("BRAINTRUST_PROJECT", "agent-e2e");
         }
         let daemon = command.spawn().expect("start daemon");
 
@@ -142,6 +143,7 @@ impl AgentTestWorld {
             .env("BT_DAEMON_DATA_DIR", &self.data_dir)
             .env("BT_DAEMON_CONFIG", &self.config_path)
             .env("BRAINTRUST_FLUSH_ON_TURN_END", "true")
+            .env("BRAINTRUST_ADDITIONAL_METADATA", r#"{"test_harness":true}"#)
             .stdin(Stdio::null());
         if self.uses_mock_ingest() {
             command

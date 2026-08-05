@@ -50,6 +50,7 @@ describe("BraintrustPlugin", () => {
     "TRACE_TO_BRAINTRUST",
     "BRAINTRUST_API_KEY",
     "BRAINTRUST_API_URL",
+    "BRAINTRUST_PROFILE",
     "BRAINTRUST_OPENCODE_ENABLE_TOOLS",
     "HOME",
   ]

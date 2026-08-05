@@ -1,11 +1,14 @@
 mod claude;
 mod codex;
+mod opencode;
 mod test_plugin;
 
 #[allow(unused_imports)]
 pub use claude::{ClaudeAgent, ClaudeRun};
 #[allow(unused_imports)]
 pub use codex::{CodexAgent, CodexRun};
+#[allow(unused_imports)]
+pub use opencode::{OpenCodeAgent, OpenCodeRun};
 
 use std::ffi::OsString;
 use std::path::PathBuf;

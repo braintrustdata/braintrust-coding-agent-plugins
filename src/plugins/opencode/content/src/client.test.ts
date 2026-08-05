@@ -58,6 +58,7 @@ describe("loadConfig", () => {
     "BRAINTRUST_API_URL",
     "BRAINTRUST_APP_URL",
     "BRAINTRUST_ORG_NAME",
+    "BRAINTRUST_PROFILE",
     "BRAINTRUST_PROJECT",
     "BRAINTRUST_ADDITIONAL_METADATA",
     "BRAINTRUST_OPENCODE_ENABLE_TOOLS",
@@ -89,6 +90,7 @@ describe("loadConfig", () => {
       expect(config.apiUrl).toBe("https://api.braintrust.dev")
       expect(config.appUrl).toBe("https://www.braintrust.dev")
       expect(config.orgName).toBeUndefined()
+      expect(config.profile).toBeUndefined()
       expect(config.projectName).toBe("opencode")
       expect(config.tracingEnabled).toBe(false)
       expect(config.enableTools).toBe(true)
@@ -149,6 +151,7 @@ describe("loadConfig", () => {
   describe("pluginConfig only (from opencode.json)", () => {
     it("loads all settings from pluginConfig", () => {
       const pluginConfig: PluginConfig = {
+        profile: "config-profile",
         api_key: "test-api-key",
         api_url: "https://custom-api.example.com",
         app_url: "https://custom-app.example.com",
@@ -163,6 +166,7 @@ describe("loadConfig", () => {
       expect(config.apiUrl).toBe("https://custom-api.example.com")
       expect(config.appUrl).toBe("https://custom-app.example.com")
       expect(config.orgName).toBe("test-org")
+      expect(config.profile).toBe("config-profile")
       expect(config.projectName).toBe("test-project")
       expect(config.tracingEnabled).toBe(true)
       expect(config.enableTools).toBe(false)
@@ -207,6 +211,12 @@ describe("loadConfig", () => {
       const pluginConfig: PluginConfig = { project: "config-project" }
       const config = loadConfig(pluginConfig)
       expect(config.projectName).toBe("env-project")
+    })
+
+    it("env var overrides pluginConfig for profile selection", () => {
+      process.env.BRAINTRUST_PROFILE = "env-profile"
+      const config = loadConfig({ profile: "config-profile" })
+      expect(config.profile).toBe("env-profile")
     })
 
     it("env var overrides pluginConfig for trace_to_braintrust", () => {

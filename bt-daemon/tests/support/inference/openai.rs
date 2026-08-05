@@ -94,6 +94,45 @@ impl OpenAiTurn {
             } => vec![
                 created,
                 json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": format!("msg_mock_{response_index}"),
+                        "status": "in_progress",
+                        "content": []
+                    }
+                }),
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": format!("msg_mock_{response_index}"),
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []}
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                        "item_id": format!("msg_mock_{response_index}"),
+                        "output_index": 0,
+                        "content_index": 0,
+                    "delta": text.clone()
+                }),
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": format!("msg_mock_{response_index}"),
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": text.clone()
+                }),
+                json!({
+                    "type": "response.content_part.done",
+                    "item_id": format!("msg_mock_{response_index}"),
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": text.clone(), "annotations": []}
+                }),
+                json!({
                     "type": "response.output_item.done",
                     "item": {
                         "type": "message",
@@ -174,6 +213,7 @@ impl OpenAiMock {
         Router::new()
             .route("/v1/models", get(models))
             .route("/v1/responses", post(responses))
+            .route("/v1/chat/completions", post(chat_completions))
             .route("/backend-api/plugins/featured", get(featured_plugins))
             .with_state(Arc::clone(&self.state))
     }
@@ -220,6 +260,95 @@ async fn responses(
             StatusCode::OK,
             "text/event-stream",
             sse(&turn.events(index)),
+        ),
+        MockReply::HttpError { status, body } => json_response(status, body),
+        MockReply::Raw {
+            status,
+            content_type,
+            body,
+        } => raw_response(status, content_type, body),
+    }
+}
+
+async fn chat_completions(
+    State(state): State<Arc<MockState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    let body = match decode_json_body(&headers, &body) {
+        Ok(body) => body,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error": error})),
+    };
+    let request = OpenAiRequest { body };
+    state
+        .requests
+        .lock()
+        .expect("request lock")
+        .push(request.clone());
+    let index = state.next_index.fetch_add(1, Ordering::SeqCst);
+    match (state.handler)(
+        RequestContext {
+            request_index: index,
+        },
+        request,
+    ) {
+        MockReply::Response(OpenAiTurn::Text {
+            text,
+            input_tokens,
+            output_tokens,
+        }) => {
+            let id = format!("chatcmpl_mock_{index}");
+            let chunks = [
+                json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}}]
+                }),
+                json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens
+                    }
+                }),
+            ];
+            let mut body = chunks
+                .iter()
+                .map(|chunk| format!("data: {chunk}\n\n"))
+                .collect::<String>();
+            body.push_str("data: [DONE]\n\n");
+            raw_response(StatusCode::OK, "text/event-stream", body.into_bytes())
+        }
+        MockReply::Response(OpenAiTurn::ToolCall {
+            call_id,
+            name,
+            arguments,
+            ..
+        }) => {
+            let body = json!({
+                "id": format!("chatcmpl_mock_{index}"),
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments.to_string()}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            });
+            json_response(StatusCode::OK, body)
+        }
+        MockReply::Response(OpenAiTurn::Events(_)) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "raw response events are unsupported on chat completions"}),
         ),
         MockReply::HttpError { status, body } => json_response(status, body),
         MockReply::Raw {

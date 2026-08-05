@@ -5,6 +5,7 @@
 import { PLUGIN_VERSION } from "./version"
 
 export interface BraintrustConfig {
+  profile?: string
   apiKey: string
   apiUrl?: string
   appUrl: string
@@ -23,6 +24,7 @@ export interface BraintrustConfig {
  * Uses snake_case to match environment variable naming.
  */
 export interface PluginConfig {
+  profile?: string
   api_key?: string
   api_url?: string
   app_url?: string
@@ -163,6 +165,7 @@ export function parseBooleanEnv(value: string | undefined): boolean {
 export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
   // Defaults
   const defaults: BraintrustConfig = {
+    profile: undefined,
     apiKey: "",
     apiUrl: "https://api.braintrust.dev",
     appUrl: "https://www.braintrust.dev",
@@ -176,6 +179,7 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
 
   // Layer 1: Apply opencode.json config (if provided)
   if (pluginConfig) {
+    if (pluginConfig.profile) defaults.profile = pluginConfig.profile
     if (pluginConfig.api_key) defaults.apiKey = pluginConfig.api_key
     if (pluginConfig.api_url) defaults.apiUrl = pluginConfig.api_url
     if (pluginConfig.app_url) defaults.appUrl = pluginConfig.app_url
@@ -227,6 +231,7 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
   }
 
   return {
+    profile: process.env.BRAINTRUST_PROFILE || defaults.profile,
     apiKey: process.env.BRAINTRUST_API_KEY || defaults.apiKey,
     apiUrl: process.env.BRAINTRUST_API_URL || defaults.apiUrl,
     appUrl: process.env.BRAINTRUST_APP_URL || defaults.appUrl,

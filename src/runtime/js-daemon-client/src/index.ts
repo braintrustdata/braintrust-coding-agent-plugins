@@ -6,6 +6,16 @@ import { join } from "node:path"
 
 export const DAEMON_PROTOCOL_VERSION = 1
 
+export interface DaemonSessionRoute {
+  auth?: {
+    profile?: string
+    org_name?: string
+  }
+  destination: unknown
+  flush_mode?: "fire_and_forget" | "flush_on_turn_end"
+  additional_metadata?: Record<string, unknown>
+}
+
 export interface DaemonEnvelope {
   source: string
   source_version?: string
@@ -13,6 +23,7 @@ export interface DaemonEnvelope {
   event: string
   ts_ms: number
   payload: unknown
+  route?: DaemonSessionRoute
 }
 
 export interface DaemonSessionStatus {
@@ -142,7 +153,8 @@ export class DaemonClient {
     })
   }
 
-  close(): void {
+  async close(): Promise<void> {
+    await this.queue
     this.disconnect(new Error("daemon client closed"))
   }
 

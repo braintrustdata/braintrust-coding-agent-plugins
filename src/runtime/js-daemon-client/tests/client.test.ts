@@ -67,7 +67,7 @@ test("serializes initialize, events, flush, and status over one connection", asy
   expect(await client.flush("session")).toBe(true)
   expect((await client.status("session"))?.daemon_version).toBe("test")
   expect(methods).toEqual(["initialize", "event.log", "event.log", "session.flush", "status.get"])
-  client.close()
+  await client.close()
   await new Promise<void>((resolve) => server.close(() => resolve()))
   rmSync(temp, { recursive: true, force: true })
 })
@@ -95,5 +95,5 @@ test("fails open when the daemon and bt executable are absent", async () => {
     }),
   ).toBe(false)
   expect(warnings.length).toBeGreaterThan(0)
-  client.close()
+  await client.close()
 })
