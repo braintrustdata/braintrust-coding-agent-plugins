@@ -3,7 +3,6 @@
 
 use braintrust_sdk_rust::SpanComponents;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// One captured hook event, forwarded from a shim to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,9 +26,9 @@ pub struct Envelope {
     /// the selected profile and organization to live credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<SessionRoute>,
-    /// Shim-resolved credentials + trace settings. Present on every event from
-    /// a legacy stateless shim. New clients should send `route` and omit this.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Daemon-internal resolved configuration. This field is never serialized;
+    /// clients can only submit `route`.
+    #[serde(skip)]
     pub config: Option<SessionConfig>,
 }
 
@@ -52,12 +51,6 @@ pub struct SessionRoute {
     pub auth: AuthSelection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<TraceDestination>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_span_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_span_id: Option<String>,
     #[serde(default)]
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,9 +62,6 @@ impl SessionRoute {
         SessionConfig {
             auth,
             destination: self.destination.clone(),
-            project: self.project.clone(),
-            parent_span_id: self.parent_span_id.clone(),
-            root_span_id: self.root_span_id.clone(),
             flush_mode: self.flush_mode,
             additional_metadata: self.additional_metadata.clone(),
         }
@@ -86,16 +76,9 @@ impl SessionRoute {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub auth: BackendAuth,
-    /// Typed destination for new front-ends. When present, this takes
-    /// precedence over the legacy project and span-attachment fields below.
+    /// Typed trace destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<TraceDestination>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_span_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_span_id: Option<String>,
     #[serde(default)]
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,7 +109,14 @@ impl SessionConfig {
         if let Some(TraceDestination::ParentSpan { components }) = &self.destination {
             return (components.span_id.clone(), components.root_span_id.clone());
         }
-        (self.parent_span_id.clone(), self.root_span_id.clone())
+        (None, None)
+    }
+
+    pub fn project_name(&self) -> Option<&str> {
+        match &self.destination {
+            Some(TraceDestination::ProjectLogs { project_name, .. }) => project_name.as_deref(),
+            _ => None,
+        }
     }
 }
 
@@ -157,7 +147,7 @@ impl std::str::FromStr for TraceDestination {
 }
 
 /// Backend credentials. `token` is an API key or an OAuth access token; the
-/// daemon does not care which. Never persisted (see [`SessionConfig::redacted`]).
+/// daemon does not care which. Never serialized or persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendAuth {
     pub token: String,
@@ -184,43 +174,9 @@ pub enum FlushMode {
     FlushOnTurnEnd,
 }
 
-/// A non-secret fingerprint of [`BackendAuth`], written to the journal in
-/// place of the token so replay can detect a credential change without ever
-/// persisting the secret.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthFingerprint {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub org_name: Option<String>,
-    /// First 12 hex chars of SHA-256(token). Enough to detect rotation, far
-    /// too little to recover the token.
-    pub token_sha256_prefix: String,
-}
-
-impl BackendAuth {
-    pub fn fingerprint(&self) -> AuthFingerprint {
-        let digest = Sha256::digest(self.token.as_bytes());
-        let hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-            s
-        });
-        AuthFingerprint {
-            api_url: self.api_url.clone(),
-            app_url: self.app_url.clone(),
-            org_name: self.org_name.clone(),
-            token_sha256_prefix: hex[..12].to_string(),
-        }
-    }
-}
-
 impl Envelope {
-    /// A copy of this envelope safe to write to the journal. Routed envelopes
-    /// retain only their non-secret route selection; legacy envelopes replace
-    /// the live token with an [`AuthFingerprint`].
+    /// A copy safe to journal. Only the non-secret route is serializable; the
+    /// daemon-internal resolved config is excluded by construction.
     pub fn redacted(&self) -> RedactedEnvelope {
         RedactedEnvelope {
             source: self.source.clone(),
@@ -230,21 +186,6 @@ impl Envelope {
             ts_ms: self.ts_ms,
             payload: self.payload.clone(),
             route: self.route.clone(),
-            config: self
-                .route
-                .is_none()
-                .then(|| {
-                    self.config.as_ref().map(|c| RedactedConfig {
-                        auth: c.auth.fingerprint(),
-                        destination: c.destination.clone(),
-                        project: c.project.clone(),
-                        parent_span_id: c.parent_span_id.clone(),
-                        root_span_id: c.root_span_id.clone(),
-                        flush_mode: c.flush_mode,
-                        additional_metadata: c.additional_metadata.clone(),
-                    })
-                })
-                .flatten(),
         }
     }
 }
@@ -262,25 +203,6 @@ pub struct RedactedEnvelope {
     pub payload: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<SessionRoute>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<RedactedConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RedactedConfig {
-    pub auth: AuthFingerprint,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<TraceDestination>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_span_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_span_id: Option<String>,
-    #[serde(default)]
-    pub flush_mode: FlushMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub additional_metadata: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -295,7 +217,17 @@ mod tests {
             event: "PostToolUse".into(),
             ts_ms: 1_753_639_552_123,
             payload: serde_json::json!({ "session_id": "sess-1", "tool_name": "shell" }),
-            route: None,
+            route: Some(SessionRoute {
+                auth: AuthSelection {
+                    profile: Some("work".into()),
+                    org_name: Some("acme".into()),
+                },
+                destination: Some(TraceDestination::ProjectLogs {
+                    project_id: None,
+                    project_name: Some("codex".into()),
+                }),
+                ..SessionRoute::default()
+            }),
             config: Some(SessionConfig {
                 auth: BackendAuth {
                     token: "sk-super-secret".into(),
@@ -305,9 +237,6 @@ mod tests {
                     org_id: None,
                 },
                 destination: None,
-                project: Some("codex".into()),
-                parent_span_id: None,
-                root_span_id: None,
                 flush_mode: FlushMode::FireAndForget,
                 additional_metadata: None,
             }),
@@ -320,11 +249,13 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         let back: Envelope = serde_json::from_str(&s).unwrap();
         assert_eq!(back.session_id, "sess-1");
-        assert_eq!(back.config.unwrap().auth.token, "sk-super-secret");
+        assert_eq!(back.route.unwrap().auth.profile.as_deref(), Some("work"));
+        assert!(back.config.is_none());
+        assert!(!s.contains("sk-super-secret"));
     }
 
     #[test]
-    fn redaction_drops_the_token_but_keeps_settings() {
+    fn journal_form_contains_only_the_route() {
         let e = sample();
         let r = e.redacted();
         let s = serde_json::to_string(&r).unwrap();
@@ -332,10 +263,7 @@ mod tests {
             !s.contains("sk-super-secret"),
             "token leaked into journal form: {s}"
         );
-        let cfg = r.config.unwrap();
-        assert_eq!(cfg.project.as_deref(), Some("codex"));
-        assert_eq!(cfg.auth.org_name.as_deref(), Some("acme"));
-        assert_eq!(cfg.auth.token_sha256_prefix.len(), 12);
+        assert_eq!(r.route.unwrap().auth.profile.as_deref(), Some("work"));
     }
 
     #[test]
@@ -345,7 +273,10 @@ mod tests {
                 profile: Some("work".into()),
                 org_name: Some("acme".into()),
             },
-            project: Some("agent-traces".into()),
+            destination: Some(TraceDestination::ProjectLogs {
+                project_id: None,
+                project_name: Some("agent-traces".into()),
+            }),
             ..SessionRoute::default()
         };
         let config = route.with_auth(BackendAuth {
@@ -355,7 +286,11 @@ mod tests {
             org_name: Some("acme".into()),
             org_id: None,
         });
-        assert_eq!(config.project.as_deref(), Some("agent-traces"));
+        assert!(matches!(
+            config.destination,
+            Some(TraceDestination::ProjectLogs { project_name: Some(ref name), .. })
+                if name == "agent-traces"
+        ));
         assert_eq!(route.auth.profile.as_deref(), Some("work"));
 
         let mut envelope = sample();
@@ -364,15 +299,6 @@ mod tests {
         let journal = serde_json::to_string(&envelope.redacted()).unwrap();
         assert!(journal.contains("work"));
         assert!(!journal.contains("secret"));
-    }
-
-    #[test]
-    fn fingerprint_changes_with_token() {
-        let mut a = sample().config.unwrap().auth;
-        let f1 = a.fingerprint();
-        a.token = "sk-different".into();
-        let f2 = a.fingerprint();
-        assert_ne!(f1.token_sha256_prefix, f2.token_sha256_prefix);
     }
 
     #[test]

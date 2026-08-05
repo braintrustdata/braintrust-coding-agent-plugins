@@ -36,9 +36,6 @@ hook processes or JavaScript plugins.
 2. **Standalone binary** (testing): the provider uses `BRAINTRUST_API_KEY` and
    related environment variables.
 
-Legacy clients that send a resolved `SessionConfig` remain wire-compatible
-during migration.
-
 ## Shared plugin settings
 
 Codex, Claude Code, and future hook plugins read the same non-credential

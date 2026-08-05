@@ -104,14 +104,18 @@ impl Daemon {
     }
 
     async fn configure_event(&self, env: &mut Envelope) -> anyhow::Result<()> {
-        // Full configs are a temporary compatibility path for old hooks.
-        if env.config.is_some() {
-            return Ok(());
-        }
         let Some(provider) = &self.auth_provider else {
-            return Ok(());
+            anyhow::bail!("daemon host has no Braintrust auth provider");
         };
-        let route = env.route.clone().unwrap_or_default();
+        let route = env
+            .route
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("event is missing its session route"))?;
+        if route.destination.is_none() {
+            anyhow::bail!(
+                "session route is missing its trace destination; select a project or destination during `bt trace setup` or `bt trace run`"
+            );
+        }
         let (selection, reason, expected_profile) = {
             let states = self.session_auth.lock().await;
             match states.get(&env.session_id) {

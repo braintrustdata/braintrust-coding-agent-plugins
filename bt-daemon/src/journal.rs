@@ -5,9 +5,7 @@
 //! Format: one [`RedactedEnvelope`] JSON value per line in
 //! `<data_dir>/journal/<session_id>.ndjson`.
 
-use crate::wire::{
-    AuthFingerprint, BackendAuth, Envelope, RedactedConfig, RedactedEnvelope, SessionConfig,
-};
+use crate::wire::{BackendAuth, Envelope, RedactedEnvelope};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
@@ -110,15 +108,13 @@ pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
 /// if replay needs to actually deliver.
 pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
     let route = r.route;
-    let config = r.config.map(config_from_redacted).or_else(|| {
-        route.as_ref().map(|route| {
-            route.with_auth(BackendAuth {
-                token: String::new(),
-                api_url: None,
-                app_url: None,
-                org_name: route.auth.org_name.clone(),
-                org_id: None,
-            })
+    let config = route.as_ref().map(|route| {
+        route.with_auth(BackendAuth {
+            token: String::new(),
+            api_url: None,
+            app_url: None,
+            org_name: route.auth.org_name.clone(),
+            org_id: None,
         })
     });
     Envelope {
@@ -130,29 +126,5 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
         payload: r.payload,
         route,
         config,
-    }
-}
-
-fn config_from_redacted(c: RedactedConfig) -> SessionConfig {
-    let AuthFingerprint {
-        api_url,
-        app_url,
-        org_name,
-        ..
-    } = c.auth;
-    SessionConfig {
-        auth: BackendAuth {
-            token: String::new(),
-            api_url,
-            app_url,
-            org_name,
-            org_id: None,
-        },
-        destination: c.destination,
-        project: c.project,
-        parent_span_id: c.parent_span_id,
-        root_span_id: c.root_span_id,
-        flush_mode: c.flush_mode,
-        additional_metadata: c.additional_metadata,
     }
 }

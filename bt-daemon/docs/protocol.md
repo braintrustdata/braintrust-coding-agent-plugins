@@ -90,7 +90,7 @@ Result:
 {
   "protocol_version": 1,
   "daemon_version": "0.1.0",
-  "capabilities": { "sources": ["codex", "claude-code", "debug"] }
+  "capabilities": { "sources": ["codex", "claude-code", "opencode", "debug"] }
 }
 ```
 If `protocol_version` is incompatible the daemon returns an application error;
@@ -170,9 +170,6 @@ Used for version handover and by tests.
       "project_id": "project-uuid",
       "project_name": "codex"
     },
-    "project": "codex",
-    "parent_span_id": null,
-    "root_span_id": null,
     "flush_mode": "fire_and_forget",
     "additional_metadata": { "…": "…" }
   }
@@ -198,23 +195,18 @@ Field notes:
   `org_name` optionally constrains organization selection. The daemon resolves
   the live credential, pins the returned canonical profile for the lifetime
   of the session, and refreshes an expiring lease without changing that route.
-  A route cannot change after a session's first accepted event.
+  A route cannot change after a session's first accepted event. `destination`
+  is required so setup/run must make project or parent selection explicit.
   `flush_mode` ∈ `fire_and_forget` | `flush_on_turn_end`.
   New front-ends set the typed `destination`: `project_logs` accepts a project
   id and/or name, `experiment` accepts an experiment id, and `parent_span`
-  carries the complete exported `SpanComponents` object. The older `project`,
-  `parent_span_id`, `root_span_id`, and `_bt_experiment_id` fields remain
-  accepted when `destination` is absent. A legacy `config` containing resolved
-  credentials remains accepted during client migration, but new clients must
-  use `route`.
+  carries the complete exported `SpanComponents` object.
 
 ### Redaction
 
 Live credentials returned by the host provider are **never** written to the
-journal, logs, status, or RPC response. Routed envelopes journal only their
-non-secret `route`, allowing restart recovery to resolve a fresh lease. Legacy
-`config.auth.token` values are reduced to a non-secret fingerprint for
-backward-compatible replay.
+journal, logs, status, or RPC response. Envelopes journal only their non-secret
+`route`, allowing restart recovery to resolve a fresh lease.
 
 ## Daemon lifecycle
 

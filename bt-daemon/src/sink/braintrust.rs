@@ -112,10 +112,6 @@ struct Creds {
     org_id: String,
     org_name: Option<String>,
     destination: Option<TraceDestination>,
-    project: Option<String>,
-    experiment_id: Option<String>,
-    parent_span_id: Option<String>,
-    root_span_id: Option<String>,
 }
 
 impl Creds {
@@ -123,10 +119,6 @@ impl Creds {
         self.token == other.token
             && self.org_id == other.org_id
             && self.org_name == other.org_name
-            && self.project == other.project
-            && self.experiment_id == other.experiment_id
-            && self.parent_span_id == other.parent_span_id
-            && self.root_span_id == other.root_span_id
             && serde_json::to_value(&self.destination).ok()
                 == serde_json::to_value(&other.destination).ok()
     }
@@ -157,7 +149,7 @@ impl BraintrustSink {
         {
             return project_name.clone();
         }
-        creds.project.clone().unwrap_or_else(|| self.source.clone())
+        self.source.clone()
     }
 
     fn parent_info(
@@ -170,16 +162,8 @@ impl BraintrustSink {
             if let Some(destination) = &creds.destination {
                 return root_destination(destination, project);
             }
-            // Session root: attach under an external trace if the shim supplied
-            // one, else land it directly in the project's logs.
-            Ok(match (&creds.parent_span_id, &creds.root_span_id) {
-                (Some(p), Some(r)) => full_span(creds, project, p.clone(), r.clone()),
-                _ if creds.experiment_id.is_some() => ParentSpanInfo::Experiment {
-                    object_id: creds.experiment_id.clone().unwrap(),
-                },
-                _ => ParentSpanInfo::ProjectName {
-                    project_name: project.to_string(),
-                },
+            Ok(ParentSpanInfo::ProjectName {
+                project_name: project.to_string(),
             })
         } else {
             Ok(full_span(
@@ -284,15 +268,6 @@ impl Sink for BraintrustSink {
             org_id: config.auth.org_id.clone().unwrap_or_default(),
             org_name: config.auth.org_name.clone(),
             destination: config.destination.clone(),
-            project: config.project.clone(),
-            experiment_id: config
-                .additional_metadata
-                .as_ref()
-                .and_then(|v| v.get("_bt_experiment_id"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            parent_span_id: config.parent_span_id.clone(),
-            root_span_id: config.root_span_id.clone(),
         };
         // Span handles capture their credentials when built. Recreate them
         // after a profile token or routing change; deterministic row ids make
@@ -350,17 +325,6 @@ fn full_span(
             propagated_event: components.propagated_event,
         };
     }
-    if let Some(experiment_id) = &creds.experiment_id {
-        return ParentSpanInfo::FullSpan {
-            object_type: SpanObjectType::Experiment,
-            object_id: Some(experiment_id.clone()),
-            compute_object_metadata_args: None,
-            span_id,
-            root_span_id,
-            span_parents: None,
-            propagated_event: None,
-        };
-    }
     let mut cma = Map::new();
     cma.insert(
         "project_name".to_string(),
@@ -409,7 +373,7 @@ fn root_destination(
 fn destination_root(creds: &Creds) -> Option<String> {
     match &creds.destination {
         Some(TraceDestination::ParentSpan { components }) => components.root_span_id.clone(),
-        _ => creds.root_span_id.clone(),
+        _ => None,
     }
 }
 

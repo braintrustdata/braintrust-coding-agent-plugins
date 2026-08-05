@@ -3,9 +3,7 @@
 //! spawning, so it's deterministic).
 
 use async_trait::async_trait;
-use bt_daemon::wire::{
-    AuthSelection, BackendAuth, Envelope, FlushMode, SessionConfig, SessionRoute,
-};
+use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionRoute};
 use bt_daemon::{
     debug_serve_options, flush_session, forward_envelope, run_serve, run_status, shutdown_daemon,
     AuthLease, AuthProvider, AuthResolveReason, HostInfo, ServeArgs, StatusArgs,
@@ -25,24 +23,6 @@ fn dummy_host() -> HostInfo {
     }
 }
 
-fn config_with_secret() -> SessionConfig {
-    SessionConfig {
-        auth: BackendAuth {
-            token: "sk-TOP-SECRET-abc123".into(),
-            api_url: Some("https://api.braintrust.dev".into()),
-            app_url: None,
-            org_name: Some("acme".into()),
-            org_id: None,
-        },
-        destination: None,
-        project: Some("codex".into()),
-        parent_span_id: None,
-        root_span_id: None,
-        flush_mode: FlushMode::FireAndForget,
-        additional_metadata: None,
-    }
-}
-
 fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
     Envelope {
         source: "debug".into(),
@@ -51,20 +31,28 @@ fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
         event: event.into(),
         ts_ms,
         payload: serde_json::json!({ "session_id": session_id, "hook_event_name": event, "n": ts_ms }),
-        route: None,
-        config: Some(config_with_secret()),
+        route: Some(SessionRoute {
+            destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+                project_id: None,
+                project_name: Some("codex".into()),
+            }),
+            ..SessionRoute::default()
+        }),
+        config: None,
     }
 }
 
 fn routed_envelope(session_id: &str, profile: &str, org: &str, event: &str) -> Envelope {
     let mut env = envelope(session_id, event, 1);
-    env.config = None;
     env.route = Some(SessionRoute {
         auth: AuthSelection {
             profile: Some(profile.into()),
             org_name: Some(org.into()),
         },
-        project: Some(format!("{profile}-traces")),
+        destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+            project_id: None,
+            project_name: Some(format!("{profile}-traces")),
+        }),
         ..SessionRoute::default()
     });
     env
@@ -198,7 +186,12 @@ async fn start_daemon() -> (
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0, // disable the watchdog for the test
     };
-    let opts = debug_serve_options("test", &data_dir);
+    let mut opts = debug_serve_options("test", &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
     let handle = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;
     });
@@ -212,7 +205,12 @@ async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::Joi
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
     };
-    let opts = debug_serve_options("test", &data_dir);
+    let mut opts = debug_serve_options("test", &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
     let handle = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;
     });
@@ -393,7 +391,7 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
     assert_eq!(flushed.pending, 0);
 
-    // Journal: three events, in order, token redacted.
+    // Journal: three events, in order, with only the non-secret route.
     let journal = data_dir.join("journal").join("sess-1.ndjson");
     let jtext = std::fs::read_to_string(&journal).unwrap();
     let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -407,10 +405,7 @@ async fn events_are_ordered_journaled_and_emitted() {
         !jtext.contains("sk-TOP-SECRET-abc123"),
         "token leaked into journal!"
     );
-    assert!(
-        jtext.contains("token_sha256_prefix"),
-        "journal missing auth fingerprint"
-    );
+    assert!(!jtext.contains("token_sha256_prefix"));
 
     let events: Vec<String> = jlines
         .iter()

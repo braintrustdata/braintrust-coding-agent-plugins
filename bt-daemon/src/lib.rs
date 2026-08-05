@@ -6,8 +6,7 @@
 //!     env/flag token auth only, for isolated testing.
 //!
 //! Hook clients submit a non-secret [`wire::SessionRoute`]. The long-lived
-//! daemon resolves and refreshes the selected profile through its host, while
-//! legacy callers may still submit a fully resolved [`wire::SessionConfig`].
+//! daemon resolves and refreshes the selected profile through its host.
 //! The `cli` feature only gates the standalone binary and its logging
 //! subscriber.
 
@@ -37,9 +36,7 @@ use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use wire::{
-    method, BackendAuth, Envelope, SessionConfig, SessionRoute, StatusResult, PROTOCOL_VERSION,
-};
+use wire::{method, Envelope, SessionConfig, SessionRoute, StatusResult, PROTOCOL_VERSION};
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -87,19 +84,9 @@ pub struct HookArgs {
     /// Bound an explicit turn/session-end flush.
     #[arg(long, default_value_t = 10_000)]
     pub flush_timeout_ms: u64,
-    /// Attach the agent session below an existing Braintrust span.
-    #[arg(long)]
-    pub parent_span_id: Option<String>,
-    /// Existing trace root when attaching below a non-root parent.
-    #[arg(long)]
-    pub root_span_id: Option<String>,
     /// JSON object merged into root-span metadata.
     #[arg(long)]
     pub additional_metadata: Option<String>,
-    /// Route spans to an existing Braintrust experiment instead of project
-    /// logs. The Claude shim supplies this from CC_EXPERIMENT_ID.
-    #[arg(long)]
-    pub experiment_id: Option<String>,
 }
 
 /// Arguments for `status`.
@@ -143,38 +130,13 @@ pub async fn run_serve(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()
 
 /// Capture one hook event from `stdin` and forward it to the daemon.
 ///
-/// `config` is the caller-resolved session config (auth + trace settings).
+/// `route` contains only non-secret profile and destination selection.
 /// Returns `Ok` once the daemon has acked (journaled + enqueued). Callers that
 /// must never fail the agent's turn should treat any `Err` as non-fatal and
 /// exit 0.
-pub async fn run_hook(args: HookArgs, config: SessionConfig, host: HostInfo) -> anyhow::Result<()> {
-    let route = SessionRoute {
-        destination: config.destination,
-        project: config.project,
-        parent_span_id: config.parent_span_id,
-        root_span_id: config.root_span_id,
-        flush_mode: config.flush_mode,
-        additional_metadata: config.additional_metadata,
-        ..SessionRoute::default()
-    };
-    run_hook_inner(args, route, Some(config.auth), host).await
-}
-
-/// Capture one hook event while deferring credential resolution to the
-/// daemon. The route contains only profile, organization, destination, and
-/// trace settings, so hooks never need access to tokens or refresh logic.
-pub async fn run_hook_routed(
-    args: HookArgs,
-    route: SessionRoute,
-    host: HostInfo,
-) -> anyhow::Result<()> {
-    run_hook_inner(args, route, None, host).await
-}
-
-async fn run_hook_inner(
+pub async fn run_hook(
     args: HookArgs,
     mut route: SessionRoute,
-    legacy_auth: Option<BackendAuth>,
     host: HostInfo,
 ) -> anyhow::Result<()> {
     let settings = settings::SharedSettings::load();
@@ -192,24 +154,16 @@ async fn run_hook_inner(
         .unwrap_or_default();
 
     if let Some(project) = settings.project.filter(|project| !project.is_empty()) {
-        route.project = Some(project);
+        route.destination = Some(wire::TraceDestination::ProjectLogs {
+            project_id: None,
+            project_name: Some(project),
+        });
     }
     match settings.flush_on_turn_end {
         Some(true) => route.flush_mode = wire::FlushMode::FlushOnTurnEnd,
         Some(false) => route.flush_mode = wire::FlushMode::FireAndForget,
         None if args.flush_on_turn_end => route.flush_mode = wire::FlushMode::FlushOnTurnEnd,
         None => {}
-    }
-    if args.parent_span_id.is_some() {
-        route.parent_span_id = args.parent_span_id.clone();
-    }
-    if args.root_span_id.is_some() {
-        route.root_span_id = args.root_span_id.clone();
-    }
-    match (route.parent_span_id.clone(), route.root_span_id.clone()) {
-        (Some(parent), None) => route.root_span_id = Some(parent),
-        (None, Some(root)) => route.parent_span_id = Some(root),
-        _ => {}
     }
     if let Some(metadata) = settings.additional_metadata {
         route.additional_metadata = Some(serde_json::Value::Object(metadata));
@@ -221,22 +175,6 @@ async fn run_hook_inner(
         }
         route.additional_metadata = Some(value);
     }
-    if let Some(experiment_id) = &args.experiment_id {
-        let mut metadata = route
-            .additional_metadata
-            .take()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        metadata.insert(
-            "_bt_experiment_id".to_string(),
-            serde_json::Value::String(experiment_id.clone()),
-        );
-        route.additional_metadata = Some(serde_json::Value::Object(metadata));
-    }
-    let (route, config) = match legacy_auth {
-        Some(auth) => (None, Some(route.with_auth(auth))),
-        None => (Some(route), None),
-    };
     let env = Envelope {
         source: args.source.clone(),
         source_version: args.source_version.clone(),
@@ -244,18 +182,15 @@ async fn run_hook_inner(
         event,
         ts_ms: now_ms(),
         payload,
-        route,
-        config,
+        route: Some(route),
+        config: None,
     };
 
     let socket = paths::socket_path(args.socket.as_deref());
     forward_envelope(&env, &socket, &host, args.no_spawn).await?;
     let should_flush = env.event == "SessionEnd"
         || (matches!(
-            env.config
-                .as_ref()
-                .map(|c| c.flush_mode)
-                .or_else(|| env.route.as_ref().map(|r| r.flush_mode)),
+            env.route.as_ref().map(|r| r.flush_mode),
             Some(wire::FlushMode::FlushOnTurnEnd)
         ) && matches!(env.event.as_str(), "Stop" | "SubagentStop"));
     if should_flush {
