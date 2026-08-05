@@ -23,12 +23,15 @@ done
 if grep -R -n -E "fetch\(|/v1/|/btql|apikey/login|from [\"']\.\./tools" "$TARGET_DIR/src/tracing"; then
   fail "daemon tracing performs API access or imports the tools runtime"
 fi
-if grep -R -n -E --exclude-dir=tools \
-  "fetch\(|/v1/project_logs|/btql|apikey/login" "$TARGET_DIR/src"; then
-  fail "Braintrust API access escaped the data-access tools directory"
+if grep -R -n -E \
+  "fetch\(|https?://api\.|/v1/|/btql|apikey/login|BRAINTRUST_API_(KEY|URL)|BRAINTRUST_APP_URL" \
+  "$TARGET_DIR/src"; then
+  fail "OpenCode package contains direct Braintrust API or credential handling"
 fi
-grep -q 'BraintrustToolsClient' "$TARGET_DIR/src/tools/index.ts" \
-  || fail "data-access tools no longer use their tools-only client"
+grep -q 'BtCliToolsClient' "$TARGET_DIR/src/tools/index.ts" \
+  || fail "data-access tools no longer delegate to bt"
+grep -q '"--prefer-profile"' "$TARGET_DIR/src/tools/bt-cli.ts" \
+  || fail "bt tool delegation does not prefer managed profiles"
 if grep -q '"braintrust"[[:space:]]*:' "$TARGET_DIR/package.json"; then
   fail "OpenCode package still depends on the Braintrust JavaScript SDK"
 fi

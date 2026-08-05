@@ -2,9 +2,6 @@
 
 export interface BraintrustConfig {
   profile?: string
-  apiKey: string
-  apiUrl?: string
-  appUrl: string
   orgName?: string
   projectName: string
   tracingEnabled: boolean
@@ -19,9 +16,6 @@ export interface BraintrustConfig {
  */
 export interface PluginConfig {
   profile?: string
-  api_key?: string
-  api_url?: string
-  app_url?: string
   org_name?: string
   project?: string
   trace_to_braintrust?: boolean
@@ -51,9 +45,6 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
   // Defaults
   const defaults: BraintrustConfig = {
     profile: undefined,
-    apiKey: "",
-    apiUrl: "https://api.braintrust.dev",
-    appUrl: "https://www.braintrust.dev",
     orgName: undefined,
     projectName: "opencode",
     tracingEnabled: false,
@@ -64,9 +55,6 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
   // Layer 1: Apply opencode.json config (if provided)
   if (pluginConfig) {
     if (pluginConfig.profile) defaults.profile = pluginConfig.profile
-    if (pluginConfig.api_key) defaults.apiKey = pluginConfig.api_key
-    if (pluginConfig.api_url) defaults.apiUrl = pluginConfig.api_url
-    if (pluginConfig.app_url) defaults.appUrl = pluginConfig.app_url
     if (pluginConfig.org_name) defaults.orgName = pluginConfig.org_name
     if (pluginConfig.project) defaults.projectName = pluginConfig.project
     if (pluginConfig.trace_to_braintrust !== undefined) {
@@ -95,9 +83,6 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
 
   return {
     profile: process.env.BRAINTRUST_PROFILE || defaults.profile,
-    apiKey: process.env.BRAINTRUST_API_KEY || defaults.apiKey,
-    apiUrl: process.env.BRAINTRUST_API_URL || defaults.apiUrl,
-    appUrl: process.env.BRAINTRUST_APP_URL || defaults.appUrl,
     orgName: process.env.BRAINTRUST_ORG_NAME || defaults.orgName,
     projectName: process.env.BRAINTRUST_PROJECT || defaults.projectName,
     tracingEnabled: process.env.TRACE_TO_BRAINTRUST

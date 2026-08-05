@@ -3,11 +3,12 @@
 OpenCode tracing is deliberately split into two independent runtime paths:
 
 - `src/tracing/daemon.ts` forwards raw OpenCode events to `bt` over the shared daemon client.
-- `src/tools/` implements the four optional Braintrust data-access tools.
+- `src/tools/` delegates the four optional Braintrust data-access tools to the
+  installed `bt` CLI.
 
 JavaScript must not construct spans, queue trace delivery, persist trace state,
-or send tracing data to the Braintrust API. All tracing translation and
-delivery belongs to `bt-daemon`.
+manage credentials, or call the Braintrust API. Translation and delivery belong
+to `bt-daemon`; data-access tools invoke `bt` with profile/org/project selection.
 
 ## Local checks
 
@@ -31,5 +32,6 @@ or update the corresponding Rust translator behavior and fixtures under
 
 ## Adding tools
 
-Add tool definitions under `src/tools/`. Tool-only API access must remain
-contained in `src/tools/client.ts` and must not be imported by tracing code.
+Add tool definitions under `src/tools/` and expose the required operation in
+`src/tools/bt-cli.ts`. Use argument arrays with `execFile`; never invoke a shell,
+read credentials, or implement Braintrust HTTP requests in the package.

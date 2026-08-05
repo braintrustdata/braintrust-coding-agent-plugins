@@ -48,15 +48,11 @@ describe("BraintrustPlugin", () => {
   const originalEnv: Record<string, string | undefined> = {}
   const envVars = [
     "TRACE_TO_BRAINTRUST",
-    "BRAINTRUST_API_KEY",
-    "BRAINTRUST_API_URL",
     "BRAINTRUST_PROFILE",
     "BRAINTRUST_OPENCODE_ENABLE_TOOLS",
     "HOME",
   ]
-  const originalFetch = globalThis.fetch
   let directory: string
-  let fetchCalls: number
 
   beforeEach(() => {
     directory = mkdtempSync(join(tmpdir(), "braintrust-opencode-plugin-"))
@@ -67,15 +63,6 @@ describe("BraintrustPlugin", () => {
     process.env.HOME = directory
     process.env.TRACE_TO_BRAINTRUST = "false"
     process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "true"
-    process.env.BRAINTRUST_API_KEY = "test-api-key"
-    process.env.BRAINTRUST_API_URL = "https://api.example.com"
-    fetchCalls = 0
-    globalThis.fetch = (async () => {
-      fetchCalls++
-      return new Response(JSON.stringify({ id: "project-id", name: "opencode" }), {
-        status: 200,
-      })
-    }) as unknown as typeof fetch
   })
 
   afterEach(() => {
@@ -87,7 +74,6 @@ describe("BraintrustPlugin", () => {
         delete process.env[key]
       }
     }
-    globalThis.fetch = originalFetch
   })
 
   it("registers Braintrust tools when enabled", async () => {
@@ -112,11 +98,9 @@ describe("BraintrustPlugin", () => {
     await Promise.resolve()
 
     expect(hooks.tool).toBeUndefined()
-    expect(fetchCalls).toBe(0)
   })
 
-  it("registers daemon tracing without a JavaScript API key", async () => {
-    delete process.env.BRAINTRUST_API_KEY
+  it("registers daemon tracing independently of the tools", async () => {
     process.env.TRACE_TO_BRAINTRUST = "true"
     process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "false"
 
@@ -128,6 +112,5 @@ describe("BraintrustPlugin", () => {
     expect(hooks["tool.execute.before"]).toBeDefined()
     expect(hooks["tool.execute.after"]).toBeDefined()
     expect(hooks.tool).toBeUndefined()
-    expect(fetchCalls).toBe(0)
   })
 })

@@ -9,14 +9,12 @@
 
 import type { ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import type { BraintrustToolsClient, ToolLogData } from "./client"
+import type { BtCliToolsClient, ToolLogData } from "./bt-cli"
 
 /**
  * Create Braintrust tools
  */
-export function createBraintrustTools(
-  client: BraintrustToolsClient,
-): Record<string, ToolDefinition> {
+export function createBraintrustTools(client: BtCliToolsClient): Record<string, ToolDefinition> {
   return {
     braintrust_query_logs: tool({
       description: `Query Braintrust logs using SQL.
@@ -122,10 +120,7 @@ This is useful for:
           }
 
           const rowId = await client.logData(data)
-          if (rowId) {
-            return `Successfully logged data with ID: ${rowId}`
-          }
-          return "Failed to log data - check Braintrust connection"
+          return `Successfully logged data with ID: ${rowId}`
         } catch (error) {
           return `Error logging data: ${error}`
         }
@@ -143,17 +138,7 @@ This is useful for:
       async execute(args) {
         const limit = args.limit || 10
         try {
-          // Query experiments via BTQL
-          const _query = `
-            SELECT id, name, created, metadata
-            FROM experiments
-            ORDER BY created DESC
-            LIMIT ${limit}
-          `
-
-          // Note: This would need the experiments endpoint
-          // For now, return a helpful message
-          return `To view experiments, visit https://www.braintrust.dev/app/projects/${client.getProjectId()}/experiments`
+          return JSON.stringify(await client.listExperiments(limit), null, 2)
         } catch (error) {
           return `Error getting experiments: ${error}`
         }

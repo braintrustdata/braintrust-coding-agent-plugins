@@ -9,7 +9,7 @@
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import { loadConfig, type PluginConfig } from "./config"
 import { createBraintrustTools } from "./tools"
-import { BraintrustToolsClient } from "./tools/client"
+import { BtCliToolsClient } from "./tools/bt-cli"
 import { createDaemonTracingHooks } from "./tracing/daemon"
 
 export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
@@ -47,22 +47,7 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
 
   const config = loadConfig(pluginConfig)
 
-  // API access exists only for the explicitly enabled data-access tools.
-  let btClient: BraintrustToolsClient | undefined
-  if (config.apiKey && config.enableTools) {
-    btClient = new BraintrustToolsClient(config)
-    void btClient.initialize().catch((error) => {
-      client.app
-        .log({
-          body: {
-            service: "braintrust",
-            level: "warn",
-            message: `Braintrust tools initialization failed: ${error instanceof Error ? error.message : String(error)}. Tracing continues through bt.`,
-          },
-        })
-        .catch(() => {})
-    })
-  }
+  const toolsClient = config.enableTools ? new BtCliToolsClient(config) : undefined
 
   const hooks: Hooks = {}
 
@@ -86,28 +71,17 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
       .catch(() => {})
   }
 
-  if (btClient && config.enableTools) {
-    hooks.tool = createBraintrustTools(btClient)
+  if (toolsClient) {
+    hooks.tool = createBraintrustTools(toolsClient)
   }
 
-  if (btClient) {
+  if (config.tracingEnabled || toolsClient) {
     client.app
       .log({
         body: {
           service: "braintrust",
           level: "info",
           message: `Braintrust plugin enabled for project "${config.projectName}"`,
-        },
-      })
-      .catch(() => {})
-  } else if (config.enableTools) {
-    client.app
-      .log({
-        body: {
-          service: "braintrust",
-          level: "warn",
-          message:
-            "Braintrust data-access tools are enabled but BRAINTRUST_API_KEY is not set. Tracing uses bt authentication independently.",
         },
       })
       .catch(() => {})

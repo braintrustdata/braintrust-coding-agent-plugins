@@ -49,7 +49,6 @@ Create a `braintrust.json` file in one of these locations:
   "enable_tools": true,
   "profile": "work",
   "project": "my-project",
-  "api_key": "your-api-key",
   "debug": true
 }
 ```
@@ -60,12 +59,9 @@ Create a `braintrust.json` file in one of these locations:
 |------------|---------|------|---------|-------------|
 | `trace_to_braintrust` | `TRACE_TO_BRAINTRUST` | boolean | `false` | Enable/disable tracing |
 | `enable_tools` | `BRAINTRUST_OPENCODE_ENABLE_TOOLS` | boolean | `true` | Register Braintrust tools in OpenCode |
-| `profile` | `BRAINTRUST_PROFILE` | string | current `bt` profile | Select the `bt` auth profile used by tracing; credentials stay in the daemon |
-| `project` | `BRAINTRUST_PROJECT` | string | `"opencode"` | Project name for traces |
+| `profile` | `BRAINTRUST_PROFILE` | string | current `bt` profile | Select the `bt` auth profile used by tracing and tools |
+| `project` | `BRAINTRUST_PROJECT` | string | `"opencode"` | Project name for traces and project-scoped tools |
 | `debug` | `BRAINTRUST_DEBUG` | boolean | `false` | Enable debug logging |
-| `api_key` | `BRAINTRUST_API_KEY` | string | | API key used only by the optional data-access tools; tracing uses `bt auth login` |
-| `api_url` | `BRAINTRUST_API_URL` | string | `"https://api.braintrust.dev"` | API URL |
-| `app_url` | `BRAINTRUST_APP_URL` | string | `"https://www.braintrust.dev"` | App URL |
 | `org_name` | `BRAINTRUST_ORG_NAME` | string | profile default | Organization selected within the tracing profile and for tools |
 | `additional_metadata` | `BRAINTRUST_ADDITIONAL_METADATA` | string | | JSON object of additional metadata to attach to the root span. Standard metadata keys take precedence on conflict. |
 
@@ -137,7 +133,7 @@ Session (task span)
 
 ## Runtime architecture
 
-Tracing never calls the Braintrust API from JavaScript. `src/tracing/daemon.ts`
-only forwards native events over local JSON-RPC; `bt-daemon` owns span creation,
-journaling, recovery, authentication, and delivery. Direct API access is
-isolated to the four optional data-access tools under `src/tools/`.
+The package never calls the Braintrust API from JavaScript. Tracing forwards
+native events over local JSON-RPC to `bt-daemon`. The four optional data-access
+tools invoke non-interactive `bt` CLI commands. In both cases, `bt` owns profile
+selection, credential storage, refresh, backend resolution, and API transport.
