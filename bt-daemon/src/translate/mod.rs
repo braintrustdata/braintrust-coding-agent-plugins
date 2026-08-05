@@ -12,11 +12,13 @@ mod codex;
 mod debug;
 mod git;
 mod opencode;
+mod pi;
 
 pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;
 pub use debug::DebugTranslatorFactory;
 pub use opencode::OpenCodeTranslatorFactory;
+pub use pi::PiTranslatorFactory;
 
 use crate::wire::{Envelope, SessionConfig};
 use serde::{Deserialize, Serialize};
@@ -125,7 +127,8 @@ impl Registry {
         let git = Arc::new(git::GitMetadataCache::default());
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
         r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
-        r.register(Box::new(OpenCodeTranslatorFactory::new(git)));
+        r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));
+        r.register(Box::new(PiTranslatorFactory::new(git)));
         r
     }
 

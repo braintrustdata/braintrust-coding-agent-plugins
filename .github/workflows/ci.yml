@@ -107,6 +107,45 @@ jobs:
           node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
             "$PWD/install-test/node_modules/@braintrust/trace-opencode/dist/index.mjs"
 
+  resolve-pi-compatibility:
+    name: Resolve Pi compatibility window
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - id: versions
+        name: Resolve latest patch from five Pi minor lines
+        env:
+          PI_VERSION_COUNT: 5
+        run: node src/plugins/pi/content/scripts/resolve-pi-versions.mjs
+
+  pi-compatibility:
+    name: Pi package (${{ matrix.pi-target.version }})
+    needs: resolve-pi-compatibility
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-target: ${{ fromJson(needs.resolve-pi-compatibility.outputs.versions) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Set up pinned pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 10.33.0
+      - name: Build validated Pi tarball
+        run: make validate-pi
+      - name: Test resolved Pi compatibility target
+        working-directory: dist/pi
+        env:
+          PI_COMPAT_VERSION: ${{ matrix.pi-target.version }}
+        run: |
+          pnpm add -D '${{ matrix.pi-target.piAiSpec }}' '${{ matrix.pi-target.piCodingAgentSpec }}' --lockfile=false
+          pnpm run test:integration
+
   daemon:
     name: Daemon (${{ matrix.os }})
     strategy:

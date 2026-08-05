@@ -1,0 +1,6 @@
+allowBuilds:
+  "@google/genai": false
+  braintrust: false
+  esbuild: true
+  koffi: true
+  protobufjs: true

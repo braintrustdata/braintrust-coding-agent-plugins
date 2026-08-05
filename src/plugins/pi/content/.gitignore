@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Local package artifacts
+*.tgz
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local environment overrides
+.env
+.env.*
+
+# Extension/project-local config with potential secrets
+.pi/braintrust.json
+
+# Local cache/state
+.cache/
+dist/
+
+# OS files
+.DS_Store
