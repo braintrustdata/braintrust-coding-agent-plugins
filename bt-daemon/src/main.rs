@@ -7,9 +7,9 @@
 use async_trait::async_trait;
 use bt_daemon::wire::{AuthSelection, BackendAuth, SessionRoute, TraceDestination};
 use bt_daemon::{
-    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, AuthLease,
-    AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo,
-    ImportArgs, Registry, RunArgs, RunHookCommand, ServeArgs, ServeOptions, StatusArgs, run_traced,
+    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, run_traced,
+    AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs,
+    HostInfo, ImportArgs, Registry, RunArgs, RunHookCommand, ServeArgs, ServeOptions, StatusArgs,
 };
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
@@ -107,7 +107,12 @@ enum Command {
     /// Import a past Codex or Claude Code session by its resume id.
     Import(ImportArgs),
     /// Launch a coding agent with live tracing hooks for this invocation.
-    Run(RunArgs),
+    Run {
+        #[command(flatten)]
+        route: RouteArgs,
+        #[command(flatten)]
+        args: RunArgs,
+    },
 }
 
 /// Non-secret session selection. Credentials are resolved by the daemon.
@@ -216,7 +221,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Run(args) => {
+        Command::Run { route, args } => {
             let exe = std::env::current_exe()
                 .map(OsString::from)
                 .unwrap_or_else(|_| OsString::from("bt-daemon"));
@@ -224,7 +229,7 @@ async fn main() {
                 program: exe,
                 args: vec![OsString::from("hook")],
             };
-            match run_traced(args, hook_command).await {
+            match run_traced(args, hook_command, route.into_route()).await {
                 Ok(status) if status.success() => {}
                 Ok(status) => std::process::exit(status.code().unwrap_or(1)),
                 Err(error) => {

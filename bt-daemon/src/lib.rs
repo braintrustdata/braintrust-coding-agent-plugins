@@ -375,16 +375,19 @@ pub async fn run_import(
 pub async fn run_traced(
     args: RunArgs,
     hook_command: RunHookCommand,
+    route: SessionRoute,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let executable = match args.source {
         RunSource::Codex => "codex",
         RunSource::Claude => "claude",
     };
     let injected_args = managed_run_args(args.source, &hook_command)?;
+    let route = serde_json::to_string(&route)?;
     let mut child = tokio::process::Command::new(executable)
         .args(injected_args)
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
+        .env(settings::SESSION_ROUTE_ENV, route)
         .spawn()
         .map_err(|error| anyhow::anyhow!("failed to launch {executable}: {error}"))?;
     let interrupt = tokio::signal::ctrl_c();
