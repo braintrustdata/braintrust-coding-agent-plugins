@@ -44,6 +44,7 @@ impl Session {
     pub fn spawn(
         session_id: String,
         source: String,
+        plugin_version: Option<String>,
         journal: JournalWriter,
         replay: Vec<Envelope>,
         translators: Arc<Registry>,
@@ -57,6 +58,7 @@ impl Session {
         let actor = SessionActor {
             session_id: session_id.clone(),
             source: source.clone(),
+            plugin_version,
             translators,
             sink_factory,
             counters: counters.clone(),
@@ -164,6 +166,7 @@ async fn hydrate_transcript_snapshot(env: &mut Envelope) {
 struct SessionActor {
     session_id: String,
     source: String,
+    plugin_version: Option<String>,
     translators: Arc<Registry>,
     sink_factory: Arc<dyn SinkFactory>,
     counters: Arc<Counters>,
@@ -175,7 +178,11 @@ struct SessionActor {
 impl SessionActor {
     async fn run(self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
         let mut translator = self.translators.create(&self.source, &self.session_id);
-        let mut sink = match self.sink_factory.create(&self.session_id, &self.source) {
+        let mut sink = match self.sink_factory.create(
+            &self.session_id,
+            &self.source,
+            self.plugin_version.as_deref(),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 self.set_error(format!("sink init failed: {e}"));

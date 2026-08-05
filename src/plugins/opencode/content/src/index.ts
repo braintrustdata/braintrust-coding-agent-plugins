@@ -7,9 +7,9 @@
  */
 
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
-import { BraintrustClient, loadConfig, type PluginConfig } from "./client"
-import { createFileLogger } from "./file-logger"
+import { loadConfig, type PluginConfig } from "./config"
 import { createBraintrustTools } from "./tools"
+import { BraintrustToolsClient } from "./tools/client"
 import { createDaemonTracingHooks } from "./tracing/daemon"
 
 export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
@@ -47,42 +47,23 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
 
   const config = loadConfig(pluginConfig)
 
-  // Set up file logger if LOG_TO_FILE is configured
-  const fileLogger = createFileLogger(config.logToFile)
-  if (fileLogger) {
-    fileLogger.logConfig(config as unknown as Record<string, unknown>)
-    client.app
-      .log({
-        body: {
-          service: "braintrust",
-          level: "info",
-          message: `Plugin I/O logging enabled: ${fileLogger.getFilePath()}`,
-        },
-      })
-      .catch(() => {})
-  }
-
-  // Create Braintrust client only when at least one Braintrust-backed feature is enabled
-  let btClient: BraintrustClient | undefined
-  let _initPromise: Promise<void> | undefined
+  // API access exists only for the explicitly enabled data-access tools.
+  let btClient: BraintrustToolsClient | undefined
   if (config.apiKey && config.enableTools) {
-    btClient = new BraintrustClient(config)
-    // Start initialization in background, don't await
-    _initPromise = btClient.initialize().catch((error) => {
-      // Log error but continue
+    btClient = new BraintrustToolsClient(config)
+    void btClient.initialize().catch((error) => {
       client.app
         .log({
           body: {
             service: "braintrust",
             level: "warn",
-            message: `Braintrust initialization failed: ${error instanceof Error ? error.message : String(error)}. Tracing disabled.`,
+            message: `Braintrust tools initialization failed: ${error instanceof Error ? error.message : String(error)}. Tracing continues through bt.`,
           },
         })
         .catch(() => {})
     })
   }
 
-  // Build hooks
   const hooks: Hooks = {}
 
   // Add tracing hooks if enabled
@@ -94,7 +75,6 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
     })
     Object.assign(hooks, tracingHooks)
 
-    // Log what hooks we're returning
     client.app
       .log({
         body: {
@@ -106,12 +86,10 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
       .catch(() => {})
   }
 
-  // Add Braintrust tools if enabled and client is available
   if (btClient && config.enableTools) {
     hooks.tool = createBraintrustTools(btClient)
   }
 
-  // Log initialization status (non-blocking to avoid hanging startup)
   if (btClient) {
     client.app
       .log({
@@ -152,4 +130,4 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
 export default BraintrustPlugin
 
 // Re-export types only (not the class, since OpenCode will try to call all exports as plugins)
-export type { BraintrustClient, BraintrustConfig, PluginConfig } from "./client"
+export type { BraintrustConfig, PluginConfig } from "./config"

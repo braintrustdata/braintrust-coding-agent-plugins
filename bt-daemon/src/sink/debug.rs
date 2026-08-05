@@ -13,7 +13,12 @@ pub struct DebugSinkFactory {
 }
 
 impl SinkFactory for DebugSinkFactory {
-    fn create(&self, session_id: &str, _source: &str) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(
+        &self,
+        session_id: &str,
+        _source: &str,
+        _plugin_version: Option<&str>,
+    ) -> anyhow::Result<Box<dyn Sink>> {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!("{}.ndjson", sanitize(session_id)));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;

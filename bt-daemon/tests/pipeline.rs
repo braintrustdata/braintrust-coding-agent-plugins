@@ -27,6 +27,7 @@ fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
     Envelope {
         source: "debug".into(),
         source_version: Some("0.0.0".into()),
+        plugin_version: None,
         session_id: session_id.into(),
         event: event.into(),
         ts_ms,

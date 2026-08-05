@@ -19,6 +19,7 @@ export interface DaemonSessionRoute {
 export interface DaemonEnvelope {
   source: string
   source_version?: string
+  plugin_version?: string
   session_id: string
   event: string
   ts_ms: number
@@ -109,13 +110,17 @@ export class DaemonClient {
 
   async log(envelope: DaemonEnvelope): Promise<boolean> {
     return this.serial(async () => {
+      const event = {
+        ...envelope,
+        ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
+      }
       try {
-        const result = (await this.request("event.log", envelope)) as { accepted?: boolean }
+        const result = (await this.request("event.log", event)) as { accepted?: boolean }
         return result.accepted === true
       } catch (error) {
         this.disconnect(error)
         try {
-          const result = (await this.request("event.log", envelope)) as { accepted?: boolean }
+          const result = (await this.request("event.log", event)) as { accepted?: boolean }
           return result.accepted === true
         } catch (retryError) {
           this.warnOnce(`event:${String(retryError)}`)

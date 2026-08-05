@@ -256,6 +256,7 @@ impl Daemon {
         let session = Session::spawn(
             env.session_id.clone(),
             env.source.clone(),
+            env.plugin_version.clone(),
             journal,
             replay,
             self.translators.clone(),

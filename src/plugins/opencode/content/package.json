@@ -43,10 +43,6 @@
     "dist",
     "README.md"
   ],
-  "dependencies": {
-    "braintrust": "^0.0.185",
-    "zod": "^3.23.8"
-  },
   "devDependencies": {
     "@biomejs/biome": "^2.3.11",
     "@opencode-ai/plugin": "^1.1.14",

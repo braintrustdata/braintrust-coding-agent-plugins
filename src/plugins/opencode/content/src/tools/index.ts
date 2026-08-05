@@ -9,12 +9,14 @@
 
 import type { ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import type { BraintrustClient } from "../client"
+import type { BraintrustToolsClient, ToolLogData } from "./client"
 
 /**
  * Create Braintrust tools
  */
-export function createBraintrustTools(client: BraintrustClient): Record<string, ToolDefinition> {
+export function createBraintrustTools(
+  client: BraintrustToolsClient,
+): Record<string, ToolDefinition> {
   return {
     braintrust_query_logs: tool({
       description: `Query Braintrust logs using SQL.
@@ -85,18 +87,7 @@ This is useful for:
         try {
           const spanId = crypto.randomUUID()
 
-          const span: {
-            id: string
-            span_id: string
-            root_span_id: string
-            input?: string
-            output?: string
-            expected?: string
-            scores?: Record<string, number>
-            metadata?: Record<string, unknown>
-            tags?: string[]
-            span_attributes: { name: string; type: "task" }
-          } = {
+          const data: ToolLogData = {
             id: crypto.randomUUID(),
             span_id: spanId,
             root_span_id: spanId,
@@ -106,13 +97,13 @@ This is useful for:
             },
           }
 
-          if (args.input) span.input = args.input
-          if (args.output) span.output = args.output
-          if (args.expected) span.expected = args.expected
+          if (args.input) data.input = args.input
+          if (args.output) data.output = args.output
+          if (args.expected) data.expected = args.expected
 
           if (args.scores) {
             try {
-              span.scores = JSON.parse(args.scores)
+              data.scores = JSON.parse(args.scores)
             } catch {
               return "Error: scores must be valid JSON"
             }
@@ -120,17 +111,17 @@ This is useful for:
 
           if (args.metadata) {
             try {
-              span.metadata = JSON.parse(args.metadata)
+              data.metadata = JSON.parse(args.metadata)
             } catch {
               return "Error: metadata must be valid JSON"
             }
           }
 
           if (args.tags) {
-            span.tags = args.tags.split(",").map((t) => t.trim())
+            data.tags = args.tags.split(",").map((t) => t.trim())
           }
 
-          const rowId = await client.insertSpan(span)
+          const rowId = await client.logData(data)
           if (rowId) {
             return `Successfully logged data with ID: ${rowId}`
           }

@@ -30,6 +30,7 @@ test("serializes initialize, events, flush, and status over one connection", asy
     ? `\\\\.\\pipe\\bt-js-client-${process.pid}-${Date.now()}`
     : join(temp, "daemon.sock")
   const methods: string[] = []
+  const eventParams: Array<Record<string, unknown>> = []
   const server = createServer((socket) => {
     socket.setEncoding("utf8")
     let input = ""
@@ -40,6 +41,7 @@ test("serializes initialize, events, flush, and status over one connection", asy
         const request = JSON.parse(input.slice(0, newline))
         input = input.slice(newline + 1)
         methods.push(request.method)
+        if (request.method === "event.log") eventParams.push(request.params)
         const result = request.method === "initialize"
           ? { protocol_version: 1, capabilities: { sources: ["opencode"] } }
           : request.method === "event.log"
@@ -52,7 +54,11 @@ test("serializes initialize, events, flush, and status over one connection", asy
     })
   })
   await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
-  const client = new DaemonClient({ source: "opencode", socketPath: endpoint })
+  const client = new DaemonClient({
+    source: "opencode",
+    pluginVersion: "0.1.0",
+    socketPath: endpoint,
+  })
   const envelope = (name: string) => ({
     source: "opencode",
     session_id: "session",
@@ -67,6 +73,7 @@ test("serializes initialize, events, flush, and status over one connection", asy
   expect(await client.flush("session")).toBe(true)
   expect((await client.status("session"))?.daemon_version).toBe("test")
   expect(methods).toEqual(["initialize", "event.log", "event.log", "session.flush", "status.get"])
+  expect(eventParams.map((params) => params.plugin_version)).toEqual(["0.1.0", "0.1.0"])
   await client.close()
   await new Promise<void>((resolve) => server.close(() => resolve()))
   rmSync(temp, { recursive: true, force: true })

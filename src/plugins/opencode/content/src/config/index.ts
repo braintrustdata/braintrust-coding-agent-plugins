@@ -1,2 +1,2 @@
-export type { BraintrustConfig, PluginConfig } from "../client"
-export { loadConfig, parseBooleanEnv } from "../client"
+export type { BraintrustConfig, PluginConfig } from "../config"
+export { loadConfig, parseBooleanEnv } from "../config"

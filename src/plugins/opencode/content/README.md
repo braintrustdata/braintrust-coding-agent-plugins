@@ -1,6 +1,8 @@
 # @braintrust/trace-opencode
 
-Braintrust tracing plugin for [OpenCode](https://opencode.ai). Automatically traces your OpenCode sessions to Braintrust with hierarchical spans.
+Braintrust tracing plugin for [OpenCode](https://opencode.ai). The JavaScript
+adapter forwards native OpenCode events to the installed `bt` daemon, which
+constructs and delivers the trace.
 
 - **Session spans**: Root span for each OpenCode session with metadata (workspace, hostname, etc.)
 - **Turn spans**: Captures each user-assistant interaction
@@ -133,12 +135,9 @@ Session (task span)
 └── metrics: total_turns, total_tool_calls
 ```
 
-## Releasing
+## Runtime architecture
 
-This package is published from GitHub Actions via `.github/workflows/publish-package.yaml` using npm trusted publishing with OIDC and npm provenance (`npm publish --provenance`).
-
-To cut a release:
-
-1. Bump `package.json` to the version you want to ship.
-2. Run the **Publish package** workflow from the branch you want to release.
-3. The workflow validates the package, publishes to npm, pushes the matching `v<version>` git tag, and creates a GitHub release.
+Tracing never calls the Braintrust API from JavaScript. `src/tracing/daemon.ts`
+only forwards native events over local JSON-RPC; `bt-daemon` owns span creation,
+journaling, recovery, authentication, and delivery. Direct API access is
+isolated to the four optional data-access tools under `src/tools/`.

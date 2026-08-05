@@ -7,6 +7,7 @@ fn event(name: &str, ts_ms: i64, payload: serde_json::Value) -> Envelope {
     Envelope {
         source: "opencode".into(),
         source_version: Some("1.1.14".into()),
+        plugin_version: Some("0.1.0".into()),
         session_id: "root-session".into(),
         event: name.into(),
         ts_ms,

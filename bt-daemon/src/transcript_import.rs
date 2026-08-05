@@ -517,6 +517,7 @@ fn envelope(
     Envelope {
         source: source.into(),
         source_version,
+        plugin_version: None,
         session_id: session_id.into(),
         event: event.into(),
         ts_ms,

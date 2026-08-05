@@ -17,10 +17,20 @@ contents="$(tar -tzf "$tarball")"
 grep -q '^package/dist/index.js$' <<<"$contents" || fail "tarball omits dist/index.js"
 grep -q '^package/README.md$' <<<"$contents" || fail "tarball omits README.md"
 grep -q '^package/LICENSE$' <<<"$contents" || fail "tarball omits LICENSE"
-if grep -R -n -E "from [\"']braintrust[\"']|from [\"']\.\./(client|span-)" "$TARGET_DIR/src/tracing"; then
-  fail "daemon tracing imports the Braintrust SDK or legacy span runtime"
+for removed in client.ts tracing.ts event-processor.ts replay.ts span-queue.ts span-sink.ts; do
+  [[ ! -e "$TARGET_DIR/src/$removed" ]] || fail "old JavaScript tracing runtime remains: src/$removed"
+done
+if grep -R -n -E "fetch\(|/v1/|/btql|apikey/login|from [\"']\.\./tools" "$TARGET_DIR/src/tracing"; then
+  fail "daemon tracing performs API access or imports the tools runtime"
 fi
-grep -q -E "from [\"']braintrust[\"']|from [\"']\.\./client[\"']" "$TARGET_DIR/src/tools/index.ts" \
-  || fail "data-access tools no longer use their intentional Braintrust client"
+if grep -R -n -E --exclude-dir=tools \
+  "fetch\(|/v1/project_logs|/btql|apikey/login" "$TARGET_DIR/src"; then
+  fail "Braintrust API access escaped the data-access tools directory"
+fi
+grep -q 'BraintrustToolsClient' "$TARGET_DIR/src/tools/index.ts" \
+  || fail "data-access tools no longer use their tools-only client"
+if grep -q '"braintrust"[[:space:]]*:' "$TARGET_DIR/package.json"; then
+  fail "OpenCode package still depends on the Braintrust JavaScript SDK"
+fi
 
 echo "validate: OpenCode npm package OK ($TARGET_DIR)"

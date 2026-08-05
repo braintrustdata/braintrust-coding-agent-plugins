@@ -1,10 +1,9 @@
 /**
- * Tests for client configuration loading
+ * Tests for plugin configuration loading
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import manifest from "../package.json" with { type: "json" }
-import { BraintrustClient, loadConfig, type PluginConfig, parseBooleanEnv } from "./client"
+import { loadConfig, type PluginConfig, parseBooleanEnv } from "./config"
 
 describe("parseBooleanEnv", () => {
   it("returns false for undefined", () => {
@@ -303,44 +302,5 @@ describe("loadConfig", () => {
       const config = loadConfig()
       expect(config.additionalMetadata).toBeUndefined()
     })
-  })
-})
-
-describe("BraintrustClient span origin", () => {
-  const originalFetch = globalThis.fetch
-
-  afterEach(() => {
-    globalThis.fetch = originalFetch
-  })
-
-  it("uses the package.json version for span origin provenance", async () => {
-    let payload: { events?: Array<{ context?: { span_origin?: { version?: string } } }> } = {}
-    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-      payload = JSON.parse(String(init?.body))
-      return new Response(JSON.stringify({ row_ids: ["row-id"] }), { status: 200 })
-    }) as typeof fetch
-
-    const client = new BraintrustClient({
-      apiKey: "key",
-      apiUrl: "https://api.example.com",
-      appUrl: "https://app.example.com",
-      projectName: "project",
-      tracingEnabled: true,
-      enableTools: true,
-      debug: false,
-    })
-    Object.assign(client, {
-      initPromise: Promise.resolve(),
-      projectId: "project-id",
-      resolvedApiUrl: "https://api.example.com",
-    })
-
-    await client.insertSpan({
-      id: "span-id",
-      span_id: "span-id",
-      root_span_id: "span-id",
-    })
-
-    expect(payload.events?.[0]?.context?.span_origin?.version).toBe(manifest.version)
   })
 })

@@ -120,6 +120,7 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
     Envelope {
         source: r.source,
         source_version: r.source_version,
+        plugin_version: r.plugin_version,
         session_id: r.session_id,
         event: r.event,
         ts_ms: r.ts_ms,
