@@ -88,6 +88,7 @@ impl AgentTestWorld {
             .kill_on_drop(true);
         if ingest_mode == TestBackendMode::Mock {
             command
+                .env("BRAINTRUST_API_KEY", "test-key")
                 .env("BRAINTRUST_API_URL", collector_server.uri())
                 .env("BRAINTRUST_APP_URL", collector_server.uri());
         }
