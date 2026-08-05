@@ -22,16 +22,22 @@ One self-contained Cargo crate, liftable to its own repo by copying
   the `cli` feature for isolated testing/development. Env/flag static-token
   auth only; not an end-user artifact.
 
-## Dual consumption
+## Dual consumption and authentication
 
-The daemon core is credential-passive — it only ever *receives* a resolved
-`BackendAuth` with each session's config — so two front-ends share all core
-behavior. The `cli` feature only enables the standalone binary and its logging
-subscriber:
+Hooks send only a non-secret `SessionRoute`: an optional profile and
+organization selection plus the trace destination. The long-lived daemon asks
+its host's `AuthProvider` for a credential lease, pins the returned canonical
+profile to that session, and refreshes expiring leases as needed. Independent
+sessions can therefore use different `bt` profiles without exposing tokens to
+hook processes or JavaScript plugins.
 
-1. **Embedded in `bt`** (production): `bt` fills `BackendAuth` from its profile
-   / OAuth / keychain auth.
-2. **Standalone binary** (testing): fills it from `BRAINTRUST_API_KEY` etc.
+1. **Embedded in `bt`** (production): the provider uses `bt`'s existing
+   profile, OAuth, refresh, keychain, organization, and backend URL machinery.
+2. **Standalone binary** (testing): the provider uses `BRAINTRUST_API_KEY` and
+   related environment variables.
+
+Legacy clients that send a resolved `SessionConfig` remain wire-compatible
+during migration.
 
 ## Shared plugin settings
 

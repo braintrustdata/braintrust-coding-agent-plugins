@@ -22,10 +22,64 @@ pub struct Envelope {
     pub ts_ms: i64,
     /// The raw agent-native hook payload; opaque except to the translator.
     pub payload: serde_json::Value,
+    /// Non-secret, immutable routing intent for this session. New clients use
+    /// this instead of resolving credentials themselves. The daemon host maps
+    /// the selected profile and organization to live credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<SessionRoute>,
     /// Shim-resolved credentials + trace settings. Present on every event from
-    /// a stateless shim; the daemon keeps the latest per session.
+    /// a legacy stateless shim. New clients should send `route` and omit this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<SessionConfig>,
+}
+
+/// Non-secret profile selection. A profile identifies the stored Braintrust
+/// user credentials; an optional organization constrains profiles that can
+/// address more than one organization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AuthSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
+}
+
+/// Immutable, journal-safe routing and trace settings for one agent session.
+/// Credentials are deliberately absent and are resolved inside the daemon.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionRoute {
+    #[serde(default)]
+    pub auth: AuthSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<TraceDestination>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_span_id: Option<String>,
+    #[serde(default)]
+    pub flush_mode: FlushMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_metadata: Option<serde_json::Value>,
+}
+
+impl SessionRoute {
+    pub fn with_auth(&self, auth: BackendAuth) -> SessionConfig {
+        SessionConfig {
+            auth,
+            destination: self.destination.clone(),
+            project: self.project.clone(),
+            parent_span_id: self.parent_span_id.clone(),
+            root_span_id: self.root_span_id.clone(),
+            flush_mode: self.flush_mode,
+            additional_metadata: self.additional_metadata.clone(),
+        }
+    }
+
+    pub fn same_route(&self, other: &Self) -> bool {
+        serde_json::to_value(self).ok() == serde_json::to_value(other).ok()
+    }
 }
 
 /// Trace settings and backend credentials resolved by the shim.
@@ -164,9 +218,9 @@ impl BackendAuth {
 }
 
 impl Envelope {
-    /// A copy of this envelope safe to write to the journal: the live token is
-    /// replaced by an [`AuthFingerprint`]. The rest of `config` (project,
-    /// span-attach ids, flush mode, metadata) is retained — none of it secret.
+    /// A copy of this envelope safe to write to the journal. Routed envelopes
+    /// retain only their non-secret route selection; legacy envelopes replace
+    /// the live token with an [`AuthFingerprint`].
     pub fn redacted(&self) -> RedactedEnvelope {
         RedactedEnvelope {
             source: self.source.clone(),
@@ -175,15 +229,22 @@ impl Envelope {
             event: self.event.clone(),
             ts_ms: self.ts_ms,
             payload: self.payload.clone(),
-            config: self.config.as_ref().map(|c| RedactedConfig {
-                auth: c.auth.fingerprint(),
-                destination: c.destination.clone(),
-                project: c.project.clone(),
-                parent_span_id: c.parent_span_id.clone(),
-                root_span_id: c.root_span_id.clone(),
-                flush_mode: c.flush_mode,
-                additional_metadata: c.additional_metadata.clone(),
-            }),
+            route: self.route.clone(),
+            config: self
+                .route
+                .is_none()
+                .then(|| {
+                    self.config.as_ref().map(|c| RedactedConfig {
+                        auth: c.auth.fingerprint(),
+                        destination: c.destination.clone(),
+                        project: c.project.clone(),
+                        parent_span_id: c.parent_span_id.clone(),
+                        root_span_id: c.root_span_id.clone(),
+                        flush_mode: c.flush_mode,
+                        additional_metadata: c.additional_metadata.clone(),
+                    })
+                })
+                .flatten(),
         }
     }
 }
@@ -199,6 +260,8 @@ pub struct RedactedEnvelope {
     pub event: String,
     pub ts_ms: i64,
     pub payload: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<SessionRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<RedactedConfig>,
 }
@@ -232,6 +295,7 @@ mod tests {
             event: "PostToolUse".into(),
             ts_ms: 1_753_639_552_123,
             payload: serde_json::json!({ "session_id": "sess-1", "tool_name": "shell" }),
+            route: None,
             config: Some(SessionConfig {
                 auth: BackendAuth {
                     token: "sk-super-secret".into(),
@@ -272,6 +336,34 @@ mod tests {
         assert_eq!(cfg.project.as_deref(), Some("codex"));
         assert_eq!(cfg.auth.org_name.as_deref(), Some("acme"));
         assert_eq!(cfg.auth.token_sha256_prefix.len(), 12);
+    }
+
+    #[test]
+    fn route_is_journal_safe_and_builds_resolved_config() {
+        let route = SessionRoute {
+            auth: AuthSelection {
+                profile: Some("work".into()),
+                org_name: Some("acme".into()),
+            },
+            project: Some("agent-traces".into()),
+            ..SessionRoute::default()
+        };
+        let config = route.with_auth(BackendAuth {
+            token: "secret".into(),
+            api_url: None,
+            app_url: None,
+            org_name: Some("acme".into()),
+            org_id: None,
+        });
+        assert_eq!(config.project.as_deref(), Some("agent-traces"));
+        assert_eq!(route.auth.profile.as_deref(), Some("work"));
+
+        let mut envelope = sample();
+        envelope.route = Some(route);
+        envelope.config = Some(config);
+        let journal = serde_json::to_string(&envelope.redacted()).unwrap();
+        assert!(journal.contains("work"));
+        assert!(!journal.contains("secret"));
     }
 
     #[test]

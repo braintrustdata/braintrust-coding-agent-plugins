@@ -118,6 +118,20 @@ struct Creds {
     root_span_id: Option<String>,
 }
 
+impl Creds {
+    fn same_as(&self, other: &Self) -> bool {
+        self.token == other.token
+            && self.org_id == other.org_id
+            && self.org_name == other.org_name
+            && self.project == other.project
+            && self.experiment_id == other.experiment_id
+            && self.parent_span_id == other.parent_span_id
+            && self.root_span_id == other.root_span_id
+            && serde_json::to_value(&self.destination).ok()
+                == serde_json::to_value(&other.destination).ok()
+    }
+}
+
 struct BraintrustSink {
     cache: Arc<ClientCache>,
     default_api_url: Option<String>,
@@ -251,7 +265,8 @@ impl Sink for BraintrustSink {
             .or_else(|| self.default_app_url.clone())
             .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
         let new_urls = (api, app);
-        if self.urls.as_ref() != Some(&new_urls) {
+        let urls_changed = self.urls.as_ref() != Some(&new_urls);
+        if urls_changed {
             // A session shouldn't change backend URLs mid-flight; if it does,
             // rebind the client on the next emit. Pre-change open handles stay
             // bound to the old client (pathological; just noted).
@@ -264,7 +279,7 @@ impl Sink for BraintrustSink {
             self.urls = Some(new_urls);
             self.client = None;
         }
-        self.creds = Some(Creds {
+        let next_creds = Creds {
             token: config.auth.token.clone(),
             org_id: config.auth.org_id.clone().unwrap_or_default(),
             org_name: config.auth.org_name.clone(),
@@ -278,7 +293,19 @@ impl Sink for BraintrustSink {
                 .map(ToOwned::to_owned),
             parent_span_id: config.parent_span_id.clone(),
             root_span_id: config.root_span_id.clone(),
-        });
+        };
+        // Span handles capture their credentials when built. Recreate them
+        // after a profile token or routing change; deterministic row ids make
+        // subsequent updates merge into the same Braintrust rows.
+        if urls_changed
+            || self
+                .creds
+                .as_ref()
+                .is_some_and(|old| !old.same_as(&next_creds))
+        {
+            self.open.clear();
+        }
+        self.creds = Some(next_creds);
     }
 
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {

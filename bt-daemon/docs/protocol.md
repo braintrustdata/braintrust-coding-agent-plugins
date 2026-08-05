@@ -8,8 +8,9 @@ All hook clients share one daemon-level, non-credential settings file. Its path
 is `$BT_DAEMON_CONFIG`, falling back to `<BT_DAEMON_DATA_DIR>/config.json` and
 then the platform default daemon state directory. The hook front-end applies
 `traceToBraintrust`, `project`, `flushOnTurnEnd`, and `additionalMetadata`
-before constructing `SessionConfig`. Authentication and backend URLs are
-resolved by `bt` and never read from this file.
+before constructing a `SessionRoute`. Authentication and backend URLs are
+resolved and refreshed inside the daemon through the embedding `bt` process
+and are never read from this file.
 
 `PROTOCOL_VERSION = 1`.
 
@@ -159,11 +160,9 @@ Used for version handover and by tests.
   "event": "PostToolUse",
   "ts_ms": 1753639552123,
   "payload": { "…raw agent-native hook payload…": true },
-  "config": {
+  "route": {
     "auth": {
-      "token": "sk-…",
-      "api_url": "https://api.braintrust.dev",
-      "app_url": "https://www.braintrust.dev",
+      "profile": "work",
       "org_name": "acme"
     },
     "destination": {
@@ -194,24 +193,28 @@ Field notes:
   daemon.
 - **`payload`** is opaque to transport and to everything except the translator
   for `source`.
-- **`config`** carries shim-resolved credentials and trace settings. The shim
-  attaches it on **every** event (stateless shim); the daemon keeps the latest
-  per session and only re-inits the Braintrust sink when it changes. `auth` is
-  filled by `bt`'s `resolve_auth` when embedded, or from env/flags in the
-  standalone binary. `flush_mode` ∈ `fire_and_forget` | `flush_on_turn_end`.
+- **`route`** carries non-secret auth selection and trace settings. `profile`
+  is optional and resolves through `bt`'s default profile when absent;
+  `org_name` optionally constrains organization selection. The daemon resolves
+  the live credential, pins the returned canonical profile for the lifetime
+  of the session, and refreshes an expiring lease without changing that route.
+  A route cannot change after a session's first accepted event.
+  `flush_mode` ∈ `fire_and_forget` | `flush_on_turn_end`.
   New front-ends set the typed `destination`: `project_logs` accepts a project
   id and/or name, `experiment` accepts an experiment id, and `parent_span`
   carries the complete exported `SpanComponents` object. The older `project`,
   `parent_span_id`, `root_span_id`, and `_bt_experiment_id` fields remain
-  accepted when `destination` is absent.
+  accepted when `destination` is absent. A legacy `config` containing resolved
+  credentials remains accepted during client migration, but new clients must
+  use `route`.
 
 ### Redaction
 
-`config.auth.token` (and any nested secret) is **never** written to the
-journal or logs. The journal stores the envelope with `config.auth` reduced to
-a non-secret fingerprint (`{ "api_url", "app_url", "org_name", "token_sha256_prefix" }`)
-so replay can detect a credential change without persisting the secret; on
-replay the live credentials must be re-supplied.
+Live credentials returned by the host provider are **never** written to the
+journal, logs, status, or RPC response. Routed envelopes journal only their
+non-secret `route`, allowing restart recovery to resolve a fresh lease. Legacy
+`config.auth.token` values are reduced to a non-secret fingerprint for
+backward-compatible replay.
 
 ## Daemon lifecycle
 

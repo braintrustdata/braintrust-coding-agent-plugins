@@ -396,6 +396,7 @@ fn envelope(
         event: event.into(),
         ts_ms,
         payload,
+        route: None,
         config: None,
     }
 }

@@ -12,12 +12,14 @@ use crate::wire::{
     InitializeParams, InitializeResult, Message, Request, Response, RpcError, SessionStatus,
     ShutdownResult, StatusParams, StatusResult, PROTOCOL_VERSION,
 };
+use crate::wire::{AuthSelection, BackendAuth, SessionRoute};
 use crate::{paths, ServeArgs};
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Notify;
 
@@ -27,6 +29,45 @@ pub struct ServeOptions {
     pub version: String,
     pub translators: Arc<Registry>,
     pub sink_factory: Arc<dyn SinkFactory>,
+    /// Host-owned access to Braintrust profiles, OAuth, and keychains. The
+    /// daemon owns lease timing and session routing; the embedding `bt`
+    /// process owns the credential store implementation.
+    pub auth_provider: Option<Arc<dyn AuthProvider>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthResolveReason {
+    Initial,
+    Expiring,
+    Unauthorized,
+}
+
+/// A live credential lease. Only the canonical profile name is observable;
+/// the backend credential remains in daemon memory and is never journaled.
+#[derive(Debug, Clone)]
+pub struct AuthLease {
+    pub profile: String,
+    pub auth: BackendAuth,
+    /// Epoch milliseconds. `None` is appropriate for non-expiring API keys.
+    pub expires_at_ms: Option<i64>,
+}
+
+#[async_trait]
+pub trait AuthProvider: Send + Sync {
+    /// Resolve without prompting. On refresh, `selection.profile` is the
+    /// canonical profile returned by the initial lease, keeping an active
+    /// session pinned even if the user's default profile changes.
+    async fn resolve(
+        &self,
+        selection: &AuthSelection,
+        reason: AuthResolveReason,
+    ) -> anyhow::Result<AuthLease>;
+}
+
+#[derive(Clone)]
+struct SessionAuthState {
+    route: SessionRoute,
+    lease: AuthLease,
 }
 
 pub struct Daemon {
@@ -34,6 +75,9 @@ pub struct Daemon {
     data_dir: PathBuf,
     translators: Arc<Registry>,
     sink_factory: Arc<dyn SinkFactory>,
+    auth_provider: Option<Arc<dyn AuthProvider>>,
+    session_auth: tokio::sync::Mutex<HashMap<String, SessionAuthState>>,
+    auth_errors: Mutex<HashMap<String, (String, String)>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     started: Instant,
     last_activity: Mutex<Instant>,
@@ -48,12 +92,124 @@ impl Daemon {
             data_dir,
             translators: opts.translators,
             sink_factory: opts.sink_factory,
+            auth_provider: opts.auth_provider,
+            session_auth: tokio::sync::Mutex::new(HashMap::new()),
+            auth_errors: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
             shutting_down: AtomicBool::new(false),
             shutdown: Notify::new(),
         })
+    }
+
+    async fn configure_event(&self, env: &mut Envelope) -> anyhow::Result<()> {
+        // Full configs are a temporary compatibility path for old hooks.
+        if env.config.is_some() {
+            return Ok(());
+        }
+        let Some(provider) = &self.auth_provider else {
+            return Ok(());
+        };
+        let route = env.route.clone().unwrap_or_default();
+        let (selection, reason, expected_profile) = {
+            let states = self.session_auth.lock().await;
+            match states.get(&env.session_id) {
+                Some(state) => {
+                    if !state.route.same_route(&route) {
+                        anyhow::bail!(
+                            "session route changed after initialization; start a new agent session to change profile, organization, or destination"
+                        );
+                    }
+                    if !lease_is_expiring(&state.lease) {
+                        env.config = Some(state.route.with_auth(state.lease.auth.clone()));
+                        return Ok(());
+                    }
+                    (
+                        AuthSelection {
+                            profile: Some(state.lease.profile.clone()),
+                            org_name: state.lease.auth.org_name.clone(),
+                        },
+                        AuthResolveReason::Expiring,
+                        Some(state.lease.profile.clone()),
+                    )
+                }
+                None => (route.auth.clone(), AuthResolveReason::Initial, None),
+            }
+        };
+
+        let lease = provider.resolve(&selection, reason).await.map_err(|error| {
+            let message = format!(
+                "could not resolve Braintrust profile for {}: {error}; run `bt auth login` or select a profile explicitly",
+                env.source
+            );
+            self.auth_errors.lock().unwrap().insert(
+                env.session_id.clone(),
+                (env.source.clone(), message.clone()),
+            );
+            anyhow::anyhow!(message)
+        })?;
+        if let Some(expected) = expected_profile {
+            if lease.profile != expected {
+                anyhow::bail!(
+                    "credential refresh changed profile from {expected:?} to {:?}",
+                    lease.profile
+                );
+            }
+        }
+        if let Some(expected_org) = route.auth.org_name.as_deref() {
+            if lease.auth.org_name.as_deref() != Some(expected_org) {
+                anyhow::bail!(
+                    "profile {:?} resolved organization {:?}, expected {:?}",
+                    lease.profile,
+                    lease.auth.org_name,
+                    expected_org
+                );
+            }
+        }
+
+        env.config = Some(route.with_auth(lease.auth.clone()));
+        self.session_auth
+            .lock()
+            .await
+            .insert(env.session_id.clone(), SessionAuthState { route, lease });
+        self.auth_errors.lock().unwrap().remove(&env.session_id);
+        Ok(())
+    }
+
+    async fn refresh_session_before_flush(&self, session_id: &str) -> anyhow::Result<()> {
+        let Some(provider) = &self.auth_provider else {
+            return Ok(());
+        };
+        let Some(state) = self.session_auth.lock().await.get(session_id).cloned() else {
+            return Ok(());
+        };
+        if !lease_is_expiring(&state.lease) {
+            return Ok(());
+        }
+        let selection = AuthSelection {
+            profile: Some(state.lease.profile.clone()),
+            org_name: state.lease.auth.org_name.clone(),
+        };
+        let lease = provider
+            .resolve(&selection, AuthResolveReason::Expiring)
+            .await?;
+        if lease.profile != state.lease.profile {
+            anyhow::bail!("credential refresh changed the session profile");
+        }
+        let config = state.route.with_auth(lease.auth.clone());
+        self.session_auth.lock().await.insert(
+            session_id.to_string(),
+            SessionAuthState {
+                route: state.route,
+                lease,
+            },
+        );
+        let session = { self.sessions.lock().unwrap().get(session_id).cloned() };
+        if let Some(session) = session {
+            session.configure(config).await?;
+        }
+        Ok(())
     }
 
     fn touch(&self) {
@@ -118,6 +274,21 @@ impl Daemon {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
     }
+}
+
+fn lease_is_expiring(lease: &AuthLease) -> bool {
+    const REFRESH_WINDOW_MS: i64 = 60_000;
+    let Some(expires_at_ms) = lease.expires_at_ms else {
+        return false;
+    };
+    expires_at_ms <= now_ms().saturating_add(REFRESH_WINDOW_MS)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Bind the socket (handling a stale/rival socket), serve until shutdown, then
@@ -260,7 +431,7 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
     Ok(())
 }
 
-async fn accept_event(daemon: &Arc<Daemon>, env: Envelope) -> Result<(), String> {
+async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), String> {
     let source = env.source.clone();
     let event = env.event.clone();
     let session_id = env.session_id.clone();
@@ -268,6 +439,10 @@ async fn accept_event(daemon: &Arc<Daemon>, env: Envelope) -> Result<(), String>
     daemon.touch();
 
     let result = async {
+        daemon
+            .configure_event(&mut env)
+            .await
+            .map_err(|error| format!("session auth failed: {error}"))?;
         let session = daemon
             .session_for(&env)
             .await
@@ -340,6 +515,15 @@ async fn handle_request(daemon: &Arc<Daemon>, req: Request) -> Response {
         }
         method::SESSION_FLUSH => {
             let p = parse!(FlushParams);
+            if let Err(error) = daemon.refresh_session_before_flush(&p.session_id).await {
+                return Response::err(
+                    id,
+                    RpcError::new(
+                        error_code::INTERNAL,
+                        format!("session auth refresh failed: {error}"),
+                    ),
+                );
+            }
             let session = { daemon.sessions.lock().unwrap().get(&p.session_id).cloned() };
             let (flushed, pending) = match session {
                 Some(s) => s.flush(Duration::from_millis(p.timeout_ms)).await,
@@ -375,7 +559,7 @@ async fn handle_request(daemon: &Arc<Daemon>, req: Request) -> Response {
 impl Daemon {
     fn status(&self, p: StatusParams) -> StatusResult {
         let map = self.sessions.lock().unwrap();
-        let sessions = map
+        let mut sessions: Vec<_> = map
             .iter()
             .filter(|(sid, _)| p.session_id.as_ref().is_none_or(|want| *want == **sid))
             .map(|(sid, s)| SessionStatus {
@@ -387,6 +571,22 @@ impl Daemon {
                 last_error: s.last_error.lock().unwrap().clone(),
             })
             .collect();
+        for (session_id, (source, error)) in self.auth_errors.lock().unwrap().iter() {
+            if p.session_id.as_ref().is_some_and(|want| want != session_id) {
+                continue;
+            }
+            if map.contains_key(session_id) {
+                continue;
+            }
+            sessions.push(SessionStatus {
+                session_id: session_id.clone(),
+                source: source.clone(),
+                queued: 0,
+                spans_emitted: 0,
+                permalink: None,
+                last_error: Some(error.clone()),
+            });
+        }
         StatusResult {
             daemon_version: self.version.clone(),
             uptime_ms: self.started.elapsed().as_millis() as u64,

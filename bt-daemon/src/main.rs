@@ -4,11 +4,12 @@
 //! profiles, OAuth, or keychain here (that lives in `bt`). See
 //! the crate README's "Dual consumption" section.
 
-use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
+use async_trait::async_trait;
+use bt_daemon::wire::{AuthSelection, BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
-    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status,
-    BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo, ImportArgs, Registry, ServeArgs,
-    ServeOptions, StatusArgs,
+    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, AuthLease,
+    AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo,
+    ImportArgs, Registry, ServeArgs, ServeOptions, StatusArgs,
 };
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
@@ -23,6 +24,38 @@ fn debug_serve_options(version: &str, data_dir: &std::path::Path) -> ServeOption
         sink_factory: Arc::new(DebugSinkFactory {
             dir: data_dir.join("spans"),
         }),
+        auth_provider: None,
+    }
+}
+
+struct EnvironmentAuthProvider;
+
+#[async_trait]
+impl AuthProvider for EnvironmentAuthProvider {
+    async fn resolve(
+        &self,
+        selection: &AuthSelection,
+        _reason: AuthResolveReason,
+    ) -> anyhow::Result<AuthLease> {
+        let token = std::env::var("BRAINTRUST_API_KEY")
+            .map_err(|_| anyhow::anyhow!("BRAINTRUST_API_KEY is not set"))?;
+        Ok(AuthLease {
+            profile: selection
+                .profile
+                .clone()
+                .unwrap_or_else(|| "environment".to_string()),
+            auth: BackendAuth {
+                token,
+                api_url: std::env::var("BRAINTRUST_API_URL").ok(),
+                app_url: std::env::var("BRAINTRUST_APP_URL").ok(),
+                org_name: selection
+                    .org_name
+                    .clone()
+                    .or_else(|| std::env::var("BRAINTRUST_ORG_NAME").ok()),
+                org_id: std::env::var("BRAINTRUST_ORG_ID").ok(),
+            },
+            expires_at_ms: None,
+        })
     }
 }
 
@@ -137,7 +170,7 @@ async fn main() {
             app_url,
         } => {
             let data_dir = paths::data_dir(args.data_dir.as_deref());
-            let opts = if debug_sink {
+            let mut opts = if debug_sink {
                 debug_serve_options(VERSION, &data_dir)
             } else {
                 let cfg = BraintrustSinkConfig {
@@ -147,6 +180,9 @@ async fn main() {
                 };
                 braintrust_serve_options(VERSION, cfg, Arc::new(Registry::default_agents()))
             };
+            if !debug_sink {
+                opts.auth_provider = Some(Arc::new(EnvironmentAuthProvider));
+            }
             if let Err(e) = run_serve(args, opts).await {
                 eprintln!("bt-daemon serve: {e}");
                 std::process::exit(1);

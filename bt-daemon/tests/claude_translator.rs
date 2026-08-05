@@ -50,6 +50,7 @@ fn replay(name: &str) -> Vec<SpanOp> {
             event: record["hook"].as_str().unwrap().into(),
             ts_ms,
             payload,
+            route: None,
             config: None,
         };
         ops.extend(translator.handle(&env, &ctx).unwrap());
@@ -257,6 +258,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         event: name.into(),
         ts_ms: 1,
         payload,
+        route: None,
         config: None,
     };
     let mut ops = translator
@@ -343,6 +345,7 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
         event: name.into(),
         ts_ms,
         payload,
+        route: None,
         config: None,
     };
     let mut ops = Vec::new();
@@ -459,6 +462,7 @@ fn claude_groups_streamed_rows_and_reads_late_final_output_at_session_end() {
         event: name.into(),
         ts_ms,
         payload,
+        route: None,
         config: None,
     };
     let mut ops = translator

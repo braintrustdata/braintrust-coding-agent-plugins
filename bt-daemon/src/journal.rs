@@ -109,6 +109,18 @@ pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
 /// rebuilding translator state; the sink must be re-supplied live credentials
 /// if replay needs to actually deliver.
 pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
+    let route = r.route;
+    let config = r.config.map(config_from_redacted).or_else(|| {
+        route.as_ref().map(|route| {
+            route.with_auth(BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: route.auth.org_name.clone(),
+                org_id: None,
+            })
+        })
+    });
     Envelope {
         source: r.source,
         source_version: r.source_version,
@@ -116,7 +128,8 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
         event: r.event,
         ts_ms: r.ts_ms,
         payload: r.payload,
-        config: r.config.map(config_from_redacted),
+        route,
+        config,
     }
 }
 

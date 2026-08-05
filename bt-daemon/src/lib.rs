@@ -1,14 +1,15 @@
 //! bt-daemon: the embeddable library behind the Braintrust coding-agent
 //! tracing daemon. Two front-ends consume it (see `../DESIGN.md`):
-//!   * `bt` wires the [`clap::Args`] structs into its command tree and fills
-//!     [`wire::SessionConfig`] from its own auth resolution.
+//!   * `bt` wires the [`clap::Args`] structs into its command tree and exposes
+//!     its profile store through [`AuthProvider`].
 //!   * the feature-gated standalone `bt-daemon` binary does the same with
 //!     env/flag token auth only, for isolated testing.
 //!
-//! The core is credential-passive: it only ever *receives* a resolved
-//! [`wire::BackendAuth`] with the session config, so both front-ends share all
-//! core behavior. The `cli` feature only gates the standalone binary and its
-//! logging subscriber.
+//! Hook clients submit a non-secret [`wire::SessionRoute`]. The long-lived
+//! daemon resolves and refreshes the selected profile through its host, while
+//! legacy callers may still submit a fully resolved [`wire::SessionConfig`].
+//! The `cli` feature only gates the standalone binary and its logging
+//! subscriber.
 
 pub mod paths;
 
@@ -25,7 +26,7 @@ mod transport;
 
 pub mod wire;
 pub use client::HostInfo;
-pub use server::ServeOptions;
+pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
 pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -36,7 +37,9 @@ use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use wire::{method, Envelope, SessionConfig, StatusResult, PROTOCOL_VERSION};
+use wire::{
+    method, BackendAuth, Envelope, SessionConfig, SessionRoute, StatusResult, PROTOCOL_VERSION,
+};
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -144,9 +147,34 @@ pub async fn run_serve(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()
 /// Returns `Ok` once the daemon has acked (journaled + enqueued). Callers that
 /// must never fail the agent's turn should treat any `Err` as non-fatal and
 /// exit 0.
-pub async fn run_hook(
+pub async fn run_hook(args: HookArgs, config: SessionConfig, host: HostInfo) -> anyhow::Result<()> {
+    let route = SessionRoute {
+        destination: config.destination,
+        project: config.project,
+        parent_span_id: config.parent_span_id,
+        root_span_id: config.root_span_id,
+        flush_mode: config.flush_mode,
+        additional_metadata: config.additional_metadata,
+        ..SessionRoute::default()
+    };
+    run_hook_inner(args, route, Some(config.auth), host).await
+}
+
+/// Capture one hook event while deferring credential resolution to the
+/// daemon. The route contains only profile, organization, destination, and
+/// trace settings, so hooks never need access to tokens or refresh logic.
+pub async fn run_hook_routed(
     args: HookArgs,
-    mut config: SessionConfig,
+    route: SessionRoute,
+    host: HostInfo,
+) -> anyhow::Result<()> {
+    run_hook_inner(args, route, None, host).await
+}
+
+async fn run_hook_inner(
+    args: HookArgs,
+    mut route: SessionRoute,
+    legacy_auth: Option<BackendAuth>,
     host: HostInfo,
 ) -> anyhow::Result<()> {
     let settings = settings::SharedSettings::load();
@@ -164,37 +192,37 @@ pub async fn run_hook(
         .unwrap_or_default();
 
     if let Some(project) = settings.project.filter(|project| !project.is_empty()) {
-        config.project = Some(project);
+        route.project = Some(project);
     }
     match settings.flush_on_turn_end {
-        Some(true) => config.flush_mode = wire::FlushMode::FlushOnTurnEnd,
-        Some(false) => config.flush_mode = wire::FlushMode::FireAndForget,
-        None if args.flush_on_turn_end => config.flush_mode = wire::FlushMode::FlushOnTurnEnd,
+        Some(true) => route.flush_mode = wire::FlushMode::FlushOnTurnEnd,
+        Some(false) => route.flush_mode = wire::FlushMode::FireAndForget,
+        None if args.flush_on_turn_end => route.flush_mode = wire::FlushMode::FlushOnTurnEnd,
         None => {}
     }
     if args.parent_span_id.is_some() {
-        config.parent_span_id = args.parent_span_id.clone();
+        route.parent_span_id = args.parent_span_id.clone();
     }
     if args.root_span_id.is_some() {
-        config.root_span_id = args.root_span_id.clone();
+        route.root_span_id = args.root_span_id.clone();
     }
-    match (config.parent_span_id.clone(), config.root_span_id.clone()) {
-        (Some(parent), None) => config.root_span_id = Some(parent),
-        (None, Some(root)) => config.parent_span_id = Some(root),
+    match (route.parent_span_id.clone(), route.root_span_id.clone()) {
+        (Some(parent), None) => route.root_span_id = Some(parent),
+        (None, Some(root)) => route.parent_span_id = Some(root),
         _ => {}
     }
     if let Some(metadata) = settings.additional_metadata {
-        config.additional_metadata = Some(serde_json::Value::Object(metadata));
+        route.additional_metadata = Some(serde_json::Value::Object(metadata));
     } else if let Some(metadata) = &args.additional_metadata {
         let value: serde_json::Value = serde_json::from_str(metadata)
             .map_err(|e| anyhow::anyhow!("invalid --additional-metadata JSON: {e}"))?;
         if !value.is_object() {
             anyhow::bail!("--additional-metadata must be a JSON object");
         }
-        config.additional_metadata = Some(value);
+        route.additional_metadata = Some(value);
     }
     if let Some(experiment_id) = &args.experiment_id {
-        let mut metadata = config
+        let mut metadata = route
             .additional_metadata
             .take()
             .and_then(|value| value.as_object().cloned())
@@ -203,8 +231,12 @@ pub async fn run_hook(
             "_bt_experiment_id".to_string(),
             serde_json::Value::String(experiment_id.clone()),
         );
-        config.additional_metadata = Some(serde_json::Value::Object(metadata));
+        route.additional_metadata = Some(serde_json::Value::Object(metadata));
     }
+    let (route, config) = match legacy_auth {
+        Some(auth) => (None, Some(route.with_auth(auth))),
+        None => (Some(route), None),
+    };
     let env = Envelope {
         source: args.source.clone(),
         source_version: args.source_version.clone(),
@@ -212,14 +244,18 @@ pub async fn run_hook(
         event,
         ts_ms: now_ms(),
         payload,
-        config: Some(config),
+        route,
+        config,
     };
 
     let socket = paths::socket_path(args.socket.as_deref());
     forward_envelope(&env, &socket, &host, args.no_spawn).await?;
     let should_flush = env.event == "SessionEnd"
         || (matches!(
-            env.config.as_ref().map(|c| c.flush_mode),
+            env.config
+                .as_ref()
+                .map(|c| c.flush_mode)
+                .or_else(|| env.route.as_ref().map(|r| r.flush_mode)),
             Some(wire::FlushMode::FlushOnTurnEnd)
         ) && matches!(env.event.as_str(), "Stop" | "SubagentStop"));
     if should_flush {
@@ -457,6 +493,7 @@ pub fn debug_serve_options(version: impl Into<String>, data_dir: &std::path::Pat
         sink_factory: Arc::new(DebugSinkFactory {
             dir: data_dir.join("spans"),
         }),
+        auth_provider: None,
     }
 }
 
@@ -473,6 +510,7 @@ pub fn braintrust_serve_options(
         version: version.into(),
         translators,
         sink_factory: Arc::new(BraintrustSinkFactory::new(sink_config)),
+        auth_provider: None,
     }
 }
 
