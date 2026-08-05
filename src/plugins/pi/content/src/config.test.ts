@@ -10,6 +10,7 @@ const ENV_KEYS = [
   "BRAINTRUST_API_KEY",
   "BRAINTRUST_API_URL",
   "BRAINTRUST_APP_URL",
+  "BRAINTRUST_PROFILE",
   "BRAINTRUST_ORG_NAME",
   "BRAINTRUST_PROJECT",
   "TRACE_TO_BRAINTRUST",
@@ -66,6 +67,7 @@ describe("loadConfig", () => {
     const envStateDir = join(home, "env-state");
 
     process.env.HOME = home;
+    process.env.BRAINTRUST_PROFILE = "from-env";
     process.env.BRAINTRUST_PROJECT = "from-env";
     process.env.TRACE_TO_BRAINTRUST = "false";
     process.env.BRAINTRUST_ADDITIONAL_METADATA = '{"origin":"env","team":"platform"}';
@@ -74,6 +76,7 @@ describe("loadConfig", () => {
     writeJson(join(home, ".pi", "agent", "braintrust.json"), {
       api_key: "global-key",
       api_url: "https://global.example",
+      profile: "from-global",
       project: "from-global",
       trace_to_braintrust: false,
       debug: true,
@@ -92,6 +95,7 @@ describe("loadConfig", () => {
 
     expect(config.apiKey).toBe("global-key");
     expect(config.apiUrl).toBe("https://project.example");
+    expect(config.profile).toBe("from-env");
     expect(config.projectName).toBe("from-env");
     expect(config.enabled).toBe(false);
     expect(config.additionalMetadata).toEqual({ origin: "env", team: "platform" });

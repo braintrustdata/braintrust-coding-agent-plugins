@@ -3,7 +3,9 @@ mod support;
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 use support::agent_process::AgentTestWorld;
-use support::agents::{ClaudeAgent, ClaudeRun, CodexAgent, CodexRun, OpenCodeAgent, OpenCodeRun};
+use support::agents::{
+    ClaudeAgent, ClaudeRun, CodexAgent, CodexRun, OpenCodeAgent, OpenCodeRun, PiAgent, PiRun,
+};
 use support::inference::{
     AnthropicMock, AnthropicRequest, AnthropicTurn, MockReply, OpenAiMock, OpenAiRequest,
     OpenAiTurn,
@@ -324,6 +326,40 @@ async fn opencode_session_emits_traces() {
                 row_contains(row, &[r#""type":"llm""#, "OPENCODE_MOCK_OK"])
             });
         world.wait_for_mock_ingest_scenario(&scenario).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the Pi CLI and built extension"]
+async fn pi_session_emits_traces() {
+    let inference = OpenAiMock::new(|_context, request| {
+        assert!(request.model().is_some());
+        MockReply::response(OpenAiTurn::text("PI_MOCK_OK"))
+    });
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let pi = PiAgent::new(&world);
+
+    let output = pi
+        .run(
+            &world,
+            PiRun::new("Reply with the exact text PI_MOCK_OK.")
+                .mock_inference(inference_server.uri()),
+        )
+        .await;
+    output.assert_success();
+    if world.uses_mock_inference() {
+        output.assert_contains("PI_MOCK_OK");
+        assert!(!inference.requests().is_empty(), "{}", output.text());
+    }
+
+    let rows = world.wait_for_trace_delivery().await;
+    if world.uses_mock_ingest() {
+        assert!(
+            rows.iter()
+                .any(|row| row_contains(row, &["braintrust.plugin.pi", "test_harness"])),
+            "Pi trace origin metadata was not emitted"
+        );
     }
 }
 

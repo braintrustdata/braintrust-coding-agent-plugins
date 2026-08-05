@@ -18,6 +18,7 @@ export interface TraceConfig {
   apiKey: string;
   apiUrl?: string;
   appUrl: string;
+  profile?: string;
   orgName?: string;
   projectName: string;
   debug: boolean;

@@ -92,6 +92,7 @@ Example:
 ```json
 {
   "trace_to_braintrust": true,
+  "profile": "work",
   "project": "pi",
   "debug": true,
   "additional_metadata": {
@@ -109,6 +110,7 @@ Example:
 | `api_url` | `BRAINTRUST_API_URL` | `https://api.braintrust.dev` |
 | `app_url` | `BRAINTRUST_APP_URL` | `https://www.braintrust.dev` |
 | `org_name` | `BRAINTRUST_ORG_NAME` | unset |
+| `profile` | `BRAINTRUST_PROFILE` | default `bt` profile |
 | `project` | `BRAINTRUST_PROJECT` | `pi` |
 | `debug` | `BRAINTRUST_DEBUG` | `false` |
 | `additional_metadata` | `BRAINTRUST_ADDITIONAL_METADATA` | `{}` |

@@ -168,7 +168,7 @@ jobs:
           rustup default stable
           rustup component add clippy rustfmt
       - name: Install latest coding agents
-        run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest
+        run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest @earendil-works/pi-coding-agent@latest
       - name: Set up pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
         with:
@@ -193,11 +193,16 @@ jobs:
             "$tarball" @opencode-ai/plugin@latest @opencode-ai/sdk@latest
           echo "OPENCODE_PLUGIN=$install_dir/node_modules/@braintrust/trace-opencode/dist/index.mjs" \
             >> "$GITHUB_ENV"
+      - name: Build Pi extension for integration harness
+        run: make build-pi
+      - name: Install built Pi extension for integration harness
+        run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund ./dist/pi/braintrust-pi-extension-*.tgz
       - name: Report coding-agent versions
         run: |
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- codex --version
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- claude --version
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- opencode --version
+          npm exec --prefix "${{ runner.temp }}/coding-agents" -- pi --version
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --manifest-path bt-daemon/Cargo.toml -- --check
@@ -212,6 +217,8 @@ jobs:
           CODEX_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/codex${{ matrix.agent_suffix }}
           CLAUDE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/claude${{ matrix.agent_suffix }}
           OPENCODE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/opencode${{ matrix.agent_suffix }}
+          PI_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/pi${{ matrix.agent_suffix }}
+          PI_EXTENSION_PATH: ${{ runner.temp }}/coding-agents/node_modules/@braintrust/pi-extension/dist/index.mjs
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
       - name: Lint daemon
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings

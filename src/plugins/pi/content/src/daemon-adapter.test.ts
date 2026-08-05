@@ -31,14 +31,22 @@ vi.mock("./runtime/daemon-client.ts", () => ({
         ],
       };
     }
-    close(): void {
+    async close(): Promise<void> {
       mockState.closed += 1;
     }
   },
 }));
 
 vi.mock("./config.ts", () => ({
-  loadConfig: () => ({ enabled: true, showUi: true, showTraceLink: true }),
+  loadConfig: () => ({
+    enabled: true,
+    profile: "work",
+    orgName: "acme",
+    projectName: "agents",
+    additionalMetadata: { team: "platform" },
+    showUi: true,
+    showTraceLink: true,
+  }),
 }));
 
 describe("Pi daemon adapter", () => {
@@ -86,6 +94,12 @@ describe("Pi daemon adapter", () => {
     expect(
       mockState.logs.every((log) => log.source === "pi" && typeof log.ts_ms === "number"),
     ).toBe(true);
+    expect(mockState.logs[0]?.route).toEqual({
+      auth: { profile: "work", org_name: "acme" },
+      destination: { type: "project_logs", project_name: "agents" },
+      flush_mode: "flush_on_turn_end",
+      additional_metadata: { team: "platform" },
+    });
     expect(mockState.flushes).toHaveLength(2);
     expect(
       widgets.some((args) => JSON.stringify(args).includes("https://www.braintrust.dev/trace/1")),

@@ -11,6 +11,7 @@ fn event(name: &str, ts_ms: i64, native: serde_json::Value) -> Envelope {
         event: name.into(),
         ts_ms,
         payload: json!({"event":native,"extension_version":"0.10.0","cwd":"."}),
+        route: None,
         config: None,
     }
 }

@@ -177,6 +177,9 @@ function applyConfig(
   const appUrl = validateOptionalUrl(source.app_url, issues, path, "app_url");
   if (appUrl !== undefined) target.appUrl = appUrl;
 
+  const profile = validateOptionalNonEmptyString(source.profile, issues, path, "profile");
+  if (profile !== undefined) target.profile = profile;
+
   const orgName = validateOptionalNonEmptyString(source.org_name, issues, path, "org_name");
   if (orgName !== undefined) target.orgName = orgName;
 
@@ -247,6 +250,7 @@ export function loadConfig(cwd = process.cwd()): TraceConfig {
     apiKey: "",
     apiUrl: undefined,
     appUrl: "https://www.braintrust.dev",
+    profile: undefined,
     orgName: undefined,
     projectName: "pi",
     debug: false,
@@ -314,6 +318,14 @@ export function loadConfig(cwd = process.cwd()): TraceConfig {
     "BRAINTRUST_APP_URL",
   );
   if (envAppUrl !== undefined) config.appUrl = envAppUrl;
+
+  const envProfile = validateOptionalNonEmptyString(
+    process.env.BRAINTRUST_PROFILE,
+    config.configIssues,
+    "BRAINTRUST_PROFILE",
+    "BRAINTRUST_PROFILE",
+  );
+  if (envProfile !== undefined) config.profile = envProfile;
 
   const envOrgName = validateOptionalNonEmptyString(
     process.env.BRAINTRUST_ORG_NAME,

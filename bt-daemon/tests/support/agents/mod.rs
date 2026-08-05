@@ -1,6 +1,7 @@
 mod claude;
 mod codex;
 mod opencode;
+mod pi;
 mod test_plugin;
 
 #[allow(unused_imports)]
@@ -9,6 +10,8 @@ pub use claude::{ClaudeAgent, ClaudeRun};
 pub use codex::{CodexAgent, CodexRun};
 #[allow(unused_imports)]
 pub use opencode::{OpenCodeAgent, OpenCodeRun};
+#[allow(unused_imports)]
+pub use pi::{PiAgent, PiRun};
 
 use std::ffi::OsString;
 use std::path::PathBuf;

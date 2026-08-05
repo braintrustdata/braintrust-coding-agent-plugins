@@ -95,12 +95,15 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
         native_session_id: descriptor?.nativeSessionId,
         cwd: ctx?.cwd,
         model: nativePayload(ctx?.model),
-        trace_settings: {
-          project: config.projectName,
-          additional_metadata: config.additionalMetadata,
-          parent_span_id: config.parentSpanId,
-          root_span_id: config.rootSpanId,
+      },
+      route: {
+        auth: {
+          ...(config.profile ? { profile: config.profile } : {}),
+          ...(config.orgName ? { org_name: config.orgName } : {}),
         },
+        destination: { type: "project_logs", project_name: config.projectName },
+        flush_mode: "flush_on_turn_end",
+        additional_metadata: config.additionalMetadata,
       },
     });
     if (flush) {
@@ -136,7 +139,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
       ctx.ui.setStatus(STATUS_KEY, undefined);
       ctx.ui.setWidget(WIDGET_KEY, undefined);
     }
-    client.close();
+    await client.close();
     sessionId = undefined;
     lastContext = undefined;
   });
