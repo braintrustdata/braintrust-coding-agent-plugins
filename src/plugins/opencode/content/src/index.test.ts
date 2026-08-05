@@ -1,0 +1,132 @@
+/**
+ * Tests for OpenCode plugin registration behavior
+ */
+
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import type { PluginInput } from "@opencode-ai/plugin"
+
+mock.module("@opencode-ai/plugin", () => ({
+  tool: Object.assign((definition: unknown) => definition, {
+    schema: {
+      string: () => ({
+        optional() {
+          return this
+        },
+        describe() {
+          return this
+        },
+      }),
+      number: () => ({
+        optional() {
+          return this
+        },
+        describe() {
+          return this
+        },
+      }),
+    },
+  }),
+}))
+
+function createInput(directory: string): PluginInput {
+  return {
+    directory,
+    worktree: directory,
+    project: "test-project",
+    client: {
+      app: {
+        log: async () => {},
+      },
+    },
+  } as unknown as PluginInput
+}
+
+describe("BraintrustPlugin", () => {
+  const originalEnv: Record<string, string | undefined> = {}
+  const envVars = [
+    "TRACE_TO_BRAINTRUST",
+    "BRAINTRUST_API_KEY",
+    "BRAINTRUST_API_URL",
+    "BRAINTRUST_OPENCODE_ENABLE_TOOLS",
+    "HOME",
+  ]
+  const originalFetch = globalThis.fetch
+  let directory: string
+  let fetchCalls: number
+
+  beforeEach(() => {
+    directory = mkdtempSync(join(tmpdir(), "braintrust-opencode-plugin-"))
+    for (const key of envVars) {
+      originalEnv[key] = process.env[key]
+      delete process.env[key]
+    }
+    process.env.HOME = directory
+    process.env.TRACE_TO_BRAINTRUST = "false"
+    process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "true"
+    process.env.BRAINTRUST_API_KEY = "test-api-key"
+    process.env.BRAINTRUST_API_URL = "https://api.example.com"
+    fetchCalls = 0
+    globalThis.fetch = (async () => {
+      fetchCalls++
+      return new Response(JSON.stringify({ id: "project-id", name: "opencode" }), {
+        status: 200,
+      })
+    }) as unknown as typeof fetch
+  })
+
+  afterEach(() => {
+    rmSync(directory, { recursive: true, force: true })
+    for (const key of envVars) {
+      if (originalEnv[key] !== undefined) {
+        process.env[key] = originalEnv[key]
+      } else {
+        delete process.env[key]
+      }
+    }
+    globalThis.fetch = originalFetch
+  })
+
+  it("registers Braintrust tools when enabled", async () => {
+    const { BraintrustPlugin } = await import("./index")
+    const hooks = await BraintrustPlugin(createInput(directory))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(hooks.tool).toBeDefined()
+    expect(Object.keys(hooks.tool ?? {}).sort()).toEqual([
+      "braintrust_get_experiments",
+      "braintrust_list_projects",
+      "braintrust_log_data",
+      "braintrust_query_logs",
+    ])
+  })
+
+  it("does not register Braintrust tools when disabled", async () => {
+    process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "false"
+
+    const { BraintrustPlugin } = await import("./index")
+    const hooks = await BraintrustPlugin(createInput(directory))
+    await Promise.resolve()
+
+    expect(hooks.tool).toBeUndefined()
+    expect(fetchCalls).toBe(0)
+  })
+
+  it("registers daemon tracing without a JavaScript API key", async () => {
+    delete process.env.BRAINTRUST_API_KEY
+    process.env.TRACE_TO_BRAINTRUST = "true"
+    process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "false"
+
+    const { BraintrustPlugin } = await import("./index")
+    const hooks = await BraintrustPlugin(createInput(directory))
+
+    expect(hooks.event).toBeDefined()
+    expect(hooks["chat.message"]).toBeDefined()
+    expect(hooks["tool.execute.before"]).toBeDefined()
+    expect(hooks["tool.execute.after"]).toBeDefined()
+    expect(hooks.tool).toBeUndefined()
+    expect(fetchCalls).toBe(0)
+  })
+})
