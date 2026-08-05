@@ -17,10 +17,10 @@ contents="$(tar -tzf "$tarball")"
 grep -q '^package/dist/index.js$' <<<"$contents" || fail "tarball omits dist/index.js"
 grep -q '^package/README.md$' <<<"$contents" || fail "tarball omits README.md"
 grep -q '^package/LICENSE$' <<<"$contents" || fail "tarball omits LICENSE"
-if rg -n "from [\"']braintrust[\"']|from [\"']\.\./(client|span-)" "$TARGET_DIR/src/tracing"; then
+if grep -R -n -E "from [\"']braintrust[\"']|from [\"']\.\./(client|span-)" "$TARGET_DIR/src/tracing"; then
   fail "daemon tracing imports the Braintrust SDK or legacy span runtime"
 fi
-rg -q "from [\"']braintrust[\"']|from [\"']\.\./client[\"']" "$TARGET_DIR/src/tools/index.ts" \
+grep -q -E "from [\"']braintrust[\"']|from [\"']\.\./client[\"']" "$TARGET_DIR/src/tools/index.ts" \
   || fail "data-access tools no longer use their intentional Braintrust client"
 
 echo "validate: OpenCode npm package OK ($TARGET_DIR)"
