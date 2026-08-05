@@ -21,7 +21,7 @@ done
 if grep -q '^package/src/' <<<"$contents"; then fail "tarball contains local tracing source"; fi
 node -e 'const p=require(process.argv[1]); if (p.dependencies?.braintrust) process.exit(1)' "$TARGET_DIR/package.json" \
   || fail "Braintrust SDK remains a Pi runtime dependency"
-if rg -n "from [\"']braintrust[\"']|from [\"']\.\/(client|state)[\"']" "$TARGET_DIR/src/index.ts"; then
+if grep -n -E "from [\"']braintrust[\"']|from [\"']\.\/(client|state)[\"']" "$TARGET_DIR/src/index.ts"; then
   fail "Pi daemon adapter imports the Braintrust SDK or local span persistence"
 fi
 
