@@ -146,6 +146,15 @@ impl std::str::FromStr for TraceDestination {
     }
 }
 
+impl TraceDestination {
+    pub fn project_name(&self) -> Option<&str> {
+        match self {
+            Self::ProjectLogs { project_name, .. } => project_name.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// Backend credentials. `token` is an API key or an OAuth access token; the
 /// daemon does not care which. Never serialized or persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]

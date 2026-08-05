@@ -153,21 +153,13 @@ pub async fn run_hook(
         .or_else(|| json_str_field(&payload, &args.event_field))
         .unwrap_or_default();
 
-    if let Some(project) = settings.project.filter(|project| !project.is_empty()) {
-        route.destination = Some(wire::TraceDestination::ProjectLogs {
-            project_id: None,
-            project_name: Some(project),
-        });
+    if let Some(configured_route) = settings.route {
+        route = configured_route;
     }
-    match settings.flush_on_turn_end {
-        Some(true) => route.flush_mode = wire::FlushMode::FlushOnTurnEnd,
-        Some(false) => route.flush_mode = wire::FlushMode::FireAndForget,
-        None if args.flush_on_turn_end => route.flush_mode = wire::FlushMode::FlushOnTurnEnd,
-        None => {}
+    if args.flush_on_turn_end {
+        route.flush_mode = wire::FlushMode::FlushOnTurnEnd;
     }
-    if let Some(metadata) = settings.additional_metadata {
-        route.additional_metadata = Some(serde_json::Value::Object(metadata));
-    } else if let Some(metadata) = &args.additional_metadata {
+    if let Some(metadata) = &args.additional_metadata {
         let value: serde_json::Value = serde_json::from_str(metadata)
             .map_err(|e| anyhow::anyhow!("invalid --additional-metadata JSON: {e}"))?;
         if !value.is_object() {

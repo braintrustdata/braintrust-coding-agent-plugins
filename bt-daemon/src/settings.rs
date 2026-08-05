@@ -5,22 +5,29 @@
 //! across Codex, Claude Code, and future agent plugins.
 
 use crate::paths;
+use crate::wire::SessionRoute;
 use serde::Deserialize;
-use serde_json::{Map, Value};
 use std::path::Path;
+
+pub(crate) const SESSION_ROUTE_ENV: &str = "BT_TRACE_SESSION_ROUTE";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SharedSettings {
     pub trace_to_braintrust: Option<bool>,
-    pub project: Option<String>,
-    pub flush_on_turn_end: Option<bool>,
-    pub additional_metadata: Option<Map<String, Value>>,
+    pub route: Option<SessionRoute>,
 }
 
 impl SharedSettings {
     pub(crate) fn load() -> Self {
-        Self::load_from(&paths::settings_path(None))
+        let mut settings = Self::load_from(&paths::settings_path(None));
+        if let Ok(raw) = std::env::var(SESSION_ROUTE_ENV) {
+            match serde_json::from_str(&raw) {
+                Ok(route) => settings.route = Some(route),
+                Err(error) => tracing::warn!("managed run route ignored: {error}"),
+            }
+        }
+        settings
     }
 
     fn load_from(path: &Path) -> Self {
@@ -75,9 +82,11 @@ mod tests {
             &path,
             r#"{
                 "traceToBraintrust": true,
-                "project": "agents",
-                "flushOnTurnEnd": false,
-                "additionalMetadata": {"team": "platform"},
+                "route": {
+                    "destination": {"type": "project_logs", "project_name": "agents"},
+                    "flush_mode": "fire_and_forget",
+                    "additional_metadata": {"team": "platform"}
+                },
                 "apiKey": "ignored",
                 "apiUrl": "https://ignored.example"
             }"#,
@@ -86,23 +95,20 @@ mod tests {
 
         let settings = SharedSettings::load_from(&path);
         assert_eq!(settings.trace_to_braintrust, Some(true));
-        assert_eq!(settings.project.as_deref(), Some("agents"));
-        assert_eq!(settings.flush_on_turn_end, Some(false));
-        assert_eq!(
-            settings.additional_metadata.unwrap()["team"],
-            Value::String("platform".into())
-        );
+        let route = settings.route.unwrap();
+        assert_eq!(route.destination.unwrap().project_name(), Some("agents"));
+        assert_eq!(route.additional_metadata.unwrap()["team"], "platform");
     }
 
     #[test]
     fn malformed_or_missing_settings_are_fail_open() {
         let temp = tempfile::tempdir().unwrap();
         assert!(SharedSettings::load_from(&temp.path().join("missing.json"))
-            .project
+            .route
             .is_none());
         let malformed = temp.path().join("malformed.json");
         std::fs::write(&malformed, "{").unwrap();
-        assert!(SharedSettings::load_from(&malformed).project.is_none());
+        assert!(SharedSettings::load_from(&malformed).route.is_none());
     }
 
     #[test]

@@ -60,9 +60,11 @@ impl AgentTestWorld {
             &config_path,
             serde_json::to_vec_pretty(&json!({
                 "traceToBraintrust": true,
-                "project": "agent-e2e",
-                "flushOnTurnEnd": true,
-                "additionalMetadata": {"test_harness": true}
+                "route": {
+                    "destination": {"type": "project_logs", "project_name": "agent-e2e"},
+                    "flush_mode": "flush_on_turn_end",
+                    "additional_metadata": {"test_harness": true}
+                }
             }))
             .unwrap(),
         )

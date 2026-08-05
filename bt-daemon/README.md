@@ -44,11 +44,11 @@ or use `config.json` under `BT_DAEMON_DATA_DIR` (by default
 `~/.braintrust/state/bt-daemon/config.json` on Unix and
 `%LOCALAPPDATA%\Braintrust\bt-daemon\config.json` on Windows).
 
-See [`config.json.example`](config.json.example). Supported settings are
-`traceToBraintrust`, `project`, `flushOnTurnEnd`, and
-`additionalMetadata`. File values override plugin environment fallbacks.
-Credentials, auth tokens, organization selection, and backend URLs are not
-settings here; production resolves them through `bt`.
+See [`config.json.example`](config.json.example). `traceToBraintrust` controls
+enablement and `route` stores the selected profile, organization, typed
+destination, flush mode, and metadata. Omitting `route.auth.profile` selects
+the default `bt` profile. Credentials and backend URLs are never stored here;
+production resolves and refreshes them through `bt`.
 
 ## Build / test
 
