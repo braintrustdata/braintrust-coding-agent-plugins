@@ -267,7 +267,10 @@ async fn opencode_session_emits_traces() {
                 row_contains(row, &["braintrust.plugin.opencode", "test_harness"])
             })
             .expect("OpenCode turn input", |row| {
-                row_contains(row, &["Turn 1", "Reply with the exact text OPENCODE_MOCK_OK"])
+                row_contains(
+                    row,
+                    &["Turn 1", "Reply with the exact text OPENCODE_MOCK_OK"],
+                )
             });
         world.wait_for_mock_ingest_scenario(&scenario).await;
     }
