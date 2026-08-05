@@ -196,7 +196,7 @@ jobs:
       - name: Build Pi extension for integration harness
         run: make build-pi
       - name: Install built Pi extension for integration harness
-        run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund ./dist/pi/braintrust-pi-extension-*.tgz
+        run: npm install --prefix "${{ runner.temp }}/pi-extension" --no-save --no-package-lock --no-audit --no-fund ./dist/pi/braintrust-pi-extension-*.tgz
       - name: Report coding-agent versions
         run: |
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- codex --version
@@ -218,7 +218,7 @@ jobs:
           CLAUDE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/claude${{ matrix.agent_suffix }}
           OPENCODE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/opencode${{ matrix.agent_suffix }}
           PI_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/pi${{ matrix.agent_suffix }}
-          PI_EXTENSION_PATH: ${{ runner.temp }}/coding-agents/node_modules/@braintrust/pi-extension/dist/index.mjs
+          PI_EXTENSION_PATH: ${{ runner.temp }}/pi-extension/node_modules/@braintrust/pi-extension/dist/index.mjs
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
       - name: Lint daemon
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings
