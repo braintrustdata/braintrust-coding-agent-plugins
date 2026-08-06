@@ -122,10 +122,16 @@ struct RouteArgs {
     profile: Option<String>,
     #[arg(long = "org", env = "BRAINTRUST_ORG_NAME")]
     org_name: Option<String>,
-    #[arg(long, env = "BRAINTRUST_PROJECT", conflicts_with = "destination")]
+    #[arg(
+        long,
+        env = "BRAINTRUST_PROJECT",
+        conflicts_with_all = ["destination", "parent"]
+    )]
     project: Option<String>,
-    #[arg(long, env = "BRAINTRUST_DESTINATION")]
+    #[arg(long, env = "BRAINTRUST_DESTINATION", conflicts_with = "parent")]
     destination: Option<TraceDestination>,
+    #[arg(long, value_name = "SPAN_COMPONENTS")]
+    parent: Option<braintrust_sdk_rust::SpanComponents>,
 }
 
 impl RouteArgs {
@@ -135,13 +141,17 @@ impl RouteArgs {
                 profile: self.profile,
                 org_name: self.org_name,
             },
-            destination: self.destination.or_else(|| {
-                self.project
-                    .map(|project_name| TraceDestination::ProjectLogs {
-                        project_id: None,
-                        project_name: Some(project_name),
-                    })
-            }),
+            destination: self
+                .parent
+                .map(|components| TraceDestination::ParentSpan { components })
+                .or(self.destination)
+                .or_else(|| {
+                    self.project
+                        .map(|project_name| TraceDestination::ProjectLogs {
+                            project_id: None,
+                            project_name: Some(project_name),
+                        })
+                }),
             ..SessionRoute::default()
         }
     }

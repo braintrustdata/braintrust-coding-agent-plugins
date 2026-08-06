@@ -6,10 +6,27 @@
 
 use crate::paths;
 use crate::wire::SessionRoute;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub(crate) const SESSION_ROUTE_ENV: &str = "BT_TRACE_SESSION_ROUTE";
+pub(crate) const INVOCATION_SETTINGS_ENV: &str = "BT_TRACE_INVOCATION_SETTINGS";
+
+/// Non-secret settings scoped to one `bt trace run` process tree.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InvocationSettings {
+    pub trace_to_braintrust: bool,
+    pub route: SessionRoute,
+}
+
+impl InvocationSettings {
+    pub(crate) fn enabled(route: SessionRoute) -> Self {
+        Self {
+            trace_to_braintrust: true,
+            route,
+        }
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,11 +37,25 @@ pub(crate) struct SharedSettings {
 
 impl SharedSettings {
     pub(crate) fn load() -> Self {
-        let mut settings = Self::load_from(&paths::settings_path(None));
-        if let Ok(raw) = std::env::var(SESSION_ROUTE_ENV) {
-            match serde_json::from_str(&raw) {
-                Ok(route) => settings.route = Some(route),
-                Err(error) => tracing::warn!("managed run route ignored: {error}"),
+        let invocation = std::env::var(INVOCATION_SETTINGS_ENV).ok();
+        Self::load_from_sources(&paths::settings_path(None), invocation.as_deref())
+    }
+
+    fn load_from_sources(path: &Path, invocation: Option<&str>) -> Self {
+        let mut settings = Self::load_from(path);
+        if let Some(raw) = invocation {
+            match serde_json::from_str::<InvocationSettings>(raw) {
+                Ok(invocation) => {
+                    settings.trace_to_braintrust = Some(invocation.trace_to_braintrust);
+                    settings.route = Some(invocation.route);
+                }
+                Err(error) => {
+                    tracing::warn!("managed run settings ignored: {error}");
+                    // Never fall back to the persistent route for a managed
+                    // child whose invocation selection cannot be decoded.
+                    settings.trace_to_braintrust = Some(false);
+                    settings.route = None;
+                }
             }
         }
         settings
@@ -127,6 +158,81 @@ mod tests {
 
         assert!(SharedSettings::default().tracing_enabled_with(Some(true)));
         assert!(!SharedSettings::default().tracing_enabled_with(None));
+    }
+
+    #[test]
+    fn invocation_settings_override_setup_without_mutating_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "traceToBraintrust": false,
+                "route": {
+                    "auth": {"profile": "global", "org_name": "global-org"},
+                    "destination": {"type": "project_logs", "project_name": "global-project"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let invocation = |profile: &str, project: &str| {
+            serde_json::to_string(&InvocationSettings::enabled(SessionRoute {
+                auth: crate::wire::AuthSelection {
+                    profile: Some(profile.to_string()),
+                    org_name: Some(format!("{profile}-org")),
+                },
+                destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                    project_id: None,
+                    project_name: Some(project.to_string()),
+                }),
+                ..SessionRoute::default()
+            }))
+            .unwrap()
+        };
+
+        let work =
+            SharedSettings::load_from_sources(&path, Some(&invocation("work", "work-project")));
+        let personal = SharedSettings::load_from_sources(
+            &path,
+            Some(&invocation("personal", "personal-project")),
+        );
+        let global = SharedSettings::load_from_sources(&path, None);
+
+        assert!(work.tracing_enabled_with(None));
+        assert!(personal.tracing_enabled_with(None));
+        assert_eq!(work.route.unwrap().auth.profile.as_deref(), Some("work"));
+        assert_eq!(
+            personal.route.unwrap().auth.profile.as_deref(),
+            Some("personal")
+        );
+        assert!(!global.tracing_enabled_with(None));
+        let global_route = global.route.unwrap();
+        assert_eq!(global_route.auth.profile.as_deref(), Some("global"));
+        assert_eq!(
+            global_route.destination.unwrap().project_name(),
+            Some("global-project")
+        );
+    }
+
+    #[test]
+    fn malformed_invocation_settings_do_not_fall_back_to_setup_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "traceToBraintrust": true,
+                "route": {
+                    "destination": {"type": "project_logs", "project_name": "global-project"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = SharedSettings::load_from_sources(&path, Some("{"));
+        assert!(!settings.tracing_enabled_with(None));
+        assert!(settings.route.is_none());
     }
 
     #[test]

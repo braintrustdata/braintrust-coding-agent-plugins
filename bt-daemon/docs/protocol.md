@@ -252,6 +252,11 @@ Codex does not bypass hook trust: the user reviews the injected hook once throug
 `/hooks`, and Codex reuses its hash-based trust while the definition is unchanged.
 The resulting native hook events follow the regular journal, translator, and
 sink path; transcript tailing remains specific to `import --attach`.
+The managed child inherits a non-secret invocation-settings value containing
+`traceToBraintrust: true` and its immutable `SessionRoute`. This overrides the
+persistent setup route only within that process tree. Other agent processes
+continue using setup settings, and concurrent managed runs can select distinct
+profiles, organizations, and destinations while sharing one daemon.
 
 - **Journal (WAL).** Every accepted event is appended (auth-redacted) to
   `<data_dir>/journal/<session_id>.ndjson` before/at enqueue. `data_dir`

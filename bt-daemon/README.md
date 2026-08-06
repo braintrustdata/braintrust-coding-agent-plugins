@@ -94,6 +94,11 @@ Codex applies its normal hook-review flow, so the first run requires trusting
 the injected Braintrust hook through `/hooks`; later runs reuse that trust while
 the hook definition remains unchanged.
 
+Managed-run settings are scoped to the launched agent process tree. They enable
+tracing for that invocation and override the persistent setup route without
+rewriting it, so ordinary agent sessions and concurrent managed runs may use
+different profiles, organizations, projects, experiments, or parent spans.
+
 ## Status
 
 Phases 0–5 are implemented: protocol, daemon lifecycle, Braintrust sink,

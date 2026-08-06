@@ -377,17 +377,22 @@ pub async fn run_traced(
     hook_command: RunHookCommand,
     route: SessionRoute,
 ) -> anyhow::Result<std::process::ExitStatus> {
+    if route.destination.is_none() {
+        anyhow::bail!(
+            "managed run requires a trace destination; select a project, object destination, or parent span"
+        );
+    }
     let executable = match args.source {
         RunSource::Codex => "codex",
         RunSource::Claude => "claude",
     };
     let injected_args = managed_run_args(args.source, &hook_command)?;
-    let route = serde_json::to_string(&route)?;
+    let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut child = tokio::process::Command::new(executable)
         .args(injected_args)
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
-        .env(settings::SESSION_ROUTE_ENV, route)
+        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings)
         .spawn()
         .map_err(|error| anyhow::anyhow!("failed to launch {executable}: {error}"))?;
     let interrupt = tokio::signal::ctrl_c();
@@ -758,6 +763,22 @@ mod tests {
             program: OsString::from("/opt/Braintrust CLI/bt"),
             args: vec![OsString::from("agents"), OsString::from("hook")],
         }
+    }
+
+    #[tokio::test]
+    async fn managed_run_rejects_a_missing_destination_before_launch() {
+        let error = run_traced(
+            RunArgs {
+                source: RunSource::Codex,
+                agent_args: Vec::new(),
+            },
+            test_run_hook_command(),
+            SessionRoute::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires a trace destination"));
     }
 
     #[test]
