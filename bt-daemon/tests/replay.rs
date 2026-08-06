@@ -55,9 +55,15 @@ async fn imports_native_codex_rollout_through_codex_translator() {
     );
 
     let output = tmp.path().join("spans");
-    import_transcript(&transcript, ImportSource::Codex, options(&output), None)
-        .await
-        .unwrap();
+    import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        options(&output),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     let rows = rows(&output.join("codex-past.ndjson"));
     assert_eq!(inserted(&rows, "task"), 3, "session and two turns");
@@ -94,9 +100,15 @@ async fn imports_native_claude_transcript_with_multiple_turns_and_tools() {
     );
 
     let output = tmp.path().join("spans");
-    import_transcript(&transcript, ImportSource::Claude, options(&output), None)
-        .await
-        .unwrap();
+    import_transcript(
+        &transcript,
+        ImportSource::Claude,
+        options(&output),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     let rows = rows(&output.join("claude-past.ndjson"));
     assert_eq!(inserted(&rows, "task"), 3, "session and two turns");
@@ -130,9 +142,15 @@ async fn imports_non_monotonic_claude_records_into_their_native_turns() {
     );
 
     let output = tmp.path().join("spans");
-    import_transcript(&transcript, ImportSource::Claude, options(&output), None)
-        .await
-        .unwrap();
+    import_transcript(
+        &transcript,
+        ImportSource::Claude,
+        options(&output),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
 
     let rows = rows(&output.join("claude-non-monotonic.ndjson"));
     assert_eq!(inserted(&rows, "task"), 4, "session and three turns");

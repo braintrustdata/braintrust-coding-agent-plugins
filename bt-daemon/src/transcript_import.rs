@@ -9,11 +9,15 @@ pub(crate) fn resolve_transcript(
     source: ImportSource,
 ) -> anyhow::Result<PathBuf> {
     validate_session_id(session_id)?;
+    resolve_transcript_in(session_id, source, &transcript_roots(source))
+}
+
+fn transcript_roots(source: ImportSource) -> Vec<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let roots = match source {
+    match source {
         ImportSource::Codex => {
             let codex_home = std::env::var_os("CODEX_HOME")
                 .map(PathBuf::from)
@@ -29,8 +33,7 @@ pub(crate) fn resolve_transcript(
                 .unwrap_or_else(|| home.join(".claude"));
             vec![claude_home.join("projects")]
         }
-    };
-    resolve_transcript_in(session_id, source, &roots)
+    }
 }
 
 fn resolve_transcript_in(
@@ -159,6 +162,128 @@ pub(crate) fn transcript_envelopes(
         ImportSource::Claude => {
             claude_envelopes(path, &records, &record_end_offsets, contents.len() as u64)
         }
+    }
+}
+
+/// Incrementally converts a growing native transcript into synthetic hook
+/// events for one persistent translator. The final poll closes the active
+/// turn/session; ordinary polls keep the newest turn open.
+pub(crate) struct TranscriptTail {
+    path: PathBuf,
+    source: ImportSource,
+    started: bool,
+    completed_turns: usize,
+    active_turn: Option<usize>,
+    codex_checkpoints: usize,
+    last_len: u64,
+}
+
+impl TranscriptTail {
+    pub(crate) fn new(path: PathBuf, source: ImportSource) -> Self {
+        Self {
+            path,
+            source,
+            started: false,
+            completed_turns: 0,
+            active_turn: None,
+            codex_checkpoints: 0,
+            last_len: 0,
+        }
+    }
+
+    pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
+        let events = match transcript_envelopes(&self.path, self.source) {
+            Ok(events) => events,
+            Err(_) if !finalize => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let len = std::fs::metadata(&self.path)?.len();
+        match self.source {
+            ImportSource::Codex => self.poll_codex(events, len, finalize),
+            ImportSource::Claude => self.poll_claude(events, len, finalize),
+        }
+    }
+
+    fn poll_codex(
+        &mut self,
+        events: Vec<Envelope>,
+        len: u64,
+        finalize: bool,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        if events.len() < 2 {
+            bail!("Codex import did not produce session boundary events");
+        }
+        let mut out = Vec::new();
+        if !self.started {
+            out.push(events[0].clone());
+            self.started = true;
+        }
+        let checkpoints = &events[1..events.len() - 1];
+        out.extend(checkpoints.iter().skip(self.codex_checkpoints).cloned());
+        self.codex_checkpoints = checkpoints.len();
+        let mut tail = events.last().cloned().unwrap();
+        if finalize {
+            out.push(tail);
+        } else if len != self.last_len {
+            tail.event = "ImportCheckpoint".into();
+            if let Some(payload) = tail.payload.as_object_mut() {
+                payload.insert("hook_event_name".into(), json!("ImportCheckpoint"));
+            }
+            out.push(tail);
+        }
+        self.last_len = len;
+        Ok(out)
+    }
+
+    fn poll_claude(
+        &mut self,
+        events: Vec<Envelope>,
+        len: u64,
+        finalize: bool,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        if events.len() < 2 || !(events.len() - 2).is_multiple_of(2) {
+            bail!("Claude import did not produce turn boundary pairs");
+        }
+        let mut out = Vec::new();
+        if !self.started {
+            out.push(events[0].clone());
+            self.started = true;
+        }
+        let turn_count = (events.len() - 2) / 2;
+        let completed_target = if finalize {
+            turn_count
+        } else {
+            turn_count.saturating_sub(1)
+        };
+        while self.completed_turns < completed_target {
+            let turn = self.completed_turns;
+            if self.active_turn != Some(turn) {
+                out.push(events[1 + turn * 2].clone());
+            }
+            out.push(events[2 + turn * 2].clone());
+            self.completed_turns += 1;
+            self.active_turn = None;
+        }
+        if !finalize && turn_count > 0 {
+            let active = turn_count - 1;
+            if self.active_turn != Some(active) {
+                out.push(events[1 + active * 2].clone());
+                self.active_turn = Some(active);
+            }
+            if len != self.last_len {
+                let mut checkpoint = events.last().cloned().unwrap();
+                checkpoint.event = "ImportCheckpoint".into();
+                if let Some(payload) = checkpoint.payload.as_object_mut() {
+                    payload.insert("hook_event_name".into(), json!("ImportCheckpoint"));
+                }
+                out.push(checkpoint);
+            }
+        }
+        if finalize {
+            out.push(events.last().cloned().unwrap());
+        }
+        self.last_len = len;
+        Ok(out)
     }
 }
 
@@ -574,6 +699,94 @@ mod tests {
                 .filter(|event| event.event == "ImportCheckpoint")
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn codex_tail_keeps_session_open_until_final_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-123.jsonl");
+        let mut records = vec![
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"session-123"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant"}}),
+        ];
+        let write = |records: &[Value]| {
+            std::fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+        };
+        write(&records);
+        let mut tail = TranscriptTail::new(path.clone(), ImportSource::Codex);
+        let first = tail.poll(false).unwrap();
+        assert_eq!(first.first().unwrap().event, "SessionStart");
+        assert_eq!(first.last().unwrap().event, "ImportCheckpoint");
+        assert!(first.iter().all(|event| event.event != "Stop"));
+
+        records.push(json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}));
+        write(&records);
+        let second = tail.poll(false).unwrap();
+        assert!(second.iter().all(|event| event.event != "SessionStart"));
+        assert_eq!(second.last().unwrap().event, "ImportCheckpoint");
+        assert_eq!(tail.poll(true).unwrap().last().unwrap().event, "Stop");
+    }
+
+    #[test]
+    fn claude_tail_closes_only_completed_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-123.jsonl");
+        let mut records = vec![
+            json!({"type":"user","sessionId":"session-123","timestamp":"2026-01-01T00:00:01Z","message":{"content":"one"}}),
+            json!({"type":"assistant","sessionId":"session-123","timestamp":"2026-01-01T00:00:02Z","message":{"content":"answer one"}}),
+        ];
+        let write = |records: &[Value]| {
+            std::fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+        };
+        write(&records);
+        let mut tail = TranscriptTail::new(path.clone(), ImportSource::Claude);
+        let first = tail.poll(false).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SessionStart", "UserPromptSubmit", "ImportCheckpoint"]
+        );
+
+        records.extend([
+            json!({"type":"user","sessionId":"session-123","timestamp":"2026-01-01T00:00:03Z","message":{"content":"two"}}),
+            json!({"type":"assistant","sessionId":"session-123","timestamp":"2026-01-01T00:00:04Z","message":{"content":"answer two"}}),
+        ]);
+        write(&records);
+        let second = tail.poll(false).unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Stop", "UserPromptSubmit", "ImportCheckpoint"]
+        );
+        assert_eq!(
+            tail.poll(true)
+                .unwrap()
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Stop", "SessionEnd"]
         );
     }
 }

@@ -7,9 +7,9 @@
 use async_trait::async_trait;
 use bt_daemon::wire::{AuthSelection, BackendAuth, SessionRoute, TraceDestination};
 use bt_daemon::{
-    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, AuthLease,
-    AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo,
-    ImportArgs, Registry, ServeArgs, ServeOptions, StatusArgs,
+    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, run_traced,
+    AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs,
+    HostInfo, ImportArgs, Registry, RunArgs, RunHookCommand, ServeArgs, ServeOptions, StatusArgs,
 };
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
@@ -106,6 +106,13 @@ enum Command {
     Status(StatusArgs),
     /// Import a past Codex or Claude Code session by its resume id.
     Import(ImportArgs),
+    /// Launch a coding agent with live tracing hooks for this invocation.
+    Run {
+        #[command(flatten)]
+        route: RouteArgs,
+        #[command(flatten)]
+        args: RunArgs,
+    },
 }
 
 /// Non-secret session selection. Credentials are resolved by the daemon.
@@ -115,10 +122,16 @@ struct RouteArgs {
     profile: Option<String>,
     #[arg(long = "org", env = "BRAINTRUST_ORG_NAME")]
     org_name: Option<String>,
-    #[arg(long, env = "BRAINTRUST_PROJECT", conflicts_with = "destination")]
+    #[arg(
+        long,
+        env = "BRAINTRUST_PROJECT",
+        conflicts_with_all = ["destination", "parent"]
+    )]
     project: Option<String>,
-    #[arg(long, env = "BRAINTRUST_DESTINATION")]
+    #[arg(long, env = "BRAINTRUST_DESTINATION", conflicts_with = "parent")]
     destination: Option<TraceDestination>,
+    #[arg(long, value_name = "SPAN_COMPONENTS")]
+    parent: Option<braintrust_sdk_rust::SpanComponents>,
 }
 
 impl RouteArgs {
@@ -128,13 +141,17 @@ impl RouteArgs {
                 profile: self.profile,
                 org_name: self.org_name,
             },
-            destination: self.destination.or_else(|| {
-                self.project
-                    .map(|project_name| TraceDestination::ProjectLogs {
-                        project_id: None,
-                        project_name: Some(project_name),
-                    })
-            }),
+            destination: self
+                .parent
+                .map(|components| TraceDestination::ParentSpan { components })
+                .or(self.destination)
+                .or_else(|| {
+                    self.project
+                        .map(|project_name| TraceDestination::ProjectLogs {
+                            project_id: None,
+                            project_name: Some(project_name),
+                        })
+                }),
             ..SessionRoute::default()
         }
     }
@@ -212,6 +229,23 @@ async fn main() {
             if let Err(e) = run_import(args, opts, None).await {
                 eprintln!("bt-daemon import: {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::Run { route, args } => {
+            let exe = std::env::current_exe()
+                .map(OsString::from)
+                .unwrap_or_else(|_| OsString::from("bt-daemon"));
+            let hook_command = RunHookCommand {
+                program: exe,
+                args: vec![OsString::from("hook")],
+            };
+            match run_traced(args, hook_command, route.into_route()).await {
+                Ok(status) if status.success() => {}
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(error) => {
+                    eprintln!("bt-daemon run: {error}");
+                    std::process::exit(1);
+                }
             }
         }
     }

@@ -242,6 +242,22 @@ routing synthetic lifecycle events through the regular translator. `--parent
 <SpanComponents>` attaches it below an exported span and is mutually exclusive
 with an object destination.
 
+`--attach` keeps a single translator and sink alive, tails new native records,
+and finalizes the active turn on Ctrl-C. `run <codex|claude> [ARGS...]`
+launches the selected agent with inherited stdio and injects live hook
+configuration for that invocation, so it works without plugin setup. A private
+inherited environment marker makes installed Braintrust plugin hooks no-op for
+that managed child, while a private hook flag authorizes the injected hook process.
+Codex does not bypass hook trust: the user reviews the injected hook once through
+`/hooks`, and Codex reuses its hash-based trust while the definition is unchanged.
+The resulting native hook events follow the regular journal, translator, and
+sink path; transcript tailing remains specific to `import --attach`.
+The managed child inherits a non-secret invocation-settings value containing
+`traceToBraintrust: true` and its immutable `SessionRoute`. This overrides the
+persistent setup route only within that process tree. Other agent processes
+continue using setup settings, and concurrent managed runs can select distinct
+profiles, organizations, and destinations while sharing one daemon.
+
 - **Journal (WAL).** Every accepted event is appended (auth-redacted) to
   `<data_dir>/journal/<session_id>.ndjson` before/at enqueue. `data_dir`
   defaults to `$XDG_STATE_HOME/braintrust/bt-daemon` or
