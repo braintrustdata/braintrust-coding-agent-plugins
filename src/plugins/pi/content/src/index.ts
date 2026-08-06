@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import {
   VERSION as PI_VERSION,
   type ExtensionAPI,
@@ -5,11 +7,20 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
 import { DaemonClient } from "./runtime/daemon-client.ts";
-import { sessionKeyFor } from "./utils.ts";
 import { EXTENSION_VERSION } from "./version.ts";
 
 const STATUS_KEY = "braintrust-tracing";
 const WIDGET_KEY = "braintrust-trace-link";
+
+function sessionKeyFor(
+  sessionFile: string | undefined,
+  sessionId: string | undefined,
+  cwd: string,
+): string {
+  if (sessionFile) return `file:${sessionFile}`;
+  const projectKey = createHash("sha256").update(resolve(cwd)).digest("hex").slice(0, 12);
+  return `ephemeral:${projectKey}:${sessionId ?? randomUUID()}`;
+}
 
 function nativePayload(value: unknown): unknown {
   try {

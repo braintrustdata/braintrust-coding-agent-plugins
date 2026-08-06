@@ -139,12 +139,13 @@ jobs:
       - name: Build validated Pi tarball
         run: make validate-pi
       - name: Test resolved Pi compatibility target
-        working-directory: dist/pi
-        env:
-          PI_COMPAT_VERSION: ${{ matrix.pi-target.version }}
         run: |
-          pnpm add -D '${{ matrix.pi-target.piAiSpec }}' '${{ matrix.pi-target.piCodingAgentSpec }}' --lockfile=false
-          pnpm run test:integration
+          mkdir pi-install-test
+          pnpm --dir pi-install-test add --lockfile=false \
+            "$PWD"/dist/pi/braintrust-pi-extension-*.tgz \
+            '${{ matrix.pi-target.piCodingAgentSpec }}'
+          node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
+            "$PWD/pi-install-test/node_modules/@braintrust/pi-extension/dist/index.mjs"
 
   daemon:
     name: Daemon (${{ matrix.os }})

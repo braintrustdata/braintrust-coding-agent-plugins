@@ -5,6 +5,9 @@
 Braintrust extension for [pi](https://github.com/earendil-works/pi-coding-agent).
 
 Today this extension automatically traces pi sessions, turns, model calls, and tool executions to Braintrust.
+The extension forwards native pi events to the installed `bt` tracing daemon;
+all span construction, authentication, recovery, and Braintrust delivery happen
+inside the daemon.
 
 ## What gets traced
 
@@ -94,7 +97,6 @@ Example:
   "trace_to_braintrust": true,
   "profile": "work",
   "project": "pi",
-  "debug": true,
   "additional_metadata": {
     "team": "platform"
   }
@@ -106,20 +108,12 @@ Example:
 | Config key | Env var | Default |
 |---|---|---|
 | `trace_to_braintrust` | `TRACE_TO_BRAINTRUST` | `false` |
-| `api_key` | `BRAINTRUST_API_KEY` | legacy; tracing authentication is owned by `bt auth login` |
-| `api_url` | `BRAINTRUST_API_URL` | `https://api.braintrust.dev` |
-| `app_url` | `BRAINTRUST_APP_URL` | `https://www.braintrust.dev` |
 | `org_name` | `BRAINTRUST_ORG_NAME` | unset |
 | `profile` | `BRAINTRUST_PROFILE` | default `bt` profile |
 | `project` | `BRAINTRUST_PROJECT` | `pi` |
-| `debug` | `BRAINTRUST_DEBUG` | `false` |
 | `additional_metadata` | `BRAINTRUST_ADDITIONAL_METADATA` | `{}` |
-| `log_file` | `BRAINTRUST_LOG_FILE` | unset |
-| `state_dir` | `BRAINTRUST_STATE_DIR` | `~/.pi/agent/state/braintrust-pi-extension` |
 | `show_ui` | `BRAINTRUST_SHOW_UI` | `true` |
 | `show_trace_link` | `BRAINTRUST_SHOW_TRACE_LINK` | `true` |
-| `parent_span_id` | `PI_PARENT_SPAN_ID` | unset |
-| `root_span_id` | `PI_ROOT_SPAN_ID` | unset |
 
 ## Notes
 
@@ -128,10 +122,10 @@ Example:
 - Project config follows pi's configured project config directory, which defaults to `.pi`.
 - The extension does not persist local span state; recovery and incomplete-operation cleanup are owned by the daemon journal.
 - Span construction and Braintrust delivery run in the installed `bt` tracing daemon.
+- The extension never reads or stores Braintrust credentials. Profile selection is
+  non-secret, optional, and resolved by the daemon through `bt` authentication.
 - Provider request tracing is allowlisted to effective model, thinking, output-limit, and tool-count settings; full provider payloads and thinking signatures are never logged.
 - If Braintrust is unavailable, pi should continue working normally.
-- If `PI_PARENT_SPAN_ID` is set, the pi session span is attached under an existing Braintrust trace.
-- `PI_ROOT_SPAN_ID` can be used when the parent span is not the trace root.
 
 ## Contributing
 

@@ -80,6 +80,26 @@ describe("Pi daemon adapter", () => {
     const { default: extension } = await import("./index.ts");
     extension(pi as never);
 
+    expect([...handlers.keys()]).toEqual([
+      "session_start",
+      "input",
+      "before_agent_start",
+      "context",
+      "before_provider_request",
+      "after_provider_response",
+      "message_update",
+      "thinking_level_select",
+      "message_end",
+      "tool_execution_start",
+      "tool_execution_end",
+      "session_before_compact",
+      "session_compact",
+      "session_before_tree",
+      "session_tree",
+      "agent_end",
+      "session_shutdown",
+    ]);
+
     await handlers.get("session_start")?.({ reason: "new" }, ctx);
     await handlers.get("before_agent_start")?.({ prompt: "hello" }, ctx);
     await handlers.get("agent_end")?.({ messages: [] });
@@ -99,6 +119,14 @@ describe("Pi daemon adapter", () => {
       destination: { type: "project_logs", project_name: "agents" },
       flush_mode: "flush_on_turn_end",
       additional_metadata: { team: "platform" },
+    });
+    expect(mockState.logs[0]?.payload).toMatchObject({
+      event: { reason: "new" },
+      extension_version: expect.any(String),
+      session_file: "/tmp/session.jsonl",
+      native_session_id: "native-session",
+      cwd: "/tmp/project",
+      model: { provider: "openai", id: "gpt-5" },
     });
     expect(mockState.flushes).toHaveLength(2);
     expect(
