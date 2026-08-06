@@ -2,13 +2,16 @@
 //! debug sink. Runs the daemon in-process on a temp socket (no process
 //! spawning, so it's deterministic).
 
-use bt_daemon::wire::{BackendAuth, Envelope, FlushMode, SessionConfig};
+use async_trait::async_trait;
+use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionRoute};
 use bt_daemon::{
     debug_serve_options, flush_session, forward_envelope, run_serve, run_status, shutdown_daemon,
-    HostInfo, ServeArgs, StatusArgs,
+    AuthLease, AuthProvider, AuthResolveReason, HostInfo, ServeArgs, StatusArgs,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 fn dummy_host() -> HostInfo {
@@ -20,24 +23,6 @@ fn dummy_host() -> HostInfo {
     }
 }
 
-fn config_with_secret() -> SessionConfig {
-    SessionConfig {
-        auth: BackendAuth {
-            token: "sk-TOP-SECRET-abc123".into(),
-            api_url: Some("https://api.braintrust.dev".into()),
-            app_url: None,
-            org_name: Some("acme".into()),
-            org_id: None,
-        },
-        destination: None,
-        project: Some("codex".into()),
-        parent_span_id: None,
-        root_span_id: None,
-        flush_mode: FlushMode::FireAndForget,
-        additional_metadata: None,
-    }
-}
-
 fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
     Envelope {
         source: "debug".into(),
@@ -46,8 +31,94 @@ fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
         event: event.into(),
         ts_ms,
         payload: serde_json::json!({ "session_id": session_id, "hook_event_name": event, "n": ts_ms }),
-        config: Some(config_with_secret()),
+        route: Some(SessionRoute {
+            destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+                project_id: None,
+                project_name: Some("codex".into()),
+            }),
+            ..SessionRoute::default()
+        }),
+        config: None,
     }
+}
+
+fn routed_envelope(session_id: &str, profile: &str, org: &str, event: &str) -> Envelope {
+    let mut env = envelope(session_id, event, 1);
+    env.route = Some(SessionRoute {
+        auth: AuthSelection {
+            profile: Some(profile.into()),
+            org_name: Some(org.into()),
+        },
+        destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+            project_id: None,
+            project_name: Some(format!("{profile}-traces")),
+        }),
+        ..SessionRoute::default()
+    });
+    env
+}
+
+struct TestAuthProvider {
+    calls: Mutex<Vec<(AuthSelection, AuthResolveReason)>>,
+    fail: bool,
+    first_lease_expired: bool,
+}
+
+#[async_trait]
+impl AuthProvider for TestAuthProvider {
+    async fn resolve(
+        &self,
+        selection: &AuthSelection,
+        reason: AuthResolveReason,
+    ) -> anyhow::Result<AuthLease> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push((selection.clone(), reason));
+        let call_index = calls.len();
+        drop(calls);
+        if self.fail {
+            anyhow::bail!("profile credential unavailable")
+        }
+        let profile = selection
+            .profile
+            .clone()
+            .unwrap_or_else(|| "default".into());
+        Ok(AuthLease {
+            profile: profile.clone(),
+            auth: BackendAuth {
+                token: format!("secret-{profile}-{call_index}"),
+                api_url: Some(format!("https://{profile}.example.test")),
+                app_url: None,
+                org_name: selection.org_name.clone(),
+                org_id: Some(format!("org-{profile}")),
+            },
+            expires_at_ms: (self.first_lease_expired && call_index == 1).then_some(0),
+        })
+    }
+}
+
+async fn start_routed_daemon(
+    provider: Arc<TestAuthProvider>,
+) -> (
+    PathBuf,
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+    };
+    let mut opts = debug_serve_options("test", &data_dir);
+    opts.auth_provider = Some(provider);
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    (data_dir, socket, handle, tmp)
 }
 
 fn test_endpoint(tmp: &Path) -> PathBuf {
@@ -115,7 +186,12 @@ async fn start_daemon() -> (
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0, // disable the watchdog for the test
     };
-    let opts = debug_serve_options("test", &data_dir);
+    let mut opts = debug_serve_options("test", &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
     let handle = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;
     });
@@ -129,7 +205,12 @@ async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::Joi
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
     };
-    let opts = debug_serve_options("test", &data_dir);
+    let mut opts = debug_serve_options("test", &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
     let handle = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;
     });
@@ -139,6 +220,160 @@ async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::Joi
 
 async fn shutdown(socket: &Path) {
     shutdown_daemon(socket).await.unwrap();
+}
+
+#[tokio::test]
+async fn routed_sessions_resolve_multiple_profiles_without_journaling_credentials() {
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let (data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
+    let host = dummy_host();
+
+    for (session, profile, org) in [
+        ("work-session", "work", "work-org"),
+        ("personal-session", "personal", "personal-org"),
+    ] {
+        forward_envelope(
+            &routed_envelope(session, profile, org, "SessionStart"),
+            &socket,
+            &host,
+            false,
+        )
+        .await
+        .unwrap();
+        flush_session(session, &socket, 5000).await.unwrap();
+    }
+
+    let calls = provider.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0.profile.as_deref(), Some("work"));
+    assert_eq!(calls[0].0.org_name.as_deref(), Some("work-org"));
+    assert_eq!(calls[0].1, AuthResolveReason::Initial);
+    assert_eq!(calls[1].0.profile.as_deref(), Some("personal"));
+    assert_eq!(calls[1].0.org_name.as_deref(), Some("personal-org"));
+    assert_eq!(calls[1].1, AuthResolveReason::Initial);
+
+    for session in ["work-session", "personal-session"] {
+        let journal =
+            std::fs::read_to_string(data_dir.join("journal").join(format!("{session}.ndjson")))
+                .unwrap();
+        assert!(journal.contains("\"route\""));
+        assert!(!journal.contains("secret-"));
+        assert!(!journal.contains("token_sha256_prefix"));
+        assert!(!journal.contains("\"config\""));
+    }
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn expiring_profile_lease_is_refreshed_for_the_pinned_profile() {
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: true,
+    });
+    let (_data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
+    let host = dummy_host();
+
+    forward_envelope(
+        &routed_envelope("refresh", "work", "work-org", "SessionStart"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    forward_envelope(
+        &routed_envelope("refresh", "work", "work-org", "Stop"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let calls = provider.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, AuthResolveReason::Initial);
+    assert_eq!(calls[1].1, AuthResolveReason::Expiring);
+    assert_eq!(calls[1].0.profile.as_deref(), Some("work"));
+    assert_eq!(calls[1].0.org_name.as_deref(), Some("work-org"));
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn active_session_rejects_route_changes() {
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let (_data_dir, socket, handle, _tmp) = start_routed_daemon(provider).await;
+    let host = dummy_host();
+
+    forward_envelope(
+        &routed_envelope("pinned", "work", "work-org", "SessionStart"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    let error = forward_envelope(
+        &routed_envelope("pinned", "personal", "personal-org", "Stop"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("session route changed"));
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: true,
+        first_lease_expired: false,
+    });
+    let (data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
+    let host = dummy_host();
+
+    let error = forward_envelope(
+        &routed_envelope("login-needed", "missing", "missing-org", "SessionStart"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("bt auth login"));
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("login-needed".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let status_error = status.sessions[0].last_error.as_deref().unwrap();
+    assert!(status_error.contains("select a profile explicitly"));
+    assert!(!status_error.contains("secret-"));
+    assert!(!data_dir.join("journal/login-needed.ndjson").exists());
+    assert_eq!(provider.calls.lock().unwrap().len(), 1);
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
 }
 
 #[tokio::test]
@@ -156,7 +391,7 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
     assert_eq!(flushed.pending, 0);
 
-    // Journal: three events, in order, token redacted.
+    // Journal: three events, in order, with only the non-secret route.
     let journal = data_dir.join("journal").join("sess-1.ndjson");
     let jtext = std::fs::read_to_string(&journal).unwrap();
     let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -170,10 +405,7 @@ async fn events_are_ordered_journaled_and_emitted() {
         !jtext.contains("sk-TOP-SECRET-abc123"),
         "token leaked into journal!"
     );
-    assert!(
-        jtext.contains("token_sha256_prefix"),
-        "journal missing auth fingerprint"
-    );
+    assert!(!jtext.contains("token_sha256_prefix"));
 
     let events: Vec<String> = jlines
         .iter()

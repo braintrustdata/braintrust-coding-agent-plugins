@@ -142,7 +142,7 @@ impl AgentTranslator for CodexTranslator {
 
         if let Some(config) = &ctx.config {
             self.external_parent_span_id = config.attached_span_ids().0;
-            self.project = config.project.clone();
+            self.project = config.project_name().map(ToOwned::to_owned);
             self.additional_metadata = config
                 .additional_metadata
                 .as_ref()

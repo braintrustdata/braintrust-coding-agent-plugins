@@ -112,10 +112,16 @@ struct Creds {
     org_id: String,
     org_name: Option<String>,
     destination: Option<TraceDestination>,
-    project: Option<String>,
-    experiment_id: Option<String>,
-    parent_span_id: Option<String>,
-    root_span_id: Option<String>,
+}
+
+impl Creds {
+    fn same_as(&self, other: &Self) -> bool {
+        self.token == other.token
+            && self.org_id == other.org_id
+            && self.org_name == other.org_name
+            && serde_json::to_value(&self.destination).ok()
+                == serde_json::to_value(&other.destination).ok()
+    }
 }
 
 struct BraintrustSink {
@@ -143,7 +149,7 @@ impl BraintrustSink {
         {
             return project_name.clone();
         }
-        creds.project.clone().unwrap_or_else(|| self.source.clone())
+        self.source.clone()
     }
 
     fn parent_info(
@@ -156,16 +162,8 @@ impl BraintrustSink {
             if let Some(destination) = &creds.destination {
                 return root_destination(destination, project);
             }
-            // Session root: attach under an external trace if the shim supplied
-            // one, else land it directly in the project's logs.
-            Ok(match (&creds.parent_span_id, &creds.root_span_id) {
-                (Some(p), Some(r)) => full_span(creds, project, p.clone(), r.clone()),
-                _ if creds.experiment_id.is_some() => ParentSpanInfo::Experiment {
-                    object_id: creds.experiment_id.clone().unwrap(),
-                },
-                _ => ParentSpanInfo::ProjectName {
-                    project_name: project.to_string(),
-                },
+            Ok(ParentSpanInfo::ProjectName {
+                project_name: project.to_string(),
             })
         } else {
             Ok(full_span(
@@ -251,7 +249,8 @@ impl Sink for BraintrustSink {
             .or_else(|| self.default_app_url.clone())
             .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
         let new_urls = (api, app);
-        if self.urls.as_ref() != Some(&new_urls) {
+        let urls_changed = self.urls.as_ref() != Some(&new_urls);
+        if urls_changed {
             // A session shouldn't change backend URLs mid-flight; if it does,
             // rebind the client on the next emit. Pre-change open handles stay
             // bound to the old client (pathological; just noted).
@@ -264,21 +263,24 @@ impl Sink for BraintrustSink {
             self.urls = Some(new_urls);
             self.client = None;
         }
-        self.creds = Some(Creds {
+        let next_creds = Creds {
             token: config.auth.token.clone(),
             org_id: config.auth.org_id.clone().unwrap_or_default(),
             org_name: config.auth.org_name.clone(),
             destination: config.destination.clone(),
-            project: config.project.clone(),
-            experiment_id: config
-                .additional_metadata
+        };
+        // Span handles capture their credentials when built. Recreate them
+        // after a profile token or routing change; deterministic row ids make
+        // subsequent updates merge into the same Braintrust rows.
+        if urls_changed
+            || self
+                .creds
                 .as_ref()
-                .and_then(|v| v.get("_bt_experiment_id"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            parent_span_id: config.parent_span_id.clone(),
-            root_span_id: config.root_span_id.clone(),
-        });
+                .is_some_and(|old| !old.same_as(&next_creds))
+        {
+            self.open.clear();
+        }
+        self.creds = Some(next_creds);
     }
 
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
@@ -321,17 +323,6 @@ fn full_span(
             root_span_id,
             span_parents: None,
             propagated_event: components.propagated_event,
-        };
-    }
-    if let Some(experiment_id) = &creds.experiment_id {
-        return ParentSpanInfo::FullSpan {
-            object_type: SpanObjectType::Experiment,
-            object_id: Some(experiment_id.clone()),
-            compute_object_metadata_args: None,
-            span_id,
-            root_span_id,
-            span_parents: None,
-            propagated_event: None,
         };
     }
     let mut cma = Map::new();
@@ -382,7 +373,7 @@ fn root_destination(
 fn destination_root(creds: &Creds) -> Option<String> {
     match &creds.destination {
         Some(TraceDestination::ParentSpan { components }) => components.root_span_id.clone(),
-        _ => creds.root_span_id.clone(),
+        _ => None,
     }
 }
 

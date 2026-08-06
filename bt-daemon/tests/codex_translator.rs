@@ -61,6 +61,7 @@ fn envelope(session: &str, event: &str, transcript_path: &str, extra: Value) -> 
         event: event.into(),
         ts_ms: 0,
         payload,
+        route: None,
         config: None,
     }
 }
@@ -388,10 +389,10 @@ fn configured_ctx(session_id: &str, additional_metadata: Value) -> SessionCtx {
                 org_name: None,
                 org_id: None,
             },
-            destination: None,
-            project: Some("team-project".into()),
-            parent_span_id: None,
-            root_span_id: None,
+            destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+                project_id: None,
+                project_name: Some("team-project".into()),
+            }),
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: Some(additional_metadata),
         }),

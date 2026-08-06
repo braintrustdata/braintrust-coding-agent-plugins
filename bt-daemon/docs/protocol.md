@@ -4,12 +4,15 @@ Status: **frozen for the prototype.** This is the contract between plugin shims
 (`hook` clients) and the daemon (`serve`), and between the embedded-in-`bt`
 front-end and the standalone test binary.
 
-All hook clients share one daemon-level, non-credential settings file. Its path
+Hook clients may use a non-credential settings file. Its path
 is `$BT_DAEMON_CONFIG`, falling back to `<BT_DAEMON_DATA_DIR>/config.json` and
 then the platform default daemon state directory. The hook front-end applies
-`traceToBraintrust`, `project`, `flushOnTurnEnd`, and `additionalMetadata`
-before constructing `SessionConfig`. Authentication and backend URLs are
-resolved by `bt` and never read from this file.
+`traceToBraintrust` and the stored `route` before sending an event. Setup can
+persist a project-scoped route; a managed run can point `BT_DAEMON_CONFIG` at
+an invocation-local route file, or set `BT_TRACE_SESSION_ROUTE` to the selected
+route JSON, while keeping generated hook commands stable.
+The profile is optional and defaults through `bt`. Credentials and backend
+URLs are resolved and refreshed inside the daemon and never enter this file.
 
 `PROTOCOL_VERSION = 1`.
 
@@ -89,7 +92,7 @@ Result:
 {
   "protocol_version": 1,
   "daemon_version": "0.1.0",
-  "capabilities": { "sources": ["codex", "claude-code", "debug"] }
+  "capabilities": { "sources": ["codex", "claude-code", "opencode", "debug"] }
 }
 ```
 If `protocol_version` is incompatible the daemon returns an application error;
@@ -159,11 +162,9 @@ Used for version handover and by tests.
   "event": "PostToolUse",
   "ts_ms": 1753639552123,
   "payload": { "…raw agent-native hook payload…": true },
-  "config": {
+  "route": {
     "auth": {
-      "token": "sk-…",
-      "api_url": "https://api.braintrust.dev",
-      "app_url": "https://www.braintrust.dev",
+      "profile": "work",
       "org_name": "acme"
     },
     "destination": {
@@ -171,9 +172,6 @@ Used for version handover and by tests.
       "project_id": "project-uuid",
       "project_name": "codex"
     },
-    "project": "codex",
-    "parent_span_id": null,
-    "root_span_id": null,
     "flush_mode": "fire_and_forget",
     "additional_metadata": { "…": "…" }
   }
@@ -194,24 +192,23 @@ Field notes:
   daemon.
 - **`payload`** is opaque to transport and to everything except the translator
   for `source`.
-- **`config`** carries shim-resolved credentials and trace settings. The shim
-  attaches it on **every** event (stateless shim); the daemon keeps the latest
-  per session and only re-inits the Braintrust sink when it changes. `auth` is
-  filled by `bt`'s `resolve_auth` when embedded, or from env/flags in the
-  standalone binary. `flush_mode` ∈ `fire_and_forget` | `flush_on_turn_end`.
+- **`route`** carries non-secret auth selection and trace settings. `profile`
+  is optional and resolves through `bt`'s default profile when absent;
+  `org_name` optionally constrains organization selection. The daemon resolves
+  the live credential, pins the returned canonical profile for the lifetime
+  of the session, and refreshes an expiring lease without changing that route.
+  A route cannot change after a session's first accepted event. `destination`
+  is required so setup/run must make project or parent selection explicit.
+  `flush_mode` ∈ `fire_and_forget` | `flush_on_turn_end`.
   New front-ends set the typed `destination`: `project_logs` accepts a project
   id and/or name, `experiment` accepts an experiment id, and `parent_span`
-  carries the complete exported `SpanComponents` object. The older `project`,
-  `parent_span_id`, `root_span_id`, and `_bt_experiment_id` fields remain
-  accepted when `destination` is absent.
+  carries the complete exported `SpanComponents` object.
 
 ### Redaction
 
-`config.auth.token` (and any nested secret) is **never** written to the
-journal or logs. The journal stores the envelope with `config.auth` reduced to
-a non-secret fingerprint (`{ "api_url", "app_url", "org_name", "token_sha256_prefix" }`)
-so replay can detect a credential change without persisting the secret; on
-replay the live credentials must be re-supplied.
+Live credentials returned by the host provider are **never** written to the
+journal, logs, status, or RPC response. Envelopes journal only their non-secret
+`route`, allowing restart recovery to resolve a fresh lease.
 
 ## Daemon lifecycle
 

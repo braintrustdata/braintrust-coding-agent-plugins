@@ -15,6 +15,7 @@ fn options(output: &std::path::Path) -> ServeOptions {
         version: "test".into(),
         translators: Arc::new(Registry::default_agents()),
         sink_factory: Arc::new(DebugSinkFactory { dir: output.into() }),
+        auth_provider: None,
     }
 }
 

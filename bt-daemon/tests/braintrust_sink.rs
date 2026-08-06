@@ -20,10 +20,10 @@ fn session_config(base: &str) -> SessionConfig {
             org_name: Some("acme".into()),
             org_id: None,
         },
-        destination: None,
-        project: Some("my-project".into()),
-        parent_span_id: None,
-        root_span_id: None,
+        destination: Some(TraceDestination::ProjectLogs {
+            project_id: None,
+            project_name: Some("my-project".into()),
+        }),
         flush_mode: FlushMode::FireAndForget,
         additional_metadata: None,
     }
@@ -187,8 +187,11 @@ async fn attached_trace_children_keep_the_external_root() {
     });
     let mut sink = factory.create("sess-1", "codex").unwrap();
     let mut config = session_config(&base);
-    config.parent_span_id = Some("external-parent".into());
-    config.root_span_id = Some("external-root".into());
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.object_id = Some("proj-parent".into());
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    config.destination = Some(TraceDestination::ParentSpan { components });
     sink.configure(&config);
     sink.emit(&[SpanOp::Insert(row(
         "child",

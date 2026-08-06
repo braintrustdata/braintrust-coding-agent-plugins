@@ -4,11 +4,12 @@
 //! profiles, OAuth, or keychain here (that lives in `bt`). See
 //! the crate README's "Dual consumption" section.
 
-use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
+use async_trait::async_trait;
+use bt_daemon::wire::{AuthSelection, BackendAuth, SessionRoute, TraceDestination};
 use bt_daemon::{
-    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status,
-    BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo, ImportArgs, Registry, ServeArgs,
-    ServeOptions, StatusArgs,
+    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, AuthLease,
+    AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo,
+    ImportArgs, Registry, ServeArgs, ServeOptions, StatusArgs,
 };
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
@@ -23,6 +24,42 @@ fn debug_serve_options(version: &str, data_dir: &std::path::Path) -> ServeOption
         sink_factory: Arc::new(DebugSinkFactory {
             dir: data_dir.join("spans"),
         }),
+        auth_provider: None,
+    }
+}
+
+struct EnvironmentAuthProvider {
+    require_token: bool,
+}
+
+#[async_trait]
+impl AuthProvider for EnvironmentAuthProvider {
+    async fn resolve(
+        &self,
+        selection: &AuthSelection,
+        _reason: AuthResolveReason,
+    ) -> anyhow::Result<AuthLease> {
+        let token = std::env::var("BRAINTRUST_API_KEY").unwrap_or_default();
+        if self.require_token && token.is_empty() {
+            anyhow::bail!("BRAINTRUST_API_KEY is not set");
+        }
+        Ok(AuthLease {
+            profile: selection
+                .profile
+                .clone()
+                .unwrap_or_else(|| "environment".to_string()),
+            auth: BackendAuth {
+                token,
+                api_url: std::env::var("BRAINTRUST_API_URL").ok(),
+                app_url: std::env::var("BRAINTRUST_APP_URL").ok(),
+                org_name: selection
+                    .org_name
+                    .clone()
+                    .or_else(|| std::env::var("BRAINTRUST_ORG_NAME").ok()),
+                org_id: std::env::var("BRAINTRUST_ORG_ID").ok(),
+            },
+            expires_at_ms: None,
+        })
     }
 }
 
@@ -63,7 +100,7 @@ enum Command {
         #[command(flatten)]
         args: HookArgs,
         #[command(flatten)]
-        auth: AuthArgs,
+        route: RouteArgs,
     },
     /// Print daemon/session status.
     Status(StatusArgs),
@@ -71,39 +108,34 @@ enum Command {
     Import(ImportArgs),
 }
 
-/// Static-token backend auth from env/flags (no profile resolution).
+/// Non-secret session selection. Credentials are resolved by the daemon.
 #[derive(Args)]
-struct AuthArgs {
-    #[arg(long, env = "BRAINTRUST_API_KEY")]
-    api_key: Option<String>,
-    #[arg(long, env = "BRAINTRUST_API_URL")]
-    api_url: Option<String>,
-    #[arg(long, env = "BRAINTRUST_APP_URL")]
-    app_url: Option<String>,
+struct RouteArgs {
+    #[arg(long, env = "BRAINTRUST_PROFILE")]
+    profile: Option<String>,
     #[arg(long = "org", env = "BRAINTRUST_ORG_NAME")]
     org_name: Option<String>,
-    #[arg(long = "org-id", env = "BRAINTRUST_ORG_ID")]
-    org_id: Option<String>,
-    #[arg(long, env = "BRAINTRUST_PROJECT")]
+    #[arg(long, env = "BRAINTRUST_PROJECT", conflicts_with = "destination")]
     project: Option<String>,
+    #[arg(long, env = "BRAINTRUST_DESTINATION")]
+    destination: Option<TraceDestination>,
 }
 
-impl AuthArgs {
-    fn into_config(self) -> SessionConfig {
-        SessionConfig {
-            auth: BackendAuth {
-                token: self.api_key.unwrap_or_default(),
-                api_url: self.api_url,
-                app_url: self.app_url,
+impl RouteArgs {
+    fn into_route(self) -> SessionRoute {
+        SessionRoute {
+            auth: AuthSelection {
+                profile: self.profile,
                 org_name: self.org_name,
-                org_id: self.org_id,
             },
-            destination: None,
-            project: self.project,
-            parent_span_id: None,
-            root_span_id: None,
-            flush_mode: FlushMode::FireAndForget,
-            additional_metadata: None,
+            destination: self.destination.or_else(|| {
+                self.project
+                    .map(|project_name| TraceDestination::ProjectLogs {
+                        project_id: None,
+                        project_name: Some(project_name),
+                    })
+            }),
+            ..SessionRoute::default()
         }
     }
 }
@@ -137,7 +169,7 @@ async fn main() {
             app_url,
         } => {
             let data_dir = paths::data_dir(args.data_dir.as_deref());
-            let opts = if debug_sink {
+            let mut opts = if debug_sink {
                 debug_serve_options(VERSION, &data_dir)
             } else {
                 let cfg = BraintrustSinkConfig {
@@ -147,15 +179,17 @@ async fn main() {
                 };
                 braintrust_serve_options(VERSION, cfg, Arc::new(Registry::default_agents()))
             };
+            opts.auth_provider = Some(Arc::new(EnvironmentAuthProvider {
+                require_token: !debug_sink,
+            }));
             if let Err(e) = run_serve(args, opts).await {
                 eprintln!("bt-daemon serve: {e}");
                 std::process::exit(1);
             }
         }
-        Command::Hook { args, auth } => {
+        Command::Hook { args, route } => {
             // A hook must NEVER fail the agent's turn: log and exit 0 on error.
-            let config = auth.into_config();
-            if let Err(e) = run_hook(args, config, host_info()).await {
+            if let Err(e) = run_hook(args, route.into_route(), host_info()).await {
                 eprintln!("bt-daemon hook (non-fatal): {e}");
             }
             std::process::exit(0);

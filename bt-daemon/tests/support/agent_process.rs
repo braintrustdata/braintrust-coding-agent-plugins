@@ -60,9 +60,11 @@ impl AgentTestWorld {
             &config_path,
             serde_json::to_vec_pretty(&json!({
                 "traceToBraintrust": true,
-                "project": "agent-e2e",
-                "flushOnTurnEnd": true,
-                "additionalMetadata": {"test_harness": true}
+                "route": {
+                    "destination": {"type": "project_logs", "project_name": "agent-e2e"},
+                    "flush_mode": "flush_on_turn_end",
+                    "additional_metadata": {"test_harness": true}
+                }
             }))
             .unwrap(),
         )
@@ -86,6 +88,7 @@ impl AgentTestWorld {
             .kill_on_drop(true);
         if ingest_mode == TestBackendMode::Mock {
             command
+                .env("BRAINTRUST_API_KEY", "test-key")
                 .env("BRAINTRUST_API_URL", collector_server.uri())
                 .env("BRAINTRUST_APP_URL", collector_server.uri());
         }

@@ -24,6 +24,7 @@ pub struct Counters {
 
 enum SessionMsg {
     Event(Box<Envelope>),
+    Configure(Box<crate::wire::SessionConfig>, oneshot::Sender<()>),
     Flush(oneshot::Sender<u64>),
     Shutdown(oneshot::Sender<()>),
 }
@@ -102,6 +103,18 @@ impl Session {
         }
     }
 
+    /// Reconfigure the sink before a refresh-triggered flush. Queue ordering
+    /// guarantees that all earlier events are processed first.
+    pub async fn configure(&self, config: crate::wire::SessionConfig) -> anyhow::Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(SessionMsg::Configure(Box::new(config), reply_tx))
+            .map_err(|_| anyhow::anyhow!("session actor is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("session actor dropped configuration reply"))
+    }
+
     /// Drain, flush, and stop the actor (used on daemon shutdown).
     pub async fn shutdown(&self) {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -171,6 +184,8 @@ impl SessionActor {
                 while let Some(msg) = rx.recv().await {
                     if let SessionMsg::Event(_) = msg {
                         self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                    } else if let SessionMsg::Configure(_, r) = msg {
+                        let _ = r.send(());
                     } else if let SessionMsg::Flush(r) = msg {
                         let _ = r.send(0);
                     } else if let SessionMsg::Shutdown(r) = msg {
@@ -228,6 +243,12 @@ impl SessionActor {
                         Err(e) => self.set_error(format!("translate failed: {e}")),
                     }
                     self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                }
+                SessionMsg::Configure(config, reply) => {
+                    sink.configure(&config);
+                    ctx.config = Some(*config);
+                    self.refresh_permalink(sink.as_ref());
+                    let _ = reply.send(());
                 }
                 SessionMsg::Flush(reply) => {
                     self.drain_flush(&mut translator, &mut sink, &ctx).await;
