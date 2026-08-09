@@ -334,6 +334,14 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
 
 async fn accept_loop(daemon: Arc<Daemon>, mut listener: Listener) -> anyhow::Result<()> {
     loop {
+        // `Notify::notify_waiters` does not retain a permit. If accepting a
+        // connection wins the select at the same time shutdown is requested,
+        // check the sticky flag before waiting again so the notification
+        // cannot be lost.
+        if daemon.shutting_down.load(Ordering::SeqCst) {
+            tracing::info!("shutdown requested");
+            return Ok(());
+        }
         tokio::select! {
             _ = daemon.shutdown.notified() => {
                 tracing::info!("shutdown requested");
