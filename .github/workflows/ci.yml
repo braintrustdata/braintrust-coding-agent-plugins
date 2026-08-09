@@ -197,7 +197,17 @@ jobs:
       - name: Build Pi extension for integration harness
         run: make build-pi
       - name: Install built Pi extension for integration harness
+        if: runner.os != 'Windows'
         run: npm install --prefix "${{ runner.temp }}/pi-extension" --no-save --no-package-lock --no-audit --no-fund ./dist/pi/braintrust-pi-extension-*.tgz
+      - name: Install built Pi extension for integration harness (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tarballs = @(Get-ChildItem -Path ./dist/pi -Filter 'braintrust-pi-extension-*.tgz')
+          if ($tarballs.Count -ne 1) {
+            throw "expected exactly one Pi extension tarball, found $($tarballs.Count)"
+          }
+          npm install --prefix "${{ runner.temp }}/pi-extension" --no-save --no-package-lock --no-audit --no-fund $tarballs[0].FullName
       - name: Report coding-agent versions
         run: |
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- codex --version
