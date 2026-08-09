@@ -334,7 +334,14 @@ async fn opencode_session_emits_traces() {
 async fn pi_session_emits_traces() {
     let inference = OpenAiMock::new(|_context, request| {
         assert!(request.model().is_some());
-        MockReply::response(OpenAiTurn::text("PI_MOCK_OK"))
+        if request.has_function_output("call_pi_1") {
+            return MockReply::response(OpenAiTurn::text("PI_MOCK_OK"));
+        }
+        MockReply::response(shell_tool_call(
+            &request,
+            "call_pi_1",
+            &tool_command("PI_TOOL_OK"),
+        ))
     });
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
@@ -343,14 +350,26 @@ async fn pi_session_emits_traces() {
     let output = pi
         .run(
             &world,
-            PiRun::new("Reply with the exact text PI_MOCK_OK.")
+            PiRun::new("Run a shell command that prints PI_TOOL_OK, then reply with PI_MOCK_OK.")
                 .mock_inference(inference_server.uri()),
         )
         .await;
     output.assert_success();
     if world.uses_mock_inference() {
         output.assert_contains("PI_MOCK_OK");
-        assert!(!inference.requests().is_empty(), "{}", output.text());
+        assert!(
+            !output.text().contains("PI_MOCK_OKPI_MOCK_OK"),
+            "Pi rendered the final response twice: {}",
+            output.text()
+        );
+        assert!(
+            inference
+                .requests()
+                .iter()
+                .any(|request| request.has_function_output("call_pi_1")),
+            "Pi did not return the tool result: {}",
+            output.text()
+        );
     }
 
     let rows = world.wait_for_trace_delivery().await;
@@ -360,6 +379,16 @@ async fn pi_session_emits_traces() {
                 .any(|row| row_contains(row, &["braintrust.plugin.pi", "test_harness"])),
             "Pi trace origin metadata was not emitted"
         );
+    }
+    if world.uses_mock_inference() && world.uses_mock_ingest() {
+        let scenario = IngestScenario::new()
+            .expect("Pi LLM span", |row| {
+                row_contains(row, &[r#""type":"llm""#, "PI_MOCK_OK"])
+            })
+            .expect("Pi tool span", |row| {
+                row_contains(row, &[r#""type":"tool""#, "PI_TOOL_OK"])
+            });
+        world.wait_for_mock_ingest_scenario(&scenario).await;
     }
 }
 

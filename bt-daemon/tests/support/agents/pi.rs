@@ -105,7 +105,8 @@ impl PiAgent {
                 "--no-extensions",
                 "--no-skills",
                 "--no-context-files",
-                "--no-tools",
+                "--tools",
+                "bash",
                 "--extension",
             ])
             .arg(&self.extension)
