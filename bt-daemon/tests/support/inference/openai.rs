@@ -125,22 +125,6 @@ impl OpenAiTurn {
                     "content_index": 0,
                     "text": text.clone()
                 }),
-                json!({
-                    "type": "response.content_part.done",
-                    "item_id": format!("msg_mock_{response_index}"),
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": text.clone(), "annotations": []}
-                }),
-                json!({
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "message",
-                        "role": "assistant",
-                        "id": format!("msg_mock_{response_index}"),
-                        "content": [{"type": "output_text", "text": text}]
-                    }
-                }),
                 completed(&response_id, input_tokens, output_tokens),
             ],
             Self::ToolCall {
@@ -149,19 +133,50 @@ impl OpenAiTurn {
                 arguments,
                 input_tokens,
                 output_tokens,
-            } => vec![
-                created,
-                json!({
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "function_call",
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": arguments.to_string()
-                    }
-                }),
-                completed(&response_id, input_tokens, output_tokens),
-            ],
+            } => {
+                let item_id = format!("fc_mock_{response_index}");
+                let arguments = arguments.to_string();
+                vec![
+                    created,
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": "",
+                            "status": "in_progress"
+                        }
+                    }),
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item_id,
+                        "output_index": 0,
+                        "delta": arguments
+                    }),
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item_id,
+                        "output_index": 0,
+                        "arguments": arguments
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                            "status": "completed"
+                        }
+                    }),
+                    completed(&response_id, input_tokens, output_tokens),
+                ]
+            }
             Self::Events(events) => events,
         }
     }

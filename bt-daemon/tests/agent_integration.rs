@@ -37,6 +37,32 @@ fn codex_tool_call(request: &OpenAiRequest) -> OpenAiTurn {
     panic!("Codex offered no supported shell tool; offered tools: {names:?}");
 }
 
+fn shell_tool_call(request: &OpenAiRequest, call_id: &str, command: &str) -> OpenAiTurn {
+    let names = request.tool_names();
+    let name = ["bash", "shell", "shell_command", "exec_command"]
+        .into_iter()
+        .find(|name| names.contains(name))
+        .unwrap_or_else(|| {
+            panic!("agent offered no supported shell tool; offered tools: {names:?}")
+        });
+    let arguments = match name {
+        "exec_command" => json!({"cmd": command, "login": false}),
+        _ => json!({"command": command}),
+    };
+    OpenAiTurn::tool_call(call_id, name, arguments)
+}
+
+fn tool_command(marker: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("printf {marker}")
+    }
+    #[cfg(windows)]
+    {
+        format!("Write-Output {marker}")
+    }
+}
+
 fn codex_tool_command() -> &'static str {
     #[cfg(unix)]
     {
@@ -234,7 +260,17 @@ async fn claude_session_emits_traces() {
 async fn opencode_session_emits_traces() {
     let inference = OpenAiMock::new(|_context, request| {
         assert_eq!(request.model(), Some("mock-model"));
-        MockReply::response(OpenAiTurn::text("OPENCODE_MOCK_OK"))
+        if request.tool_names().is_empty() {
+            return MockReply::response(OpenAiTurn::text("OpenCode harness"));
+        }
+        if request.has_function_output("call_opencode_1") {
+            return MockReply::response(OpenAiTurn::text("OPENCODE_MOCK_OK"));
+        }
+        MockReply::response(shell_tool_call(
+            &request,
+            "call_opencode_1",
+            &tool_command("OPENCODE_TOOL_OK"),
+        ))
     });
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
@@ -243,14 +279,23 @@ async fn opencode_session_emits_traces() {
     let output = opencode
         .run(
             &world,
-            OpenCodeRun::new("Reply with the exact text OPENCODE_MOCK_OK.")
+            OpenCodeRun::new(
+                "Run a shell command that prints OPENCODE_TOOL_OK, then reply with OPENCODE_MOCK_OK.",
+            )
                 .mock_inference(inference_server.uri()),
         )
         .await;
     output.assert_success();
     if world.uses_mock_inference() {
         output.assert_contains("OPENCODE_MOCK_OK");
-        assert!(!inference.requests().is_empty(), "{}", output.text());
+        assert!(
+            inference
+                .requests()
+                .iter()
+                .any(|request| request.has_function_output("call_opencode_1")),
+            "OpenCode did not return the tool result: {}",
+            output.text()
+        );
     }
 
     let rows = world.wait_for_trace_delivery().await;
@@ -267,10 +312,13 @@ async fn opencode_session_emits_traces() {
                 row_contains(row, &["braintrust.plugin.opencode", "0.1.0"])
             })
             .expect("OpenCode turn input", |row| {
-                row_contains(
-                    row,
-                    &["Turn 1", "Reply with the exact text OPENCODE_MOCK_OK"],
-                )
+                row_contains(row, &["Turn 1", "OPENCODE_TOOL_OK"])
+            })
+            .expect("OpenCode tool span", |row| {
+                row_contains(row, &[r#""type":"tool""#, "OPENCODE_TOOL_OK"])
+            })
+            .expect("OpenCode LLM span", |row| {
+                row_contains(row, &[r#""type":"llm""#, "call_opencode_1"])
             });
         world.wait_for_mock_ingest_scenario(&scenario).await;
     }

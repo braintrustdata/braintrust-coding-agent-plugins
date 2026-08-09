@@ -73,6 +73,13 @@ behavior while reporting traces to the normal Braintrust backend:
 
 ```console
 BT_AGENT_INFERENCE_MODE=mock BT_AGENT_INGEST_MODE=live \
+BT_AGENT_BT_BIN=/path/to/bt BT_AGENT_PROFILE=work \
+BT_AGENT_PROJECT=agent-e2e \
   cargo test --manifest-path bt-daemon/Cargo.toml \
   --all-features --test agent_integration -- --ignored --test-threads=1
 ```
+
+The live-ingest path starts the daemon through `bt`, so OAuth access-token
+refresh and profile resolution remain inside the long-lived CLI host. The
+standalone daemon is intentionally limited to mock-ingest and explicit API-key
+development scenarios.

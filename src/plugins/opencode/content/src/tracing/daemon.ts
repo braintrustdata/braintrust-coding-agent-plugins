@@ -13,6 +13,17 @@ interface TracingRouteConfig {
   additionalMetadata?: Record<string, unknown>
 }
 
+const FORWARDED_NATIVE_EVENTS = new Set([
+  "session.created",
+  "session.idle",
+  "session.deleted",
+  "session.error",
+  "message.part.updated",
+  "message.updated",
+  "permission.asked",
+  "permission.replied",
+])
+
 export function createDaemonTracingHooks(
   input: PluginInput,
   config: TracingRouteConfig,
@@ -65,6 +76,7 @@ export function createDaemonTracingHooks(
         await daemon.close()
         return
       }
+      if (!FORWARDED_NATIVE_EVENTS.has(event.type)) return
       await forward(event.type, { properties: event.properties })
     },
     "chat.message": async (hookInput, hookOutput) =>

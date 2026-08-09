@@ -37,6 +37,18 @@ The world controls inference and ingest independently:
 - `BT_AGENT_INGEST_MODE=mock|live` selects captured local ingest or the normal
   Braintrust backend.
 
+Mock ingest launches the feature-gated standalone daemon with test
+credentials. Live ingest instead launches the profile-aware daemon embedded in
+`bt`, selected by:
+
+- `BT_AGENT_BT_BIN` — `bt` executable to test (defaults to `bt` on `PATH`);
+- `BT_AGENT_PROFILE` — optional saved OAuth or API-key profile;
+- `BT_AGENT_ORG` — optional organization constraint;
+- `BT_AGENT_PROJECT` — destination project name (defaults to `agent-e2e`).
+
+Only those non-secret selections are written to the harness route. The `bt`
+daemon host resolves credentials and refreshes OAuth leases internally.
+
 This allows deterministic inference to drive real Braintrust ingest without
 paying for model inference. Every test uses ordinary assertions for stable
 process behavior and trace delivery regardless of mode. When ingest is mocked,
