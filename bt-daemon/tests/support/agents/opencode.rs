@@ -6,6 +6,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::process::Child;
 
 pub struct OpenCodeAgent {
     home: PathBuf,
@@ -110,6 +111,9 @@ impl OpenCodeAgent {
         // can drop those last plugin events before the daemon receives them.
         let port = available_port();
         let server_url = format!("http://127.0.0.1:{port}");
+        let server_log = world.temp_path("opencode-server.log");
+        let server_log_file =
+            std::fs::File::create(&server_log).expect("create OpenCode server diagnostic log");
         let mut server = command_from_env("OPENCODE_BIN", "opencode");
         server
             .args([
@@ -122,15 +126,20 @@ impl OpenCodeAgent {
             .current_dir(&workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(server_log_file))
             .kill_on_drop(true);
         configure_environment(&mut server, self);
         world.configure(&mut server);
         run.options.apply_env(&mut server);
         let mut server = server.spawn().expect("start OpenCode server");
-        wait_for_server(port).await;
+        if let Err(error) = wait_for_server(&server_url, &mut server, &server_log).await {
+            let _ = server.kill().await;
+            return AgentOutput::from_http_result(Err(error));
+        }
 
-        let output = run_session(&server_url, &workspace, &run.prompt).await;
+        let output = run_session(&server_url, &workspace, &run.prompt)
+            .await
+            .map_err(|error| format!("{error}\n{}", server_diagnostics(&mut server, &server_log)));
 
         // The synchronous message endpoint returns once the final assistant
         // message is persisted. Give the server event bus a bounded window to
@@ -169,21 +178,44 @@ fn available_port() -> u16 {
         .port()
 }
 
-async fn wait_for_server(port: u16) {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
+async fn wait_for_server(url: &str, server: &mut Child, log: &Path) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .map_err(|error| format!("build OpenCode health client: {error}"))?;
+    for _ in 0..60 {
+        if let Some(status) = server
+            .try_wait()
+            .map_err(|error| format!("query OpenCode server process: {error}"))?
         {
-            return;
+            return Err(format!(
+                "OpenCode server exited before becoming healthy with {status}\n{}",
+                server_diagnostics(server, log)
+            ));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Ok(response) = client.get(format!("{url}/global/health")).send().await {
+            if let Ok(response) = response.error_for_status() {
+                if response
+                    .json::<serde_json::Value>()
+                    .await
+                    .is_ok_and(|body| body["healthy"] == true)
+                {
+                    return Ok(());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("OpenCode server did not become ready on port {port}");
+    Err(format!(
+        "OpenCode server did not become healthy at {url}/global/health\n{}",
+        server_diagnostics(server, log)
+    ))
 }
 
 async fn run_session(url: &str, workspace: &Path, prompt: &OsString) -> Result<String, String> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(90))
         .build()
         .map_err(|error| format!("build OpenCode HTTP client: {error}"))?;
@@ -218,6 +250,16 @@ async fn run_session(url: &str, workspace: &Path, prompt: &OsString) -> Result<S
         .await
         .map_err(|error| format!("read OpenCode response: {error}"))?;
     Ok(response)
+}
+
+fn server_diagnostics(server: &mut Child, log: &Path) -> String {
+    let status = match server.try_wait() {
+        Ok(Some(status)) => format!("exited with {status}"),
+        Ok(None) => "still running".into(),
+        Err(error) => format!("status unavailable: {error}"),
+    };
+    let log = std::fs::read_to_string(log).unwrap_or_else(|error| format!("<unreadable: {error}>"));
+    format!("OpenCode server is {status}; stderr:\n{log}")
 }
 
 fn path_to_file_url(path: &Path) -> String {
