@@ -241,7 +241,21 @@ impl PiTranslator {
             .map(explicit_skills)
             .unwrap_or_default();
         self.turn = Some((id.clone(), input.clone()));
-        ops.push(SpanOp::Insert(SpanRow{span_id:id,root_span_id:self.effective_root_span_id.clone(),parent_span_ids:vec![self.root_span_id.clone()],name:format!("Turn {}",self.turn_seq),span_type:SpanType::Task,start_ms:Some(ts),input:Some(input),metadata:Some(json!({"turn_number":self.turn_seq,"loaded_skill_names":skills,"thinking_level":self.thinking_level})),..Default::default()}));
+        ops.push(SpanOp::Insert(SpanRow {
+            span_id: id,
+            root_span_id: self.effective_root_span_id.clone(),
+            parent_span_ids: vec![self.root_span_id.clone()],
+            name: format!("Turn {}", self.turn_seq),
+            span_type: SpanType::Task,
+            start_ms: Some(ts),
+            input: Some(input),
+            metadata: Some(json!({
+                "turn_number": self.turn_seq,
+                "loaded_skill_names": skills,
+                "thinking_level": self.thinking_level,
+            })),
+            ..Default::default()
+        }));
         ops
     }
     fn capture_context(&mut self, event: &Value, ts: i64) {
@@ -330,12 +344,26 @@ impl PiTranslator {
             end_ms: Some(ts),
             input: Some(pending.input),
             output: Some(json!([output])),
-            metadata: Some(
-                json!({"model":model,"provider":message.get("provider"),"api":message.get("api"),"stop_reason":message.get("stopReason"),"thinking_level":self.thinking_level,"provider_request":pending.provider,"response_id":message.get("responseId")}),
-            ),
-            metrics: Some(
-                json!({"prompt_tokens":prompt,"completion_tokens":completion,"reasoning_tokens":reasoning,"tokens":total,"prompt_cached_tokens":num(&usage,"cacheRead"),"prompt_cache_creation_tokens":num(&usage,"cacheWrite")+num(&usage,"cacheWrite1h"),"time_to_first_token":ttft,"cost":usage.get("cost")}),
-            ),
+            metadata: Some(json!({
+                "model": model,
+                "provider": message.get("provider"),
+                "api": message.get("api"),
+                "stop_reason": message.get("stopReason"),
+                "thinking_level": self.thinking_level,
+                "provider_request": pending.provider,
+                "response_id": message.get("responseId"),
+            })),
+            metrics: Some(json!({
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "reasoning_tokens": reasoning,
+                "tokens": total,
+                "prompt_cached_tokens": num(&usage, "cacheRead"),
+                "prompt_cache_creation_tokens": num(&usage, "cacheWrite")
+                    + num(&usage, "cacheWrite1h"),
+                "time_to_first_token": ttft,
+                "cost": usage.get("cost"),
+            })),
             error,
             ..Default::default()
         })]
@@ -391,9 +419,14 @@ impl PiTranslator {
             end_ms: Some(ts),
             input: Some(tracked.args),
             output: event.get("result").cloned(),
-            metadata: Some(
-                json!({"tool_name":if skill.is_some(){"skill"}else{&tracked.name},"original_tool_name":tracked.name,"tool_call_id":call,"tool_approval":"approved","tool_outcome":if failed{"error"}else{"success"},"skill_name":skill}),
-            ),
+            metadata: Some(json!({
+                "tool_name": if skill.is_some() { "skill" } else { &tracked.name },
+                "original_tool_name": tracked.name,
+                "tool_call_id": call,
+                "tool_approval": "approved",
+                "tool_outcome": if failed { "error" } else { "success" },
+                "skill_name": skill,
+            })),
             error: failed.then(|| format_error(event.get("result"))),
             ..Default::default()
         })]
@@ -493,7 +526,30 @@ fn normalize_assistant(v: &Value) -> Value {
         .into_iter()
         .flatten()
     {
-        match part.get("type").and_then(Value::as_str){Some("text")=>if let Some(s)=part.get("text").and_then(Value::as_str){text.push_str(s)},Some("thinking")=>if let Some(s)=part.get("thinking").and_then(Value::as_str){reasoning.push_str(s)},Some("toolCall")=>calls.push(json!({"id":part.get("id"),"type":"function","function":{"name":part.get("name"),"arguments":serde_json::to_string(part.get("arguments").unwrap_or(&Value::Null)).unwrap_or_default()}})),_=>{}}
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(s) = part.get("text").and_then(Value::as_str) {
+                    text.push_str(s);
+                }
+            }
+            Some("thinking") => {
+                if let Some(s) = part.get("thinking").and_then(Value::as_str) {
+                    reasoning.push_str(s);
+                }
+            }
+            Some("toolCall") => calls.push(json!({
+                "id": part.get("id"),
+                "type": "function",
+                "function": {
+                    "name": part.get("name"),
+                    "arguments": serde_json::to_string(
+                        part.get("arguments").unwrap_or(&Value::Null),
+                    )
+                    .unwrap_or_default(),
+                },
+            })),
+            _ => {}
+        }
     }
     let mut out = json!({"role":"assistant","content":text});
     if !reasoning.is_empty() {
