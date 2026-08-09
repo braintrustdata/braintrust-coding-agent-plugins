@@ -125,6 +125,32 @@ impl OpenAiTurn {
                     "content_index": 0,
                     "text": text.clone()
                 }),
+                json!({
+                    "type": "response.content_part.done",
+                    "item_id": format!("msg_mock_{response_index}"),
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": text.clone(),
+                        "annotations": []
+                    }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": format!("msg_mock_{response_index}"),
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": text,
+                            "annotations": []
+                        }]
+                    }
+                }),
                 completed(&response_id, input_tokens, output_tokens),
             ],
             Self::ToolCall {

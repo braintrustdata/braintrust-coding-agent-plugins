@@ -2,7 +2,10 @@ use super::{command_from_env, AgentOutput, ProcessOptions};
 use crate::support::agent_process::AgentTestWorld;
 use serde_json::json;
 use std::ffi::OsString;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 pub struct OpenCodeAgent {
     home: PathBuf,
@@ -101,36 +104,120 @@ impl OpenCodeAgent {
         )
         .expect("write OpenCode config");
 
-        let mut command = command_from_env("OPENCODE_BIN", "opencode");
-        command
-            .args(["run", "--format", "json", "--auto"])
-            .arg("--dir")
-            .arg(&workspace)
+        // Keep the plugin-hosting process alive until OpenCode has published
+        // the final message and session.idle events. The one-shot `run` server
+        // tears itself down as soon as it has printed the final response, which
+        // can drop those last plugin events before the daemon receives them.
+        let port = available_port();
+        let server_url = format!("http://127.0.0.1:{port}");
+        let mut server = command_from_env("OPENCODE_BIN", "opencode");
+        server
+            .args([
+                "serve",
+                "--hostname",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
             .current_dir(&workspace)
-            .env("HOME", &self.home)
-            .env("USERPROFILE", &self.home)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_DATA_HOME", &self.data_home)
-            .env("XDG_CACHE_HOME", &self.cache_home)
-            .env("TRACE_TO_BRAINTRUST", "true")
-            .env("BRAINTRUST_OPENCODE_ENABLE_TOOLS", "false")
-            .env("OPENCODE_DISABLE_MODELS_FETCH", "true");
-        if world.uses_mock_inference() {
-            command.args(["--model", "mock/mock-model"]);
-        }
-        for key in [
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "GOOGLE_GENERATIVE_AI_API_KEY",
-        ] {
-            command.env_remove(key);
-        }
-        world.configure(&mut command);
-        run.options.apply(&mut command);
-        command.arg(run.prompt);
-        world.output(&mut command).await.into()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        configure_environment(&mut server, self);
+        world.configure(&mut server);
+        run.options.apply_env(&mut server);
+        let mut server = server.spawn().expect("start OpenCode server");
+        wait_for_server(port).await;
+
+        let output = run_session(&server_url, &workspace, &run.prompt).await;
+
+        // The synchronous message endpoint returns once the final assistant
+        // message is persisted. Give the server event bus a bounded window to
+        // deliver completion and idle callbacks before stopping the plugin host.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = server.kill().await;
+        AgentOutput::from_http_result(output)
     }
+}
+
+fn configure_environment(command: &mut tokio::process::Command, agent: &OpenCodeAgent) {
+    command
+        .env("HOME", &agent.home)
+        .env("USERPROFILE", &agent.home)
+        .env("XDG_CONFIG_HOME", &agent.config_home)
+        .env("XDG_DATA_HOME", &agent.data_home)
+        .env("XDG_CACHE_HOME", &agent.cache_home)
+        .env("TRACE_TO_BRAINTRUST", "true")
+        .env("BRAINTRUST_OPENCODE_ENABLE_TOOLS", "false")
+        .env("OPENCODE_DISABLE_MODELS_FETCH", "true");
+    for key in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+fn available_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("reserve OpenCode server port")
+        .local_addr()
+        .expect("read OpenCode server port")
+        .port()
+}
+
+async fn wait_for_server(port: u16) {
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("OpenCode server did not become ready on port {port}");
+}
+
+async fn run_session(url: &str, workspace: &Path, prompt: &OsString) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|error| format!("build OpenCode HTTP client: {error}"))?;
+    let directory = workspace.to_string_lossy().into_owned();
+    let session = client
+        .post(format!("{url}/session"))
+        .query(&[("directory", &directory)])
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|error| format!("create OpenCode session: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("create OpenCode session: {error}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("decode OpenCode session: {error}"))?;
+    let session_id = session["id"]
+        .as_str()
+        .ok_or_else(|| format!("OpenCode session response omitted id: {session}"))?;
+    let response = client
+        .post(format!("{url}/session/{session_id}/message"))
+        .query(&[("directory", &directory)])
+        .json(&json!({
+            "parts": [{"type": "text", "text": prompt.to_string_lossy()}]
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("run OpenCode session: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("run OpenCode session: {error}"))?
+        .text()
+        .await
+        .map_err(|error| format!("read OpenCode response: {error}"))?;
+    Ok(response)
 }
 
 fn path_to_file_url(path: &Path) -> String {

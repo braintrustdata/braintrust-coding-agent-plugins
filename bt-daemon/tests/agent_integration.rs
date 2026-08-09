@@ -319,6 +319,9 @@ async fn opencode_session_emits_traces() {
             })
             .expect("OpenCode LLM span", |row| {
                 row_contains(row, &[r#""type":"llm""#, "call_opencode_1"])
+            })
+            .expect("OpenCode final LLM span", |row| {
+                row_contains(row, &[r#""type":"llm""#, "OPENCODE_MOCK_OK"])
             });
         world.wait_for_mock_ingest_scenario(&scenario).await;
     }
