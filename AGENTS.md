@@ -22,6 +22,14 @@ Everything an agent installs lives under `src/plugins/<agent>/content/`.
 Plugin hooks are thin fail-open shell and Windows command launchers that invoke
 `bt daemon hook`; they do not contain or compile a second tracing runtime.
 
+## Adding a coding-agent integration
+
+For complete integrations, use `$add-coding-agent-integration` to delegate the
+tracing audit, translator, capture, setup, managed run, import/attach, testing,
+and shipping work to the corresponding repo-local skills. Use a component skill
+directly for focused work. Every integration uses one source identity and daemon
+translator; hooks and plugins remain thin, fail-open, credential-free forwarders.
+
 ## Local development
 
 ```bash

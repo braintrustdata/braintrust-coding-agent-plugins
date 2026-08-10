@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Agent Import"
+  short_description: "Import and follow native agent transcripts"
+  default_prompt: "Use $add-coding-agent-import to add transcript import and attach support for a coding agent."

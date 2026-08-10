@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Agent Translator"
+  short_description: "Build an agent event-to-trace translator"
+  default_prompt: "Use $add-coding-agent-translator to implement daemon translation for a coding agent."

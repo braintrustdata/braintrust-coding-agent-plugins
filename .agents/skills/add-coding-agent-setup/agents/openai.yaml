@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Agent Setup"
+  short_description: "Install and configure persistent agent tracing"
+  default_prompt: "Use $add-coding-agent-setup to add persistent tracing setup for a coding agent."
