@@ -1,6 +1,6 @@
 {
   "_comment": "Non-secret hook route. Authentication credentials and backend URLs are resolved by bt and do not belong here.",
-  "traceToBraintrust": true,
+  "trace_to_braintrust": true,
   "route": {
     "auth": {
       "profile": "work",

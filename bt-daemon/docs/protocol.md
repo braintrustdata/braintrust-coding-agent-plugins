@@ -4,13 +4,13 @@ Status: **frozen for the prototype.** This is the contract between plugin shims
 (`hook` clients) and the daemon (`serve`), and between the embedded-in-`bt`
 front-end and the standalone test binary.
 
-Hook clients may use a non-credential settings file. Its path
-is `$BT_DAEMON_CONFIG`, falling back to `<BT_DAEMON_DATA_DIR>/config.json` and
-then the platform default daemon state directory. The hook front-end applies
-`traceToBraintrust` and the stored `route` before sending an event. Setup can
-persist a project-scoped route; a managed run can point `BT_DAEMON_CONFIG` at
-an invocation-local route file, or set `BT_TRACE_SESSION_ROUTE` to the selected
-route JSON, while keeping generated hook commands stable.
+Hook clients use an agent-specific non-credential `braintrust.json` file. Codex,
+Claude Code, OpenCode, and Pi therefore retain independent persistent profile,
+organization, and destination selections. `$BT_DAEMON_CONFIG` may explicitly
+override the file path. The hook front-end applies `trace_to_braintrust` and the
+stored `route` before sending an event. A managed run sets
+`BT_TRACE_INVOCATION_SETTINGS` for only its child process tree, keeping global
+agent configuration and generated hook commands unchanged.
 The profile is optional and defaults through `bt`. Credentials and backend
 URLs are resolved and refreshed inside the daemon and never enter this file.
 
@@ -243,9 +243,12 @@ routing synthetic lifecycle events through the regular translator. `--parent
 with an object destination.
 
 `--attach` keeps a single translator and sink alive, tails new native records,
-and finalizes the active turn on Ctrl-C. `run <codex|claude> [ARGS...]`
-launches the selected agent with inherited stdio and injects live hook
-configuration for that invocation, so it works without plugin setup. A private
+and finalizes the active turn on Ctrl-C.
+`run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent with
+inherited stdio and injects its tracing integration for that invocation, so it
+works without plugin setup. Codex and Claude receive live hook configuration;
+OpenCode receives its npm plugin through inline OpenCode configuration; Pi
+receives its npm extension through `-e`. A private
 inherited environment marker makes installed Braintrust plugin hooks no-op for
 that managed child, while a private hook flag authorizes the injected hook process.
 Codex does not bypass hook trust: the user reviews the injected hook once through
@@ -253,7 +256,7 @@ Codex does not bypass hook trust: the user reviews the injected hook once throug
 The resulting native hook events follow the regular journal, translator, and
 sink path; transcript tailing remains specific to `import --attach`.
 The managed child inherits a non-secret invocation-settings value containing
-`traceToBraintrust: true` and its immutable `SessionRoute`. This overrides the
+`trace_to_braintrust: true` and its immutable `SessionRoute`. This overrides the
 persistent setup route only within that process tree. Other agent processes
 continue using setup settings, and concurrent managed runs can select distinct
 profiles, organizations, and destinations while sharing one daemon.

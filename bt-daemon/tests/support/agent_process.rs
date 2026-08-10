@@ -66,7 +66,7 @@ impl AgentTestWorld {
         std::fs::write(
             &config_path,
             serde_json::to_vec_pretty(&json!({
-                "traceToBraintrust": true,
+                "trace_to_braintrust": true,
                 "route": {
                     "auth": {"profile": profile, "org_name": org},
                     "destination": {"type": "project_logs", "project_name": project},

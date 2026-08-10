@@ -10,6 +10,10 @@ const config: BraintrustConfig = {
   tracingEnabled: true,
   enableTools: true,
   debug: false,
+  route: {
+    auth: { profile: "work", org_name: "acme" },
+    destination: { type: "project_logs", project_name: "agents" },
+  },
 };
 
 describe("BtCliToolsClient", () => {

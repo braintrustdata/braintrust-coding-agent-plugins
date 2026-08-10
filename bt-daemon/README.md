@@ -36,19 +36,24 @@ hook processes or JavaScript plugins.
 2. **Standalone binary** (testing): the provider uses `BRAINTRUST_API_KEY` and
    related environment variables.
 
-## Shared plugin settings
+## Per-agent plugin settings
 
-Codex, Claude Code, and future hook plugins read the same non-credential
-settings file through the embedded daemon. Set `BT_DAEMON_CONFIG` explicitly,
-or use `config.json` under `BT_DAEMON_DATA_DIR` (by default
-`~/.braintrust/state/bt-daemon/config.json` on Unix and
-`%LOCALAPPDATA%\Braintrust\bt-daemon\config.json` on Windows).
+Each coding agent reads an independent non-credential `braintrust.json` file:
 
-See [`config.json.example`](config.json.example). `traceToBraintrust` controls
+- Codex: `~/.codex/braintrust.json`
+- Claude Code: `~/.claude/braintrust.json`
+- OpenCode: `$XDG_CONFIG_HOME/opencode/braintrust.json`, falling back to
+  `~/.config/opencode/braintrust.json`
+- Pi: `~/.pi/agent/braintrust.json`
+
+`BT_DAEMON_CONFIG` can override the path for isolated tests and managed hosts.
+
+See [`config.json.example`](config.json.example). `trace_to_braintrust` controls
 enablement and `route` stores the selected profile, organization, typed
 destination, flush mode, and metadata. Omitting `route.auth.profile` selects
 the default `bt` profile. Credentials and backend URLs are never stored here;
-production resolves and refreshes them through `bt`.
+production resolves and refreshes them through `bt`. `bt trace run` supplies a
+process-local settings overlay and never changes any of these files.
 
 ## Build / test
 

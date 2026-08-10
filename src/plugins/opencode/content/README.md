@@ -14,27 +14,14 @@ running.
 
 ## Quick Start
 
-Add to your OpenCode configuration (`opencode.json` or `~/.config/opencode/opencode.json`):
-
-```json
-{
-  "plugin": ["@braintrust/trace-opencode@^1.0.0"]
-}
-```
-
-Then,
-
 ```bash
-# Authenticate the installed bt CLI used by the tracing daemon
 bt auth login
-export TRACE_TO_BRAINTRUST="true"
-
-# Run OpenCode
+bt trace setup opencode
 opencode
-
-# View traces at:
-# https://www.braintrust.dev/app/projects/opencode/logs
 ```
+
+For one invocation without changing OpenCode's global tracing configuration,
+use `bt trace run --project <PROJECT> opencode -- [OPENCODE_ARGS...]`.
 
 ## Configuration
 
@@ -51,8 +38,10 @@ Create a `braintrust.json` file in one of these locations:
 {
   "trace_to_braintrust": true,
   "enable_tools": true,
-  "profile": "work",
-  "project": "my-project",
+  "route": {
+    "auth": { "profile": "work", "org_name": "acme" },
+    "destination": { "type": "project_logs", "project_name": "my-project" }
+  },
   "debug": true
 }
 ```
@@ -76,7 +65,8 @@ Configuration is loaded with the following precedence (later overrides earlier):
 1. Default values
 2. `~/.config/opencode/braintrust.json` (global config)
 3. `.opencode/braintrust.json` (project config)
-4. Environment variables (highest priority)
+4. Environment variables
+5. `bt trace run` invocation settings (tracing only, highest priority)
 
 ## Disabling Braintrust Tools
 

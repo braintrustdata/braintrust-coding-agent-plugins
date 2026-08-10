@@ -24,6 +24,7 @@ describe("loadConfig", () => {
     "BRAINTRUST_PROJECT",
     "BRAINTRUST_ADDITIONAL_METADATA",
     "BRAINTRUST_OPENCODE_ENABLE_TOOLS",
+    "BT_TRACE_INVOCATION_SETTINGS",
   ];
   const original: Record<string, string | undefined> = {};
 
@@ -50,6 +51,11 @@ describe("loadConfig", () => {
       enableTools: true,
       debug: false,
       additionalMetadata: undefined,
+      route: {
+        auth: {},
+        destination: { type: "project_logs", project_name: "opencode" },
+        flush_mode: "fire_and_forget",
+      },
     });
   });
 
@@ -71,6 +77,12 @@ describe("loadConfig", () => {
       enableTools: false,
       debug: true,
       additionalMetadata: { team: "platform" },
+      route: {
+        auth: { profile: "work", org_name: "acme" },
+        destination: { type: "project_logs", project_name: "agents" },
+        flush_mode: "fire_and_forget",
+        additional_metadata: { team: "platform" },
+      },
     });
   });
 
@@ -97,5 +109,28 @@ describe("loadConfig", () => {
     expect(loadConfig({ additional_metadata: { fallback: true } }).additionalMetadata).toEqual({
       fallback: true,
     });
+  });
+
+  it("preserves a structured persistent destination", () => {
+    const destination = {
+      type: "parent_span",
+      components: { object_id: "object", row_id: "row", span_id: "span" },
+    };
+    expect(
+      loadConfig({
+        trace_to_braintrust: true,
+        route: { destination, flush_mode: "flush_on_turn_end" },
+      }).route,
+    ).toEqual({ destination, auth: {}, flush_mode: "flush_on_turn_end" });
+  });
+
+  it("does not fall back to persistent settings for a malformed managed run", () => {
+    process.env.BT_TRACE_INVOCATION_SETTINGS = "{";
+    expect(
+      loadConfig({
+        trace_to_braintrust: true,
+        route: { destination: { type: "project_logs", project_name: "global" } },
+      }),
+    ).toMatchObject({ tracingEnabled: false });
   });
 });

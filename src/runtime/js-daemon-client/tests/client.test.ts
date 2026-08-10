@@ -5,7 +5,11 @@ import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, test } from "node:test"
-import { DaemonClient, daemonSocketPath } from "../src/index.ts"
+import {
+  DaemonClient,
+  daemonSocketPath,
+  resolveDaemonTraceSettings,
+} from "../src/index.ts"
 
 describe("daemonSocketPath", () => {
   test("prefers the explicit environment override", () => {
@@ -23,6 +27,44 @@ describe("daemonSocketPath", () => {
   test("documents the Windows identity hash contract", () => {
     const identity = "ACME\\alice"
     assert.equal(createHash("sha256").update(identity).digest("hex").slice(0, 16).length, 16)
+  })
+})
+
+describe("resolveDaemonTraceSettings", () => {
+  const persistent = {
+    trace_to_braintrust: true,
+    route: {
+      auth: { profile: "global" },
+      destination: { type: "project_logs", project_name: "global-project" },
+    },
+  }
+
+  test("keeps one agent's persistent selection without a managed run", () => {
+    assert.deepEqual(resolveDaemonTraceSettings(persistent, {}), persistent)
+  })
+
+  test("uses an invocation selection without mutating persistent settings", () => {
+    const invocation = {
+      trace_to_braintrust: true,
+      route: {
+        auth: { profile: "run" },
+        destination: { type: "project_logs", project_name: "run-project" },
+      },
+    }
+    assert.deepEqual(
+      resolveDaemonTraceSettings(persistent, {
+        BT_TRACE_INVOCATION_SETTINGS: JSON.stringify(invocation),
+      }),
+      invocation,
+    )
+    assert.equal(persistent.route.auth.profile, "global")
+  })
+
+  test("does not fall back when invocation settings are malformed", () => {
+    assert.deepEqual(
+      resolveDaemonTraceSettings(persistent, { BT_TRACE_INVOCATION_SETTINGS: "{" }),
+      { trace_to_braintrust: false },
+    )
   })
 })
 

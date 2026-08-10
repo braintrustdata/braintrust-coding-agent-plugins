@@ -46,6 +46,12 @@ vi.mock("./config.ts", () => ({
     additionalMetadata: { team: "platform" },
     showUi: true,
     showTraceLink: true,
+    route: {
+      auth: { profile: "work", org_name: "acme" },
+      destination: { type: "project_logs", project_name: "agents" },
+      flush_mode: "flush_on_turn_end",
+      additional_metadata: { team: "platform" },
+    },
   }),
 }));
 

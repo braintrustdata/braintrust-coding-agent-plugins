@@ -159,6 +159,9 @@ pub enum RunSource {
     Codex,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
+    #[value(name = "opencode", alias = "open-code")]
+    OpenCode,
+    Pi,
 }
 
 /// Run the daemon until shutdown.
@@ -183,7 +186,7 @@ pub async fn run_hook(
     if std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook {
         return Ok(());
     }
-    let settings = settings::SharedSettings::load();
+    let settings = settings::AgentSettings::load(&args.source);
     if !settings.tracing_enabled() {
         return Ok(());
     }
@@ -383,19 +386,31 @@ pub async fn run_traced(
             "managed run requires a trace destination; select a project, object destination, or parent span"
         );
     }
-    let executable = match args.source {
-        RunSource::Codex => "codex",
-        RunSource::Claude => "claude",
+    let (executable_env, default_executable) = match args.source {
+        RunSource::Codex => ("CODEX_BIN", "codex"),
+        RunSource::Claude => ("CLAUDE_BIN", "claude"),
+        RunSource::OpenCode => ("OPENCODE_BIN", "opencode"),
+        RunSource::Pi => ("PI_BIN", "pi"),
     };
+    let executable =
+        std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
     let injected_args = managed_run_args(args.source, &hook_command)?;
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
-    let mut child = tokio::process::Command::new(executable)
+    let mut command = tokio::process::Command::new(&executable);
+    command
         .args(injected_args)
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
-        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings)
-        .spawn()
-        .map_err(|error| anyhow::anyhow!("failed to launch {executable}: {error}"))?;
+        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
+    if args.source == RunSource::OpenCode {
+        command.env(
+            "OPENCODE_CONFIG_CONTENT",
+            opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?,
+        );
+    }
+    let mut child = command.spawn().map_err(|error| {
+        anyhow::anyhow!("failed to launch {}: {error}", executable.to_string_lossy())
+    })?;
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
 
@@ -416,17 +431,52 @@ fn managed_run_args(
     let source_name = match source {
         RunSource::Codex => "codex",
         RunSource::Claude => "claude",
+        RunSource::OpenCode => "opencode",
+        RunSource::Pi => "pi",
     };
-    let unix_command = managed_hook_shell_command(hook_command, source_name, false)?;
-    let windows_command = managed_hook_shell_command(hook_command, source_name, true)?;
     match source {
-        RunSource::Codex => Ok(codex_managed_run_args(&unix_command, &windows_command)),
-        RunSource::Claude => Ok(claude_managed_run_args(if cfg!(windows) {
-            &windows_command
-        } else {
-            &unix_command
-        })?),
+        RunSource::Codex | RunSource::Claude => {
+            let unix_command = managed_hook_shell_command(hook_command, source_name, false)?;
+            let windows_command = managed_hook_shell_command(hook_command, source_name, true)?;
+            match source {
+                RunSource::Codex => Ok(codex_managed_run_args(&unix_command, &windows_command)),
+                RunSource::Claude => Ok(claude_managed_run_args(if cfg!(windows) {
+                    &windows_command
+                } else {
+                    &unix_command
+                })?),
+                _ => unreachable!(),
+            }
+        }
+        RunSource::OpenCode => Ok(Vec::new()),
+        RunSource::Pi => Ok(vec![
+            OsString::from("-e"),
+            std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC")
+                .unwrap_or_else(|| OsString::from("npm:@braintrust/pi-extension@^1")),
+        ]),
     }
+}
+
+fn opencode_managed_config(existing: Option<&str>) -> anyhow::Result<String> {
+    let mut config = match existing {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|error| anyhow::anyhow!("invalid OPENCODE_CONFIG_CONTENT: {error}"))?,
+        None => serde_json::json!({}),
+    };
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("OPENCODE_CONFIG_CONTENT must be a JSON object"))?;
+    let plugins = object
+        .entry("plugin")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("OPENCODE_CONFIG_CONTENT.plugin must be an array"))?;
+    let plugin = std::env::var("BT_TRACE_OPENCODE_PLUGIN_SPEC")
+        .unwrap_or_else(|_| "@braintrust/trace-opencode@^1".to_string());
+    if !plugins.iter().any(|value| value.as_str() == Some(&plugin)) {
+        plugins.push(serde_json::Value::String(plugin));
+    }
+    Ok(serde_json::to_string(&config)?)
 }
 
 fn managed_hook_shell_command(
@@ -829,6 +879,31 @@ mod tests {
         assert!(command.contains("--source"));
         assert!(command.contains("claude"));
         assert!(!command.contains("transcript"));
+    }
+
+    #[test]
+    fn opencode_managed_run_preserves_inline_config_and_adds_plugin() {
+        let config =
+            opencode_managed_config(Some(r#"{"model":"test/model","plugin":["other"]}"#)).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(config["model"], "test/model");
+        assert_eq!(
+            config["plugin"],
+            serde_json::json!(["other", "@braintrust/trace-opencode@^1"])
+        );
+        assert!(
+            managed_run_args(RunSource::OpenCode, &test_run_hook_command())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pi_managed_run_loads_the_npm_extension() {
+        assert_eq!(
+            managed_run_args(RunSource::Pi, &test_run_hook_command()).unwrap(),
+            ["-e", "npm:@braintrust/pi-extension@^1"]
+        );
     }
 
     #[test]
