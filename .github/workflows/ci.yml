@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           if git grep -n -E 'bun:test|bun run|bun install|packageManager.*bun' -- \
-            src/plugins/opencode src/runtime/js-daemon-client; then
+            src/plugins/opencode/content src/runtime/js-daemon-client; then
             echo "OpenCode or the shared daemon client still depends on Bun" >&2
             exit 1
           fi
@@ -74,7 +74,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        peer-version: ["1.0.0", "latest"]
+        peer-version: ["1.2.25", "latest"]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

@@ -50,8 +50,8 @@
     "vitest": "^4.1.4"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.0.0",
-    "@opencode-ai/sdk": ">=1.0.0"
+    "@opencode-ai/plugin": ">=1.2.25",
+    "@opencode-ai/sdk": ">=1.2.25"
   },
   "packageManager": "pnpm@11.21.0"
 }
