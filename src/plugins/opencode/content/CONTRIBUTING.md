@@ -13,15 +13,15 @@ to `bt-daemon`; data-access tools invoke `bt` with profile/org/project selection
 ## Local checks
 
 ```bash
-bun install --frozen-lockfile
-bun run check
-bun run typecheck
-bun test
-bun run build
+pnpm install --frozen-lockfile
+pnpm run check
+pnpm test
+pnpm run build
+pnpm run smoke
 ```
 
 From the monorepo root, `make validate-opencode` additionally builds and checks
-the npm tarball. The real-agent integration test runs OpenCode with deterministic
+the npm package. The real-agent integration test runs OpenCode with deterministic
 inference through the daemon and mock Braintrust ingest.
 
 ## Adding hooks

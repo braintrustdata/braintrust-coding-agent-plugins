@@ -1,26 +1,28 @@
-import { describe, expect, test } from "bun:test"
+import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { DaemonClient, daemonSocketPath } from "../src/index"
+import { describe, test } from "node:test"
+import { DaemonClient, daemonSocketPath } from "../src/index.ts"
 
 describe("daemonSocketPath", () => {
   test("prefers the explicit environment override", () => {
-    expect(daemonSocketPath({ BT_DAEMON_SOCKET: "/tmp/custom.sock" })).toBe("/tmp/custom.sock")
+    assert.equal(daemonSocketPath({ BT_DAEMON_SOCKET: "/tmp/custom.sock" }), "/tmp/custom.sock")
   })
 
   test("matches the Unix runtime-directory contract", () => {
     if (process.platform === "win32") return
-    expect(daemonSocketPath({ XDG_RUNTIME_DIR: "/run/user/1" })).toBe(
+    assert.equal(
+      daemonSocketPath({ XDG_RUNTIME_DIR: "/run/user/1" }),
       "/run/user/1/braintrust/daemon.sock",
     )
   })
 
   test("documents the Windows identity hash contract", () => {
     const identity = "ACME\\alice"
-    expect(createHash("sha256").update(identity).digest("hex").slice(0, 16)).toHaveLength(16)
+    assert.equal(createHash("sha256").update(identity).digest("hex").slice(0, 16).length, 16)
   })
 })
 
@@ -56,7 +58,7 @@ test("serializes initialize, events, flush, and status over one connection", asy
   await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
   const client = new DaemonClient({
     source: "opencode",
-    pluginVersion: "0.1.0",
+    pluginVersion: "1.0.0",
     socketPath: endpoint,
   })
   const envelope = (name: string) => ({
@@ -66,14 +68,20 @@ test("serializes initialize, events, flush, and status over one connection", asy
     ts_ms: Date.now(),
     payload: {},
   })
-  expect(await Promise.all([client.log(envelope("one")), client.log(envelope("two"))])).toEqual([
+  assert.deepEqual(await Promise.all([client.log(envelope("one")), client.log(envelope("two"))]), [
     true,
     true,
   ])
-  expect(await client.flush("session")).toBe(true)
-  expect((await client.status("session"))?.daemon_version).toBe("test")
-  expect(methods).toEqual(["initialize", "event.log", "event.log", "session.flush", "status.get"])
-  expect(eventParams.map((params) => params.plugin_version)).toEqual(["0.1.0", "0.1.0"])
+  assert.equal(await client.flush("session"), true)
+  assert.equal((await client.status("session"))?.daemon_version, "test")
+  assert.deepEqual(methods, [
+    "initialize",
+    "event.log",
+    "event.log",
+    "session.flush",
+    "status.get",
+  ])
+  assert.deepEqual(eventParams.map((params) => params.plugin_version), ["1.0.0", "1.0.0"])
   await client.close()
   await new Promise<void>((resolve) => server.close(() => resolve()))
   rmSync(temp, { recursive: true, force: true })
@@ -92,7 +100,7 @@ test("fails open when the daemon and bt executable are absent", async () => {
     connectDelayMs: 1,
     warn: (message) => warnings.push(message),
   })
-  expect(
+  assert.equal(
     await client.log({
       source: "opencode",
       session_id: "session",
@@ -100,7 +108,8 @@ test("fails open when the daemon and bt executable are absent", async () => {
       ts_ms: Date.now(),
       payload: {},
     }),
-  ).toBe(false)
-  expect(warnings.length).toBeGreaterThan(0)
+    false,
+  )
+  assert.ok(warnings.length > 0)
   await client.close()
 })

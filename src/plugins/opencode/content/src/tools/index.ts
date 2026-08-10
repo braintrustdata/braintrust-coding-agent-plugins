@@ -7,9 +7,13 @@
  * - Logging data
  */
 
-import type { ToolDefinition } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
-import type { BtCliToolsClient, ToolLogData } from "./bt-cli"
+import type { ToolDefinition } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin";
+import type { BtCliToolsClient, ToolLogData } from "./bt-cli";
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 /**
  * Create Braintrust tools
@@ -35,10 +39,10 @@ Example queries:
       },
       async execute(args) {
         try {
-          const results = await client.queryLogs(args.query)
-          return JSON.stringify(results, null, 2)
+          const results = await client.queryLogs(args.query);
+          return JSON.stringify(results, null, 2);
         } catch (error) {
-          return `Error executing query: ${error}`
+          return `Error executing query: ${formatError(error)}`;
         }
       },
     }),
@@ -48,13 +52,13 @@ Example queries:
       args: {},
       async execute() {
         try {
-          const projects = await client.listProjects()
+          const projects = await client.listProjects();
           if (projects.length === 0) {
-            return "No projects found."
+            return "No projects found.";
           }
-          return projects.map((p) => `- ${p.name} (${p.id})`).join("\n")
+          return projects.map((p) => `- ${p.name} (${p.id})`).join("\n");
         } catch (error) {
-          return `Error listing projects: ${error}`
+          return `Error listing projects: ${formatError(error)}`;
         }
       },
     }),
@@ -83,7 +87,7 @@ This is useful for:
       },
       async execute(args) {
         try {
-          const spanId = crypto.randomUUID()
+          const spanId = crypto.randomUUID();
 
           const data: ToolLogData = {
             id: crypto.randomUUID(),
@@ -93,36 +97,36 @@ This is useful for:
               name: "Manual Log",
               type: "task",
             },
-          }
+          };
 
-          if (args.input) data.input = args.input
-          if (args.output) data.output = args.output
-          if (args.expected) data.expected = args.expected
+          if (args.input) data.input = args.input;
+          if (args.output) data.output = args.output;
+          if (args.expected) data.expected = args.expected;
 
           if (args.scores) {
             try {
-              data.scores = JSON.parse(args.scores)
+              data.scores = JSON.parse(args.scores);
             } catch {
-              return "Error: scores must be valid JSON"
+              return "Error: scores must be valid JSON";
             }
           }
 
           if (args.metadata) {
             try {
-              data.metadata = JSON.parse(args.metadata)
+              data.metadata = JSON.parse(args.metadata);
             } catch {
-              return "Error: metadata must be valid JSON"
+              return "Error: metadata must be valid JSON";
             }
           }
 
           if (args.tags) {
-            data.tags = args.tags.split(",").map((t) => t.trim())
+            data.tags = args.tags.split(",").map((t) => t.trim());
           }
 
-          const rowId = await client.logData(data)
-          return `Successfully logged data with ID: ${rowId}`
+          const rowId = await client.logData(data);
+          return `Successfully logged data with ID: ${rowId}`;
         } catch (error) {
-          return `Error logging data: ${error}`
+          return `Error logging data: ${formatError(error)}`;
         }
       },
     }),
@@ -136,13 +140,13 @@ This is useful for:
           .describe("Maximum number of experiments to return (default: 10)"),
       },
       async execute(args) {
-        const limit = args.limit || 10
+        const limit = args.limit || 10;
         try {
-          return JSON.stringify(await client.listExperiments(limit), null, 2)
+          return JSON.stringify(await client.listExperiments(limit), null, 2);
         } catch (error) {
-          return `Error getting experiments: ${error}`
+          return `Error getting experiments: ${formatError(error)}`;
         }
       },
     }),
-  }
+  };
 }

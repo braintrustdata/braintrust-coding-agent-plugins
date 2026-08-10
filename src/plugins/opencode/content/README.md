@@ -4,6 +4,10 @@ Braintrust tracing plugin for [OpenCode](https://opencode.ai). The JavaScript
 adapter forwards native OpenCode events to the installed `bt` daemon, which
 constructs and delivers the trace.
 
+Version 1 requires a current `bt` CLI with the OpenCode daemon translator. If
+`bt` or the translator is unavailable, tracing fails open and OpenCode keeps
+running.
+
 - **Session spans**: Root span for each OpenCode session with metadata (workspace, hostname, etc.)
 - **Turn spans**: Captures each user-assistant interaction
 - **Tool spans**: Records individual tool executions with inputs and outputs
@@ -14,7 +18,7 @@ Add to your OpenCode configuration (`opencode.json` or `~/.config/opencode/openc
 
 ```json
 {
-  "plugin": ["@braintrust/trace-opencode@0.0.x"], <--- replace with latest version
+  "plugin": ["@braintrust/trace-opencode@^1.0.0"]
 }
 ```
 

@@ -7,19 +7,19 @@ set -e
 
 echo "Installing opencode-braintrust plugin..."
 
-# Check if bun is available
-if ! command -v bun &> /dev/null; then
-    echo "Error: bun is required but not found. Install it from https://bun.sh"
+# Check if pnpm is available
+if ! command -v pnpm &> /dev/null; then
+    echo "Error: pnpm is required but not found. Install it from https://pnpm.io"
     exit 1
 fi
 
 # Install dependencies
 echo "Installing dependencies..."
-bun install
+pnpm install --frozen-lockfile
 
 # Build the plugin
 echo "Building plugin..."
-bun run build
+pnpm run build
 
 # Create OpenCode plugin directory if it doesn't exist
 PLUGIN_DIR="$HOME/.config/opencode/plugin"
@@ -27,7 +27,7 @@ mkdir -p "$PLUGIN_DIR"
 
 # Copy plugin to OpenCode
 echo "Installing plugin to $PLUGIN_DIR/trace-opencode.js"
-cp dist/index.js "$PLUGIN_DIR/trace-opencode.js"
+cp dist/index.mjs "$PLUGIN_DIR/trace-opencode.js"
 
 echo ""
 echo "✓ Plugin installed successfully!"

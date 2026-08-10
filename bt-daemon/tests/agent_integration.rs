@@ -302,14 +302,14 @@ async fn opencode_session_emits_traces() {
     if world.uses_mock_ingest() {
         assert!(
             rows.iter()
-                .any(|row| row_contains(row, &["braintrust.plugin.opencode", "0.1.0"])),
+                .any(|row| row_contains(row, &["braintrust.plugin.opencode", "1.0.0"])),
             "OpenCode trace origin metadata was not emitted"
         );
     }
     if world.uses_mock_inference() && world.uses_mock_ingest() {
         let scenario = IngestScenario::new()
             .expect("OpenCode trace origin", |row| {
-                row_contains(row, &["braintrust.plugin.opencode", "0.1.0"])
+                row_contains(row, &["braintrust.plugin.opencode", "1.0.0"])
             })
             .expect("OpenCode turn input", |row| {
                 row_contains(row, &["Turn 1", "OPENCODE_TOOL_OK"])

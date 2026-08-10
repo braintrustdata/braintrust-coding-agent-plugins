@@ -1,16 +1,16 @@
-import { randomUUID } from "node:crypto"
-import type { Hooks, PluginInput } from "@opencode-ai/plugin"
-import type { Event } from "@opencode-ai/sdk"
-import { DaemonClient } from "../runtime/daemon-client"
-import { PLUGIN_VERSION } from "../version"
+import { randomUUID } from "node:crypto";
+import type { Hooks, PluginInput } from "@opencode-ai/plugin";
+import type { Event } from "@opencode-ai/sdk";
+import { DaemonClient } from "../runtime/daemon-client";
+import { PLUGIN_VERSION } from "../version";
 
-type Logger = (message: string, extra?: Record<string, unknown>) => void
+type Logger = (message: string, extra?: Record<string, unknown>) => void;
 
 interface TracingRouteConfig {
-  profile?: string
-  orgName?: string
-  projectName: string
-  additionalMetadata?: Record<string, unknown>
+  profile?: string;
+  orgName?: string;
+  projectName: string;
+  additionalMetadata?: Record<string, unknown>;
 }
 
 const FORWARDED_NATIVE_EVENTS = new Set([
@@ -22,7 +22,7 @@ const FORWARDED_NATIVE_EVENTS = new Set([
   "message.updated",
   "permission.asked",
   "permission.replied",
-])
+]);
 
 export function createDaemonTracingHooks(
   input: PluginInput,
@@ -32,12 +32,12 @@ export function createDaemonTracingHooks(
   // One transport stream per plugin instance. Native OpenCode session IDs and
   // parent relationships stay untouched in each payload for the daemon to
   // interpret.
-  const daemonSessionId = randomUUID()
+  const daemonSessionId = randomUUID();
   const daemon = new DaemonClient({
     source: "opencode",
     pluginVersion: PLUGIN_VERSION,
     warn: (message) => log("Braintrust tracing unavailable", { message }),
-  })
+  });
 
   const forward = async (event: string, payload: unknown) => {
     await daemon.log({
@@ -63,21 +63,21 @@ export function createDaemonTracingHooks(
         flush_mode: "fire_and_forget",
         ...(config.additionalMetadata ? { additional_metadata: config.additionalMetadata } : {}),
       },
-    })
+    });
     if (event === "session.idle" || event === "session.deleted" || event === "session.error") {
-      await daemon.flush(daemonSessionId)
+      await daemon.flush(daemonSessionId);
     }
-  }
+  };
 
   return {
     event: async ({ event }: { event: Event }) => {
       if (event.type === "server.instance.disposed") {
-        await daemon.flush(daemonSessionId)
-        await daemon.close()
-        return
+        await daemon.flush(daemonSessionId);
+        await daemon.close();
+        return;
       }
-      if (!FORWARDED_NATIVE_EVENTS.has(event.type)) return
-      await forward(event.type, { properties: event.properties })
+      if (!FORWARDED_NATIVE_EVENTS.has(event.type)) return;
+      await forward(event.type, { properties: event.properties });
     },
     "chat.message": async (hookInput, hookOutput) =>
       forward("chat.message", { input: hookInput, output: hookOutput }),
@@ -90,5 +90,5 @@ export function createDaemonTracingHooks(
       forward("tool.execute.before", { input: hookInput, output: hookOutput }),
     "tool.execute.after": async (hookInput, hookOutput) =>
       forward("tool.execute.after", { input: hookInput, result: hookOutput }),
-  }
+  };
 }

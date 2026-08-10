@@ -1,13 +1,13 @@
 /** Shared OpenCode plugin configuration. */
 
 export interface BraintrustConfig {
-  profile?: string
-  orgName?: string
-  projectName: string
-  tracingEnabled: boolean
-  enableTools: boolean
-  debug: boolean
-  additionalMetadata?: Record<string, unknown>
+  profile?: string;
+  orgName?: string;
+  projectName: string;
+  tracingEnabled: boolean;
+  enableTools: boolean;
+  debug: boolean;
+  additionalMetadata?: Record<string, unknown>;
 }
 
 /**
@@ -15,13 +15,13 @@ export interface BraintrustConfig {
  * Uses snake_case to match environment variable naming.
  */
 export interface PluginConfig {
-  profile?: string
-  org_name?: string
-  project?: string
-  trace_to_braintrust?: boolean
-  enable_tools?: boolean
-  debug?: boolean
-  additional_metadata?: Record<string, unknown>
+  profile?: string;
+  org_name?: string;
+  project?: string;
+  trace_to_braintrust?: boolean;
+  enable_tools?: boolean;
+  debug?: boolean;
+  additional_metadata?: Record<string, unknown>;
 }
 
 /**
@@ -30,9 +30,9 @@ export interface PluginConfig {
  * All other values (including undefined, "false", "0", "no") are falsy.
  */
 export function parseBooleanEnv(value: string | undefined): boolean {
-  if (!value) return false
-  const normalized = value.toLowerCase()
-  return normalized === "true" || normalized === "1"
+  if (!value) return false;
+  const normalized = value.toLowerCase();
+  return normalized === "true" || normalized === "1";
 }
 
 /**
@@ -50,32 +50,32 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
     tracingEnabled: false,
     enableTools: true,
     debug: false,
-  }
+  };
 
   // Layer 1: Apply opencode.json config (if provided)
   if (pluginConfig) {
-    if (pluginConfig.profile) defaults.profile = pluginConfig.profile
-    if (pluginConfig.org_name) defaults.orgName = pluginConfig.org_name
-    if (pluginConfig.project) defaults.projectName = pluginConfig.project
+    if (pluginConfig.profile) defaults.profile = pluginConfig.profile;
+    if (pluginConfig.org_name) defaults.orgName = pluginConfig.org_name;
+    if (pluginConfig.project) defaults.projectName = pluginConfig.project;
     if (pluginConfig.trace_to_braintrust !== undefined) {
-      defaults.tracingEnabled = pluginConfig.trace_to_braintrust
+      defaults.tracingEnabled = pluginConfig.trace_to_braintrust;
     }
     if (pluginConfig.enable_tools !== undefined) {
-      defaults.enableTools = pluginConfig.enable_tools
+      defaults.enableTools = pluginConfig.enable_tools;
     }
     if (pluginConfig.debug !== undefined) {
-      defaults.debug = pluginConfig.debug
+      defaults.debug = pluginConfig.debug;
     }
     if (pluginConfig.additional_metadata) {
-      defaults.additionalMetadata = pluginConfig.additional_metadata
+      defaults.additionalMetadata = pluginConfig.additional_metadata;
     }
   }
 
   // Layer 2: Apply environment variables (override opencode.json)
-  let additionalMetadata = defaults.additionalMetadata
+  let additionalMetadata = defaults.additionalMetadata;
   if (process.env.BRAINTRUST_ADDITIONAL_METADATA) {
     try {
-      additionalMetadata = JSON.parse(process.env.BRAINTRUST_ADDITIONAL_METADATA)
+      additionalMetadata = JSON.parse(process.env.BRAINTRUST_ADDITIONAL_METADATA);
     } catch {
       // Invalid JSON in env var — ignore and keep config file value (if any)
     }
@@ -95,5 +95,5 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
       ? parseBooleanEnv(process.env.BRAINTRUST_DEBUG)
       : defaults.debug,
     additionalMetadata,
-  }
+  };
 }

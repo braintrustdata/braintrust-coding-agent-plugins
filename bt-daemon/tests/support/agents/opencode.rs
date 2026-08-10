@@ -56,13 +56,17 @@ impl OpenCodeAgent {
         for directory in [&home, &config_home, &data_home, &cache_home] {
             std::fs::create_dir_all(directory).expect("create OpenCode test directory");
         }
-        let plugin = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("repository root")
-            .join("dist/opencode/dist/index.js");
+        let plugin = std::env::var_os("OPENCODE_PLUGIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("repository root")
+                    .join("dist/opencode/dist/index.mjs")
+            });
         assert!(
             plugin.is_file(),
-            "build the OpenCode plugin before running integration tests: {}",
+            "install the packed OpenCode plugin and set OPENCODE_PLUGIN before running integration tests: {}",
             plugin.display()
         );
         Self {

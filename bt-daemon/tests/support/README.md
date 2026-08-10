@@ -24,6 +24,11 @@ invocation flags, mock-inference routing, and process output. Runs remain
 configurable with additional arguments and environment variables so scenarios
 can add inputs such as attachment paths without duplicating CLI setup.
 
+OpenCode integration runs set `OPENCODE_PLUGIN` to the entrypoint from an
+isolated installation of the ephemeral npm package. This exercises the same
+peer-dependency resolution and published file allowlist as a registry install,
+rather than loading the monorepo build tree directly.
+
 The integration test composes those pieces: it hosts an inference router,
 starts the daemon world, runs an agent, and evaluates the ingest scenario. This
 keeps both protocol mocks usable without coding agents, keeps the generic
