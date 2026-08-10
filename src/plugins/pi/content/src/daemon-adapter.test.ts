@@ -129,8 +129,21 @@ describe("Pi daemon adapter", () => {
       model: { provider: "openai", id: "gpt-5" },
     });
     expect(mockState.flushes).toHaveLength(2);
+    const widgetUrls = widgets
+      .flatMap((args) => args)
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => {
+        try {
+          return new URL(value);
+        } catch {
+          return null;
+        }
+      })
+      .filter((value): value is URL => value !== null);
     expect(
-      widgets.some((args) => JSON.stringify(args).includes("https://www.braintrust.dev/trace/1")),
+      widgetUrls.some(
+        (url) => url.hostname === "www.braintrust.dev" && url.pathname === "/trace/1",
+      ),
     ).toBe(true);
     expect(statuses.length).toBeGreaterThan(0);
     expect(mockState.closed).toBe(1);
