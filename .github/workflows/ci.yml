@@ -154,7 +154,7 @@ jobs:
           (cd dist/pi && pnpm pack --pack-destination "$package_dir" >/dev/null)
           tarball="$(find "$package_dir" -name 'braintrust-pi-extension-*.tgz' -print -quit)"
           mkdir pi-install-test
-          pnpm --dir pi-install-test add --lockfile=false \
+          npm install --prefix pi-install-test --no-audit --no-fund \
             "$tarball" \
             '${{ matrix.pi-target.piCodingAgentSpec }}'
           node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
