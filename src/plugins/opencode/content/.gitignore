@@ -1,0 +1,13 @@
+node_modules/
+dist/
+src/runtime/daemon-client.ts
+*.log
+.env
+.env.local
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml

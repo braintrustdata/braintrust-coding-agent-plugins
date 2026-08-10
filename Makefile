@@ -22,8 +22,9 @@ DIST := dist
 # name would shadow it in recipe subshells.
 BUILD_RULES := $(addprefix build-,$(PLUGINS))
 PUBLISH_RULES := $(addprefix publish-,$(PLUGINS))
+VALIDATE_RULES := $(addprefix validate-,$(PLUGINS))
 
-.PHONY: build test publish clean $(BUILD_RULES) $(PUBLISH_RULES)
+.PHONY: build test publish clean $(BUILD_RULES) $(VALIDATE_RULES) $(PUBLISH_RULES)
 
 build: $(BUILD_RULES)
 
@@ -37,6 +38,10 @@ test: build
 		echo "==> validate $$p"; \
 		src/plugins/$$p/validate.sh "$(DIST)/$$p"; \
 	done
+
+$(VALIDATE_RULES): validate-%: build-%
+	@echo "==> validate $*"
+	@src/plugins/$*/validate.sh "$(DIST)/$*"
 
 # Deploy every plugin named in the PUBLISH_TARGETS env var map. Fails if unset.
 publish:

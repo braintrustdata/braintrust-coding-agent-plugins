@@ -91,12 +91,17 @@ impl BraintrustSinkFactory {
 }
 
 impl SinkFactory for BraintrustSinkFactory {
-    fn create(&self, _session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(
+        &self,
+        _session_id: &str,
+        source: &str,
+        plugin_version: Option<&str>,
+    ) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(BraintrustSink {
             cache: self.cache.clone(),
             default_api_url: self.default_api_url.clone(),
             default_app_url: self.default_app_url.clone(),
-            version: self.version.clone(),
+            version: plugin_version.unwrap_or(&self.version).to_string(),
             source: source.to_string(),
             creds: None,
             urls: None,

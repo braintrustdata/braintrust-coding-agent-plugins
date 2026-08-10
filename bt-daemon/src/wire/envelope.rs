@@ -13,6 +13,10 @@ pub struct Envelope {
     /// The agent version, for payload-drift handling. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
+    /// Version of the Braintrust instrumentation package that captured the
+    /// event. Distinct from the coding agent's `source_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_version: Option<String>,
     /// Per-session queue + state key.
     pub session_id: String,
     /// Agent-native hook event name (not normalized).
@@ -190,6 +194,7 @@ impl Envelope {
         RedactedEnvelope {
             source: self.source.clone(),
             source_version: self.source_version.clone(),
+            plugin_version: self.plugin_version.clone(),
             session_id: self.session_id.clone(),
             event: self.event.clone(),
             ts_ms: self.ts_ms,
@@ -206,6 +211,8 @@ pub struct RedactedEnvelope {
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_version: Option<String>,
     pub session_id: String,
     pub event: String,
     pub ts_ms: i64,
@@ -222,6 +229,7 @@ mod tests {
         Envelope {
             source: "codex".into(),
             source_version: Some("1.2.3".into()),
+            plugin_version: Some("0.4.0".into()),
             session_id: "sess-1".into(),
             event: "PostToolUse".into(),
             ts_ms: 1_753_639_552_123,

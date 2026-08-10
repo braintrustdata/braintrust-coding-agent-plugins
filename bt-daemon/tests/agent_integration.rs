@@ -3,7 +3,7 @@ mod support;
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 use support::agent_process::AgentTestWorld;
-use support::agents::{ClaudeAgent, ClaudeRun, CodexAgent, CodexRun};
+use support::agents::{ClaudeAgent, ClaudeRun, CodexAgent, CodexRun, OpenCodeAgent, OpenCodeRun};
 use support::inference::{
     AnthropicMock, AnthropicRequest, AnthropicTurn, MockReply, OpenAiMock, OpenAiRequest,
     OpenAiTurn,
@@ -35,6 +35,32 @@ fn codex_tool_call(request: &OpenAiRequest) -> OpenAiTurn {
         );
     }
     panic!("Codex offered no supported shell tool; offered tools: {names:?}");
+}
+
+fn shell_tool_call(request: &OpenAiRequest, call_id: &str, command: &str) -> OpenAiTurn {
+    let names = request.tool_names();
+    let name = ["bash", "shell", "shell_command", "exec_command"]
+        .into_iter()
+        .find(|name| names.contains(name))
+        .unwrap_or_else(|| {
+            panic!("agent offered no supported shell tool; offered tools: {names:?}")
+        });
+    let arguments = match name {
+        "exec_command" => json!({"cmd": command, "login": false}),
+        _ => json!({"command": command}),
+    };
+    OpenAiTurn::tool_call(call_id, name, arguments)
+}
+
+fn tool_command(marker: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("printf {marker}")
+    }
+    #[cfg(windows)]
+    {
+        format!("Write-Output {marker}")
+    }
 }
 
 fn codex_tool_command() -> &'static str {
@@ -224,6 +250,78 @@ async fn claude_session_emits_traces() {
             })
             .expect("Claude tool output", |row| {
                 row_contains(row, &[r#""type":"tool""#, "CLAUDE_TOOL_OK"])
+            });
+        world.wait_for_mock_ingest_scenario(&scenario).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the OpenCode CLI and built plugin"]
+async fn opencode_session_emits_traces() {
+    let inference = OpenAiMock::new(|_context, request| {
+        assert_eq!(request.model(), Some("mock-model"));
+        if request.tool_names().is_empty() {
+            return MockReply::response(OpenAiTurn::text("OpenCode harness"));
+        }
+        if request.has_function_output("call_opencode_1") {
+            return MockReply::response(OpenAiTurn::text("OPENCODE_MOCK_OK"));
+        }
+        MockReply::response(shell_tool_call(
+            &request,
+            "call_opencode_1",
+            &tool_command("OPENCODE_TOOL_OK"),
+        ))
+    });
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let opencode = OpenCodeAgent::new(&world);
+
+    let output = opencode
+        .run(
+            &world,
+            OpenCodeRun::new(
+                "Run a shell command that prints OPENCODE_TOOL_OK, then reply with OPENCODE_MOCK_OK.",
+            )
+                .mock_inference(inference_server.uri()),
+        )
+        .await;
+    output.assert_success();
+    if world.uses_mock_inference() {
+        output.assert_contains("OPENCODE_MOCK_OK");
+        assert!(
+            inference
+                .requests()
+                .iter()
+                .any(|request| request.has_function_output("call_opencode_1")),
+            "OpenCode did not return the tool result: {}",
+            output.text()
+        );
+    }
+
+    let rows = world.wait_for_trace_delivery().await;
+    if world.uses_mock_ingest() {
+        assert!(
+            rows.iter()
+                .any(|row| row_contains(row, &["braintrust.plugin.opencode", "1.0.0"])),
+            "OpenCode trace origin metadata was not emitted"
+        );
+    }
+    if world.uses_mock_inference() && world.uses_mock_ingest() {
+        let scenario = IngestScenario::new()
+            .expect("OpenCode trace origin", |row| {
+                row_contains(row, &["braintrust.plugin.opencode", "1.0.0"])
+            })
+            .expect("OpenCode turn input", |row| {
+                row_contains(row, &["Turn 1", "OPENCODE_TOOL_OK"])
+            })
+            .expect("OpenCode tool span", |row| {
+                row_contains(row, &[r#""type":"tool""#, "OPENCODE_TOOL_OK"])
+            })
+            .expect("OpenCode LLM span", |row| {
+                row_contains(row, &[r#""type":"llm""#, "call_opencode_1"])
+            })
+            .expect("OpenCode final LLM span", |row| {
+                row_contains(row, &[r#""type":"llm""#, "OPENCODE_MOCK_OK"])
             });
         world.wait_for_mock_ingest_scenario(&scenario).await;
     }

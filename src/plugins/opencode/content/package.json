@@ -1,0 +1,57 @@
+{
+  "name": "@braintrust/trace-opencode",
+  "version": "1.0.0",
+  "description": "Automatically trace OpenCode conversations to Braintrust. Captures user messages, assistant responses, and tool calls for observability.",
+  "keywords": [
+    "braintrust",
+    "evaluation",
+    "llm",
+    "observability",
+    "opencode",
+    "tracing"
+  ],
+  "license": "MIT",
+  "author": "Braintrust",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/braintrustdata/braintrust-coding-agent-plugins.git",
+    "directory": "src/plugins/opencode/content"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepare:daemon-client": "node ../../../../scripts/prepare-js-daemon-client.mjs opencode",
+    "build": "pnpm run prepare:daemon-client && vp pack",
+    "build:prepared": "vp pack",
+    "check": "pnpm run prepare:daemon-client && vp check",
+    "fmt": "vp fmt",
+    "lint": "vp lint",
+    "publish:dry-run": "pnpm run build && pnpm publish --dry-run --no-git-checks",
+    "smoke": "node -e \"import('./dist/index.mjs')\"",
+    "test": "pnpm run prepare:daemon-client && vitest run",
+    "test:watch": "pnpm run prepare:daemon-client && vitest",
+    "typecheck": "pnpm run check"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.1.14",
+    "@opencode-ai/sdk": "^1.1.14",
+    "@types/node": "^26.0.0",
+    "typescript": "^6.0.2",
+    "vite-plus": "^0.2.1",
+    "vitest": "^4.1.4"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.2.25",
+    "@opencode-ai/sdk": ">=1.2.25"
+  },
+  "packageManager": "pnpm@11.21.0"
+}

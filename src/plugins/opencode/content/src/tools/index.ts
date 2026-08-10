@@ -1,0 +1,152 @@
+/**
+ * Braintrust tools for OpenCode
+ *
+ * Provides tools for:
+ * - Querying logs
+ * - Listing projects
+ * - Logging data
+ */
+
+import type { ToolDefinition } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin";
+import type { BtCliToolsClient, ToolLogData } from "./bt-cli";
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Create Braintrust tools
+ */
+export function createBraintrustTools(client: BtCliToolsClient): Record<string, ToolDefinition> {
+  return {
+    braintrust_query_logs: tool({
+      description: `Query Braintrust logs using SQL.
+Use "FROM logs" in your query - it will be automatically rewritten.
+
+SQL dialect notes:
+- Use hour(timestamp_column), day(timestamp_column) instead of date_trunc
+- Use "interval 1 day" (singular unit, no quotes) for intervals
+- Use dot notation for nested fields: metadata.key
+- Common columns: id, input, output, expected, scores, metadata, created
+
+Example queries:
+- SELECT * FROM logs ORDER BY created DESC LIMIT 10
+- SELECT * FROM logs WHERE scores.Factuality < 0.5
+- SELECT * FROM logs WHERE created > now() - interval 1 hour`,
+      args: {
+        query: tool.schema.string().describe("SQL query to execute against Braintrust logs"),
+      },
+      async execute(args) {
+        try {
+          const results = await client.queryLogs(args.query);
+          return JSON.stringify(results, null, 2);
+        } catch (error) {
+          return `Error executing query: ${formatError(error)}`;
+        }
+      },
+    }),
+
+    braintrust_list_projects: tool({
+      description: "List all projects in your Braintrust organization",
+      args: {},
+      async execute() {
+        try {
+          const projects = await client.listProjects();
+          if (projects.length === 0) {
+            return "No projects found.";
+          }
+          return projects.map((p) => `- ${p.name} (${p.id})`).join("\n");
+        } catch (error) {
+          return `Error listing projects: ${formatError(error)}`;
+        }
+      },
+    }),
+
+    braintrust_log_data: tool({
+      description: `Log data to Braintrust for evaluation or tracking.
+You can log input/output pairs, scores, and metadata.
+
+This is useful for:
+- Recording important decisions or outputs for review
+- Creating evaluation datasets
+- Tracking model performance over time`,
+      args: {
+        input: tool.schema.string().optional().describe("The input that was given (optional)"),
+        output: tool.schema.string().optional().describe("The output that was produced (optional)"),
+        expected: tool.schema.string().optional().describe("The expected/ideal output (optional)"),
+        scores: tool.schema
+          .string()
+          .optional()
+          .describe('JSON object of scores, e.g. {"accuracy": 0.95, "relevance": 0.8}'),
+        metadata: tool.schema
+          .string()
+          .optional()
+          .describe('JSON object of additional metadata, e.g. {"task_type": "code_review"}'),
+        tags: tool.schema.string().optional().describe("Comma-separated list of tags"),
+      },
+      async execute(args) {
+        try {
+          const spanId = crypto.randomUUID();
+
+          const data: ToolLogData = {
+            id: crypto.randomUUID(),
+            span_id: spanId,
+            root_span_id: spanId,
+            span_attributes: {
+              name: "Manual Log",
+              type: "task",
+            },
+          };
+
+          if (args.input) data.input = args.input;
+          if (args.output) data.output = args.output;
+          if (args.expected) data.expected = args.expected;
+
+          if (args.scores) {
+            try {
+              data.scores = JSON.parse(args.scores);
+            } catch {
+              return "Error: scores must be valid JSON";
+            }
+          }
+
+          if (args.metadata) {
+            try {
+              data.metadata = JSON.parse(args.metadata);
+            } catch {
+              return "Error: metadata must be valid JSON";
+            }
+          }
+
+          if (args.tags) {
+            data.tags = args.tags.split(",").map((t) => t.trim());
+          }
+
+          const rowId = await client.logData(data);
+          return `Successfully logged data with ID: ${rowId}`;
+        } catch (error) {
+          return `Error logging data: ${formatError(error)}`;
+        }
+      },
+    }),
+
+    braintrust_get_experiments: tool({
+      description: "List recent experiments for the current project",
+      args: {
+        limit: tool.schema
+          .number()
+          .optional()
+          .describe("Maximum number of experiments to return (default: 10)"),
+      },
+      async execute(args) {
+        const limit = args.limit || 10;
+        try {
+          return JSON.stringify(await client.listExperiments(limit), null, 2);
+        } catch (error) {
+          return `Error getting experiments: ${formatError(error)}`;
+        }
+      },
+    }),
+  };
+}

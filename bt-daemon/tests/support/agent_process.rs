@@ -1,6 +1,6 @@
 use crate::support::ingest::{IngestMock, IngestScenario};
 use crate::support::server::TestServer;
-use bt_daemon::{run_status, StatusArgs};
+use bt_daemon::{flush_session, run_status, StatusArgs};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,6 +12,10 @@ use uuid::Uuid;
 
 const INFERENCE_MODE_ENV: &str = "BT_AGENT_INFERENCE_MODE";
 const INGEST_MODE_ENV: &str = "BT_AGENT_INGEST_MODE";
+const BT_BIN_ENV: &str = "BT_AGENT_BT_BIN";
+const PROFILE_ENV: &str = "BT_AGENT_PROFILE";
+const ORG_ENV: &str = "BT_AGENT_ORG";
+const PROJECT_ENV: &str = "BT_AGENT_PROJECT";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestBackendMode {
@@ -54,6 +58,9 @@ impl AgentTestWorld {
         let data_dir = root.path().join("daemon");
         let socket = test_endpoint(root.path());
         let config_path = data_dir.join("config.json");
+        let profile = selection(PROFILE_ENV, "BRAINTRUST_PROFILE");
+        let org = selection(ORG_ENV, "BRAINTRUST_ORG_NAME");
+        let project = std::env::var(PROJECT_ENV).unwrap_or_else(|_| "agent-e2e".into());
         std::fs::create_dir_all(&wrapper_dir).expect("create wrapper directory");
         std::fs::create_dir_all(&data_dir).expect("create daemon data directory");
         std::fs::write(
@@ -61,7 +68,8 @@ impl AgentTestWorld {
             serde_json::to_vec_pretty(&json!({
                 "traceToBraintrust": true,
                 "route": {
-                    "destination": {"type": "project_logs", "project_name": "agent-e2e"},
+                    "auth": {"profile": profile, "org_name": org},
+                    "destination": {"type": "project_logs", "project_name": project},
                     "flush_mode": "flush_on_turn_end",
                     "additional_metadata": {"test_harness": true}
                 }
@@ -71,11 +79,25 @@ impl AgentTestWorld {
         .expect("write daemon config");
 
         let daemon_binary = Path::new(env!("CARGO_BIN_EXE_bt-daemon"));
-        write_bt_wrapper(&wrapper_dir, daemon_binary);
-
-        let mut command = Command::new(daemon_binary);
+        let mut command = if ingest_mode == TestBackendMode::Live {
+            let bt_binary = std::env::var_os(BT_BIN_ENV).unwrap_or_else(|| "bt".into());
+            write_bt_host_wrapper(&wrapper_dir, Path::new(&bt_binary));
+            let mut command = Command::new(bt_binary);
+            command.args(["trace", "daemon"]);
+            if let Some(profile) = selection(PROFILE_ENV, "BRAINTRUST_PROFILE") {
+                command.arg("--profile").arg(profile);
+            }
+            if let Some(org) = selection(ORG_ENV, "BRAINTRUST_ORG_NAME") {
+                command.arg("--org").arg(org);
+            }
+            command
+        } else {
+            write_bt_wrapper(&wrapper_dir, daemon_binary);
+            let mut command = Command::new(daemon_binary);
+            command.arg("serve");
+            command
+        };
         command
-            .arg("serve")
             .arg("--socket")
             .arg(&socket)
             .arg("--data-dir")
@@ -90,11 +112,12 @@ impl AgentTestWorld {
             command
                 .env("BRAINTRUST_API_KEY", "test-key")
                 .env("BRAINTRUST_API_URL", collector_server.uri())
-                .env("BRAINTRUST_APP_URL", collector_server.uri());
+                .env("BRAINTRUST_APP_URL", collector_server.uri())
+                .env("BRAINTRUST_PROJECT", "agent-e2e");
         }
         let daemon = command.spawn().expect("start daemon");
 
-        wait_for_daemon(daemon_binary, &socket).await;
+        wait_for_daemon(&socket).await;
         Self {
             inference_mode,
             ingest_mode,
@@ -142,7 +165,17 @@ impl AgentTestWorld {
             .env("BT_DAEMON_DATA_DIR", &self.data_dir)
             .env("BT_DAEMON_CONFIG", &self.config_path)
             .env("BRAINTRUST_FLUSH_ON_TURN_END", "true")
+            .env("BRAINTRUST_ADDITIONAL_METADATA", r#"{"test_harness":true}"#)
             .stdin(Stdio::null());
+        if let Ok(profile) = std::env::var(PROFILE_ENV) {
+            command.env("BRAINTRUST_PROFILE", profile);
+        }
+        if let Ok(org) = std::env::var(ORG_ENV) {
+            command.env("BRAINTRUST_ORG_NAME", org);
+        }
+        if let Ok(project) = std::env::var(PROJECT_ENV) {
+            command.env("BRAINTRUST_PROJECT", project);
+        }
         if self.uses_mock_ingest() {
             command
                 .env("BRAINTRUST_API_KEY", "test-key")
@@ -243,6 +276,40 @@ impl AgentTestWorld {
                         "live ingest reported daemon sink errors: {errors:?}"
                     );
                     if emitted {
+                        for session in &status.sessions {
+                            let result = flush_session(&session.session_id, &self.socket, 10_000)
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "failed to flush live ingest session {}: {error}",
+                                        session.session_id
+                                    )
+                                });
+                            assert!(
+                                result.flushed && result.pending == 0,
+                                "live ingest session {} did not flush: {result:?}",
+                                session.session_id
+                            );
+                            if let Some(permalink) = &session.permalink {
+                                eprintln!("Braintrust trace: {permalink}");
+                            }
+                        }
+                        let flushed_status = run_status(StatusArgs {
+                            socket: Some(self.socket.clone()),
+                            session_id: None,
+                        })
+                        .await
+                        .expect("query daemon status after live ingest flush")
+                        .expect("daemon stopped during live ingest flush");
+                        let flush_errors = flushed_status
+                            .sessions
+                            .iter()
+                            .filter_map(|session| session.last_error.as_deref())
+                            .collect::<Vec<_>>();
+                        assert!(
+                            flush_errors.is_empty(),
+                            "live ingest flush reported daemon sink errors: {flush_errors:?}"
+                        );
                         return Vec::new();
                     }
                 }
@@ -253,6 +320,13 @@ impl AgentTestWorld {
         }
         panic!("live ingest emitted no spans; last daemon status: {last_status}");
     }
+}
+
+fn selection(primary: &str, fallback: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(fallback).ok())
+        .filter(|value| !value.trim().is_empty())
 }
 
 impl Drop for AgentTestWorld {
@@ -274,6 +348,18 @@ fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
     let mut permissions = std::fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).expect("make bt wrapper executable");
+}
+
+#[cfg(unix)]
+fn write_bt_host_wrapper(directory: &Path, bt_binary: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = directory.join("bt");
+    let script = format!("#!/bin/sh\nexec '{}' \"$@\"\n", bt_binary.display());
+    std::fs::write(&path, script).expect("write bt host wrapper");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("make bt host wrapper executable");
 }
 
 #[cfg(windows)]
@@ -306,6 +392,25 @@ fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
     std::fs::write(directory.join("bt"), shell).expect("write bt Git Bash wrapper");
 }
 
+#[cfg(windows)]
+fn write_bt_host_wrapper(directory: &Path, bt_binary: &Path) {
+    let powershell = directory.join("bt-wrapper.ps1");
+    let script = format!("& '{}' @args\nexit $LASTEXITCODE\n", bt_binary.display());
+    std::fs::write(&powershell, script).expect("write bt host PowerShell wrapper");
+    std::fs::write(
+        directory.join("bt.cmd"),
+        "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0bt-wrapper.ps1\" %*\r\n",
+    )
+    .expect("write bt host command wrapper");
+
+    let shell_binary = bt_binary.to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        directory.join("bt"),
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", shell_binary),
+    )
+    .expect("write bt host Git Bash wrapper");
+}
+
 #[cfg(unix)]
 fn test_endpoint(root: &Path) -> PathBuf {
     root.join("daemon.sock")
@@ -319,20 +424,17 @@ fn test_endpoint(_root: &Path) -> PathBuf {
     ))
 }
 
-async fn wait_for_daemon(daemon_binary: &Path, endpoint: &Path) {
+async fn wait_for_daemon(endpoint: &Path) {
     for _ in 0..100 {
-        let output = Command::new(daemon_binary)
-            .arg("status")
-            .arg("--socket")
-            .arg(endpoint)
-            .output()
-            .await;
-        if let Ok(output) = output {
-            if output.status.success()
-                && !String::from_utf8_lossy(&output.stdout).contains("not running")
-            {
-                return;
-            }
+        if matches!(
+            run_status(StatusArgs {
+                socket: Some(endpoint.to_path_buf()),
+                session_id: None,
+            })
+            .await,
+            Ok(Some(_))
+        ) {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

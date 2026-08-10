@@ -46,6 +46,7 @@ fn replay(name: &str) -> Vec<SpanOp> {
         let env = Envelope {
             source: "claude-code".into(),
             source_version: None,
+            plugin_version: None,
             session_id: session_id.into(),
             event: record["hook"].as_str().unwrap().into(),
             ts_ms,
@@ -254,6 +255,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
     let event = |name: &str, payload: Value| Envelope {
         source: "claude-code".into(),
         source_version: None,
+        plugin_version: None,
         session_id: "s".into(),
         event: name.into(),
         ts_ms: 1,
@@ -341,6 +343,7 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
     let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
         source: "claude-code".into(),
         source_version: Some("2.0.0".into()),
+        plugin_version: None,
         session_id: "lifecycle".into(),
         event: name.into(),
         ts_ms,
@@ -458,6 +461,7 @@ fn claude_groups_streamed_rows_and_reads_late_final_output_at_session_end() {
     let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
         source: "claude-code".into(),
         source_version: None,
+        plugin_version: None,
         session_id: "streamed".into(),
         event: name.into(),
         ts_ms,

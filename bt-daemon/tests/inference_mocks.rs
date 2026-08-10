@@ -22,7 +22,8 @@ async fn openai_mock_streams_text_and_captures_requests() {
         .unwrap();
     let body = response.text().await.unwrap();
 
-    assert!(body.contains("response.output_item.done"));
+    assert!(body.contains("response.output_text.done"));
+    assert!(body.contains("response.completed"));
     assert!(body.contains("deterministic"));
     assert_eq!(mock.requests().len(), 1);
 }

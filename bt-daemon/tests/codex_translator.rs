@@ -57,6 +57,7 @@ fn envelope(session: &str, event: &str, transcript_path: &str, extra: Value) -> 
     Envelope {
         source: "codex".into(),
         source_version: None,
+        plugin_version: None,
         session_id: session.into(),
         event: event.into(),
         ts_ms: 0,

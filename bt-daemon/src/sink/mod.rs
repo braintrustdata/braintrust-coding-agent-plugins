@@ -36,8 +36,14 @@ pub trait Sink: Send {
     }
 }
 
-/// Builds a sink per session. `source` is the agent id (e.g. `codex`), used by
-/// the Braintrust sink to stamp `context.span_origin`.
+/// Builds a sink per session. `source` and `plugin_version` identify the
+/// instrumentation that captured the events and are used to stamp
+/// `context.span_origin` centrally.
 pub trait SinkFactory: Send + Sync {
-    fn create(&self, session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>>;
+    fn create(
+        &self,
+        session_id: &str,
+        source: &str,
+        plugin_version: Option<&str>,
+    ) -> anyhow::Result<Box<dyn Sink>>;
 }

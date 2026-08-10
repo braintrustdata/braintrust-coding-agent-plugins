@@ -105,7 +105,7 @@ async fn multi_profile_sessions_route_to_their_own_backend() {
         version: "test".into(),
     });
 
-    let mut sink_a = factory.create("sess-a", "codex").unwrap();
+    let mut sink_a = factory.create("sess-a", "codex", None).unwrap();
     sink_a.configure(&session_config(&base_a));
     sink_a
         .emit(&[SpanOp::Insert(row(
@@ -121,7 +121,7 @@ async fn multi_profile_sessions_route_to_their_own_backend() {
         .unwrap();
     sink_a.flush().await.unwrap();
 
-    let mut sink_b = factory.create("sess-b", "codex").unwrap();
+    let mut sink_b = factory.create("sess-b", "codex", None).unwrap();
     sink_b.configure(&session_config(&base_b));
     sink_b
         .emit(&[SpanOp::Insert(row(
@@ -157,7 +157,7 @@ async fn merge_with_empty_name_does_not_clobber_the_original_name() {
         app_url: Some(base.clone()),
         version: "test".into(),
     });
-    let mut sink = factory.create("sess-1", "codex").unwrap();
+    let mut sink = factory.create("sess-1", "codex", None).unwrap();
     sink.configure(&session_config(&base));
 
     let named = row("s1", "s1", &[], "codex: myapp", SpanType::Task, 1, None);
@@ -185,7 +185,7 @@ async fn attached_trace_children_keep_the_external_root() {
         app_url: Some(base.clone()),
         version: "test".into(),
     });
-    let mut sink = factory.create("sess-1", "codex").unwrap();
+    let mut sink = factory.create("sess-1", "codex", None).unwrap();
     let mut config = session_config(&base);
     let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
     components.object_id = Some("proj-parent".into());
@@ -222,7 +222,7 @@ async fn exported_parent_preserves_object_root_and_propagated_event() {
         app_url: Some(base.clone()),
         version: "test".into(),
     });
-    let mut sink = factory.create("sess-parent", "codex").unwrap();
+    let mut sink = factory.create("sess-parent", "codex", None).unwrap();
     let mut config = session_config(&base);
     let mut components = SpanComponents::new(SpanObjectType::Experiment);
     components.object_id = Some("exp-parent".into());
@@ -287,7 +287,7 @@ async fn braintrust_sink_delivers_spans_to_collector() {
         version: "test".into(),
     });
 
-    let mut sink = factory.create("sess-1", "codex").unwrap();
+    let mut sink = factory.create("sess-1", "codex", Some("0.9.0")).unwrap();
     sink.configure(&session_config(&base));
 
     // A session root (task) and a child tool span under it.
@@ -343,6 +343,14 @@ async fn braintrust_sink_delivers_spans_to_collector() {
     );
     assert!(bodies.contains("codex: sess-1"), "root span name missing");
     assert!(bodies.contains("\"command\""), "tool input missing");
+    assert!(
+        bodies.contains("braintrust.plugin.codex"),
+        "shared span origin name missing"
+    );
+    assert!(
+        bodies.contains("0.9.0"),
+        "plugin version missing from shared span origin"
+    );
 
     // Project registration happened (org_name path, no login).
     assert!(
@@ -367,7 +375,7 @@ async fn experiment_sessions_use_experiment_object_type_and_id() {
         app_url: Some(base.clone()),
         version: "test".into(),
     });
-    let mut sink = factory.create("sess-exp", "claude-code").unwrap();
+    let mut sink = factory.create("sess-exp", "claude-code", None).unwrap();
     let mut config = session_config(&base);
     config.destination = Some(TraceDestination::Experiment {
         experiment_id: "exp-42".into(),

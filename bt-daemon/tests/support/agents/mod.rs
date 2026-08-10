@@ -1,30 +1,35 @@
 mod claude;
 mod codex;
+mod opencode;
 mod test_plugin;
 
 #[allow(unused_imports)]
 pub use claude::{ClaudeAgent, ClaudeRun};
 #[allow(unused_imports)]
 pub use codex::{CodexAgent, CodexRun};
+#[allow(unused_imports)]
+pub use opencode::{OpenCodeAgent, OpenCodeRun};
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use tokio::process::Command;
 
 pub struct AgentOutput {
-    output: std::process::Output,
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 impl AgentOutput {
     pub fn success(&self) -> bool {
-        self.output.status.success()
+        self.success
     }
 
     pub fn text(&self) -> String {
         format!(
             "stdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&self.output.stdout),
-            String::from_utf8_lossy(&self.output.stderr)
+            String::from_utf8_lossy(&self.stdout),
+            String::from_utf8_lossy(&self.stderr)
         )
     }
 
@@ -43,11 +48,30 @@ impl AgentOutput {
             self.text()
         );
     }
+
+    fn from_http_result(result: Result<String, String>) -> Self {
+        match result {
+            Ok(stdout) => Self {
+                success: true,
+                stdout: stdout.into_bytes(),
+                stderr: Vec::new(),
+            },
+            Err(stderr) => Self {
+                success: false,
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            },
+        }
+    }
 }
 
 impl From<std::process::Output> for AgentOutput {
     fn from(output: std::process::Output) -> Self {
-        Self { output }
+        Self {
+            success: output.status.success(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
     }
 }
 
@@ -70,6 +94,10 @@ impl ProcessOptions {
         command
             .args(&self.args)
             .envs(self.env.iter().map(|(k, v)| (k, v)));
+    }
+
+    fn apply_env(&self, command: &mut Command) {
+        command.envs(self.env.iter().map(|(k, v)| (k, v)));
     }
 }
 

@@ -214,6 +214,7 @@ pub async fn run_hook(
     let env = Envelope {
         source: args.source.clone(),
         source_version: args.source_version.clone(),
+        plugin_version: None,
         session_id,
         event,
         ts_ms: now_ms(),
@@ -612,7 +613,11 @@ impl ImportProcessor {
                 Some(live) => live,
                 None => {
                     let translator = self.opts.translators.create(&env.source, &sid);
-                    let sink = self.opts.sink_factory.create(&sid, &env.source)?;
+                    let sink = self.opts.sink_factory.create(
+                        &sid,
+                        &env.source,
+                        env.plugin_version.as_deref(),
+                    )?;
                     self.sessions.insert(
                         sid.clone(),
                         ImportLive {
