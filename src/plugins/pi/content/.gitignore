@@ -20,6 +20,7 @@ pnpm-debug.log*
 # Local cache/state
 .cache/
 dist/
+src/runtime/daemon-client.ts
 
 # OS files
 .DS_Store

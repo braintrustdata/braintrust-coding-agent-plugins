@@ -9,6 +9,9 @@ The extension forwards native pi events to the installed `bt` tracing daemon;
 all span construction, authentication, recovery, and Braintrust delivery happen
 inside the daemon.
 
+Version 1 requires a current `bt` CLI with the Pi daemon translator. If `bt` or
+the translator is unavailable, tracing fails open and Pi keeps running.
+
 ## What gets traced
 
 - **Session spans**: one root span per pi session that actually produces at least one turn

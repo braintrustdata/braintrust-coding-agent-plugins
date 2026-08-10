@@ -7,11 +7,11 @@ fn event(name: &str, ts_ms: i64, native: serde_json::Value) -> Envelope {
     Envelope {
         source: "pi".into(),
         source_version: Some("0.80.10".into()),
-        plugin_version: Some("0.10.0".into()),
+        plugin_version: Some("1.0.0".into()),
         session_id: "pi-session".into(),
         event: name.into(),
         ts_ms,
-        payload: json!({"event":native,"extension_version":"0.10.0","cwd":"."}),
+        payload: json!({"event":native,"extension_version":"1.0.0","cwd":"."}),
         route: None,
         config: None,
     }

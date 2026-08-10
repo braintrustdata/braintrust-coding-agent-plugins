@@ -14,12 +14,12 @@ Run the package checks from this directory with:
 pnpm install --frozen-lockfile
 pnpm run check
 pnpm test
+pnpm run build
 pnpm run smoke
-pnpm run pack
 ```
 
-From the monorepo root, `make validate-pi` performs the complete package and
-tarball validation. The Rust translator and real-agent harness live under
+From the monorepo root, `make validate-pi` performs the complete package
+validation. The Rust translator and real-agent harness live under
 `bt-daemon/` and are exercised by the root CI workflow.
 
 Configuration precedence remains defaults, the global pi extension config,

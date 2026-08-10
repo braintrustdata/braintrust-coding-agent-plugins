@@ -376,7 +376,7 @@ async fn pi_session_emits_traces() {
     if world.uses_mock_ingest() {
         assert!(
             rows.iter()
-                .any(|row| row_contains(row, &["braintrust.plugin.pi", "test_harness"])),
+                .any(|row| row_contains(row, &["braintrust.plugin.pi", "1.0.0", "test_harness"])),
             "Pi trace origin metadata was not emitted"
         );
     }

@@ -1,6 +1,6 @@
 {
   "name": "@braintrust/pi-extension",
-  "version": "0.10.0",
+  "version": "1.0.0",
   "description": "Braintrust extension for pi. Includes automatic tracing for pi sessions, turns, LLM calls, and tool executions to Braintrust.",
   "keywords": [
     "braintrust",
@@ -13,7 +13,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/braintrustdata/plugin-monorepo.git",
+    "url": "https://github.com/braintrustdata/braintrust-coding-agent-plugins.git",
     "directory": "src/plugins/pi/content"
   },
   "files": [
@@ -28,17 +28,20 @@
     "access": "public"
   },
   "scripts": {
-    "preinstall": "node -e \"const userAgent = process.env.npm_config_user_agent || ''; if (process.env.INIT_CWD === process.cwd() && !userAgent.includes('pnpm/')) { console.error('Use pnpm in this repo.'); process.exit(1); }\"",
-    "check": "node scripts/sync-version.mjs --check && vp check",
+    "prepare:daemon-client": "node ../../../../scripts/prepare-js-daemon-client.mjs pi",
+    "build": "pnpm run prepare:daemon-client && pnpm run sync:version && vp pack",
+    "build:prepared": "pnpm run sync:version && vp pack",
+    "check": "pnpm run prepare:daemon-client && node scripts/sync-version.mjs --check && vp check",
     "fmt": "vp fmt",
     "lint": "vp lint",
     "prepack": "node scripts/sync-version.mjs",
-    "pack": "vp pack",
+    "pack": "pnpm run build",
+    "publish:dry-run": "pnpm run build && pnpm publish --dry-run --no-git-checks",
+    "smoke": "node -e \"import('./dist/index.mjs')\"",
     "sync:version": "node scripts/sync-version.mjs",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "typecheck": "vp check",
-    "smoke": "vp exec node -e \"import('./src/index.ts')\""
+    "test": "pnpm run prepare:daemon-client && vitest run",
+    "test:watch": "pnpm run prepare:daemon-client && vitest",
+    "typecheck": "pnpm run check"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.2",
@@ -50,19 +53,7 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": ">=10.33.0",
-      "onFail": "error"
-    }
-  },
-  "engines": {
-    "npm": "please-use-pnpm",
-    "pnpm": ">=10.33.0",
-    "yarn": "please-use-pnpm"
-  },
-  "packageManager": "pnpm@10.33.0",
+  "packageManager": "pnpm@11.21.0",
   "pi": {
     "extensions": [
       "./dist/index.mjs"

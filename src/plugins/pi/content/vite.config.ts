@@ -2,7 +2,7 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   fmt: {
-    ignorePatterns: ["AGENTS.md", "README.md", "dist/**"],
+    ignorePatterns: ["AGENTS.md", "README.md", "dist/**", "src/runtime/daemon-client.ts"],
   },
   lint: {
     ignorePatterns: ["dist/**"],

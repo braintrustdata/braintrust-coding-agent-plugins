@@ -58,7 +58,7 @@ impl PiAgent {
             });
         assert!(
             extension.is_file(),
-            "build the Pi extension before running integration tests: {}",
+            "install the packed Pi extension and set PI_EXTENSION_PATH before running integration tests: {}",
             extension.display()
         );
         Self {
