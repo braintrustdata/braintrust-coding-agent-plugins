@@ -92,7 +92,7 @@ Result:
 {
   "protocol_version": 1,
   "daemon_version": "0.1.0",
-  "capabilities": { "sources": ["codex", "claude-code", "opencode", "debug"] }
+  "capabilities": { "sources": ["codex", "claude-code", "opencode", "pi", "debug"] }
 }
 ```
 If `protocol_version` is incompatible the daemon returns an application error;

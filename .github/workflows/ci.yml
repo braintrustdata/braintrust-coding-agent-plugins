@@ -32,7 +32,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: src/plugins/opencode/content/pnpm-lock.yaml
+          cache-dependency-path: |
+            src/plugins/opencode/content/pnpm-lock.yaml
+            src/plugins/pi/content/pnpm-lock.yaml
       - name: Reject Bun tooling in OpenCode and the shared client
         shell: bash
         run: |
@@ -66,8 +68,8 @@ jobs:
         run: node --test src/runtime/js-daemon-client/tests/client.test.ts
       - name: Verify generated client preparation
         run: |
-          node scripts/prepare-js-daemon-client.mjs opencode
-          node scripts/prepare-js-daemon-client.mjs opencode --check
+          node scripts/prepare-js-daemon-client.mjs all
+          node scripts/prepare-js-daemon-client.mjs all --check
 
   opencode-compatibility:
     name: OpenCode package (${{ matrix.peer-version }})
@@ -107,6 +109,57 @@ jobs:
           node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
             "$PWD/install-test/node_modules/@braintrust/trace-opencode/dist/index.mjs"
 
+  resolve-pi-compatibility:
+    name: Resolve Pi compatibility window
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - id: versions
+        name: Resolve latest patch from five Pi minor lines
+        env:
+          PI_VERSION_COUNT: 5
+        run: node src/plugins/pi/content/scripts/resolve-pi-versions.mjs
+
+  pi-compatibility:
+    name: Pi package (${{ matrix.pi-target.version }})
+    needs: resolve-pi-compatibility
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-target: ${{ fromJson(needs.resolve-pi-compatibility.outputs.versions) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          version: 11.21.0
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: src/plugins/pi/content/pnpm-lock.yaml
+      - name: Build and validate Pi package
+        run: make validate-pi
+      - name: Test resolved Pi compatibility target
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="$(mktemp -d)"
+          (cd dist/pi && pnpm pack --pack-destination "$package_dir" >/dev/null)
+          tarball="$(find "$package_dir" -name 'braintrust-pi-extension-*.tgz' -print -quit)"
+          mkdir pi-install-test
+          npm install --prefix pi-install-test --no-audit --no-fund \
+            "$tarball" \
+            '${{ matrix.pi-target.piCodingAgentSpec }}'
+          node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
+            "$PWD/pi-install-test/node_modules/@braintrust/pi-extension/dist/index.mjs"
+
   daemon:
     name: Daemon (${{ matrix.os }})
     strategy:
@@ -129,7 +182,7 @@ jobs:
           rustup default stable
           rustup component add clippy rustfmt
       - name: Install latest coding agents
-        run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest
+        run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest @earendil-works/pi-coding-agent@latest
       - name: Set up pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
         with:
@@ -139,7 +192,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: src/plugins/opencode/content/pnpm-lock.yaml
+          cache-dependency-path: |
+            src/plugins/opencode/content/pnpm-lock.yaml
+            src/plugins/pi/content/pnpm-lock.yaml
       - name: Build and install OpenCode plugin for integration harness
         shell: bash
         run: |
@@ -154,11 +209,24 @@ jobs:
             "$tarball" @opencode-ai/plugin@latest @opencode-ai/sdk@latest
           echo "OPENCODE_PLUGIN=$install_dir/node_modules/@braintrust/trace-opencode/dist/index.mjs" \
             >> "$GITHUB_ENV"
+      - name: Build and install Pi extension for integration harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          make build-pi
+          package_dir="$RUNNER_TEMP/pi-package"
+          install_dir="$RUNNER_TEMP/pi-extension"
+          mkdir -p "$package_dir" "$install_dir"
+          (cd dist/pi && pnpm pack --pack-destination "$package_dir" >/dev/null)
+          tarball="$(find "$package_dir" -name 'braintrust-pi-extension-*.tgz' -print -quit)"
+          npm install --prefix "$install_dir" --no-save --no-package-lock --no-audit --no-fund \
+            "$tarball"
       - name: Report coding-agent versions
         run: |
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- codex --version
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- claude --version
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- opencode --version
+          npm exec --prefix "${{ runner.temp }}/coding-agents" -- pi --version
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --manifest-path bt-daemon/Cargo.toml -- --check
@@ -173,6 +241,8 @@ jobs:
           CODEX_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/codex${{ matrix.agent_suffix }}
           CLAUDE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/claude${{ matrix.agent_suffix }}
           OPENCODE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/opencode${{ matrix.agent_suffix }}
+          PI_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/pi${{ matrix.agent_suffix }}
+          PI_EXTENSION_PATH: ${{ runner.temp }}/pi-extension/node_modules/@braintrust/pi-extension/dist/index.mjs
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
       - name: Lint daemon
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings

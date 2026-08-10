@@ -148,9 +148,10 @@ export class DaemonClient {
   async status(sessionId?: string): Promise<DaemonStatus | undefined> {
     return this.serial(async () => {
       try {
-        return (await this.request("status.get", {
-          ...(sessionId ? { session_id: sessionId } : {}),
-        })) as DaemonStatus
+        return (await this.request(
+          "status.get",
+          sessionId ? { session_id: sessionId } : {},
+        )) as DaemonStatus
       } catch (error) {
         this.warnOnce(`status:${String(error)}`)
         return undefined
