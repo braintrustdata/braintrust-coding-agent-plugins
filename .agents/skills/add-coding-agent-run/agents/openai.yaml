@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Agent Run"
+  short_description: "Launch an agent with invocation-local tracing"
+  default_prompt: "Use $add-coding-agent-run to add managed tracing runs for a coding agent."

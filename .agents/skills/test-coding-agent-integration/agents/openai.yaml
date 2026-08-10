@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Agent Integration"
+  short_description: "Verify agent tracing from events to delivered spans"
+  default_prompt: "Use $test-coding-agent-integration to verify a coding-agent integration end to end."

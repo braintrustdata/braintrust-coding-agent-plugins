@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ship Agent Integration"
+  short_description: "Package and release a coding-agent integration"
+  default_prompt: "Use $ship-coding-agent-integration to prepare and ship a coding-agent integration."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Coding Agent Integration"
+  short_description: "Orchestrate all coding-agent integration layers"
+  default_prompt: "Use $add-coding-agent-integration to coordinate a complete coding-agent integration."

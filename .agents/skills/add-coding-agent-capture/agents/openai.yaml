@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Agent Capture"
+  short_description: "Forward agent events through hooks or plugins"
+  default_prompt: "Use $add-coding-agent-capture to add daemon event capture for a coding agent."
