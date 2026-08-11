@@ -13,6 +13,7 @@
 pub mod paths;
 
 mod client;
+mod command_output;
 mod dispatch;
 mod ids;
 mod journal;
@@ -25,6 +26,9 @@ mod transport;
 
 pub mod wire;
 pub use client::HostInfo;
+pub use command_output::{
+    OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
+};
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
 pub use translate::{
