@@ -41,6 +41,7 @@ pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 
+use anyhow::Context;
 use braintrust_sdk_rust::SpanComponents;
 use clap::{Args, ValueEnum};
 use std::ffi::OsString;
@@ -126,18 +127,27 @@ pub struct ImportArgs {
     /// Agent that produced the session.
     #[arg(value_enum)]
     pub source: ImportSource,
-    /// Codex or Claude Code session id shown by the agent's resume command.
-    pub session_id: String,
+    /// One or more session ids shown by the agent's resume command.
+    #[arg(
+        value_name = "SESSION_ID",
+        num_args = 1..,
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    pub session_ids: Vec<String>,
+    /// Import every locally discoverable session for this agent.
+    #[arg(long, conflicts_with = "session_ids")]
+    pub all: bool,
     /// Destination object reference, such as `project_logs:<project-id>` or
     /// `experiment:<experiment-id>`.
-    #[arg(value_name = "DESTINATION", conflicts_with = "parent")]
+    #[arg(long, value_name = "DESTINATION", conflicts_with = "parent")]
     pub destination: Option<wire::TraceDestination>,
     /// Attach the imported session below an exported Braintrust span.
     #[arg(long, value_name = "SPAN_COMPONENTS", conflicts_with = "destination")]
     pub parent: Option<SpanComponents>,
     /// Keep following the transcript until Ctrl-C, importing new turns as the
     /// coding-agent session grows.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "all")]
     pub attach: bool,
 }
 
@@ -416,13 +426,27 @@ pub async fn run_import(
     opts: ServeOptions,
     mut config: Option<SessionConfig>,
 ) -> anyhow::Result<()> {
+    validate_import_selection(&args)?;
     let destination = args
         .parent
         .map(|components| wire::TraceDestination::ParentSpan { components })
         .or(args.destination);
     apply_import_destination(&mut config, destination)?;
-    let file = transcript_import::resolve_transcript(&args.session_id, args.source)?;
-    import_transcript(&file, args.source, opts, config, args.attach).await
+    let files = transcript_import::resolve_transcripts(&args.session_ids, args.all, args.source)?;
+    if args.attach {
+        return import_transcript(&files[0], args.source, opts, config, true).await;
+    }
+    import_transcripts(&files, args.source, opts, config).await
+}
+
+fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
+    if args.all != args.session_ids.is_empty() {
+        anyhow::bail!("provide explicit session ids or use --all, but not both");
+    }
+    if args.attach && args.session_ids.len() != 1 {
+        anyhow::bail!("--attach requires exactly one session id");
+    }
+    Ok(())
 }
 
 /// Launch a coding agent with inherited stdio and inject Braintrust hooks for
@@ -705,6 +729,27 @@ pub async fn import_transcript(
     processor.finish().await
 }
 
+/// Import multiple completed native transcripts through one processor.
+///
+/// This shares translator and sink setup while keeping each native session's
+/// correlation state isolated by session id.
+pub async fn import_transcripts(
+    files: &[PathBuf],
+    source: ImportSource,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+) -> anyhow::Result<()> {
+    let mut processor = ImportProcessor::new(opts, config);
+    for file in files {
+        let mut tail = transcript_import::TranscriptTail::new(file.clone(), source);
+        let entries = tail
+            .poll(true)
+            .with_context(|| format!("import transcript {}", file.display()))?;
+        processor.process(entries).await?;
+    }
+    processor.finish().await
+}
+
 struct ImportLive {
     translator: Box<dyn AgentTranslator>,
     sink: Box<dyn Sink>,
@@ -846,6 +891,55 @@ fn json_str_field(payload: &serde_json::Value, field: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct ImportCli {
+        #[command(flatten)]
+        args: ImportArgs,
+    }
+
+    #[test]
+    fn import_args_accept_multiple_sessions_or_all() {
+        let explicit = ImportCli::try_parse_from([
+            "test",
+            "codex",
+            "session-a",
+            "session-b",
+            "--destination",
+            "project_logs:project-id",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(explicit.session_ids, ["session-a", "session-b"]);
+        assert!(!explicit.all);
+        assert!(explicit.destination.is_some());
+
+        let all = ImportCli::try_parse_from(["test", "claude", "--all"])
+            .unwrap()
+            .args;
+        assert!(all.session_ids.is_empty());
+        assert!(all.all);
+
+        assert!(ImportCli::try_parse_from(["test", "codex"]).is_err());
+        assert!(ImportCli::try_parse_from(["test", "codex", "session-a", "--all"]).is_err());
+    }
+
+    #[test]
+    fn attach_requires_one_explicit_session() {
+        let args = ImportArgs {
+            source: ImportSource::Codex,
+            session_ids: vec!["one".into(), "two".into()],
+            all: false,
+            destination: None,
+            parent: None,
+            attach: true,
+        };
+        assert!(validate_import_selection(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+    }
 
     #[test]
     fn json_string_fields_accept_strings_and_numbers_only() {

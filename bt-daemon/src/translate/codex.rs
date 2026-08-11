@@ -184,7 +184,7 @@ impl AgentTranslator for CodexTranslator {
         match event.event.as_str() {
             // Catch up first: this same hook may be the first observation of
             // the spawn_agent transcript record that establishes call -> turn.
-            "PostToolUse" if agent_id.is_none() => self.record_spawned_agent(payload),
+            "PostToolUse" => self.record_spawned_agent(payload),
             "SubagentStop" => {
                 if let Some(p) = str_field(payload, "agent_transcript_path") {
                     self.close_subagent(&p, event.ts_ms, &mut ops);
@@ -695,8 +695,9 @@ impl CodexTranslator {
 
         let span_id = ids::span_id(&self.session_id, &format!("tool:{call_id}"));
         // spawn_agent: remember which turn ran it, so a later SubagentStart can
-        // nest the subagent root under this turn (main scope only).
-        if scope.kind == ScopeKind::Main && tool_name == SPAWN_AGENT_TOOL {
+        // nest the subagent root under this turn in either the main or a nested
+        // agent scope.
+        if tool_name == SPAWN_AGENT_TOOL {
             self.spawn_turn_by_call_id
                 .insert(call_id.clone(), turn_span.clone());
         }
