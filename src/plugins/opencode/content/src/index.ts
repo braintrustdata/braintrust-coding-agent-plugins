@@ -24,8 +24,9 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
     const os = await import("node:os");
 
     // Load configs in order: global first, then project (so project overrides global)
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
     const configPaths = [
-      path.join(os.homedir(), ".config", "opencode", "braintrust.json"), // global
+      path.join(configHome, "opencode", "braintrust.json"), // global
       path.join(input.directory, ".opencode", "braintrust.json"), // project
     ];
 

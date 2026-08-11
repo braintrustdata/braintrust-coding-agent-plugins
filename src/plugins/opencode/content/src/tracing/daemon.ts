@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Hooks, PluginInput } from "@opencode-ai/plugin";
 import type { Event } from "@opencode-ai/sdk";
-import { DaemonClient } from "../runtime/daemon-client";
+import { DaemonClient, type DaemonSessionRoute } from "../runtime/daemon-client";
 import { PLUGIN_VERSION } from "../version";
 
 type Logger = (message: string, extra?: Record<string, unknown>) => void;
@@ -11,6 +11,7 @@ interface TracingRouteConfig {
   orgName?: string;
   projectName: string;
   additionalMetadata?: Record<string, unknown>;
+  route: DaemonSessionRoute;
 }
 
 const FORWARDED_NATIVE_EVENTS = new Set([
@@ -51,18 +52,7 @@ export function createDaemonTracingHooks(
         directory: input.directory,
         worktree: input.worktree,
       },
-      route: {
-        auth: {
-          ...(config.profile ? { profile: config.profile } : {}),
-          ...(config.orgName ? { org_name: config.orgName } : {}),
-        },
-        destination: {
-          type: "project_logs",
-          project_name: config.projectName,
-        },
-        flush_mode: "fire_and_forget",
-        ...(config.additionalMetadata ? { additional_metadata: config.additionalMetadata } : {}),
-      },
+      route: config.route,
     });
     if (event === "session.idle" || event === "session.deleted" || event === "session.error") {
       await daemon.flush(daemonSessionId);

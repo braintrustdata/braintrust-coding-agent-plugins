@@ -16,6 +16,36 @@ export interface DaemonSessionRoute {
   additional_metadata?: Record<string, unknown>
 }
 
+export interface DaemonTraceSettings {
+  trace_to_braintrust?: boolean
+  route?: DaemonSessionRoute
+}
+
+/**
+ * Apply the invocation-only selection created by `bt trace run` without
+ * mutating or falling back to an agent's persistent configuration.
+ */
+export function resolveDaemonTraceSettings(
+  persistent: DaemonTraceSettings,
+  env: NodeJS.ProcessEnv = process.env,
+): DaemonTraceSettings {
+  const raw = env.BT_TRACE_INVOCATION_SETTINGS
+  if (raw === undefined) return persistent
+  try {
+    const invocation = JSON.parse(raw) as DaemonTraceSettings
+    if (
+      invocation.trace_to_braintrust !== true ||
+      !invocation.route ||
+      invocation.route.destination === undefined
+    ) {
+      return { trace_to_braintrust: false }
+    }
+    return invocation
+  } catch {
+    return { trace_to_braintrust: false }
+  }
+}
+
 export interface DaemonEnvelope {
   source: string
   source_version?: string

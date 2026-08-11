@@ -49,6 +49,7 @@ fn shell_tool_call(request: &OpenAiRequest, call_id: &str, command: &str) -> Ope
         });
     let arguments = match name {
         "exec_command" => json!({"cmd": command, "login": false}),
+        "bash" => json!({"command": command, "description": "Print the integration marker"}),
         _ => json!({"command": command}),
     };
     OpenAiTurn::tool_call(call_id, name, arguments)
@@ -376,7 +377,7 @@ async fn pi_session_emits_traces() {
     if world.uses_mock_ingest() {
         assert!(
             rows.iter()
-                .any(|row| row_contains(row, &["braintrust.plugin.pi", "1.0.0", "test_harness"])),
+                .any(|row| row_contains(row, &["braintrust.plugin.pi", "1.0.0"])),
             "Pi trace origin metadata was not emitted"
         );
     }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub const SOCKET_ENV: &str = "BT_DAEMON_SOCKET";
 /// Env override for the data/journal directory.
 pub const DATA_DIR_ENV: &str = "BT_DAEMON_DATA_DIR";
-/// Env override for the shared non-credential daemon settings file.
+/// Env override for the current agent's non-credential tracing settings file.
 pub const SETTINGS_ENV: &str = "BT_DAEMON_CONFIG";
 
 fn home() -> PathBuf {
@@ -77,15 +77,30 @@ pub fn data_dir(explicit: Option<&Path>) -> PathBuf {
     home().join(".braintrust").join("state").join("bt-daemon")
 }
 
-/// Resolve the shared settings file: explicit override → `$BT_DAEMON_CONFIG`
-/// → `<data_dir>/config.json`.
-pub fn settings_path(explicit: Option<&Path>) -> PathBuf {
+/// Resolve one coding agent's persistent tracing settings file.
+///
+/// An explicit override and `$BT_DAEMON_CONFIG` remain useful for isolated
+/// tests and managed environments. Normal setup keeps every agent independent
+/// by writing into that agent's native configuration directory.
+pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    std::env::var_os(SETTINGS_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir(None).join("config.json"))
+    if let Some(path) = std::env::var_os(SETTINGS_ENV) {
+        return PathBuf::from(path);
+    }
+    match source {
+        "codex" => home().join(".codex").join("braintrust.json"),
+        "claude" | "claude-code" => home().join(".claude").join("braintrust.json"),
+        "opencode" => std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join(".config"))
+            .join("opencode")
+            .join("braintrust.json"),
+        "pi" => home().join(".pi").join("agent").join("braintrust.json"),
+        other => data_dir(None).join("agents").join(format!("{other}.json")),
+    }
 }
 
 /// Create `dir` (and parents) mode 0700 on unix.
@@ -111,7 +126,7 @@ mod tests {
         assert_eq!(socket_path(Some(socket)), socket);
         assert_eq!(data_dir(Some(data)), data);
         assert_eq!(
-            settings_path(Some(Path::new("config.json"))),
+            agent_settings_path("codex", Some(Path::new("config.json"))),
             Path::new("config.json")
         );
     }

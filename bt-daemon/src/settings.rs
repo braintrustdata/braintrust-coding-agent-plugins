@@ -1,8 +1,9 @@
-//! Shared, non-credential settings for every agent connected to the daemon.
+//! Per-agent, non-credential tracing settings.
 //!
+//! Every coding agent owns an independent persistent file with the same schema.
 //! Authentication and backend URLs deliberately stay with the embedding `bt`
-//! CLI. This file only controls tracing behavior that should be consistent
-//! across Codex, Claude Code, and future agent plugins.
+//! CLI. `bt trace run` overlays invocation settings without mutating any
+//! persistent agent configuration.
 
 use crate::paths;
 use crate::wire::SessionRoute;
@@ -13,7 +14,6 @@ pub(crate) const INVOCATION_SETTINGS_ENV: &str = "BT_TRACE_INVOCATION_SETTINGS";
 
 /// Non-secret settings scoped to one `bt trace run` process tree.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct InvocationSettings {
     pub trace_to_braintrust: bool,
     pub route: SessionRoute,
@@ -29,16 +29,18 @@ impl InvocationSettings {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SharedSettings {
+pub(crate) struct AgentSettings {
     pub trace_to_braintrust: Option<bool>,
     pub route: Option<SessionRoute>,
 }
 
-impl SharedSettings {
-    pub(crate) fn load() -> Self {
+impl AgentSettings {
+    pub(crate) fn load(source: &str) -> Self {
         let invocation = std::env::var(INVOCATION_SETTINGS_ENV).ok();
-        Self::load_from_sources(&paths::settings_path(None), invocation.as_deref())
+        Self::load_from_sources(
+            &paths::agent_settings_path(source, None),
+            invocation.as_deref(),
+        )
     }
 
     fn load_from_sources(path: &Path, invocation: Option<&str>) -> Self {
@@ -112,7 +114,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{
-                "traceToBraintrust": true,
+                "trace_to_braintrust": true,
                 "route": {
                     "destination": {"type": "project_logs", "project_name": "agents"},
                     "flush_mode": "fire_and_forget",
@@ -124,7 +126,7 @@ mod tests {
         )
         .unwrap();
 
-        let settings = SharedSettings::load_from(&path);
+        let settings = AgentSettings::load_from(&path);
         assert_eq!(settings.trace_to_braintrust, Some(true));
         let route = settings.route.unwrap();
         assert_eq!(route.destination.unwrap().project_name(), Some("agents"));
@@ -134,30 +136,30 @@ mod tests {
     #[test]
     fn malformed_or_missing_settings_are_fail_open() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(SharedSettings::load_from(&temp.path().join("missing.json"))
+        assert!(AgentSettings::load_from(&temp.path().join("missing.json"))
             .route
             .is_none());
         let malformed = temp.path().join("malformed.json");
         std::fs::write(&malformed, "{").unwrap();
-        assert!(SharedSettings::load_from(&malformed).route.is_none());
+        assert!(AgentSettings::load_from(&malformed).route.is_none());
     }
 
     #[test]
     fn file_enablement_overrides_environment_fallback() {
-        let enabled = SharedSettings {
+        let enabled = AgentSettings {
             trace_to_braintrust: Some(true),
             ..Default::default()
         };
         assert!(enabled.tracing_enabled_with(Some(false)));
 
-        let disabled = SharedSettings {
+        let disabled = AgentSettings {
             trace_to_braintrust: Some(false),
             ..Default::default()
         };
         assert!(!disabled.tracing_enabled_with(Some(true)));
 
-        assert!(SharedSettings::default().tracing_enabled_with(Some(true)));
-        assert!(!SharedSettings::default().tracing_enabled_with(None));
+        assert!(AgentSettings::default().tracing_enabled_with(Some(true)));
+        assert!(!AgentSettings::default().tracing_enabled_with(None));
     }
 
     #[test]
@@ -167,7 +169,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{
-                "traceToBraintrust": false,
+                "trace_to_braintrust": false,
                 "route": {
                     "auth": {"profile": "global", "org_name": "global-org"},
                     "destination": {"type": "project_logs", "project_name": "global-project"}
@@ -192,12 +194,12 @@ mod tests {
         };
 
         let work =
-            SharedSettings::load_from_sources(&path, Some(&invocation("work", "work-project")));
-        let personal = SharedSettings::load_from_sources(
+            AgentSettings::load_from_sources(&path, Some(&invocation("work", "work-project")));
+        let personal = AgentSettings::load_from_sources(
             &path,
             Some(&invocation("personal", "personal-project")),
         );
-        let global = SharedSettings::load_from_sources(&path, None);
+        let global = AgentSettings::load_from_sources(&path, None);
 
         assert!(work.tracing_enabled_with(None));
         assert!(personal.tracing_enabled_with(None));
@@ -222,7 +224,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{
-                "traceToBraintrust": true,
+                "trace_to_braintrust": true,
                 "route": {
                     "destination": {"type": "project_logs", "project_name": "global-project"}
                 }
@@ -230,7 +232,7 @@ mod tests {
         )
         .unwrap();
 
-        let settings = SharedSettings::load_from_sources(&path, Some("{"));
+        let settings = AgentSettings::load_from_sources(&path, Some("{"));
         assert!(!settings.tracing_enabled_with(None));
         assert!(settings.route.is_none());
     }

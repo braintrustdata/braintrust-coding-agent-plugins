@@ -107,15 +107,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
         cwd: ctx?.cwd,
         model: nativePayload(ctx?.model),
       },
-      route: {
-        auth: {
-          ...(config.profile ? { profile: config.profile } : {}),
-          ...(config.orgName ? { org_name: config.orgName } : {}),
-        },
-        destination: { type: "project_logs", project_name: config.projectName },
-        flush_mode: "flush_on_turn_end",
-        additional_metadata: config.additionalMetadata,
-      },
+      route: config.route,
     });
     if (flush) {
       await client.flush(sessionId);

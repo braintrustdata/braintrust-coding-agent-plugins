@@ -1,4 +1,4 @@
-use super::{command_from_env, AgentOutput, ProcessOptions};
+use super::{AgentOutput, ProcessOptions};
 use crate::support::agent_process::AgentTestWorld;
 use serde_json::json;
 use std::ffi::OsString;
@@ -69,7 +69,7 @@ impl PiAgent {
     }
 
     pub async fn run(&self, world: &AgentTestWorld, run: PiRun) -> AgentOutput {
-        let mut command = command_from_env("PI_BIN", "pi");
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bt-daemon"));
         if world.uses_mock_inference() {
             let base_url = run
                 .mock_inference
@@ -93,6 +93,10 @@ impl PiAgent {
         }
         command
             .args([
+                "run",
+                "--project",
+                "agent-e2e",
+                "pi",
                 "--print",
                 "--mode",
                 "json",
@@ -107,15 +111,12 @@ impl PiAgent {
                 "--no-context-files",
                 "--tools",
                 "bash",
-                "--extension",
             ])
-            .arg(&self.extension)
             .arg("--session-dir")
             .arg(&self.session_dir)
             .current_dir(world.workspace())
             .env("PI_CODING_AGENT_DIR", &self.config_dir)
-            .env("TRACE_TO_BRAINTRUST", "true")
-            .env("BRAINTRUST_PROJECT", "agent-e2e")
+            .env("BT_TRACE_PI_PLUGIN_SPEC", &self.extension)
             .env("PI_OFFLINE", "true");
         world.configure(&mut command);
         run.options.apply(&mut command);

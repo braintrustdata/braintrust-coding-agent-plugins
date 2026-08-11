@@ -63,17 +63,14 @@ Our GitHub Actions compatibility job automatically resolves and tests that compa
 
 ## Quick start
 
-Tracing is disabled by default.
-
-Set these environment variables:
-
 ```bash
-export TRACE_TO_BRAINTRUST=true
 bt auth login
-export BRAINTRUST_PROJECT=pi
+bt trace setup pi
+pi
 ```
 
-Then start pi normally.
+For one invocation without changing Pi's global tracing configuration, use
+`bt trace run --project <PROJECT> pi -- [PI_ARGS...]`.
 
 In interactive mode, the footer shows a `Braintrust` status indicator while tracing is active, and a widget below the editor shows a shortened clickable trace link when available.
 
@@ -87,6 +84,7 @@ Config precedence is:
 2. `~/.pi/agent/braintrust.json`
 3. `.pi/braintrust.json`
 4. environment variables
+5. `bt trace run` invocation settings (tracing only, highest priority)
 
 ### Config file locations
 
@@ -98,10 +96,10 @@ Example:
 ```json
 {
   "trace_to_braintrust": true,
-  "profile": "work",
-  "project": "pi",
-  "additional_metadata": {
-    "team": "platform"
+  "route": {
+    "auth": { "profile": "work", "org_name": "acme" },
+    "destination": { "type": "project_logs", "project_name": "pi" },
+    "additional_metadata": { "team": "platform" }
   }
 }
 ```

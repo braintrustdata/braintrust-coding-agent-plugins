@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -12,6 +12,7 @@ const ENVIRONMENT_KEYS = [
   "BRAINTRUST_SHOW_UI",
   "BRAINTRUST_SHOW_TRACE_LINK",
   "TRACE_TO_BRAINTRUST",
+  "BT_TRACE_INVOCATION_SETTINGS",
 ] as const;
 
 const originalEnvironment = new Map<string, string | undefined>();
@@ -53,6 +54,15 @@ describe("loadConfig", () => {
       projectName: "pi",
       showUi: true,
       showTraceLink: true,
+      profile: undefined,
+      orgName: undefined,
+      additionalMetadata: undefined,
+      route: {
+        auth: {},
+        destination: { type: "project_logs", project_name: "pi" },
+        flush_mode: "flush_on_turn_end",
+        additional_metadata: undefined,
+      },
     });
   });
 
@@ -82,6 +92,12 @@ describe("loadConfig", () => {
       additionalMetadata: { source: "run" },
       showUi: true,
       showTraceLink: false,
+      route: {
+        auth: { profile: "run", org_name: "run-org" },
+        destination: { type: "project_logs", project_name: "run-project" },
+        flush_mode: "flush_on_turn_end",
+        additional_metadata: { source: "run" },
+      },
     });
   });
 
@@ -111,6 +127,64 @@ describe("loadConfig", () => {
       projectName: "pi",
       showUi: true,
       showTraceLink: true,
+      profile: undefined,
+      orgName: undefined,
+      additionalMetadata: undefined,
+      route: {
+        auth: {},
+        destination: { type: "project_logs", project_name: "pi" },
+        flush_mode: "flush_on_turn_end",
+        additional_metadata: undefined,
+      },
     });
+  });
+
+  it("uses managed-run settings without replacing the agent's global file", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: true,
+      profile: "global",
+      project: "global-project",
+    });
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: {
+        auth: { profile: "run", org_name: "run-org" },
+        destination: { type: "project_logs", project_name: "run-project" },
+      },
+    });
+
+    expect(loadConfig(cwd)).toMatchObject({
+      enabled: true,
+      route: {
+        auth: { profile: "run", org_name: "run-org" },
+        destination: { type: "project_logs", project_name: "run-project" },
+      },
+    });
+    expect(
+      JSON.parse(readFileSync(join(home, ".pi", "agent", "braintrust.json"), "utf8")).project,
+    ).toBe("global-project");
+  });
+
+  it("preserves a structured persistent destination", () => {
+    const destination = {
+      type: "parent_span",
+      components: { object_id: "object", row_id: "row", span_id: "span" },
+    };
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: true,
+      route: { destination, flush_mode: "flush_on_turn_end" },
+    });
+
+    expect(loadConfig(cwd).route).toMatchObject({ destination });
+  });
+
+  it("does not fall back to persistent settings for a malformed managed run", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: true,
+      route: { destination: { type: "project_logs", project_name: "global" } },
+    });
+    process.env.BT_TRACE_INVOCATION_SETTINGS = "{";
+
+    expect(loadConfig(cwd).enabled).toBe(false);
   });
 });

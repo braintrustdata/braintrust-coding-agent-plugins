@@ -1,4 +1,4 @@
-use super::{command_from_env, AgentOutput, ProcessOptions};
+use super::{AgentOutput, ProcessOptions};
 use crate::support::agent_process::AgentTestWorld;
 use serde_json::json;
 use std::ffi::OsString;
@@ -82,7 +82,6 @@ impl OpenCodeAgent {
         let workspace = world.workspace();
         let mut config = json!({
             "$schema": "https://opencode.ai/config.json",
-            "plugin": [path_to_file_url(&self.plugin)],
             "permission": {"*": "allow"}
         });
         if world.uses_mock_inference() {
@@ -118,9 +117,13 @@ impl OpenCodeAgent {
         let server_log = world.temp_path("opencode-server.log");
         let server_log_file =
             std::fs::File::create(&server_log).expect("create OpenCode server diagnostic log");
-        let mut server = command_from_env("OPENCODE_BIN", "opencode");
+        let mut server = tokio::process::Command::new(env!("CARGO_BIN_EXE_bt-daemon"));
         server
             .args([
+                "run",
+                "--project",
+                "agent-e2e",
+                "opencode",
                 "serve",
                 "--hostname",
                 "127.0.0.1",
@@ -133,6 +136,10 @@ impl OpenCodeAgent {
             .stderr(Stdio::from(server_log_file))
             .kill_on_drop(true);
         configure_environment(&mut server, self);
+        server.env(
+            "BT_TRACE_OPENCODE_PLUGIN_SPEC",
+            path_to_file_url(&self.plugin),
+        );
         world.configure(&mut server);
         run.options.apply_env(&mut server);
         let mut server = server.spawn().expect("start OpenCode server");
@@ -161,7 +168,6 @@ fn configure_environment(command: &mut tokio::process::Command, agent: &OpenCode
         .env("XDG_CONFIG_HOME", &agent.config_home)
         .env("XDG_DATA_HOME", &agent.data_home)
         .env("XDG_CACHE_HOME", &agent.cache_home)
-        .env("TRACE_TO_BRAINTRUST", "true")
         .env("BRAINTRUST_OPENCODE_ENABLE_TOOLS", "false")
         .env("OPENCODE_DISABLE_MODELS_FETCH", "true");
     for key in [
