@@ -9,7 +9,8 @@ use bt_daemon::wire::{AuthSelection, BackendAuth, SessionRoute, TraceDestination
 use bt_daemon::{
     braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, run_traced,
     AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs,
-    HostInfo, ImportArgs, Registry, RunArgs, RunHookCommand, ServeArgs, ServeOptions, StatusArgs,
+    HostInfo, ImportArgs, OutputFormat, Registry, RunArgs, RunHookCommand, ServeArgs, ServeOptions,
+    StatusArgs, TraceCommandOutput,
 };
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
@@ -72,6 +73,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     about = "Braintrust coding-agent tracing daemon (standalone test binary)"
 )]
 struct Cli {
+    /// Output user-facing command results as JSON.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -212,11 +216,9 @@ async fn main() {
             std::process::exit(0);
         }
         Command::Status(args) => match run_status(args).await {
-            Ok(Some(status)) => {
-                println!("{}", serde_json::to_string_pretty(&status).unwrap());
-            }
-            Ok(None) => {
-                println!("bt-daemon is not running");
+            Ok(status) => {
+                let output = TraceCommandOutput::status(status);
+                println!("{}", output.render(OutputFormat::from(cli.json)).unwrap());
             }
             Err(e) => {
                 eprintln!("bt-daemon status: {e}");
