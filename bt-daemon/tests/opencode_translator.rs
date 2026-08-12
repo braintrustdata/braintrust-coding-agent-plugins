@@ -11,6 +11,7 @@ fn event(name: &str, ts_ms: i64, payload: serde_json::Value) -> Envelope {
         session_id: "root-session".into(),
         event: name.into(),
         ts_ms,
+        managed_run_id: None,
         payload,
         route: None,
         config: None,

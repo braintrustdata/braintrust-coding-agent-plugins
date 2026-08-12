@@ -9,13 +9,13 @@ use crate::translate::Registry;
 use crate::transport::{self, Listener, ServerStream};
 use crate::wire::{
     error_code, method, Capabilities, Envelope, EventLogResult, FlushParams, FlushResult,
-    InitializeParams, InitializeResult, Message, Request, Response, RpcError, SessionStatus,
-    ShutdownResult, StatusParams, StatusResult, PROTOCOL_VERSION,
+    InitializeParams, InitializeResult, ManagedRunFlushParams, Message, Request, Response,
+    RpcError, SessionStatus, ShutdownResult, StatusParams, StatusResult, PROTOCOL_VERSION,
 };
 use crate::wire::{AuthSelection, BackendAuth, SessionRoute};
 use crate::{paths, ServeArgs};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,6 +77,7 @@ pub struct Daemon {
     sink_factory: Arc<dyn SinkFactory>,
     auth_provider: Option<Arc<dyn AuthProvider>>,
     session_auth: tokio::sync::Mutex<HashMap<String, SessionAuthState>>,
+    managed_run_sessions: Mutex<HashMap<String, HashSet<String>>>,
     auth_errors: Mutex<HashMap<String, (String, String)>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     started: Instant,
@@ -94,6 +95,7 @@ impl Daemon {
             sink_factory: opts.sink_factory,
             auth_provider: opts.auth_provider,
             session_auth: tokio::sync::Mutex::new(HashMap::new()),
+            managed_run_sessions: Mutex::new(HashMap::new()),
             auth_errors: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             started: Instant::now(),
@@ -275,6 +277,50 @@ impl Daemon {
             .sum()
     }
 
+    fn record_managed_run_session(&self, managed_run_id: &str, session_id: &str) {
+        self.managed_run_sessions
+            .lock()
+            .unwrap()
+            .entry(managed_run_id.to_string())
+            .or_default()
+            .insert(session_id.to_string());
+    }
+
+    async fn flush_managed_run(&self, params: ManagedRunFlushParams) -> FlushResult {
+        let session_ids = self
+            .managed_run_sessions
+            .lock()
+            .unwrap()
+            .get(&params.managed_run_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut result = FlushResult {
+            flushed: true,
+            pending: 0,
+        };
+        for session_id in session_ids {
+            if let Err(error) = self.refresh_session_before_flush(&session_id).await {
+                tracing::warn!(
+                    managed_run_id = %params.managed_run_id,
+                    session_id,
+                    %error,
+                    "managed run session auth refresh failed"
+                );
+                result.flushed = false;
+                continue;
+            }
+            let session = { self.sessions.lock().unwrap().get(&session_id).cloned() };
+            if let Some(session) = session {
+                let (flushed, pending) = session
+                    .flush(Duration::from_millis(params.timeout_ms))
+                    .await;
+                result.flushed &= flushed;
+                result.pending = result.pending.saturating_add(pending);
+            }
+        }
+        result
+    }
+
     fn trigger_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
@@ -448,6 +494,7 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
     let source = env.source.clone();
     let event = env.event.clone();
     let session_id = env.session_id.clone();
+    let managed_run_id = env.managed_run_id.clone();
     tracing::info!(source, event, session_id, "event received");
     daemon.touch();
 
@@ -468,7 +515,12 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
     .await;
 
     match &result {
-        Ok(()) => tracing::info!(source, event, session_id, "event accepted"),
+        Ok(()) => {
+            if let Some(managed_run_id) = managed_run_id {
+                daemon.record_managed_run_session(&managed_run_id, &session_id);
+            }
+            tracing::info!(source, event, session_id, "event accepted")
+        }
         Err(error) => tracing::warn!(source, event, session_id, error, "event rejected"),
     }
     result
@@ -546,6 +598,11 @@ async fn handle_request(daemon: &Arc<Daemon>, req: Request) -> Response {
                 id,
                 serde_json::to_value(FlushResult { flushed, pending }).unwrap(),
             )
+        }
+        method::MANAGED_RUN_FLUSH => {
+            let params = parse!(ManagedRunFlushParams);
+            let result = daemon.flush_managed_run(params).await;
+            Response::ok(id, serde_json::to_value(result).unwrap())
         }
         method::STATUS_GET => {
             let p = parse!(StatusParams);

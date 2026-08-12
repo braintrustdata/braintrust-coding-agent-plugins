@@ -47,7 +47,13 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use wire::{method, Envelope, SessionConfig, SessionRoute, StatusResult, PROTOCOL_VERSION};
+use wire::{
+    method, Envelope, ManagedRunFlushParams, SessionConfig, SessionRoute, StatusResult,
+    PROTOCOL_VERSION,
+};
+
+const MANAGED_RUN_ID_ENV: &str = "BT_TRACE_MANAGED_RUN_ID";
+const MANAGED_RUN_FLUSH_TIMEOUT_MS: u64 = 10_000;
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -231,6 +237,9 @@ pub async fn run_hook(
         session_id,
         event,
         ts_ms: now_ms(),
+        managed_run_id: std::env::var(MANAGED_RUN_ID_ENV)
+            .ok()
+            .filter(|value| !value.is_empty()),
         payload,
         route: Some(route),
         config: None,
@@ -333,6 +342,39 @@ pub async fn flush_session(
     Ok(serde_json::from_value(value)?)
 }
 
+/// Flush every daemon session accepted from one managed child process tree.
+/// A missing daemon means the child emitted no accepted trace events.
+pub async fn flush_managed_run(
+    managed_run_id: &str,
+    socket: &std::path::Path,
+    timeout_ms: u64,
+) -> anyhow::Result<wire::FlushResult> {
+    let stream = match client::connect(socket).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            return Ok(wire::FlushResult {
+                flushed: true,
+                pending: 0,
+            })
+        }
+    };
+    let mut conn = client::Conn::new(stream);
+    conn.request(
+        method::INITIALIZE,
+        serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "client": { "source": "managed-run-flush" }
+        }),
+    )
+    .await?;
+    let params = ManagedRunFlushParams {
+        managed_run_id: managed_run_id.to_string(),
+        timeout_ms,
+    };
+    let value = conn.request(method::MANAGED_RUN_FLUSH, params).await?;
+    Ok(serde_json::from_value(value)?)
+}
+
 /// Query daemon status. `Ok(None)` means no daemon is running.
 pub async fn run_status(args: StatusArgs) -> anyhow::Result<Option<StatusResult>> {
     let socket = paths::socket_path(args.socket.as_deref());
@@ -405,12 +447,14 @@ pub async fn run_traced(
     let executable =
         std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
     let injected_args = managed_run_args(args.source, &hook_command)?;
+    let managed_run_id = uuid::Uuid::new_v4().to_string();
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut command = tokio::process::Command::new(&executable);
     command
         .args(injected_args)
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
+        .env(MANAGED_RUN_ID_ENV, &managed_run_id)
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
     if args.source == RunSource::OpenCode {
         command.env(
@@ -424,14 +468,32 @@ pub async fn run_traced(
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
 
-    tokio::select! {
-        status = child.wait() => Ok(status?),
+    let status = tokio::select! {
+        status = child.wait() => status.map_err(anyhow::Error::from),
         result = &mut interrupt => {
-            result?;
-            child.start_kill()?;
-            Ok(child.wait().await?)
+            match result {
+                Ok(()) => {
+                    let kill_result = child.start_kill();
+                    let wait_result = child.wait().await;
+                    kill_result
+                        .map_err(anyhow::Error::from)
+                        .and_then(|()| wait_result.map_err(anyhow::Error::from))
+                }
+                Err(error) => Err(error.into()),
+            }
         }
+    };
+    let socket = paths::socket_path(None);
+    match flush_managed_run(&managed_run_id, &socket, MANAGED_RUN_FLUSH_TIMEOUT_MS).await {
+        Ok(result) if result.flushed => {}
+        Ok(result) => tracing::warn!(
+            managed_run_id,
+            pending = result.pending,
+            "managed run trace flush timed out"
+        ),
+        Err(error) => tracing::warn!(managed_run_id, %error, "managed run trace flush failed"),
     }
+    status
 }
 
 fn managed_run_args(
