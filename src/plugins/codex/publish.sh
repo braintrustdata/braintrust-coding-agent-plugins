@@ -7,11 +7,6 @@
 # tracked tree with a fresh build, and commit+push only if something changed.
 # History is not preserved on the dist repo — it is a generated artifact.
 #
-# The build compiles the trace-codex hook binaries for all platforms and commits
-# them directly into the dist tree (CODEX_BUILD_BINARIES=1 below) as plain files
-# (no Git LFS), so a normal `git clone` — with or without git-lfs — yields real,
-# runnable binaries. Requires node + pnpm on the machine.
-#
 # Env:
 #   DIST_REPO   (required) target dist repo. Either a full git URL
 #               (git@github.com:owner/name.git or https://github.com/owner/name)
@@ -50,10 +45,10 @@ git clone --depth 1 "$CLONE_URL" "$WORKTREE" 2>/dev/null \
 git -C "$WORKTREE" config user.name "github-actions[bot]"
 git -C "$WORKTREE" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-echo "==> Rebuilding tree from source (with binaries)"
+echo "==> Rebuilding tree from source"
 # Clear tracked content (keep .git), then repopulate via the build script.
 git -C "$WORKTREE" rm -rfq --ignore-unmatch . >/dev/null 2>&1 || true
-CODEX_BUILD_BINARIES=1 "$SRC_DIR/build.sh" "$WORKTREE"
+"$SRC_DIR/build.sh" "$WORKTREE"
 "$SRC_DIR/validate.sh" "$WORKTREE"
 
 git -C "$WORKTREE" add -A

@@ -64,7 +64,7 @@ impl ClaudeAgent {
 
     pub async fn run(&self, world: &AgentTestWorld, run: ClaudeRun) -> AgentOutput {
         let session_id = Uuid::new_v4().to_string();
-        let plugin = test_plugin::claude_plugin(world);
+        let plugin = test_plugin::claude_plugin();
         let mut command = command_from_env("CLAUDE_BIN", "claude");
         command
             .args([

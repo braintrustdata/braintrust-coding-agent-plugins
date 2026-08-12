@@ -77,7 +77,7 @@ jobs:
 
       - name: Require daemon-capable bt
         run: |
-          "$HOME/.local/bin/bt" daemon hook --help
+          "$HOME/.local/bin/bt" trace hook --help
 
       - name: Install plugin from ${{ inputs.dist_repo }}
         env:
@@ -97,7 +97,7 @@ jobs:
           BT_DAEMON_CONFIG: ${{ runner.temp }}/bt-daemon-config.json
           MOCK_COLLECTOR_OUT: ${{ runner.temp }}/mock-summary.json
         run: |
-          printf '%s\n' '{"traceToBraintrust":true,"project":"trace-codex-smoke","flushOnTurnEnd":true}' > "$BT_DAEMON_CONFIG"
+          printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"trace-codex-smoke"},"flush_mode":"flush_on_turn_end"}}' > "$BT_DAEMON_CONFIG"
           python3 .github/scripts/mock-braintrust.py > "${{ runner.temp }}/mock-collector.log" 2>&1 &
           collector_pid=$!
           trap 'kill "$collector_pid" 2>/dev/null || true' EXIT
