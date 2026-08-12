@@ -123,10 +123,15 @@ jobs:
             tag_sha="$(git rev-list -n 1 "$tag")"
             head_sha="$(git rev-parse HEAD)"
             if [ "$tag_sha" != "$head_sha" ]; then
-              echo "::error::tag $tag points to $tag_sha, not the selected release commit $head_sha."
-              exit 1
+              plugin_dir="src/plugins/${{ inputs.plugin }}"
+              if ! git diff --quiet "$tag" HEAD -- "$plugin_dir"; then
+                echo "::error::tag $tag points to $tag_sha and $plugin_dir has changed at $head_sha."
+                exit 1
+              fi
+              echo "Monorepo tag $tag points to $tag_sha; $plugin_dir is unchanged at $head_sha, so the interrupted release can resume."
+            else
+              echo "Monorepo tag $tag already points to the selected release commit; resuming."
             fi
-            echo "Monorepo tag $tag already points to the selected release commit; resuming."
           else
             git tag "$tag"
             git push origin "$tag"
