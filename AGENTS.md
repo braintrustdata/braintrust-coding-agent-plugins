@@ -19,8 +19,8 @@ Makefile                     build, test, and publish entry points
 ```
 
 Everything an agent installs lives under `src/plugins/<agent>/content/`.
-Plugin hooks are thin fail-open shell and Windows command launchers that invoke
-`bt daemon hook`; they do not contain or compile a second tracing runtime.
+Plugin hooks are thin fail-open shell launchers that invoke
+`bt trace hook`; they do not contain or compile a second tracing runtime.
 
 ## Adding a coding-agent integration
 

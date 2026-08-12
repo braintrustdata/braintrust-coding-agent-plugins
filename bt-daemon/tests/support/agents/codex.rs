@@ -56,7 +56,7 @@ impl CodexAgent {
         let home = world.temp_path("codex-home");
         std::fs::create_dir_all(&home).expect("create Codex home");
 
-        let marketplace = test_plugin::codex_marketplace(world);
+        let marketplace = test_plugin::codex_marketplace();
         let mut add_marketplace = command_from_env("CODEX_BIN", "codex");
         add_marketplace
             .arg("plugin")
@@ -69,7 +69,7 @@ impl CodexAgent {
 
         let mut add_plugin = command_from_env("CODEX_BIN", "codex");
         add_plugin
-            .args(["plugin", "add", "trace-codex-test@braintrust-daemon-tests"])
+            .args(["plugin", "add", "trace-codex@braintrust-codex-plugins"])
             .env("CODEX_HOME", &home);
         world.configure(&mut add_plugin);
         AgentOutput::from(world.output(&mut add_plugin).await).assert_success();

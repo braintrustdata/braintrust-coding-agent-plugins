@@ -5,12 +5,11 @@
 # The Claude Code marketplace consumes a repo whose ROOT is the marketplace:
 #   .claude-plugin/marketplace.json    marketplace manifest
 #   plugins/braintrust/                skills plugin (MCP + skills)
-#   plugins/trace-claude-code/         tracing plugin (shell hooks)
+#   plugins/trace-claude-code/         tracing plugin (thin daemon hook shim)
 #
 # Everything is plain shell + config — no compiled artifacts — so the whole
 # deployable tree is checked in under content/ and this build is a straight
-# copy. The seam is here for when shared skills/MCP config are extracted and
-# assembled in at build time.
+# copy.
 #
 # Usage: build.sh <TARGET_DIR>   (TARGET_DIR is created if missing)
 

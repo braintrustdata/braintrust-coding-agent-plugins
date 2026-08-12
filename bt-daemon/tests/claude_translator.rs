@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../src/plugins/claude/content/plugins/trace-claude-code/test/fixtures/sessions")
+        .join("tests/fixtures/claude")
         .join(name)
 }
 

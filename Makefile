@@ -38,6 +38,7 @@ test: build
 		echo "==> validate $$p"; \
 		src/plugins/$$p/validate.sh "$(DIST)/$$p"; \
 	done
+	@bash scripts/test-hook-forwarders.sh "$(DIST)"
 
 $(VALIDATE_RULES): validate-%: build-%
 	@echo "==> validate $*"

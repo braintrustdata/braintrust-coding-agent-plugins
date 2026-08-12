@@ -1,6 +1,6 @@
 {
   "name": "braintrust",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Access Braintrust docs, logs, experiments, datasets, prompts, schemas, SQL queries, and permalinks through the official Braintrust MCP server.",
   "author": {
     "name": "Braintrust",

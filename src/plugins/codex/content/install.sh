@@ -28,25 +28,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MARKETPLACE="braintrust-codex-plugins"
 
-# Default port the trace-codex event server listens on (see plugins/trace-codex
-# config.ts DEFAULT_PORT). Overridable via the same env var the plugin reads.
-EVENT_SERVER_PORT="${BRAINTRUST_EVENT_SERVER_PORT:-52734}"
-
-# Ask any running trace-codex event server to shut down. After a re-install the
-# cache holds a new build, but a server spawned from the OLD build may still be
-# running; it would refuse the new version (version mismatch) and block tracing
-# until its idle timeout. Shutting it down lets the next session boot a fresh
-# one. No server running is the normal case, so failures are ignored.
-shutdown_event_server() {
-  if ! command -v curl >/dev/null 2>&1; then
-    return 0
-  fi
-  if curl -fsS --max-time 2 -X POST \
-    "http://127.0.0.1:$EVENT_SERVER_PORT/shutdown" >/dev/null 2>&1; then
-    echo "  shut down running event server on port $EVENT_SERVER_PORT."
-  fi
-}
-
 # Plugin folders to install. Default: every folder under plugins/.
 if [ "$#" -gt 0 ]; then
   PLUGINS=("$@")
@@ -122,11 +103,6 @@ for folder in "${PLUGINS[@]}"; do
   codex plugin add "$name" --marketplace "$MARKETPLACE" >/dev/null
   echo "  installed."
 
-  # trace-codex runs a long-lived background event server. Stop any stale one
-  # left over from a previous build so it doesn't linger with the old version.
-  if [ "$folder" = "trace-codex" ]; then
-    shutdown_event_server
-  fi
 done
 
 echo ""

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Thin, fail-open bridge from Codex hooks to the shared Braintrust daemon.
+# Thin, fail-open bridge from Claude Code hooks to the shared Braintrust daemon.
 
 BT_INSTALL_URL="https://bt.dev/cli/install.sh"
 
@@ -24,22 +24,22 @@ resolve_bt() {
 BT_BIN="$(resolve_bt || true)"
 if [[ -z "$BT_BIN" ]]; then
   if ! command -v curl >/dev/null 2>&1; then
-    printf 'trace-codex: curl is required to install bt; tracing skipped\n' >&2
+    printf 'trace-claude-code: curl is required to install bt; tracing skipped\n' >&2
     exit 0
   fi
 
-  printf 'trace-codex: bt CLI not found; installing it now\n' >&2
+  printf 'trace-claude-code: bt CLI not found; installing it now\n' >&2
   if ! (set -o pipefail; curl -fsSL "$BT_INSTALL_URL" | bash) >&2; then
-    printf 'trace-codex: bt installation failed; tracing skipped\n' >&2
+    printf 'trace-claude-code: bt installation failed; tracing skipped\n' >&2
     exit 0
   fi
 
   BT_BIN="$(resolve_bt || true)"
   if [[ -z "$BT_BIN" ]]; then
-    printf 'trace-codex: bt was installed but is not executable; tracing skipped\n' >&2
+    printf 'trace-claude-code: bt was installed but is not executable; tracing skipped\n' >&2
     exit 0
   fi
 fi
 
-"$BT_BIN" trace hook --source codex || true
+"$BT_BIN" trace hook --source claude-code || true
 exit 0
