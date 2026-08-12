@@ -2,9 +2,10 @@
 #   claude -> braintrustdata/braintrust-claude-plugin
 #   codex  -> braintrustdata/braintrust-codex-plugin
 #
-# Full flow: bump version -> commit to main -> tag v<version>-<plugin> ->
-# GitHub Release -> deploy. For a safe dry run, use test-release.yml (deploys to
-# the sandbox repo and skips the monorepo commit/tag/release).
+# Full flow: stamp the version -> commit to main when needed -> monorepo
+# tag/release using v<version>-<plugin> -> deploy -> distribution-repo
+# tag/release using v<version>. For a safe dry run, use test-release.yml
+# (deploys to the sandbox repo and skips all commits, tags, and releases).
 
 name: Release plugin
 

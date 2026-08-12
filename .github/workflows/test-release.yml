@@ -2,8 +2,9 @@
 # (braintrustdata/test-coding-agent-dist). Same dropdowns as release.yml.
 #
 # Exercises the version bump, build, and deploy, but deploys to the test repo
-# and does NOT commit/tag/release on the monorepo — so it leaves no trace and
-# can be re-run with the same version. Use release.yml for a real release.
+# and does NOT commit/tag/release on the monorepo or tag/release the sandbox
+# distribution repo — so it can be re-run with the same version. Use
+# release.yml for a real release.
 
 name: Release plugin (test)
 
