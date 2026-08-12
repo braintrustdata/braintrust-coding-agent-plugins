@@ -62,15 +62,14 @@ jobs:
           fi
           tag="v$version-${{ inputs.plugin }}"
           dist_tag="v$version"
-          # Production releases must come from main and not reuse a monorepo tag.
+          # Production releases must come from main. Existing monorepo release
+          # state is checked against HEAD below so an interrupted release can
+          # safely resume without moving a tag.
           if [ "${{ inputs.record }}" = "true" ]; then
             if [ "${{ github.ref }}" != "refs/heads/main" ]; then
               echo "::error::Production releases must run on main (got '${{ github.ref }}')."; exit 1
             fi
             git fetch --tags --quiet
-            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-              echo "::error::tag $tag already exists."; exit 1
-            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -105,17 +104,54 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
+          tag="${{ steps.vars.outputs.tag }}"
+          tag_exists=false
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            tag_exists=true
+            if ! git diff --cached --quiet; then
+              echo "::error::tag $tag already exists, but the requested version would change committed manifests."
+              exit 1
+            fi
+          fi
           if ! git diff --cached --quiet; then
             git commit -m "chore(${{ inputs.plugin }}): release v${{ steps.vars.outputs.version }}"
             git push origin HEAD:main
           else
             echo "Plugin manifests already contain v${{ steps.vars.outputs.version }}; tagging the committed version."
           fi
-          git tag "${{ steps.vars.outputs.tag }}"
-          git push origin "${{ steps.vars.outputs.tag }}"
-          gh release create "${{ steps.vars.outputs.tag }}" \
-            --title "${{ steps.vars.outputs.tag }}" \
-            --generate-notes
+          if [ "$tag_exists" = "true" ]; then
+            tag_sha="$(git rev-list -n 1 "$tag")"
+            head_sha="$(git rev-parse HEAD)"
+            if [ "$tag_sha" != "$head_sha" ]; then
+              echo "::error::tag $tag points to $tag_sha, not the selected release commit $head_sha."
+              exit 1
+            fi
+            echo "Monorepo tag $tag already points to the selected release commit; resuming."
+          else
+            git tag "$tag"
+            git push origin "$tag"
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Monorepo release $tag already exists; resuming."
+          else
+            gh release create "$tag" \
+              --title "$tag" \
+              --generate-notes
+          fi
+
+      - name: Set up pnpm for Codex distribution build
+        if: ${{ inputs.plugin == 'codex' }}
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          version: 11.21.0
+
+      - name: Set up Node for Codex distribution build
+        if: ${{ inputs.plugin == 'codex' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: src/plugins/codex/content/plugins/trace-codex/pnpm-lock.yaml
 
       - name: Deploy to distribution repo
         env:
