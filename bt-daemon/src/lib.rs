@@ -19,7 +19,10 @@ mod ids;
 mod journal;
 mod server;
 mod settings;
+mod setup;
 mod sink;
+mod trace_command;
+mod trace_runtime;
 mod transcript_import;
 mod translate;
 mod transport;
@@ -30,7 +33,10 @@ pub use command_output::{
     OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
 };
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
+pub use setup::run_setup;
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
+pub use trace_command::{SetupAgent, SetupArgs, StopArgs, TraceArgs, TraceCommand};
+pub use trace_runtime::{run_trace, TraceHostContext, TraceHostServices};
 pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };

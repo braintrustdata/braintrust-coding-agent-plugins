@@ -16,6 +16,10 @@ One self-contained Cargo crate, liftable to its own repo by copying
 - `src/wire` — the wire protocol module: envelope types + JSON-RPC framing.
 - `src/translate` and `src/sink` — agent state machines and Braintrust output.
 - `src/lib.rs` — the embeddable library: clap `Args` + async entry points
+- `src/trace_command.rs`, `src/trace_runtime.rs`, and `src/setup.rs` — the
+  complete mounted `bt trace` command schema, dispatch, daemon lifecycle, and
+  agent-specific persistent setup behavior. Hosts supply only credential and
+  destination-resolution services.
   (`run_serve`, `run_hook`, `run_status`, `run_import`, `run_traced`). This is what `bt`
   depends on.
 - `src/main.rs` — the standalone **`bt-daemon` binary**, compiled only with
