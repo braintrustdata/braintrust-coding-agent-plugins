@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionConfig, SessionRoute};
 use bt_daemon::{
     debug_serve_options, flush_managed_run, flush_session, forward_envelope, run_serve, run_status,
-    run_traced, shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry,
-    RunArgs, RunHookCommand, RunSource, ServeArgs, ServeOptions, Sink, SinkFactory, SpanOp,
-    StatusArgs,
+    shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs,
+    ServeOptions, Sink, SinkFactory, SpanOp, StatusArgs,
 };
+#[cfg(all(feature = "cli", unix))]
+use bt_daemon::{run_traced, RunArgs, RunHookCommand, RunSource};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
