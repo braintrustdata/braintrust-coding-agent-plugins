@@ -521,6 +521,7 @@ fn envelope(
         session_id: session_id.into(),
         event: event.into(),
         ts_ms,
+        managed_run_id: None,
         payload,
         route: None,
         config: None,

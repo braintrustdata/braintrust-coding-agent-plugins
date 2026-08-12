@@ -15,7 +15,8 @@ pub use envelope::{
 };
 pub use methods::{
     method, Capabilities, ClientInfo, EventLogResult, FlushParams, FlushResult, InitializeParams,
-    InitializeResult, SessionStatus, ShutdownResult, StatusParams, StatusResult,
+    InitializeResult, ManagedRunFlushParams, SessionStatus, ShutdownResult, StatusParams,
+    StatusResult,
 };
 pub use rpc::{error_code, Message, Request, RequestId, Response, RpcError};
 

@@ -61,6 +61,7 @@ fn envelope(session: &str, event: &str, transcript_path: &str, extra: Value) -> 
         session_id: session.into(),
         event: event.into(),
         ts_ms: 0,
+        managed_run_id: None,
         payload,
         route: None,
         config: None,

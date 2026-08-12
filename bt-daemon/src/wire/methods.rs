@@ -7,6 +7,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const EVENT_LOG: &str = "event.log";
     pub const SESSION_FLUSH: &str = "session.flush";
+    pub const MANAGED_RUN_FLUSH: &str = "managed_run.flush";
     pub const STATUS_GET: &str = "status.get";
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
 }
@@ -48,6 +49,13 @@ pub struct EventLogResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlushParams {
     pub session_id: String,
+    #[serde(default = "default_flush_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedRunFlushParams {
+    pub managed_run_id: String,
     #[serde(default = "default_flush_timeout_ms")]
     pub timeout_ms: u64,
 }

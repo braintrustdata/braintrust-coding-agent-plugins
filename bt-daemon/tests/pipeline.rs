@@ -3,16 +3,61 @@
 //! spawning, so it's deterministic).
 
 use async_trait::async_trait;
-use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionRoute};
+use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionConfig, SessionRoute};
 use bt_daemon::{
-    debug_serve_options, flush_session, forward_envelope, run_serve, run_status, shutdown_daemon,
-    AuthLease, AuthProvider, AuthResolveReason, HostInfo, ServeArgs, StatusArgs,
+    debug_serve_options, flush_managed_run, flush_session, forward_envelope, run_serve, run_status,
+    run_traced, shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry,
+    RunArgs, RunHookCommand, RunSource, ServeArgs, ServeOptions, Sink, SinkFactory, SpanOp,
+    StatusArgs,
 };
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+
+struct TrackingSinkFactory {
+    flushes: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl SinkFactory for TrackingSinkFactory {
+    fn create(
+        &self,
+        session_id: &str,
+        _source: &str,
+        _plugin_version: Option<&str>,
+    ) -> anyhow::Result<Box<dyn Sink>> {
+        Ok(Box::new(TrackingSink {
+            session_id: session_id.to_string(),
+            flushes: self.flushes.clone(),
+        }))
+    }
+}
+
+struct TrackingSink {
+    session_id: String,
+    flushes: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+#[async_trait]
+impl Sink for TrackingSink {
+    fn configure(&mut self, _config: &SessionConfig) {}
+
+    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        Ok(ops.len() as u64)
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        *self
+            .flushes
+            .lock()
+            .unwrap()
+            .entry(self.session_id.clone())
+            .or_default() += 1;
+        Ok(())
+    }
+}
 
 fn dummy_host() -> HostInfo {
     // The daemon is started in-process, so the client never spawns; serve_argv
@@ -31,6 +76,7 @@ fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
         session_id: session_id.into(),
         event: event.into(),
         ts_ms,
+        managed_run_id: None,
         payload: serde_json::json!({ "session_id": session_id, "hook_event_name": event, "n": ts_ms }),
         route: Some(SessionRoute {
             destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
@@ -198,6 +244,42 @@ async fn start_daemon() -> (
     });
     wait_for(&socket).await;
     (data_dir, socket, handle, tmp)
+}
+
+async fn start_tracking_daemon(
+    version: &str,
+) -> (
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    Arc<Mutex<HashMap<String, usize>>>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let flushes = Arc::new(Mutex::new(HashMap::new()));
+    let opts = ServeOptions {
+        version: version.to_string(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory: Arc::new(TrackingSinkFactory {
+            flushes: flushes.clone(),
+        }),
+        auth_provider: Some(Arc::new(TestAuthProvider {
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+            first_lease_expired: false,
+        })),
+    };
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir),
+        idle_timeout_secs: 0,
+    };
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    (socket, handle, flushes, tmp)
 }
 
 async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::JoinHandle<()> {
@@ -680,4 +762,140 @@ async fn claude_boundary_journal_contains_a_self_contained_transcript_snapshot()
     assert!(journal.contains("durable"));
     assert!(!journal.contains("sk-TOP-SECRET-abc123"));
     handle.abort();
+}
+
+#[tokio::test]
+async fn managed_run_flush_is_scoped_to_its_accepted_sessions() {
+    let (socket, handle, flushes, _tmp) = start_tracking_daemon("test").await;
+    let host = dummy_host();
+    for (session_id, managed_run_id) in [
+        ("run-a-main", "run-a"),
+        ("run-a-child", "run-a"),
+        ("run-b-main", "run-b"),
+    ] {
+        let mut env = envelope(session_id, "SessionStart", 1);
+        env.managed_run_id = Some(managed_run_id.to_string());
+        forward_envelope(&env, &socket, &host, false).await.unwrap();
+    }
+
+    let result = flush_managed_run("run-a", &socket, 5_000).await.unwrap();
+    assert!(result.flushed, "managed run did not flush: {result:?}");
+    assert_eq!(result.pending, 0);
+    assert_eq!(
+        *flushes.lock().unwrap(),
+        HashMap::from([
+            ("run-a-main".to_string(), 1),
+            ("run-a-child".to_string(), 1)
+        ])
+    );
+
+    let result = flush_managed_run("run-b", &socket, 5_000).await.unwrap();
+    assert!(result.flushed, "managed run did not flush: {result:?}");
+    assert_eq!(flushes.lock().unwrap().get("run-b-main"), Some(&1));
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[cfg(all(feature = "cli", unix))]
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(all(feature = "cli", unix))]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(all(feature = "cli", unix))]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[tokio::test]
+async fn managed_run_flushes_after_success_failure_and_signal_exit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let version = env!("CARGO_PKG_VERSION");
+    let (socket, handle, flushes, tmp) = start_tracking_daemon(version).await;
+    let agent = tmp.path().join("fake-codex.sh");
+    std::fs::write(
+        &agent,
+        r#"#!/bin/sh
+previous=
+last=
+for argument in "$@"; do
+  previous=$last
+  last=$argument
+done
+session_id=$previous
+mode=$last
+printf '{"session_id":"%s","hook_event_name":"SessionStart"}\n' "$session_id" |
+  "$BT_DAEMON_TEST_BIN" hook --source debug --managed-run-hook --no-spawn
+case "$mode" in
+  success) exit 0 ;;
+  failure) exit 7 ;;
+  signal) kill -TERM "$$" ;;
+  *) exit 99 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let _socket = EnvVarGuard::set("BT_DAEMON_SOCKET", &socket);
+    let _agent = EnvVarGuard::set("CODEX_BIN", &agent);
+    let _daemon = EnvVarGuard::set("BT_DAEMON_TEST_BIN", env!("CARGO_BIN_EXE_bt-daemon"));
+    let route = || SessionRoute {
+        destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+            project_id: None,
+            project_name: Some("managed-run-test".into()),
+        }),
+        ..SessionRoute::default()
+    };
+    let run = |session_id: &str, mode: &str| {
+        run_traced(
+            RunArgs {
+                source: RunSource::Codex,
+                agent_args: vec![session_id.into(), mode.into()],
+            },
+            RunHookCommand {
+                program: "unused-hook-command".into(),
+                args: Vec::new(),
+            },
+            route(),
+        )
+    };
+
+    assert!(run("managed-success", "success").await.unwrap().success());
+    assert_eq!(
+        run("managed-failure", "failure").await.unwrap().code(),
+        Some(7)
+    );
+    let signal_status = run("managed-signal", "signal").await.unwrap();
+    assert!(!signal_status.success());
+    assert_eq!(signal_status.code(), None);
+
+    assert_eq!(
+        *flushes.lock().unwrap(),
+        HashMap::from([
+            ("managed-success".to_string(), 1),
+            ("managed-failure".to_string(), 1),
+            ("managed-signal".to_string(), 1),
+        ])
+    );
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
 }

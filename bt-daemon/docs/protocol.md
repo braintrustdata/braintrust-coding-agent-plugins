@@ -124,6 +124,17 @@ Result:
 `flushed: false` with `pending > 0` means the timeout was hit with work
 outstanding. Used by session-end hooks and flush-on-turn-end mode.
 
+### `managed_run.flush` (request)
+
+Block until every session accepted from one `bt trace run` child process tree
+has flushed. Params:
+```json
+{ "managed_run_id": "…", "timeout_ms": 10000 }
+```
+The result has the same shape as `session.flush`. The managed-run identifier is
+invocation-local and prevents the shared daemon from flushing unrelated agent
+sessions.
+
 ### `status.get` (request)
 
 Params: `{ "session_id": "…" }` (omit `session_id` for daemon-wide status).
@@ -161,6 +172,7 @@ Used for version handover and by tests.
   "session_id": "0f9d…",
   "event": "PostToolUse",
   "ts_ms": 1753639552123,
+  "managed_run_id": "invocation-uuid",
   "payload": { "…raw agent-native hook payload…": true },
   "route": {
     "auth": {
@@ -192,6 +204,9 @@ Field notes:
   daemon.
 - **`payload`** is opaque to transport and to everything except the translator
   for `source`.
+- **`managed_run_id`** is present only for events inherited from a
+  `bt trace run` process tree. It groups native sessions for the final
+  invocation flush and is not trace metadata.
 - **`route`** carries non-secret auth selection and trace settings. `profile`
   is optional and resolves through `bt`'s default profile when absent;
   `org_name` optionally constrains organization selection. The daemon resolves

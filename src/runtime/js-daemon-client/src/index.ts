@@ -53,6 +53,7 @@ export interface DaemonEnvelope {
   session_id: string
   event: string
   ts_ms: number
+  managed_run_id?: string
   payload: unknown
   route?: DaemonSessionRoute
 }
@@ -81,6 +82,7 @@ export interface DaemonClientOptions {
   connectAttempts?: number
   connectDelayMs?: number
   requestTimeoutMs?: number
+  managedRunId?: string
   warn?: (message: string) => void
 }
 
@@ -134,6 +136,7 @@ export class DaemonClient {
       connectAttempts: 50,
       connectDelayMs: 20,
       requestTimeoutMs: 10_000,
+      managedRunId: process.env.BT_TRACE_MANAGED_RUN_ID,
       ...options,
     }
   }
@@ -143,6 +146,7 @@ export class DaemonClient {
       const event = {
         ...envelope,
         ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
+        ...(this.options.managedRunId ? { managed_run_id: this.options.managedRunId } : {}),
       }
       try {
         const result = (await this.request("event.log", event)) as { accepted?: boolean }

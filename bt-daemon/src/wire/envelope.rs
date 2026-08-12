@@ -23,6 +23,10 @@ pub struct Envelope {
     pub event: String,
     /// Epoch milliseconds, stamped by the shim at capture time.
     pub ts_ms: i64,
+    /// Invocation-local identifier supplied by `bt trace run`. The daemon uses
+    /// it only to flush the sessions created by one managed child process tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_run_id: Option<String>,
     /// The raw agent-native hook payload; opaque except to the translator.
     pub payload: serde_json::Value,
     /// Non-secret, immutable routing intent for this session. New clients use
@@ -198,6 +202,7 @@ impl Envelope {
             session_id: self.session_id.clone(),
             event: self.event.clone(),
             ts_ms: self.ts_ms,
+            managed_run_id: self.managed_run_id.clone(),
             payload: self.payload.clone(),
             route: self.route.clone(),
         }
@@ -216,6 +221,8 @@ pub struct RedactedEnvelope {
     pub session_id: String,
     pub event: String,
     pub ts_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_run_id: Option<String>,
     pub payload: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<SessionRoute>,
@@ -233,6 +240,7 @@ mod tests {
             session_id: "sess-1".into(),
             event: "PostToolUse".into(),
             ts_ms: 1_753_639_552_123,
+            managed_run_id: Some("run-1".into()),
             payload: serde_json::json!({ "session_id": "sess-1", "tool_name": "shell" }),
             route: Some(SessionRoute {
                 auth: AuthSelection {
@@ -266,6 +274,7 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         let back: Envelope = serde_json::from_str(&s).unwrap();
         assert_eq!(back.session_id, "sess-1");
+        assert_eq!(back.managed_run_id.as_deref(), Some("run-1"));
         assert_eq!(back.route.unwrap().auth.profile.as_deref(), Some("work"));
         assert!(back.config.is_none());
         assert!(!s.contains("sk-super-secret"));
@@ -281,6 +290,7 @@ mod tests {
             "token leaked into journal form: {s}"
         );
         assert_eq!(r.route.unwrap().auth.profile.as_deref(), Some("work"));
+        assert_eq!(r.managed_run_id.as_deref(), Some("run-1"));
     }
 
     #[test]
