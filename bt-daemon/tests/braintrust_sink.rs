@@ -90,6 +90,66 @@ async fn logs3_bodies(server: &MockServer) -> String {
         .join("\n")
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_project_id_does_not_register_a_project_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/project/register"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("sess-id", "antigravity", None).unwrap();
+    let mut config = session_config(&base);
+    config.destination = Some(TraceDestination::ProjectLogs {
+        project_id: Some("proj-existing".into()),
+        project_name: None,
+    });
+    sink.configure(&config);
+    sink.emit(&[SpanOp::Insert(row(
+        "root-id",
+        "root-id",
+        &[],
+        "Antigravity",
+        SpanType::Task,
+        1,
+        Some(2),
+    ))])
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path() == "/logs3"),
+        "expected delivery to the existing project"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path() == "/api/project/register"),
+        "an explicit project id must not trigger project registration"
+    );
+}
+
 /// Two sessions on two different backend URLs, from one factory, each deliver
 /// only to their own collector — the per-`(api_url, app_url)` client cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -218,6 +278,61 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
         "initial row absent: {bodies}"
     );
     assert!(bodies.contains("late"), "late merge absent: {bodies}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_session_can_extend_an_already_ended_root() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("sess-resumed", "antigravity", None).unwrap();
+    sink.configure(&session_config(&base));
+
+    let root = row(
+        "resumed-root",
+        "resumed-root",
+        &[],
+        "Antigravity",
+        SpanType::Task,
+        1_000,
+        None,
+    );
+    let first_stop = row(
+        "resumed-root",
+        "resumed-root",
+        &[],
+        "",
+        SpanType::Task,
+        1_000,
+        Some(2_000),
+    );
+    let resumed_stop = row(
+        "resumed-root",
+        "resumed-root",
+        &[],
+        "",
+        SpanType::Task,
+        1_000,
+        Some(5_000),
+    );
+    sink.emit(&[
+        SpanOp::Insert(root),
+        SpanOp::Merge(first_stop),
+        SpanOp::Merge(resumed_stop),
+    ])
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+
+    let bodies = logs3_bodies(&server).await;
+    assert!(
+        bodies.contains("\"end\":5.0"),
+        "later stop did not extend the root end time: {bodies}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

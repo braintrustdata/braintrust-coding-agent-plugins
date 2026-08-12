@@ -104,6 +104,11 @@ pub struct HookArgs {
     /// Explicit event name (overrides `--event-field` lookup).
     #[arg(long)]
     pub event: Option<String>,
+    /// JSON field holding a transcript path. When present, capture the file
+    /// length observed by this hook so deterministic journal replay cannot
+    /// read transcript records written by later lifecycle events.
+    #[arg(long)]
+    pub transcript_path_field: Option<String>,
     /// Fail instead of spawning a daemon if none is running.
     #[arg(long)]
     pub no_spawn: bool,
@@ -237,7 +242,11 @@ pub async fn run_hook(
     if !settings.tracing_enabled() {
         return Ok(());
     }
-    let payload = read_stdin_json()?;
+    let mut payload = read_stdin_json()?;
+
+    if let Some(field) = &args.transcript_path_field {
+        add_transcript_observation(&mut payload, field);
+    }
 
     let session_id = json_str_field(&payload, &args.session_id_field)
         .ok_or_else(|| anyhow::anyhow!("no `{}` field in hook payload", args.session_id_field))?;
@@ -1018,6 +1027,47 @@ fn json_str_field(payload: &serde_json::Value, field: &str) -> Option<String> {
     }
 }
 
+/// Stamp the transcript boundary visible when a blocking hook runs. Agent
+/// transcripts are append-only, while daemon journal replay may happen after
+/// the session has advanced. Recording byte lengths keeps translation causally
+/// aligned with each native hook without copying transcript contents into the
+/// journal.
+fn add_transcript_observation(payload: &mut serde_json::Value, field: &str) {
+    let Some(path) = json_str_field(payload, field) else {
+        return;
+    };
+    let transcript = std::path::Path::new(&path);
+    let mut observation = serde_json::Map::new();
+    observation.insert("path".into(), serde_json::Value::String(path.clone()));
+    if let Ok(metadata) = std::fs::metadata(transcript) {
+        observation.insert(
+            "observed_bytes".into(),
+            serde_json::Value::Number(metadata.len().into()),
+        );
+    }
+
+    if transcript.file_name().and_then(|name| name.to_str()) == Some("transcript.jsonl") {
+        let full = transcript.with_file_name("transcript_full.jsonl");
+        if let Ok(metadata) = std::fs::metadata(&full) {
+            observation.insert(
+                "full_path".into(),
+                serde_json::Value::String(full.to_string_lossy().into_owned()),
+            );
+            observation.insert(
+                "full_observed_bytes".into(),
+                serde_json::Value::Number(metadata.len().into()),
+            );
+        }
+    }
+
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "_bt_transcript_observation".into(),
+            serde_json::Value::Object(observation),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,6 +1175,26 @@ mod tests {
     #[test]
     fn clock_returns_a_positive_epoch_timestamp() {
         assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn transcript_observation_captures_compact_and_full_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let compact = dir.path().join("transcript.jsonl");
+        let full = dir.path().join("transcript_full.jsonl");
+        std::fs::write(&compact, b"compact\n").unwrap();
+        std::fs::write(&full, b"complete record\n").unwrap();
+        let mut payload = serde_json::json!({
+            "transcriptPath": compact.to_string_lossy()
+        });
+
+        add_transcript_observation(&mut payload, "transcriptPath");
+
+        let observed = &payload["_bt_transcript_observation"];
+        assert_eq!(observed["path"], compact.to_string_lossy().as_ref());
+        assert_eq!(observed["observed_bytes"], 8);
+        assert_eq!(observed["full_path"], full.to_string_lossy().as_ref());
+        assert_eq!(observed["full_observed_bytes"], 16);
     }
 
     #[test]
