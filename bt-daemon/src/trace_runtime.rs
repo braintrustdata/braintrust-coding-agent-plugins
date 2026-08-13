@@ -117,12 +117,54 @@ async fn session_config(
         .services
         .resolve_auth(&route.auth, AuthResolveReason::Initial)
         .await?;
+    require_resolved_org(route, &lease)?;
     Ok(SessionConfig {
         auth: lease.auth,
         destination: route.destination.clone(),
         flush_mode: route.flush_mode,
         additional_metadata: route.additional_metadata.clone(),
     })
+}
+
+fn require_resolved_org(route: &SessionRoute, lease: &AuthLease) -> anyhow::Result<String> {
+    let org_name = lease
+        .auth
+        .org_name
+        .as_deref()
+        .filter(|org| !org.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "organization choice required for tracing; pass --org <NAME> or select an organization during setup"
+            )
+        })?;
+    if let Some(expected) = route
+        .auth
+        .org_name
+        .as_deref()
+        .filter(|org| !org.trim().is_empty())
+    {
+        if expected != org_name {
+            anyhow::bail!(
+                "selected profile resolved organization {org_name:?}, expected {expected:?}"
+            );
+        }
+    }
+    Ok(org_name.to_string())
+}
+
+async fn resolve_command_route(
+    host: &TraceHostContext,
+    destination_required: bool,
+) -> anyhow::Result<SessionRoute> {
+    let mut route = host.services.resolve_route(destination_required).await?;
+    let lease = host
+        .services
+        .resolve_auth(&route.auth, AuthResolveReason::Initial)
+        .await?;
+    let org_name = require_resolved_org(&route, &lease)?;
+    route.auth.profile = Some(lease.profile);
+    route.auth.org_name = Some(org_name);
+    Ok(route)
 }
 
 fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Result<()> {
@@ -134,7 +176,7 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
     match args.command {
         TraceCommand::Setup(setup_args) => {
-            let route = host.services.resolve_route(true).await?;
+            let route = resolve_command_route(&host, true).await?;
             print_output(run_setup(setup_args, route)?, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
@@ -178,7 +220,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             run_import(import_args, serve_options(&host), Some(config)).await
         }
         TraceCommand::Run(run_args) => {
-            let route = host.services.resolve_route(true).await?;
+            let route = resolve_command_route(&host, true).await?;
             let hook_command = child_command(&host.command, "hook");
             let status = run_traced(run_args, hook_command, route).await?;
             if status.success() {
@@ -246,6 +288,7 @@ mod tests {
         route_requests: Mutex<Vec<bool>>,
         route_error: Option<&'static str>,
         auth_error: Option<&'static str>,
+        resolved_org: Option<&'static str>,
     }
 
     impl RecordingHost {
@@ -254,6 +297,16 @@ mod tests {
                 route_requests: Mutex::new(Vec::new()),
                 route_error,
                 auth_error,
+                resolved_org: Some("test-org"),
+            }
+        }
+
+        fn without_org() -> Self {
+            Self {
+                route_requests: Mutex::new(Vec::new()),
+                route_error: None,
+                auth_error: None,
+                resolved_org: None,
             }
         }
     }
@@ -291,7 +344,7 @@ mod tests {
                     token: "secret".into(),
                     api_url: None,
                     app_url: None,
-                    org_name: None,
+                    org_name: self.resolved_org.map(str::to_string),
                     org_id: None,
                 },
                 expires_at_ms: None,
@@ -330,6 +383,25 @@ mod tests {
             assert_eq!(error.to_string(), "no destination");
             assert_eq!(*services.route_requests.lock().unwrap(), [true]);
         }
+    }
+
+    #[tokio::test]
+    async fn command_routes_persist_the_resolved_profile_and_organization() {
+        let services = Arc::new(RecordingHost::new(None, None));
+        let route = resolve_command_route(&test_host(services), true)
+            .await
+            .unwrap();
+        assert_eq!(route.auth.profile.as_deref(), Some("test"));
+        assert_eq!(route.auth.org_name.as_deref(), Some("test-org"));
+    }
+
+    #[tokio::test]
+    async fn command_routes_reject_an_unresolved_organization() {
+        let services = Arc::new(RecordingHost::without_org());
+        let error = resolve_command_route(&test_host(services), true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("organization choice required"));
     }
 
     #[tokio::test]

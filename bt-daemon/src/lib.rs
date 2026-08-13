@@ -355,6 +355,7 @@ pub async fn flush_managed_run(
             return Ok(wire::FlushResult {
                 flushed: true,
                 pending: 0,
+                accepted_sessions: 0,
             })
         }
     };
@@ -485,6 +486,11 @@ pub async fn run_traced(
     };
     let socket = paths::socket_path(None);
     match flush_managed_run(&managed_run_id, &socket, MANAGED_RUN_FLUSH_TIMEOUT_MS).await {
+        Ok(result) if result.accepted_sessions == 0 => {
+            anyhow::bail!(
+                "managed run produced no accepted trace events; verify hook output and `bt trace status`"
+            )
+        }
         Ok(result) if result.flushed => {}
         Ok(result) => tracing::warn!(
             managed_run_id,

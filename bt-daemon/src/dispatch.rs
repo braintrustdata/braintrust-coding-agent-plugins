@@ -8,7 +8,6 @@
 //! Braintrust happens later in the actor; a downstream error never fails the
 //! caller's turn.
 
-use crate::journal::JournalWriter;
 use crate::sink::SinkFactory;
 use crate::translate::{Registry, SessionCtx};
 use crate::wire::Envelope;
@@ -33,7 +32,6 @@ enum SessionMsg {
 pub struct Session {
     pub source: String,
     tx: mpsc::UnboundedSender<SessionMsg>,
-    journal: tokio::sync::Mutex<JournalWriter>,
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
     pub permalink: Arc<Mutex<Option<String>>>,
@@ -45,8 +43,8 @@ impl Session {
         session_id: String,
         source: String,
         plugin_version: Option<String>,
-        journal: JournalWriter,
         replay: Vec<Envelope>,
+        config: crate::wire::SessionConfig,
         translators: Arc<Registry>,
         sink_factory: Arc<dyn SinkFactory>,
     ) -> Arc<Session> {
@@ -65,26 +63,21 @@ impl Session {
             last_error: last_error.clone(),
             permalink: permalink.clone(),
             replay,
+            config,
         };
         tokio::spawn(actor.run(rx));
 
         Arc::new(Session {
             source,
             tx,
-            journal: tokio::sync::Mutex::new(journal),
             counters,
             last_error,
             permalink,
         })
     }
 
-    /// Journal (redacted) then enqueue. Both complete before the caller acks.
-    pub async fn append_and_enqueue(&self, mut env: Envelope) -> anyhow::Result<()> {
-        hydrate_transcript_snapshot(&mut env).await;
-        {
-            let mut j = self.journal.lock().await;
-            j.append(&env).await?;
-        }
+    /// Enqueue an event after the daemon has journaled it.
+    pub fn enqueue(&self, env: Envelope) -> anyhow::Result<()> {
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
         self.tx
             .send(SessionMsg::Event(Box::new(env)))
@@ -130,7 +123,7 @@ impl Session {
 /// journal at lifecycle boundaries so recovery/replay does not depend on a
 /// path that Claude may later rewrite or delete. Fail open: a missing file is
 /// handled by the translator exactly as before.
-async fn hydrate_transcript_snapshot(env: &mut Envelope) {
+pub(crate) async fn hydrate_transcript_snapshot(env: &mut Envelope) {
     if env.source != "claude-code"
         || !matches!(
             env.event.as_str(),
@@ -173,6 +166,7 @@ struct SessionActor {
     last_error: Arc<Mutex<Option<String>>>,
     permalink: Arc<Mutex<Option<String>>>,
     replay: Vec<Envelope>,
+    config: crate::wire::SessionConfig,
 }
 
 impl SessionActor {
@@ -189,15 +183,20 @@ impl SessionActor {
                 // Still drain the queue so the daemon's counters settle and
                 // callers waiting on flush don't hang.
                 while let Some(msg) = rx.recv().await {
-                    if let SessionMsg::Event(_) = msg {
-                        self.counters.queued.fetch_sub(1, Ordering::Relaxed);
-                    } else if let SessionMsg::Configure(_, r) = msg {
-                        let _ = r.send(());
-                    } else if let SessionMsg::Flush(r) = msg {
-                        let _ = r.send(0);
-                    } else if let SessionMsg::Shutdown(r) = msg {
-                        let _ = r.send(());
-                        break;
+                    match msg {
+                        SessionMsg::Event(_) => {
+                            self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        SessionMsg::Configure(_, r) => {
+                            let _ = r.send(());
+                        }
+                        SessionMsg::Flush(r) => {
+                            let _ = r.send(0);
+                        }
+                        SessionMsg::Shutdown(r) => {
+                            let _ = r.send(());
+                            break;
+                        }
                     }
                 }
                 return;
@@ -205,23 +204,15 @@ impl SessionActor {
         };
         let mut ctx = SessionCtx {
             session_id: self.session_id.clone(),
-            config: None,
+            config: Some(self.config.clone()),
         };
-        // Rebuild translator state before accepting the first new event. Keep
-        // the deterministic replay ops buffered until live credentials arrive;
-        // then re-emitting them repairs any rows lost by a prior crash. The
-        // stable span ids ensure these target existing rows rather than create
-        // duplicate spans.
-        let mut replay_ops = Vec::new();
-        for env in &self.replay {
-            if let Some(cfg) = &env.config {
-                ctx.config = Some(cfg.clone());
-            }
-            match translator.handle(env, &ctx) {
-                Ok(mut ops) => replay_ops.append(&mut ops),
-                Err(e) => self.set_error(format!("journal replay failed: {e}")),
-            }
-        }
+        sink.configure(&self.config);
+        self.refresh_permalink(sink.as_ref());
+        // Rebuild translator state before accepting the first new event.
+        // Stable span ids make this both crash recovery and a complete copy
+        // when an existing source session is sent to another destination.
+        self.replay_into(&mut translator, &mut sink, &ctx, &self.replay)
+            .await;
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -230,15 +221,6 @@ impl SessionActor {
                         sink.configure(cfg);
                         ctx.config = Some(cfg.clone());
                         self.refresh_permalink(sink.as_ref());
-                    }
-                    if !replay_ops.is_empty() {
-                        match sink.emit(&replay_ops).await {
-                            Ok(n) => {
-                                self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
-                                replay_ops.clear();
-                            }
-                            Err(e) => self.set_error(format!("sink replay emit failed: {e}")),
-                        }
                     }
                     match translator.handle(&env, &ctx) {
                         Ok(ops) => match sink.emit(&ops).await {
@@ -267,6 +249,31 @@ impl SessionActor {
                     break;
                 }
             }
+        }
+    }
+
+    async fn replay_into(
+        &self,
+        translator: &mut Box<dyn crate::translate::AgentTranslator>,
+        sink: &mut Box<dyn crate::sink::Sink>,
+        ctx: &SessionCtx,
+        replay: &[Envelope],
+    ) {
+        let mut replay_ops = Vec::new();
+        for env in replay {
+            match translator.handle(env, ctx) {
+                Ok(mut ops) => replay_ops.append(&mut ops),
+                Err(e) => self.set_error(format!("journal replay failed: {e}")),
+            }
+        }
+        if replay_ops.is_empty() {
+            return;
+        }
+        match sink.emit(&replay_ops).await {
+            Ok(n) => {
+                self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
+            }
+            Err(e) => self.set_error(format!("sink replay emit failed: {e}")),
         }
     }
 

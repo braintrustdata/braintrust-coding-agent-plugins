@@ -68,6 +68,8 @@ fn default_flush_timeout_ms() -> u64 {
 pub struct FlushResult {
     pub flushed: bool,
     pub pending: u64,
+    #[serde(default)]
+    pub accepted_sessions: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -88,6 +90,8 @@ pub struct StatusResult {
 pub struct SessionStatus {
     pub session_id: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<crate::wire::SessionRoute>,
     pub queued: u64,
     pub spans_emitted: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
