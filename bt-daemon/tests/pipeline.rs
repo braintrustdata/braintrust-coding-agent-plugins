@@ -252,7 +252,8 @@ async fn start_daemon_with(
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
-    let handle = start_daemon_at_with(data_dir.clone(), socket.clone(), provider, sink_factory).await;
+    let handle =
+        start_daemon_at_with(data_dir.clone(), socket.clone(), provider, sink_factory).await;
     (data_dir, socket, handle, tmp)
 }
 

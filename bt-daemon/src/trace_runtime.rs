@@ -206,7 +206,10 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         TraceCommand::Hook(hook_args) => {
             // A persistent hook must never fail the coding agent's turn.
             let result = async {
-                let route = host.services.resolve_route(RouteRequirements::default()).await?;
+                let route = host
+                    .services
+                    .resolve_route(RouteRequirements::default())
+                    .await?;
                 run_hook(hook_args, route, host_info(&host)).await
             }
             .await;
@@ -417,7 +420,10 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.to_string(), "no destination");
-            assert_eq!(*services.route_requests.lock().unwrap(), [COMMAND_REQUIREMENTS]);
+            assert_eq!(
+                *services.route_requests.lock().unwrap(),
+                [COMMAND_REQUIREMENTS]
+            );
         }
     }
 

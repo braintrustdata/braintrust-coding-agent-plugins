@@ -191,25 +191,6 @@ impl Daemon {
             }
         }
 
-        let resolved_org = lease
-            .auth
-            .org_name
-            .as_deref()
-            .filter(|org| !org.trim().is_empty())
-            .ok_or_else(|| {
-                let message = format!(
-                    "selected Braintrust profile {:?} did not resolve an organization; pass --org <NAME> or select an organization during setup",
-                    lease.profile
-                );
-                self.auth_errors.lock().unwrap().insert(
-                    key.clone(),
-                    (env.source.clone(), message.clone()),
-                );
-                anyhow::anyhow!(message)
-            })?
-            .to_string();
-        let _ = resolved_org;
-
         env.config = Some(route.with_auth(lease.auth.clone()));
         self.session_auth
             .lock()
@@ -386,8 +367,8 @@ impl Daemon {
             session_id: key.session_id.clone(),
             route: route.clone(),
         };
-        if let Err(error) = journal::append_managed_run_key(&self.data_dir, managed_run_id, &record)
-            .await
+        if let Err(error) =
+            journal::append_managed_run_key(&self.data_dir, managed_run_id, &record).await
         {
             tracing::warn!(
                 managed_run_id,

@@ -109,8 +109,20 @@ async fn concurrent_imports_of_the_same_session_reach_independent_destinations()
     let project_a = tmp.path().join("spans-a");
     let project_b = tmp.path().join("spans-b");
     let (result_a, result_b) = tokio::join!(
-        import_transcript(&transcript, ImportSource::Codex, options(&project_a), None, false),
-        import_transcript(&transcript, ImportSource::Codex, options(&project_b), None, false),
+        import_transcript(
+            &transcript,
+            ImportSource::Codex,
+            options(&project_a),
+            None,
+            false
+        ),
+        import_transcript(
+            &transcript,
+            ImportSource::Codex,
+            options(&project_b),
+            None,
+            false
+        ),
     );
     result_a.unwrap();
     result_b.unwrap();
