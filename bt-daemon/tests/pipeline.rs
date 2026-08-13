@@ -11,7 +11,7 @@ use bt_daemon::{
 };
 #[cfg(all(feature = "cli", unix))]
 use bt_daemon::{run_traced, RunArgs, RunHookCommand, RunSource};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +56,60 @@ impl Sink for TrackingSink {
             .unwrap()
             .entry(self.session_id.clone())
             .or_default() += 1;
+        Ok(())
+    }
+}
+
+/// One observed delivery pipeline: the resolved route configuration plus the
+/// span activity delivered through it.
+#[derive(Default)]
+struct RouteSinkRecord {
+    org: Mutex<Option<String>>,
+    destination: Mutex<Option<bt_daemon::wire::TraceDestination>>,
+    emitted: std::sync::atomic::AtomicU64,
+    flushes: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct RouteRecordingSinkFactory {
+    sinks: Mutex<Vec<Arc<RouteSinkRecord>>>,
+}
+
+impl SinkFactory for RouteRecordingSinkFactory {
+    fn create(
+        &self,
+        _session_id: &str,
+        _source: &str,
+        _plugin_version: Option<&str>,
+    ) -> anyhow::Result<Box<dyn Sink>> {
+        let record = Arc::new(RouteSinkRecord::default());
+        self.sinks.lock().unwrap().push(record.clone());
+        Ok(Box::new(RouteRecordingSink { record }))
+    }
+}
+
+struct RouteRecordingSink {
+    record: Arc<RouteSinkRecord>,
+}
+
+#[async_trait]
+impl Sink for RouteRecordingSink {
+    fn configure(&mut self, config: &SessionConfig) {
+        *self.record.org.lock().unwrap() = config.auth.org_name.clone();
+        *self.record.destination.lock().unwrap() = config.destination.clone();
+    }
+
+    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        self.record
+            .emitted
+            .fetch_add(ops.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(ops.len() as u64)
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.record
+            .flushes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -136,7 +190,12 @@ impl AuthProvider for TestAuthProvider {
                 token: format!("secret-{profile}-{call_index}"),
                 api_url: Some(format!("https://{profile}.example.test")),
                 app_url: None,
-                org_name: selection.org_name.clone(),
+                // Model a profile with a default organization for selections
+                // that do not constrain one.
+                org_name: selection
+                    .org_name
+                    .clone()
+                    .or_else(|| Some(format!("{profile}-org"))),
                 org_id: Some(format!("org-{profile}")),
             },
             expires_at_ms: (self.first_lease_expired && call_index == 1).then_some(0),
@@ -179,6 +238,46 @@ fn test_endpoint(tmp: &Path) -> PathBuf {
         let _ = tmp;
         PathBuf::from(format!(r"\\.\pipe\bt-daemon-test-{}", uuid::Uuid::new_v4()))
     }
+}
+
+async fn start_daemon_with(
+    provider: Arc<TestAuthProvider>,
+    sink_factory: Arc<RouteRecordingSinkFactory>,
+) -> (
+    PathBuf,
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let handle = start_daemon_at_with(data_dir.clone(), socket.clone(), provider, sink_factory).await;
+    (data_dir, socket, handle, tmp)
+}
+
+async fn start_daemon_at_with(
+    data_dir: PathBuf,
+    socket: PathBuf,
+    provider: Arc<TestAuthProvider>,
+    sink_factory: Arc<RouteRecordingSinkFactory>,
+) -> tokio::task::JoinHandle<()> {
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir),
+        idle_timeout_secs: 0,
+    };
+    let opts = ServeOptions {
+        version: "test".to_string(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory,
+        auth_provider: Some(provider),
+    };
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    handle
 }
 
 async fn wait_for(endpoint: &Path) {
@@ -393,35 +492,173 @@ async fn expiring_profile_lease_is_refreshed_for_the_pinned_profile() {
 }
 
 #[tokio::test]
-async fn active_session_rejects_route_changes() {
+async fn one_session_reports_to_multiple_routes_and_orgs_concurrently() {
     let provider = Arc::new(TestAuthProvider {
         calls: Mutex::new(Vec::new()),
         fail: false,
         first_lease_expired: false,
     });
-    let (_data_dir, socket, handle, _tmp) = start_routed_daemon(provider).await;
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let (_data_dir, socket, handle, _tmp) =
+        start_daemon_with(provider.clone(), recording.clone()).await;
     let host = dummy_host();
 
     forward_envelope(
-        &routed_envelope("pinned", "work", "work-org", "SessionStart"),
+        &routed_envelope("shared", "work", "work-org", "SessionStart"),
         &socket,
         &host,
         false,
     )
     .await
     .unwrap();
-    let error = forward_envelope(
-        &routed_envelope("pinned", "personal", "personal-org", "Stop"),
+    forward_envelope(
+        &routed_envelope("shared", "personal", "personal-org", "Stop"),
         &socket,
         &host,
         false,
     )
     .await
-    .unwrap_err();
-    assert!(error.to_string().contains("session route changed"));
+    .unwrap();
+
+    let flushed = flush_session("shared", &socket, 5000).await.unwrap();
+    assert!(flushed.flushed, "flush did not complete: {flushed:?}");
+    assert_eq!(flushed.pending, 0);
+    assert_eq!(
+        flushed.accepted_sessions, 2,
+        "each route is an independent delivery pipeline"
+    );
+
+    let calls = provider.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2, "each route resolves its own credentials");
+    assert_eq!(calls[0].0.org_name.as_deref(), Some("work-org"));
+    assert_eq!(calls[1].0.org_name.as_deref(), Some("personal-org"));
+
+    let sinks = recording.sinks.lock().unwrap().clone();
+    assert_eq!(sinks.len(), 2, "one sink per route, not per session");
+    let orgs: HashSet<_> = sinks
+        .iter()
+        .map(|sink| sink.org.lock().unwrap().clone().unwrap())
+        .collect();
+    assert_eq!(
+        orgs,
+        HashSet::from(["work-org".to_string(), "personal-org".to_string()])
+    );
+    for sink in &sinks {
+        assert!(
+            sink.emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "every destination must receive spans"
+        );
+        assert_eq!(sink.flushes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("shared".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status.sessions.len(), 2);
+    let status_orgs: HashSet<_> = status
+        .sessions
+        .iter()
+        .map(|session| {
+            session
+                .route
+                .as_ref()
+                .and_then(|route| route.auth.org_name.clone())
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        status_orgs,
+        HashSet::from(["work-org".to_string(), "personal-org".to_string()])
+    );
 
     shutdown(&socket).await;
     handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn restarted_daemon_replays_each_route_only_to_its_own_destination() {
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let handle = start_daemon_at_with(data_dir.clone(), socket.clone(), provider, recording).await;
+    let host = dummy_host();
+
+    forward_envelope(
+        &routed_envelope("rerouted", "work", "work-org", "SessionStart"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    forward_envelope(
+        &routed_envelope("rerouted", "personal", "personal-org", "PostToolUse"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session("rerouted", &socket, 5000).await.unwrap();
+    shutdown(&socket).await;
+    handle.await.unwrap();
+
+    // A fresh daemon generation must rebuild each route's pipeline from the
+    // shared journal without cross-delivering one route's events to the other
+    // route's destination.
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let second = start_daemon_at_with(
+        data_dir.clone(),
+        socket.clone(),
+        provider,
+        recording.clone(),
+    )
+    .await;
+    forward_envelope(
+        &routed_envelope("rerouted", "work", "work-org", "Stop"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    let flushed = flush_session("rerouted", &socket, 5000).await.unwrap();
+    assert!(flushed.flushed, "flush did not complete: {flushed:?}");
+    assert_eq!(flushed.accepted_sessions, 1);
+
+    let sinks = recording.sinks.lock().unwrap().clone();
+    assert_eq!(
+        sinks.len(),
+        1,
+        "only the route with new events is rebuilt eagerly"
+    );
+    assert_eq!(
+        sinks[0].org.lock().unwrap().clone().as_deref(),
+        Some("work-org")
+    );
+    assert_eq!(
+        sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "replayed SessionStart (root + span) plus the new Stop span"
+    );
+
+    shutdown(&socket).await;
+    second.await.unwrap();
 }
 
 #[tokio::test]
@@ -647,6 +884,7 @@ async fn spawn_on_demand_runs_the_real_standalone_daemon() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("spawned-data");
     let socket = test_endpoint(tmp.path());
+    let _org = EnvVarGuard::set("BRAINTRUST_ORG_NAME", "spawn-org");
     let host = HostInfo {
         serve_argv: vec![
             OsString::from(env!("CARGO_BIN_EXE_bt-daemon")),
@@ -798,13 +1036,13 @@ async fn managed_run_flush_is_scoped_to_its_accepted_sessions() {
     handle.await.unwrap();
 }
 
-#[cfg(all(feature = "cli", unix))]
+#[cfg(feature = "cli")]
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
 }
 
-#[cfg(all(feature = "cli", unix))]
+#[cfg(feature = "cli")]
 impl EnvVarGuard {
     fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
@@ -813,7 +1051,7 @@ impl EnvVarGuard {
     }
 }
 
-#[cfg(all(feature = "cli", unix))]
+#[cfg(feature = "cli")]
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match &self.previous {

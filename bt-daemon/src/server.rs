@@ -364,23 +364,56 @@ impl Daemon {
             .sum()
     }
 
-    fn record_managed_run_session(&self, managed_run_id: &str, key: &DeliveryKey) {
+    fn record_managed_run_session(&self, managed_run_id: &str, key: &DeliveryKey) -> bool {
         self.managed_run_sessions
             .lock()
             .unwrap()
             .entry(managed_run_id.to_string())
             .or_default()
-            .insert(key.clone());
+            .insert(key.clone())
+    }
+
+    async fn persist_managed_run_session(
+        &self,
+        managed_run_id: &str,
+        key: &DeliveryKey,
+        route: &SessionRoute,
+    ) {
+        if !self.record_managed_run_session(managed_run_id, key) {
+            return;
+        }
+        let record = journal::ManagedRunKey {
+            session_id: key.session_id.clone(),
+            route: route.clone(),
+        };
+        if let Err(error) = journal::append_managed_run_key(&self.data_dir, managed_run_id, &record)
+            .await
+        {
+            tracing::warn!(
+                managed_run_id,
+                session_id = %key.session_id,
+                %error,
+                "failed to record managed run delivery pipeline"
+            );
+        }
     }
 
     async fn flush_managed_run(&self, params: ManagedRunFlushParams) -> FlushResult {
-        let delivery_keys = self
+        let mut delivery_keys: HashSet<DeliveryKey> = self
             .managed_run_sessions
             .lock()
             .unwrap()
             .get(&params.managed_run_id)
             .cloned()
             .unwrap_or_default();
+        // A daemon restart or idle exit loses the in-memory mapping; the
+        // persisted record keeps flush accounting accurate for runs whose
+        // events were accepted by an earlier daemon generation.
+        for record in journal::read_managed_run_keys(&self.data_dir, &params.managed_run_id).await {
+            if let Ok(key) = DeliveryKey::new(&record.session_id, &record.route) {
+                delivery_keys.insert(key);
+            }
+        }
         let mut result = FlushResult {
             flushed: true,
             pending: 0,
@@ -455,6 +488,7 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
 
     let daemon = Daemon::new(opts, data_dir);
     journal::gc_old_journals(&daemon.data_dir, Duration::from_secs(7 * 24 * 60 * 60)).await;
+    journal::gc_old_managed_runs(&daemon.data_dir, Duration::from_secs(7 * 24 * 60 * 60)).await;
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
     spawn_idle_watchdog(daemon.clone(), idle_timeout);
 
@@ -583,6 +617,7 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
     let event = env.event.clone();
     let session_id = env.session_id.clone();
     let managed_run_id = env.managed_run_id.clone();
+    let route = env.route.clone();
     tracing::info!(source, event, session_id, "event received");
     daemon.touch();
     let session_lock = daemon.session_lock(&session_id);
@@ -610,8 +645,10 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
 
     match &result {
         Ok(delivery_key) => {
-            if let Some(managed_run_id) = managed_run_id {
-                daemon.record_managed_run_session(&managed_run_id, delivery_key);
+            if let (Some(managed_run_id), Some(route)) = (managed_run_id, route) {
+                daemon
+                    .persist_managed_run_session(&managed_run_id, delivery_key, &route)
+                    .await;
             }
             tracing::info!(source, event, session_id, "event accepted")
         }

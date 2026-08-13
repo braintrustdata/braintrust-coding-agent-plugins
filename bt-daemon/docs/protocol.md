@@ -111,7 +111,9 @@ those are handled asynchronously and surfaced via `status.get`.
 
 ### `session.flush` (request)
 
-Block until the session's spans are delivered, or `timeout_ms` elapses.
+Block until every route's spans for the session are delivered, or `timeout_ms`
+elapses. A session_id may have opened more than one route (see "Multiple
+routes per session" below); this flushes all of them.
 
 Params:
 ```json
@@ -119,10 +121,12 @@ Params:
 ```
 Result:
 ```json
-{ "flushed": true, "pending": 0 }
+{ "flushed": true, "pending": 0, "accepted_sessions": 1 }
 ```
 `flushed: false` with `pending > 0` means the timeout was hit with work
-outstanding. Used by session-end hooks and flush-on-turn-end mode.
+outstanding across one or more routes. `accepted_sessions` counts how many
+independent routes this session_id has open. Used by session-end hooks and
+flush-on-turn-end mode.
 
 ### `managed_run.flush` (request)
 
@@ -147,6 +151,10 @@ Result:
     {
       "session_id": "…",
       "source": "codex",
+      "route": {
+        "auth": { "profile": "work", "org_name": "acme" },
+        "destination": { "type": "project_logs", "project_name": "codex" }
+      },
       "queued": 0,
       "spans_emitted": 42,
       "permalink": "https://www.braintrust.dev/app/…",
@@ -155,7 +163,10 @@ Result:
   ]
 }
 ```
-Powers a `status` CLI and pi's trace-link widget.
+`sessions` lists one entry **per route**, not per session_id: a session_id
+reporting to two destinations appears twice, each entry carrying its own
+`route`, counters, and permalink. Powers a `status` CLI and pi's trace-link
+widget.
 
 ### `daemon.shutdown` (request)
 
@@ -194,9 +205,11 @@ Field notes:
 
 - **`source`** selects the daemon-side translator. `debug` is a built-in
   pass-through translator used by the prototype and tests.
-- **`session_id`** is the per-session queue + state key. The shim extracts it
-  from the payload (default JSON field `session_id`, overridable with
-  `--session-id-field`); both Claude Code and Codex use `session_id`.
+- **`session_id`** identifies the source agent session. Combined with `route`
+  it forms the queue + state key (see "Multiple routes per session" below).
+  The shim extracts it from the payload (default JSON field `session_id`,
+  overridable with `--session-id-field`); both Claude Code and Codex use
+  `session_id`.
 - **`event`** is the agent-native hook name (not normalized). Extracted from
   the payload (default field `hook_event_name`, overridable with `--event`).
 - **`ts_ms`** is stamped by the shim **at capture time** (epoch millis),
@@ -211,13 +224,22 @@ Field notes:
   is optional and resolves through `bt`'s default profile when absent;
   `org_name` optionally constrains organization selection. The daemon resolves
   the live credential, pins the returned canonical profile for the lifetime
-  of the session, and refreshes an expiring lease without changing that route.
-  A route cannot change after a session's first accepted event. `destination`
-  is required so setup/run must make project or parent selection explicit.
-  `flush_mode` ∈ `fire_and_forget` | `flush_on_turn_end`.
-  New front-ends set the typed `destination`: `project_logs` accepts a project
-  id and/or name, `experiment` accepts an experiment id, and `parent_span`
-  carries the complete exported `SpanComponents` object.
+  of that route's pipeline, and refreshes an expiring lease without changing
+  the route. `destination` is required so setup/run must make project or
+  parent selection explicit. `flush_mode` ∈ `fire_and_forget` |
+  `flush_on_turn_end`. New front-ends set the typed `destination`:
+  `project_logs` accepts a project id and/or name, `experiment` accepts an
+  experiment id, and `parent_span` carries the complete exported
+  `SpanComponents` object.
+- **Multiple routes per session.** `session_id` plus the exact `route` forms
+  one independent delivery pipeline: its own auth resolution, translator,
+  sink, and queue. A session_id is not pinned to a single route — events for
+  the same session_id but a different route open a second, fully independent
+  pipeline rather than replacing or rejecting the first. This lets one source
+  session report concurrently to multiple destinations, including multiple
+  organizations (e.g. two `bt trace import` runs, or an active hook capture
+  alongside a concurrent import, targeting different projects or orgs for the
+  same underlying session).
 
 ### Redaction
 
@@ -277,15 +299,24 @@ continue using setup settings, and concurrent managed runs can select distinct
 profiles, organizations, and destinations while sharing one daemon.
 
 - **Journal (WAL).** Every accepted event is appended (auth-redacted) to
-  `<data_dir>/journal/<session_id>.ndjson` before/at enqueue. `data_dir`
-  defaults to `$XDG_STATE_HOME/braintrust/bt-daemon` or
+  `<data_dir>/journal/<session_id>.ndjson` before/at enqueue — one journal
+  file per session_id, shared across every route that session_id has opened.
+  `data_dir` defaults to `$XDG_STATE_HOME/braintrust/bt-daemon` or
   `$HOME/.braintrust/state/bt-daemon` on Unix, and
   `%LOCALAPPDATA%\Braintrust\bt-daemon` on Windows. On restart the daemon
-  rebuilds a session's unfinished correlation state by applying its journal to
-  a fresh translator. The resulting rows may be resubmitted to repair delivery
+  rebuilds each route's unfinished correlation state independently, replaying
+  only the journal entries whose `route` matches that pipeline into a fresh
+  translator. The resulting rows may be resubmitted to repair delivery
   interrupted by a crash, but their deterministic ids target the same backend
-  rows and must never create duplicate spans.
+  rows and must never create duplicate spans, and a route never receives
+  another route's rows.
   Journals are GC'd after 7 days.
+- **Managed-run acceptance records.** Alongside the journal, each accepted
+  event that carries a `managed_run_id` also appends `{session_id, route}` to
+  `<data_dir>/managed-runs/<managed_run_id>.ndjson`. `managed_run.flush` reads
+  this record when the daemon that accepted the events has since restarted or
+  idle-exited, so flush accounting for a child process tree survives a daemon
+  generation change. GC'd after 7 days like the journal.
 - **Deterministic span ids.** Translators derive span ids as UUIDv5 over stable
   keys (`session_id`, `turn_id`, `call_id`, …) so a replayed re-emit merges
   server-side (`_is_merge`) instead of duplicating.

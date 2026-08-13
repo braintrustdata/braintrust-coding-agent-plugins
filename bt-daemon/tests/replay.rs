@@ -83,6 +83,45 @@ async fn imports_native_codex_rollout_through_codex_translator() {
     assert!(turn_ids.contains(&"turn-2"));
 }
 
+/// Two `bt trace import` invocations for the same session id, each headed to
+/// a different destination, must not interfere: every field the daemon's
+/// per-route dispatch protects (accepted events, span counts) belongs to an
+/// in-process `ImportProcessor` with no shared state, so running them
+/// concurrently must produce two complete, independent copies rather than one
+/// import starving or corrupting the other.
+#[tokio::test]
+async fn concurrent_imports_of_the_same_session_reach_independent_destinations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"codex-concurrent","cwd":"/tmp/demo","cli_version":"1.2.3"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-test"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"list files"}}),
+            json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"command\":\"ls\"}"}}),
+            json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"README.md"}}),
+            json!({"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done"}}),
+        ],
+    );
+
+    let project_a = tmp.path().join("spans-a");
+    let project_b = tmp.path().join("spans-b");
+    let (result_a, result_b) = tokio::join!(
+        import_transcript(&transcript, ImportSource::Codex, options(&project_a), None, false),
+        import_transcript(&transcript, ImportSource::Codex, options(&project_b), None, false),
+    );
+    result_a.unwrap();
+    result_b.unwrap();
+
+    for project in [&project_a, &project_b] {
+        let rows = rows(&project.join("codex-concurrent.ndjson"));
+        assert_eq!(inserted(&rows, "task"), 2, "session and one turn");
+        assert_eq!(inserted(&rows, "tool"), 1);
+    }
+}
+
 #[tokio::test]
 async fn imports_native_claude_transcript_with_multiple_turns_and_tools() {
     let tmp = tempfile::tempdir().unwrap();

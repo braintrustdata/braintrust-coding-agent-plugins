@@ -17,6 +17,19 @@ use async_trait::async_trait;
 use std::ffi::OsString;
 use std::sync::Arc;
 
+/// What a command still needs the host to resolve before tracing can start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteRequirements {
+    /// The command cannot proceed without a trace destination. Hosts should
+    /// resolve one from flags, stored defaults, or an interactive selection.
+    pub destination_required: bool,
+    /// The command may prompt to complete missing auth selections: asking the
+    /// user to log in when no profile exists, or listing available
+    /// organizations when the profile has no default. Hooks leave this false
+    /// so an agent's turn never blocks on interactive input.
+    pub interactive_auth: bool,
+}
+
 /// Host-owned services used by the integration runtime.
 ///
 /// Implementations resolve Braintrust profiles and destination choices but do
@@ -24,9 +37,9 @@ use std::sync::Arc;
 #[async_trait]
 pub trait TraceHostServices: Send + Sync {
     /// Resolve the non-secret route selected by the host. Commands such as
-    /// setup and managed run require a destination; hooks may use the current
-    /// selection without prompting.
-    async fn resolve_route(&self, destination_required: bool) -> anyhow::Result<SessionRoute>;
+    /// setup and managed run require a destination and allow interactive auth
+    /// resolution; hooks may use the current selection without prompting.
+    async fn resolve_route(&self, requirements: RouteRequirements) -> anyhow::Result<SessionRoute>;
 
     /// Resolve a Braintrust credential lease without exposing credentials to
     /// plugins, settings files, journals, or command arguments.
@@ -154,9 +167,9 @@ fn require_resolved_org(route: &SessionRoute, lease: &AuthLease) -> anyhow::Resu
 
 async fn resolve_command_route(
     host: &TraceHostContext,
-    destination_required: bool,
+    requirements: RouteRequirements,
 ) -> anyhow::Result<SessionRoute> {
-    let mut route = host.services.resolve_route(destination_required).await?;
+    let mut route = host.services.resolve_route(requirements).await?;
     let lease = host
         .services
         .resolve_auth(&route.auth, AuthResolveReason::Initial)
@@ -176,7 +189,14 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
     match args.command {
         TraceCommand::Setup(setup_args) => {
-            let route = resolve_command_route(&host, true).await?;
+            let route = resolve_command_route(
+                &host,
+                RouteRequirements {
+                    destination_required: true,
+                    interactive_auth: true,
+                },
+            )
+            .await?;
             print_output(run_setup(setup_args, route)?, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
@@ -186,7 +206,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         TraceCommand::Hook(hook_args) => {
             // A persistent hook must never fail the coding agent's turn.
             let result = async {
-                let route = host.services.resolve_route(false).await?;
+                let route = host.services.resolve_route(RouteRequirements::default()).await?;
                 run_hook(hook_args, route, host_info(&host)).await
             }
             .await;
@@ -214,13 +234,24 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         TraceCommand::Import(import_args) => {
             let route = host
                 .services
-                .resolve_route(import_args.destination.is_none() && import_args.parent.is_none())
+                .resolve_route(RouteRequirements {
+                    destination_required: import_args.destination.is_none()
+                        && import_args.parent.is_none(),
+                    interactive_auth: true,
+                })
                 .await?;
             let config = session_config(&host, &route).await?;
             run_import(import_args, serve_options(&host), Some(config)).await
         }
         TraceCommand::Run(run_args) => {
-            let route = resolve_command_route(&host, true).await?;
+            let route = resolve_command_route(
+                &host,
+                RouteRequirements {
+                    destination_required: true,
+                    interactive_auth: true,
+                },
+            )
+            .await?;
             let hook_command = child_command(&host.command, "hook");
             let status = run_traced(run_args, hook_command, route).await?;
             if status.success() {
@@ -271,7 +302,7 @@ mod tests {
 
     #[async_trait]
     impl TraceHostServices for PanicHost {
-        async fn resolve_route(&self, _: bool) -> anyhow::Result<SessionRoute> {
+        async fn resolve_route(&self, _: RouteRequirements) -> anyhow::Result<SessionRoute> {
             panic!("host service should not be called")
         }
 
@@ -285,7 +316,7 @@ mod tests {
     }
 
     struct RecordingHost {
-        route_requests: Mutex<Vec<bool>>,
+        route_requests: Mutex<Vec<RouteRequirements>>,
         route_error: Option<&'static str>,
         auth_error: Option<&'static str>,
         resolved_org: Option<&'static str>,
@@ -313,11 +344,11 @@ mod tests {
 
     #[async_trait]
     impl TraceHostServices for RecordingHost {
-        async fn resolve_route(&self, destination_required: bool) -> anyhow::Result<SessionRoute> {
-            self.route_requests
-                .lock()
-                .unwrap()
-                .push(destination_required);
+        async fn resolve_route(
+            &self,
+            requirements: RouteRequirements,
+        ) -> anyhow::Result<SessionRoute> {
+            self.route_requests.lock().unwrap().push(requirements);
             if let Some(error) = self.route_error {
                 anyhow::bail!(error);
             }
@@ -365,6 +396,11 @@ mod tests {
         }
     }
 
+    const COMMAND_REQUIREMENTS: RouteRequirements = RouteRequirements {
+        destination_required: true,
+        interactive_auth: true,
+    };
+
     #[tokio::test]
     async fn setup_and_run_require_a_host_resolved_destination() {
         for command in [
@@ -381,14 +417,14 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.to_string(), "no destination");
-            assert_eq!(*services.route_requests.lock().unwrap(), [true]);
+            assert_eq!(*services.route_requests.lock().unwrap(), [COMMAND_REQUIREMENTS]);
         }
     }
 
     #[tokio::test]
     async fn command_routes_persist_the_resolved_profile_and_organization() {
         let services = Arc::new(RecordingHost::new(None, None));
-        let route = resolve_command_route(&test_host(services), true)
+        let route = resolve_command_route(&test_host(services), COMMAND_REQUIREMENTS)
             .await
             .unwrap();
         assert_eq!(route.auth.profile.as_deref(), Some("test"));
@@ -398,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn command_routes_reject_an_unresolved_organization() {
         let services = Arc::new(RecordingHost::without_org());
-        let error = resolve_command_route(&test_host(services), true)
+        let error = resolve_command_route(&test_host(services), COMMAND_REQUIREMENTS)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("organization choice required"));
@@ -406,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_only_requires_a_default_destination_without_an_override() {
-        for (destination, required) in [
+        for (destination, destination_required) in [
             (None, true),
             (
                 Some(TraceDestination::ProjectLogs {
@@ -433,7 +469,13 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(error.to_string(), "stop before lookup");
-            assert_eq!(*services.route_requests.lock().unwrap(), [required]);
+            assert_eq!(
+                *services.route_requests.lock().unwrap(),
+                [RouteRequirements {
+                    destination_required,
+                    interactive_auth: true,
+                }]
+            );
         }
     }
 
@@ -461,7 +503,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(*services.route_requests.lock().unwrap(), [false]);
+        assert_eq!(
+            *services.route_requests.lock().unwrap(),
+            [RouteRequirements::default()]
+        );
     }
 
     #[tokio::test]

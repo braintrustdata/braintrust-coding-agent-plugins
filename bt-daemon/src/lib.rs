@@ -36,7 +36,7 @@ pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
 pub use setup::run_setup;
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
 pub use trace_command::{SetupAgent, SetupArgs, StopArgs, TraceArgs, TraceCommand};
-pub use trace_runtime::{run_trace, TraceHostContext, TraceHostServices};
+pub use trace_runtime::{run_trace, RouteRequirements, TraceHostContext, TraceHostServices};
 pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
@@ -343,7 +343,9 @@ pub async fn flush_session(
 }
 
 /// Flush every daemon session accepted from one managed child process tree.
-/// A missing daemon means the child emitted no accepted trace events.
+/// A missing daemon is not itself a failure: the daemon may have idle-exited
+/// after draining every session, so acceptance is checked against the
+/// persisted managed-run record instead.
 pub async fn flush_managed_run(
     managed_run_id: &str,
     socket: &std::path::Path,
@@ -352,11 +354,15 @@ pub async fn flush_managed_run(
     let stream = match client::connect(socket).await {
         Ok(stream) => stream,
         Err(_) => {
+            let accepted_sessions =
+                journal::read_managed_run_keys(&paths::data_dir(None), managed_run_id)
+                    .await
+                    .len() as u64;
             return Ok(wire::FlushResult {
                 flushed: true,
                 pending: 0,
-                accepted_sessions: 0,
-            })
+                accepted_sessions,
+            });
         }
     };
     let mut conn = client::Conn::new(stream);

@@ -4,7 +4,7 @@
 //! concurrently.
 //!
 //! Ack semantics: `event.log` is acked once the event is journaled and handed
-//! to the session's queue (see [`Session::append_and_enqueue`]). Delivery to
+//! to the session's queue (see [`Session::enqueue`]). Delivery to
 //! Braintrust happens later in the actor; a downstream error never fails the
 //! caller's turn.
 
