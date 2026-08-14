@@ -4,8 +4,14 @@
 //!
 //! Format: one [`RedactedEnvelope`] JSON value per line in
 //! `<data_dir>/journal/<session_id>.ndjson`.
+//!
+//! Managed-run acceptance records live alongside the journals so a flush can
+//! still tell which delivery pipelines a managed child produced after the
+//! daemon that accepted them has restarted or idle-exited.
 
-use crate::wire::{BackendAuth, Envelope, RedactedEnvelope};
+use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
@@ -27,6 +33,90 @@ fn sanitize(s: &str) -> String {
 
 pub fn journal_path(data_dir: &Path, session_id: &str) -> PathBuf {
     journal_dir(data_dir).join(format!("{}.ndjson", sanitize(session_id)))
+}
+
+pub fn managed_run_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("managed-runs")
+}
+
+pub fn managed_run_path(data_dir: &Path, managed_run_id: &str) -> PathBuf {
+    managed_run_dir(data_dir).join(format!("{}.ndjson", sanitize(managed_run_id)))
+}
+
+/// One delivery pipeline accepted from a managed child process tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedRunKey {
+    pub session_id: String,
+    pub route: SessionRoute,
+}
+
+/// Append one accepted delivery pipeline to the managed run's record.
+pub async fn append_managed_run_key(
+    data_dir: &Path,
+    managed_run_id: &str,
+    key: &ManagedRunKey,
+) -> anyhow::Result<()> {
+    let dir = managed_run_dir(data_dir);
+    tokio::fs::create_dir_all(&dir).await?;
+    let mut line = serde_json::to_vec(key)?;
+    line.push(b'\n');
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(managed_run_path(data_dir, managed_run_id))
+        .await?;
+    file.write_all(&line).await?;
+    file.flush().await?;
+    Ok(())
+}
+
+/// Read a managed run's accepted delivery pipelines back, deduplicated.
+/// A missing record means the run never produced an accepted event.
+pub async fn read_managed_run_keys(data_dir: &Path, managed_run_id: &str) -> Vec<ManagedRunKey> {
+    let Ok(data) = tokio::fs::read_to_string(managed_run_path(data_dir, managed_run_id)).await
+    else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if seen.insert(line.to_string()) {
+            if let Ok(key) = serde_json::from_str::<ManagedRunKey>(line) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Best-effort age-based collection of managed-run records, mirroring journal
+/// GC.
+pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) {
+    let dir = managed_run_dir(data_dir);
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("ndjson") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > max_age);
+        if old {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
 }
 
 /// Append-only journal writer for one session.
