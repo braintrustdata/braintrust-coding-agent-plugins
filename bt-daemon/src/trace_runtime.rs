@@ -461,7 +461,8 @@ mod tests {
             let services = Arc::new(RecordingHost::new(None, Some("stop before lookup")));
             let args = ImportArgs {
                 source: ImportSource::Codex,
-                session_id: "00000000-0000-0000-0000-000000000000".into(),
+                session_ids: vec!["00000000-0000-0000-0000-000000000000".into()],
+                all: false,
                 destination,
                 parent: None,
                 attach: false,
