@@ -1064,7 +1064,7 @@ impl Drop for EnvVarGuard {
 
 #[cfg(all(feature = "cli", unix))]
 #[tokio::test]
-async fn managed_run_flushes_after_success_failure_and_signal_exit() {
+async fn managed_run_flushes_and_preserves_agent_exit_status() {
     use std::os::unix::fs::PermissionsExt;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -1081,12 +1081,19 @@ for argument in "$@"; do
 done
 session_id=$previous
 mode=$last
-printf '{"session_id":"%s","hook_event_name":"SessionStart"}\n' "$session_id" |
-  "$BT_DAEMON_TEST_BIN" hook --source debug --managed-run-hook --no-spawn
+case "$mode" in
+  untraced-success|untraced-failure) ;;
+  *)
+    printf '{"session_id":"%s","hook_event_name":"SessionStart"}\n' "$session_id" |
+      "$BT_DAEMON_TEST_BIN" hook --source debug --managed-run-hook --no-spawn
+    ;;
+esac
 case "$mode" in
   success) exit 0 ;;
   failure) exit 7 ;;
   signal) kill -TERM "$$" ;;
+  untraced-success) exit 0 ;;
+  untraced-failure) exit 7 ;;
   *) exit 99 ;;
 esac
 "#,
@@ -1126,6 +1133,18 @@ esac
     let signal_status = run("managed-signal", "signal").await.unwrap();
     assert!(!signal_status.success());
     assert_eq!(signal_status.code(), None);
+
+    assert!(run("managed-untraced", "untraced-success")
+        .await
+        .unwrap()
+        .success());
+    assert_eq!(
+        run("managed-untraced", "untraced-failure")
+            .await
+            .unwrap()
+            .code(),
+        Some(7)
+    );
 
     assert_eq!(
         *flushes.lock().unwrap(),
