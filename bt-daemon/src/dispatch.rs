@@ -10,10 +10,18 @@
 
 use crate::sink::SinkFactory;
 use crate::translate::{Registry, SessionCtx};
-use crate::wire::Envelope;
+use crate::wire::{Envelope, SessionRoute};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
+
+/// Bound on a session's in-flight queue. Enqueue awaits a slot rather than
+/// letting a stalled sink accumulate events without limit; the daemon has
+/// already journaled anything waiting here, so backpressure costs latency,
+/// never data.
+const QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Default)]
 pub struct Counters {
@@ -28,13 +36,24 @@ enum SessionMsg {
     Shutdown(oneshot::Sender<()>),
 }
 
+/// Where to rebuild a session's translator state from, streamed at startup.
+pub struct ReplayPlan {
+    pub journal_path: PathBuf,
+    pub route: SessionRoute,
+    /// Replay stops here — the journal's length when this session was
+    /// created, so the event creating it is not replayed and then delivered
+    /// a second time from the queue.
+    pub through: u64,
+}
+
 /// Handle to one live session: its queue plus observable counters/state.
 pub struct Session {
     pub source: String,
-    tx: mpsc::UnboundedSender<SessionMsg>,
+    tx: mpsc::Sender<SessionMsg>,
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
     pub permalink: Arc<Mutex<Option<String>>>,
+    last_activity: Mutex<Instant>,
 }
 
 impl Session {
@@ -43,12 +62,12 @@ impl Session {
         session_id: String,
         source: String,
         plugin_version: Option<String>,
-        replay: Vec<Envelope>,
+        replay: Option<ReplayPlan>,
         config: crate::wire::SessionConfig,
         translators: Arc<Registry>,
         sink_factory: Arc<dyn SinkFactory>,
     ) -> Arc<Session> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         let counters = Arc::new(Counters::default());
         let last_error = Arc::new(Mutex::new(None));
         let permalink = Arc::new(Mutex::new(None));
@@ -73,23 +92,36 @@ impl Session {
             counters,
             last_error,
             permalink,
+            last_activity: Mutex::new(Instant::now()),
         })
     }
 
     /// Enqueue an event after the daemon has journaled it.
-    pub fn enqueue(&self, env: Envelope) -> anyhow::Result<()> {
+    pub async fn enqueue(&self, env: Envelope) -> anyhow::Result<()> {
+        self.touch();
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
         self.tx
             .send(SessionMsg::Event(Box::new(env)))
+            .await
             .map_err(|_| anyhow::anyhow!("session actor is gone"))?;
         Ok(())
+    }
+
+    fn touch(&self) {
+        *self.last_activity.lock().unwrap() = Instant::now();
+    }
+
+    /// How long since this session last saw traffic. Drives idle retirement.
+    pub fn idle_for(&self) -> std::time::Duration {
+        self.last_activity.lock().unwrap().elapsed()
     }
 
     /// Ask the actor to drain and flush its sink, bounded by `timeout`.
     /// Returns `(flushed, pending)`.
     pub async fn flush(&self, timeout: std::time::Duration) -> (bool, u64) {
+        self.touch();
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.tx.send(SessionMsg::Flush(reply_tx)).is_err() {
+        if self.tx.send(SessionMsg::Flush(reply_tx)).await.is_err() {
             return (false, self.counters.queued.load(Ordering::Relaxed));
         }
         match tokio::time::timeout(timeout, reply_rx).await {
@@ -104,26 +136,30 @@ impl Session {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(SessionMsg::Configure(Box::new(config), reply_tx))
+            .await
             .map_err(|_| anyhow::anyhow!("session actor is gone"))?;
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("session actor dropped configuration reply"))
     }
 
-    /// Drain, flush, and stop the actor (used on daemon shutdown).
+    /// Drain, flush, and stop the actor (used on daemon shutdown and when an
+    /// idle session is retired).
     pub async fn shutdown(&self) {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.tx.send(SessionMsg::Shutdown(reply_tx)).is_ok() {
+        if self.tx.send(SessionMsg::Shutdown(reply_tx)).await.is_ok() {
             let _ = reply_rx.await;
         }
     }
 }
 
-/// Claude transcript files are external mutable state. Capture them in the
-/// journal at lifecycle boundaries so recovery/replay does not depend on a
-/// path that Claude may later rewrite or delete. Fail open: a missing file is
-/// handled by the translator exactly as before.
-pub(crate) async fn hydrate_transcript_snapshot(env: &mut Envelope) {
+/// Claude transcript files are external mutable state. Mirror them into
+/// daemon-owned storage at lifecycle boundaries and journal only a reference,
+/// so recovery/replay does not depend on a path that Claude may later rewrite
+/// or delete — and so the transcript is stored once rather than re-copied into
+/// every event. Fail open: without a reference the translator reads the live
+/// path exactly as before.
+pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env: &mut Envelope) {
     if env.source != "claude-code"
         || !matches!(
             env.event.as_str(),
@@ -145,13 +181,22 @@ pub(crate) async fn hydrate_transcript_snapshot(env: &mut Envelope) {
     else {
         return;
     };
-    let Ok(contents) = tokio::fs::read_to_string(&path).await else {
-        return;
-    };
+    let (mirror, through) =
+        match crate::transcript_mirror::capture(data_dir, &env.session_id, &path).await {
+            Ok(captured) => captured,
+            Err(error) => {
+                tracing::debug!(session_id = %env.session_id, %error, "transcript mirror skipped");
+                return;
+            }
+        };
     if let Some(payload) = env.payload.as_object_mut() {
         payload.insert(
-            "_bt_transcript_snapshot".to_string(),
-            serde_json::json!({ "path": path, "contents": contents }),
+            "_bt_transcript_mirror".to_string(),
+            serde_json::json!({
+                "path": path,
+                "mirror": mirror.to_string_lossy(),
+                "through": through,
+            }),
         );
     }
 }
@@ -165,12 +210,12 @@ struct SessionActor {
     counters: Arc<Counters>,
     last_error: Arc<Mutex<Option<String>>>,
     permalink: Arc<Mutex<Option<String>>>,
-    replay: Vec<Envelope>,
+    replay: Option<ReplayPlan>,
     config: crate::wire::SessionConfig,
 }
 
 impl SessionActor {
-    async fn run(self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
+    async fn run(self, mut rx: mpsc::Receiver<SessionMsg>) {
         let mut translator = self.translators.create(&self.source, &self.session_id);
         let mut sink = match self.sink_factory.create(
             &self.session_id,
@@ -211,8 +256,7 @@ impl SessionActor {
         // Rebuild translator state before accepting the first new event.
         // Stable span ids make this both crash recovery and a complete copy
         // when an existing source session is sent to another destination.
-        self.replay_into(&mut translator, &mut sink, &ctx, &self.replay)
-            .await;
+        self.replay_into(&mut translator, &mut sink, &ctx).await;
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -252,28 +296,62 @@ impl SessionActor {
         }
     }
 
+    /// Stream the journal through the translator, emitting each entry's spans
+    /// as they are produced. Nothing is accumulated across entries: peak
+    /// memory is one journal entry and the ops it yields, so recovering a
+    /// long session costs the same as running it.
     async fn replay_into(
         &self,
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
-        replay: &[Envelope],
     ) {
-        let mut replay_ops = Vec::new();
-        for env in replay {
-            match translator.handle(env, ctx) {
-                Ok(mut ops) => replay_ops.append(&mut ops),
-                Err(e) => self.set_error(format!("journal replay failed: {e}")),
-            }
-        }
-        if replay_ops.is_empty() {
+        let Some(plan) = &self.replay else {
             return;
-        }
-        match sink.emit(&replay_ops).await {
-            Ok(n) => {
-                self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
+        };
+        let mut reader = match crate::journal::JournalReader::open(&plan.journal_path, plan.through)
+            .await
+        {
+            Ok(Some(reader)) => reader,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(session_id = %self.session_id, "journal replay skipped: {error}");
+                return;
             }
-            Err(e) => self.set_error(format!("sink replay emit failed: {e}")),
+        };
+        loop {
+            let entry = match reader.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(session_id = %self.session_id, "journal replay stopped: {error}");
+                    break;
+                }
+            };
+            if !entry
+                .route
+                .as_ref()
+                .is_some_and(|candidate| candidate.same_route(&plan.route))
+            {
+                continue;
+            }
+            let env = crate::journal::envelope_from_redacted(entry);
+            let ops = match translator.handle(&env, ctx) {
+                Ok(ops) => ops,
+                Err(e) => {
+                    self.set_error(format!("journal replay failed: {e}"));
+                    continue;
+                }
+            };
+            if ops.is_empty() {
+                continue;
+            }
+            match sink.emit(&ops).await {
+                Ok(n) => {
+                    self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
+                }
+                Err(e) => self.set_error(format!("sink replay emit failed: {e}")),
+            }
         }
     }
 

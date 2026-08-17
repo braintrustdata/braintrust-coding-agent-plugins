@@ -13,7 +13,7 @@ use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 pub fn journal_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("journal")
@@ -140,6 +140,12 @@ impl JournalWriter {
     /// Append one event in redacted form and flush to the OS. Not fsync'd per
     /// event (that would dominate hook latency); an OS crash can lose the last
     /// few lines, which replay tolerates.
+    ///
+    /// The journal is a durability record and is never capped or truncated:
+    /// dropping entries would silently cost recovery fidelity. Its size is
+    /// bounded instead by writing each transcript byte once (see
+    /// [`crate::transcript_mirror`]) and by age-based GC, and replay reads it
+    /// as a stream so a large journal never becomes a large allocation.
     pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<()> {
         let mut line = serde_json::to_vec(&env.redacted())?;
         line.push(b'\n');
@@ -149,19 +155,60 @@ impl JournalWriter {
     }
 }
 
-/// Read a journal file back into redacted envelopes (for replay/rebuild).
-pub async fn read_journal(path: &Path) -> anyhow::Result<Vec<RedactedEnvelope>> {
-    let data = tokio::fs::read_to_string(path).await?;
-    let mut out = Vec::new();
-    for (i, line) in data.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let env: RedactedEnvelope = serde_json::from_str(line)
-            .map_err(|e| anyhow::anyhow!("journal {}:{}: {e}", path.display(), i + 1))?;
-        out.push(env);
+/// Streaming reader over one session's journal.
+///
+/// Replay must never materialize a whole journal: the file is read line by
+/// line so peak memory is one entry, not the entire recorded session.
+pub struct JournalReader {
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::Take<tokio::fs::File>>>,
+    path: PathBuf,
+    line_no: usize,
+}
+
+impl JournalReader {
+    /// Open a journal for streaming, reading at most `through` bytes.
+    ///
+    /// That bound is what keeps replay from consuming the very event that
+    /// triggered the session's creation: the caller records the journal's
+    /// length before appending, so the actor replays strictly what was
+    /// already recovered state, never the live event still on its way to the
+    /// queue. `Ok(None)` means the session has no journal yet.
+    pub async fn open(path: &Path, through: u64) -> anyhow::Result<Option<Self>> {
+        let file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(Self {
+            lines: tokio::io::BufReader::new(file.take(through)).lines(),
+            path: path.to_path_buf(),
+            line_no: 0,
+        }))
     }
-    Ok(out)
+
+    /// The journal's current length, which is the bound a session created now
+    /// should replay through. A missing journal replays nothing.
+    pub async fn recorded_len(path: &Path) -> u64 {
+        tokio::fs::metadata(path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    }
+
+    /// The next entry, or `None` at end of file.
+    pub async fn next_entry(&mut self) -> anyhow::Result<Option<RedactedEnvelope>> {
+        while let Some(line) = self.lines.next_line().await? {
+            self.line_no += 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let env: RedactedEnvelope = serde_json::from_str(&line).map_err(|error| {
+                anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
+            })?;
+            return Ok(Some(env));
+        }
+        Ok(None)
+    }
 }
 
 /// Best-effort age-based journal collection. A failed stat/remove is logged

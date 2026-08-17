@@ -441,8 +441,13 @@ impl ClaudeTranslator {
             .map(|cursor| std::mem::take(&mut cursor.buffered))
             .unwrap_or_default();
         let parsed = parse_transcript(&records, std::mem::take(&mut self.main_history));
-        self.main_history = parsed.history.clone();
-        self.emit_parsed(parsed, "main", parent, ops);
+        // Moved, not cloned: this used to deep-copy the whole conversation on
+        // every turn. The history is never trimmed — it is the model input
+        // these spans report, so dropping any of it would silently corrupt the
+        // trace. Its footprint is the active session's own conversation, and
+        // retiring an idle session releases it.
+        self.main_history = parsed.history;
+        self.emit_parsed(parsed.calls, parsed.tools, "main", parent, ops);
     }
 
     fn emit_transcript(
@@ -453,17 +458,18 @@ impl ClaudeTranslator {
         ops: &mut Vec<SpanOp>,
     ) {
         let parsed = parse_transcript(records, Vec::new());
-        self.emit_parsed(parsed, scope, parent, ops);
+        self.emit_parsed(parsed.calls, parsed.tools, scope, parent, ops);
     }
 
     fn emit_parsed(
         &mut self,
-        parsed: ParsedTranscript,
+        calls: Vec<LlmCall>,
+        tools: Vec<TranscriptTool>,
         scope: &str,
         parent: &str,
         ops: &mut Vec<SpanOp>,
     ) {
-        for call in parsed.calls {
+        for call in calls {
             let request_key = format!("{scope}:{}", call.request_id);
             if self.emitted_requests.insert(request_key.clone()) {
                 let span_key = format!("{scope}:llm:{}", call.request_id);
@@ -474,7 +480,7 @@ impl ClaudeTranslator {
                 )));
             }
         }
-        for tool in parsed.tools {
+        for tool in tools {
             if self.emitted_tools.insert(tool.call_id.clone()) {
                 let span_key = format!("tool:{}", tool.call_id);
                 ops.push(SpanOp::Insert(tool.into_row(
@@ -503,8 +509,8 @@ impl ClaudeTranslator {
         let current_turn_rows = cursor.buffered.split_off(split);
         let previous_rows = std::mem::replace(&mut cursor.buffered, current_turn_rows);
         let parsed = parse_transcript(&previous_rows, std::mem::take(&mut self.main_history));
-        self.main_history = parsed.history.clone();
-        self.emit_parsed(parsed, "main", &parent, ops);
+        self.main_history = parsed.history;
+        self.emit_parsed(parsed.calls, parsed.tools, "main", &parent, ops);
         self.git
             .enrich_rows(self.last_turn_cwd.as_deref(), &mut ops[op_start..]);
     }
@@ -1027,29 +1033,26 @@ impl TranscriptTool {
     }
 }
 
-fn read_records_until(path: &str, offset: &mut u64, cutoff_ms: i64) -> Vec<Value> {
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if *offset > len {
-        *offset = 0;
-    }
-    if file.seek(SeekFrom::Start(*offset)).is_err() {
-        return Vec::new();
-    }
-    let mut reader = std::io::BufReader::new(file);
-    read_buffered_until(&mut reader, offset, cutoff_ms)
-}
-
-fn read_buffered_until<R: std::io::Read>(
+/// Read newline-delimited records forward from `offset`, advancing it past
+/// everything consumed.
+///
+/// `cutoff_ms` stops before the first record stamped after the hook that is
+/// being handled, so replaying against a transcript that already contains the
+/// finished session does not pull in future turns. `through` stops at a byte
+/// offset — the transcript mirror's high-water mark, which bounds a replayed
+/// event to exactly the bytes the live run saw.
+fn read_buffered_bounded<R: std::io::Read>(
     reader: &mut std::io::BufReader<R>,
     offset: &mut u64,
-    cutoff_ms: i64,
+    cutoff_ms: Option<i64>,
+    through: Option<u64>,
 ) -> Vec<Value> {
     let mut records = Vec::new();
     let mut line = String::new();
     loop {
+        if through.is_some_and(|through| *offset >= through) {
+            break;
+        }
         line.clear();
         let start = *offset;
         let Ok(read) = reader.read_line(&mut line) else {
@@ -1058,11 +1061,16 @@ fn read_buffered_until<R: std::io::Read>(
         if read == 0 {
             break;
         }
+        if through.is_some_and(|through| start + read as u64 > through) {
+            break;
+        }
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
             *offset += read as u64;
             continue;
         };
-        if parse_timestamp_ms(&value).is_some_and(|timestamp| timestamp > cutoff_ms) {
+        if cutoff_ms.is_some_and(|cutoff| {
+            parse_timestamp_ms(&value).is_some_and(|timestamp| timestamp > cutoff)
+        }) {
             *offset = start;
             break;
         }
@@ -1072,26 +1080,12 @@ fn read_buffered_until<R: std::io::Read>(
     records
 }
 
-fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Value> {
-    let import_through_offset = event
-        .payload
-        .get("_bt_import_through_offset")
-        .and_then(Value::as_u64);
-    let snapshot = event
-        .payload
-        .get("_bt_transcript_snapshot")
-        .filter(|snapshot| snapshot.get("path").and_then(Value::as_str) == Some(path))
-        .and_then(|snapshot| snapshot.get("contents"))
-        .and_then(Value::as_str);
-    match (snapshot, import_through_offset) {
-        (Some(contents), Some(through)) => read_snapshot_through_offset(contents, offset, through),
-        (None, Some(through)) => read_records_through_offset(path, offset, through),
-        (Some(contents), None) => read_snapshot_until(contents, offset, event.ts_ms),
-        (None, None) => read_records_until(path, offset, event.ts_ms),
-    }
-}
-
-fn read_records_through_offset(path: &str, offset: &mut u64, through: u64) -> Vec<Value> {
+fn read_file_bounded(
+    path: &str,
+    offset: &mut u64,
+    cutoff_ms: Option<i64>,
+    through: Option<u64>,
+) -> Vec<Value> {
     let Ok(mut file) = std::fs::File::open(path) else {
         return Vec::new();
     };
@@ -1102,53 +1096,76 @@ fn read_records_through_offset(path: &str, offset: &mut u64, through: u64) -> Ve
     if file.seek(SeekFrom::Start(*offset)).is_err() {
         return Vec::new();
     }
-    read_buffered_through_offset(&mut std::io::BufReader::new(file), offset, through.min(len))
+    let through = through.map(|through| through.min(len));
+    read_buffered_bounded(
+        &mut std::io::BufReader::new(file),
+        offset,
+        cutoff_ms,
+        through,
+    )
 }
 
-fn read_snapshot_through_offset(contents: &str, offset: &mut u64, through: u64) -> Vec<Value> {
-    if *offset > contents.len() as u64 {
-        *offset = 0;
-    }
-    let mut reader = std::io::BufReader::new(std::io::Cursor::new(contents.as_bytes()));
-    if reader.seek(SeekFrom::Start(*offset)).is_err() {
-        return Vec::new();
-    }
-    read_buffered_through_offset(&mut reader, offset, through.min(contents.len() as u64))
-}
-
-fn read_buffered_through_offset<R: std::io::Read>(
-    reader: &mut std::io::BufReader<R>,
+fn read_snapshot_bounded(
+    contents: &str,
     offset: &mut u64,
-    through: u64,
+    cutoff_ms: Option<i64>,
+    through: Option<u64>,
 ) -> Vec<Value> {
-    let mut records = Vec::new();
-    let mut line = String::new();
-    while *offset < through {
-        line.clear();
-        let start = *offset;
-        let Ok(read) = reader.read_line(&mut line) else {
-            break;
-        };
-        if read == 0 || start + read as u64 > through {
-            break;
-        }
-        *offset += read as u64;
-        if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
-            records.push(value);
-        }
-    }
-    records
-}
-
-fn read_snapshot_until(contents: &str, offset: &mut u64, cutoff_ms: i64) -> Vec<Value> {
-    if *offset > contents.len() as u64 {
+    let len = contents.len() as u64;
+    if *offset > len {
         *offset = 0;
     }
     let mut reader = std::io::BufReader::new(std::io::Cursor::new(contents.as_bytes()));
     if reader.seek(SeekFrom::Start(*offset)).is_err() {
         return Vec::new();
     }
-    read_buffered_until(&mut reader, offset, cutoff_ms)
+    let through = through.map(|through| through.min(len));
+    read_buffered_bounded(&mut reader, offset, cutoff_ms, through)
+}
+
+/// Where this event's transcript records should be read from, in preference
+/// order: the daemon's own mirror, then an inline snapshot (older journals),
+/// then the live path.
+fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Value> {
+    let import_through_offset = event
+        .payload
+        .get("_bt_import_through_offset")
+        .and_then(Value::as_u64);
+
+    let mirror = event
+        .payload
+        .get("_bt_transcript_mirror")
+        .filter(|mirror| mirror.get("path").and_then(Value::as_str) == Some(path));
+    if let Some(mirror) = mirror {
+        let mirror_path = mirror.get("mirror").and_then(Value::as_str);
+        let through = mirror.get("through").and_then(Value::as_u64);
+        if let (Some(mirror_path), Some(through)) = (mirror_path, through) {
+            // The mirror is byte-identical to the source prefix, so offsets
+            // are interchangeable between them. An import offset is the
+            // tighter bound when present.
+            let through = import_through_offset.unwrap_or(through);
+            let cutoff = import_through_offset.is_none().then_some(event.ts_ms);
+            if std::fs::metadata(mirror_path).is_ok() {
+                return read_file_bounded(mirror_path, offset, cutoff, Some(through));
+            }
+        }
+    }
+
+    // Journals written before transcript mirroring carry the whole file.
+    let snapshot = event
+        .payload
+        .get("_bt_transcript_snapshot")
+        .filter(|snapshot| snapshot.get("path").and_then(Value::as_str) == Some(path))
+        .and_then(|snapshot| snapshot.get("contents"))
+        .and_then(Value::as_str);
+    match (snapshot, import_through_offset) {
+        (Some(contents), through @ Some(_)) => {
+            read_snapshot_bounded(contents, offset, None, through)
+        }
+        (Some(contents), None) => read_snapshot_bounded(contents, offset, Some(event.ts_ms), None),
+        (None, through @ Some(_)) => read_file_bounded(path, offset, None, through),
+        (None, None) => read_file_bounded(path, offset, Some(event.ts_ms), None),
+    }
 }
 
 fn tool_metadata(

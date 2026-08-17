@@ -2,7 +2,7 @@
 //! serves JSON-RPC connections, and shuts down gracefully (idle timeout,
 //! `daemon.shutdown`, or SIGINT/SIGTERM).
 
-use crate::dispatch::{hydrate_transcript_snapshot, Session};
+use crate::dispatch::{hydrate_transcript_reference, ReplayPlan, Session};
 use crate::journal::{self, JournalWriter};
 use crate::sink::SinkFactory;
 use crate::translate::Registry;
@@ -239,33 +239,6 @@ impl Daemon {
         *self.last_activity.lock().unwrap() = Instant::now();
     }
 
-    async fn replay_for(
-        &self,
-        session_id: &str,
-        route: &SessionRoute,
-    ) -> anyhow::Result<Vec<Envelope>> {
-        match journal::read_journal(&journal::journal_path(&self.data_dir, session_id)).await {
-            Ok(entries) => Ok(entries
-                .into_iter()
-                .filter(|entry| {
-                    entry
-                        .route
-                        .as_ref()
-                        .is_some_and(|candidate| candidate.same_route(route))
-                })
-                .map(journal::envelope_from_redacted)
-                .collect()),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                Ok(Vec::new())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     async fn session_for(&self, env: &Envelope, key: &DeliveryKey) -> anyhow::Result<Arc<Session>> {
         {
             let map = self.sessions.lock().unwrap();
@@ -273,22 +246,23 @@ impl Daemon {
                 return Ok(session.clone());
             }
         }
-        // Open the journal outside the lock (async I/O), then insert under it,
-        // resolving a race where two connections create the same session.
         let route = env
             .route
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("event is missing its session route"))?;
-        let replay = match self.replay_for(&env.session_id, route).await {
-            Ok(replay) => replay,
-            Err(error) => {
-                tracing::warn!(session_id = %env.session_id, "journal replay skipped: {error}");
-                Vec::new()
-            }
-        };
         let config = env.config.clone().ok_or_else(|| {
             anyhow::anyhow!("resolved route is missing its session configuration")
         })?;
+        // The actor streams the journal itself, so creating a session stays
+        // cheap and allocation-free here no matter how long the recorded
+        // session is. Bound it to what is recorded now, before this event is
+        // appended, so replay covers recovery only.
+        let journal_path = journal::journal_path(&self.data_dir, &env.session_id);
+        let replay = ReplayPlan {
+            through: journal::JournalReader::recorded_len(&journal_path).await,
+            journal_path,
+            route: route.clone(),
+        };
         let mut map = self.sessions.lock().unwrap();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
@@ -297,7 +271,7 @@ impl Daemon {
             env.session_id.clone(),
             env.source.clone(),
             env.plugin_version.clone(),
-            replay,
+            Some(replay),
             config,
             self.translators.clone(),
             self.sink_factory.clone(),
@@ -306,8 +280,60 @@ impl Daemon {
         Ok(session)
     }
 
+    /// Drop every trace of one delivery pipeline. A session that goes quiet
+    /// must not pin its translator state, sink handles, credential lease, or
+    /// journal file for the rest of the daemon's life; deterministic span ids
+    /// mean a late event simply rebuilds it from the journal.
+    async fn retire_session(&self, key: &DeliveryKey) {
+        let lock = self.session_lock(&key.session_id);
+        let _guard = lock.lock().await;
+
+        let session = { self.sessions.lock().unwrap().remove(key) };
+        let Some(session) = session else {
+            return;
+        };
+        session.shutdown().await;
+
+        self.session_auth.lock().await.remove(key);
+        self.auth_errors.lock().unwrap().remove(key);
+        self.managed_run_sessions.lock().unwrap().retain(|_, keys| {
+            keys.remove(key);
+            !keys.is_empty()
+        });
+
+        // The journal writer and lock are keyed by session id, which several
+        // delivery pipelines can share; only release them once the last one
+        // for that id is gone.
+        let last = !self
+            .sessions
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|other| other.session_id == key.session_id);
+        if last {
+            self.journals.lock().unwrap().remove(&key.session_id);
+            self.session_locks.lock().unwrap().remove(&key.session_id);
+        }
+        tracing::info!(session_id = %key.session_id, "session retired");
+    }
+
+    /// Delivery pipelines with no traffic for `idle_timeout` and nothing left
+    /// queued.
+    fn idle_sessions(&self, idle_timeout: Duration) -> Vec<DeliveryKey> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, session)| {
+                session.idle_for() >= idle_timeout
+                    && session.counters.queued.load(Ordering::Relaxed) == 0
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<()> {
-        hydrate_transcript_snapshot(env).await;
+        hydrate_transcript_reference(&self.data_dir, env).await;
         let existing = { self.journals.lock().unwrap().get(&env.session_id).cloned() };
         let writer = match existing {
             Some(writer) => writer,
@@ -468,10 +494,14 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
     tracing::info!(socket = %socket.display(), "bt-daemon listening");
 
     let daemon = Daemon::new(opts, data_dir);
-    journal::gc_old_journals(&daemon.data_dir, Duration::from_secs(7 * 24 * 60 * 60)).await;
-    journal::gc_old_managed_runs(&daemon.data_dir, Duration::from_secs(7 * 24 * 60 * 60)).await;
+    collect_garbage(&daemon.data_dir).await;
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
     spawn_idle_watchdog(daemon.clone(), idle_timeout);
+    spawn_session_reaper(
+        daemon.clone(),
+        Duration::from_secs(args.session_idle_timeout_secs),
+    );
+    spawn_gc(daemon.clone());
 
     let accept_result = accept_loop(daemon.clone(), listener).await;
 
@@ -619,6 +649,7 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
             .map_err(|error| format!("journal failed: {error}"))?;
         session
             .enqueue(env)
+            .await
             .map_err(|error| format!("enqueue failed: {error}"))?;
         Ok(delivery_key)
     }
@@ -804,6 +835,51 @@ impl Daemon {
             sessions,
         }
     }
+}
+
+/// How long recovery state is kept on disk.
+const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How often that retention is enforced while the daemon keeps running.
+const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+async fn collect_garbage(data_dir: &std::path::Path) {
+    journal::gc_old_journals(data_dir, RETENTION).await;
+    journal::gc_old_managed_runs(data_dir, RETENTION).await;
+    crate::transcript_mirror::gc_old_mirrors(data_dir, RETENTION).await;
+}
+
+/// Retire delivery pipelines that have gone quiet. Without this, every session
+/// the daemon ever saw keeps its translator state, sink handles, and journal
+/// file handle alive until the process exits — which for a continuously busy
+/// user is never, since the idle watchdog needs *all* sessions quiet.
+fn spawn_session_reaper(daemon: Arc<Daemon>, idle_timeout: Duration) {
+    if idle_timeout.is_zero() {
+        return; // 0 disables retirement (useful in tests)
+    }
+    tokio::spawn(async move {
+        let tick = (idle_timeout / 4).max(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = daemon.shutdown.notified() => return,
+                _ = tokio::time::sleep(tick) => {}
+            }
+            for key in daemon.idle_sessions(idle_timeout) {
+                daemon.retire_session(&key).await;
+            }
+        }
+    });
+}
+
+fn spawn_gc(daemon: Arc<Daemon>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = daemon.shutdown.notified() => return,
+                _ = tokio::time::sleep(GC_INTERVAL) => {}
+            }
+            collect_garbage(&daemon.data_dir).await;
+        }
+    });
 }
 
 fn spawn_idle_watchdog(daemon: Arc<Daemon>, idle_timeout: Duration) {

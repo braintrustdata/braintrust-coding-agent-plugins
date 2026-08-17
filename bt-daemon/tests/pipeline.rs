@@ -218,6 +218,7 @@ async fn start_routed_daemon(
         socket: Some(socket.clone()),
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
     };
     let mut opts = debug_serve_options("test", &data_dir);
     opts.auth_provider = Some(provider);
@@ -267,6 +268,7 @@ async fn start_daemon_at_with(
         socket: Some(socket.clone()),
         data_dir: Some(data_dir),
         idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
     };
     let opts = ServeOptions {
         version: "test".to_string(),
@@ -333,6 +335,7 @@ async fn start_daemon() -> (
         socket: Some(socket.clone()),
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0, // disable the watchdog for the test
+        session_idle_timeout_secs: 0,
     };
     let mut opts = debug_serve_options("test", &data_dir);
     opts.auth_provider = Some(Arc::new(TestAuthProvider {
@@ -375,6 +378,7 @@ async fn start_tracking_daemon(
         socket: Some(socket.clone()),
         data_dir: Some(data_dir),
         idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
     };
     let handle = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;
@@ -388,6 +392,7 @@ async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::Joi
         socket: Some(socket.clone()),
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
     };
     let mut opts = debug_serve_options("test", &data_dir);
     opts.auth_provider = Some(Arc::new(TestAuthProvider {
@@ -833,6 +838,7 @@ async fn a_second_server_detects_the_existing_daemon() {
         socket: Some(socket.clone()),
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
     };
     let result = tokio::time::timeout(
         Duration::from_secs(2),
@@ -975,7 +981,7 @@ async fn restart_replays_journal_with_stable_span_ids_before_new_events() {
 }
 
 #[tokio::test]
-async fn claude_boundary_journal_contains_a_self_contained_transcript_snapshot() {
+async fn claude_boundary_journal_references_a_self_contained_transcript_mirror() {
     let (data_dir, socket, handle, tmp) = start_daemon().await;
     let transcript = tmp.path().join("claude.jsonl");
     std::fs::write(
@@ -998,9 +1004,197 @@ async fn claude_boundary_journal_contains_a_self_contained_transcript_snapshot()
         .unwrap();
 
     let journal = std::fs::read_to_string(data_dir.join("journal/claude-journal.ndjson")).unwrap();
-    assert!(journal.contains("_bt_transcript_snapshot"));
-    assert!(journal.contains("durable"));
     assert!(!journal.contains("sk-TOP-SECRET-abc123"));
+
+    // The journal references the mirror rather than inlining the transcript,
+    // so re-journaling a growing transcript stays linear in its size.
+    let entry: serde_json::Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    let reference = &entry["payload"]["_bt_transcript_mirror"];
+    assert_eq!(reference["path"], transcript.to_str().unwrap());
+    assert!(
+        !journal.contains("durable"),
+        "the journal must not inline transcript contents: {journal}"
+    );
+
+    // The mirror is daemon-owned and survives the original being rewritten.
+    let mirror = std::path::PathBuf::from(reference["mirror"].as_str().unwrap());
+    assert!(mirror.starts_with(data_dir.join("transcripts")));
+    let mirrored = std::fs::read_to_string(&mirror).unwrap();
+    assert!(mirrored.contains("durable"));
+    assert_eq!(
+        reference["through"].as_u64().unwrap(),
+        mirrored.len() as u64,
+        "the journaled offset must bound replay to the bytes captured here"
+    );
+    handle.abort();
+}
+
+/// Start a daemon that retires sessions after `ttl_secs` of quiet.
+async fn start_daemon_with_session_ttl(
+    ttl_secs: u64,
+) -> (
+    PathBuf,
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: ttl_secs,
+    };
+    let mut opts = debug_serve_options("test", &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    (data_dir, socket, handle, tmp)
+}
+
+fn claude_stop(session_id: &str, transcript: &Path, ts_ms: i64) -> Envelope {
+    let mut env = envelope(session_id, "Stop", ts_ms);
+    env.source = "claude-code".into();
+    env.payload = serde_json::json!({
+        "session_id": session_id,
+        "hook_event_name": "Stop",
+        "transcript_path": transcript,
+    });
+    env
+}
+
+/// The 20 GB crash: every lifecycle event used to journal the whole transcript,
+/// so a session's journal grew with the square of its transcript and replay
+/// had to hold all of it in memory at once. Journal growth must stay tied to
+/// the *number* of events, not to the transcript size times that number.
+#[tokio::test]
+async fn claude_journal_does_not_grow_with_the_transcript_on_every_turn() {
+    let (data_dir, socket, handle, tmp) = start_daemon().await;
+    let host = dummy_host();
+    let transcript = tmp.path().join("claude.jsonl");
+
+    const TURNS: i64 = 40;
+    let mut contents = String::new();
+    for turn in 0..TURNS {
+        // Each turn appends a chunky assistant record, as a real session does.
+        contents.push_str(&format!(
+            r#"{{"type":"assistant","timestamp":"2026-07-29T00:00:00Z","message":{{"id":"m{turn}","model":"claude","content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            "x".repeat(20_000)
+        ));
+        contents.push('\n');
+        std::fs::write(&transcript, &contents).unwrap();
+        forward_envelope(
+            &claude_stop("grow", &transcript, 1_775_000_000_000 + turn),
+            &socket,
+            &host,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    flush_session("grow", &socket, 5000).await.unwrap();
+
+    let transcript_len = std::fs::metadata(&transcript).unwrap().len();
+    let journal_len = std::fs::metadata(data_dir.join("journal/grow.ndjson"))
+        .unwrap()
+        .len();
+
+    // Re-journaling the transcript every turn would put this near
+    // TURNS * transcript_len / 2 (tens of megabytes). References are ~a few
+    // hundred bytes each.
+    assert!(
+        journal_len < 64 * 1024,
+        "journal grew with the transcript: {journal_len} bytes for {TURNS} events \
+         over a {transcript_len}-byte transcript"
+    );
+
+    // The transcript is still captured durably -- once, in the mirror.
+    let mirrors: Vec<_> = std::fs::read_dir(data_dir.join("transcripts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(mirrors.len(), 1, "one mirror per (session, transcript)");
+    assert_eq!(
+        std::fs::metadata(&mirrors[0]).unwrap().len(),
+        transcript_len,
+        "the mirror must hold the whole transcript exactly once"
+    );
+    handle.abort();
+}
+
+/// A session that goes quiet must release its translator state, sink, journal
+/// handle, and credential lease instead of pinning them until the process
+/// exits -- which, for a continuously busy user, never happened.
+#[tokio::test]
+async fn idle_sessions_are_retired_and_can_resume_from_their_journal() {
+    let (data_dir, socket, handle, _tmp) = start_daemon_with_session_ttl(1).await;
+    let host = dummy_host();
+    forward_envelope(&envelope("nap", "SessionStart", 1), &socket, &host, false)
+        .await
+        .unwrap();
+    flush_session("nap", &socket, 5000).await.unwrap();
+
+    let live = |socket: PathBuf| async move {
+        run_status(StatusArgs {
+            socket: Some(socket),
+            session_id: Some("nap".into()),
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .sessions
+        .len()
+    };
+    assert_eq!(live(socket.clone()).await, 1, "session should be live");
+
+    let mut retired = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if live(socket.clone()).await == 0 {
+            retired = true;
+            break;
+        }
+    }
+    assert!(retired, "an idle session was never retired");
+
+    // Retirement is not data loss: a later event rebuilds the session from its
+    // journal, and deterministic span ids merge the re-emitted rows.
+    forward_envelope(&envelope("nap", "Stop", 2), &socket, &host, false)
+        .await
+        .unwrap();
+    flush_session("nap", &socket, 5000).await.unwrap();
+    let spans = std::fs::read_to_string(data_dir.join("spans/nap.ndjson")).unwrap();
+    let ids: Vec<String> = spans
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            row.get("Insert")
+                .or_else(|| row.get("Merge"))
+                .and_then(|body| body.get("span_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        ids.len(),
+        5,
+        "first delivery (2) + replay after retirement (2) + resumed event (1)"
+    );
+    assert_eq!(
+        ids.iter().collect::<HashSet<_>>().len(),
+        3,
+        "replay after retirement must reuse the original span ids, not mint new ones"
+    );
     handle.abort();
 }
 

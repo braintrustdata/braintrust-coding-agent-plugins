@@ -24,6 +24,7 @@ mod sink;
 mod trace_command;
 mod trace_runtime;
 mod transcript_import;
+mod transcript_mirror;
 mod translate;
 mod transport;
 
@@ -69,6 +70,11 @@ pub struct ServeArgs {
     /// disables the watchdog.
     #[arg(long, default_value_t = 300)]
     pub idle_timeout_secs: u64,
+    /// Retire a session's in-memory state after this many seconds without
+    /// traffic. A later event rebuilds it from the journal. 0 disables
+    /// retirement.
+    #[arg(long, default_value_t = 300)]
+    pub session_idle_timeout_secs: u64,
 }
 
 /// Arguments for `hook`.

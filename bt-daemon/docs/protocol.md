@@ -107,7 +107,10 @@ The hot path. Params are the **Envelope** (see below). Request result:
 ```
 `accepted: true` means enqueued to the session's ordered queue and journaled.
 The daemon never fails the caller's turn for a downstream (Braintrust) error;
-those are handled asynchronously and surfaced via `status.get`.
+those are handled asynchronously and surfaced via `status.get`. The queue is
+bounded, so a session whose sink has stalled applies backpressure here instead
+of accumulating events without limit; the event is already journaled by then,
+so this costs latency, never data.
 
 ### `session.flush` (request)
 
@@ -262,6 +265,13 @@ journal, logs, status, or RPC response. Envelopes journal only their non-secret
   handle, so it retries the exclusive claim without filesystem cleanup.
 - **Idle exit.** The daemon exits after `--idle-timeout` (default 300 s) with
   zero active sessions and empty queues.
+- **Session retirement.** A delivery pipeline with no traffic for
+  `--session-idle-timeout` (default 300 s) and an empty queue is flushed and
+  dropped: its translator state, sink handles, credential lease, and journal
+  handle are released rather than held for the daemon's lifetime. A later
+  event rebuilds it from the journal, and deterministic span ids merge the
+  re-emitted rows. This matters because the idle exit above requires *every*
+  session to be quiet, which for a continuously active user never happens.
 - **Version handover.** `initialize` compares versions. A newer client sends
   `daemon.shutdown`, waits until the endpoint no longer accepts connections,
   and spawns its own daemon. In-flight session state is rebuilt from the
@@ -309,8 +319,24 @@ profiles, organizations, and destinations while sharing one daemon.
   translator. The resulting rows may be resubmitted to repair delivery
   interrupted by a crash, but their deterministic ids target the same backend
   rows and must never create duplicate spans, and a route never receives
-  another route's rows.
-  Journals are GC'd after 7 days.
+  another route's rows. Replay streams the journal and is bounded to the
+  bytes recorded before the replaying session was created, so recovering a
+  long session costs no more memory than running it. The journal itself is
+  never capped or truncated — dropping entries would silently cost recovery
+  fidelity — so its size is governed by writing each transcript byte once
+  (below) and by GC after 7 days.
+- **Transcript mirrors.** Claude transcript files are external mutable state,
+  so a lifecycle event must stay replayable after the agent rewrites the path
+  it came from. The daemon appends new transcript bytes to
+  `<data_dir>/transcripts/<uuid>.jsonl` — one mirror per
+  (session_id, transcript path) — and the journal entry carries only
+  `_bt_transcript_mirror: {path, mirror, through}`. `through` is the mirror's
+  high-water offset at acceptance, which bounds replay to exactly the bytes
+  the live run saw. Storing each byte once keeps a journal proportional to a
+  session's transcript rather than to its transcript times its turn count.
+  Entries written before mirroring instead carry the whole transcript inline
+  as `_bt_transcript_snapshot`, which translators still accept. Mirrors are
+  GC'd after 7 days like the journal.
 - **Managed-run acceptance records.** Alongside the journal, each accepted
   event that carries a `managed_run_id` also appends `{session_id, route}` to
   `<data_dir>/managed-runs/<managed_run_id>.ndjson`. `managed_run.flush` reads
