@@ -174,6 +174,22 @@ mod tests {
     }
 
     #[test]
+    fn disable_output_is_explicit() {
+        let output = TraceCommandOutput::disable(
+            "antigravity",
+            "Google Antigravity",
+            PathBuf::from("/tmp/antigravity/braintrust.json"),
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&output.render(OutputFormat::Json).unwrap()).unwrap();
+        assert_eq!(value["command"], "disable");
+        assert!(output
+            .render(OutputFormat::Human)
+            .unwrap()
+            .contains("removed for Google Antigravity"));
+    }
+
+    #[test]
     fn stop_json_reports_idempotent_and_successful_shutdowns() {
         let absent: serde_json::Value = serde_json::from_str(
             &TraceCommandOutput::stop(false, false)

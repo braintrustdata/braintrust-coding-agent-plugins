@@ -9,6 +9,9 @@ pub const SOCKET_ENV: &str = "BT_DAEMON_SOCKET";
 pub const DATA_DIR_ENV: &str = "BT_DAEMON_DATA_DIR";
 /// Env override for the current agent's non-credential tracing settings file.
 pub const SETTINGS_ENV: &str = "BT_DAEMON_CONFIG";
+/// Env override for Antigravity's native configuration directory. Primarily
+/// useful for isolated validation and managed environments.
+pub const ANTIGRAVITY_CONFIG_DIR_ENV: &str = "BT_ANTIGRAVITY_CONFIG_DIR";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -99,8 +102,22 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
             .join("opencode")
             .join("braintrust.json"),
         "pi" => home().join(".pi").join("agent").join("braintrust.json"),
+        "antigravity" => home()
+            .join(".gemini")
+            .join("config")
+            .join("braintrust.json"),
         other => data_dir(None).join("agents").join(format!("{other}.json")),
     }
+}
+
+/// Resolve Antigravity's native configuration directory.
+pub(crate) fn antigravity_config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os(ANTIGRAVITY_CONFIG_DIR_ENV) {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    home().join(".gemini").join("config")
 }
 
 /// Create `dir` (and parents) mode 0700 on unix.

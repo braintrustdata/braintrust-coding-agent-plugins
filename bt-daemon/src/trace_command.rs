@@ -78,6 +78,8 @@ pub enum SetupAgent {
     OpenCode,
     /// Install the published Pi tracing extension.
     Pi,
+    /// Install the Google Antigravity tracing hooks.
+    Antigravity,
 }
 
 #[cfg(test)]
@@ -167,5 +169,29 @@ mod tests {
                 ..
             }) if value == r#"{"import":true}"#
         ));
+    }
+
+    #[test]
+    fn antigravity_uses_shared_enable_and_disable_commands() {
+        for command in ["enable", "setup"] {
+            let parsed = Cli::try_parse_from(["bt", command, "antigravity"]).unwrap();
+            assert!(matches!(
+                parsed.trace.command,
+                TraceCommand::Setup(SetupArgs {
+                    agent: SetupAgent::Antigravity,
+                    ..
+                })
+            ));
+        }
+
+        let parsed = Cli::try_parse_from(["bt", "disable", "antigravity"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Disable(DisableArgs {
+                agent: SetupAgent::Antigravity
+            })
+        ));
+
+        assert!(Cli::try_parse_from(["bt", "setup", "antigravity", "--disable"]).is_err());
     }
 }
