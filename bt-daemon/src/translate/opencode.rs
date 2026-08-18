@@ -2,6 +2,7 @@
 //! this module owns span construction, correlation, and recovery.
 
 use super::git::GitMetadataCache;
+use super::recent::RecentSet;
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -54,7 +55,7 @@ struct NativeSession {
     tool_errors: HashMap<String, String>,
     tool_message_ids: HashMap<String, String>,
     denied_tools: HashSet<String>,
-    completed_messages: HashSet<String>,
+    completed_messages: RecentSet<String>,
 }
 
 struct OpenCodeTranslator {
@@ -224,6 +225,14 @@ impl OpenCodeTranslator {
                 ..Default::default()
             }));
         }
+        // Message fragments are only needed until their completed LLM row is
+        // emitted. A new turn is also a hard boundary for any incomplete native
+        // fragments left behind by a missing completion event.
+        state.output_parts.clear();
+        state.reasoning_parts.clear();
+        state.tool_calls.clear();
+        state.tool_message_ids.clear();
+        state.completed_messages.clear();
         state.turn_number += 1;
         let turn_id = ids::span_id(
             &self.daemon_session_id,
@@ -379,13 +388,16 @@ impl OpenCodeTranslator {
         let prompt = num(info, "/tokens/input") + cache_read + cache_write;
         let completion = num(info, "/tokens/output");
         let reasoning = num(info, "/tokens/reasoning");
-        let mut assistant = json!({"role":"assistant","content":state.output_parts.get(mid).cloned().unwrap_or_default()});
-        if let Some(calls) = state.tool_calls.get(mid) {
-            assistant["tool_calls"] = Value::Array(calls.clone())
+        let mut assistant = json!({"role":"assistant","content":state.output_parts.remove(mid).unwrap_or_default()});
+        if let Some(calls) = state.tool_calls.remove(mid) {
+            assistant["tool_calls"] = Value::Array(calls)
         }
-        if let Some(reason) = state.reasoning_parts.get(mid) {
+        if let Some(reason) = state.reasoning_parts.remove(mid) {
             assistant["reasoning"] = json!([{"id":"reasoning","content":reason}])
         }
+        state
+            .tool_message_ids
+            .retain(|_, message_id| message_id != mid);
         let mut input = Vec::new();
         if let Some(system) = &state.system_prompt {
             input.push(json!({"role":"system","content":system}))

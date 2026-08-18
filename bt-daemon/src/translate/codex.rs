@@ -18,12 +18,13 @@
 //! newer turn has already started.
 
 use super::git::GitMetadataCache;
+use super::recent::{RecentMap, RecentSet};
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -62,10 +63,10 @@ impl TranslatorFactory for CodexTranslatorFactory {
             main_path: None,
             // The main scope is created lazily once we learn its transcript path.
             scopes: HashMap::new(),
-            spawn_turn_by_call_id: HashMap::new(),
-            spawn_turn_by_agent_id: HashMap::new(),
-            compaction_trigger_by_turn: HashMap::new(),
-            compaction_spans: HashSet::new(),
+            spawn_turn_by_call_id: RecentMap::default(),
+            spawn_turn_by_agent_id: RecentMap::default(),
+            compaction_trigger_by_turn: RecentMap::default(),
+            compaction_spans: RecentSet::default(),
             pending: None,
             git: self.git.clone(),
         })
@@ -163,10 +164,10 @@ struct CodexTranslator {
     additional_metadata: Map<String, Value>,
     main_path: Option<String>,
     scopes: HashMap<String, Scope>,
-    spawn_turn_by_call_id: HashMap<String, String>,
-    spawn_turn_by_agent_id: HashMap<String, String>,
-    compaction_trigger_by_turn: HashMap<String, String>,
-    compaction_spans: HashSet<String>,
+    spawn_turn_by_call_id: RecentMap<String, String>,
+    spawn_turn_by_agent_id: RecentMap<String, String>,
+    compaction_trigger_by_turn: RecentMap<String, String>,
+    compaction_spans: RecentSet<String>,
     pending: Option<PendingWork>,
     git: Arc<GitMetadataCache>,
 }
@@ -322,7 +323,8 @@ impl CodexTranslator {
         self.compaction_trigger_by_turn
             .insert(turn_id.clone(), trigger.clone());
         // Back-fill onto an already-built compaction span.
-        if self.compaction_spans.contains(&turn_id) {
+        if self.compaction_spans.remove(&turn_id) {
+            self.compaction_trigger_by_turn.remove(&turn_id);
             let span_id = ids::span_id(&self.session_id, &format!("turn:{turn_id}"));
             ops.push(SpanOp::Merge(SpanRow {
                 span_id,
@@ -348,9 +350,8 @@ impl CodexTranslator {
             _ => None,
         });
         let Some(agent_id) = agent_id else { return };
-        if let Some(turn_span) = self.spawn_turn_by_call_id.get(&call_id) {
-            self.spawn_turn_by_agent_id
-                .insert(agent_id, turn_span.clone());
+        if let Some(turn_span) = self.spawn_turn_by_call_id.remove(&call_id) {
+            self.spawn_turn_by_agent_id.insert(agent_id, turn_span);
         }
     }
 
@@ -366,8 +367,7 @@ impl CodexTranslator {
         }
         let parent = self
             .spawn_turn_by_agent_id
-            .get(&agent_id)
-            .cloned()
+            .remove(&agent_id)
             .unwrap_or_else(|| self.root_span_id.clone());
         let subagent_root = ids::span_id(&self.session_id, &format!("subagent:{agent_id}"));
         let mut scope = Scope::new(&path, ScopeKind::Subagent, subagent_root);
@@ -1082,8 +1082,10 @@ impl CodexTranslator {
             .get("replacement_history")
             .and_then(Value::as_array)
             .cloned();
-        let trigger = self.compaction_trigger_by_turn.get(&turn_id).cloned();
-        self.compaction_spans.insert(turn_id.clone());
+        let trigger = self.compaction_trigger_by_turn.remove(&turn_id);
+        if trigger.is_none() {
+            self.compaction_spans.insert(turn_id.clone());
+        }
 
         // Relabel the turn as a compaction span.
         ops.push(SpanOp::Merge(SpanRow {
@@ -1121,6 +1123,9 @@ impl CodexTranslator {
             ..Default::default()
         }));
         if let Some(replacement) = replacement {
+            // Native compaction is a semantic memory barrier: future requests
+            // use only the replacement context, so the pre-compaction Values
+            // can be dropped as soon as their one compaction span is emitted.
             scope.conversation_history = replacement;
         }
         let _ = (turn_span, name);
@@ -1181,7 +1186,9 @@ impl CodexTranslator {
                 ..Default::default()
             }));
         }
-        self.scopes.insert(path.to_string(), scope);
+        // SubagentStop is terminal for this transcript. Its durable rollout is
+        // still on disk and journal replay can rebuild it, so retaining the
+        // closed scope would only pin its entire conversation history.
     }
 
     /// Close any open llm/tool/turn in `scope` (used on subagent stop + flush).

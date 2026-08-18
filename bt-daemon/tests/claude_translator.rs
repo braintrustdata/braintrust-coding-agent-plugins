@@ -82,8 +82,14 @@ fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
             config: None,
         };
         ops.extend(translator.handle(&env, &ctx).unwrap());
+        while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+            ops.extend(batch);
+        }
     }
     ops.extend(translator.flush(&ctx).unwrap());
+    while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+        ops.extend(batch);
+    }
     ops
 }
 
@@ -609,4 +615,95 @@ fn claude_groups_streamed_rows_and_reads_late_final_output_at_session_end() {
         final_output.output.as_ref().unwrap()["content"],
         json!("done")
     );
+}
+
+#[test]
+fn claude_large_catch_up_emits_one_historical_snapshot_per_batch() {
+    const CALLS: usize = 24;
+    const MESSAGE_BYTES: usize = 64 * 1024;
+    let transcript = tempfile::NamedTempFile::new().unwrap();
+    let transcript_path = transcript.path().to_str().unwrap();
+    let mut records = Vec::with_capacity(CALLS * 2);
+    for index in 0..CALLS {
+        records.push(json!({
+            "type": "user",
+            "timestamp": "2026-07-28T16:00:00Z",
+            "message": {"role":"user", "content": "x".repeat(MESSAGE_BYTES)}
+        }));
+        records.push(json!({
+            "type": "assistant",
+            "timestamp": "2026-07-28T16:00:01Z",
+            "message": {
+                "id": format!("request-{index}"),
+                "model": "claude-test",
+                "role": "assistant",
+                "content": [{"type":"text", "text":format!("answer-{index}")}],
+                "usage": {"input_tokens":1,"output_tokens":1}
+            }
+        }));
+    }
+    let contents = records
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(transcript.path(), &contents).unwrap();
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "bounded");
+    let ctx = SessionCtx {
+        session_id: "bounded".into(),
+        config: None,
+    };
+    let envelope = |name: &str, payload: Value| Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "bounded".into(),
+        event: name.into(),
+        ts_ms: 2_000_000_000_000,
+        managed_run_id: None,
+        payload,
+        route: None,
+        config: None,
+    };
+    translator
+        .handle(
+            &envelope(
+                "UserPromptSubmit",
+                json!({"session_id":"bounded","prompt":"go"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    let mut batch = translator
+        .handle(
+            &envelope(
+                "Stop",
+                json!({
+                    "session_id":"bounded",
+                    "transcript_path":transcript_path,
+                    "_bt_transcript_snapshot":{"path":transcript_path,"contents":contents}
+                }),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    let mut llm_count = 0;
+    loop {
+        let batch_llms = batch
+            .iter()
+            .filter(|op| matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Llm))
+            .count();
+        assert!(
+            batch_llms <= 1,
+            "catch-up batch materialized {batch_llms} LLM inputs"
+        );
+        llm_count += batch_llms;
+        let Some(next) = translator.drain_pending(&ctx).unwrap() else {
+            break;
+        };
+        batch = next;
+    }
+    assert_eq!(llm_count, CALLS);
 }

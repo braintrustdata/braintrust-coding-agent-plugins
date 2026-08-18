@@ -13,6 +13,7 @@ mod debug;
 mod git;
 mod opencode;
 mod pi;
+mod recent;
 
 pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;

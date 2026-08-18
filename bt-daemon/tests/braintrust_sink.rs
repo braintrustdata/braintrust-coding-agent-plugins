@@ -176,6 +176,50 @@ async fn merge_with_empty_name_does_not_clobber_the_original_name() {
     );
 }
 
+/// Completed handles must be releasable without changing the update contract:
+/// an update that arrives after terminal insertion is emitted as a stateless
+/// merge against the same deterministic span id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_merge_updates_a_completed_span_without_an_open_handle() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("sess-late", "codex", None).unwrap();
+    sink.configure(&session_config(&base));
+
+    sink.emit(&[SpanOp::Insert(row(
+        "finished",
+        "finished",
+        &[],
+        "original name",
+        SpanType::Task,
+        1,
+        Some(2),
+    ))])
+    .await
+    .unwrap();
+    let mut late = SpanRow {
+        span_id: "finished".into(),
+        root_span_id: "finished".into(),
+        output: Some(json!({"status":"late"})),
+        ..Default::default()
+    };
+    late.name.clear();
+    sink.emit(&[SpanOp::Merge(late)]).await.unwrap();
+    sink.flush().await.unwrap();
+
+    let bodies = logs3_bodies(&server).await;
+    assert!(
+        bodies.contains("original name"),
+        "initial row absent: {bodies}"
+    );
+    assert!(bodies.contains("late"), "late merge absent: {bodies}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attached_trace_children_keep_the_external_root() {
     let server = mock_backend().await;

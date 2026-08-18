@@ -13,11 +13,12 @@ use super::{Sink, SinkFactory};
 use crate::translate::{SpanOp, SpanRow, SpanType};
 use crate::wire::{SessionConfig, TraceDestination};
 use braintrust_sdk_rust::{
-    BraintrustClient, ParentSpanInfo, SpanHandle, SpanLog, SpanObjectType, SpanOrigin,
-    SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
+    BraintrustClient, ParentSpanInfo, SpanComponents, SpanHandle, SpanLog, SpanObjectType,
+    SpanOrigin, SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
 };
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -33,14 +34,78 @@ pub struct BraintrustSinkConfig {
 
 /// Lazily-built, shared-by-URL client pool.
 struct ClientCache {
-    clients: AsyncMutex<HashMap<(String, String), Arc<BraintrustClient>>>,
+    state: AsyncMutex<ClientCacheState>,
     version: String,
+}
+
+const CLIENT_CACHE_CAPACITY: usize = 16;
+const QUEUE_FLUSH_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct ClientCacheState {
+    clients: HashMap<(String, String), Arc<CachedClient>>,
+    order: VecDeque<(String, String)>,
+}
+
+struct CachedClient {
+    client: BraintrustClient,
+    queued_bytes: AsyncMutex<usize>,
+}
+
+impl CachedClient {
+    async fn account_and_flush(&self, bytes: usize) -> anyhow::Result<()> {
+        let mut queued_bytes = self.queued_bytes.lock().await;
+        *queued_bytes = queued_bytes.saturating_add(bytes);
+        if *queued_bytes < QUEUE_FLUSH_BYTE_BUDGET {
+            return Ok(());
+        }
+        self.client
+            .flush()
+            .await
+            .map_err(|error| anyhow::anyhow!("braintrust flush failed: {error}"))?;
+        *queued_bytes = 0;
+        Ok(())
+    }
+
+    async fn flush(&self) -> anyhow::Result<()> {
+        let mut queued_bytes = self.queued_bytes.lock().await;
+        self.client
+            .flush()
+            .await
+            .map_err(|error| anyhow::anyhow!("braintrust flush failed: {error}"))?;
+        *queued_bytes = 0;
+        Ok(())
+    }
+}
+
+impl ClientCacheState {
+    fn touch(&mut self, key: &(String, String)) {
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+    }
+
+    fn trim_inactive(&mut self) {
+        while self.clients.len() >= CLIENT_CACHE_CAPACITY {
+            let Some(index) = self.order.iter().position(|key| {
+                self.clients
+                    .get(key)
+                    .is_some_and(|client| Arc::strong_count(client) == 1)
+            }) else {
+                // Every client is still referenced by a live session; those are
+                // active working state and cannot be evicted safely.
+                break;
+            };
+            if let Some(key) = self.order.remove(index) {
+                self.clients.remove(&key);
+            }
+        }
+    }
 }
 
 impl ClientCache {
     fn new(version: String) -> Self {
         Self {
-            clients: AsyncMutex::new(HashMap::new()),
+            state: AsyncMutex::new(ClientCacheState::default()),
             version,
         }
     }
@@ -49,13 +114,14 @@ impl ClientCache {
         &self,
         api_url: &str,
         app_url: &str,
-    ) -> anyhow::Result<Arc<BraintrustClient>> {
+    ) -> anyhow::Result<Arc<CachedClient>> {
         let key = (api_url.to_string(), app_url.to_string());
         // Hold the lock across build so two sessions on a new URL don't build
         // duplicate clients. Build is cheap (skip_login: no network).
-        let mut map = self.clients.lock().await;
-        if let Some(c) = map.get(&key) {
-            return Ok(c.clone());
+        let mut state = self.state.lock().await;
+        if let Some(c) = state.clients.get(&key).cloned() {
+            state.touch(&key);
+            return Ok(c);
         }
         let client = BraintrustClient::builder()
             .skip_login(true)
@@ -65,8 +131,13 @@ impl ClientCache {
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("braintrust client build failed: {e}"))?;
-        let arc = Arc::new(client);
-        map.insert(key, arc.clone());
+        let arc = Arc::new(CachedClient {
+            client,
+            queued_bytes: AsyncMutex::new(0),
+        });
+        state.trim_inactive();
+        state.clients.insert(key.clone(), arc.clone());
+        state.touch(&key);
         Ok(arc)
     }
 }
@@ -139,7 +210,7 @@ struct BraintrustSink {
     /// Resolved `(api_url, app_url)` for this session, from its config.
     urls: Option<(String, String)>,
     /// The client for `urls`, obtained from the cache on first emit.
-    client: Option<Arc<BraintrustClient>>,
+    client: Option<Arc<CachedClient>>,
     /// Live span handles keyed by deterministic span id, so a later op (e.g.
     /// setting `end`) merges onto the same row the SDK already knows.
     open: HashMap<String, SpanHandle<BraintrustClient>>,
@@ -180,7 +251,7 @@ impl BraintrustSink {
         }
     }
 
-    async fn ensure_client(&mut self) -> anyhow::Result<Arc<BraintrustClient>> {
+    async fn ensure_client(&mut self) -> anyhow::Result<Arc<CachedClient>> {
         if let Some(c) = &self.client {
             return Ok(c.clone());
         }
@@ -227,14 +298,62 @@ impl BraintrustSink {
         Ok(())
     }
 
-    fn upsert(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
+    fn update_open(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         self.ensure_handle(client, row)?;
         let handle = self.open.get(&row.span_id).expect("just inserted");
         handle.log(build_log(row)?);
         if let Some(end) = row.end_ms {
             handle.end_with_time(ms_to_secs(end));
+            // SpanHandle retains the complete accumulated input/output. Once a
+            // span is terminal, use stateless SDK merges for any unusually late
+            // update instead of pinning that payload for the session lifetime.
+            self.open.remove(&row.span_id);
         }
         Ok(())
+    }
+
+    fn merge_closed(&self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
+        let creds = self
+            .creds
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("session has no credentials/config yet"))?;
+        let project = self.project(creds);
+        let components = self.span_components(row, creds, &project).to_str();
+        client
+            .update_span_with_credentials(
+                creds.token.clone(),
+                creds.org_id.clone(),
+                &components,
+                build_log(row)?,
+            )
+            .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))
+    }
+
+    fn span_components(&self, row: &SpanRow, creds: &Creds, project: &str) -> SpanComponents {
+        let destination = creds
+            .destination
+            .as_ref()
+            .map(|destination| destination_components(destination, project))
+            .unwrap_or_else(|| {
+                let mut args = Map::new();
+                args.insert("project_name".into(), Value::String(project.to_string()));
+                DestinationComponents {
+                    object_type: SpanObjectType::ProjectLogs,
+                    object_id: None,
+                    compute_object_metadata_args: Some(args),
+                    propagated_event: None,
+                }
+            });
+        SpanComponents {
+            object_type: destination.object_type,
+            object_id: destination.object_id,
+            compute_object_metadata_args: destination.compute_object_metadata_args,
+            row_id: Some(row.span_id.clone()),
+            span_id: Some(row.span_id.clone()),
+            root_span_id: Some(destination_root(creds).unwrap_or_else(|| row.root_span_id.clone())),
+            span_parents: (!row.parent_span_ids.is_empty()).then(|| row.parent_span_ids.clone()),
+            propagated_event: destination.propagated_event,
+        }
     }
 }
 
@@ -292,21 +411,24 @@ impl Sink for BraintrustSink {
         let client = self.ensure_client().await?;
         let mut n = 0u64;
         for op in ops {
-            let row = match op {
-                SpanOp::Insert(r) | SpanOp::Merge(r) => r,
-            };
-            self.upsert(&client, row)?;
+            match op {
+                SpanOp::Insert(row) => self.update_open(&client.client, row)?,
+                SpanOp::Merge(row) if self.open.contains_key(&row.span_id) => {
+                    self.update_open(&client.client, row)?
+                }
+                SpanOp::Merge(row) => self.merge_closed(&client.client, row)?,
+            }
             n += 1;
+            client
+                .account_and_flush(serialized_len(op).unwrap_or(0))
+                .await?;
         }
         Ok(n)
     }
 
     async fn flush(&mut self) -> anyhow::Result<()> {
         match &self.client {
-            Some(client) => client
-                .flush()
-                .await
-                .map_err(|e| anyhow::anyhow!("braintrust flush failed: {e}")),
+            Some(client) => client.flush().await,
             None => Ok(()),
         }
     }
@@ -455,14 +577,24 @@ fn build_log(row: &SpanRow) -> anyhow::Result<SpanLog> {
     if let Some(Value::Object(md)) = &row.metadata {
         lb = lb.metadata(md.clone());
     }
-    if let Some(Value::Object(metrics)) = &row.metrics {
-        let hm: HashMap<String, f64> = metrics
-            .iter()
-            .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
-            .collect();
-        if !hm.is_empty() {
-            lb = lb.metrics(hm);
-        }
+    let mut metrics = row
+        .metrics
+        .as_ref()
+        .and_then(Value::as_object)
+        .map(|metrics| {
+            metrics
+                .iter()
+                .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
+                .collect::<HashMap<String, f64>>()
+        })
+        .unwrap_or_default();
+    // Stateless updates do not have a SpanHandle on which to call `end`, so
+    // carry terminal timing in the merge payload itself.
+    if let Some(end) = row.end_ms {
+        metrics.insert("end".into(), ms_to_secs(end));
+    }
+    if !metrics.is_empty() {
+        lb = lb.metrics(metrics);
     }
     if let Some(err) = &row.error {
         lb = lb.error(Value::String(err.clone()));
@@ -474,4 +606,24 @@ fn build_log(row: &SpanRow) -> anyhow::Result<SpanLog> {
     }
     lb.build()
         .map_err(|e| anyhow::anyhow!("span log build failed: {e}"))
+}
+
+#[derive(Default)]
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_len(op: &SpanOp) -> serde_json::Result<usize> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, op)?;
+    Ok(counter.0)
 }
