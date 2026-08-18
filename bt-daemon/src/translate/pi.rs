@@ -5,7 +5,7 @@ use super::git::GitMetadataCache;
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -156,24 +156,18 @@ impl PiTranslator {
             .as_ref()
             .map(|c| c.attached_span_ids())
             .unwrap_or_default();
-        let settings = envelope.payload.get("trace_settings");
-        self.external_parent = attached.0.or_else(|| {
-            settings
-                .and_then(|value| value.get("parent_span_id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
+        self.external_parent = attached.0;
         self.effective_root_span_id = attached
             .1
-            .or_else(|| {
-                settings
-                    .and_then(|value| value.get("root_span_id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
             .or_else(|| self.external_parent.clone())
             .unwrap_or_else(|| self.root_span_id.clone());
-        let mut metadata = Map::new();
+        let mut metadata = ctx
+            .config
+            .as_ref()
+            .and_then(|c| c.additional_metadata.as_ref())
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         metadata.insert("session_id".into(), json!(self.session_id));
         metadata.insert("source".into(), json!("pi"));
         metadata.insert("pi_version".into(), json!(envelope.source_version));
@@ -201,20 +195,6 @@ impl PiTranslator {
                 .cloned()
                 .unwrap_or(Value::Null),
         );
-        if let Some(extra) = ctx
-            .config
-            .as_ref()
-            .and_then(|c| c.additional_metadata.as_ref())
-            .and_then(Value::as_object)
-        {
-            metadata.extend(extra.clone());
-        }
-        if let Some(extra) = settings
-            .and_then(|value| value.get("additional_metadata"))
-            .and_then(Value::as_object)
-        {
-            metadata.extend(extra.clone());
-        }
         vec![SpanOp::Insert(SpanRow {
             span_id: self.root_span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),

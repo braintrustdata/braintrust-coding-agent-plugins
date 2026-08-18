@@ -5,7 +5,7 @@ use super::git::GitMetadataCache;
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -171,20 +171,18 @@ impl OpenCodeTranslator {
                 "OpenCode".to_string(),
             )
         };
-        let mut metadata = Map::new();
+        let mut metadata = ctx
+            .config
+            .as_ref()
+            .and_then(|c| c.additional_metadata.as_ref())
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         metadata.insert("session_id".into(), Value::String(native_id.to_string()));
         metadata.insert("source".into(), Value::String("opencode".into()));
         if let Some(parent) = parent_id {
             metadata.insert("parent_session_id".into(), Value::String(parent.into()));
             metadata.insert("is_subagent".into(), Value::Bool(true));
-        }
-        if let Some(extra) = ctx
-            .config
-            .as_ref()
-            .and_then(|c| c.additional_metadata.as_ref())
-            .and_then(Value::as_object)
-        {
-            metadata.extend(extra.clone());
         }
         self.sessions.insert(
             native_id.to_string(),

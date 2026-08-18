@@ -8,10 +8,10 @@
 use crate::trace_command::TraceCommand;
 use crate::wire::{AuthSelection, SessionConfig, SessionRoute};
 use crate::{
-    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_setup, run_status,
-    run_traced, shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig,
-    HostInfo, OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
-    TraceCommandOutput,
+    apply_additional_metadata, braintrust_serve_options, paths, run_hook, run_import, run_serve,
+    run_setup, run_status, run_traced, shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason,
+    BraintrustSinkConfig, HostInfo, OutputFormat, Registry, RunHookCommand, ServeOptions,
+    StatusArgs, TraceArgs, TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -189,7 +189,7 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
     match args.command {
         TraceCommand::Setup(setup_args) => {
-            let route = resolve_command_route(
+            let mut route = resolve_command_route(
                 &host,
                 RouteRequirements {
                     destination_required: true,
@@ -197,6 +197,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 },
             )
             .await?;
+            apply_additional_metadata(&mut route, setup_args.additional_metadata.as_deref())?;
             print_output(run_setup(setup_args, route)?, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
@@ -235,7 +236,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             print_output(TraceCommandOutput::stop(true, true), host.output_format)
         }
         TraceCommand::Import(import_args) => {
-            let route = host
+            let mut route = host
                 .services
                 .resolve_route(RouteRequirements {
                     destination_required: import_args.destination.is_none()
@@ -243,11 +244,12 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                     interactive_auth: true,
                 })
                 .await?;
+            apply_additional_metadata(&mut route, import_args.additional_metadata.as_deref())?;
             let config = session_config(&host, &route).await?;
             run_import(import_args, serve_options(&host), Some(config)).await
         }
         TraceCommand::Run(run_args) => {
-            let route = resolve_command_route(
+            let mut route = resolve_command_route(
                 &host,
                 RouteRequirements {
                     destination_required: true,
@@ -255,6 +257,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 },
             )
             .await?;
+            apply_additional_metadata(&mut route, run_args.additional_metadata.as_deref())?;
             let hook_command = child_command(&host.command, "hook");
             let status = run_traced(run_args, hook_command, route).await?;
             if status.success() {
@@ -409,9 +412,11 @@ mod tests {
         for command in [
             TraceCommand::Setup(SetupArgs {
                 agent: SetupAgent::OpenCode,
+                additional_metadata: None,
             }),
             TraceCommand::Run(RunArgs {
                 source: RunSource::Codex,
+                additional_metadata: None,
                 agent_args: Vec::new(),
             }),
         ] {
@@ -435,6 +440,20 @@ mod tests {
             .unwrap();
         assert_eq!(route.auth.profile.as_deref(), Some("test"));
         assert_eq!(route.auth.org_name.as_deref(), Some("test-org"));
+    }
+
+    #[tokio::test]
+    async fn session_config_carries_route_additional_metadata() {
+        let services = Arc::new(RecordingHost::new(None, None));
+        let route = SessionRoute {
+            additional_metadata: Some(serde_json::json!({"import": true})),
+            ..SessionRoute::default()
+        };
+        let config = session_config(&test_host(services), &route).await.unwrap();
+        assert_eq!(
+            config.additional_metadata,
+            Some(serde_json::json!({"import": true}))
+        );
     }
 
     #[tokio::test]
@@ -466,6 +485,7 @@ mod tests {
                 destination,
                 parent: None,
                 attach: false,
+                additional_metadata: None,
             };
             let error = run_trace(
                 TraceArgs {

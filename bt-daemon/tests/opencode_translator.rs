@@ -1,4 +1,4 @@
-use bt_daemon::wire::Envelope;
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::json;
 use std::collections::HashMap;
@@ -147,4 +147,41 @@ fn opencode_child_sessions_share_the_parent_trace_root() {
         .unwrap();
     assert_eq!(child.root_span_id, parent.root_span_id);
     assert_eq!(child.parent_span_ids.len(), 1);
+}
+
+#[test]
+fn opencode_additional_metadata_reaches_roots_without_overriding_session_fields() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: Some(
+            SessionRoute {
+                additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
+    };
+    let rows = reduce(
+        translator
+            .handle(
+                &event(
+                    "session.created",
+                    1,
+                    json!({"properties":{"info":{"id":"native"}}}),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    let root = rows.values().next().unwrap();
+    assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
+    assert_eq!(root.metadata.as_ref().unwrap()["source"], "opencode");
 }

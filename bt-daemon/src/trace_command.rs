@@ -50,6 +50,9 @@ pub struct StopArgs {
 pub struct SetupArgs {
     #[command(subcommand)]
     pub agent: SetupAgent,
+    /// JSON object persisted in this agent's tracing route and merged into root-span metadata.
+    #[arg(long, global = true, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    pub additional_metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -63,4 +66,85 @@ pub enum SetupAgent {
     OpenCode,
     /// Install the published Pi tracing extension.
     Pi,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct Cli {
+        #[command(flatten)]
+        trace: TraceArgs,
+    }
+
+    #[test]
+    fn every_public_trace_ingress_accepts_additional_metadata() {
+        let setup = Cli::try_parse_from([
+            "bt",
+            "setup",
+            "claude",
+            "--additional-metadata",
+            r#"{"setup":true}"#,
+        ])
+        .unwrap();
+        assert!(matches!(
+            setup.trace.command,
+            TraceCommand::Setup(SetupArgs {
+                agent: SetupAgent::Claude,
+                additional_metadata: Some(ref value),
+            }) if value == r#"{"setup":true}"#
+        ));
+
+        let hook = Cli::try_parse_from([
+            "bt",
+            "hook",
+            "--source",
+            "claude-code",
+            "--additional-metadata",
+            r#"{"hook":true}"#,
+        ])
+        .unwrap();
+        assert!(matches!(
+            hook.trace.command,
+            TraceCommand::Hook(HookArgs {
+                additional_metadata: Some(ref value),
+                ..
+            }) if value == r#"{"hook":true}"#
+        ));
+
+        let run = Cli::try_parse_from([
+            "bt",
+            "run",
+            "--additional-metadata",
+            r#"{"run":true}"#,
+            "codex",
+        ])
+        .unwrap();
+        assert!(matches!(
+            run.trace.command,
+            TraceCommand::Run(RunArgs {
+                additional_metadata: Some(ref value),
+                ..
+            }) if value == r#"{"run":true}"#
+        ));
+
+        let import = Cli::try_parse_from([
+            "bt",
+            "import",
+            "codex",
+            "session-id",
+            "--additional-metadata",
+            r#"{"import":true}"#,
+        ])
+        .unwrap();
+        assert!(matches!(
+            import.trace.command,
+            TraceCommand::Import(ImportArgs {
+                additional_metadata: Some(ref value),
+                ..
+            }) if value == r#"{"import":true}"#
+        ));
+    }
 }

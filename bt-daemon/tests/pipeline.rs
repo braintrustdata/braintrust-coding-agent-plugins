@@ -1309,6 +1309,7 @@ esac
         run_traced(
             RunArgs {
                 source: RunSource::Codex,
+                additional_metadata: None,
                 agent_args: vec![session_id.into(), mode.into()],
             },
             RunHookCommand {

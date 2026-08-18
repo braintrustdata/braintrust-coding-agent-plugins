@@ -35,3 +35,15 @@ bt trace status
 Hook setup or forwarding never fails a Codex turn. If installation fails or the
 daemon cannot accept an event, the launcher reports a bounded diagnostic and
 exits successfully.
+
+## Additional root metadata
+
+Set `BRAINTRUST_ADDITIONAL_METADATA` to a JSON object to tag the root span of a
+Codex session. Standard session metadata takes precedence if keys conflict.
+
+```bash
+BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"abc-123"}' codex
+```
+
+For a persistent route, pass the same object to `bt trace setup codex
+--additional-metadata '<JSON>'`.
