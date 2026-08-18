@@ -25,6 +25,9 @@ The recommended tracing setup is:
 bt trace enable codex --project my-coding-agent
 ```
 
+Use `bt trace disable codex` to remove the Braintrust tracing plugin and its
+saved route without disturbing unrelated Codex plugins or settings.
+
 This installs the tracing plugin and stores only non-secret routing settings.
 The `bt` CLI owns authentication and forwards hook events through the shared
 daemon. Restart Codex after setup.

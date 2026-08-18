@@ -108,6 +108,7 @@ jobs:
             "@opencode-ai/sdk@${PEER_VERSION}"
           node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
             "$PWD/install-test/node_modules/@braintrust/trace-opencode/dist/index.mjs"
+          (cd install-test && node -e 'import("@braintrust/trace-opencode/tracing").then((m) => { if (typeof m.default !== "function") process.exit(1) })')
 
   resolve-pi-compatibility:
     name: Resolve Pi compatibility window
@@ -207,7 +208,7 @@ jobs:
           tarball="$(find "$package_dir" -name 'braintrust-trace-opencode-*.tgz' -print -quit)"
           npm install --prefix "$install_dir" --no-audit --no-fund \
             "$tarball" @opencode-ai/plugin@latest @opencode-ai/sdk@latest
-          echo "OPENCODE_PLUGIN=$install_dir/node_modules/@braintrust/trace-opencode/dist/index.mjs" \
+          echo "OPENCODE_PLUGIN=$install_dir/node_modules/@braintrust/trace-opencode/dist/tracing.mjs" \
             >> "$GITHUB_ENV"
       - name: Build and install Pi extension for integration harness
         shell: bash

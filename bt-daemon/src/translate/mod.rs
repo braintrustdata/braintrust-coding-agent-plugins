@@ -23,6 +23,7 @@ pub use pi::PiTranslatorFactory;
 
 use crate::wire::{Envelope, SessionConfig};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -84,23 +85,58 @@ pub struct SessionCtx {
     pub config: Option<SessionConfig>,
 }
 
+/// Apply user-supplied metadata while protecting daemon-owned identity fields.
+/// All agent roots use this so routing internals and canonical identity cannot
+/// drift between translators.
+pub(crate) fn root_metadata(
+    additional: Option<&Value>,
+    source: &str,
+    session_id: &str,
+) -> Map<String, Value> {
+    let mut metadata = additional
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    metadata.retain(|key, _| !key.starts_with("_bt_"));
+    metadata.insert("session_id".into(), Value::String(session_id.to_string()));
+    metadata.insert("source".into(), Value::String(source.to_string()));
+    metadata
+}
+
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
 pub trait AgentTranslator: Send {
     /// Handle one event, returning span ops to emit.
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>>;
 
-    /// Continue bounded work started by [`Self::handle`] or [`Self::flush`].
+    /// Continue bounded work started by [`Self::handle`], [`Self::checkpoint`],
+    /// or [`Self::finalize`].
     /// `Some` means the caller must emit this batch and call again; `None`
     /// means the translator is fully caught up.
     fn drain_pending(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
         Ok(None)
     }
 
-    /// Emit any pending spans (e.g. close dangling turns) at flush/shutdown.
-    fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    /// Catch up any externally buffered observations without ending the
+    /// logical agent session. Delivery barriers call this before flushing the
+    /// sink, so a session can keep accepting later turns.
+    fn checkpoint(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let _ = ctx;
         Ok(Vec::new())
+    }
+
+    /// Finish the logical agent session and defensively close any work whose
+    /// terminal native event never arrived. Called only when the session actor
+    /// itself is shutting down or being retired.
+    fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        let _ = ctx;
+        Ok(Vec::new())
+    }
+
+    /// Backward-compatible terminal flush used by transcript import callers.
+    /// Live delivery barriers use [`Self::checkpoint`] instead.
+    fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        self.finalize(ctx)
     }
 }
 
@@ -110,28 +146,33 @@ pub trait TranslatorFactory: Send + Sync {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator>;
 }
 
-/// Maps a `source` string to its factory, with a fallback for unknown sources.
+/// Maps canonical and supported alias source strings to translator factories.
+/// Production rejects unknown sources; the debug registry maps every known
+/// agent identity to the pass-through translator for pipeline tests.
 pub struct Registry {
     factories: HashMap<String, Box<dyn TranslatorFactory>>,
-    fallback: Box<dyn TranslatorFactory>,
+    debug_known_agents: bool,
 }
 
 impl Registry {
-    /// A registry whose only translator (and fallback) is the debug
-    /// pass-through. This is the Phase 1 default.
+    /// A pass-through registry for debug sinks and pipeline tests. Known agent
+    /// identities are accepted, while arbitrary unknown sources are rejected.
     pub fn debug_only() -> Self {
         let mut r = Registry {
             factories: HashMap::new(),
-            fallback: Box::new(DebugTranslatorFactory),
+            debug_known_agents: true,
         };
         r.register(Box::new(DebugTranslatorFactory));
         r
     }
 
-    /// The production registry: all real agent translators registered, debug
-    /// as the fallback for unknown sources.
+    /// The production registry with every real agent translator registered.
     pub fn default_agents() -> Self {
-        let mut r = Registry::debug_only();
+        let mut r = Registry {
+            factories: HashMap::new(),
+            debug_known_agents: false,
+        };
+        r.register(Box::new(DebugTranslatorFactory));
         let git = Arc::new(git::GitMetadataCache::default());
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
         r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
@@ -151,15 +192,37 @@ impl Registry {
         v
     }
 
-    /// Create a translator for `source`, falling back (with a warning) to the
-    /// debug translator for an unknown source.
-    pub fn create(&self, source: &str, session_id: &str) -> Box<dyn AgentTranslator> {
-        match self.factories.get(source) {
-            Some(f) => f.create(session_id),
-            None => {
-                tracing::warn!(source, "no translator registered; using debug fallback");
-                self.fallback.create(session_id)
-            }
+    pub fn canonical_source<'a>(&'a self, source: &'a str) -> Option<&'a str> {
+        if self.factories.contains_key(source) {
+            return Some(source);
         }
+        let canonical = crate::AgentId::parse(source)?.canonical_source();
+        (self.factories.contains_key(canonical) || self.debug_known_agents).then_some(canonical)
+    }
+
+    pub fn create_checked(
+        &self,
+        source: &str,
+        session_id: &str,
+    ) -> anyhow::Result<Box<dyn AgentTranslator>> {
+        let canonical = self
+            .canonical_source(source)
+            .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
+        let factory = self.factories.get(canonical).or_else(|| {
+            self.debug_known_agents
+                .then(|| self.factories.get("debug"))
+                .flatten()
+        });
+        let factory = factory.expect("canonical source must have a factory");
+        let namespace = crate::ids::session_namespace(canonical, session_id);
+        Ok(factory.create(&namespace))
+    }
+
+    /// Create a known translator. Production ingress uses
+    /// [`Self::create_checked`] and returns an RPC error for unsupported
+    /// sources; this convenience remains for focused tests.
+    pub fn create(&self, source: &str, session_id: &str) -> Box<dyn AgentTranslator> {
+        self.create_checked(source, session_id)
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 }

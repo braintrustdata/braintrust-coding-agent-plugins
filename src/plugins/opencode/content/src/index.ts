@@ -7,44 +7,16 @@
  */
 
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
-import { loadConfig, type PluginConfig } from "./config";
+import { loadConfig } from "./config";
 import { createBraintrustTools } from "./tools";
 import { BtCliToolsClient } from "./tools/bt-cli";
-import { createDaemonTracingHooks } from "./tracing/daemon";
+import { addTracingHooks, readPluginConfig } from "./tracing/plugin";
+
+export { BraintrustTracingPlugin } from "./tracing/plugin";
 
 export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
   const { client } = input;
-
-  // Load plugin config from config files
-  // Precedence: global config -> project config (project overrides global)
-  let pluginConfig: PluginConfig | undefined;
-  try {
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    const os = await import("node:os");
-
-    // Load configs in order: global first, then project (so project overrides global)
-    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-    const configPaths = [
-      path.join(configHome, "opencode", "braintrust.json"), // global
-      path.join(input.directory, ".opencode", "braintrust.json"), // project
-    ];
-
-    for (const configPath of configPaths) {
-      try {
-        if (fs.existsSync(configPath)) {
-          const content = fs.readFileSync(configPath, "utf-8");
-          const parsed = JSON.parse(content) as PluginConfig;
-          // Merge: later config overrides earlier
-          pluginConfig = pluginConfig ? { ...pluginConfig, ...parsed } : parsed;
-        }
-      } catch {
-        // Continue to next path
-      }
-    }
-  } catch {
-    // Config loading failed, proceed with env vars only
-  }
+  const pluginConfig = await readPluginConfig(input);
 
   const config = loadConfig(pluginConfig);
 
@@ -52,25 +24,7 @@ export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
 
   const hooks: Hooks = {};
 
-  // Add tracing hooks if enabled
-  if (config.tracingEnabled) {
-    const tracingHooks = createDaemonTracingHooks(input, config, (message, extra) => {
-      client.app
-        .log({ body: { service: "braintrust-trace", level: "warn", message, extra } })
-        .catch(() => {});
-    });
-    Object.assign(hooks, tracingHooks);
-
-    client.app
-      .log({
-        body: {
-          service: "braintrust",
-          level: "info",
-          message: `Tracing hooks registered: ${Object.keys(tracingHooks).join(", ")}`,
-        },
-      })
-      .catch(() => {});
-  }
+  addTracingHooks(input, config, hooks);
 
   if (toolsClient) {
     hooks.tool = createBraintrustTools(toolsClient);

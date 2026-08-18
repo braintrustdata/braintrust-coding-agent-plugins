@@ -34,6 +34,9 @@ on:
       OPENAI_API_KEY:
         description: "For the post-deploy codex smoke test; skipped if unset."
         required: false
+      CODEX_HOOK_TRUST_CONFIG:
+        description: "Reviewed Codex hook hashes for the deployed artifact; smoke skips if unset."
+        required: false
 
 permissions:
   contents: write

@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [

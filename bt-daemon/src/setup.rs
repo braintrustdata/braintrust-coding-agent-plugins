@@ -1,9 +1,9 @@
 //! Persistent installation and configuration for coding-agent tracing plugins.
 
 use crate::paths;
-use crate::trace_command::{EnableArgs, SetupAgent};
+use crate::trace_command::{DisableArgs, EnableArgs};
 use crate::wire::SessionRoute;
-use crate::TraceCommandOutput;
+use crate::{AgentId, TraceCommandOutput};
 use anyhow::{bail, Context};
 use serde_json::{Map, Value};
 use std::io::Write;
@@ -12,12 +12,8 @@ use std::process::Command as ProcessCommand;
 
 const CODEX_MARKETPLACE: &str = "braintrust-codex-plugins";
 const CODEX_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-codex-plugin";
-const CODEX_PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
 const CLAUDE_MARKETPLACE: &str = "braintrust-claude-plugin";
 const CLAUDE_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-claude-plugin";
-const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
-const OPENCODE_PLUGIN: &str = "@braintrust/trace-opencode@^1";
-const PI_PLUGIN: &str = "npm:@braintrust/pi-extension@^1";
 
 trait CommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value>;
@@ -106,23 +102,10 @@ fn setup_codex(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
 
     // Adding is idempotent and reconciles the installed cache to the refreshed
     // marketplace snapshot.
-    runner.run("codex", &["plugin", "add", CODEX_PLUGIN])
-}
-
-fn codex_plugin(value: &Value) -> Option<&Value> {
-    value
-        .get("installed")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|item| item.get("pluginId").and_then(Value::as_str) == Some(CODEX_PLUGIN))
-}
-
-fn disable_codex(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    let plugins = runner.json("codex", &["plugin", "list", "--json"])?;
-    if codex_plugin(&plugins).is_some() {
-        runner.run("codex", &["plugin", "remove", CODEX_PLUGIN, "--json"])?;
-    }
-    Ok(())
+    runner.run(
+        "codex",
+        &["plugin", "add", AgentId::Codex.spec().setup_package],
+    )
 }
 
 fn claude_marketplace(value: &Value) -> Option<&Value> {
@@ -141,10 +124,9 @@ fn claude_marketplace_is_published(item: &Value) -> bool {
 }
 
 fn claude_plugin(value: &Value) -> Option<&Value> {
-    value
-        .as_array()?
-        .iter()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(CLAUDE_PLUGIN))
+    value.as_array()?.iter().find(|item| {
+        item.get("id").and_then(Value::as_str) == Some(AgentId::Claude.spec().setup_package)
+    })
 }
 
 fn setup_claude(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
@@ -180,28 +162,32 @@ fn setup_claude(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     // Claude removes a marketplace's installed plugins when that marketplace
     // is removed, so replacing a stale source requires a fresh installation.
     if marketplace_replaced {
-        return runner.run("claude", &["plugin", "install", CLAUDE_PLUGIN]);
+        return runner.run(
+            "claude",
+            &["plugin", "install", AgentId::Claude.spec().setup_package],
+        );
     }
 
     let plugins = runner.json("claude", &["plugin", "list", "--json"])?;
     match claude_plugin(&plugins) {
-        None => runner.run("claude", &["plugin", "install", CLAUDE_PLUGIN]),
+        None => runner.run(
+            "claude",
+            &["plugin", "install", AgentId::Claude.spec().setup_package],
+        ),
         Some(plugin) => {
-            runner.run("claude", &["plugin", "update", CLAUDE_PLUGIN])?;
+            runner.run(
+                "claude",
+                &["plugin", "update", AgentId::Claude.spec().setup_package],
+            )?;
             if plugin.get("enabled").and_then(Value::as_bool) == Some(false) {
-                runner.run("claude", &["plugin", "enable", CLAUDE_PLUGIN])?;
+                runner.run(
+                    "claude",
+                    &["plugin", "enable", AgentId::Claude.spec().setup_package],
+                )?;
             }
             Ok(())
         }
     }
-}
-
-fn disable_claude(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    let plugins = runner.json("claude", &["plugin", "list", "--json"])?;
-    if claude_plugin(&plugins).is_some() {
-        runner.run("claude", &["plugin", "uninstall", CLAUDE_PLUGIN])?;
-    }
-    Ok(())
 }
 
 fn load_object(path: &Path) -> anyhow::Result<Map<String, Value>> {
@@ -247,26 +233,44 @@ fn write_object_atomic(path: &Path, object: Map<String, Value>) -> anyhow::Resul
     Ok(())
 }
 
-fn setup_opencode_at(path: &Path) -> anyhow::Result<()> {
+fn reconcile_opencode_at(path: &Path, install: bool) -> anyhow::Result<()> {
+    if !install && !path.exists() {
+        return Ok(());
+    }
     let mut config = load_object(path)?;
-    let plugins = config
-        .entry("plugin")
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or_else(|| {
+    if let Some(plugins) = config.get_mut("plugin") {
+        let plugins = plugins.as_array_mut().ok_or_else(|| {
             anyhow::anyhow!(
                 "OpenCode `plugin` config must be an array: {}",
                 path.display()
             )
         })?;
-    plugins.retain(|plugin| {
-        plugin.as_str().is_none_or(|plugin| {
-            plugin != "@braintrust/trace-opencode"
-                && !plugin.starts_with("@braintrust/trace-opencode@")
-        })
-    });
-    plugins.push(Value::String(OPENCODE_PLUGIN.into()));
+        plugins.retain(|plugin| {
+            plugin.as_str().is_none_or(|plugin| {
+                plugin != "@braintrust/trace-opencode"
+                    && !plugin.starts_with("@braintrust/trace-opencode@")
+                    && !plugin.starts_with("@braintrust/trace-opencode/")
+            })
+        });
+        if install {
+            plugins.push(Value::String(AgentId::OpenCode.spec().setup_package.into()));
+        }
+        if plugins.is_empty() {
+            config.remove("plugin");
+        }
+    } else if install {
+        config.insert(
+            "plugin".into(),
+            Value::Array(vec![Value::String(
+                AgentId::OpenCode.spec().setup_package.into(),
+            )]),
+        );
+    }
     write_object_atomic(path, config)
+}
+
+fn setup_opencode_at(path: &Path) -> anyhow::Result<()> {
+    reconcile_opencode_at(path, true)
 }
 
 fn setup_opencode() -> anyhow::Result<()> {
@@ -278,58 +282,54 @@ fn setup_opencode() -> anyhow::Result<()> {
     setup_opencode_at(&path)
 }
 
-fn remove_opencode_plugin_at(path: &Path) -> anyhow::Result<()> {
-    let mut config = match std::fs::read(path) {
-        Ok(raw) => serde_json::from_slice::<Value>(&raw)
-            .with_context(|| format!("invalid JSON configuration: {}", path.display()))?
-            .as_object()
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!("configuration must be a JSON object: {}", path.display())
-            })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read configuration: {}", path.display()))
-        }
-    };
-    let Some(plugins) = config.get_mut("plugin") else {
-        return Ok(());
-    };
-    let plugins = plugins.as_array_mut().ok_or_else(|| {
-        anyhow::anyhow!(
-            "OpenCode `plugin` config must be an array: {}",
-            path.display()
-        )
-    })?;
-    let original_len = plugins.len();
-    plugins.retain(|plugin| {
-        plugin.as_str().is_none_or(|plugin| {
-            plugin != "@braintrust/trace-opencode"
-                && !plugin.starts_with("@braintrust/trace-opencode@")
+fn setup_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    runner.run("pi", &["install", AgentId::Pi.spec().setup_package])
+}
+
+fn codex_plugin(value: &Value) -> Option<&Value> {
+    value
+        .get("installed")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| {
+            item.get("pluginId").and_then(Value::as_str)
+                == Some(AgentId::Codex.spec().uninstall_package)
         })
-    });
-    if plugins.len() != original_len {
-        write_object_atomic(path, config)?;
+}
+
+fn uninstall_codex(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    let plugins = runner.json("codex", &["plugin", "list", "--json"])?;
+    if codex_plugin(&plugins).is_some() {
+        runner.run(
+            "codex",
+            &[
+                "plugin",
+                "remove",
+                AgentId::Codex.spec().uninstall_package,
+                "--json",
+            ],
+        )?;
     }
     Ok(())
 }
 
-fn disable_opencode() -> anyhow::Result<()> {
-    let settings_path = paths::agent_settings_path("opencode", None);
-    let path = settings_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("opencode.json");
-    remove_opencode_plugin_at(&path)
+fn uninstall_claude(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    let plugins = runner.json("claude", &["plugin", "list", "--json"])?;
+    if claude_plugin(&plugins).is_some() {
+        runner.run(
+            "claude",
+            &[
+                "plugin",
+                "uninstall",
+                AgentId::Claude.spec().uninstall_package,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
-fn setup_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    runner.run("pi", &["install", PI_PLUGIN])
-}
-
-fn disable_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    runner.run("pi", &["uninstall", PI_PLUGIN])
+fn uninstall_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    runner.run("pi", &["uninstall", AgentId::Pi.spec().setup_package])
 }
 
 fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()> {
@@ -362,76 +362,78 @@ fn enable_tracing(source: &str, route: SessionRoute) -> anyhow::Result<PathBuf> 
     Ok(path)
 }
 
-fn remove_tracing_settings(path: &Path) -> anyhow::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to remove tracing settings: {}", path.display())),
+fn uninstall_tracing_at(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut settings = load_object(path)?;
+    settings.remove("trace_to_braintrust");
+    settings.remove("traceToBraintrust");
+    settings.remove("route");
+    settings.remove("project");
+    if settings.is_empty() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove agent settings: {}", path.display()))?;
+        Ok(())
+    } else {
+        write_object_atomic(path, settings)
     }
 }
 
-/// Uninstall an agent's tracing adapter and remove its Braintrust-owned settings.
-pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
-    let mut runner = SystemCommandRunner;
-    let (source, display_name) = agent_details(agent);
-    match agent {
-        SetupAgent::Codex => disable_codex(&mut runner)?,
-        SetupAgent::Claude => disable_claude(&mut runner)?,
-        SetupAgent::OpenCode => disable_opencode()?,
-        SetupAgent::Pi => disable_pi(&mut runner)?,
-    }
-    let settings_path = paths::agent_settings_path(source, None);
-    remove_tracing_settings(&settings_path)?;
-    Ok(TraceCommandOutput::disable(
-        source,
-        display_name,
-        settings_path,
-    ))
-}
-
-fn agent_details(agent: SetupAgent) -> (&'static str, &'static str) {
-    match agent {
-        SetupAgent::Codex => ("codex", "Codex"),
-        SetupAgent::Claude => ("claude", "Claude Code"),
-        SetupAgent::OpenCode => ("opencode", "OpenCode"),
-        SetupAgent::Pi => ("pi", "Pi"),
-    }
+fn settings_path(agent: AgentId) -> PathBuf {
+    paths::agent_settings_path(agent.canonical_source(), None)
 }
 
 /// Install or refresh one agent's published tracing adapter and persist its
 /// non-secret route selection.
 pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<TraceCommandOutput> {
     let mut runner = SystemCommandRunner;
-    let (source, display_name) = match args.agent {
-        SetupAgent::Codex => {
+    let agent = args.agent;
+    match agent {
+        AgentId::Codex => {
             setup_codex(&mut runner)?;
-            ("codex", "Codex")
         }
-        SetupAgent::Claude => {
+        AgentId::Claude => {
             setup_claude(&mut runner)?;
-            ("claude", "Claude Code")
         }
-        SetupAgent::OpenCode => {
+        AgentId::OpenCode => {
             setup_opencode()?;
-            ("opencode", "OpenCode")
         }
-        SetupAgent::Pi => {
+        AgentId::Pi => {
             setup_pi(&mut runner)?;
-            ("pi", "Pi")
         }
-    };
-    let settings_path = enable_tracing(source, route)?;
-    Ok(TraceCommandOutput::setup(
-        source,
-        display_name,
-        settings_path,
-    ))
+    }
+    let spec = agent.spec();
+    let settings_path = enable_tracing(spec.canonical_source, route)?;
+    Ok(TraceCommandOutput::setup(spec, settings_path))
 }
 
 /// Backwards-compatible library entry point for hosts that used the former setup name.
 pub fn run_setup(args: EnableArgs, route: SessionRoute) -> anyhow::Result<TraceCommandOutput> {
     run_enable(args, route)
+}
+
+/// Uninstall the adapter and remove only Braintrust-owned route configuration.
+pub fn run_disable(args: DisableArgs) -> anyhow::Result<TraceCommandOutput> {
+    let mut runner = SystemCommandRunner;
+    let agent = args.agent;
+    match agent {
+        AgentId::Codex => uninstall_codex(&mut runner)?,
+        AgentId::Claude => uninstall_claude(&mut runner)?,
+        AgentId::OpenCode => {
+            let settings_path = paths::agent_settings_path("opencode", None);
+            let opencode_path = settings_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("opencode.json");
+            reconcile_opencode_at(&opencode_path, false)?;
+        }
+        AgentId::Pi => uninstall_pi(&mut runner)?,
+    }
+    let spec = agent.spec();
+    let settings_path = settings_path(agent);
+    uninstall_tracing_at(&settings_path)?;
+    Ok(TraceCommandOutput::disable(spec, settings_path))
 }
 
 #[cfg(test)]
@@ -470,6 +472,18 @@ mod tests {
             self.calls.push(format!("{program} {}", args.join(" ")));
             Ok(())
         }
+    }
+
+    #[test]
+    fn missing_agent_executable_has_an_actionable_error() {
+        let mut runner = SystemCommandRunner;
+        let error = runner
+            .run("bt-test-agent-that-does-not-exist", &[])
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("install bt-test-agent-that-does-not-exist and ensure it is on PATH"));
     }
 
     #[test]
@@ -542,7 +556,7 @@ mod tests {
                 "repo": CLAUDE_MARKETPLACE_SOURCE
             }]),
             serde_json::json!([{
-                "id": CLAUDE_PLUGIN,
+                "id": AgentId::Claude.spec().setup_package,
                 "version": "1.4.4",
                 "enabled": true
             }]),
@@ -580,7 +594,7 @@ mod tests {
                 "source": "github",
                 "repo": CLAUDE_MARKETPLACE_SOURCE
             }]),
-            serde_json::json!([{"id": CLAUDE_PLUGIN, "enabled": false}]),
+            serde_json::json!([{"id": AgentId::Claude.spec().setup_package, "enabled": false}]),
         ]);
 
         setup_claude(&mut runner).unwrap();
@@ -614,12 +628,47 @@ mod tests {
 
         setup_opencode_at(&path).unwrap();
 
-        let config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(config["model"], "test/model");
         assert_eq!(
             config["plugin"],
             serde_json::json!(["other", "@braintrust/trace-opencode@^1"])
         );
+
+        setup_opencode_at(&path).unwrap();
+        let config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            config["plugin"],
+            serde_json::json!(["other", "@braintrust/trace-opencode@^1"])
+        );
+    }
+
+    #[test]
+    fn opencode_uninstall_removes_only_braintrust_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.json");
+        std::fs::write(
+            &path,
+            r#"{"plugin":["other","@braintrust/trace-opencode@0.9.0","@braintrust/trace-opencode/tracing"],"model":"test/model"}"#,
+        )
+        .unwrap();
+
+        reconcile_opencode_at(&path, false).unwrap();
+
+        let config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(config["plugin"], serde_json::json!(["other"]));
+        assert_eq!(config["model"], "test/model");
+    }
+
+    #[test]
+    fn opencode_uninstall_is_idempotent_and_does_not_create_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.json");
+
+        reconcile_opencode_at(&path, false).unwrap();
+        reconcile_opencode_at(&path, false).unwrap();
+
+        assert!(!path.exists());
     }
 
     #[test]
@@ -629,6 +678,15 @@ mod tests {
         setup_pi(&mut runner).unwrap();
 
         assert!(runner.called("pi install npm:@braintrust/pi-extension@^1"));
+    }
+
+    #[test]
+    fn pi_disable_uninstalls_the_published_extension_range() {
+        let mut runner = FakeRunner::new([]);
+
+        uninstall_pi(&mut runner).unwrap();
+
+        assert!(runner.called("pi uninstall npm:@braintrust/pi-extension@^1"));
     }
 
     #[test]
@@ -693,50 +751,56 @@ mod tests {
     }
 
     #[test]
-    fn disabling_removes_only_the_braintrust_settings_file() {
+    fn disable_removes_only_braintrust_owned_settings() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("braintrust.json");
         std::fs::write(
             &path,
-            r#"{"traceToBraintrust":true,"route":{"destination":{"project_name":"coding-agents"}},"other":true}"#,
+            r#"{"trace_to_braintrust":false,"traceToBraintrust":true,"route":{"destination":{"type":"project_logs","project_name":"agents"}},"project":"legacy","unrelated":{"keep":true}}"#,
         )
         .unwrap();
 
-        remove_tracing_settings(&path).unwrap();
+        uninstall_tracing_at(&path).unwrap();
+
+        let settings: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(settings, serde_json::json!({"unrelated": {"keep": true}}));
+    }
+
+    #[test]
+    fn disable_removes_an_owned_only_file_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        std::fs::write(&path, r#"{"trace_to_braintrust":true,"route":{}}"#).unwrap();
+
+        uninstall_tracing_at(&path).unwrap();
+        uninstall_tracing_at(&path).unwrap();
+
         assert!(!path.exists());
     }
 
     #[test]
-    fn disabling_installed_plugins_uses_each_agents_uninstall_command() {
-        let mut codex = FakeRunner::new([serde_json::json!({
-            "installed": [{"pluginId": CODEX_PLUGIN}]
-        })]);
-        disable_codex(&mut codex).unwrap();
-        assert!(codex.called("codex plugin remove trace-codex@braintrust-codex-plugins --json"));
+    fn plugin_uninstall_skips_absent_codex_and_claude_plugins() {
+        let mut codex = FakeRunner::new([serde_json::json!({"installed": []})]);
+        uninstall_codex(&mut codex).unwrap();
+        assert_eq!(codex.calls, ["codex plugin list --json"]);
 
-        let mut claude = FakeRunner::new([serde_json::json!([{"id": CLAUDE_PLUGIN}])]);
-        disable_claude(&mut claude).unwrap();
-        assert!(claude.called("claude plugin uninstall trace-claude-code@braintrust-claude-plugin"));
-
-        let mut pi = FakeRunner::new([]);
-        disable_pi(&mut pi).unwrap();
-        assert!(pi.called("pi uninstall npm:@braintrust/pi-extension@^1"));
+        let mut claude = FakeRunner::new([serde_json::json!([])]);
+        uninstall_claude(&mut claude).unwrap();
+        assert_eq!(claude.calls, ["claude plugin list --json"]);
     }
 
     #[test]
-    fn disabling_opencode_removes_only_the_managed_plugin() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("opencode.json");
-        std::fs::write(
-            &path,
-            r#"{"plugin":["other","@braintrust/trace-opencode@^1"],"model":"test/model"}"#,
-        )
-        .unwrap();
+    fn plugin_uninstall_removes_exact_braintrust_plugins() {
+        let mut codex = FakeRunner::new([serde_json::json!({
+            "installed": [{"pluginId": AgentId::Codex.spec().uninstall_package}]
+        })]);
+        uninstall_codex(&mut codex).unwrap();
+        assert!(codex.called("codex plugin remove trace-codex@braintrust-codex-plugins --json"));
 
-        remove_opencode_plugin_at(&path).unwrap();
-
-        let config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(config["plugin"], serde_json::json!(["other"]));
-        assert_eq!(config["model"], "test/model");
+        let mut claude = FakeRunner::new([serde_json::json!([{
+            "id": AgentId::Claude.spec().uninstall_package
+        }])]);
+        uninstall_claude(&mut claude).unwrap();
+        assert!(claude.called("claude plugin uninstall trace-claude-code@braintrust-claude-plugin"));
     }
 }

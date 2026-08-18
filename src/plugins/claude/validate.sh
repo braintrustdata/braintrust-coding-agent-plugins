@@ -12,6 +12,7 @@
 set -euo pipefail
 
 TARGET_DIR="${1:?usage: validate.sh <TARGET_DIR>}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 fail() { echo "validate: $*" >&2; exit 1; }
 
 # jq if available (preferred), else python3 as a fallback JSON checker.
@@ -41,7 +42,12 @@ for rel in "${required[@]}"; do
   [[ -f "$TARGET_DIR/$rel" ]] || fail "missing $rel"
   case "$rel" in *.json) check_json "$TARGET_DIR/$rel";; esac
 done
+python3 "$REPO_ROOT/scripts/render-hook-forwarders.py" claude --target-root "$TARGET_DIR" --check \
+  || fail "Claude forwarder differs from the canonical template"
 
+python3 "$REPO_ROOT/scripts/validate-hook-events.py" claude \
+  "$TARGET_DIR/plugins/trace-claude-code/hooks/hooks.json" \
+  || fail "Claude shipped hook events differ from AgentSpec"
 python3 - "$TARGET_DIR/plugins/trace-claude-code/hooks/hooks.json" <<'PY' \
   || fail "Claude hooks do not all use the blocking daemon forwarder"
 import json
@@ -50,17 +56,6 @@ import sys
 with open(sys.argv[1]) as f:
     hooks = json.load(f)["hooks"]
 
-expected_events = {
-    "ConfigChange", "CwdChanged", "Elicitation", "ElicitationResult",
-    "FileChanged", "InstructionsLoaded", "MessageDisplay", "Notification",
-    "PermissionDenied", "PermissionRequest", "PostCompact", "PostToolBatch",
-    "PostToolUse", "PostToolUseFailure", "PreCompact", "PreToolUse",
-    "SessionEnd", "SessionStart", "Setup", "Stop", "StopFailure",
-    "SubagentStart", "SubagentStop", "TaskCompleted", "TaskCreated",
-    "TeammateIdle", "UserPromptExpansion", "UserPromptSubmit",
-    "WorktreeCreate", "WorktreeRemove",
-}
-assert set(hooks) == expected_events
 for definitions in hooks.values():
     for definition in definitions:
         for hook in definition["hooks"]:
@@ -69,7 +64,7 @@ for definitions in hooks.values():
             assert hook["async"] is False
 PY
 
-grep -Fq 'trace hook --source claude-code' \
+grep -Fq 'trace hook --source claude-code --plugin-version' \
   "$TARGET_DIR/plugins/trace-claude-code/hooks/forward.sh" \
   || fail "Claude forwarder does not invoke bt trace hook with source claude-code"
 python3 - "$TARGET_DIR/plugins/trace-claude-code/hooks/forward.sh" <<'PY' \

@@ -10,8 +10,8 @@ use crate::wire::{AuthSelection, SessionConfig, SessionRoute};
 use crate::{
     apply_additional_metadata, braintrust_serve_options, paths, run_disable, run_enable, run_hook,
     run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthLease, AuthProvider,
-    AuthResolveReason, BraintrustSinkConfig, HostInfo, OutputFormat, Registry, RunHookCommand,
-    ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
+    AuthResolveReason, BraintrustSinkConfig, HostInfo, ManagedRunExitError, OutputFormat, Registry,
+    RunHookCommand, ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -201,7 +201,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             print_output(run_enable(enable_args, route)?, host.output_format)
         }
         TraceCommand::Disable(disable_args) => {
-            print_output(run_disable(disable_args.agent)?, host.output_format)
+            print_output(run_disable(disable_args)?, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
             init_daemon_logging(host.verbose);
@@ -266,7 +266,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             if status.success() {
                 Ok(())
             } else {
-                anyhow::bail!("coding agent exited with {status}")
+                Err(ManagedRunExitError::new(status).into())
             }
         }
     }
@@ -515,6 +515,7 @@ mod tests {
         let args = crate::HookArgs {
             source: "codex".into(),
             source_version: None,
+            plugin_version: None,
             socket: None,
             session_id_field: "session_id".into(),
             event_field: "hook_event_name".into(),

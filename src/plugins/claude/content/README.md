@@ -45,6 +45,9 @@ owns authentication, trace construction, and delivery.
 bt trace enable claude --project my-coding-agent
 ```
 
+Use `bt trace disable claude` to remove the Braintrust tracing plugin and its
+saved route without disturbing unrelated Claude plugins or settings.
+
 Use `--profile` or `--org` when needed. Setup stores only non-secret routing
 settings under `~/.claude/braintrust.json`. Restart Claude Code after setup.
 

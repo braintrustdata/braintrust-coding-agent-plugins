@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionConfig, SessionRoute};
 use bt_daemon::{
     debug_serve_options, flush_managed_run, flush_session, forward_envelope, run_serve, run_status,
-    shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs,
-    ServeOptions, Sink, SinkFactory, SpanOp, StatusArgs,
+    shutdown_daemon, source_journal_path, AuthLease, AuthProvider, AuthResolveReason, HostInfo,
+    Registry, ServeArgs, ServeOptions, Sink, SinkFactory, SpanOp, StatusArgs,
 };
 #[cfg(all(feature = "cli", unix))]
 use bt_daemon::{run_traced, RunArgs, RunHookCommand, RunSource};
@@ -447,8 +447,7 @@ async fn routed_sessions_resolve_multiple_profiles_without_journaling_credential
 
     for session in ["work-session", "personal-session"] {
         let journal =
-            std::fs::read_to_string(data_dir.join("journal").join(format!("{session}.ndjson")))
-                .unwrap();
+            std::fs::read_to_string(source_journal_path(&data_dir, "debug", session)).unwrap();
         assert!(journal.contains("\"route\""));
         assert!(!journal.contains("secret-"));
         assert!(!journal.contains("token_sha256_prefix"));
@@ -719,7 +718,7 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert_eq!(flushed.pending, 0);
 
     // Journal: three events, in order, with only the non-secret route.
-    let journal = data_dir.join("journal").join("sess-1.ndjson");
+    let journal = source_journal_path(&data_dir, "debug", "sess-1");
     let jtext = std::fs::read_to_string(&journal).unwrap();
     let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
@@ -765,6 +764,20 @@ async fn events_are_ordered_journaled_and_emitted() {
 }
 
 #[tokio::test]
+async fn unknown_sources_are_rejected_before_journaling() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let mut env = envelope("unknown-session", "SessionStart", 1);
+    env.source = "mystery-agent".into();
+    let error = forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unsupported coding-agent source"), "{error}");
+    assert!(!source_journal_path(&data_dir, "mystery-agent", "unknown-session").exists());
+    handle.abort();
+}
+
+#[tokio::test]
 async fn distinct_sessions_are_isolated() {
     let (data_dir, socket, handle, _tmp) = start_daemon().await;
     let host = dummy_host();
@@ -782,8 +795,8 @@ async fn distinct_sessions_are_isolated() {
     flush_session("a", &socket, 5000).await.unwrap();
     flush_session("b", &socket, 5000).await.unwrap();
 
-    let a = std::fs::read_to_string(data_dir.join("journal").join("a.ndjson")).unwrap();
-    let b = std::fs::read_to_string(data_dir.join("journal").join("b.ndjson")).unwrap();
+    let a = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "a")).unwrap();
+    let b = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "b")).unwrap();
     assert_eq!(a.lines().filter(|l| !l.trim().is_empty()).count(), 2);
     assert_eq!(b.lines().filter(|l| !l.trim().is_empty()).count(), 1);
 
@@ -943,7 +956,8 @@ async fn restart_replays_journal_with_stable_span_ids_before_new_events() {
         .unwrap();
     flush_session("resume", &socket, 5000).await.unwrap();
 
-    let journal = std::fs::read_to_string(data_dir.join("journal/resume.ndjson")).unwrap();
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "resume")).unwrap();
     assert_eq!(journal.lines().count(), 2);
     let spans = std::fs::read_to_string(data_dir.join("spans/resume.ndjson")).unwrap();
     let rows: Vec<serde_json::Value> = spans
@@ -1003,7 +1017,12 @@ async fn claude_boundary_journal_references_a_self_contained_transcript_mirror()
         .await
         .unwrap();
 
-    let journal = std::fs::read_to_string(data_dir.join("journal/claude-journal.ndjson")).unwrap();
+    let journal = std::fs::read_to_string(source_journal_path(
+        &data_dir,
+        "claude-code",
+        "claude-journal",
+    ))
+    .unwrap();
     assert!(!journal.contains("sk-TOP-SECRET-abc123"));
 
     // The journal references the mirror rather than inlining the transcript,
@@ -1104,7 +1123,7 @@ async fn claude_journal_does_not_grow_with_the_transcript_on_every_turn() {
     flush_session("grow", &socket, 5000).await.unwrap();
 
     let transcript_len = std::fs::metadata(&transcript).unwrap().len();
-    let journal_len = std::fs::metadata(data_dir.join("journal/grow.ndjson"))
+    let journal_len = std::fs::metadata(source_journal_path(&data_dir, "claude-code", "grow"))
         .unwrap()
         .len();
 

@@ -17,6 +17,9 @@ on:
         required: true
       OPENAI_API_KEY:
         required: false
+      CODEX_HOOK_TRUST_CONFIG:
+        description: "Reviewed [hooks.state] TOML for the deployed hook definitions."
+        required: false
   workflow_dispatch:
     inputs:
       dist_repo:
@@ -35,22 +38,23 @@ jobs:
   guard:
     runs-on: ubuntu-24.04
     outputs:
-      has_key: ${{ steps.check.outputs.has_key }}
+      ready: ${{ steps.check.outputs.ready }}
     steps:
       - id: check
         env:
           KEY: ${{ secrets.OPENAI_API_KEY }}
+          TRUST: ${{ secrets.CODEX_HOOK_TRUST_CONFIG }}
         run: |
-          if [ -n "$KEY" ]; then
-            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$KEY" ] && [ -n "$TRUST" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
           else
-            echo "has_key=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::OPENAI_API_KEY not set; skipping codex smoke test."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Codex smoke requires OPENAI_API_KEY and reviewed CODEX_HOOK_TRUST_CONFIG; skipping rather than bypassing hook trust."
           fi
 
   smoke:
     needs: guard
-    if: needs.guard.outputs.has_key == 'true'
+    if: needs.guard.outputs.ready == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -72,7 +76,7 @@ jobs:
       - name: Install Codex and bt CLIs
         run: |
           npm install -g @openai/codex
-          curl -fsSL https://bt.dev/cli/install.sh | sh
+          curl -fsSL https://bt.dev/cli/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Require daemon-capable bt
@@ -86,6 +90,14 @@ jobs:
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           codex plugin marketplace add "${{ inputs.dist_repo }}"
           codex plugin add "trace-codex@${MARKETPLACE}"
+
+      - name: Configure reviewed hook trust
+        env:
+          TRUST_CONFIG: ${{ secrets.CODEX_HOOK_TRUST_CONFIG }}
+        run: |
+          mkdir -p "$HOME/.codex"
+          printf '%s\n' "$TRUST_CONFIG" > "$HOME/.codex/config.toml"
+          chmod 600 "$HOME/.codex/config.toml"
 
       - name: Run real traced Codex session (${{ matrix.label }})
         env:
@@ -108,7 +120,6 @@ jobs:
           curl -fsS http://127.0.0.1:53999/version >/dev/null
           codex exec \
             --skip-git-repo-check \
-            --dangerously-bypass-hook-trust \
             --sandbox read-only \
             "say hi"
           python3 -c 'import json, os; s=json.load(open(os.environ["MOCK_COLLECTOR_OUT"])); assert s["totalRows"] >= 1, s; print(s)'

@@ -75,6 +75,9 @@ For one invocation without changing Pi's global tracing configuration, use
 matching `BRAINTRUST_*` environment variable; a plain `pi` session's
 extension does not.
 
+Use `bt trace disable pi` to uninstall the Braintrust extension and remove its
+saved route while preserving unrelated Pi configuration.
+
 In interactive mode, the footer shows a `Braintrust` status indicator while tracing is active, and a widget below the editor shows a shortened clickable trace link when available.
 
 ## Configuration
@@ -124,6 +127,9 @@ Example:
 `show_ui` and `show_trace_link` control local display behavior only and can
 still be set from the environment. Tracing routing and enablement come only
 from `braintrust.json` and `bt trace run`.
+
+Boolean settings accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`
+case-insensitively.
 
 ## Notes
 

@@ -50,6 +50,8 @@ describe("BraintrustPlugin", () => {
     "TRACE_TO_BRAINTRUST",
     "BRAINTRUST_PROFILE",
     "BRAINTRUST_OPENCODE_ENABLE_TOOLS",
+    "BT_TRACE_INVOCATION_SETTINGS",
+    "BT_TRACE_MANAGED_RUN_ID",
     "HOME",
     "XDG_CONFIG_HOME",
   ];
@@ -118,5 +120,38 @@ describe("BraintrustPlugin", () => {
     expect(hooks["tool.execute.before"]).toBeDefined();
     expect(hooks["tool.execute.after"]).toBeDefined();
     expect(hooks.tool).toBeUndefined();
+  });
+
+  it("provides a trace-only managed entrypoint without data tools", async () => {
+    process.env.BT_TRACE_MANAGED_RUN_ID = `test-${Date.now()}`;
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: {
+        destination: { type: "project_logs", project_name: "managed" },
+      },
+    });
+    const { default: tracingPlugin } = await import("./tracing");
+    const hooks = await tracingPlugin(createInput(directory));
+
+    expect(hooks.event).toBeDefined();
+    expect(hooks["chat.message"]).toBeDefined();
+    expect(hooks.tool).toBeUndefined();
+  });
+
+  it("registers only one tracing adapter when managed and installed copies load", async () => {
+    process.env.BT_TRACE_MANAGED_RUN_ID = `dedupe-${Date.now()}`;
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: { destination: { type: "project_logs", project_name: "managed" } },
+    });
+    const [{ BraintrustPlugin }, { default: tracingPlugin }] = await Promise.all([
+      import("./index"),
+      import("./tracing"),
+    ]);
+
+    const installedHooks = await BraintrustPlugin(createInput(directory));
+    const injectedHooks = await tracingPlugin(createInput(directory));
+    expect(installedHooks.event).toBeDefined();
+    expect(injectedHooks.event).toBeUndefined();
   });
 });

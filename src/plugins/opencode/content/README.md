@@ -21,7 +21,12 @@ opencode
 ```
 
 For one invocation without changing OpenCode's global tracing configuration,
-use `bt trace run --project <PROJECT> opencode -- [OPENCODE_ARGS...]`.
+use `bt trace run --project <PROJECT> opencode -- [OPENCODE_ARGS...]`. Managed
+runs load the package's trace-only entrypoint, so they do not add Braintrust
+data-access tools to OpenCode.
+
+Use `bt trace disable opencode` to remove only the Braintrust-owned plugin
+registration and settings while preserving unrelated OpenCode configuration.
 
 ## Configuration
 
@@ -64,6 +69,9 @@ Create a `braintrust.json` file in one of these locations:
 from the environment. Tracing routing and enablement (`trace_to_braintrust`,
 `profile`, `project`, `org_name`, `additional_metadata`) come only from
 `braintrust.json` and `bt trace run`.
+
+Boolean settings accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`
+case-insensitively.
 
 ### Precedence
 

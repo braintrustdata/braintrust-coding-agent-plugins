@@ -24,22 +24,22 @@ resolve_bt() {
 BT_BIN="$(resolve_bt || true)"
 if [[ -z "$BT_BIN" ]]; then
   if ! command -v curl >/dev/null 2>&1; then
-    printf 'trace-codex: curl is required to install bt; tracing skipped\n' >&2
+    printf '@PLUGIN_NAME@: curl is required to install bt; tracing skipped\n' >&2
     exit 0
   fi
 
-  printf 'trace-codex: bt CLI not found; installing it now\n' >&2
+  printf '@PLUGIN_NAME@: bt CLI not found; installing it now\n' >&2
   if ! (set -o pipefail; curl -fsSL "$BT_INSTALL_URL" | bash) >&2; then
-    printf 'trace-codex: bt installation failed; tracing skipped\n' >&2
+    printf '@PLUGIN_NAME@: bt installation failed; tracing skipped\n' >&2
     exit 0
   fi
 
   BT_BIN="$(resolve_bt || true)"
   if [[ -z "$BT_BIN" ]]; then
-    printf 'trace-codex: bt was installed but is not executable; tracing skipped\n' >&2
+    printf '@PLUGIN_NAME@: bt was installed but is not executable; tracing skipped\n' >&2
     exit 0
   fi
 fi
 
-"$BT_BIN" trace hook --source codex --plugin-version 1.0.1 || true
+"$BT_BIN" trace hook --source @SOURCE@ --plugin-version @PLUGIN_VERSION@ || true
 exit 0

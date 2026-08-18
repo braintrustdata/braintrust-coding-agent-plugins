@@ -5,6 +5,7 @@
 //! consistently and JSON mode never falls back to human prose.
 
 use crate::wire::StatusResult;
+use crate::AgentSpec;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -61,6 +62,9 @@ pub struct SetupCommandOutput {
     pub restart_required: bool,
 }
 
+/// Enable and disable report the same stable agent lifecycle shape.
+pub type LifecycleCommandOutput = SetupCommandOutput;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StopCommandOutput {
     pub running: bool,
@@ -72,7 +76,7 @@ pub struct StopCommandOutput {
 pub enum TraceCommandOutput {
     Status(StatusCommandOutput),
     Enable(SetupCommandOutput),
-    Disable(SetupCommandOutput),
+    Disable(LifecycleCommandOutput),
     Stop(StopCommandOutput),
 }
 
@@ -81,14 +85,19 @@ impl TraceCommandOutput {
         Self::Status(status.into())
     }
 
-    pub fn setup(
-        source: impl Into<String>,
-        display_name: impl Into<String>,
-        settings_path: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn setup(spec: &AgentSpec, settings_path: impl Into<PathBuf>) -> Self {
         Self::Enable(SetupCommandOutput {
-            source: source.into(),
-            display_name: display_name.into(),
+            source: spec.canonical_source.into(),
+            display_name: spec.display_name.into(),
+            settings_path: settings_path.into(),
+            restart_required: true,
+        })
+    }
+
+    pub fn disable(spec: &AgentSpec, settings_path: impl Into<PathBuf>) -> Self {
+        Self::Disable(SetupCommandOutput {
+            source: spec.canonical_source.into(),
+            display_name: spec.display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
         })
@@ -96,19 +105,6 @@ impl TraceCommandOutput {
 
     pub fn stop(running: bool, stopped: bool) -> Self {
         Self::Stop(StopCommandOutput { running, stopped })
-    }
-
-    pub fn disable(
-        source: impl Into<String>,
-        display_name: impl Into<String>,
-        settings_path: impl Into<PathBuf>,
-    ) -> Self {
-        Self::Disable(SetupCommandOutput {
-            source: source.into(),
-            display_name: display_name.into(),
-            settings_path: settings_path.into(),
-            restart_required: true,
-        })
     }
 
     pub fn render(&self, format: OutputFormat) -> anyhow::Result<String> {
@@ -161,8 +157,7 @@ mod tests {
     #[test]
     fn enable_json_contains_stable_selection_fields_without_prose() {
         let output = TraceCommandOutput::setup(
-            "opencode",
-            "OpenCode",
+            crate::AgentId::OpenCode.spec(),
             PathBuf::from("/tmp/opencode/braintrust.json"),
         );
         let rendered = output.render(OutputFormat::Json).unwrap();
@@ -204,6 +199,20 @@ mod tests {
                 "stopped": true
             })
         );
+    }
+
+    #[test]
+    fn lifecycle_json_uses_canonical_source_names() {
+        let path = PathBuf::from("/tmp/claude/braintrust.json");
+        let disabled: serde_json::Value = serde_json::from_str(
+            &TraceCommandOutput::disable(crate::AgentId::Claude.spec(), path)
+                .render(OutputFormat::Json)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(disabled["command"], "disable");
+        assert_eq!(disabled["source"], "claude-code");
+        assert_eq!(disabled["restart_required"], true);
     }
 
     #[test]

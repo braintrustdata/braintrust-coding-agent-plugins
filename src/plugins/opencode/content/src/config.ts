@@ -1,4 +1,9 @@
-import { type DaemonSessionRoute, resolveDaemonTraceSettings } from "./runtime/daemon-client";
+import {
+  type DaemonSessionRoute,
+  jsonRecord,
+  parseOptionalBoolean,
+  resolveDaemonTraceSettings,
+} from "./runtime/daemon-client";
 
 /** OpenCode-specific behavior plus its independently selected tracing route. */
 
@@ -34,9 +39,7 @@ export interface PluginConfig {
  * All other values (including undefined, "false", "0", "no") are falsy.
  */
 export function parseBooleanEnv(value: string | undefined): boolean {
-  if (!value) return false;
-  const normalized = value.toLowerCase();
-  return normalized === "true" || normalized === "1";
+  return parseOptionalBoolean(value) ?? false;
 }
 
 /**
@@ -91,9 +94,10 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
     if (pluginConfig.debug !== undefined) {
       defaults.debug = pluginConfig.debug;
     }
-    if (pluginConfig.additional_metadata) {
-      defaults.additionalMetadata = pluginConfig.additional_metadata;
-    }
+    defaults.additionalMetadata =
+      jsonRecord(pluginConfig.additional_metadata) ??
+      jsonRecord(pluginConfig.route?.additional_metadata) ??
+      defaults.additionalMetadata;
   }
 
   const persistentRoute: DaemonSessionRoute = {
@@ -125,13 +129,10 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
         ? routeDestination.project_name
         : defaults.projectName,
     tracingEnabled: traceSettings.trace_to_braintrust === true,
-    enableTools: process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS
-      ? parseBooleanEnv(process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS)
-      : defaults.enableTools,
-    debug: process.env.BRAINTRUST_DEBUG
-      ? parseBooleanEnv(process.env.BRAINTRUST_DEBUG)
-      : defaults.debug,
-    additionalMetadata: defaults.additionalMetadata,
+    enableTools:
+      parseOptionalBoolean(process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS) ?? defaults.enableTools,
+    debug: parseOptionalBoolean(process.env.BRAINTRUST_DEBUG) ?? defaults.debug,
+    additionalMetadata: jsonRecord(route.additional_metadata) ?? defaults.additionalMetadata,
     route,
   };
 }
