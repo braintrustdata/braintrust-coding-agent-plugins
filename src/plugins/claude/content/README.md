@@ -45,6 +45,10 @@ owns authentication, trace construction, and delivery.
 bt trace setup claude --project my-coding-agent
 ```
 
+Use `bt trace disable claude` to keep the marketplace plugin installed while
+turning off persistent tracing. Use `bt trace uninstall claude` to remove only
+the Braintrust tracing plugin registration and route.
+
 Use `--profile` or `--org` when needed. Setup stores only non-secret routing
 settings under `~/.claude/braintrust.json`. Restart Claude Code after setup.
 

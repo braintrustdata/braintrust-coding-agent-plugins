@@ -34,7 +34,7 @@ $(BUILD_RULES): build-%:
 	@src/plugins/$*/build.sh "$(DIST)/$*"
 
 test: build
-	@for p in $(PLUGINS); do \
+	@set -e; for p in $(PLUGINS); do \
 		echo "==> validate $$p"; \
 		src/plugins/$$p/validate.sh "$(DIST)/$$p"; \
 	done

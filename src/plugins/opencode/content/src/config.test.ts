@@ -8,10 +8,12 @@ describe("parseBooleanEnv", () => {
     expect(parseBooleanEnv("1")).toBe(true);
   });
 
-  it("rejects other and missing values", () => {
+  it("accepts false spellings and rejects unknown or missing values", () => {
     expect(parseBooleanEnv(undefined)).toBe(false);
     expect(parseBooleanEnv("false")).toBe(false);
-    expect(parseBooleanEnv("yes")).toBe(false);
+    expect(parseBooleanEnv("yes")).toBe(true);
+    expect(parseBooleanEnv("off")).toBe(false);
+    expect(parseBooleanEnv("sometimes")).toBe(false);
   });
 });
 
@@ -122,6 +124,21 @@ describe("loadConfig", () => {
         route: { destination, flush_mode: "flush_on_turn_end" },
       }).route,
     ).toEqual({ destination, auth: {}, flush_mode: "flush_on_turn_end" });
+  });
+
+  it("preserves additional metadata nested in the canonical route", () => {
+    expect(
+      loadConfig({
+        trace_to_braintrust: true,
+        route: {
+          destination: { type: "project_logs", project_name: "nested" },
+          additional_metadata: { team: "platform" },
+        },
+      }),
+    ).toMatchObject({
+      additionalMetadata: { team: "platform" },
+      route: { additional_metadata: { team: "platform" } },
+    });
   });
 
   it("does not fall back to persistent settings for a malformed managed run", () => {

@@ -16,28 +16,8 @@ TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 (cd "$SOURCE_DIR" && pnpm run check && pnpm test && pnpm run build && pnpm run smoke)
 node "$REPO_ROOT/scripts/prepare-js-daemon-client.mjs" pi --check
 
-pack_json="$(cd "$TARGET_DIR" && pnpm pack --dry-run --json)"
-node -e '
-  const parsed = JSON.parse(process.argv[1])
-  const result = Array.isArray(parsed) ? parsed[0] : parsed
-  const files = new Set(result.files.map((file) => file.path))
-  for (const required of ["dist/index.mjs", "dist/index.d.mts", "README.md", "LICENSE"]) {
-    if (!files.has(required)) throw new Error(`package omits ${required}`)
-  }
-  for (const file of files) {
-    if (file.startsWith("src/") || file.endsWith("daemon-client.ts")) {
-      throw new Error(`package exposes generated source: ${file}`)
-    }
-  }
-' "$pack_json"
-(cd "$SOURCE_DIR" && pnpm run publish:dry-run >/dev/null)
-
-node -e '
-  const manifest = require(process.argv[1])
-  for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
-    if (manifest[field]?.braintrust) process.exit(1)
-  }
-' "$TARGET_DIR/package.json" || fail "Braintrust SDK remains in Pi package dependencies"
+node "$REPO_ROOT/scripts/validate-npm-artifact.mjs" pi "$TARGET_DIR"
+(cd "$TARGET_DIR" && pnpm publish --dry-run --ignore-scripts --no-git-checks >/dev/null)
 for removed in client.ts legacy-processor.ts state.ts types.ts utils.ts; do
   [[ ! -e "$TARGET_DIR/src/$removed" ]] || fail "legacy tracing source remains: src/$removed"
 done

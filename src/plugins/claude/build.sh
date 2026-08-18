@@ -18,8 +18,11 @@ set -euo pipefail
 TARGET_DIR="${1:?usage: build.sh <TARGET_DIR>}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTENT_DIR="$SRC_DIR/content"
+REPO_ROOT="$(cd "$SRC_DIR/../../.." && pwd)"
 
+python3 "$REPO_ROOT/scripts/render-hook-forwarders.py" claude --check
 mkdir -p "$TARGET_DIR"
 rsync -a --delete --exclude '.git' "$CONTENT_DIR/" "$TARGET_DIR/"
+python3 "$REPO_ROOT/scripts/render-hook-forwarders.py" claude --target-root "$TARGET_DIR"
 
 echo "Built claude dist into $TARGET_DIR (content from $CONTENT_DIR)."

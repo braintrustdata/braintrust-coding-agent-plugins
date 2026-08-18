@@ -3,7 +3,7 @@ use crate::ImportSource;
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read, Seek};
 use std::path::{Path, PathBuf};
 
 mod claude;
@@ -136,10 +136,11 @@ fn resolve_transcript_in(
     for root in roots {
         let mut candidates = Vec::new();
         find_jsonl_files(root, &mut candidates);
-        matches.extend(candidates.into_iter().filter(|path| match source {
-            ImportSource::Codex => codex::filename_matches(path, session_id),
-            ImportSource::Claude => claude::filename_matches(path, session_id),
-        }));
+        matches.extend(
+            candidates
+                .into_iter()
+                .filter(|path| transcript_session_id(path, source).as_deref() == Some(session_id)),
+        );
     }
     matches.sort();
     matches.dedup();
@@ -188,38 +189,148 @@ fn source_name(source: ImportSource) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transcript_envelopes(
     path: &Path,
     source: ImportSource,
 ) -> anyhow::Result<Vec<Envelope>> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("read transcript {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut records = Vec::new();
-    let mut record_end_offsets = Vec::new();
-    let mut offset = 0_u64;
-    let mut line = String::new();
-    let mut index = 0_usize;
-    while reader.read_line(&mut line)? != 0 {
-        index += 1;
-        offset += line.len() as u64;
-        if !line.trim().is_empty() {
-            records.push(
-                serde_json::from_str(&line).with_context(|| {
-                    format!("parse transcript {} line {}", path.display(), index)
-                })?,
-            );
-            record_end_offsets.push(offset);
-        }
-        line.clear();
-    }
-    if records.is_empty() {
-        bail!("transcript {} is empty", path.display());
-    }
+    let mut records = IncrementalRecords::default();
+    records.refresh(path, true)?;
+    envelopes_from_records(path, source, &records)
+}
+
+fn envelopes_from_records(
+    path: &Path,
+    source: ImportSource,
+    records: &IncrementalRecords,
+) -> anyhow::Result<Vec<Envelope>> {
     match source {
-        ImportSource::Codex => codex::envelopes(path, &records),
-        ImportSource::Claude => claude::envelopes(path, &records, &record_end_offsets, offset),
+        ImportSource::Codex => codex::envelopes(path, &records.values),
+        ImportSource::Claude => claude::envelopes(
+            path,
+            &records.values,
+            &records.end_offsets,
+            records.read_offset,
+        ),
     }
+}
+
+/// Append-only JSONL reader used by attach. Native transcript files can be
+/// large, so unchanged history is parsed once and retained as structured
+/// records instead of being read and decoded again on every poll.
+#[derive(Default)]
+struct IncrementalRecords {
+    values: Vec<Value>,
+    end_offsets: Vec<u64>,
+    read_offset: u64,
+    line_count: usize,
+    modified: Option<std::time::SystemTime>,
+    anchor: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refresh {
+    Unchanged,
+    Appended,
+    Reset,
+}
+
+impl IncrementalRecords {
+    fn refresh(&mut self, path: &Path, finalize: bool) -> anyhow::Result<Refresh> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("read transcript metadata {}", path.display()))?;
+        let len = metadata.len();
+        let modified = metadata.modified().ok();
+        let prefix_changed = self.read_offset > 0
+            && len >= self.read_offset
+            && read_anchor(path, self.read_offset, self.anchor.len())? != self.anchor;
+        let reset = self.read_offset > 0
+            && (len < self.read_offset
+                || prefix_changed
+                || (len == self.read_offset && modified != self.modified));
+        if reset {
+            *self = Self::default();
+        }
+        if len == self.read_offset {
+            self.modified = modified;
+            if self.values.is_empty() && finalize {
+                bail!("transcript {} is empty", path.display());
+            }
+            return Ok(if reset {
+                Refresh::Reset
+            } else {
+                Refresh::Unchanged
+            });
+        }
+
+        let start_offset = self.read_offset;
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("read transcript {}", path.display()))?;
+        file.seek(std::io::SeekFrom::Start(self.read_offset))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut values = Vec::new();
+        let mut end_offsets = Vec::new();
+        let mut offset = self.read_offset;
+        let mut parsed_through = self.read_offset;
+        let mut line_count = self.line_count;
+        let mut parsed_line_count = self.line_count;
+        let mut line = String::new();
+        loop {
+            let bytes = reader.read_line(&mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            line_count += 1;
+            offset += bytes as u64;
+            if !line.trim().is_empty() {
+                match serde_json::from_str(&line) {
+                    Ok(value) => {
+                        values.push(value);
+                        end_offsets.push(offset);
+                    }
+                    Err(_) if !finalize && offset == len && !line.ends_with('\n') => break,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("parse transcript {} line {}", path.display(), line_count)
+                        });
+                    }
+                }
+            }
+            parsed_through = offset;
+            parsed_line_count = line_count;
+            line.clear();
+        }
+
+        self.values.extend(values);
+        self.end_offsets.extend(end_offsets);
+        self.read_offset = parsed_through;
+        self.line_count = parsed_line_count;
+        self.modified = modified;
+        self.anchor = read_anchor(path, parsed_through, 64)?;
+        if self.values.is_empty() && finalize {
+            bail!("transcript {} is empty", path.display());
+        }
+        Ok(if reset {
+            Refresh::Reset
+        } else if parsed_through > start_offset {
+            Refresh::Appended
+        } else {
+            Refresh::Unchanged
+        })
+    }
+}
+
+fn read_anchor(path: &Path, through: u64, max_len: usize) -> anyhow::Result<Vec<u8>> {
+    let len = usize::try_from(through.min(max_len as u64)).unwrap_or(max_len);
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("read transcript {}", path.display()))?;
+    file.seek(std::io::SeekFrom::Start(through - len as u64))?;
+    let mut anchor = vec![0; len];
+    file.read_exact(&mut anchor)?;
+    Ok(anchor)
 }
 
 /// Incrementally converts a growing native transcript into synthetic hook
@@ -229,7 +340,7 @@ pub(crate) struct TranscriptTail {
     path: PathBuf,
     source: ImportSource,
     state: TailState,
-    observed_file: Option<(u64, Option<std::time::SystemTime>)>,
+    records: IncrementalRecords,
 }
 
 enum TailState {
@@ -242,11 +353,15 @@ impl TranscriptTail {
         Self {
             path,
             source,
-            state: match source {
-                ImportSource::Codex => TailState::Codex(codex::Tail::default()),
-                ImportSource::Claude => TailState::Claude(claude::Tail::default()),
-            },
-            observed_file: None,
+            state: Self::new_state(source),
+            records: IncrementalRecords::default(),
+        }
+    }
+
+    fn new_state(source: ImportSource) -> TailState {
+        match source {
+            ImportSource::Codex => TailState::Codex(codex::Tail::default()),
+            ImportSource::Claude => TailState::Claude(claude::Tail::default()),
         }
     }
 
@@ -257,16 +372,18 @@ impl TranscriptTail {
             Err(error) => return Err(error.into()),
         };
         let len = metadata.len();
-        let observed_file = (len, metadata.modified().ok());
-        if !finalize && self.observed_file == Some(observed_file) {
-            return Ok(Vec::new());
-        }
-        let events = match transcript_envelopes(&self.path, self.source) {
-            Ok(events) => events,
+        let refresh = match self.records.refresh(&self.path, finalize) {
+            Ok(refresh) => refresh,
             Err(_) if !finalize => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        self.observed_file = Some(observed_file);
+        if refresh == Refresh::Unchanged && !finalize {
+            return Ok(Vec::new());
+        }
+        if refresh == Refresh::Reset {
+            self.state = Self::new_state(self.source);
+        }
+        let events = envelopes_from_records(&self.path, self.source, &self.records)?;
         match &mut self.state {
             TailState::Codex(state) => state.poll(events, len, finalize),
             TailState::Claude(state) => state.poll(events, len, finalize),
@@ -351,7 +468,11 @@ mod tests {
             .join("2026/07/31")
             .join("rollout-2026-07-31T12-00-00-session-123.jsonl");
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        std::fs::write(&transcript, "{}\n").unwrap();
+        std::fs::write(
+            &transcript,
+            r#"{"type":"session_meta","payload":{"id":"session-123"}}"#,
+        )
+        .unwrap();
 
         assert_eq!(
             resolve_transcript_in("session-123", ImportSource::Codex, &[root]).unwrap(),
@@ -365,9 +486,13 @@ mod tests {
         let root = temp.path().join("projects");
         let project = root.join("-tmp-project");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("prefix-session-123.jsonl"), "{}\n").unwrap();
+        std::fs::write(
+            project.join("prefix-session-123.jsonl"),
+            r#"{"type":"user","sessionId":"prefix-session-123"}"#,
+        )
+        .unwrap();
         let transcript = project.join("session-123.jsonl");
-        std::fs::write(&transcript, "{}\n").unwrap();
+        std::fs::write(&transcript, r#"{"type":"user","sessionId":"session-123"}"#).unwrap();
 
         assert_eq!(
             resolve_transcript_in("session-123", ImportSource::Claude, &[root]).unwrap(),
@@ -402,13 +527,37 @@ mod tests {
         .unwrap_err();
         assert!(missing.to_string().contains("no Claude Code transcript"));
 
-        std::fs::write(first.join("duplicate.jsonl"), "{}\n").unwrap();
-        std::fs::write(second.join("duplicate.jsonl"), "{}\n").unwrap();
+        std::fs::write(
+            first.join("duplicate.jsonl"),
+            r#"{"type":"user","sessionId":"duplicate"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            second.join("duplicate.jsonl"),
+            r#"{"type":"user","sessionId":"duplicate"}"#,
+        )
+        .unwrap();
         let ambiguous =
             resolve_transcript_in("duplicate", ImportSource::Claude, &[first, second]).unwrap_err();
         assert!(ambiguous
             .to_string()
             .contains("multiple Claude Code transcripts"));
+    }
+
+    #[test]
+    fn explicit_lookup_rejects_filename_only_session_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let transcript = root.join("rollout-session-123.jsonl");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            transcript,
+            r#"{"type":"session_meta","payload":{"id":"different-session"}}"#,
+        )
+        .unwrap();
+
+        let error = resolve_transcript_in("session-123", ImportSource::Codex, &[root]).unwrap_err();
+        assert!(error.to_string().contains("no Codex transcript"));
     }
 
     #[test]
@@ -563,6 +712,31 @@ mod tests {
     }
 
     #[test]
+    fn codex_import_rejects_ambiguous_subagent_transcripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("rollout-parent.jsonl");
+        let records = vec![
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"parent"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-a","name":"spawn_agent","arguments":"{}"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-a","output":"{\"agent_id\":\"child-a\"}"}}),
+        ];
+        for directory in ["first", "second"] {
+            let path = temp.path().join(directory).join("rollout-child-a.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                json!({"timestamp":"2026-01-01T00:00:02Z","type":"session_meta","payload":{"id":"child-a","source":{"subagent":{}}}}).to_string(),
+            )
+            .unwrap();
+        }
+
+        let error = codex::envelopes(&parent, &records).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("multiple Codex transcripts found for subagent child-a"));
+    }
+
+    #[test]
     fn codex_import_adds_native_turn_checkpoints() {
         let records = vec![
             json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"session-123"}}),
@@ -617,6 +791,42 @@ mod tests {
         assert!(second.iter().all(|event| event.event != "SessionStart"));
         assert_eq!(second.last().unwrap().event, "ImportCheckpoint");
         assert_eq!(tail.poll(true).unwrap().last().unwrap().event, "Stop");
+    }
+
+    #[test]
+    fn incremental_reader_handles_partial_appends_and_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(&path, "{\"type\":\"session_meta\"").unwrap();
+        let mut records = IncrementalRecords::default();
+        assert!(records.refresh(&path, false).unwrap() == Refresh::Unchanged);
+        assert!(records.values.is_empty());
+
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
+        )
+        .unwrap();
+        assert!(records.refresh(&path, false).unwrap() == Refresh::Appended);
+        assert_eq!(records.values.len(), 1);
+
+        std::fs::write(&path, "{\"type\":\"event_msg\"}\n").unwrap();
+        assert!(records.refresh(&path, false).unwrap() == Refresh::Reset);
+        assert_eq!(records.values, vec![json!({"type":"event_msg"})]);
+
+        std::fs::write(
+            &path,
+            "{\"type\":\"replacement_with_a_longer_prefix\"}\n{\"type\":\"second\"}\n",
+        )
+        .unwrap();
+        assert!(records.refresh(&path, false).unwrap() == Refresh::Reset);
+        assert_eq!(
+            records.values,
+            vec![
+                json!({"type":"replacement_with_a_longer_prefix"}),
+                json!({"type":"second"})
+            ]
+        );
     }
 
     #[test]

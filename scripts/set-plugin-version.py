@@ -13,6 +13,7 @@ Usage: set-plugin-version.py <agent> <version>   (leading 'v' is stripped)
 import glob
 import os
 import re
+import subprocess
 import sys
 
 # agent -> glob of its per-plugin manifests (relative to repo root)
@@ -44,6 +45,13 @@ def main() -> None:
         with open(path, "w") as f:
             f.write(new_text)
         print(f"set {os.path.relpath(path)} version -> {version}")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    subprocess.run(
+        [sys.executable, os.path.join(repo_root, "scripts/render-hook-forwarders.py"), agent],
+        check=True,
+        cwd=repo_root,
+    )
 
 
 if __name__ == "__main__":

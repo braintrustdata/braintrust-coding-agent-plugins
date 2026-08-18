@@ -5,6 +5,7 @@
 //! consistently and JSON mode never falls back to human prose.
 
 use crate::wire::StatusResult;
+use crate::AgentSpec;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -61,6 +62,9 @@ pub struct SetupCommandOutput {
     pub restart_required: bool,
 }
 
+/// Setup, disable, and uninstall report the same stable agent lifecycle shape.
+pub type LifecycleCommandOutput = SetupCommandOutput;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StopCommandOutput {
     pub running: bool,
@@ -72,6 +76,8 @@ pub struct StopCommandOutput {
 pub enum TraceCommandOutput {
     Status(StatusCommandOutput),
     Setup(SetupCommandOutput),
+    Disable(LifecycleCommandOutput),
+    Uninstall(LifecycleCommandOutput),
     Stop(StopCommandOutput),
 }
 
@@ -80,14 +86,28 @@ impl TraceCommandOutput {
         Self::Status(status.into())
     }
 
-    pub fn setup(
-        source: impl Into<String>,
-        display_name: impl Into<String>,
-        settings_path: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn setup(spec: &AgentSpec, settings_path: impl Into<PathBuf>) -> Self {
         Self::Setup(SetupCommandOutput {
-            source: source.into(),
-            display_name: display_name.into(),
+            source: spec.canonical_source.into(),
+            display_name: spec.display_name.into(),
+            settings_path: settings_path.into(),
+            restart_required: true,
+        })
+    }
+
+    pub fn disable(spec: &AgentSpec, settings_path: impl Into<PathBuf>) -> Self {
+        Self::Disable(SetupCommandOutput {
+            source: spec.canonical_source.into(),
+            display_name: spec.display_name.into(),
+            settings_path: settings_path.into(),
+            restart_required: true,
+        })
+    }
+
+    pub fn uninstall(spec: &AgentSpec, settings_path: impl Into<PathBuf>) -> Self {
+        Self::Uninstall(SetupCommandOutput {
+            source: spec.canonical_source.into(),
+            display_name: spec.display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
         })
@@ -117,6 +137,16 @@ impl TraceCommandOutput {
                 setup.display_name,
                 setup.settings_path.display()
             )),
+            Self::Disable(disable) => Ok(format!(
+                "Braintrust tracing is disabled for {} in {}.\nRestart the coding agent to unload tracing.",
+                disable.display_name,
+                disable.settings_path.display()
+            )),
+            Self::Uninstall(uninstall) => Ok(format!(
+                "The Braintrust tracing plugin is uninstalled for {} and its route was removed from {}.\nRestart the coding agent to unload tracing.",
+                uninstall.display_name,
+                uninstall.settings_path.display()
+            )),
             Self::Stop(stop) if stop.stopped => Ok("Tracing daemon stopped.".into()),
             Self::Stop(_) => Ok("No tracing daemon is running.".into()),
         }
@@ -142,8 +172,7 @@ mod tests {
     #[test]
     fn setup_json_contains_stable_selection_fields_without_prose() {
         let output = TraceCommandOutput::setup(
-            "opencode",
-            "OpenCode",
+            crate::AgentId::OpenCode.spec(),
             PathBuf::from("/tmp/opencode/braintrust.json"),
         );
         let rendered = output.render(OutputFormat::Json).unwrap();
@@ -185,6 +214,29 @@ mod tests {
                 "stopped": true
             })
         );
+    }
+
+    #[test]
+    fn lifecycle_json_uses_canonical_source_names() {
+        let path = PathBuf::from("/tmp/claude/braintrust.json");
+        let disabled: serde_json::Value = serde_json::from_str(
+            &TraceCommandOutput::disable(crate::AgentId::Claude.spec(), path.clone())
+                .render(OutputFormat::Json)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(disabled["command"], "disable");
+        assert_eq!(disabled["source"], "claude-code");
+        assert_eq!(disabled["restart_required"], true);
+
+        let uninstalled: serde_json::Value = serde_json::from_str(
+            &TraceCommandOutput::uninstall(crate::AgentId::Claude.spec(), path)
+                .render(OutputFormat::Json)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(uninstalled["command"], "uninstall");
+        assert_eq!(uninstalled["source"], "claude-code");
     }
 
     #[test]

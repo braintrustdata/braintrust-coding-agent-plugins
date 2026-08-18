@@ -21,7 +21,13 @@ opencode
 ```
 
 For one invocation without changing OpenCode's global tracing configuration,
-use `bt trace run --project <PROJECT> opencode -- [OPENCODE_ARGS...]`.
+use `bt trace run --project <PROJECT> opencode -- [OPENCODE_ARGS...]`. Managed
+runs load the package's trace-only entrypoint, so they do not add Braintrust
+data-access tools to OpenCode.
+
+Use `bt trace disable opencode` to keep the package installed while turning
+off persistent tracing, or `bt trace uninstall opencode` to remove only the
+Braintrust-owned registration and settings.
 
 ## Configuration
 
@@ -57,6 +63,9 @@ Create a `braintrust.json` file in one of these locations:
 | `debug` | `BRAINTRUST_DEBUG` | boolean | `false` | Enable debug logging |
 | `org_name` | `BRAINTRUST_ORG_NAME` | string | profile default | Organization selected within the tracing profile and for tools |
 | `additional_metadata` | `BRAINTRUST_ADDITIONAL_METADATA` | string | | JSON object of additional metadata to attach to the root span. Standard metadata keys take precedence on conflict. |
+
+Boolean settings accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`
+case-insensitively.
 
 ### Precedence
 

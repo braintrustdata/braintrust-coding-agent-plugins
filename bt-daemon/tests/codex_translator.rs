@@ -2,6 +2,7 @@
 //! hook triggers into a session → turn → {llm, tool} span tree. Mirrors the
 //! happy-path shape of the TS `event-processor` tests.
 
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, FlushMode, SessionConfig};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
@@ -183,7 +184,8 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
         json!("gpt-5.5"),
         "model backfilled from turn_context"
     );
-    assert_eq!(md["source"], json!("startup"));
+    assert_eq!(md["source"], json!("codex"));
+    assert_eq!(md["session_source"], json!("startup"));
     assert_eq!(md["permission_mode"], json!("auto"));
 
     // Turn.
@@ -495,6 +497,97 @@ fn configured_ctx(session_id: &str, additional_metadata: Value) -> SessionCtx {
             additional_metadata: Some(additional_metadata),
         }),
     }
+}
+
+#[test]
+fn codex_honors_external_parent_and_root_without_metadata_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"native","cwd":"/x/app"}}),
+    );
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    let ctx = SessionCtx {
+        session_id: "daemon-session".into(),
+        config: Some(SessionConfig {
+            auth: BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: Some(bt_daemon::wire::TraceDestination::ParentSpan { components }),
+            flush_mode: FlushMode::FireAndForget,
+            additional_metadata: Some(json!({
+                "source": "spoofed",
+                "session_id": "spoofed",
+                "_bt_secret": "hidden",
+                "team": "platform"
+            })),
+        }),
+    };
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "daemon-session");
+    let ops = translator
+        .handle(
+            &envelope(
+                "daemon-session",
+                "SessionStart",
+                transcript.to_str().unwrap(),
+                json!({"source":"startup"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    let rows = reduce(ops);
+    let root = find(&rows, SpanType::Task, "codex: app");
+    assert_eq!(root.root_span_id, "external-root");
+    assert_eq!(root.parent_span_ids, vec!["external-parent"]);
+    let metadata = root.metadata.as_ref().unwrap();
+    assert_eq!(metadata["source"], "codex");
+    assert_eq!(metadata["session_id"], "native");
+    assert_eq!(metadata["session_source"], "startup");
+    assert_eq!(metadata["team"], "platform");
+    assert!(metadata.get("_bt_secret").is_none());
+}
+
+#[test]
+fn codex_replays_from_a_daemon_owned_mirror_after_source_deletion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let original = tmp.path().join("original.jsonl");
+    let mirror = tmp.path().join("mirror.jsonl");
+    let record = json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"native","cwd":"/x/app"}});
+    append(&original, record.clone());
+    append(&mirror, record);
+    let through = std::fs::metadata(&mirror).unwrap().len();
+    std::fs::remove_file(&original).unwrap();
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "daemon-session");
+    let ctx = SessionCtx {
+        session_id: "daemon-session".into(),
+        config: None,
+    };
+    let mut hook = envelope(
+        "daemon-session",
+        "SessionStart",
+        original.to_str().unwrap(),
+        json!({}),
+    );
+    hook.payload["_bt_transcript_mirror"] = json!({
+        "path": original.to_str().unwrap(),
+        "mirror": mirror.to_str().unwrap(),
+        "through": through,
+    });
+    let rows = reduce(translator.handle(&hook, &ctx).unwrap());
+    assert_eq!(
+        find(&rows, SpanType::Task, "codex: app").root_span_id.len(),
+        36
+    );
 }
 
 #[test]

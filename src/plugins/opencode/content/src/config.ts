@@ -1,4 +1,10 @@
-import { type DaemonSessionRoute, resolveDaemonTraceSettings } from "./runtime/daemon-client";
+import {
+  type DaemonSessionRoute,
+  jsonRecord,
+  parseJsonRecord,
+  parseOptionalBoolean,
+  resolveDaemonTraceSettings,
+} from "./runtime/daemon-client";
 
 /** OpenCode-specific behavior plus its independently selected tracing route. */
 
@@ -34,9 +40,7 @@ export interface PluginConfig {
  * All other values (including undefined, "false", "0", "no") are falsy.
  */
 export function parseBooleanEnv(value: string | undefined): boolean {
-  if (!value) return false;
-  const normalized = value.toLowerCase();
-  return normalized === "true" || normalized === "1";
+  return parseOptionalBoolean(value) ?? false;
 }
 
 /**
@@ -87,27 +91,21 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
     if (pluginConfig.debug !== undefined) {
       defaults.debug = pluginConfig.debug;
     }
-    if (pluginConfig.additional_metadata) {
-      defaults.additionalMetadata = pluginConfig.additional_metadata;
-    }
+    defaults.additionalMetadata =
+      jsonRecord(pluginConfig.additional_metadata) ??
+      jsonRecord(pluginConfig.route?.additional_metadata) ??
+      defaults.additionalMetadata;
   }
 
   // Layer 2: Apply environment variables (override opencode.json)
-  let additionalMetadata = defaults.additionalMetadata;
-  if (process.env.BRAINTRUST_ADDITIONAL_METADATA) {
-    try {
-      additionalMetadata = JSON.parse(process.env.BRAINTRUST_ADDITIONAL_METADATA);
-    } catch {
-      // Invalid JSON in env var — ignore and keep config file value (if any)
-    }
-  }
+  const additionalMetadata =
+    parseJsonRecord(process.env.BRAINTRUST_ADDITIONAL_METADATA) ?? defaults.additionalMetadata;
 
   const profile = process.env.BRAINTRUST_PROFILE || defaults.profile;
   const orgName = process.env.BRAINTRUST_ORG_NAME || defaults.orgName;
   const projectName = process.env.BRAINTRUST_PROJECT || defaults.projectName;
-  const tracingEnabled = process.env.TRACE_TO_BRAINTRUST
-    ? parseBooleanEnv(process.env.TRACE_TO_BRAINTRUST)
-    : defaults.tracingEnabled;
+  const tracingEnabled =
+    parseOptionalBoolean(process.env.TRACE_TO_BRAINTRUST) ?? defaults.tracingEnabled;
   const persistentRoute: DaemonSessionRoute = {
     ...(pluginConfig?.route ?? defaults.route),
     auth: {
@@ -140,13 +138,10 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
         ? routeDestination.project_name
         : projectName,
     tracingEnabled: traceSettings.trace_to_braintrust === true,
-    enableTools: process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS
-      ? parseBooleanEnv(process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS)
-      : defaults.enableTools,
-    debug: process.env.BRAINTRUST_DEBUG
-      ? parseBooleanEnv(process.env.BRAINTRUST_DEBUG)
-      : defaults.debug,
-    additionalMetadata,
+    enableTools:
+      parseOptionalBoolean(process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS) ?? defaults.enableTools,
+    debug: parseOptionalBoolean(process.env.BRAINTRUST_DEBUG) ?? defaults.debug,
+    additionalMetadata: jsonRecord(route.additional_metadata) ?? additionalMetadata,
     route,
   };
 }

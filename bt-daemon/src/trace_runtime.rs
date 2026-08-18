@@ -8,10 +8,11 @@
 use crate::trace_command::TraceCommand;
 use crate::wire::{AuthSelection, SessionConfig, SessionRoute};
 use crate::{
-    apply_additional_metadata, braintrust_serve_options, paths, run_hook, run_import, run_serve,
-    run_setup, run_status, run_traced, shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason,
-    BraintrustSinkConfig, HostInfo, OutputFormat, Registry, RunHookCommand, ServeOptions,
-    StatusArgs, TraceArgs, TraceCommandOutput,
+    apply_additional_metadata, braintrust_serve_options, paths, run_disable, run_hook, run_import,
+    run_serve, run_setup, run_status, run_traced, run_uninstall, shutdown_daemon, AuthLease,
+    AuthProvider, AuthResolveReason, BraintrustSinkConfig, HostInfo, ManagedRunExitError,
+    OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
+    TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -200,6 +201,12 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             apply_additional_metadata(&mut route, setup_args.additional_metadata.as_deref())?;
             print_output(run_setup(setup_args, route)?, host.output_format)
         }
+        TraceCommand::Disable(lifecycle_args) => {
+            print_output(run_disable(lifecycle_args)?, host.output_format)
+        }
+        TraceCommand::Uninstall(lifecycle_args) => {
+            print_output(run_uninstall(lifecycle_args)?, host.output_format)
+        }
         TraceCommand::Daemon(serve_args) => {
             init_daemon_logging(host.verbose);
             run_serve(serve_args, serve_options(&host)).await
@@ -263,7 +270,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             if status.success() {
                 Ok(())
             } else {
-                anyhow::bail!("coding agent exited with {status}")
+                Err(ManagedRunExitError::new(status).into())
             }
         }
     }
@@ -512,6 +519,7 @@ mod tests {
         let args = crate::HookArgs {
             source: "codex".into(),
             source_version: None,
+            plugin_version: None,
             socket: None,
             session_id_field: "session_id".into(),
             event_field: "hook_event_name".into(),

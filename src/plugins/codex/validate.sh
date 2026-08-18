@@ -12,6 +12,7 @@
 set -euo pipefail
 
 TARGET_DIR="${1:?usage: validate.sh <TARGET_DIR>}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 fail() { echo "validate: $*" >&2; exit 1; }
 
 # jq if available (preferred), else python3 as a fallback JSON checker.
@@ -41,7 +42,12 @@ for rel in "${required[@]}"; do
   [[ -f "$TARGET_DIR/$rel" ]] || fail "missing $rel"
   case "$rel" in *.json) check_json "$TARGET_DIR/$rel";; esac
 done
+python3 "$REPO_ROOT/scripts/render-hook-forwarders.py" codex --target-root "$TARGET_DIR" --check \
+  || fail "Codex forwarder differs from the canonical template"
 
+python3 "$REPO_ROOT/scripts/validate-hook-events.py" codex \
+  "$TARGET_DIR/plugins/trace-codex/hooks/hooks.json" \
+  || fail "Codex shipped hook events differ from AgentSpec"
 python3 - "$TARGET_DIR/plugins/trace-codex/hooks/hooks.json" <<'PY' \
   || fail "Codex hooks do not all use the daemon forwarders"
 import json
@@ -50,12 +56,6 @@ import sys
 with open(sys.argv[1]) as f:
     hooks = json.load(f)["hooks"]
 
-expected_events = {
-    "PermissionRequest", "PostCompact", "PostToolUse", "PreCompact",
-    "PreToolUse", "SessionStart", "Stop", "SubagentStart", "SubagentStop",
-    "UserPromptSubmit",
-}
-assert set(hooks) == expected_events
 for definitions in hooks.values():
     for definition in definitions:
         for hook in definition["hooks"]:
@@ -64,7 +64,7 @@ for definitions in hooks.values():
             assert hook["commandWindows"] == 'bash "${PLUGIN_ROOT}\\bin\\codex-hook.sh"'
 PY
 
-grep -Fq 'trace hook --source codex' \
+grep -Fq 'trace hook --source codex --plugin-version' \
   "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.sh" \
   || fail "Codex Unix forwarder does not invoke bt trace hook with source codex"
 python3 - "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.sh" <<'PY' \

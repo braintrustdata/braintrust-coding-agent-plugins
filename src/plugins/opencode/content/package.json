@@ -25,6 +25,16 @@
   "type": "module",
   "main": "dist/index.mjs",
   "types": "dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./tracing": {
+      "types": "./dist/tracing.d.mts",
+      "import": "./dist/tracing.mjs"
+    }
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -36,7 +46,7 @@
     "fmt": "vp fmt",
     "lint": "vp lint",
     "publish:dry-run": "pnpm run build && pnpm publish --dry-run --no-git-checks",
-    "smoke": "node -e \"import('./dist/index.mjs')\"",
+    "smoke": "node -e \"Promise.all([import('./dist/index.mjs'), import('./dist/tracing.mjs')])\"",
     "test": "pnpm run prepare:daemon-client && vitest run",
     "test:watch": "pnpm run prepare:daemon-client && vitest",
     "typecheck": "pnpm run check"
