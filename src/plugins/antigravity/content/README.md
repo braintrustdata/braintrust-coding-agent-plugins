@@ -14,7 +14,9 @@ Antigravity requires that hook to return a permission decision. Live testing
 confirmed that an empty decision is handled as a denial, while `allow` would
 bypass normal permission checks and `ask` could add prompts.
 
-This package currently requires a `bt` CLI that exposes `bt trace hook` and a
-Unix-compatible `sh`. Persistent setup, managed-run injection, transcript
-import/attach, Windows support, and production distribution are not yet part of
-this feasibility implementation.
+This package requires a `bt` CLI that exposes `bt trace hook` and a
+Unix-compatible `sh`. Install or refresh it with `bt trace enable antigravity`
+(`setup` remains an alias); remove its managed registration with
+`bt trace disable antigravity`.
+Managed-run injection, transcript import/attach, Windows support, and production
+distribution are not yet part of this feasibility implementation.
