@@ -273,6 +273,102 @@ fn codex_incremental_reads_advance_offset() {
     }
 }
 
+/// Reproduction for a large rollout first observed through one `SessionStart`
+/// hook. The source transcript stays modest, but each LLM span snapshots the
+/// growing conversation history. The translator must emit bounded batches
+/// instead of retaining every clone from the catch-up at once.
+#[test]
+fn codex_large_catch_up_emits_bounded_batches() {
+    const CALLS: usize = 256;
+    const USER_BYTES: usize = 8 * 1024;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("large-rollout.jsonl");
+    let tpath = transcript.to_str().unwrap();
+    let mut file = std::fs::File::create(&transcript).unwrap();
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta", "payload": { "id": "large", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context", "payload": { "model": "gpt-test" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "large-turn" } }),
+    ] {
+        writeln!(file, "{}", line(record)).unwrap();
+    }
+    let user_text = "x".repeat(USER_BYTES);
+    for index in 0..CALLS {
+        let timestamp = |offset: usize| {
+            let seconds = 4 + index * 3 + offset;
+            format!("2026-01-01T00:{:02}:{:02}Z", seconds / 60, seconds % 60)
+        };
+        writeln!(file, "{}", line(json!({
+            "timestamp": timestamp(0),
+            "type": "response_item",
+            "payload": { "type": "message", "role": "user", "content": [{ "type": "output_text", "text": user_text }] }
+        }))).unwrap();
+        writeln!(file, "{}", line(json!({
+            "timestamp": timestamp(1),
+            "type": "response_item",
+            "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "ok" }] }
+        }))).unwrap();
+        writeln!(file, "{}", line(json!({
+            "timestamp": timestamp(2),
+            "type": "event_msg",
+            "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 1, "output_tokens": 1 } } }
+        }))).unwrap();
+    }
+    file.flush().unwrap();
+
+    let reg = Registry::default_agents();
+    let mut translator = reg.create("codex", "large");
+    let ctx = SessionCtx {
+        session_id: "large".into(),
+        config: None,
+    };
+    let mut next = Some(
+        translator
+            .handle(&envelope("large", "SessionStart", tpath, json!({})), &ctx)
+            .unwrap(),
+    );
+    let mut batches = 0;
+    let mut total_llms = 0;
+    let mut total_llm_inputs = 0;
+    let mut largest_batch_inputs = 0;
+    while let Some(ops) = next {
+        batches += 1;
+        let batch_inputs = ops
+            .iter()
+            .filter_map(|op| match op {
+                SpanOp::Insert(row) if row.span_type == SpanType::Llm => row.input.as_ref(),
+                _ => None,
+            })
+            .map(|input| serde_json::to_vec(input).unwrap().len())
+            .sum::<usize>();
+        total_llms += ops
+            .iter()
+            .filter(|op| matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Llm))
+            .count();
+        total_llm_inputs += batch_inputs;
+        largest_batch_inputs = largest_batch_inputs.max(batch_inputs);
+        next = translator.drain_pending(&ctx).unwrap();
+    }
+
+    eprintln!(
+        "reproduction: rollout={} bytes, {batches} batches, total llm inputs={} bytes, largest batch={} bytes",
+        std::fs::metadata(&transcript).unwrap().len(),
+        total_llm_inputs,
+        largest_batch_inputs,
+    );
+    assert_eq!(total_llms, CALLS);
+    assert!(
+        total_llm_inputs > 200 * 1024 * 1024,
+        "expected substantial total output"
+    );
+    assert!(batches > 1, "large rollout must be drained incrementally");
+    assert!(
+        largest_batch_inputs < 40 * 1024 * 1024,
+        "each emitted batch must stay bounded"
+    );
+}
+
 #[test]
 fn codex_import_checkpoints_preserve_native_turn_boundaries() {
     let tmp = tempfile::tempdir().unwrap();

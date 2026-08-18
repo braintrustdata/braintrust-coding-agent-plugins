@@ -13,6 +13,7 @@ mod debug;
 mod git;
 mod opencode;
 mod pi;
+mod recent;
 
 pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;
@@ -88,6 +89,13 @@ pub struct SessionCtx {
 pub trait AgentTranslator: Send {
     /// Handle one event, returning span ops to emit.
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>>;
+
+    /// Continue bounded work started by [`Self::handle`] or [`Self::flush`].
+    /// `Some` means the caller must emit this batch and call again; `None`
+    /// means the translator is fully caught up.
+    fn drain_pending(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
+        Ok(None)
+    }
 
     /// Emit any pending spans (e.g. close dangling turns) at flush/shutdown.
     fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {

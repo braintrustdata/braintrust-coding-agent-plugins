@@ -3,6 +3,7 @@ use crate::ImportSource;
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 mod claude;
@@ -191,31 +192,33 @@ pub(crate) fn transcript_envelopes(
     path: &Path,
     source: ImportSource,
 ) -> anyhow::Result<Vec<Envelope>> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("read transcript {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("read transcript {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
     let mut records = Vec::new();
     let mut record_end_offsets = Vec::new();
     let mut offset = 0_u64;
-    for (index, line) in contents.split_inclusive('\n').enumerate() {
+    let mut line = String::new();
+    let mut index = 0_usize;
+    while reader.read_line(&mut line)? != 0 {
+        index += 1;
         offset += line.len() as u64;
-        if line.trim().is_empty() {
-            continue;
+        if !line.trim().is_empty() {
+            records.push(
+                serde_json::from_str(&line).with_context(|| {
+                    format!("parse transcript {} line {}", path.display(), index)
+                })?,
+            );
+            record_end_offsets.push(offset);
         }
-        records.push(
-            serde_json::from_str(line).with_context(|| {
-                format!("parse transcript {} line {}", path.display(), index + 1)
-            })?,
-        );
-        record_end_offsets.push(offset);
+        line.clear();
     }
     if records.is_empty() {
         bail!("transcript {} is empty", path.display());
     }
     match source {
         ImportSource::Codex => codex::envelopes(path, &records),
-        ImportSource::Claude => {
-            claude::envelopes(path, &records, &record_end_offsets, contents.len() as u64)
-        }
+        ImportSource::Claude => claude::envelopes(path, &records, &record_end_offsets, offset),
     }
 }
 
@@ -226,6 +229,7 @@ pub(crate) struct TranscriptTail {
     path: PathBuf,
     source: ImportSource,
     state: TailState,
+    observed_file: Option<(u64, Option<std::time::SystemTime>)>,
 }
 
 enum TailState {
@@ -242,16 +246,27 @@ impl TranscriptTail {
                 ImportSource::Codex => TailState::Codex(codex::Tail::default()),
                 ImportSource::Claude => TailState::Claude(claude::Tail::default()),
             },
+            observed_file: None,
         }
     }
 
     pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
+        let metadata = match std::fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(_) if !finalize => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let len = metadata.len();
+        let observed_file = (len, metadata.modified().ok());
+        if !finalize && self.observed_file == Some(observed_file) {
+            return Ok(Vec::new());
+        }
         let events = match transcript_envelopes(&self.path, self.source) {
             Ok(events) => events,
             Err(_) if !finalize => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        let len = std::fs::metadata(&self.path)?.len();
+        self.observed_file = Some(observed_file);
         match &mut self.state {
             TailState::Codex(state) => state.poll(events, len, finalize),
             TailState::Claude(state) => state.poll(events, len, finalize),

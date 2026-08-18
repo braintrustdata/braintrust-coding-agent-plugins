@@ -452,7 +452,12 @@ impl PiTranslator {
         })]
     }
     fn close_turn(&mut self, ts: i64, error: Option<String>) -> Vec<SpanOp> {
-        let Some((id, _)) = self.turn.take() else {
+        let turn = self.turn.take();
+        // Native context/tool payloads are only correlation state for the active
+        // turn. The journal can rebuild them if a retired session later resumes.
+        self.pending_llms.clear();
+        self.tools.clear();
+        let Some((id, _)) = turn else {
             return vec![];
         };
         vec![SpanOp::Merge(SpanRow {
@@ -465,6 +470,8 @@ impl PiTranslator {
     }
     fn close_root(&mut self, ts: i64) -> SpanOp {
         self.opened = false;
+        self.compaction = None;
+        self.branch_summary = None;
         SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),

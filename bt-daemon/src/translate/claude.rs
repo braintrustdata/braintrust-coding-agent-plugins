@@ -7,11 +7,12 @@
 //! transcript that already contains the completed session.
 
 use super::git::GitMetadataCache;
+use super::recent::RecentSet;
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Seek, SeekFrom};
 use std::process::Command;
 use std::sync::Arc;
@@ -58,6 +59,20 @@ struct PendingTool {
     parent_id: String,
 }
 
+enum PendingHistory {
+    Main,
+    Owned(Vec<Value>),
+}
+
+struct PendingEmission {
+    segments: VecDeque<Vec<Value>>,
+    history: PendingHistory,
+    scope: String,
+    parent: String,
+    cwd: Option<String>,
+    clear_after: bool,
+}
+
 struct ClaudeTranslator {
     session_id: String,
     session_span_id: String,
@@ -71,11 +86,12 @@ struct ClaudeTranslator {
     main_transcript: Option<String>,
     transcripts: HashMap<String, TranscriptCursor>,
     main_history: Vec<Value>,
-    emitted_requests: HashSet<String>,
-    emitted_tools: HashSet<String>,
+    emitted_requests: RecentSet<String>,
+    emitted_tools: RecentSet<String>,
     pending_tools: HashMap<String, PendingTool>,
     subagents: HashMap<String, Subagent>,
     pending_skills: Vec<String>,
+    pending_emission: Option<PendingEmission>,
     claude_version: Option<String>,
     claude_version_logged: bool,
     git: Arc<GitMetadataCache>,
@@ -99,11 +115,12 @@ impl ClaudeTranslator {
             main_transcript: None,
             transcripts: HashMap::new(),
             main_history: Vec::new(),
-            emitted_requests: HashSet::new(),
-            emitted_tools: HashSet::new(),
+            emitted_requests: RecentSet::default(),
+            emitted_tools: RecentSet::default(),
             pending_tools: HashMap::new(),
             subagents: HashMap::new(),
             pending_skills: Vec::new(),
+            pending_emission: None,
             claude_version: None,
             claude_version_logged: false,
             git,
@@ -414,7 +431,15 @@ impl ClaudeTranslator {
                 .buffered
                 .extend(read_event_records(event, &path, &mut cursor.offset));
             let records = std::mem::take(&mut cursor.buffered);
-            self.emit_transcript(&records, &format!("subagent:{agent_id}"), &parent, ops);
+            self.queue_transcript(
+                records,
+                PendingHistory::Owned(Vec::new()),
+                format!("subagent:{agent_id}"),
+                parent.clone(),
+                self.current_cwd.clone(),
+                ops,
+            );
+            self.transcripts.remove(&path);
         }
         self.close_pending_tools(
             &parent,
@@ -423,12 +448,13 @@ impl ClaudeTranslator {
             ops,
         );
         ops.push(SpanOp::Merge(SpanRow {
-            span_id: parent,
+            span_id: parent.clone(),
             root_span_id: self.root_span_id.clone(),
             end_ms: Some(event.ts_ms),
             output: event.payload.get("last_assistant_message").cloned(),
             ..Default::default()
         }));
+        self.subagents.remove(&agent_id);
     }
 
     fn emit_main(&mut self, parent: &str, ops: &mut Vec<SpanOp>) {
@@ -440,25 +466,83 @@ impl ClaudeTranslator {
             .get_mut(&path)
             .map(|cursor| std::mem::take(&mut cursor.buffered))
             .unwrap_or_default();
-        let parsed = parse_transcript(&records, std::mem::take(&mut self.main_history));
-        // Moved, not cloned: this used to deep-copy the whole conversation on
-        // every turn. The history is never trimmed — it is the model input
-        // these spans report, so dropping any of it would silently corrupt the
-        // trace. Its footprint is the active session's own conversation, and
-        // retiring an idle session releases it.
-        self.main_history = parsed.history;
-        self.emit_parsed(parsed.calls, parsed.tools, "main", parent, ops);
+        self.queue_transcript(
+            records,
+            PendingHistory::Main,
+            "main".into(),
+            parent.into(),
+            self.current_cwd.clone(),
+            ops,
+        );
     }
 
-    fn emit_transcript(
+    fn queue_transcript(
         &mut self,
-        records: &[Value],
-        scope: &str,
-        parent: &str,
+        records: Vec<Value>,
+        history: PendingHistory,
+        scope: String,
+        parent: String,
+        cwd: Option<String>,
         ops: &mut Vec<SpanOp>,
     ) {
-        let parsed = parse_transcript(records, Vec::new());
-        self.emit_parsed(parsed.calls, parsed.tools, scope, parent, ops);
+        debug_assert!(self.pending_emission.is_none());
+        let pending = PendingEmission {
+            segments: transcript_segments(records),
+            history,
+            scope,
+            parent,
+            cwd,
+            clear_after: false,
+        };
+        self.pending_emission = self.emit_next_pending(pending, ops);
+    }
+
+    fn emit_next_pending(
+        &mut self,
+        mut pending: PendingEmission,
+        ops: &mut Vec<SpanOp>,
+    ) -> Option<PendingEmission> {
+        let Some(records) = pending.segments.pop_front() else {
+            if pending.clear_after {
+                self.release_terminal_state();
+            }
+            return None;
+        };
+        let history = match &mut pending.history {
+            PendingHistory::Main => std::mem::take(&mut self.main_history),
+            PendingHistory::Owned(history) => std::mem::take(history),
+        };
+        let ParsedTranscript {
+            calls,
+            tools,
+            history,
+        } = parse_transcript(&records, history);
+        match &mut pending.history {
+            PendingHistory::Main => self.main_history = history,
+            PendingHistory::Owned(pending_history) => *pending_history = history,
+        }
+        let op_start = ops.len();
+        self.emit_parsed(calls, tools, &pending.scope, &pending.parent, ops);
+        self.git
+            .enrich_rows(pending.cwd.as_deref(), &mut ops[op_start..]);
+        if pending.segments.is_empty() {
+            if pending.clear_after {
+                self.release_terminal_state();
+            }
+            None
+        } else {
+            Some(pending)
+        }
+    }
+
+    fn release_terminal_state(&mut self) {
+        self.main_history.clear();
+        self.transcripts.clear();
+        self.subagents.clear();
+        self.pending_tools.clear();
+        self.pending_skills.clear();
+        self.emitted_requests.clear();
+        self.emitted_tools.clear();
     }
 
     fn emit_parsed(
@@ -493,7 +577,6 @@ impl ClaudeTranslator {
     }
 
     fn flush_previous_turn_rows(&mut self, ops: &mut Vec<SpanOp>) {
-        let op_start = ops.len();
         let (Some(path), Some(parent)) = (self.main_transcript.clone(), self.last_turn_id.clone())
         else {
             return;
@@ -508,11 +591,14 @@ impl ClaudeTranslator {
             .unwrap_or(cursor.buffered.len());
         let current_turn_rows = cursor.buffered.split_off(split);
         let previous_rows = std::mem::replace(&mut cursor.buffered, current_turn_rows);
-        let parsed = parse_transcript(&previous_rows, std::mem::take(&mut self.main_history));
-        self.main_history = parsed.history;
-        self.emit_parsed(parsed.calls, parsed.tools, "main", &parent, ops);
-        self.git
-            .enrich_rows(self.last_turn_cwd.as_deref(), &mut ops[op_start..]);
+        self.queue_transcript(
+            previous_rows,
+            PendingHistory::Main,
+            "main".into(),
+            parent,
+            self.last_turn_cwd.clone(),
+            ops,
+        );
     }
 
     fn stop_turn(&mut self, event: &Envelope, error: Option<String>, ops: &mut Vec<SpanOp>) {
@@ -604,11 +690,20 @@ impl ClaudeTranslator {
                 ..Default::default()
             }));
         }
+        if let Some(pending) = &mut self.pending_emission {
+            pending.clear_after = true;
+        } else {
+            self.release_terminal_state();
+        }
     }
 }
 
 impl AgentTranslator for ClaudeTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        anyhow::ensure!(
+            self.pending_emission.is_none(),
+            "Claude translator has pending catch-up work; drain it before handling another event"
+        );
         let mut ops = Vec::new();
         if let Some(cwd) = string_field(&event.payload, "cwd") {
             self.current_cwd = Some(cwd);
@@ -674,9 +769,56 @@ impl AgentTranslator for ClaudeTranslator {
         Ok(ops)
     }
 
+    fn drain_pending(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
+        let Some(pending) = self.pending_emission.take() else {
+            return Ok(None);
+        };
+        let mut ops = Vec::new();
+        self.pending_emission = self.emit_next_pending(pending, &mut ops);
+        Ok(Some(ops))
+    }
+
     fn flush(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         Ok(Vec::new())
     }
+}
+
+fn transcript_segments(records: Vec<Value>) -> VecDeque<Vec<Value>> {
+    let mut segments = VecDeque::new();
+    let mut current = Vec::new();
+    let mut request_id: Option<String> = None;
+    for record in records {
+        let next_request_id = assistant_request_id(&record);
+        if next_request_id
+            .as_ref()
+            .zip(request_id.as_ref())
+            .is_some_and(|(next, current)| next != current)
+            && !current.is_empty()
+        {
+            segments.push_back(std::mem::take(&mut current));
+        }
+        if next_request_id.is_some() {
+            request_id = next_request_id;
+        }
+        current.push(record);
+    }
+    if !current.is_empty() {
+        segments.push_back(current);
+    }
+    segments
+}
+
+fn assistant_request_id(record: &Value) -> Option<String> {
+    (record.get("type").and_then(Value::as_str) == Some("assistant"))
+        .then(|| {
+            record
+                .get("message")
+                .and_then(|message| string_field(message, "id"))
+                .or_else(|| string_field(record, "requestId"))
+                .or_else(|| string_field(record, "uuid"))
+        })
+        .flatten()
+        .filter(|id| !id.is_empty())
 }
 
 struct ParsedTranscript {

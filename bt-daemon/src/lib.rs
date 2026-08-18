@@ -73,7 +73,7 @@ pub struct ServeArgs {
     /// Retire a session's in-memory state after this many seconds without
     /// traffic. A later event rebuilds it from the journal. 0 disables
     /// retirement.
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 30)]
     pub session_idle_timeout_secs: u64,
 }
 
@@ -786,7 +786,14 @@ pub async fn import_transcripts(
         let entries = tail
             .poll(true)
             .with_context(|| format!("import transcript {}", file.display()))?;
+        let session_ids = entries
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect::<std::collections::HashSet<_>>();
         processor.process(entries).await?;
+        for session_id in session_ids {
+            processor.finish_session(&session_id).await?;
+        }
     }
     processor.finish().await
 }
@@ -846,6 +853,17 @@ impl ImportProcessor {
                 live.ctx.config = Some(cfg.clone());
             }
             let ops = live.translator.handle(&env, &live.ctx)?;
+            Self::emit_translator_batches(live, ops).await?;
+        }
+        Ok(())
+    }
+
+    async fn emit_translator_batches(
+        live: &mut ImportLive,
+        first: Vec<SpanOp>,
+    ) -> anyhow::Result<()> {
+        let mut next = Some(first);
+        while let Some(ops) = next {
             // Imports can contain tens of thousands of SDK log commands. Bound the
             // number queued between drains without serializing one network flush
             // for every native turn boundary.
@@ -858,6 +876,7 @@ impl ImportProcessor {
                     live.pending_ops = 0;
                 }
             }
+            next = live.translator.drain_pending(&live.ctx)?;
         }
         Ok(())
     }
@@ -865,10 +884,19 @@ impl ImportProcessor {
     async fn finish(self) -> anyhow::Result<()> {
         for (_sid, mut live) in self.sessions {
             let ops = live.translator.flush(&live.ctx)?;
-            live.sink.emit(&ops).await?;
+            Self::emit_translator_batches(&mut live, ops).await?;
             live.sink.flush().await?;
         }
         Ok(())
+    }
+
+    async fn finish_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        let Some(mut live) = self.sessions.remove(session_id) else {
+            return Ok(());
+        };
+        let ops = live.translator.flush(&live.ctx)?;
+        Self::emit_translator_batches(&mut live, ops).await?;
+        live.sink.flush().await
     }
 }
 
@@ -938,6 +966,18 @@ mod tests {
     struct ImportCli {
         #[command(flatten)]
         args: ImportArgs,
+    }
+
+    #[derive(Debug, Parser)]
+    struct ServeCli {
+        #[command(flatten)]
+        args: ServeArgs,
+    }
+
+    #[test]
+    fn serve_defaults_to_short_journal_backed_session_retirement() {
+        let args = ServeCli::try_parse_from(["test"]).unwrap().args;
+        assert_eq!(args.session_idle_timeout_secs, 30);
     }
 
     #[test]

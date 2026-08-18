@@ -12,6 +12,40 @@ fn write_jsonl(path: &std::path::Path, records: &[Value]) {
     }
 }
 
+#[tokio::test]
+async fn importing_large_codex_rollout_drains_translator_continuations() {
+    const CALLS: usize = 32;
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("large-codex.jsonl");
+    let mut records = vec![
+        json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"codex-large-import","cwd":"/tmp/demo"}}),
+        json!({"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-test"}}),
+        json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"large-turn"}}),
+    ];
+    let prompt = "x".repeat(4 * 1024);
+    for _ in 0..CALLS {
+        records.push(json!({"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"output_text","text":prompt}]}}));
+        records.push(json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}));
+        records.push(json!({"timestamp":"2026-01-01T00:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1,"output_tokens":1}}}}));
+    }
+    records.push(json!({"timestamp":"2026-01-01T00:01:00Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}));
+    write_jsonl(&transcript, &records);
+
+    let output = tmp.path().join("spans");
+    import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        options(&output),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let output_rows = rows(&output.join("codex-large-import.ndjson"));
+    assert_eq!(inserted(&output_rows, "llm"), CALLS);
+}
+
 fn options(output: &std::path::Path) -> ServeOptions {
     ServeOptions {
         version: "test".into(),
