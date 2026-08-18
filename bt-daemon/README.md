@@ -59,6 +59,23 @@ the default `bt` profile. Credentials and backend URLs are never stored here;
 production resolves and refreshes them through `bt`. `bt trace run` supplies a
 process-local settings overlay and never changes any of these files.
 
+### Additional root metadata
+
+`additional_metadata` is a JSON object merged into each traced session's root
+span. Standard agent metadata (such as the session id, source, and workspace)
+takes precedence over keys supplied by users. Set it persistently during setup
+or provide it for one process with `BRAINTRUST_ADDITIONAL_METADATA`:
+
+```bash
+bt trace setup claude --additional-metadata '{"team":"platform"}'
+BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"abc-123"}' \
+  bt trace run codex -- "summarize this change"
+```
+
+The same option/environment value applies to `bt trace hook`, `bt trace import`,
+and `bt trace import --attach`. An explicit `--additional-metadata` flag wins
+over the environment, which wins over metadata saved in an agent route.
+
 ## Build / test
 
 ```bash

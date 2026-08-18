@@ -51,3 +51,16 @@ settings under `~/.claude/braintrust.json`. Restart Claude Code after setup.
 Every registered lifecycle event is forwarded synchronously to
 `bt trace hook --source claude-code`, preserving per-session ordering. Hook
 failures never fail a Claude Code turn.
+
+#### Additional root metadata
+
+Set `BRAINTRUST_ADDITIONAL_METADATA` to a JSON object to tag the root span of a
+Claude Code session. Standard session metadata takes precedence if keys
+conflict.
+
+```bash
+BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"abc-123"}' claude
+```
+
+For a persistent route, pass the same object to `bt trace setup claude
+--additional-metadata '<JSON>'`.

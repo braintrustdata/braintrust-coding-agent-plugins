@@ -188,6 +188,7 @@ mod tests {
                     project_id: None,
                     project_name: Some(project.to_string()),
                 }),
+                additional_metadata: Some(serde_json::json!({"profile": profile})),
                 ..SessionRoute::default()
             }))
             .unwrap()
@@ -203,10 +204,17 @@ mod tests {
 
         assert!(work.tracing_enabled_with(None));
         assert!(personal.tracing_enabled_with(None));
-        assert_eq!(work.route.unwrap().auth.profile.as_deref(), Some("work"));
+        let work_route = work.route.unwrap();
+        assert_eq!(work_route.auth.profile.as_deref(), Some("work"));
         assert_eq!(
-            personal.route.unwrap().auth.profile.as_deref(),
-            Some("personal")
+            work_route.additional_metadata,
+            Some(serde_json::json!({"profile": "work"}))
+        );
+        let personal_route = personal.route.unwrap();
+        assert_eq!(personal_route.auth.profile.as_deref(), Some("personal"));
+        assert_eq!(
+            personal_route.additional_metadata,
+            Some(serde_json::json!({"profile": "personal"}))
         );
         assert!(!global.tracing_enabled_with(None));
         let global_route = global.route.unwrap();

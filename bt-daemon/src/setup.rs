@@ -258,8 +258,15 @@ fn setup_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     runner.run("pi", &["install", PI_PLUGIN])
 }
 
-fn enable_tracing_at(path: &Path, route: SessionRoute) -> anyhow::Result<()> {
+fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()> {
     let mut settings = load_object(path)?;
+    if route.additional_metadata.is_none() {
+        route.additional_metadata = settings
+            .get("route")
+            .and_then(|route| route.get("additional_metadata"))
+            .filter(|metadata| metadata.is_object())
+            .cloned();
+    }
     settings.insert("trace_to_braintrust".into(), Value::Bool(true));
     settings.insert("route".into(), serde_json::to_value(route)?);
     settings.remove("traceToBraintrust");
@@ -541,5 +548,31 @@ mod tests {
         assert_eq!(settings["auth"]["type"], "legacy");
         assert!(settings.get("traceToBraintrust").is_none());
         assert!(settings.get("project").is_none());
+    }
+
+    #[test]
+    fn tracing_settings_preserve_metadata_until_setup_explicitly_replaces_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        std::fs::write(&path, r#"{"route":{"additional_metadata":{"ci":true}}}"#).unwrap();
+
+        let route = SessionRoute::default();
+        enable_tracing_at(&path, route).unwrap();
+        let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["route"]["additional_metadata"],
+            serde_json::json!({"ci": true})
+        );
+
+        let route = SessionRoute {
+            additional_metadata: Some(serde_json::json!({"run_id": "new"})),
+            ..SessionRoute::default()
+        };
+        enable_tracing_at(&path, route).unwrap();
+        let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["route"]["additional_metadata"],
+            serde_json::json!({"run_id": "new"})
+        );
     }
 }

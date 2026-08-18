@@ -1,4 +1,4 @@
-use bt_daemon::wire::Envelope;
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -230,6 +230,54 @@ fn claude_real_fixture_matches_session_turn_tool_and_token_contract() {
                     .is_some_and(Value::is_string)
             })
     }));
+}
+
+#[test]
+fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "session");
+    let ctx = SessionCtx {
+        session_id: "session".into(),
+        config: Some(
+            SessionRoute {
+                additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
+    };
+    let ops = translator
+        .handle(
+            &Envelope {
+                source: "claude-code".into(),
+                source_version: None,
+                plugin_version: None,
+                session_id: "session".into(),
+                event: "UserPromptSubmit".into(),
+                ts_ms: 1,
+                managed_run_id: None,
+                payload: json!({"session_id":"session","cwd":"/workspace","prompt":"go"}),
+                route: None,
+                config: None,
+            },
+            &ctx,
+        )
+        .unwrap();
+    let root = ops
+        .into_iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name.starts_with("Claude Code:") => Some(row),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
+    assert_eq!(root.metadata.as_ref().unwrap()["source"], "claude-code");
 }
 
 #[test]

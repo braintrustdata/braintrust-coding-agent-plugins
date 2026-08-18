@@ -109,7 +109,7 @@ pub struct HookArgs {
     #[arg(long, default_value_t = 10_000)]
     pub flush_timeout_ms: u64,
     /// JSON object merged into root-span metadata.
-    #[arg(long)]
+    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
     /// Marks the hook definition injected by `run`; inherited plugin hooks do
     /// not carry this flag and are suppressed for the managed child.
@@ -155,6 +155,9 @@ pub struct ImportArgs {
     /// coding-agent session grows.
     #[arg(long, conflicts_with = "all")]
     pub attach: bool,
+    /// JSON object merged into every imported root span's metadata.
+    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    pub additional_metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -171,6 +174,9 @@ pub struct RunArgs {
     /// Coding agent to launch.
     #[arg(value_enum)]
     pub source: RunSource,
+    /// JSON object merged into root-span metadata for this invocation.
+    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    pub additional_metadata: Option<String>,
     /// Arguments forwarded verbatim to the coding agent.
     #[arg(allow_hyphen_values = true)]
     pub agent_args: Vec<OsString>,
@@ -238,14 +244,7 @@ pub async fn run_hook(
     if args.flush_on_turn_end {
         route.flush_mode = wire::FlushMode::FlushOnTurnEnd;
     }
-    if let Some(metadata) = &args.additional_metadata {
-        let value: serde_json::Value = serde_json::from_str(metadata)
-            .map_err(|e| anyhow::anyhow!("invalid --additional-metadata JSON: {e}"))?;
-        if !value.is_object() {
-            anyhow::bail!("--additional-metadata must be a JSON object");
-        }
-        route.additional_metadata = Some(value);
-    }
+    apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
     let env = Envelope {
         source: args.source.clone(),
         source_version: args.source_version.clone(),
@@ -271,6 +270,27 @@ pub async fn run_hook(
     if should_flush {
         flush_session(&env.session_id, &socket, args.flush_timeout_ms).await?;
     }
+    Ok(())
+}
+
+/// Apply one invocation-local JSON metadata override to a non-secret route.
+///
+/// The route is then carried unchanged through live hooks, managed runs, and
+/// transcript import. Keeping validation here gives every public command the
+/// same contract and prevents individual agent shims from parsing JSON.
+pub(crate) fn apply_additional_metadata(
+    route: &mut SessionRoute,
+    additional_metadata: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(metadata) = additional_metadata else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_str(metadata)
+        .map_err(|e| anyhow::anyhow!("invalid --additional-metadata JSON: {e}"))?;
+    if !value.is_object() {
+        anyhow::bail!("--additional-metadata must be a JSON object");
+    }
+    route.additional_metadata = Some(value);
     Ok(())
 }
 
@@ -492,7 +512,11 @@ pub async fn run_traced(
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
-        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
+        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings)
+        // The parent has already resolved the public environment variable into
+        // the invocation route. Do not let a child hook re-apply it and defeat
+        // an explicit `bt trace run --additional-metadata` override.
+        .env_remove("BRAINTRUST_ADDITIONAL_METADATA");
     if args.source == RunSource::OpenCode {
         command.env(
             "OPENCODE_CONFIG_CONTENT",
@@ -917,6 +941,26 @@ mod tests {
     }
 
     #[test]
+    fn additional_metadata_overrides_a_route_only_with_a_json_object() {
+        let mut route = SessionRoute {
+            additional_metadata: Some(serde_json::json!({"saved": true})),
+            ..SessionRoute::default()
+        };
+        apply_additional_metadata(&mut route, Some(r#"{"run_id":"123"}"#)).unwrap();
+        assert_eq!(
+            route.additional_metadata,
+            Some(serde_json::json!({"run_id": "123"}))
+        );
+
+        let error = apply_additional_metadata(&mut route, Some("[]")).unwrap_err();
+        assert!(error.to_string().contains("must be a JSON object"));
+        let error = apply_additional_metadata(&mut route, Some("not-json")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid --additional-metadata JSON"));
+    }
+
+    #[test]
     fn import_args_accept_multiple_sessions_or_all() {
         let explicit = ImportCli::try_parse_from([
             "test",
@@ -951,6 +995,7 @@ mod tests {
             destination: None,
             parent: None,
             attach: true,
+            additional_metadata: None,
         };
         assert!(validate_import_selection(&args)
             .unwrap_err()
@@ -1008,6 +1053,7 @@ mod tests {
         let error = run_traced(
             RunArgs {
                 source: RunSource::Codex,
+                additional_metadata: None,
                 agent_args: Vec::new(),
             },
             test_run_hook_command(),

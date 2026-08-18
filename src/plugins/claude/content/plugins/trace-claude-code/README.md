@@ -11,3 +11,7 @@ The hook first installs the `bt` CLI with the official installer when it is not
 already available, then forwards the event. The plugin is credential-free and
 fail-open; the `bt` CLI and shared daemon own authentication, event journaling,
 trace construction, and delivery.
+
+To add fields to each root trace span, set `BRAINTRUST_ADDITIONAL_METADATA` to
+a JSON object before launching Claude Code. For a persistent configuration,
+pass the same JSON with `bt trace setup claude --additional-metadata`.

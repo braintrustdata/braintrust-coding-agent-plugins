@@ -1,4 +1,4 @@
-use bt_daemon::wire::Envelope;
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::json;
 use std::collections::HashMap;
@@ -124,4 +124,38 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
         .values()
         .filter(|r| r.span_type == SpanType::Task)
         .all(|r| r.end_ms.is_some()));
+}
+
+#[test]
+fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: Some(
+            SessionRoute {
+                additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
+    };
+    let mut event = event("session_start", 1, json!({"reason":"new"}));
+    event.payload["trace_settings"] = json!({
+        "additional_metadata": {"team": "payload"},
+        "parent_span_id": "payload-parent",
+        "root_span_id": "payload-root",
+    });
+    let rows = reduce(translator.handle(&event, &ctx).unwrap());
+    let root = rows.values().next().unwrap();
+    assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
+    assert_eq!(root.metadata.as_ref().unwrap()["source"], "pi");
+    assert!(root.parent_span_ids.is_empty());
+    assert_eq!(root.root_span_id, root.span_id);
 }
