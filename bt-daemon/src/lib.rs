@@ -822,6 +822,17 @@ impl ImportProcessor {
                 live.ctx.config = Some(cfg.clone());
             }
             let ops = live.translator.handle(&env, &live.ctx)?;
+            Self::emit_translator_batches(live, ops).await?;
+        }
+        Ok(())
+    }
+
+    async fn emit_translator_batches(
+        live: &mut ImportLive,
+        first: Vec<SpanOp>,
+    ) -> anyhow::Result<()> {
+        let mut next = Some(first);
+        while let Some(ops) = next {
             // Imports can contain tens of thousands of SDK log commands. Bound the
             // number queued between drains without serializing one network flush
             // for every native turn boundary.
@@ -834,6 +845,7 @@ impl ImportProcessor {
                     live.pending_ops = 0;
                 }
             }
+            next = live.translator.drain_pending(&live.ctx)?;
         }
         Ok(())
     }
@@ -841,7 +853,7 @@ impl ImportProcessor {
     async fn finish(self) -> anyhow::Result<()> {
         for (_sid, mut live) in self.sessions {
             let ops = live.translator.flush(&live.ctx)?;
-            live.sink.emit(&ops).await?;
+            Self::emit_translator_batches(&mut live, ops).await?;
             live.sink.flush().await?;
         }
         Ok(())

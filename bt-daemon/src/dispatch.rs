@@ -266,15 +266,16 @@ impl SessionActor {
                         ctx.config = Some(cfg.clone());
                         self.refresh_permalink(sink.as_ref());
                     }
-                    match translator.handle(&env, &ctx) {
-                        Ok(ops) => match sink.emit(&ops).await {
-                            Ok(n) => {
-                                self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
-                            }
-                            Err(e) => self.set_error(format!("sink emit failed: {e}")),
-                        },
-                        Err(e) => self.set_error(format!("translate failed: {e}")),
-                    }
+                    let translated = translator.handle(&env, &ctx);
+                    self.emit_translator_batches(
+                        &mut translator,
+                        &mut sink,
+                        &ctx,
+                        translated,
+                        "translate failed",
+                        "sink emit failed",
+                    )
+                    .await;
                     self.counters.queued.fetch_sub(1, Ordering::Relaxed);
                 }
                 SessionMsg::Configure(config, reply) => {
@@ -293,6 +294,44 @@ impl SessionActor {
                     break;
                 }
             }
+        }
+    }
+
+    /// Emit a translator result and every bounded continuation it schedules.
+    /// A continuation may be empty (for example, irrelevant rollout rows), so
+    /// only `None` signals that the translator is fully caught up.
+    async fn emit_translator_batches(
+        &self,
+        translator: &mut Box<dyn crate::translate::AgentTranslator>,
+        sink: &mut Box<dyn crate::sink::Sink>,
+        ctx: &SessionCtx,
+        first: anyhow::Result<Vec<crate::translate::SpanOp>>,
+        translate_error: &str,
+        emit_error: &str,
+    ) {
+        let mut next = match first {
+            Ok(ops) => Some(ops),
+            Err(e) => {
+                self.set_error(format!("{translate_error}: {e}"));
+                return;
+            }
+        };
+        while let Some(ops) = next {
+            if !ops.is_empty() {
+                match sink.emit(&ops).await {
+                    Ok(n) => {
+                        self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
+                    }
+                    Err(e) => self.set_error(format!("{emit_error}: {e}")),
+                }
+            }
+            next = match translator.drain_pending(ctx) {
+                Ok(next) => next,
+                Err(e) => {
+                    self.set_error(format!("{translate_error}: {e}"));
+                    None
+                }
+            };
         }
     }
 
@@ -336,22 +375,16 @@ impl SessionActor {
                 continue;
             }
             let env = crate::journal::envelope_from_redacted(entry);
-            let ops = match translator.handle(&env, ctx) {
-                Ok(ops) => ops,
-                Err(e) => {
-                    self.set_error(format!("journal replay failed: {e}"));
-                    continue;
-                }
-            };
-            if ops.is_empty() {
-                continue;
-            }
-            match sink.emit(&ops).await {
-                Ok(n) => {
-                    self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
-                }
-                Err(e) => self.set_error(format!("sink replay emit failed: {e}")),
-            }
+            let translated = translator.handle(&env, ctx);
+            self.emit_translator_batches(
+                translator,
+                sink,
+                ctx,
+                translated,
+                "journal replay failed",
+                "sink replay emit failed",
+            )
+            .await;
         }
     }
 
@@ -361,14 +394,16 @@ impl SessionActor {
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
     ) {
-        match translator.flush(ctx) {
-            Ok(ops) => {
-                if let Err(e) = sink.emit(&ops).await {
-                    self.set_error(format!("sink emit (flush) failed: {e}"));
-                }
-            }
-            Err(e) => self.set_error(format!("translate flush failed: {e}")),
-        }
+        let translated = translator.flush(ctx);
+        self.emit_translator_batches(
+            translator,
+            sink,
+            ctx,
+            translated,
+            "translate flush failed",
+            "sink emit (flush) failed",
+        )
+        .await;
         if let Err(e) = sink.flush().await {
             self.set_error(format!("sink flush failed: {e}"));
         }

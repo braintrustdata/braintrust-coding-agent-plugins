@@ -29,6 +29,9 @@ use std::sync::{Arc, OnceLock};
 
 const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 const MISSING_TOOL_OUTPUT_ERROR: &str = "Tool output missing before turn ended";
+/// A hook can arrive after a daemon restart or against an existing rollout.
+/// Keep a single translator batch small even when the unread suffix is large.
+const CATCH_UP_BYTE_BUDGET: usize = 64 * 1024;
 
 pub struct CodexTranslatorFactory {
     git: Arc<GitMetadataCache>,
@@ -63,6 +66,7 @@ impl TranslatorFactory for CodexTranslatorFactory {
             spawn_turn_by_agent_id: HashMap::new(),
             compaction_trigger_by_turn: HashMap::new(),
             compaction_spans: HashSet::new(),
+            pending: None,
             git: self.git.clone(),
         })
     }
@@ -115,6 +119,37 @@ struct Scope {
     subagent_ended: bool,
 }
 
+enum DeferredHook {
+    None,
+    PostToolUse(Value),
+    SubagentStop {
+        path: Option<String>,
+        ts: i64,
+    },
+    Stop {
+        is_main: bool,
+        payload: Value,
+        ts: i64,
+    },
+    PostCompact {
+        payload: Value,
+        ts: i64,
+    },
+}
+
+enum PendingWork {
+    Hook {
+        path: String,
+        hook_ts: i64,
+        through_ms: Option<i64>,
+        after: DeferredHook,
+    },
+    Flush {
+        paths: Vec<String>,
+        next_path: usize,
+    },
+}
+
 struct CodexTranslator {
     session_id: String,
     root_span_id: String,
@@ -132,11 +167,16 @@ struct CodexTranslator {
     spawn_turn_by_agent_id: HashMap<String, String>,
     compaction_trigger_by_turn: HashMap<String, String>,
     compaction_spans: HashSet<String>,
+    pending: Option<PendingWork>,
     git: Arc<GitMetadataCache>,
 }
 
 impl AgentTranslator for CodexTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "Codex translator has pending catch-up work; drain it before handling another event"
+        );
         let payload = &event.payload;
         let mut ops = Vec::new();
 
@@ -177,45 +217,88 @@ impl AgentTranslator for CodexTranslator {
                 self.ensure_main_scope(&path);
             }
             let import_through_ms = payload.get("_bt_import_through_ms").and_then(Value::as_i64);
-            self.catch_up(&path, event.ts_ms, import_through_ms, &mut ops);
-        }
-
-        // --- hook-specific handling (after catch-up) ---
-        match event.event.as_str() {
-            // Catch up first: this same hook may be the first observation of
-            // the spawn_agent transcript record that establishes call -> turn.
-            "PostToolUse" => self.record_spawned_agent(payload),
-            "SubagentStop" => {
-                if let Some(p) = str_field(payload, "agent_transcript_path") {
-                    self.close_subagent(&p, event.ts_ms, &mut ops);
-                }
+            let after = self.deferred_hook(event, agent_id.is_none());
+            if self.catch_up_chunk(&path, event.ts_ms, import_through_ms, &mut ops) {
+                self.finish_deferred_hook(after, &mut ops);
+            } else {
+                self.pending = Some(PendingWork::Hook {
+                    path,
+                    hook_ts: event.ts_ms,
+                    through_ms: import_through_ms,
+                    after,
+                });
             }
-            "Stop" if agent_id.is_none() => {
-                // Codex writes task_complete slightly after the Stop hook in
-                // real sessions. Close the active turn from the hook payload
-                // now so a short-lived process cannot flush an open turn.
-                self.close_main_turn(payload, event.ts_ms, &mut ops);
-                self.end_main_root(event.ts_ms, &mut ops);
-            }
-            "PostCompact" => self.close_compaction_turn(payload, event.ts_ms, &mut ops),
-            _ => {}
+        } else {
+            self.finish_deferred_hook(self.deferred_hook(event, agent_id.is_none()), &mut ops);
         }
 
         Ok(ops)
     }
 
-    fn flush(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn drain_pending(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(None);
+        };
         let mut ops = Vec::new();
-        // Re-read each scope to catch a late task_complete, then close dangling.
-        let paths: Vec<String> = self.scopes.keys().cloned().collect();
-        for path in paths {
-            self.catch_up(&path, 0, None, &mut ops);
-            if let Some(mut scope) = self.scopes.remove(&path) {
-                self.close_dangling(&mut scope, None, &mut ops);
-                self.scopes.insert(path, scope);
+        match pending {
+            PendingWork::Hook {
+                path,
+                hook_ts,
+                through_ms,
+                after,
+            } => {
+                if self.catch_up_chunk(&path, hook_ts, through_ms, &mut ops) {
+                    self.finish_deferred_hook(after, &mut ops);
+                } else {
+                    self.pending = Some(PendingWork::Hook {
+                        path,
+                        hook_ts,
+                        through_ms,
+                        after,
+                    });
+                }
+            }
+            PendingWork::Flush {
+                paths,
+                mut next_path,
+            } => {
+                while next_path < paths.len() {
+                    let path = &paths[next_path];
+                    if self.catch_up_chunk(path, 0, None, &mut ops) {
+                        if let Some(mut scope) = self.scopes.remove(path) {
+                            self.close_dangling(&mut scope, None, &mut ops);
+                            self.scopes.insert(path.clone(), scope);
+                        }
+                        next_path += 1;
+                    }
+                    // Return after any completed scope or a bounded partial read.
+                    // This keeps a flush over many scopes bounded as well.
+                    if !ops.is_empty() || next_path < paths.len() {
+                        self.pending = (next_path < paths.len())
+                            .then_some(PendingWork::Flush { paths, next_path });
+                        break;
+                    }
+                }
             }
         }
-        Ok(ops)
+        Ok(Some(ops))
+    }
+
+    fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "Codex translator has pending catch-up work; drain it before flushing"
+        );
+        // Re-read each scope to catch a late task_complete, then close dangling.
+        let paths: Vec<String> = self.scopes.keys().cloned().collect();
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.pending = Some(PendingWork::Flush {
+            paths,
+            next_path: 0,
+        });
+        Ok(self.drain_pending(ctx)?.unwrap_or_default())
     }
 }
 
@@ -294,24 +377,79 @@ impl CodexTranslator {
         self.scopes.insert(path, scope);
     }
 
-    /// Read new transcript lines for `path` and process them against its scope.
-    fn catch_up(
+    fn deferred_hook(&self, event: &Envelope, is_main_scope: bool) -> DeferredHook {
+        match event.event.as_str() {
+            // Catch up first: this same hook may be the first observation of
+            // the spawn_agent transcript record that establishes call -> turn.
+            "PostToolUse" => DeferredHook::PostToolUse(event.payload.clone()),
+            "SubagentStop" => DeferredHook::SubagentStop {
+                path: str_field(&event.payload, "agent_transcript_path"),
+                ts: event.ts_ms,
+            },
+            // Codex writes task_complete slightly after the Stop hook in real
+            // sessions. Do this only after the entire bounded catch-up finishes.
+            "Stop" => DeferredHook::Stop {
+                is_main: is_main_scope,
+                payload: event.payload.clone(),
+                ts: event.ts_ms,
+            },
+            "PostCompact" => DeferredHook::PostCompact {
+                payload: event.payload.clone(),
+                ts: event.ts_ms,
+            },
+            _ => DeferredHook::None,
+        }
+    }
+
+    fn finish_deferred_hook(&mut self, after: DeferredHook, ops: &mut Vec<SpanOp>) {
+        match after {
+            DeferredHook::None => {}
+            DeferredHook::PostToolUse(payload) => self.record_spawned_agent(&payload),
+            DeferredHook::SubagentStop { path, ts } => {
+                if let Some(path) = path {
+                    self.close_subagent(&path, ts, ops);
+                }
+            }
+            DeferredHook::Stop {
+                is_main: true,
+                payload,
+                ts,
+            } => {
+                self.close_main_turn(&payload, ts, ops);
+                self.end_main_root(ts, ops);
+            }
+            DeferredHook::Stop { is_main: false, .. } => {}
+            DeferredHook::PostCompact { payload, ts } => {
+                self.close_compaction_turn(&payload, ts, ops)
+            }
+        }
+    }
+
+    /// Read a bounded batch of transcript lines for `path` and process them
+    /// against its scope. `true` means the requested catch-up is complete.
+    fn catch_up_chunk(
         &mut self,
         path: &str,
         hook_ts: i64,
         through_ms: Option<i64>,
         ops: &mut Vec<SpanOp>,
-    ) {
+    ) -> bool {
         let Some(mut scope) = self.scopes.remove(path) else {
-            return;
+            return true;
         };
-        let lines = read_new_lines(&scope.path, &mut scope.offset, through_ms);
-        for line in lines {
+        let read = read_new_lines(
+            &scope.path,
+            &mut scope.offset,
+            through_ms,
+            CATCH_UP_BYTE_BUDGET,
+        );
+        for line in read.lines {
             if let Ok(rec) = serde_json::from_str::<Value>(&line) {
                 self.process_record(&mut scope, &rec, hook_ts, ops);
             }
         }
         self.scopes.insert(path.to_string(), scope);
+        read.complete
     }
 
     fn process_record(
@@ -1454,10 +1592,23 @@ fn parse_ts(rec: &Value) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
-fn read_new_lines(path: &str, offset: &mut u64, through_ms: Option<i64>) -> Vec<String> {
+struct ReadLines {
+    lines: Vec<String>,
+    complete: bool,
+}
+
+fn read_new_lines(
+    path: &str,
+    offset: &mut u64,
+    through_ms: Option<i64>,
+    byte_budget: usize,
+) -> ReadLines {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
-        return Vec::new();
+        return ReadLines {
+            lines: Vec::new(),
+            complete: true,
+        };
     };
     if let Ok(meta) = f.metadata() {
         if *offset > meta.len() {
@@ -1465,11 +1616,21 @@ fn read_new_lines(path: &str, offset: &mut u64, through_ms: Option<i64>) -> Vec<
         }
     }
     if f.seek(SeekFrom::Start(*offset)).is_err() {
-        return Vec::new();
+        return ReadLines {
+            lines: Vec::new(),
+            complete: true,
+        };
     }
     let mut reader = BufReader::new(f);
     let mut lines = Vec::new();
+    let mut consumed = 0usize;
     loop {
+        if consumed >= byte_budget && !lines.is_empty() {
+            return ReadLines {
+                lines,
+                complete: false,
+            };
+        }
         let mut line = String::new();
         let Ok(bytes) = reader.read_line(&mut line) else {
             break;
@@ -1488,11 +1649,15 @@ fn read_new_lines(path: &str, offset: &mut u64, through_ms: Option<i64>) -> Vec<
             }
         }
         *offset += bytes as u64;
+        consumed += bytes;
         if !trimmed.trim().is_empty() {
             lines.push(trimmed.to_string());
         }
     }
-    lines
+    ReadLines {
+        lines,
+        complete: true,
+    }
 }
 
 fn token_metrics(usage: &Value) -> Map<String, Value> {
