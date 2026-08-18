@@ -10,7 +10,20 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// How a replayed event points at its transcript bytes.
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    /// The daemon's append-only mirror plus a high-water offset (current).
+    Mirror,
+    /// The whole transcript inlined into the event (pre-mirror journals).
+    Snapshot,
+}
+
 fn replay(name: &str) -> Vec<SpanOp> {
+    replay_from(name, Source::Mirror)
+}
+
+fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
     let dir = fixture(name);
     let contents = std::fs::read_to_string(dir.join("events.ndjson")).unwrap();
     let first: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
@@ -34,10 +47,23 @@ fn replay(name: &str) -> Vec<SpanOp> {
             let local = dir.join("transcripts").join(basename);
             if local.exists() {
                 payload[field] = json!(local.to_str().unwrap());
-                payload["_bt_transcript_snapshot"] = json!({
-                    "path": local.to_str().unwrap(),
-                    "contents": std::fs::read_to_string(&local).unwrap()
-                });
+                let contents = std::fs::read_to_string(&local).unwrap();
+                payload[match source {
+                    Source::Mirror => "_bt_transcript_mirror",
+                    Source::Snapshot => "_bt_transcript_snapshot",
+                }] = match source {
+                    // The mirror is byte-identical to the source prefix, so
+                    // the fixture file stands in for it directly.
+                    Source::Mirror => json!({
+                        "path": local.to_str().unwrap(),
+                        "mirror": local.to_str().unwrap(),
+                        "through": contents.len() as u64,
+                    }),
+                    Source::Snapshot => json!({
+                        "path": local.to_str().unwrap(),
+                        "contents": contents,
+                    }),
+                };
             }
         }
         let ts_ms = chrono::DateTime::parse_from_rfc3339(record["ts"].as_str().unwrap())
@@ -86,6 +112,32 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
         }
     }
     rows
+}
+
+/// Journals recorded before transcript mirroring inline the whole transcript.
+/// Both forms must translate identically, so upgrading the daemon neither
+/// changes live output nor breaks recovery from an existing journal.
+#[test]
+fn mirror_and_inline_snapshot_transcripts_translate_identically() {
+    for name in ["test-fixture", "example-simple", "subagent-compact"] {
+        let mirrored = reduce(replay_from(name, Source::Mirror));
+        let inlined = reduce(replay_from(name, Source::Snapshot));
+        assert_eq!(
+            mirrored.len(),
+            inlined.len(),
+            "{name}: span count differs between mirror and inline snapshot"
+        );
+        for (span_id, row) in &mirrored {
+            let other = inlined
+                .get(span_id)
+                .unwrap_or_else(|| panic!("{name}: {span_id} missing from the inline replay"));
+            assert_eq!(
+                serde_json::to_value(row).unwrap(),
+                serde_json::to_value(other).unwrap(),
+                "{name}: {span_id} differs between mirror and inline snapshot"
+            );
+        }
+    }
 }
 
 #[test]

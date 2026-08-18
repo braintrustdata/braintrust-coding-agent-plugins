@@ -114,9 +114,17 @@ Phases 0–5 are implemented: protocol, daemon lifecycle, Braintrust sink,
 Codex and Claude translators, `bt daemon` integration, and thin hook shims for
 both shipped plugins. Restart recovery replays the redacted journal with
 deterministic span ids, so resubmitted rows merge into the same spans instead
-of creating duplicates. Claude lifecycle entries embed transcript snapshots, so
-recovery does not depend on mutable external paths. Explicit turn/session-end
+of creating duplicates. Claude lifecycle entries reference a daemon-owned
+transcript mirror, so recovery does not depend on mutable external paths
+without re-recording the transcript on every turn. Explicit turn/session-end
 flushes are bounded, and sessions can target project logs or an experiment.
+
+Memory is bounded end to end, while on-disk records stay complete: the daemon
+never holds a transcript or a whole journal in memory, mirroring and replay
+both stream, session queues apply backpressure, and sessions that go quiet are
+retired and rebuilt from their journal on the next event. Nothing on disk —
+journal, mirror, or conversation content — is capped or truncated; only
+in-memory caches are bounded, and each is re-derivable from disk.
 
 Windows named-pipe transport, detached spawning, lifecycle handover, and
 cross-platform pipeline tests are implemented. The remaining host follow-ups
