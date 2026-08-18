@@ -72,6 +72,10 @@ pi
 For one invocation without changing Pi's global tracing configuration, use
 `bt trace run --project <PROJECT> pi -- [PI_ARGS...]`.
 
+Use `bt trace disable pi` to keep the extension installed while turning off
+persistent tracing, or `bt trace uninstall pi` to remove only the
+Braintrust-owned registration and settings.
+
 In interactive mode, the footer shows a `Braintrust` status indicator while tracing is active, and a widget below the editor shows a shortened clickable trace link when available.
 
 ## Configuration
@@ -115,6 +119,9 @@ Example:
 | `additional_metadata` | `BRAINTRUST_ADDITIONAL_METADATA` | `{}` |
 | `show_ui` | `BRAINTRUST_SHOW_UI` | `true` |
 | `show_trace_link` | `BRAINTRUST_SHOW_TRACE_LINK` | `true` |
+
+Boolean settings accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`
+case-insensitively.
 
 ## Notes
 

@@ -65,6 +65,10 @@ impl Tail {
 }
 
 pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
+    transcript_session_id_with_subagents(path, false)
+}
+
+fn transcript_session_id_with_subagents(path: &Path, include_subagents: bool) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
@@ -73,7 +77,7 @@ pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
         }
-        if record.pointer("/payload/source/subagent").is_some() {
+        if !include_subagents && record.pointer("/payload/source/subagent").is_some() {
             return None;
         }
         let session_id = record.pointer("/payload/id").and_then(Value::as_str)?;
@@ -207,7 +211,7 @@ fn append_subagent_events(
         if !visited.insert(call.agent_id.clone()) {
             continue;
         }
-        let Some(child_path) = find_transcript_by_id(&search_root, &call.agent_id) else {
+        let Some(child_path) = find_transcript_by_id(&search_root, &call.agent_id)? else {
             continue;
         };
         let child_records = read_jsonl_records(&child_path)?;
@@ -353,13 +357,28 @@ fn transcript_search_root(path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn find_transcript_by_id(root: &Path, session_id: &str) -> Option<PathBuf> {
+fn find_transcript_by_id(root: &Path, session_id: &str) -> anyhow::Result<Option<PathBuf>> {
     let mut candidates = Vec::new();
     find_jsonl_files(root, &mut candidates);
     candidates.sort();
-    candidates
+    let matches = candidates
         .into_iter()
-        .find(|path| filename_matches(path, session_id))
+        .filter(|path| {
+            transcript_session_id_with_subagents(path, true).as_deref() == Some(session_id)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [path] => Ok(Some(path.clone())),
+        paths => {
+            let locations = paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("multiple Codex transcripts found for subagent {session_id}: {locations}")
+        }
+    }
 }
 
 fn last_message(records: &[Value]) -> Option<Value> {

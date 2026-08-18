@@ -25,6 +25,10 @@ The recommended tracing setup is:
 bt trace setup codex --project my-coding-agent
 ```
 
+Use `bt trace disable codex` to keep the marketplace plugin installed while
+turning off persistent tracing. Use `bt trace uninstall codex` to remove only
+the Braintrust tracing plugin registration and route.
+
 This installs the tracing plugin and stores only non-secret routing settings.
 The `bt` CLI owns authentication and forwards hook events through the shared
 daemon. Restart Codex after setup.

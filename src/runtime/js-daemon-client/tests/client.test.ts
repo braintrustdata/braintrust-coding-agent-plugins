@@ -6,10 +6,51 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, test } from "node:test"
 import {
+  claimManagedTracingInstance,
   DaemonClient,
   daemonSocketPath,
+  jsonRecord,
+  parseJsonRecord,
+  parseOptionalBoolean,
   resolveDaemonTraceSettings,
 } from "../src/index.ts"
+
+describe("shared adapter configuration", () => {
+  test("normalizes the same boolean spellings for every adapter", () => {
+    for (const value of [true, 1, "true", "TRUE", "yes", "on"]) {
+      assert.equal(parseOptionalBoolean(value), true)
+    }
+    for (const value of [false, 0, "false", "FALSE", "no", "off"]) {
+      assert.equal(parseOptionalBoolean(value), false)
+    }
+    assert.equal(parseOptionalBoolean("sometimes"), undefined)
+  })
+
+  test("accepts object metadata but rejects arrays and malformed JSON", () => {
+    assert.deepEqual(jsonRecord({ team: "platform" }), { team: "platform" })
+    assert.equal(jsonRecord([]), undefined)
+    assert.deepEqual(parseJsonRecord('{"ci":true}'), { ci: true })
+    assert.equal(parseJsonRecord("{"), undefined)
+  })
+
+  test("deduplicates only managed instances for the same source and run", () => {
+    const target = {} as typeof globalThis
+    assert.equal(claimManagedTracingInstance("pi", {}, target), true)
+    assert.equal(claimManagedTracingInstance("pi", {}, target), true)
+    const env = { BT_TRACE_MANAGED_RUN_ID: "run-1" }
+    assert.equal(claimManagedTracingInstance("pi", env, target), true)
+    assert.equal(claimManagedTracingInstance("pi", env, target), false)
+    assert.equal(
+      claimManagedTracingInstance("opencode", env, target),
+      true,
+      "different sources retain independent claims",
+    )
+    assert.equal(
+      claimManagedTracingInstance("pi", { BT_TRACE_MANAGED_RUN_ID: "run-2" }, target),
+      true,
+    )
+  })
+})
 
 describe("daemonSocketPath", () => {
   test("prefers the explicit environment override", () => {

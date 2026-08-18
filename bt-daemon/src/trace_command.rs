@@ -4,7 +4,7 @@
 //! integrations they control. Hosts such as `bt` provide global auth flags and
 //! dispatch these commands without duplicating agent-specific CLI knowledge.
 
-use crate::{HookArgs, ImportArgs, RunArgs, ServeArgs, StatusArgs};
+use crate::{AgentId, HookArgs, ImportArgs, RunArgs, ServeArgs, StatusArgs};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
@@ -21,6 +21,10 @@ pub struct TraceArgs {
 pub enum TraceCommand {
     /// Install the published Braintrust tracing plugin for a coding agent.
     Setup(SetupArgs),
+    /// Disable tracing while preserving the installed adapter and route.
+    Disable(LifecycleArgs),
+    /// Remove the Braintrust tracing adapter and its non-secret route.
+    Uninstall(LifecycleArgs),
     /// Run the tracing daemon (foreground).
     #[command(hide = true)]
     Daemon(ServeArgs),
@@ -48,25 +52,23 @@ pub struct StopArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct SetupArgs {
-    #[command(subcommand)]
+    /// Coding agent to configure.
+    #[arg(value_enum)]
     pub agent: SetupAgent,
     /// JSON object persisted in this agent's tracing route and merged into root-span metadata.
     #[arg(long, global = true, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
-pub enum SetupAgent {
-    /// Install the published Codex tracing plugin.
-    Codex,
-    /// Install the published Claude Code tracing plugin.
-    Claude,
-    /// Configure the published OpenCode tracing plugin.
-    #[command(name = "opencode", alias = "open-code")]
-    OpenCode,
-    /// Install the published Pi tracing extension.
-    Pi,
+#[derive(Debug, Clone, Args)]
+pub struct LifecycleArgs {
+    /// Coding agent whose Braintrust tracing lifecycle should be changed.
+    #[arg(value_enum)]
+    pub agent: AgentId,
 }
+
+/// Backwards-compatible name for the shared coding-agent identity.
+pub type SetupAgent = AgentId;
 
 #[cfg(test)]
 mod tests {
@@ -145,6 +147,48 @@ mod tests {
                 additional_metadata: Some(ref value),
                 ..
             }) if value == r#"{"import":true}"#
+        ));
+    }
+
+    #[test]
+    fn lifecycle_commands_share_agent_aliases() {
+        let disable = Cli::try_parse_from(["bt", "disable", "claude-code"]).unwrap();
+        assert!(matches!(
+            disable.trace.command,
+            TraceCommand::Disable(LifecycleArgs {
+                agent: AgentId::Claude
+            })
+        ));
+
+        let uninstall = Cli::try_parse_from(["bt", "uninstall", "open-code"]).unwrap();
+        assert!(matches!(
+            uninstall.trace.command,
+            TraceCommand::Uninstall(LifecycleArgs {
+                agent: AgentId::OpenCode
+            })
+        ));
+    }
+
+    #[test]
+    fn hook_accepts_adapter_provenance() {
+        let hook = Cli::try_parse_from([
+            "bt",
+            "hook",
+            "--source",
+            "codex",
+            "--source-version",
+            "1.2.3",
+            "--plugin-version",
+            "4.5.6",
+        ])
+        .unwrap();
+        assert!(matches!(
+            hook.trace.command,
+            TraceCommand::Hook(HookArgs {
+                source_version: Some(ref source_version),
+                plugin_version: Some(ref plugin_version),
+                ..
+            }) if source_version == "1.2.3" && plugin_version == "4.5.6"
         ));
     }
 }

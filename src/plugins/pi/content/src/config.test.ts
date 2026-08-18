@@ -13,6 +13,7 @@ const ENVIRONMENT_KEYS = [
   "BRAINTRUST_SHOW_TRACE_LINK",
   "TRACE_TO_BRAINTRUST",
   "BT_TRACE_INVOCATION_SETTINGS",
+  "BT_TRACE_MANAGED_RUN_ID",
 ] as const;
 
 const originalEnvironment = new Map<string, string | undefined>();
@@ -176,6 +177,21 @@ describe("loadConfig", () => {
     });
 
     expect(loadConfig(cwd).route).toMatchObject({ destination });
+  });
+
+  it("preserves additional metadata nested in the canonical route", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: true,
+      route: {
+        destination: { type: "project_logs", project_name: "nested" },
+        additional_metadata: { team: "platform" },
+      },
+    });
+
+    expect(loadConfig(cwd)).toMatchObject({
+      additionalMetadata: { team: "platform" },
+      route: { additional_metadata: { team: "platform" } },
+    });
   });
 
   it("does not fall back to persistent settings for a malformed managed run", () => {

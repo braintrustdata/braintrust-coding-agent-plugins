@@ -24,7 +24,8 @@ PAYLOAD='{"session_id":"shim-test","hook_event_name":"SessionStart","message":"u
 exercise() {
   local name="$1"
   local source="$2"
-  shift 2
+  local plugin_version="$3"
+  shift 3
   local args_file="$TEST_DIR/$name.args"
   local stdin_file="$TEST_DIR/$name.stdin"
 
@@ -34,7 +35,7 @@ exercise() {
     BT_CAPTURE_STDIN="$stdin_file" \
     "$@"
 
-  [[ "$(cat "$args_file")" == "trace hook --source $source" ]]
+  [[ "$(cat "$args_file")" == "trace hook --source $source --plugin-version $plugin_version" ]]
   [[ "$(cat "$stdin_file")" == "$PAYLOAD" ]]
 
   # The shim must swallow a daemon-client failure after forwarding the payload.
@@ -46,9 +47,12 @@ exercise() {
     "$@"
 }
 
-exercise claude claude-code \
+CLAUDE_PLUGIN_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$DIST_DIR/claude/plugins/trace-claude-code/.claude-plugin/plugin.json")"
+CODEX_PLUGIN_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$DIST_DIR/codex/plugins/trace-codex/.codex-plugin/plugin.json")"
+
+exercise claude claude-code "$CLAUDE_PLUGIN_VERSION" \
   bash "$DIST_DIR/claude/plugins/trace-claude-code/hooks/forward.sh"
-exercise codex codex \
+exercise codex codex "$CODEX_PLUGIN_VERSION" \
   bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
 
 # Additional metadata is consumed by the shared `bt trace hook` command from
@@ -73,10 +77,10 @@ exercise_metadata() {
 
 exercise_metadata claude \
   bash "$DIST_DIR/claude/plugins/trace-claude-code/hooks/forward.sh"
-[[ "$(cat "$TEST_DIR/claude.metadata.args")" == 'trace hook --source claude-code' ]]
+[[ "$(cat "$TEST_DIR/claude.metadata.args")" == "trace hook --source claude-code --plugin-version $CLAUDE_PLUGIN_VERSION" ]]
 exercise_metadata codex \
   bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
-[[ "$(cat "$TEST_DIR/codex.metadata.args")" == 'trace hook --source codex' ]]
+[[ "$(cat "$TEST_DIR/codex.metadata.args")" == "trace hook --source codex --plugin-version $CODEX_PLUGIN_VERSION" ]]
 
 # Exercise first-use bootstrap without touching the developer's installation.
 # The fake curl materializes a fake bt binary and emits a no-op installer body.
@@ -99,7 +103,8 @@ chmod +x "$BOOTSTRAP_DIR/curl" "$TEST_DIR/installable-bt"
 bootstrap() {
   local name="$1"
   local source="$2"
-  shift 2
+  local plugin_version="$3"
+  shift 3
   local args_file="$TEST_DIR/$name.bootstrap.args"
   local stdin_file="$TEST_DIR/$name.bootstrap.stdin"
   local install_file="$TEST_DIR/$name.install.args"
@@ -117,13 +122,13 @@ bootstrap() {
     "$@"
 
   [[ "$(cat "$install_file")" == "-fsSL https://bt.dev/cli/install.sh" ]]
-  [[ "$(cat "$args_file")" == "trace hook --source $source" ]]
+  [[ "$(cat "$args_file")" == "trace hook --source $source --plugin-version $plugin_version" ]]
   [[ "$(cat "$stdin_file")" == "$PAYLOAD" ]]
 }
 
-bootstrap claude claude-code \
+bootstrap claude claude-code "$CLAUDE_PLUGIN_VERSION" \
   bash "$DIST_DIR/claude/plugins/trace-claude-code/hooks/forward.sh"
-bootstrap codex codex \
+bootstrap codex codex "$CODEX_PLUGIN_VERSION" \
   bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
 
 # No bt binary is also fail-open. Use an empty path so the test does not depend

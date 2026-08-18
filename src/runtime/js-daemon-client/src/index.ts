@@ -21,6 +21,72 @@ export interface DaemonTraceSettings {
   route?: DaemonSessionRoute
 }
 
+export type JsonRecord = Record<string, unknown>
+
+/** Return an object-shaped JSON value without accepting arrays or null. */
+export function jsonRecord(value: unknown): JsonRecord | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : undefined
+}
+
+/** Parse the boolean spellings accepted by every JavaScript adapter. */
+export function parseOptionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value
+  if (typeof value !== "string" && typeof value !== "number") return undefined
+  switch (String(value).trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true
+    case "0":
+    case "false":
+    case "no":
+    case "off":
+      return false
+    default:
+      return undefined
+  }
+}
+
+/** Parse optional object metadata while treating malformed values as absent. */
+export function parseJsonRecord(value: string | undefined): JsonRecord | undefined {
+  if (!value) return undefined
+  try {
+    return jsonRecord(JSON.parse(value))
+  } catch {
+    return undefined
+  }
+}
+
+const MANAGED_INSTANCE_CLAIMS = Symbol.for("braintrust.coding-agent.managed-instance-claims")
+
+/**
+ * Claim capture for one source in a managed process.
+ *
+ * A managed agent may load both its persistently installed adapter and the
+ * invocation-injected adapter. They run in the same JavaScript process, so a
+ * process-global claim keeps exactly one live forwarder. Ordinary (unmanaged)
+ * plugin instances are deliberately unaffected.
+ */
+export function claimManagedTracingInstance(
+  source: string,
+  env: NodeJS.ProcessEnv = process.env,
+  target: typeof globalThis = globalThis,
+): boolean {
+  const managedRunId = env.BT_TRACE_MANAGED_RUN_ID
+  if (!managedRunId) return true
+  const globals = target as typeof globalThis & {
+    [MANAGED_INSTANCE_CLAIMS]?: Set<string>
+  }
+  const claims = (globals[MANAGED_INSTANCE_CLAIMS] ??= new Set<string>())
+  const key = `${source}:${managedRunId}`
+  if (claims.has(key)) return false
+  claims.add(key)
+  return true
+}
+
 /**
  * Apply the invocation-only selection created by `bt trace run` without
  * mutating or falling back to an agent's persistent configuration.

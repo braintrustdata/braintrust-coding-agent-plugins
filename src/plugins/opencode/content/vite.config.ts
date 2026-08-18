@@ -15,7 +15,7 @@ export default defineConfig({
     include: ["src/**/*.test.ts"],
   },
   pack: {
-    entry: ["src/index.ts"],
+    entry: ["src/index.ts", "src/tracing.ts"],
     dts: true,
     format: ["esm"],
     sourcemap: true,

@@ -5,9 +5,6 @@ stateful daemon that plugin **hook shims** forward events to; it owns the
 event→trace state machine and sends spans to Braintrust out-of-band. See
 [`docs/protocol.md`](docs/protocol.md) for the wire contract.
 
-> **Placeholder name** — the real name is TBD. The subcommand framing
-> (`serve` / `hook` / `status` / `import` / `run`) should survive a rename.
-
 ## Layout
 
 One self-contained Cargo crate, liftable to its own repo by copying
@@ -111,11 +108,12 @@ create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
 
 Add `--attach` to keep following an active Codex or Claude transcript until
-Ctrl-C. `run <codex|claude> [ARGS...]` launches the selected agent with
-inherited stdio and injects live Braintrust hooks for that invocation, so it
-does not depend on the tracing plugin being installed or enabled. Managed runs
-suppress inherited Braintrust plugin hooks to avoid logging the same session
-twice; the injected hooks still use the normal daemon translator and sink.
+Ctrl-C. `run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent
+with inherited stdio and injects live Braintrust capture for that invocation,
+so it does not depend on persistent tracing being enabled. Managed runs
+suppress or deduplicate inherited Braintrust capture to avoid logging the same
+session twice; OpenCode uses the package's trace-only entrypoint so managed
+tracing does not add its optional data tools.
 Codex applies its normal hook-review flow, so the first run requires trusting
 the injected Braintrust hook through `/hooks`; later runs reuse that trust while
 the hook definition remains unchanged.
@@ -127,9 +125,10 @@ different profiles, organizations, projects, experiments, or parent spans.
 
 ## Status
 
-Phases 0–5 are implemented: protocol, daemon lifecycle, Braintrust sink,
-Codex and Claude translators, `bt daemon` integration, and thin hook shims for
-both shipped plugins. Restart recovery replays the redacted journal with
+The shared protocol, daemon lifecycle, Braintrust sink, all four production
+translators, persistent setup, managed runs, and thin capture adapters are
+implemented. Codex and Claude additionally support transcript import and live
+attach. Restart recovery replays the redacted journal with
 deterministic span ids, so resubmitted rows merge into the same spans instead
 of creating duplicates. Claude lifecycle entries reference a daemon-owned
 transcript mirror, so recovery does not depend on mutable external paths
@@ -144,8 +143,8 @@ journal, mirror, or conversation content — is capped or truncated; only
 in-memory caches are bounded, and each is re-derivable from disk.
 
 Windows named-pipe transport, detached spawning, lifecycle handover, and
-cross-platform pipeline tests are implemented. The remaining host follow-ups
-are OpenCode and pi, which are not present in this monorepo.
+cross-platform pipeline tests are implemented. Pi and OpenCode use the same
+long-lived JavaScript daemon client on every supported platform.
 
 - The Braintrust sink pins `braintrust-sdk-rust` commit `d33e806`, which adds
   deterministic span ids, `span_origin`/`span_attributes` passthrough, and

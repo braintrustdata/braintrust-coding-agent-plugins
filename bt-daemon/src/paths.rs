@@ -1,6 +1,7 @@
 //! Socket and data-directory resolution. Both `serve` and `hook` must agree on
 //! the defaults, so the logic lives here. See `docs/protocol.md`.
 
+use crate::{AgentId, AgentSettingsLocation};
 use std::path::{Path, PathBuf};
 
 /// Env override for the socket path (also settable via `--socket`).
@@ -89,17 +90,17 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = std::env::var_os(SETTINGS_ENV) {
         return PathBuf::from(path);
     }
-    match source {
-        "codex" => home().join(".codex").join("braintrust.json"),
-        "claude" | "claude-code" => home().join(".claude").join("braintrust.json"),
-        "opencode" => std::env::var_os("XDG_CONFIG_HOME")
+    match AgentId::parse(source).map(|agent| agent.spec().settings_location) {
+        Some(AgentSettingsLocation::Codex) => home().join(".codex").join("braintrust.json"),
+        Some(AgentSettingsLocation::Claude) => home().join(".claude").join("braintrust.json"),
+        Some(AgentSettingsLocation::OpenCode) => std::env::var_os("XDG_CONFIG_HOME")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home().join(".config"))
             .join("opencode")
             .join("braintrust.json"),
-        "pi" => home().join(".pi").join("agent").join("braintrust.json"),
-        other => data_dir(None).join("agents").join(format!("{other}.json")),
+        Some(AgentSettingsLocation::Pi) => home().join(".pi").join("agent").join("braintrust.json"),
+        None => data_dir(None).join("agents").join(format!("{source}.json")),
     }
 }
 
@@ -128,6 +129,18 @@ mod tests {
         assert_eq!(
             agent_settings_path("codex", Some(Path::new("config.json"))),
             Path::new("config.json")
+        );
+    }
+
+    #[test]
+    fn aliases_share_their_canonical_settings_location() {
+        assert_eq!(
+            agent_settings_path("claude", None),
+            agent_settings_path("claude-code", None)
+        );
+        assert_eq!(
+            agent_settings_path("open-code", None),
+            agent_settings_path("opencode", None)
         );
     }
 

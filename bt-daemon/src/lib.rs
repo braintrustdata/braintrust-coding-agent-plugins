@@ -31,12 +31,15 @@ mod transport;
 pub mod wire;
 pub use client::HostInfo;
 pub use command_output::{
-    OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
+    LifecycleCommandOutput, OutputFormat, SetupCommandOutput, StatusCommandOutput,
+    StopCommandOutput, TraceCommandOutput,
 };
+#[doc(hidden)]
+pub use journal::source_journal_path;
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
-pub use setup::run_setup;
+pub use setup::{run_disable, run_setup, run_uninstall};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
-pub use trace_command::{SetupAgent, SetupArgs, StopArgs, TraceArgs, TraceCommand};
+pub use trace_command::{LifecycleArgs, SetupAgent, SetupArgs, StopArgs, TraceArgs, TraceCommand};
 pub use trace_runtime::{run_trace, RouteRequirements, TraceHostContext, TraceHostServices};
 pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -56,6 +59,219 @@ use wire::{
 
 const MANAGED_RUN_ID_ENV: &str = "BT_TRACE_MANAGED_RUN_ID";
 const MANAGED_RUN_FLUSH_TIMEOUT_MS: u64 = 10_000;
+
+const CODEX_HOOK_EVENTS: &[&str] = &[
+    "PermissionRequest",
+    "PostCompact",
+    "PostToolUse",
+    "PreCompact",
+    "PreToolUse",
+    "SessionEnd",
+    "SessionStart",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+    "UserPromptSubmit",
+];
+
+const CLAUDE_HOOK_EVENTS: &[&str] = &[
+    "ConfigChange",
+    "CwdChanged",
+    "Elicitation",
+    "ElicitationResult",
+    "FileChanged",
+    "InstructionsLoaded",
+    "MessageDisplay",
+    "Notification",
+    "PermissionDenied",
+    "PermissionRequest",
+    "PostCompact",
+    "PostToolBatch",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PreCompact",
+    "PreToolUse",
+    "SessionEnd",
+    "SessionStart",
+    "Setup",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "SubagentStop",
+    "TaskCompleted",
+    "TaskCreated",
+    "TeammateIdle",
+    "UserPromptExpansion",
+    "UserPromptSubmit",
+    "WorktreeCreate",
+    "WorktreeRemove",
+];
+
+/// Stable identity for every production coding-agent integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+pub enum AgentId {
+    Codex,
+    #[value(name = "claude", alias = "claude-code")]
+    Claude,
+    #[value(name = "opencode", alias = "open-code")]
+    OpenCode,
+    Pi,
+}
+
+/// Native location used for one agent's non-secret Braintrust settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSettingsLocation {
+    Codex,
+    Claude,
+    OpenCode,
+    Pi,
+}
+
+/// User-visible feature coverage declared by an integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    pub setup: bool,
+    pub managed_run: bool,
+    pub transcript_import: bool,
+    pub transcript_attach: bool,
+    pub data_tools: bool,
+}
+
+/// Static facts shared by CLI parsing, setup, managed runs, and translators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentSpec {
+    pub id: AgentId,
+    pub canonical_source: &'static str,
+    pub aliases: &'static [&'static str],
+    pub display_name: &'static str,
+    pub executable_env: &'static str,
+    pub executable: &'static str,
+    pub settings_location: AgentSettingsLocation,
+    pub setup_package: &'static str,
+    pub managed_package: &'static str,
+    pub uninstall_package: &'static str,
+    pub hook_events: &'static [&'static str],
+    pub capabilities: AgentCapabilities,
+}
+
+const AGENT_IDS: &[AgentId] = &[
+    AgentId::Codex,
+    AgentId::Claude,
+    AgentId::OpenCode,
+    AgentId::Pi,
+];
+
+const CODEX_SPEC: AgentSpec = AgentSpec {
+    id: AgentId::Codex,
+    canonical_source: "codex",
+    aliases: &[],
+    display_name: "Codex",
+    executable_env: "CODEX_BIN",
+    executable: "codex",
+    settings_location: AgentSettingsLocation::Codex,
+    setup_package: "trace-codex@braintrust-codex-plugins",
+    managed_package: "",
+    uninstall_package: "trace-codex@braintrust-codex-plugins",
+    hook_events: CODEX_HOOK_EVENTS,
+    capabilities: AgentCapabilities {
+        setup: true,
+        managed_run: true,
+        transcript_import: true,
+        transcript_attach: true,
+        data_tools: false,
+    },
+};
+
+const CLAUDE_SPEC: AgentSpec = AgentSpec {
+    id: AgentId::Claude,
+    canonical_source: "claude-code",
+    aliases: &["claude"],
+    display_name: "Claude Code",
+    executable_env: "CLAUDE_BIN",
+    executable: "claude",
+    settings_location: AgentSettingsLocation::Claude,
+    setup_package: "trace-claude-code@braintrust-claude-plugin",
+    managed_package: "",
+    uninstall_package: "trace-claude-code@braintrust-claude-plugin",
+    hook_events: CLAUDE_HOOK_EVENTS,
+    capabilities: AgentCapabilities {
+        setup: true,
+        managed_run: true,
+        transcript_import: true,
+        transcript_attach: true,
+        data_tools: false,
+    },
+};
+
+const OPENCODE_SPEC: AgentSpec = AgentSpec {
+    id: AgentId::OpenCode,
+    canonical_source: "opencode",
+    aliases: &["open-code"],
+    display_name: "OpenCode",
+    executable_env: "OPENCODE_BIN",
+    executable: "opencode",
+    settings_location: AgentSettingsLocation::OpenCode,
+    setup_package: "@braintrust/trace-opencode@^1",
+    managed_package: "@braintrust/trace-opencode/tracing",
+    uninstall_package: "@braintrust/trace-opencode",
+    hook_events: &[],
+    capabilities: AgentCapabilities {
+        setup: true,
+        managed_run: true,
+        transcript_import: false,
+        transcript_attach: false,
+        data_tools: true,
+    },
+};
+
+const PI_SPEC: AgentSpec = AgentSpec {
+    id: AgentId::Pi,
+    canonical_source: "pi",
+    aliases: &[],
+    display_name: "Pi",
+    executable_env: "PI_BIN",
+    executable: "pi",
+    settings_location: AgentSettingsLocation::Pi,
+    setup_package: "npm:@braintrust/pi-extension@^1",
+    managed_package: "npm:@braintrust/pi-extension@^1",
+    uninstall_package: "npm:@braintrust/pi-extension",
+    hook_events: &[],
+    capabilities: AgentCapabilities {
+        setup: true,
+        managed_run: true,
+        transcript_import: false,
+        transcript_attach: false,
+        data_tools: false,
+    },
+};
+
+impl AgentId {
+    pub fn all() -> &'static [Self] {
+        AGENT_IDS
+    }
+
+    /// Resolve canonical daemon identities and supported public aliases.
+    pub fn parse(source: &str) -> Option<Self> {
+        let source = source.trim().to_ascii_lowercase();
+        Self::all().iter().copied().find(|agent| {
+            let spec = agent.spec();
+            source == spec.canonical_source || spec.aliases.contains(&source.as_str())
+        })
+    }
+
+    pub const fn spec(self) -> &'static AgentSpec {
+        match self {
+            Self::Codex => &CODEX_SPEC,
+            Self::Claude => &CLAUDE_SPEC,
+            Self::OpenCode => &OPENCODE_SPEC,
+            Self::Pi => &PI_SPEC,
+        }
+    }
+
+    pub const fn canonical_source(self) -> &'static str {
+        self.spec().canonical_source
+    }
+}
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -86,6 +302,9 @@ pub struct HookArgs {
     /// Optional agent version, forwarded for payload-drift handling.
     #[arg(long)]
     pub source_version: Option<String>,
+    /// Version of the Braintrust capture adapter forwarding this event.
+    #[arg(long)]
+    pub plugin_version: Option<String>,
     /// Socket path override.
     #[arg(long)]
     pub socket: Option<PathBuf>,
@@ -167,6 +386,21 @@ pub enum ImportSource {
     Claude,
 }
 
+impl ImportSource {
+    pub const fn agent_id(self) -> AgentId {
+        match self {
+            Self::Codex => AgentId::Codex,
+            Self::Claude => AgentId::Claude,
+        }
+    }
+}
+
+impl From<ImportSource> for AgentId {
+    fn from(source: ImportSource) -> Self {
+        source.agent_id()
+    }
+}
+
 /// Arguments for launching a coding agent with invocation-local live hooks.
 #[derive(Debug, Clone, Args)]
 #[command(trailing_var_arg = true)]
@@ -192,14 +426,29 @@ pub struct RunHookCommand {
     pub args: Vec<OsString>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum RunSource {
-    Codex,
-    #[value(name = "claude", alias = "claude-code")]
-    Claude,
-    #[value(name = "opencode", alias = "open-code")]
-    OpenCode,
-    Pi,
+/// Backwards-compatible name for the shared coding-agent identity.
+pub type RunSource = AgentId;
+
+/// Typed failure returned when a managed coding agent exits unsuccessfully.
+/// Embedding CLIs can downcast this error and preserve the child's exact code.
+#[derive(Debug, thiserror::Error)]
+#[error("coding agent exited with {status}")]
+pub struct ManagedRunExitError {
+    status: std::process::ExitStatus,
+}
+
+impl ManagedRunExitError {
+    pub fn new(status: std::process::ExitStatus) -> Self {
+        Self { status }
+    }
+
+    pub fn status(&self) -> std::process::ExitStatus {
+        self.status
+    }
+
+    pub fn code(&self) -> Option<i32> {
+        self.status.code()
+    }
 }
 
 /// Run the daemon until shutdown.
@@ -224,7 +473,13 @@ pub async fn run_hook(
     if std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook {
         return Ok(());
     }
-    let settings = settings::AgentSettings::load(&args.source);
+    let source = match AgentId::parse(&args.source) {
+        Some(agent) => agent.canonical_source(),
+        // `debug` remains an explicit development-only translator identity.
+        None if args.source == "debug" => "debug",
+        None => anyhow::bail!("unsupported coding-agent source {:?}", args.source),
+    };
+    let settings = settings::AgentSettings::load(source);
     if !settings.tracing_enabled() {
         return Ok(());
     }
@@ -246,9 +501,9 @@ pub async fn run_hook(
     }
     apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
     let env = Envelope {
-        source: args.source.clone(),
+        source: source.to_string(),
         source_version: args.source_version.clone(),
-        plugin_version: None,
+        plugin_version: args.plugin_version.clone(),
         session_id,
         event,
         ts_ms: now_ms(),
@@ -312,7 +567,7 @@ pub async fn forward_envelope(
                 "protocol_version": PROTOCOL_VERSION,
                 "client": {
                     "source": env.source,
-                    "plugin_version": env.source_version,
+                    "plugin_version": env.plugin_version,
                     "pid": std::process::id()
                 }
             }),
@@ -344,7 +599,7 @@ pub async fn forward_envelope(
                 "protocol_version": PROTOCOL_VERSION,
                 "client": {
                     "source": env.source,
-                    "plugin_version": env.source_version,
+                    "plugin_version": env.plugin_version,
                     "pid": std::process::id()
                 }
             }),
@@ -495,14 +750,9 @@ pub async fn run_traced(
             "managed run requires a trace destination; select a project, object destination, or parent span"
         );
     }
-    let (executable_env, default_executable) = match args.source {
-        RunSource::Codex => ("CODEX_BIN", "codex"),
-        RunSource::Claude => ("CLAUDE_BIN", "claude"),
-        RunSource::OpenCode => ("OPENCODE_BIN", "opencode"),
-        RunSource::Pi => ("PI_BIN", "pi"),
-    };
+    let spec = args.source.spec();
     let executable =
-        std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
+        std::env::var_os(spec.executable_env).unwrap_or_else(|| OsString::from(spec.executable));
     let injected_args = managed_run_args(args.source, &hook_command)?;
     let managed_run_id = uuid::Uuid::new_v4().to_string();
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
@@ -512,6 +762,7 @@ pub async fn run_traced(
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
+        .env("BT_TRACE_CAPTURE_MODE", "managed")
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings)
         // The parent has already resolved the public environment variable into
         // the invocation route. Do not let a child hook re-apply it and defeat
@@ -565,12 +816,7 @@ fn managed_run_args(
     source: RunSource,
     hook_command: &RunHookCommand,
 ) -> anyhow::Result<Vec<OsString>> {
-    let source_name = match source {
-        RunSource::Codex => "codex",
-        RunSource::Claude => "claude",
-        RunSource::OpenCode => "opencode",
-        RunSource::Pi => "pi",
-    };
+    let source_name = source.canonical_source();
     match source {
         RunSource::Codex | RunSource::Claude => {
             let unix_command = managed_hook_shell_command(hook_command, source_name, false)?;
@@ -589,7 +835,7 @@ fn managed_run_args(
         RunSource::Pi => Ok(vec![
             OsString::from("-e"),
             std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC")
-                .unwrap_or_else(|| OsString::from("npm:@braintrust/pi-extension@^1")),
+                .unwrap_or_else(|| OsString::from(source.spec().managed_package)),
         ]),
     }
 }
@@ -609,7 +855,7 @@ fn opencode_managed_config(existing: Option<&str>) -> anyhow::Result<String> {
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("OPENCODE_CONFIG_CONTENT.plugin must be an array"))?;
     let plugin = std::env::var("BT_TRACE_OPENCODE_PLUGIN_SPEC")
-        .unwrap_or_else(|_| "@braintrust/trace-opencode@^1".to_string());
+        .unwrap_or_else(|_| AgentId::OpenCode.spec().managed_package.to_string());
     if !plugins.iter().any(|value| value.as_str() == Some(&plugin)) {
         plugins.push(serde_json::Value::String(plugin));
     }
@@ -649,50 +895,12 @@ fn quote_windows_command_arg(arg: &str) -> String {
     format!("\"{}\"", arg.replace('\\', "/").replace('"', "\"\""))
 }
 
-const CODEX_RUN_HOOK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PermissionRequest",
-    "PostToolUse",
-    "PreCompact",
-    "PostCompact",
-    "SubagentStart",
-    "SubagentStop",
-    "Stop",
-    "SessionEnd",
-];
-
-const CLAUDE_RUN_HOOK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "Setup",
-    "UserPromptSubmit",
-    "UserPromptExpansion",
-    "PreToolUse",
-    "PermissionRequest",
-    "PermissionDenied",
-    "PostToolUse",
-    "PostToolUseFailure",
-    "PostToolBatch",
-    "PreCompact",
-    "PostCompact",
-    "Notification",
-    "MessageDisplay",
-    "SubagentStart",
-    "SubagentStop",
-    "TaskCreated",
-    "TaskCompleted",
-    "Stop",
-    "StopFailure",
-    "SessionEnd",
-];
-
 fn codex_managed_run_args(unix_command: &str, windows_command: &str) -> Vec<OsString> {
     let unix_command = serde_json::to_string(unix_command).expect("serialize hook command");
     let windows_command =
         serde_json::to_string(windows_command).expect("serialize Windows hook command");
     let mut args = vec![OsString::from("--enable"), OsString::from("hooks")];
-    for event in CODEX_RUN_HOOK_EVENTS {
+    for event in AgentId::Codex.spec().hook_events {
         args.push(OsString::from("-c"));
         args.push(OsString::from(format!(
             "hooks.{event}=[{{hooks=[{{type=\"command\",command={unix_command},commandWindows={windows_command}}}]}}]"
@@ -711,7 +919,9 @@ fn claude_managed_run_args(command: &str) -> anyhow::Result<Vec<OsString>> {
             }]
         }]
     });
-    let hooks = CLAUDE_RUN_HOOK_EVENTS
+    let hooks = AgentId::Claude
+        .spec()
+        .hook_events
         .iter()
         .map(|event| ((*event).to_string(), hook.clone()))
         .collect::<serde_json::Map<_, _>>();
@@ -1115,7 +1325,7 @@ mod tests {
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert_eq!(
             args.iter().filter(|arg| *arg == "-c").count(),
-            CODEX_RUN_HOOK_EVENTS.len()
+            AgentId::Codex.spec().hook_events.len()
         );
         let config = args
             .iter()
@@ -1138,7 +1348,7 @@ mod tests {
         assert_eq!(args[0], "--settings");
         let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap()).unwrap();
         let hooks = settings["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), CLAUDE_RUN_HOOK_EVENTS.len());
+        assert_eq!(hooks.len(), AgentId::Claude.spec().hook_events.len());
         let command = hooks["SessionStart"]["hooks"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
@@ -1146,7 +1356,7 @@ mod tests {
         assert!(command.contains("agents"));
         assert!(command.contains("hook"));
         assert!(command.contains("--source"));
-        assert!(command.contains("claude"));
+        assert!(command.contains("claude-code"));
         assert!(!command.contains("transcript"));
     }
 
@@ -1158,7 +1368,7 @@ mod tests {
         assert_eq!(config["model"], "test/model");
         assert_eq!(
             config["plugin"],
-            serde_json::json!(["other", "@braintrust/trace-opencode@^1"])
+            serde_json::json!(["other", "@braintrust/trace-opencode/tracing"])
         );
         assert!(
             managed_run_args(RunSource::OpenCode, &test_run_hook_command())
@@ -1180,8 +1390,48 @@ mod tests {
         let hook = test_run_hook_command();
         let unix = managed_hook_shell_command(&hook, "codex", false).unwrap();
         assert!(unix.contains("'/opt/Braintrust CLI/bt' 'agents' 'hook' '--source' 'codex'"));
-        let windows = managed_hook_shell_command(&hook, "claude", true).unwrap();
-        assert!(windows
-            .contains("\"/opt/Braintrust CLI/bt\" \"agents\" \"hook\" \"--source\" \"claude\""));
+        let windows =
+            managed_hook_shell_command(&hook, AgentId::Claude.canonical_source(), true).unwrap();
+        assert!(windows.contains(
+            "\"/opt/Braintrust CLI/bt\" \"agents\" \"hook\" \"--source\" \"claude-code\""
+        ));
+    }
+
+    #[test]
+    fn managed_hook_commands_preserve_unicode_paths() {
+        let hook = RunHookCommand {
+            program: OsString::from("/opt/Braintrust 🧠/bt"),
+            args: vec![OsString::from("trace"), OsString::from("hook")],
+        };
+
+        let unix = managed_hook_shell_command(&hook, "codex", false).unwrap();
+        let windows = managed_hook_shell_command(&hook, "codex", true).unwrap();
+
+        assert!(unix.contains("'/opt/Braintrust 🧠/bt'"));
+        assert!(windows.contains("\"/opt/Braintrust 🧠/bt\""));
+    }
+
+    #[test]
+    fn agent_catalog_canonicalizes_aliases_and_declares_capabilities() {
+        assert_eq!(AgentId::parse("claude"), Some(AgentId::Claude));
+        assert_eq!(AgentId::parse("claude-code"), Some(AgentId::Claude));
+        assert_eq!(AgentId::parse("open-code"), Some(AgentId::OpenCode));
+        assert_eq!(AgentId::parse("unknown"), None);
+        assert_eq!(AgentId::Claude.canonical_source(), "claude-code");
+        assert!(AgentId::Codex.spec().capabilities.transcript_import);
+        assert!(!AgentId::Pi.spec().capabilities.transcript_import);
+        assert!(AgentId::OpenCode.spec().capabilities.data_tools);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_run_exit_error_preserves_the_child_code() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let error = ManagedRunExitError::new(std::process::ExitStatus::from_raw(37 << 8));
+
+        assert_eq!(error.code(), Some(37));
+        assert_eq!(error.status().code(), Some(37));
+        assert!(error.to_string().contains("37"));
     }
 }

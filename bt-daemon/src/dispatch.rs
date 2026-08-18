@@ -153,19 +153,14 @@ impl Session {
     }
 }
 
-/// Claude transcript files are external mutable state. Mirror them into
+/// Agent transcript files are external mutable state. Mirror them into
 /// daemon-owned storage at lifecycle boundaries and journal only a reference,
-/// so recovery/replay does not depend on a path that Claude may later rewrite
+/// so recovery/replay does not depend on a path that an agent may later rewrite
 /// or delete — and so the transcript is stored once rather than re-copied into
 /// every event. Fail open: without a reference the translator reads the live
 /// path exactly as before.
 pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env: &mut Envelope) {
-    if env.source != "claude-code"
-        || !matches!(
-            env.event.as_str(),
-            "UserPromptSubmit" | "Stop" | "StopFailure" | "SubagentStop" | "SessionEnd"
-        )
-    {
+    if !matches!(env.source.as_str(), "claude-code" | "codex") {
         return;
     }
     let field = if env.event == "SubagentStop" {
@@ -181,8 +176,9 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
     else {
         return;
     };
+    let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
     let (mirror, through) =
-        match crate::transcript_mirror::capture(data_dir, &env.session_id, &path).await {
+        match crate::transcript_mirror::capture(data_dir, &mirror_session, &path).await {
             Ok(captured) => captured,
             Err(error) => {
                 tracing::debug!(session_id = %env.session_id, %error, "transcript mirror skipped");
@@ -216,7 +212,16 @@ struct SessionActor {
 
 impl SessionActor {
     async fn run(self, mut rx: mpsc::Receiver<SessionMsg>) {
-        let mut translator = self.translators.create(&self.source, &self.session_id);
+        let mut translator = match self
+            .translators
+            .create_checked(&self.source, &self.session_id)
+        {
+            Ok(translator) => translator,
+            Err(error) => {
+                self.set_error(format!("translator init failed: {error}"));
+                return;
+            }
+        };
         let mut sink = match self.sink_factory.create(
             &self.session_id,
             &self.source,
@@ -285,11 +290,13 @@ impl SessionActor {
                     let _ = reply.send(());
                 }
                 SessionMsg::Flush(reply) => {
-                    self.drain_flush(&mut translator, &mut sink, &ctx).await;
+                    self.checkpoint_and_flush(&mut translator, &mut sink, &ctx)
+                        .await;
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
                 SessionMsg::Shutdown(reply) => {
-                    self.drain_flush(&mut translator, &mut sink, &ctx).await;
+                    self.finalize_and_flush(&mut translator, &mut sink, &ctx)
+                        .await;
                     let _ = reply.send(());
                     break;
                 }
@@ -375,6 +382,9 @@ impl SessionActor {
                 continue;
             }
             let env = crate::journal::envelope_from_redacted(entry);
+            if env.source != self.source {
+                continue;
+            }
             let translated = translator.handle(&env, ctx);
             self.emit_translator_batches(
                 translator,
@@ -388,22 +398,45 @@ impl SessionActor {
         }
     }
 
-    async fn drain_flush(
+    async fn checkpoint_and_flush(
         &self,
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
     ) {
-        let translated = translator.flush(ctx);
+        let translated = translator.checkpoint(ctx);
         self.emit_translator_batches(
             translator,
             sink,
             ctx,
             translated,
-            "translate flush failed",
-            "sink emit (flush) failed",
+            "translate checkpoint failed",
+            "sink emit (checkpoint) failed",
         )
         .await;
+        self.flush_sink(sink).await;
+    }
+
+    async fn finalize_and_flush(
+        &self,
+        translator: &mut Box<dyn crate::translate::AgentTranslator>,
+        sink: &mut Box<dyn crate::sink::Sink>,
+        ctx: &SessionCtx,
+    ) {
+        let translated = translator.finalize(ctx);
+        self.emit_translator_batches(
+            translator,
+            sink,
+            ctx,
+            translated,
+            "translate finalization failed",
+            "sink emit (finalization) failed",
+        )
+        .await;
+        self.flush_sink(sink).await;
+    }
+
+    async fn flush_sink(&self, sink: &mut Box<dyn crate::sink::Sink>) {
         if let Err(e) = sink.flush().await {
             self.set_error(format!("sink flush failed: {e}"));
         }
