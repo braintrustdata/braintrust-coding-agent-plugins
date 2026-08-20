@@ -51,6 +51,7 @@ describe("BraintrustPlugin", () => {
     "BRAINTRUST_PROFILE",
     "BRAINTRUST_OPENCODE_ENABLE_TOOLS",
     "HOME",
+    "XDG_CONFIG_HOME",
   ];
   let directory: string;
 
