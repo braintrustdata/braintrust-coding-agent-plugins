@@ -113,15 +113,73 @@ enum Command {
     /// Launch a coding agent with live tracing hooks for this invocation.
     Run {
         #[command(flatten)]
-        route: RouteArgs,
+        route: RunRouteArgs,
         #[command(flatten)]
         args: RunArgs,
     },
 }
 
-/// Non-secret session selection. Credentials are resolved by the daemon.
+/// Build a non-secret route from its constituent selections. Shared by
+/// [`RouteArgs`] and [`RunRouteArgs`], which differ only in whether their
+/// flags also fall back to an environment variable.
+fn build_route(
+    profile: Option<String>,
+    org_name: Option<String>,
+    project: Option<String>,
+    destination: Option<TraceDestination>,
+    parent: Option<braintrust_sdk_rust::SpanComponents>,
+) -> SessionRoute {
+    SessionRoute {
+        auth: AuthSelection { profile, org_name },
+        destination: parent
+            .map(|components| TraceDestination::ParentSpan { components })
+            .or(destination)
+            .or_else(|| {
+                project.map(|project_name| TraceDestination::ProjectLogs {
+                    project_id: None,
+                    project_name: Some(project_name),
+                })
+            }),
+        ..SessionRoute::default()
+    }
+}
+
+/// Non-secret session selection for a live hook. Credentials are resolved by
+/// the daemon. A hook fires automatically on every event, so — unlike
+/// `run` — its route never falls back to an environment variable; it comes
+/// only from explicit flags (which the packaged hook shims never pass) or the
+/// agent's persisted `braintrust.json`.
 #[derive(Args)]
 struct RouteArgs {
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long = "org")]
+    org_name: Option<String>,
+    #[arg(long, conflicts_with_all = ["destination", "parent"])]
+    project: Option<String>,
+    #[arg(long, conflicts_with = "parent")]
+    destination: Option<TraceDestination>,
+    #[arg(long, value_name = "SPAN_COMPONENTS")]
+    parent: Option<braintrust_sdk_rust::SpanComponents>,
+}
+
+impl RouteArgs {
+    fn into_route(self) -> SessionRoute {
+        build_route(
+            self.profile,
+            self.org_name,
+            self.project,
+            self.destination,
+            self.parent,
+        )
+    }
+}
+
+/// Non-secret session selection for `run`, an explicit, user-invoked
+/// command. Unlike a hook, one-off scripts and CI commonly supply these
+/// through the environment as well as explicit flags.
+#[derive(Args)]
+struct RunRouteArgs {
     #[arg(long, env = "BRAINTRUST_PROFILE")]
     profile: Option<String>,
     #[arg(long = "org", env = "BRAINTRUST_ORG_NAME")]
@@ -138,26 +196,15 @@ struct RouteArgs {
     parent: Option<braintrust_sdk_rust::SpanComponents>,
 }
 
-impl RouteArgs {
+impl RunRouteArgs {
     fn into_route(self) -> SessionRoute {
-        SessionRoute {
-            auth: AuthSelection {
-                profile: self.profile,
-                org_name: self.org_name,
-            },
-            destination: self
-                .parent
-                .map(|components| TraceDestination::ParentSpan { components })
-                .or(self.destination)
-                .or_else(|| {
-                    self.project
-                        .map(|project_name| TraceDestination::ProjectLogs {
-                            project_id: None,
-                            project_name: Some(project_name),
-                        })
-                }),
-            ..SessionRoute::default()
-        }
+        build_route(
+            self.profile,
+            self.org_name,
+            self.project,
+            self.destination,
+            self.parent,
+        )
     }
 }
 

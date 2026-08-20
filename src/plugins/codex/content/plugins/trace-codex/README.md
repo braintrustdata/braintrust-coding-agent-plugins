@@ -38,12 +38,11 @@ exits successfully.
 
 ## Additional root metadata
 
-Set `BRAINTRUST_ADDITIONAL_METADATA` to a JSON object to tag the root span of a
-Codex session. Standard session metadata takes precedence if keys conflict.
+For a persistent route, pass a JSON object to `bt trace setup codex
+--additional-metadata '<JSON>'` to tag the root span of every Codex session.
+Standard session metadata takes precedence if keys conflict.
 
-```bash
-BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"abc-123"}' codex
-```
-
-For a persistent route, pass the same object to `bt trace setup codex
---additional-metadata '<JSON>'`.
+For one invocation without changing the persistent configuration, use
+`bt trace run --additional-metadata '{"ci":true,"run_id":"abc-123"}' codex`,
+or set `BRAINTRUST_ADDITIONAL_METADATA` before that command (`bt trace run`
+still accepts it; a launched `codex` session's live hooks do not).

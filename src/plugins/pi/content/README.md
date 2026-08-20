@@ -70,21 +70,26 @@ pi
 ```
 
 For one invocation without changing Pi's global tracing configuration, use
-`bt trace run --project <PROJECT> pi -- [PI_ARGS...]`.
+`bt trace run --project <PROJECT> pi -- [PI_ARGS...]`. `bt trace run`'s flags
+(`--profile`, `--org`, `--project`, `--additional-metadata`) also accept the
+matching `BRAINTRUST_*` environment variable; a plain `pi` session's
+extension does not.
 
 In interactive mode, the footer shows a `Braintrust` status indicator while tracing is active, and a widget below the editor shows a shortened clickable trace link when available.
 
 ## Configuration
 
-You can configure the extension with environment variables or JSON config files.
+You can configure the extension with JSON config files. `braintrust.json` is
+the only source of persistent tracing configuration; routing and enablement
+are never read directly from the environment.
 
 Config precedence is:
 
 1. defaults
 2. `~/.pi/agent/braintrust.json`
 3. `.pi/braintrust.json`
-4. environment variables
-5. `bt trace run` invocation settings (tracing only, highest priority)
+4. `bt trace run` invocation settings (tracing only, per-invocation, highest
+   priority; never written back to the config files)
 
 ### Config file locations
 
@@ -108,18 +113,21 @@ Example:
 
 | Config key | Env var | Default |
 |---|---|---|
-| `trace_to_braintrust` | `TRACE_TO_BRAINTRUST` | `false` |
-| `org_name` | `BRAINTRUST_ORG_NAME` | unset |
-| `profile` | `BRAINTRUST_PROFILE` | default `bt` profile |
-| `project` | `BRAINTRUST_PROJECT` | `pi` |
-| `additional_metadata` | `BRAINTRUST_ADDITIONAL_METADATA` | `{}` |
+| `trace_to_braintrust` | — | `false` |
+| `org_name` | — | unset |
+| `profile` | — | default `bt` profile |
+| `project` | — | `pi` |
+| `additional_metadata` | — | `{}` |
 | `show_ui` | `BRAINTRUST_SHOW_UI` | `true` |
 | `show_trace_link` | `BRAINTRUST_SHOW_TRACE_LINK` | `true` |
+
+`show_ui` and `show_trace_link` control local display behavior only and can
+still be set from the environment. Tracing routing and enablement come only
+from `braintrust.json` and `bt trace run`.
 
 ## Notes
 
 - Project config overrides global config.
-- Environment variables override both config files.
 - Project config follows pi's configured project config directory, which defaults to `.pi`.
 - The extension does not persist local span state; recovery and incomplete-operation cleanup are owned by the daemon journal.
 - Span construction and Braintrust delivery run in the installed `bt` tracing daemon.

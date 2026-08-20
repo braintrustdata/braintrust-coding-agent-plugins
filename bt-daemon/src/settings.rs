@@ -82,24 +82,7 @@ impl AgentSettings {
     }
 
     pub(crate) fn tracing_enabled(&self) -> bool {
-        self.tracing_enabled_with(env_bool("TRACE_TO_BRAINTRUST"))
-    }
-
-    fn tracing_enabled_with(&self, environment: Option<bool>) -> bool {
-        self.trace_to_braintrust.or(environment).unwrap_or(false)
-    }
-}
-
-pub(crate) fn env_bool(name: &str) -> Option<bool> {
-    let value = std::env::var(name).ok()?;
-    parse_bool(&value)
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
+        self.trace_to_braintrust.unwrap_or(false)
     }
 }
 
@@ -145,21 +128,20 @@ mod tests {
     }
 
     #[test]
-    fn file_enablement_overrides_environment_fallback() {
+    fn tracing_enablement_comes_only_from_stored_settings() {
         let enabled = AgentSettings {
             trace_to_braintrust: Some(true),
             ..Default::default()
         };
-        assert!(enabled.tracing_enabled_with(Some(false)));
+        assert!(enabled.tracing_enabled());
 
         let disabled = AgentSettings {
             trace_to_braintrust: Some(false),
             ..Default::default()
         };
-        assert!(!disabled.tracing_enabled_with(Some(true)));
+        assert!(!disabled.tracing_enabled());
 
-        assert!(AgentSettings::default().tracing_enabled_with(Some(true)));
-        assert!(!AgentSettings::default().tracing_enabled_with(None));
+        assert!(!AgentSettings::default().tracing_enabled());
     }
 
     #[test]
@@ -202,8 +184,8 @@ mod tests {
         );
         let global = AgentSettings::load_from_sources(&path, None);
 
-        assert!(work.tracing_enabled_with(None));
-        assert!(personal.tracing_enabled_with(None));
+        assert!(work.tracing_enabled());
+        assert!(personal.tracing_enabled());
         let work_route = work.route.unwrap();
         assert_eq!(work_route.auth.profile.as_deref(), Some("work"));
         assert_eq!(
@@ -216,7 +198,7 @@ mod tests {
             personal_route.additional_metadata,
             Some(serde_json::json!({"profile": "personal"}))
         );
-        assert!(!global.tracing_enabled_with(None));
+        assert!(!global.tracing_enabled());
         let global_route = global.route.unwrap();
         assert_eq!(global_route.auth.profile.as_deref(), Some("global"));
         assert_eq!(
@@ -241,18 +223,7 @@ mod tests {
         .unwrap();
 
         let settings = AgentSettings::load_from_sources(&path, Some("{"));
-        assert!(!settings.tracing_enabled_with(None));
+        assert!(!settings.tracing_enabled());
         assert!(settings.route.is_none());
-    }
-
-    #[test]
-    fn boolean_environment_values_match_launcher_contract() {
-        for value in ["1", "true", "TRUE", "yes", "on"] {
-            assert_eq!(parse_bool(value), Some(true));
-        }
-        for value in ["0", "false", "FALSE", "no", "off"] {
-            assert_eq!(parse_bool(value), Some(false));
-        }
-        assert_eq!(parse_bool("sometimes"), None);
     }
 }

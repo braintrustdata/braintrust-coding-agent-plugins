@@ -95,15 +95,6 @@ function applyConfig(config: PiConfig, source: ConfigRecord | undefined): void {
   if (additionalMetadata) config.route.additional_metadata = additionalMetadata;
 }
 
-function environmentMetadata(value: string | undefined): ConfigRecord | undefined {
-  if (!value) return undefined;
-  try {
-    return record(JSON.parse(value));
-  } catch {
-    return undefined;
-  }
-}
-
 export function loadConfig(cwd = process.cwd()): PiConfig {
   const config: PiConfig = {
     enabled: false,
@@ -119,37 +110,15 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
   applyConfig(config, readConfig(join(homedir(), ".pi", "agent", "braintrust.json")));
   applyConfig(config, readConfig(join(cwd, PROJECT_CONFIG_DIR_NAME, "braintrust.json")));
 
-  config.profile = nonEmptyString(process.env.BRAINTRUST_PROFILE) ?? config.profile;
-  config.orgName = nonEmptyString(process.env.BRAINTRUST_ORG_NAME) ?? config.orgName;
-  config.projectName = nonEmptyString(process.env.BRAINTRUST_PROJECT) ?? config.projectName;
-  config.enabled = boolean(process.env.TRACE_TO_BRAINTRUST) ?? config.enabled;
-  config.additionalMetadata =
-    environmentMetadata(process.env.BRAINTRUST_ADDITIONAL_METADATA) ?? config.additionalMetadata;
   config.showUi = boolean(process.env.BRAINTRUST_SHOW_UI) ?? config.showUi;
   config.showTraceLink = boolean(process.env.BRAINTRUST_SHOW_TRACE_LINK) ?? config.showTraceLink;
 
-  const persistentRoute: DaemonSessionRoute = {
-    ...config.route,
-    auth: {
-      ...config.route.auth,
-      ...(config.profile ? { profile: config.profile } : {}),
-      ...(config.orgName ? { org_name: config.orgName } : {}),
-    },
-  };
-  if (process.env.BRAINTRUST_PROJECT !== undefined) {
-    persistentRoute.destination = { type: "project_logs", project_name: config.projectName };
-  }
-  if (config.additionalMetadata) {
-    persistentRoute.additional_metadata = config.additionalMetadata;
-  } else {
-    persistentRoute.additional_metadata = undefined;
-  }
   const traceSettings = resolveDaemonTraceSettings({
     trace_to_braintrust: config.enabled,
-    route: persistentRoute,
+    route: config.route,
   });
   config.enabled = traceSettings.trace_to_braintrust === true;
-  config.route = traceSettings.route ?? persistentRoute;
+  config.route = traceSettings.route ?? config.route;
 
   return config;
 }

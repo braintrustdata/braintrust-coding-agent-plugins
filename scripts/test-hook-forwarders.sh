@@ -14,7 +14,6 @@ cat > "$TEST_DIR/bt" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" > "$BT_CAPTURE_ARGS"
 cat > "$BT_CAPTURE_STDIN"
-[ -z "${BT_CAPTURE_METADATA:-}" ] || printf '%s' "${BRAINTRUST_ADDITIONAL_METADATA:-}" > "$BT_CAPTURE_METADATA"
 exit "${BT_STUB_STATUS:-0}"
 EOF
 chmod +x "$TEST_DIR/bt"
@@ -50,33 +49,6 @@ exercise claude claude-code \
   bash "$DIST_DIR/claude/plugins/trace-claude-code/hooks/forward.sh"
 exercise codex codex \
   bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
-
-# Additional metadata is consumed by the shared `bt trace hook` command from
-# the environment, so every thin hook forwarder receives identical behavior.
-exercise_metadata() {
-  local name="$1"
-  shift
-  local args_file="$TEST_DIR/$name.metadata.args"
-  local stdin_file="$TEST_DIR/$name.metadata.stdin"
-  local metadata_file="$TEST_DIR/$name.metadata.env"
-
-  printf '%s' "$PAYLOAD" | env \
-    PATH="$TEST_DIR:$PATH" \
-    BT_CAPTURE_ARGS="$args_file" \
-    BT_CAPTURE_STDIN="$stdin_file" \
-    BT_CAPTURE_METADATA="$metadata_file" \
-    BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"shim-test"}' \
-    "$@"
-  [[ "$(cat "$stdin_file")" == "$PAYLOAD" ]]
-  [[ "$(cat "$metadata_file")" == '{"ci":true,"run_id":"shim-test"}' ]]
-}
-
-exercise_metadata claude \
-  bash "$DIST_DIR/claude/plugins/trace-claude-code/hooks/forward.sh"
-[[ "$(cat "$TEST_DIR/claude.metadata.args")" == 'trace hook --source claude-code' ]]
-exercise_metadata codex \
-  bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
-[[ "$(cat "$TEST_DIR/codex.metadata.args")" == 'trace hook --source codex' ]]
 
 # Exercise first-use bootstrap without touching the developer's installation.
 # The fake curl materializes a fake bt binary and emits a no-op installer body.

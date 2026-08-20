@@ -108,8 +108,11 @@ pub struct HookArgs {
     /// Bound an explicit turn/session-end flush.
     #[arg(long, default_value_t = 10_000)]
     pub flush_timeout_ms: u64,
-    /// JSON object merged into root-span metadata.
-    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    /// JSON object merged into root-span metadata. Deliberately not read from
+    /// the environment: a hook fires automatically on every event, so its
+    /// configuration must come only from the persisted agent route (or, for a
+    /// managed child, the invocation settings `run` injected).
+    #[arg(long)]
     pub additional_metadata: Option<String>,
     /// Marks the hook definition injected by `run`; inherited plugin hooks do
     /// not carry this flag and are suppressed for the managed child.
@@ -512,11 +515,7 @@ pub async fn run_traced(
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
-        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings)
-        // The parent has already resolved the public environment variable into
-        // the invocation route. Do not let a child hook re-apply it and defeat
-        // an explicit `bt trace run --additional-metadata` override.
-        .env_remove("BRAINTRUST_ADDITIONAL_METADATA");
+        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
     if args.source == RunSource::OpenCode {
         command.env(
             "OPENCODE_CONFIG_CONTENT",
