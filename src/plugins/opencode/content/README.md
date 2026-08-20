@@ -98,7 +98,9 @@ BRAINTRUST_OPENCODE_ENABLE_TOOLS=false opencode
 Set `additional_metadata` via the config file to attach custom key-value pairs to the root span. This is useful for tagging traces in CI or linking them back to a specific run.
 
 For one invocation without changing the persistent configuration, use
-`bt trace run --additional-metadata '{"ci": true, "run_id": "abc-123"}' opencode -- run "do the thing"`.
+`bt trace run --additional-metadata '{"ci": true, "run_id": "abc-123"}' opencode -- run "do the thing"`,
+or set `BRAINTRUST_ADDITIONAL_METADATA` before that command (`bt trace run`
+still accepts it; a plain `opencode` session's plugin does not).
 
 You can also set it via the config file:
 

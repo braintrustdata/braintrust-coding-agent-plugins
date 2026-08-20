@@ -108,7 +108,10 @@ pub struct HookArgs {
     /// Bound an explicit turn/session-end flush.
     #[arg(long, default_value_t = 10_000)]
     pub flush_timeout_ms: u64,
-    /// JSON object merged into root-span metadata.
+    /// JSON object merged into root-span metadata. Deliberately not read from
+    /// the environment: a hook fires automatically on every event, so its
+    /// configuration must come only from the persisted agent route (or, for a
+    /// managed child, the invocation settings `run` injected).
     #[arg(long)]
     pub additional_metadata: Option<String>,
     /// Marks the hook definition injected by `run`; inherited plugin hooks do
@@ -156,7 +159,7 @@ pub struct ImportArgs {
     #[arg(long, conflicts_with = "all")]
     pub attach: bool,
     /// JSON object merged into every imported root span's metadata.
-    #[arg(long)]
+    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
 }
 
@@ -175,7 +178,7 @@ pub struct RunArgs {
     #[arg(value_enum)]
     pub source: RunSource,
     /// JSON object merged into root-span metadata for this invocation.
-    #[arg(long)]
+    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
     /// Arguments forwarded verbatim to the coding agent.
     #[arg(allow_hyphen_values = true)]

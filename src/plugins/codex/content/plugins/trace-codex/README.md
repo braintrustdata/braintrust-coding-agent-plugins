@@ -43,4 +43,6 @@ For a persistent route, pass a JSON object to `bt trace setup codex
 Standard session metadata takes precedence if keys conflict.
 
 For one invocation without changing the persistent configuration, use
-`bt trace run --additional-metadata '{"ci":true,"run_id":"abc-123"}' codex`.
+`bt trace run --additional-metadata '{"ci":true,"run_id":"abc-123"}' codex`,
+or set `BRAINTRUST_ADDITIONAL_METADATA` before that command (`bt trace run`
+still accepts it; a launched `codex` session's live hooks do not).

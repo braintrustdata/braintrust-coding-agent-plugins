@@ -70,7 +70,10 @@ pi
 ```
 
 For one invocation without changing Pi's global tracing configuration, use
-`bt trace run --project <PROJECT> pi -- [PI_ARGS...]`.
+`bt trace run --project <PROJECT> pi -- [PI_ARGS...]`. `bt trace run`'s flags
+(`--profile`, `--org`, `--project`, `--additional-metadata`) also accept the
+matching `BRAINTRUST_*` environment variable; a plain `pi` session's
+extension does not.
 
 In interactive mode, the footer shows a `Braintrust` status indicator while tracing is active, and a widget below the editor shows a shortened clickable trace link when available.
 

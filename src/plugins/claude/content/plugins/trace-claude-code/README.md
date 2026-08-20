@@ -12,6 +12,9 @@ already available, then forwards the event. The plugin is credential-free and
 fail-open; the `bt` CLI and shared daemon own authentication, event journaling,
 trace construction, and delivery.
 
-To add fields to each root trace span, pass a JSON object with
-`bt trace setup claude --additional-metadata` for a persistent configuration,
-or `bt trace run --additional-metadata '<JSON>' claude` for one invocation.
+To add fields to each root trace span, pass a JSON object (as
+`--additional-metadata` or `BRAINTRUST_ADDITIONAL_METADATA`) to
+`bt trace setup claude` for a persistent configuration, or to
+`bt trace run claude` for one invocation. The hook itself never reads that
+environment variable — only `bt trace setup`, `bt trace run`, and
+`bt trace import` do.
