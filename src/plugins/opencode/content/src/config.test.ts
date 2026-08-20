@@ -86,28 +86,28 @@ describe("loadConfig", () => {
     });
   });
 
-  it("lets environment selection override plugin configuration", () => {
+  it("ignores routing and enablement environment variables, using only the config file", () => {
     process.env.BRAINTRUST_PROFILE = "personal";
     process.env.BRAINTRUST_ORG_NAME = "braintrust";
     process.env.BRAINTRUST_PROJECT = "opencode-runs";
     process.env.TRACE_TO_BRAINTRUST = "true";
-    process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "false";
     process.env.BRAINTRUST_ADDITIONAL_METADATA = '{"ci":true}';
 
     expect(loadConfig({ profile: "work", project: "other" })).toMatchObject({
-      profile: "personal",
-      orgName: "braintrust",
-      projectName: "opencode-runs",
-      tracingEnabled: true,
-      enableTools: false,
-      additionalMetadata: { ci: true },
+      profile: "work",
+      projectName: "other",
+      tracingEnabled: false,
+      additionalMetadata: undefined,
     });
   });
 
-  it("ignores invalid optional metadata", () => {
-    process.env.BRAINTRUST_ADDITIONAL_METADATA = "not-json";
-    expect(loadConfig({ additional_metadata: { fallback: true } }).additionalMetadata).toEqual({
-      fallback: true,
+  it("still lets environment variables control unrelated plugin behavior", () => {
+    process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "false";
+    process.env.BRAINTRUST_DEBUG = "true";
+
+    expect(loadConfig()).toMatchObject({
+      enableTools: false,
+      debug: true,
     });
   });
 

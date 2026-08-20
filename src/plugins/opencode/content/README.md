@@ -25,7 +25,9 @@ use `bt trace run --project <PROJECT> opencode -- [OPENCODE_ARGS...]`.
 
 ## Configuration
 
-You can configure the plugin using a config file or environment variables.
+You can configure the plugin using a config file. `braintrust.json` is the
+only source of persistent tracing configuration; routing and enablement are
+never read directly from the environment.
 
 ### Config File
 
@@ -50,13 +52,18 @@ Create a `braintrust.json` file in one of these locations:
 
 | Config Key | Env Var | Type | Default | Description |
 |------------|---------|------|---------|-------------|
-| `trace_to_braintrust` | `TRACE_TO_BRAINTRUST` | boolean | `false` | Enable/disable tracing |
+| `trace_to_braintrust` | — | boolean | `false` | Enable/disable tracing |
 | `enable_tools` | `BRAINTRUST_OPENCODE_ENABLE_TOOLS` | boolean | `true` | Register Braintrust tools in OpenCode |
-| `profile` | `BRAINTRUST_PROFILE` | string | current `bt` profile | Select the `bt` auth profile used by tracing and tools |
-| `project` | `BRAINTRUST_PROJECT` | string | `"opencode"` | Project name for traces and project-scoped tools |
+| `profile` | — | string | current `bt` profile | Select the `bt` auth profile used by tracing and tools |
+| `project` | — | string | `"opencode"` | Project name for traces and project-scoped tools |
 | `debug` | `BRAINTRUST_DEBUG` | boolean | `false` | Enable debug logging |
-| `org_name` | `BRAINTRUST_ORG_NAME` | string | profile default | Organization selected within the tracing profile and for tools |
-| `additional_metadata` | `BRAINTRUST_ADDITIONAL_METADATA` | string | | JSON object of additional metadata to attach to the root span. Standard metadata keys take precedence on conflict. |
+| `org_name` | — | string | profile default | Organization selected within the tracing profile and for tools |
+| `additional_metadata` | — | | | JSON object of additional metadata to attach to the root span. Standard metadata keys take precedence on conflict. |
+
+`enable_tools` and `debug` control local plugin behavior and can still be set
+from the environment. Tracing routing and enablement (`trace_to_braintrust`,
+`profile`, `project`, `org_name`, `additional_metadata`) come only from
+`braintrust.json` and `bt trace run`.
 
 ### Precedence
 
@@ -65,8 +72,8 @@ Configuration is loaded with the following precedence (later overrides earlier):
 1. Default values
 2. `~/.config/opencode/braintrust.json` (global config)
 3. `.opencode/braintrust.json` (project config)
-4. Environment variables
-5. `bt trace run` invocation settings (tracing only, highest priority)
+4. `bt trace run` invocation settings (tracing only, per-invocation, highest
+   priority; never written back to the config files)
 
 ## Disabling Braintrust Tools
 
@@ -83,16 +90,15 @@ Set `enable_tools` to `false` to trace OpenCode sessions without registering Bra
 Or use the environment variable:
 
 ```bash
-BRAINTRUST_OPENCODE_ENABLE_TOOLS=false TRACE_TO_BRAINTRUST=true opencode
+BRAINTRUST_OPENCODE_ENABLE_TOOLS=false opencode
 ```
 
 ## Adding Dynamic Metadata
 
-Use `BRAINTRUST_ADDITIONAL_METADATA` to attach custom key-value pairs to the root span. This is useful for tagging traces in CI or linking them back to a specific run.
+Set `additional_metadata` via the config file to attach custom key-value pairs to the root span. This is useful for tagging traces in CI or linking them back to a specific run.
 
-```bash
-BRAINTRUST_ADDITIONAL_METADATA='{"ci": true, "run_id": "abc-123"}' opencode run "do the thing"
-```
+For one invocation without changing the persistent configuration, use
+`bt trace run --additional-metadata '{"ci": true, "run_id": "abc-123"}' opencode -- run "do the thing"`.
 
 You can also set it via the config file:
 

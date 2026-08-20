@@ -51,7 +51,7 @@ pub struct SetupArgs {
     #[command(subcommand)]
     pub agent: SetupAgent,
     /// JSON object persisted in this agent's tracing route and merged into root-span metadata.
-    #[arg(long, global = true, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    #[arg(long, global = true)]
     pub additional_metadata: Option<String>,
 }
 

@@ -122,17 +122,13 @@ enum Command {
 /// Non-secret session selection. Credentials are resolved by the daemon.
 #[derive(Args)]
 struct RouteArgs {
-    #[arg(long, env = "BRAINTRUST_PROFILE")]
+    #[arg(long)]
     profile: Option<String>,
-    #[arg(long = "org", env = "BRAINTRUST_ORG_NAME")]
+    #[arg(long = "org")]
     org_name: Option<String>,
-    #[arg(
-        long,
-        env = "BRAINTRUST_PROJECT",
-        conflicts_with_all = ["destination", "parent"]
-    )]
+    #[arg(long, conflicts_with_all = ["destination", "parent"])]
     project: Option<String>,
-    #[arg(long, env = "BRAINTRUST_DESTINATION", conflicts_with = "parent")]
+    #[arg(long, conflicts_with = "parent")]
     destination: Option<TraceDestination>,
     #[arg(long, value_name = "SPAN_COMPONENTS")]
     parent: Option<braintrust_sdk_rust::SpanComponents>,

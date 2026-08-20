@@ -58,15 +58,13 @@ describe("loadConfig", () => {
       orgName: undefined,
       additionalMetadata: undefined,
       route: {
-        auth: {},
         destination: { type: "project_logs", project_name: "pi" },
         flush_mode: "flush_on_turn_end",
-        additional_metadata: undefined,
       },
     });
   });
 
-  it("layers global, project, and invocation selection", () => {
+  it("layers global config with project config overriding it", () => {
     writeJson(join(home, ".pi", "agent", "braintrust.json"), {
       trace_to_braintrust: true,
       profile: "global",
@@ -79,48 +77,61 @@ describe("loadConfig", () => {
       project: "project-project",
       show_trace_link: false,
     });
-    process.env.BRAINTRUST_PROFILE = "run";
-    process.env.BRAINTRUST_ORG_NAME = "run-org";
-    process.env.BRAINTRUST_PROJECT = "run-project";
-    process.env.BRAINTRUST_ADDITIONAL_METADATA = '{"source":"run"}';
 
     expect(loadConfig(cwd)).toEqual({
       enabled: true,
-      profile: "run",
-      orgName: "run-org",
-      projectName: "run-project",
-      additionalMetadata: { source: "run" },
+      profile: "project",
+      orgName: "global-org",
+      projectName: "project-project",
+      additionalMetadata: { source: "global" },
       showUi: true,
       showTraceLink: false,
       route: {
-        auth: { profile: "run", org_name: "run-org" },
-        destination: { type: "project_logs", project_name: "run-project" },
+        auth: { profile: "project", org_name: "global-org" },
+        destination: { type: "project_logs", project_name: "project-project" },
         flush_mode: "flush_on_turn_end",
-        additional_metadata: { source: "run" },
+        additional_metadata: { source: "global" },
       },
     });
   });
 
-  it("accepts invocation-local enablement and UI overrides", () => {
+  it("ignores routing and enablement environment variables, using only the config file", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: false,
+      project: "global-project",
+    });
+    process.env.BRAINTRUST_PROFILE = "run";
+    process.env.BRAINTRUST_ORG_NAME = "run-org";
+    process.env.BRAINTRUST_PROJECT = "run-project";
+    process.env.BRAINTRUST_ADDITIONAL_METADATA = '{"source":"run"}';
     process.env.TRACE_TO_BRAINTRUST = "true";
+
+    expect(loadConfig(cwd)).toMatchObject({
+      enabled: false,
+      profile: undefined,
+      orgName: undefined,
+      projectName: "global-project",
+      additionalMetadata: undefined,
+    });
+  });
+
+  it("still lets environment variables control unrelated UI behavior", () => {
     process.env.BRAINTRUST_SHOW_UI = "0";
     process.env.BRAINTRUST_SHOW_TRACE_LINK = "no";
 
     expect(loadConfig(cwd)).toMatchObject({
-      enabled: true,
       showUi: false,
       showTraceLink: false,
     });
   });
 
-  it("ignores malformed files, values, and metadata", () => {
+  it("ignores malformed files and values", () => {
     writeJson(join(home, ".pi", "agent", "braintrust.json"), {
       trace_to_braintrust: "sometimes",
       project: [],
       additional_metadata: [],
     });
     writeFileSync(join(cwd, ".pi-invalid"), "ignored");
-    process.env.BRAINTRUST_ADDITIONAL_METADATA = "not-json";
 
     expect(loadConfig(cwd)).toEqual({
       enabled: false,
@@ -131,10 +142,8 @@ describe("loadConfig", () => {
       orgName: undefined,
       additionalMetadata: undefined,
       route: {
-        auth: {},
         destination: { type: "project_logs", project_name: "pi" },
         flush_mode: "flush_on_turn_end",
-        additional_metadata: undefined,
       },
     });
   });

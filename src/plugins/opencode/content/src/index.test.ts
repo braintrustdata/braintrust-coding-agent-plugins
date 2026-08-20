@@ -3,7 +3,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
@@ -101,7 +101,12 @@ describe("BraintrustPlugin", () => {
   });
 
   it("registers daemon tracing independently of the tools", async () => {
-    process.env.TRACE_TO_BRAINTRUST = "true";
+    const configDir = join(directory, ".config", "opencode");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, "braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: true }),
+    );
     process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "false";
 
     const { BraintrustPlugin } = await import("./index");

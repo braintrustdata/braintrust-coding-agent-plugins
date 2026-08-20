@@ -109,7 +109,7 @@ pub struct HookArgs {
     #[arg(long, default_value_t = 10_000)]
     pub flush_timeout_ms: u64,
     /// JSON object merged into root-span metadata.
-    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    #[arg(long)]
     pub additional_metadata: Option<String>,
     /// Marks the hook definition injected by `run`; inherited plugin hooks do
     /// not carry this flag and are suppressed for the managed child.
@@ -156,7 +156,7 @@ pub struct ImportArgs {
     #[arg(long, conflicts_with = "all")]
     pub attach: bool,
     /// JSON object merged into every imported root span's metadata.
-    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    #[arg(long)]
     pub additional_metadata: Option<String>,
 }
 
@@ -175,7 +175,7 @@ pub struct RunArgs {
     #[arg(value_enum)]
     pub source: RunSource,
     /// JSON object merged into root-span metadata for this invocation.
-    #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    #[arg(long)]
     pub additional_metadata: Option<String>,
     /// Arguments forwarded verbatim to the coding agent.
     #[arg(allow_hyphen_values = true)]
@@ -512,11 +512,7 @@ pub async fn run_traced(
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
-        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings)
-        // The parent has already resolved the public environment variable into
-        // the invocation route. Do not let a child hook re-apply it and defeat
-        // an explicit `bt trace run --additional-metadata` override.
-        .env_remove("BRAINTRUST_ADDITIONAL_METADATA");
+        .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
     if args.source == RunSource::OpenCode {
         command.env(
             "OPENCODE_CONFIG_CONTENT",

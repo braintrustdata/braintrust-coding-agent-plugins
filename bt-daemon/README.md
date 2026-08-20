@@ -64,17 +64,20 @@ process-local settings overlay and never changes any of these files.
 `additional_metadata` is a JSON object merged into each traced session's root
 span. Standard agent metadata (such as the session id, source, and workspace)
 takes precedence over keys supplied by users. Set it persistently during setup
-or provide it for one process with `BRAINTRUST_ADDITIONAL_METADATA`:
+or provide it for one invocation with `bt trace run`:
 
 ```bash
 bt trace setup claude --additional-metadata '{"team":"platform"}'
-BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"abc-123"}' \
-  bt trace run codex -- "summarize this change"
+bt trace run --additional-metadata '{"ci":true,"run_id":"'"$JOB_ID"'"}' \
+  codex -- "summarize this change"
 ```
 
-The same option/environment value applies to `bt trace hook`, `bt trace import`,
-and `bt trace import --attach`. An explicit `--additional-metadata` flag wins
-over the environment, which wins over metadata saved in an agent route.
+`--additional-metadata` accepts a shell-substituted value, so CI can still
+supply dynamic data without the daemon reading any environment variable
+directly. `bt trace hook` and `bt trace import` only ever take the persisted
+value from an agent's `braintrust.json`; an explicit `--additional-metadata`
+flag on `bt trace run` overrides it for that invocation only, without
+mutating the file.
 
 ## Build / test
 
