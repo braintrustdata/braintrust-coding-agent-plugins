@@ -67,24 +67,81 @@ the flag to compose plugins from left to right. Setup persists its ordered list;
 run and import append invocation plugins after the persisted list. Each path is
 canonicalized to an absolute path before it is validated or stored.
 
-```bash
-bt trace setup codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
-bt trace run --plugin ./local.mjs codex -- "summarize this change"
-bt trace import codex SESSION_ID --plugin ./sanitize-history.mjs
-```
-
 Each module must default-export a synchronous function. It receives a span and
 `{ operation, source, session_id, env }`, and must return a JSON-compatible span
 object. Span, root, and parent identities cannot be changed:
 
 ```js
-export default function mapSpan(span, context) {
+// redact.mjs
+function redact(value) {
+  if (typeof value === "string") {
+    return value.replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED]");
+  }
+  if (Array.isArray(value)) return value.map(redact);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [key, redact(child)]),
+    );
+  }
+  return value;
+}
+
+export default function redactSpan(span) {
+  const next = { ...span };
+  for (const field of ["input", "output", "error"]) {
+    if (field in next) next[field] = redact(next[field]);
+  }
+  return next;
+}
+```
+
+The context can drive a second transform without changing the first one:
+
+```js
+// tag-ci.mjs
+export default function tagCi(span, context) {
+  if (!context.env.CI) return span;
+
   return {
     ...span,
-    metadata: { ...span.metadata, deployment: context.env.DEPLOYMENT },
+    tags: [...new Set([...(span.tags ?? []), "ci"])],
+    metadata: {
+      ...(span.metadata ?? {}),
+      deployment: context.env.DEPLOYMENT_ENV ?? "unknown",
+      trace_source: context.source,
+    },
   };
 }
 ```
+
+Register both transforms persistently for ordinary Codex sessions. The
+redactor runs first and its returned span becomes the tagger's input:
+
+```bash
+bt trace setup codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
+```
+
+`run` and `import` plugins apply only to that command and run after any plugins
+saved by setup:
+
+```bash
+# The invocation order is redact.mjs, tag-ci.mjs, then local.mjs.
+bt trace run --plugin ./local.mjs codex -- "summarize this change"
+
+# Imported transcript spans pass through the setup plugins first, followed by
+# sanitize-history.mjs.
+bt trace import codex SESSION_ID --plugin ./sanitize-history.mjs
+```
+
+The journal stores raw input events, not transformed spans. After daemon
+recovery, replayed events therefore pass through the plugin chain supplied by
+the resumed session's current route.
+
+`context.operation` is `"insert"` or `"merge"`; `context.source` and
+`context.session_id` identify the translated event stream; and `context.env`
+contains the daemon process environment. Environment variable names are
+uppercased on Windows so common lookups such as `context.env.PATH` remain
+portable.
 
 The environment map is captured from the daemon process when each worker-local
 span processor is constructed. Plugins execute in bounded, thread-local
@@ -92,6 +149,9 @@ QuickJS runtimes with no filesystem or network host APIs. Modules must be
 self-contained and transforms must be stateless: module globals belong to a
 worker thread, not a session. If a plugin fails, that worker reports and skips
 only that plugin on subsequent spans; the remaining plugins continue to run.
+Plugins are trusted local code: although they have no host APIs, they can copy
+environment values into spans that are delivered to Braintrust. Read only the
+specific variables needed by the transform; never attach `context.env` itself.
 
 ### Additional root metadata
 
