@@ -214,10 +214,6 @@ struct SessionActor {
     config: crate::wire::SessionConfig,
 }
 
-struct PluginState {
-    disabled: bool,
-}
-
 impl SessionActor {
     async fn run(self, mut rx: mpsc::Receiver<SessionMsg>) {
         let mut translator = self.translators.create(&self.source, &self.session_id);
@@ -255,14 +251,12 @@ impl SessionActor {
             session_id: self.session_id.clone(),
             config: Some(self.config.clone()),
         };
-        let mut plugins = PluginState { disabled: false };
         sink.configure(&self.config);
         self.refresh_permalink(sink.as_ref());
         // Rebuild translator state before accepting the first new event.
         // Stable span ids make this both crash recovery and a complete copy
         // when an existing source session is sent to another destination.
-        self.replay_into(&mut translator, &mut sink, &ctx, &mut plugins)
-            .await;
+        self.replay_into(&mut translator, &mut sink, &ctx).await;
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -277,7 +271,6 @@ impl SessionActor {
                         &mut translator,
                         &mut sink,
                         &ctx,
-                        &mut plugins,
                         translated,
                         ("translate failed", "sink emit failed"),
                     )
@@ -291,13 +284,11 @@ impl SessionActor {
                     let _ = reply.send(());
                 }
                 SessionMsg::Flush(reply) => {
-                    self.drain_flush(&mut translator, &mut sink, &ctx, &mut plugins)
-                        .await;
+                    self.drain_flush(&mut translator, &mut sink, &ctx).await;
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
                 SessionMsg::Shutdown(reply) => {
-                    self.drain_flush(&mut translator, &mut sink, &ctx, &mut plugins)
-                        .await;
+                    self.drain_flush(&mut translator, &mut sink, &ctx).await;
                     let _ = reply.send(());
                     break;
                 }
@@ -313,7 +304,6 @@ impl SessionActor {
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
-        plugins: &mut PluginState,
         first: anyhow::Result<Vec<crate::translate::SpanOp>>,
         errors: (&str, &str),
     ) {
@@ -327,36 +317,35 @@ impl SessionActor {
         };
         while let Some(ops) = next {
             if !ops.is_empty() {
-                let processed = if plugins.disabled {
-                    ops.clone()
-                } else {
-                    let plugin_paths = ctx
-                        .config
-                        .as_ref()
-                        .map(|config| config.span_plugins.as_slice())
-                        .unwrap_or_default();
-                    let transformed: anyhow::Result<Vec<_>> = ops
-                        .iter()
-                        .map(|op| {
-                            crate::span_processor::process(
-                                plugin_paths,
-                                op,
-                                &self.source,
-                                &self.session_id,
-                            )
-                        })
-                        .collect();
-                    match transformed {
-                        Ok(processed) => processed,
+                let plugin_paths = ctx
+                    .config
+                    .as_ref()
+                    .map(|config| config.span_plugins.as_slice())
+                    .unwrap_or_default();
+                let mut processed = Vec::with_capacity(ops.len());
+                for op in &ops {
+                    match crate::span_processor::process(
+                        plugin_paths,
+                        op,
+                        &self.source,
+                        &self.session_id,
+                    ) {
+                        Ok(result) => {
+                            for failure in result.failures {
+                                self.set_error(format!(
+                                    "span plugin {} failed; disabled on this worker: {}",
+                                    failure.path.display(),
+                                    failure.message
+                                ));
+                            }
+                            processed.push(result.op);
+                        }
                         Err(error) => {
-                            plugins.disabled = true;
-                            self.set_error(format!(
-                                "span plugin failed; disabled for session: {error}"
-                            ));
-                            ops.clone()
+                            self.set_error(format!("span plugin processor failed: {error}"));
+                            processed.push(op.clone());
                         }
                     }
-                };
+                }
                 match sink.emit(&processed).await {
                     Ok(n) => {
                         self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
@@ -383,7 +372,6 @@ impl SessionActor {
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
-        plugins: &mut PluginState,
     ) {
         let Some(plan) = &self.replay else {
             return;
@@ -420,7 +408,6 @@ impl SessionActor {
                 translator,
                 sink,
                 ctx,
-                plugins,
                 translated,
                 ("journal replay failed", "sink replay emit failed"),
             )
@@ -433,14 +420,12 @@ impl SessionActor {
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
-        plugins: &mut PluginState,
     ) {
         let translated = translator.flush(ctx);
         self.emit_translator_batches(
             translator,
             sink,
             ctx,
-            plugins,
             translated,
             ("translate flush failed", "sink emit (flush) failed"),
         )

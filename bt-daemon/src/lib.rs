@@ -845,7 +845,6 @@ struct ImportLive {
     sink: Box<dyn Sink>,
     ctx: SessionCtx,
     pending_ops: usize,
-    plugins_disabled: bool,
 }
 
 struct ImportProcessor {
@@ -887,7 +886,6 @@ impl ImportProcessor {
                                 config: None,
                             },
                             pending_ops: 0,
-                            plugins_disabled: false,
                         },
                     );
                     self.sessions.get_mut(&sid).unwrap()
@@ -914,39 +912,41 @@ impl ImportProcessor {
             // for every native turn boundary.
             const FLUSH_OPS: usize = 500;
             for chunk in ops.chunks(FLUSH_OPS) {
-                let transformed = if live.plugins_disabled {
-                    chunk.to_vec()
-                } else {
-                    let plugins = live
-                        .ctx
-                        .config
-                        .as_ref()
-                        .map(|config| config.span_plugins.as_slice())
-                        .unwrap_or_default();
-                    let transformed: anyhow::Result<Vec<_>> = chunk
-                        .iter()
-                        .map(|op| {
-                            crate::span_processor::process(
-                                plugins,
-                                op,
-                                &live.source,
-                                &live.ctx.session_id,
-                            )
-                        })
-                        .collect();
-                    match transformed {
-                        Ok(transformed) => transformed,
+                let plugins = live
+                    .ctx
+                    .config
+                    .as_ref()
+                    .map(|config| config.span_plugins.as_slice())
+                    .unwrap_or_default();
+                let mut transformed = Vec::with_capacity(chunk.len());
+                for op in chunk {
+                    match crate::span_processor::process(
+                        plugins,
+                        op,
+                        &live.source,
+                        &live.ctx.session_id,
+                    ) {
+                        Ok(result) => {
+                            for failure in result.failures {
+                                tracing::warn!(
+                                    session_id = %live.ctx.session_id,
+                                    plugin = %failure.path.display(),
+                                    error = %failure.message,
+                                    "span plugin failed during import; disabled on this worker"
+                                );
+                            }
+                            transformed.push(result.op);
+                        }
                         Err(error) => {
-                            live.plugins_disabled = true;
                             tracing::warn!(
                                 session_id = %live.ctx.session_id,
                                 %error,
-                                "span plugin failed during import; disabled for session"
+                                "span plugin processor failed during import"
                             );
-                            chunk.to_vec()
+                            transformed.push(op.clone());
                         }
                     }
-                };
+                }
                 live.sink.emit(&transformed).await?;
                 live.pending_ops += chunk.len();
                 if live.pending_ops >= FLUSH_OPS {
@@ -1056,6 +1056,22 @@ mod tests {
     fn serve_defaults_to_short_journal_backed_session_retirement() {
         let args = ServeCli::try_parse_from(["test"]).unwrap().args;
         assert_eq!(args.session_idle_timeout_secs, 30);
+    }
+
+    #[test]
+    fn span_plugin_paths_are_canonicalized_before_use() {
+        let dir = tempfile::Builder::new()
+            .prefix("span-plugin-path-")
+            .tempdir_in(".")
+            .unwrap();
+        let plugin = dir.path().join("plugin.mjs");
+        std::fs::write(&plugin, "export default span => span").unwrap();
+        let relative = PathBuf::from(dir.path().file_name().unwrap()).join("plugin.mjs");
+
+        let resolved = resolve_span_plugin_paths(&[relative]).unwrap();
+
+        assert_eq!(resolved, [plugin.canonicalize().unwrap()]);
+        assert!(resolved[0].is_absolute());
     }
 
     #[test]

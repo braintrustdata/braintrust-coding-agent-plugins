@@ -64,7 +64,8 @@ process-local settings overlay and never changes any of these files.
 `--plugin PATH` registers a synchronous ES module that transforms each
 sink-neutral span row after translation and immediately before delivery. Repeat
 the flag to compose plugins from left to right. Setup persists its ordered list;
-run and import append invocation plugins after the persisted list.
+run and import append invocation plugins after the persisted list. Each path is
+canonicalized to an absolute path before it is validated or stored.
 
 ```bash
 bt trace setup codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
@@ -89,8 +90,8 @@ The environment map is captured from the daemon process when each worker-local
 span processor is constructed. Plugins execute in bounded, thread-local
 QuickJS runtimes with no filesystem or network host APIs. Modules must be
 self-contained and transforms must be stateless: module globals belong to a
-worker thread, not a session. A runtime failure disables the chain for that
-session and sends the original translator output instead.
+worker thread, not a session. If a plugin fails, that worker reports and skips
+only that plugin on subsequent spans; the remaining plugins continue to run.
 
 ### Additional root metadata
 
