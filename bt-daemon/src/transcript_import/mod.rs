@@ -444,6 +444,7 @@ fn envelope(
         managed_run_id: None,
         capture: None,
         payload,
+        plugin_env: Default::default(),
         route: None,
         config: None,
     }

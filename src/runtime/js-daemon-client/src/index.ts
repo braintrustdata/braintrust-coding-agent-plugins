@@ -17,6 +17,7 @@ export interface DaemonSessionRoute {
   destination: unknown
   flush_mode?: "fire_and_forget" | "flush_on_turn_end"
   additional_metadata?: Record<string, unknown>
+  span_plugins?: string[]
 }
 
 export interface DaemonTraceSettings {
@@ -80,6 +81,7 @@ export interface DaemonEnvelope {
   ts_ms: number
   managed_run_id?: string
   payload: unknown
+  plugin_env?: Record<string, string>
   route?: DaemonSessionRoute
 }
 
@@ -170,6 +172,17 @@ export class DaemonClient {
     return this.serial(async () => {
       const event = {
         ...envelope,
+        ...(envelope.plugin_env
+          ? { plugin_env: envelope.plugin_env }
+          : envelope.route?.span_plugins?.length
+            ? {
+                plugin_env: Object.fromEntries(
+                  Object.entries(process.env).filter(
+                    (entry): entry is [string, string] => entry[1] !== undefined,
+                  ),
+                ),
+              }
+            : {}),
         ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
         ...(this.options.managedRunId ? { managed_run_id: this.options.managedRunId } : {}),
       }
