@@ -78,7 +78,6 @@ fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
             ts_ms,
             managed_run_id: None,
             payload,
-            plugin_env: Default::default(),
             route: None,
             config: None,
         };
@@ -270,7 +269,6 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
                 ts_ms: 1,
                 managed_run_id: None,
                 payload: json!({"session_id":"session","cwd":"/workspace","prompt":"go"}),
-                plugin_env: Default::default(),
                 route: None,
                 config: None,
             },
@@ -370,7 +368,6 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         ts_ms: 1,
         managed_run_id: None,
         payload,
-        plugin_env: Default::default(),
         route: None,
         config: None,
     };
@@ -460,7 +457,6 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
         ts_ms,
         managed_run_id: None,
         payload,
-        plugin_env: Default::default(),
         route: None,
         config: None,
     };
@@ -580,7 +576,6 @@ fn claude_groups_streamed_rows_and_reads_late_final_output_at_session_end() {
         ts_ms,
         managed_run_id: None,
         payload,
-        plugin_env: Default::default(),
         route: None,
         config: None,
     };
@@ -717,7 +712,6 @@ fn claude_large_catch_up_emits_one_historical_snapshot_per_batch() {
         ts_ms: 2_000_000_000_000,
         managed_run_id: None,
         payload,
-        plugin_env: Default::default(),
         route: None,
         config: None,
     };

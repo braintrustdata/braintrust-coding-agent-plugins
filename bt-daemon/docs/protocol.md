@@ -188,7 +188,6 @@ Used for version handover and by tests.
   "ts_ms": 1753639552123,
   "managed_run_id": "invocation-uuid",
   "payload": { "…raw agent-native hook payload…": true },
-  "plugin_env": { "CI": "true" },
   "route": {
     "auth": {
       "profile": "work",
@@ -222,8 +221,6 @@ Field notes:
   daemon.
 - **`payload`** is opaque to transport and to everything except the translator
   for `source`.
-- **`plugin_env`** is the event producer's string environment map, exposed to
-  span plugins as `context.env`. It is transported live but never journaled.
 - **`managed_run_id`** is present only for events inherited from a
   `bt trace run` process tree. It groups native sessions for the final
   invocation flush and is not trace metadata.
@@ -251,9 +248,10 @@ Field notes:
 ### Redaction
 
 Live credentials returned by the host provider are **never** written to the
-journal, logs, status, or RPC response. The live plugin environment is likewise
-omitted because it commonly contains secrets. Envelopes journal only their
-non-secret `route`, allowing restart recovery to resolve a fresh lease.
+journal, logs, status, or RPC response. Envelopes journal only their non-secret
+`route`, allowing restart recovery to resolve a fresh lease. Span plugins read
+an environment snapshot captured inside their daemon worker process; it is not
+part of the envelope or journal schema.
 
 ## Daemon lifecycle
 

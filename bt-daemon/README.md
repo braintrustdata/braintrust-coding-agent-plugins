@@ -85,13 +85,12 @@ export default function mapSpan(span, context) {
 }
 ```
 
-The environment map comes from the event-producing hook or adapter and is sent
-only over the private daemon transport; it is never written to the recovery
-journal. Plugins execute in bounded, thread-local QuickJS runtimes with no
-filesystem or network host APIs. Modules must be self-contained and transforms
-must be stateless: module globals belong to a worker thread, not a session. A
-runtime failure disables the chain for that session and sends the original
-translator output instead.
+The environment map is captured from the daemon process when each worker-local
+span processor is constructed. Plugins execute in bounded, thread-local
+QuickJS runtimes with no filesystem or network host APIs. Modules must be
+self-contained and transforms must be stateless: module globals belong to a
+worker thread, not a session. A runtime failure disables the chain for that
+session and sends the original translator output instead.
 
 ### Additional root metadata
 

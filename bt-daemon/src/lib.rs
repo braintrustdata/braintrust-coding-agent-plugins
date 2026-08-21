@@ -268,11 +268,6 @@ pub async fn run_hook(
             .ok()
             .filter(|value| !value.is_empty()),
         payload,
-        plugin_env: if route.span_plugins.is_empty() {
-            Default::default()
-        } else {
-            span_processor::environment()
-        },
         route: Some(route),
         config: None,
     };
@@ -850,7 +845,6 @@ struct ImportLive {
     sink: Box<dyn Sink>,
     ctx: SessionCtx,
     pending_ops: usize,
-    plugin_env: std::collections::BTreeMap<String, String>,
     plugins_disabled: bool,
 }
 
@@ -893,11 +887,6 @@ impl ImportProcessor {
                                 config: None,
                             },
                             pending_ops: 0,
-                            plugin_env: if env.plugin_env.is_empty() {
-                                crate::span_processor::environment()
-                            } else {
-                                env.plugin_env.clone()
-                            },
                             plugins_disabled: false,
                         },
                     );
@@ -907,9 +896,6 @@ impl ImportProcessor {
             if let Some(cfg) = &env.config {
                 live.sink.configure(cfg);
                 live.ctx.config = Some(cfg.clone());
-            }
-            if !env.plugin_env.is_empty() {
-                live.plugin_env = env.plugin_env.clone();
             }
             let ops = live.translator.handle(&env, &live.ctx)?;
             Self::emit_translator_batches(live, ops).await?;
@@ -945,7 +931,6 @@ impl ImportProcessor {
                                 op,
                                 &live.source,
                                 &live.ctx.session_id,
-                                &live.plugin_env,
                             )
                         })
                         .collect();

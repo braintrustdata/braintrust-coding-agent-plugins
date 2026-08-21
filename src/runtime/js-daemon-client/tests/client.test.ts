@@ -127,10 +127,6 @@ test("serializes initialize, events, flush, and status over one connection", asy
   ])
   assert.deepEqual(eventParams.map((params) => params.plugin_version), ["1.0.0", "1.0.0"])
   assert.deepEqual(eventParams.map((params) => params.managed_run_id), ["run-123", "run-123"])
-  assert.equal(
-    (eventParams[0]?.plugin_env as Record<string, string> | undefined)?.PATH,
-    process.env.PATH,
-  )
   await client.close()
   await new Promise<void>((resolve) => server.close(() => resolve()))
   rmSync(temp, { recursive: true, force: true })

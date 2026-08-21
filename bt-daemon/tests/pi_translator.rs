@@ -13,7 +13,6 @@ fn event(name: &str, ts_ms: i64, native: serde_json::Value) -> Envelope {
         ts_ms,
         managed_run_id: None,
         payload: json!({"event":native,"extension_version":"1.0.0","cwd":"."}),
-        plugin_env: Default::default(),
         route: None,
         config: None,
     }

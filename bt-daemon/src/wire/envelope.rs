@@ -3,7 +3,6 @@
 
 use braintrust_sdk_rust::SpanComponents;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// One captured hook event, forwarded from a shim to the daemon.
@@ -31,10 +30,6 @@ pub struct Envelope {
     pub managed_run_id: Option<String>,
     /// The raw agent-native hook payload; opaque except to the translator.
     pub payload: serde_json::Value,
-    /// Environment visible to span plugins for this live event. It is sent over
-    /// the private daemon transport but deliberately omitted from the journal.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub plugin_env: BTreeMap<String, String>,
     /// Non-secret, immutable routing intent for this session. New clients use
     /// this instead of resolving credentials themselves. The daemon host maps
     /// the selected profile and organization to live credentials.
@@ -265,7 +260,6 @@ mod tests {
             ts_ms: 1_753_639_552_123,
             managed_run_id: Some("run-1".into()),
             payload: serde_json::json!({ "session_id": "sess-1", "tool_name": "shell" }),
-            plugin_env: BTreeMap::from([("SECRET".into(), "not-journaled".into())]),
             route: Some(SessionRoute {
                 auth: AuthSelection {
                     profile: Some("work".into()),
