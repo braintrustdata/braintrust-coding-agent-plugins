@@ -26,6 +26,7 @@ clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 regex = "1"
 rquickjs = "0.12.2"
+rquickjs-serde = "0.6.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

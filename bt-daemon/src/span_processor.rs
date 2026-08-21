@@ -18,7 +18,6 @@ use std::time::{Duration, Instant, SystemTime};
 const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const STACK_LIMIT_BYTES: usize = 512 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_millis(50);
-const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
@@ -131,32 +130,19 @@ impl Engine {
             session_id,
             env: &self.env,
         };
-        let row_json = serde_json::to_vec(row)?;
-        let context_json = serde_json::to_vec(&context)?;
         self.arm_deadline();
-        let result = self.context.with(|ctx| -> anyhow::Result<Vec<u8>> {
+        let result = self.context.with(|ctx| -> anyhow::Result<SpanRow> {
             let function = function.restore(&ctx)?;
-            let row = ctx.json_parse(row_json)?;
-            let context = ctx.json_parse(context_json)?;
+            let row = rquickjs_serde::to_value(ctx.clone(), row)?;
+            let context = rquickjs_serde::to_value(ctx.clone(), &context)?;
             let result = function.call::<_, rquickjs::Value<'_>>((row, context))?;
             if result.as_promise().is_some() {
                 anyhow::bail!("plugin returned a Promise; span plugins must be synchronous");
             }
-            let json = ctx
-                .json_stringify(result)?
-                .ok_or_else(|| anyhow::anyhow!("plugin returned a non-JSON value"))?;
-            Ok(json.to_string()?.into_bytes())
+            Ok(rquickjs_serde::from_value_strict(result)?)
         });
         self.deadline_ms.store(0, Ordering::Relaxed);
-        let json = result?;
-        if json.len() > MAX_RESULT_BYTES {
-            anyhow::bail!(
-                "plugin returned {} bytes, exceeding the {} byte limit",
-                json.len(),
-                MAX_RESULT_BYTES
-            );
-        }
-        Ok(serde_json::from_slice(&json)?)
+        result
     }
 
     fn arm_deadline(&self) {
@@ -360,6 +346,11 @@ mod tests {
         let result = process(&[asynchronous], &SpanOp::Insert(row()), "codex", "session").unwrap();
         assert_eq!(result.failures.len(), 1);
         assert!(result.failures[0].message.contains("must be synchronous"));
+
+        let non_json = dir.path().join("non-json.mjs");
+        std::fs::write(&non_json, "export default () => Symbol('not-json')").unwrap();
+        let result = process(&[non_json], &SpanOp::Insert(row()), "codex", "session").unwrap();
+        assert_eq!(result.failures.len(), 1);
     }
 
     #[test]
