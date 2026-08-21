@@ -110,6 +110,7 @@ test("serializes initialize, events, flush, and status over one connection", asy
     event: name,
     ts_ms: Date.now(),
     payload: {},
+    route: { destination: {}, span_plugins: ["plugin.mjs"] },
   })
   assert.deepEqual(await Promise.all([client.log(envelope("one")), client.log(envelope("two"))]), [
     true,

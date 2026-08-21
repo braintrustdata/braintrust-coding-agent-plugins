@@ -318,7 +318,36 @@ impl SessionActor {
         };
         while let Some(ops) = next {
             if !ops.is_empty() {
-                match sink.emit(&ops).await {
+                let plugin_paths = ctx
+                    .config
+                    .as_ref()
+                    .map(|config| config.span_plugins.as_slice())
+                    .unwrap_or_default();
+                let mut processed = Vec::with_capacity(ops.len());
+                for op in &ops {
+                    match crate::span_processor::process(
+                        plugin_paths,
+                        op,
+                        &self.source,
+                        &self.session_id,
+                    ) {
+                        Ok(result) => {
+                            for failure in result.failures {
+                                self.set_error(format!(
+                                    "span plugin {} failed; disabled on this worker: {}",
+                                    failure.path.display(),
+                                    failure.message
+                                ));
+                            }
+                            processed.push(result.op);
+                        }
+                        Err(error) => {
+                            self.set_error(format!("span plugin processor failed: {error}"));
+                            processed.push(op.clone());
+                        }
+                    }
+                }
+                match sink.emit(&processed).await {
                     Ok(n) => {
                         self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
                     }
@@ -370,7 +399,7 @@ impl SessionActor {
             if !entry
                 .route
                 .as_ref()
-                .is_some_and(|candidate| candidate.same_route(&plan.route))
+                .is_some_and(|candidate| candidate.same_replay_route(&plan.route))
             {
                 continue;
             }

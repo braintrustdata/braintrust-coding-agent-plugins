@@ -981,6 +981,134 @@ async fn restart_replays_journal_with_stable_span_ids_before_new_events() {
 }
 
 #[tokio::test]
+async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment() {
+    let (data_dir, socket, first, tmp) = start_daemon().await;
+    let host = dummy_host();
+    let first_plugin = tmp.path().join("first.mjs");
+    let second_plugin = tmp.path().join("second.mjs");
+    std::fs::write(
+        &first_plugin,
+        "export default (span, context) => ({...span, name: `${context.env.PATH}:${span.name}`})",
+    )
+    .unwrap();
+    std::fs::write(
+        &second_plugin,
+        "export default (span, context) => ({...span, name: `${context.operation}:current:${span.name}`})",
+    )
+    .unwrap();
+
+    let mut start = envelope("plugin-replay", "SessionStart", 1);
+    start
+        .route
+        .as_mut()
+        .unwrap()
+        .span_plugins
+        .push(first_plugin);
+    forward_envelope(&start, &socket, &host, false)
+        .await
+        .unwrap();
+    flush_session("plugin-replay", &socket, 5000).await.unwrap();
+    shutdown(&socket).await;
+    first.await.unwrap();
+
+    let second = start_daemon_at(data_dir.clone(), socket.clone()).await;
+    let mut stop = envelope("plugin-replay", "Stop", 2);
+    stop.route
+        .as_mut()
+        .unwrap()
+        .span_plugins
+        .push(second_plugin);
+    forward_envelope(&stop, &socket, &host, false)
+        .await
+        .unwrap();
+    flush_session("plugin-replay", &socket, 5000).await.unwrap();
+
+    let spans = std::fs::read_to_string(data_dir.join("spans/plugin-replay.ndjson")).unwrap();
+    let names: Vec<_> = spans
+        .lines()
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            value
+                .get("Insert")
+                .or_else(|| value.get("Merge"))
+                .and_then(|row| row.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let path_prefix = format!("{}:", std::env::var("PATH").unwrap());
+    assert!(names.iter().any(|name| name.starts_with(&path_prefix)));
+    assert!(
+        names.iter().any(|name| name.contains(":current:")),
+        "the new plugin chain should process replayed and live rows: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.contains(&format!(":current:{path_prefix}"))),
+        "recovery should replace the journal's old plugin chain with the resumed route: {names:?}"
+    );
+
+    shutdown(&socket).await;
+    second.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failing_span_plugin_is_reported_and_fails_open() {
+    let (data_dir, socket, handle, tmp) = start_daemon().await;
+    let plugin = tmp.path().join("bad.mjs");
+    let later_plugin = tmp.path().join("later.mjs");
+    std::fs::write(
+        &plugin,
+        "export default span => ({...span, span_id: 'corrupt'})",
+    )
+    .unwrap();
+    std::fs::write(
+        &later_plugin,
+        "export default span => ({...span, name: `after-failure:${span.name}`})",
+    )
+    .unwrap();
+    let mut env = envelope("plugin-failure", "SessionStart", 1);
+    env.route
+        .as_mut()
+        .unwrap()
+        .span_plugins
+        .extend([plugin, later_plugin]);
+    forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    flush_session("plugin-failure", &socket, 5000)
+        .await
+        .unwrap();
+
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("plugin-failure".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        status.sessions[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("failed; disabled on this worker")),
+        "unexpected plugin status: {:?}",
+        status.sessions[0].last_error
+    );
+    let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+    assert!(!spans.contains("corrupt"));
+    assert!(spans.contains("after-failure:"));
+    assert!(
+        !spans.is_empty(),
+        "the original rows should still be delivered"
+    );
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn claude_boundary_journal_references_a_self_contained_transcript_mirror() {
     let (data_dir, socket, handle, tmp) = start_daemon().await;
     let transcript = tmp.path().join("claude.jsonl");
@@ -1310,6 +1438,7 @@ esac
             RunArgs {
                 source: RunSource::Codex,
                 additional_metadata: None,
+                plugin: Vec::new(),
                 agent_args: vec![session_id.into(), mode.into()],
             },
             RunHookCommand {

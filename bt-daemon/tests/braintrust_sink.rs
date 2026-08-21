@@ -26,6 +26,7 @@ fn session_config(base: &str) -> SessionConfig {
         }),
         flush_mode: FlushMode::FireAndForget,
         additional_metadata: None,
+        span_plugins: Vec::new(),
     }
 }
 

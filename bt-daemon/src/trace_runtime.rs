@@ -136,6 +136,7 @@ async fn session_config(
         destination: route.destination.clone(),
         flush_mode: route.flush_mode,
         additional_metadata: route.additional_metadata.clone(),
+        span_plugins: route.span_plugins.clone(),
     })
 }
 
@@ -198,6 +199,9 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             )
             .await?;
             apply_additional_metadata(&mut route, setup_args.additional_metadata.as_deref())?;
+            if !setup_args.plugin.is_empty() {
+                route.span_plugins = crate::resolve_span_plugin_paths(&setup_args.plugin)?;
+            }
             print_output(run_setup(setup_args, route)?, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
@@ -413,10 +417,12 @@ mod tests {
             TraceCommand::Setup(SetupArgs {
                 agent: SetupAgent::OpenCode,
                 additional_metadata: None,
+                plugin: Vec::new(),
             }),
             TraceCommand::Run(RunArgs {
                 source: RunSource::Codex,
                 additional_metadata: None,
+                plugin: Vec::new(),
                 agent_args: Vec::new(),
             }),
         ] {
@@ -486,6 +492,7 @@ mod tests {
                 parent: None,
                 attach: false,
                 additional_metadata: None,
+                plugin: Vec::new(),
             };
             let error = run_trace(
                 TraceArgs {
