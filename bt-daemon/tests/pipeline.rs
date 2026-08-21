@@ -1330,13 +1330,23 @@ async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment()
 async fn a_failing_span_plugin_is_reported_and_fails_open() {
     let (data_dir, socket, handle, tmp) = start_daemon().await;
     let plugin = tmp.path().join("bad.mjs");
+    let later_plugin = tmp.path().join("later.mjs");
     std::fs::write(
         &plugin,
         "export default span => ({...span, span_id: 'corrupt'})",
     )
     .unwrap();
+    std::fs::write(
+        &later_plugin,
+        "export default span => ({...span, name: `after-failure:${span.name}`})",
+    )
+    .unwrap();
     let mut env = envelope("plugin-failure", "SessionStart", 1);
-    env.route.as_mut().unwrap().span_plugins.push(plugin);
+    env.route
+        .as_mut()
+        .unwrap()
+        .span_plugins
+        .extend([plugin, later_plugin]);
     forward_envelope(&env, &socket, &dummy_host(), false)
         .await
         .unwrap();
@@ -1351,12 +1361,17 @@ async fn a_failing_span_plugin_is_reported_and_fails_open() {
     .await
     .unwrap()
     .unwrap();
-    assert!(status.sessions[0]
-        .last_error
-        .as_deref()
-        .is_some_and(|error| error.contains("span plugin failed")));
+    assert!(
+        status.sessions[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("failed; disabled on this worker")),
+        "unexpected plugin status: {:?}",
+        status.sessions[0].last_error
+    );
     let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
     assert!(!spans.contains("corrupt"));
+    assert!(spans.contains("after-failure:"));
     assert!(
         !spans.is_empty(),
         "the original rows should still be delivered"
