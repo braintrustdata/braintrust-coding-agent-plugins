@@ -272,7 +272,8 @@ impl SessionActor {
                         &mut sink,
                         &ctx,
                         translated,
-                        ("translate failed", "sink emit failed"),
+                        "translate failed",
+                        "sink emit failed",
                     )
                     .await;
                     self.counters.queued.fetch_sub(1, Ordering::Relaxed);
@@ -305,9 +306,9 @@ impl SessionActor {
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
         first: anyhow::Result<Vec<crate::translate::SpanOp>>,
-        errors: (&str, &str),
+        translate_error: &str,
+        emit_error: &str,
     ) {
-        let (translate_error, emit_error) = errors;
         let mut next = match first {
             Ok(ops) => Some(ops),
             Err(e) => {
@@ -409,7 +410,8 @@ impl SessionActor {
                 sink,
                 ctx,
                 translated,
-                ("journal replay failed", "sink replay emit failed"),
+                "journal replay failed",
+                "sink replay emit failed",
             )
             .await;
         }
@@ -427,7 +429,8 @@ impl SessionActor {
             sink,
             ctx,
             translated,
-            ("translate flush failed", "sink emit (flush) failed"),
+            "translate flush failed",
+            "sink emit (flush) failed",
         )
         .await;
         if let Err(e) = sink.flush().await {
