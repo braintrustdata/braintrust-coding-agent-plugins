@@ -42,7 +42,7 @@ Braintrust daemon. The plugin contains only a fail-open hook forwarder; `bt`
 owns authentication, trace construction, and delivery.
 
 ```bash
-bt trace setup claude --project my-coding-agent
+bt trace enable claude --project my-coding-agent
 ```
 
 Use `--profile` or `--org` when needed. Setup stores only non-secret routing
@@ -54,7 +54,7 @@ failures never fail a Claude Code turn.
 
 #### Additional root metadata
 
-For a persistent route, pass a JSON object to `bt trace setup claude
+For a persistent route, pass a JSON object to `bt trace enable claude
 --additional-metadata '<JSON>'` to tag the root span of every Claude Code
 session. Standard session metadata takes precedence if keys conflict.
 

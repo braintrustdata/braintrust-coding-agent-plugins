@@ -18,7 +18,7 @@ stored in the plugin.
 Install and configure the published plugin with the Braintrust CLI:
 
 ```bash
-bt trace setup codex --project my-coding-agent
+bt trace enable codex --project my-coding-agent
 ```
 
 Use `--profile` or `--org` when needed. Restart Codex after setup so it loads
@@ -38,7 +38,7 @@ exits successfully.
 
 ## Additional root metadata
 
-For a persistent route, pass a JSON object to `bt trace setup codex
+For a persistent route, pass a JSON object to `bt trace enable codex
 --additional-metadata '<JSON>'` to tag the root span of every Codex session.
 Standard session metadata takes precedence if keys conflict.
 

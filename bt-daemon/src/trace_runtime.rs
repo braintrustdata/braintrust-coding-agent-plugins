@@ -8,10 +8,10 @@
 use crate::trace_command::TraceCommand;
 use crate::wire::{AuthSelection, SessionConfig, SessionRoute};
 use crate::{
-    apply_additional_metadata, braintrust_serve_options, paths, run_hook, run_import, run_serve,
-    run_setup, run_status, run_traced, shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason,
-    BraintrustSinkConfig, HostInfo, OutputFormat, Registry, RunHookCommand, ServeOptions,
-    StatusArgs, TraceArgs, TraceCommandOutput,
+    apply_additional_metadata, braintrust_serve_options, paths, run_disable, run_enable, run_hook,
+    run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthLease, AuthProvider,
+    AuthResolveReason, BraintrustSinkConfig, HostInfo, OutputFormat, Registry, RunHookCommand,
+    ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -188,7 +188,7 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
 /// Execute the complete mounted trace command.
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
     match args.command {
-        TraceCommand::Setup(setup_args) => {
+        TraceCommand::Setup(enable_args) => {
             let mut route = resolve_command_route(
                 &host,
                 RouteRequirements {
@@ -197,8 +197,11 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 },
             )
             .await?;
-            apply_additional_metadata(&mut route, setup_args.additional_metadata.as_deref())?;
-            print_output(run_setup(setup_args, route)?, host.output_format)
+            apply_additional_metadata(&mut route, enable_args.additional_metadata.as_deref())?;
+            print_output(run_enable(enable_args, route)?, host.output_format)
+        }
+        TraceCommand::Disable(disable_args) => {
+            print_output(run_disable(disable_args.agent)?, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
             init_daemon_logging(host.verbose);

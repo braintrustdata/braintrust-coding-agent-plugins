@@ -16,7 +16,7 @@ running.
 
 ```bash
 bt auth login
-bt trace setup opencode
+bt trace enable opencode
 opencode
 ```
 
