@@ -19,8 +19,11 @@ pub struct TraceArgs {
 // clearer than boxing individual command variants for stack-size savings.
 #[allow(clippy::large_enum_variant)]
 pub enum TraceCommand {
-    /// Install the published Braintrust tracing plugin for a coding agent.
-    Setup(SetupArgs),
+    /// Install or enable the published Braintrust tracing plugin for a coding agent.
+    #[command(name = "enable", alias = "setup")]
+    Setup(EnableArgs),
+    /// Uninstall the Braintrust tracing plugin and remove its saved configuration.
+    Disable(DisableArgs),
     /// Run the tracing daemon (foreground).
     #[command(hide = true)]
     Daemon(ServeArgs),
@@ -47,12 +50,21 @@ pub struct StopArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct SetupArgs {
+pub struct EnableArgs {
     #[command(subcommand)]
     pub agent: SetupAgent,
     /// JSON object persisted in this agent's tracing route and merged into root-span metadata.
     #[arg(long, global = true, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
+}
+
+/// Backwards-compatible API name for hosts that mounted the former setup command.
+pub type SetupArgs = EnableArgs;
+
+#[derive(Debug, Clone, Args)]
+pub struct DisableArgs {
+    #[command(subcommand)]
+    pub agent: SetupAgent,
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -95,6 +107,15 @@ mod tests {
                 agent: SetupAgent::Claude,
                 additional_metadata: Some(ref value),
             }) if value == r#"{"setup":true}"#
+        ));
+
+        let legacy_setup = Cli::try_parse_from(["bt", "setup", "codex"]).unwrap();
+        assert!(matches!(
+            legacy_setup.trace.command,
+            TraceCommand::Setup(SetupArgs {
+                agent: SetupAgent::Codex,
+                ..
+            })
         ));
 
         let hook = Cli::try_parse_from([

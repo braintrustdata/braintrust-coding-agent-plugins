@@ -68,12 +68,12 @@ or provide it for one invocation with `bt trace run`. Both accept
 `--additional-metadata` or `BRAINTRUST_ADDITIONAL_METADATA`:
 
 ```bash
-bt trace setup claude --additional-metadata '{"team":"platform"}'
+bt trace enable claude --additional-metadata '{"team":"platform"}'
 BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"'"$JOB_ID"'"}' \
   bt trace run codex -- "summarize this change"
 ```
 
-`bt trace setup`, `bt trace run`, and `bt trace import` are explicit,
+`bt trace enable`, `bt trace run`, and `bt trace import` are explicit,
 user-invoked commands, so all three accept routing (profile, organization,
 project, destination) and `additional_metadata` from either a flag or the
 matching `BRAINTRUST_*` environment variable, with the flag winning if both
@@ -83,6 +83,10 @@ agent's persisted `braintrust.json`, or, for a child launched by `bt trace
 run`, from that invocation's settings. An explicit `--additional-metadata`
 flag or environment variable on `bt trace run` overrides the persisted route
 for that invocation only, without mutating the file.
+
+Use `bt trace disable <agent>` to remove the installed tracing plugin and its
+Braintrust settings. `bt trace setup <agent>` remains an alias for `bt trace
+enable <agent>` for backwards compatibility.
 
 ## Build / test
 
