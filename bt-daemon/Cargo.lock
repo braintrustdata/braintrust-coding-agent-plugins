@@ -278,6 +278,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rquickjs",
+ "rquickjs-serde",
  "serde",
  "serde_json",
  "sha2",
@@ -1508,6 +1509,16 @@ dependencies = [
  "hashbrown",
  "relative-path",
  "rquickjs-sys",
+]
+
+[[package]]
+name = "rquickjs-serde"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04cf0aa631f8d0c5051db35f9f59899c34074d7b6be280c03fd4ce6165d0ed35"
+dependencies = [
+ "rquickjs",
+ "serde",
 ]
 
 [[package]]
