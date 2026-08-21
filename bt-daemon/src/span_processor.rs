@@ -263,7 +263,16 @@ pub fn validate(plugins: &[PathBuf]) -> anyhow::Result<()> {
 
 fn environment() -> BTreeMap<String, String> {
     std::env::vars_os()
-        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            let value = value.into_string().ok()?;
+            // Windows environment variable names are case-insensitive, while
+            // JavaScript object properties are not. Use a stable casing there
+            // so portable plugins can read conventional names such as PATH.
+            #[cfg(windows)]
+            let key = key.to_ascii_uppercase();
+            Some((key, value))
+        })
         .collect()
 }
 
