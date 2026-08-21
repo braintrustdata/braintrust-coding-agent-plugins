@@ -186,12 +186,6 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
     Ok(())
 }
 
-fn configured_plugins(source: &str) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    crate::resolve_span_plugin_paths(&crate::settings::AgentSettings::configured_span_plugins(
-        source,
-    ))
-}
-
 /// Execute the complete mounted trace command.
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
     match args.command {
@@ -255,11 +249,6 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 })
                 .await?;
             apply_additional_metadata(&mut route, import_args.additional_metadata.as_deref())?;
-            let source = match import_args.source {
-                crate::ImportSource::Codex => "codex",
-                crate::ImportSource::Claude => "claude",
-            };
-            route.span_plugins = configured_plugins(source)?;
             let config = session_config(&host, &route).await?;
             run_import(import_args, serve_options(&host), Some(config)).await
         }
@@ -273,13 +262,6 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             )
             .await?;
             apply_additional_metadata(&mut route, run_args.additional_metadata.as_deref())?;
-            let source = match run_args.source {
-                crate::RunSource::Codex => "codex",
-                crate::RunSource::Claude => "claude",
-                crate::RunSource::OpenCode => "opencode",
-                crate::RunSource::Pi => "pi",
-            };
-            route.span_plugins = configured_plugins(source)?;
             let hook_command = child_command(&host.command, "hook");
             let status = run_traced(run_args, hook_command, route).await?;
             if status.success() {

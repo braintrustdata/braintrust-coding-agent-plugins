@@ -63,8 +63,9 @@ process-local settings overlay and never changes any of these files.
 
 `--plugin PATH` registers a synchronous ES module that transforms each
 sink-neutral span row after translation and immediately before delivery. Repeat
-the flag to compose plugins from left to right. Setup persists its ordered list;
-run and import append invocation plugins after the persisted list. Each path is
+the flag to compose plugins from left to right. Setup persists its ordered list
+for ordinary agent sessions. Managed runs and imports are isolated from that
+list and use only the `--plugin` flags passed to their command. Each path is
 canonicalized to an absolute path before it is validated or stored.
 
 Each module must default-export a synchronous function. It receives a span and
@@ -121,21 +122,21 @@ redactor runs first and its returned span becomes the tagger's input:
 bt trace setup codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
 ```
 
-`run` and `import` plugins apply only to that command and run after any plugins
-saved by setup:
+`run` and `import` plugins apply only to that command. They replace, rather than
+merge with, plugins saved by setup:
 
 ```bash
-# The invocation order is redact.mjs, tag-ci.mjs, then local.mjs.
+# Only local.mjs runs; redact.mjs and tag-ci.mjs remain global setup behavior.
 bt trace run --plugin ./local.mjs codex -- "summarize this change"
 
-# Imported transcript spans pass through the setup plugins first, followed by
-# sanitize-history.mjs.
+# Only sanitize-history.mjs transforms spans produced by this import.
 bt trace import codex SESSION_ID --plugin ./sanitize-history.mjs
 ```
 
 The journal stores raw input events, not transformed spans. After daemon
-recovery, replayed events therefore pass through the plugin chain supplied by
-the resumed session's current route.
+recovery, replayed events therefore pass through the resumed session's current
+route: ordinary sessions use the current globally configured plugins, while a
+managed session continues using only that run's isolated plugins.
 
 `context.operation` is `"insert"` or `"merge"`; `context.source` and
 `context.session_id` identify the translated event stream; and `context.env`
