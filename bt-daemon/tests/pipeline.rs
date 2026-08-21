@@ -1321,6 +1321,12 @@ async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment()
         names.iter().any(|name| name.contains(":current:")),
         "the new plugin chain should process replayed and live rows: {names:?}"
     );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.contains(&format!(":current:{path_prefix}"))),
+        "recovery should replace the journal's old plugin chain with the resumed route: {names:?}"
+    );
 
     shutdown(&socket).await;
     second.await.unwrap();

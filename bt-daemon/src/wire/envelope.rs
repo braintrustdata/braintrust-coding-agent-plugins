@@ -148,7 +148,7 @@ pub struct SessionRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
     /// Ordered JavaScript span transforms. Paths are resolved by explicit
-    /// setup, run, and import commands before entering persistent settings.
+    /// setup, run, and import commands before entering a session route.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub span_plugins: Vec<PathBuf>,
 }

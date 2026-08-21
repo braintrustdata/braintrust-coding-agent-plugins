@@ -215,8 +215,8 @@ pub struct ImportArgs {
     /// JSON object merged into every imported root span's metadata.
     #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
-    /// JavaScript span transform for this import. Repeat to compose transforms
-    /// after plugins from the agent's persistent setup.
+    /// JavaScript span transform for this import. Repeat to compose an isolated
+    /// transform chain; persistent setup plugins are not included.
     #[arg(long, value_name = "PATH")]
     pub plugin: Vec<PathBuf>,
 }
@@ -265,8 +265,8 @@ pub struct RunArgs {
     /// JSON object merged into root-span metadata for this invocation.
     #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
-    /// JavaScript span transform for this invocation. Repeat to compose
-    /// transforms after plugins from persistent setup.
+    /// JavaScript span transform for this invocation. Repeat to compose an
+    /// isolated transform chain; persistent setup plugins are not included.
     #[arg(long, value_name = "PATH")]
     pub plugin: Vec<PathBuf>,
     /// Arguments forwarded verbatim to the coding agent.
@@ -565,23 +565,7 @@ pub async fn run_import(
     mut config: Option<SessionConfig>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     validate_import_selection(&args)?;
-    let command_plugins = resolve_span_plugin_paths(&args.plugin)?;
-    if !command_plugins.is_empty() {
-        let config = config.get_or_insert_with(|| SessionConfig {
-            auth: wire::BackendAuth {
-                token: String::new(),
-                api_url: None,
-                app_url: None,
-                org_name: None,
-                org_id: None,
-            },
-            destination: None,
-            flush_mode: wire::FlushMode::FireAndForget,
-            additional_metadata: None,
-            span_plugins: Vec::new(),
-        });
-        config.span_plugins.extend(command_plugins);
-    }
+    apply_import_span_plugins(&mut config, &args.plugin)?;
     let destination = import_parent_components(&args)?
         .map(|components| wire::TraceDestination::ParentSpan { components })
         .or_else(|| args.destination.clone());
@@ -600,6 +584,31 @@ pub async fn run_import(
         .await;
     }
     import_transcripts_with_ledger(&files, args.source, opts, config, Some(ledger_dir)).await
+}
+
+fn apply_import_span_plugins(
+    config: &mut Option<SessionConfig>,
+    plugins: &[PathBuf],
+) -> anyhow::Result<()> {
+    let plugins = resolve_span_plugin_paths(plugins)?;
+    if let Some(config) = config.as_mut() {
+        config.span_plugins = plugins;
+    } else if !plugins.is_empty() {
+        *config = Some(SessionConfig {
+            auth: wire::BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: None,
+            flush_mode: wire::FlushMode::FireAndForget,
+            additional_metadata: None,
+            span_plugins: plugins,
+        });
+    }
+    Ok(())
 }
 
 fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
@@ -697,9 +706,7 @@ pub async fn run_traced(
     hook_command: RunHookCommand,
     mut route: SessionRoute,
 ) -> anyhow::Result<std::process::ExitStatus> {
-    route
-        .span_plugins
-        .extend(resolve_span_plugin_paths(&args.plugin)?);
+    apply_run_span_plugins(&mut route, &args.plugin)?;
     if route.destination.is_none() {
         anyhow::bail!(
             "managed run requires a trace destination; select a project, object destination, or parent span"
@@ -825,6 +832,11 @@ impl ManagedRunRuntime {
         ));
         Ok(Self { temp_dir, socket })
     }
+}
+
+fn apply_run_span_plugins(route: &mut SessionRoute, plugins: &[PathBuf]) -> anyhow::Result<()> {
+    route.span_plugins = resolve_span_plugin_paths(plugins)?;
+    Ok(())
 }
 
 pub(crate) fn resolve_span_plugin_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
@@ -1458,6 +1470,52 @@ mod tests {
     }
 
     #[test]
+    fn managed_run_plugins_replace_inherited_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("run.mjs");
+        std::fs::write(&plugin, "export default span => span").unwrap();
+        let mut route = SessionRoute {
+            span_plugins: vec![PathBuf::from("persisted.mjs")],
+            ..SessionRoute::default()
+        };
+
+        apply_run_span_plugins(&mut route, &[]).unwrap();
+        assert!(route.span_plugins.is_empty());
+
+        apply_run_span_plugins(&mut route, std::slice::from_ref(&plugin)).unwrap();
+        assert_eq!(route.span_plugins, [plugin.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn import_plugins_replace_inherited_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("import.mjs");
+        std::fs::write(&plugin, "export default span => span").unwrap();
+        let mut config = Some(SessionConfig {
+            auth: wire::BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: None,
+            flush_mode: wire::FlushMode::FireAndForget,
+            additional_metadata: None,
+            span_plugins: vec![PathBuf::from("persisted.mjs")],
+        });
+
+        apply_import_span_plugins(&mut config, &[]).unwrap();
+        assert!(config.as_ref().unwrap().span_plugins.is_empty());
+
+        apply_import_span_plugins(&mut config, std::slice::from_ref(&plugin)).unwrap();
+        assert_eq!(
+            config.unwrap().span_plugins,
+            [plugin.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
     fn import_args_accept_multiple_sessions_or_all() {
         let explicit = ImportCli::try_parse_from([
             "test",
@@ -1748,6 +1806,7 @@ mod tests {
             RunArgs {
                 source: RunSource::Codex,
                 additional_metadata: None,
+                plugin: Vec::new(),
                 agent_args: vec![OsString::from("--dangerously-bypass-hook-trust")],
             },
             test_run_hook_command(),
