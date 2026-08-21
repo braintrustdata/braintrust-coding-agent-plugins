@@ -280,7 +280,6 @@ impl BraintrustSink {
             .span_type(map_span_type(row.span_type))
             .span_id(row.span_id.clone())
             .row_id(row.span_id.clone())
-            .project_name(project)
             .parent_info(parent)
             .span_origin(
                 SpanOrigin::new()

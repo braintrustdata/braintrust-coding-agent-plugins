@@ -7,6 +7,7 @@
 //! whole pipeline be exercised with a debug sink and makes translators unit-
 //! testable without any network.
 
+mod antigravity;
 mod claude;
 mod codex;
 mod debug;
@@ -15,6 +16,7 @@ mod opencode;
 mod pi;
 mod recent;
 
+pub use antigravity::AntigravityTranslatorFactory;
 pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;
 pub use debug::DebugTranslatorFactory;
@@ -133,6 +135,7 @@ impl Registry {
     pub fn default_agents() -> Self {
         let mut r = Registry::debug_only();
         let git = Arc::new(git::GitMetadataCache::default());
+        r.register(Box::new(AntigravityTranslatorFactory::new(git.clone())));
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
         r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
         r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));

@@ -1,2 +1,5 @@
 # Build output
 dist/
+
+# Local credentials and environment overrides
+.env
