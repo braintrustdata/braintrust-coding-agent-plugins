@@ -14,7 +14,6 @@ use crate::journal::JournalWriter;
 use crate::sink::SinkFactory;
 use crate::translate::{Registry, SessionCtx};
 use crate::wire::{Envelope, SessionRoute};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -306,7 +305,6 @@ impl BatchMode {
 }
 
 struct PluginState {
-    env: BTreeMap<String, String>,
     disabled: bool,
 }
 
@@ -370,10 +368,7 @@ impl SessionActor {
             session_id: self.session_id.clone(),
             config: Some(self.config.clone()),
         };
-        let mut plugins = PluginState {
-            env: crate::span_processor::environment(),
-            disabled: false,
-        };
+        let mut plugins = PluginState { disabled: false };
         sink.configure(&self.config);
         self.refresh_permalink(sink.as_ref());
         // Rebuild translator state before accepting the first new event.
@@ -396,9 +391,6 @@ impl SessionActor {
                 SessionMsg::Event(env, journal_through, reply) => {
                     let correlation_barrier = is_tool_lifecycle_event(&env.event);
                     let mut reply = Some(reply);
-                    if !env.plugin_env.is_empty() {
-                        plugins.env = env.plugin_env.clone();
-                    }
                     if let Some(cfg) = &env.config {
                         sink.configure(cfg);
                         ctx.config = Some(cfg.clone());
@@ -552,7 +544,6 @@ impl SessionActor {
                                 op,
                                 &self.source,
                                 &self.session_id,
-                                &plugins.env,
                             )
                         })
                         .collect();

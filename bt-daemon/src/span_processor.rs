@@ -24,7 +24,7 @@ thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
     Insert,
@@ -41,6 +41,7 @@ struct PluginContext<'a> {
 
 struct Engine {
     modules: HashMap<PathBuf, CachedModule>,
+    env: BTreeMap<String, String>,
     context: Context,
     started: Instant,
     deadline_ms: Arc<AtomicU64>,
@@ -70,6 +71,7 @@ impl Engine {
         let context = Context::full(&runtime)?;
         Ok(Self {
             modules: HashMap::new(),
+            env: environment(),
             context,
             started,
             deadline_ms,
@@ -116,11 +118,19 @@ impl Engine {
         &mut self,
         path: &Path,
         row: &SpanRow,
-        context: &PluginContext<'_>,
+        operation: Operation,
+        source: &str,
+        session_id: &str,
     ) -> anyhow::Result<SpanRow> {
         let function = self.load(path)?;
+        let context = PluginContext {
+            operation,
+            source,
+            session_id,
+            env: &self.env,
+        };
         let row_json = serde_json::to_vec(row)?;
-        let context_json = serde_json::to_vec(context)?;
+        let context_json = serde_json::to_vec(&context)?;
         self.arm_deadline();
         let result = self.context.with(|ctx| -> anyhow::Result<Vec<u8>> {
             let function = function.restore(&ctx)?;
@@ -165,7 +175,6 @@ pub fn process(
     op: &SpanOp,
     source: &str,
     session_id: &str,
-    env: &BTreeMap<String, String>,
 ) -> anyhow::Result<SpanOp> {
     if plugins.is_empty() {
         return Ok(op.clone());
@@ -179,19 +188,13 @@ pub fn process(
         row.root_span_id.clone(),
         row.parent_span_ids.clone(),
     );
-    let context = PluginContext {
-        operation,
-        source,
-        session_id,
-        env,
-    };
     ENGINE.with_borrow_mut(|slot| -> anyhow::Result<()> {
         if slot.is_none() {
             *slot = Some(Engine::new()?);
         }
         let engine = slot.as_mut().expect("engine initialized");
         for plugin in plugins {
-            row = engine.call(plugin, &row, &context)?;
+            row = engine.call(plugin, &row, operation, source, session_id)?;
             if (
                 row.span_id.as_str(),
                 row.root_span_id.as_str(),
@@ -230,7 +233,7 @@ pub fn validate(plugins: &[PathBuf]) -> anyhow::Result<()> {
     })
 }
 
-pub fn environment() -> BTreeMap<String, String> {
+fn environment() -> BTreeMap<String, String> {
     std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect()
@@ -256,7 +259,7 @@ mod tests {
         let second = dir.path().join("second.mjs");
         std::fs::write(
             &first,
-            "export default (span, context) => ({...span, name: `${context.source}:${context.env.TEAM}:${span.name}`})",
+            "export default (span, context) => ({...span, name: `${context.source}:${context.env.PATH}:${span.name}`})",
         )
         .unwrap();
         std::fs::write(
@@ -264,19 +267,15 @@ mod tests {
             "export default span => ({...span, metadata: {second: true}})",
         )
         .unwrap();
-        let env = BTreeMap::from([("TEAM".into(), "platform".into())]);
-        let processed = process(
-            &[first, second],
-            &SpanOp::Insert(row()),
-            "codex",
-            "session",
-            &env,
-        )
-        .unwrap();
+        let processed =
+            process(&[first, second], &SpanOp::Insert(row()), "codex", "session").unwrap();
         let SpanOp::Insert(processed) = processed else {
             panic!("expected insert")
         };
-        assert_eq!(processed.name, "codex:platform:original");
+        assert_eq!(
+            processed.name,
+            format!("codex:{}:original", std::env::var("PATH").unwrap())
+        );
         assert_eq!(processed.metadata.unwrap()["second"], true);
     }
 
@@ -289,14 +288,7 @@ mod tests {
             "export default span => ({...span, span_id: 'different'})",
         )
         .unwrap();
-        let error = process(
-            &[plugin],
-            &SpanOp::Insert(row()),
-            "codex",
-            "session",
-            &BTreeMap::new(),
-        )
-        .unwrap_err();
+        let error = process(&[plugin], &SpanOp::Insert(row()), "codex", "session").unwrap_err();
         assert!(error.to_string().contains("immutable span identity"));
     }
 
@@ -306,14 +298,7 @@ mod tests {
         let runaway = dir.path().join("runaway.mjs");
         std::fs::write(&runaway, "export default span => { while (true) {} }").unwrap();
         let started = Instant::now();
-        assert!(process(
-            &[runaway],
-            &SpanOp::Insert(row()),
-            "codex",
-            "session",
-            &BTreeMap::new(),
-        )
-        .is_err());
+        assert!(process(&[runaway], &SpanOp::Insert(row()), "codex", "session").is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
 
         let asynchronous = dir.path().join("async.mjs");
@@ -322,14 +307,8 @@ mod tests {
             "export default async span => ({...span, name: 'later'})",
         )
         .unwrap();
-        let error = process(
-            &[asynchronous],
-            &SpanOp::Insert(row()),
-            "codex",
-            "session",
-            &BTreeMap::new(),
-        )
-        .unwrap_err();
+        let error =
+            process(&[asynchronous], &SpanOp::Insert(row()), "codex", "session").unwrap_err();
         assert!(error.to_string().contains("must be synchronous"));
     }
 }

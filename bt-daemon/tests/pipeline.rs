@@ -137,7 +137,6 @@ fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
         ts_ms,
         managed_run_id: None,
         payload: serde_json::json!({ "session_id": session_id, "hook_event_name": event, "n": ts_ms }),
-        plugin_env: Default::default(),
         route: Some(SessionRoute {
             destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
                 project_id: None,
@@ -1261,14 +1260,14 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
 }
 
 #[tokio::test]
-async fn span_plugins_transform_live_and_replayed_rows_with_event_environment() {
+async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment() {
     let (data_dir, socket, first, tmp) = start_daemon().await;
     let host = dummy_host();
     let first_plugin = tmp.path().join("first.mjs");
     let second_plugin = tmp.path().join("second.mjs");
     std::fs::write(
         &first_plugin,
-        "export default (span, context) => ({...span, name: `${context.env.PREFIX}:${span.name}`})",
+        "export default (span, context) => ({...span, name: `${context.env.PATH}:${span.name}`})",
     )
     .unwrap();
     std::fs::write(
@@ -1284,20 +1283,12 @@ async fn span_plugins_transform_live_and_replayed_rows_with_event_environment() 
         .unwrap()
         .span_plugins
         .push(first_plugin);
-    start.plugin_env = std::collections::BTreeMap::from([
-        ("PREFIX".into(), "live".into()),
-        ("PLUGIN_SECRET".into(), "must-not-be-journaled".into()),
-    ]);
     forward_envelope(&start, &socket, &host, false)
         .await
         .unwrap();
     flush_session("plugin-replay", &socket, 5000).await.unwrap();
     shutdown(&socket).await;
     first.await.unwrap();
-
-    let journal = std::fs::read_to_string(data_dir.join("journal/plugin-replay.ndjson")).unwrap();
-    assert!(!journal.contains("PLUGIN_SECRET"));
-    assert!(!journal.contains("must-not-be-journaled"));
 
     let second = start_daemon_at(data_dir.clone(), socket.clone()).await;
     let mut stop = envelope("plugin-replay", "Stop", 2);
@@ -1324,7 +1315,8 @@ async fn span_plugins_transform_live_and_replayed_rows_with_event_environment() 
                 .map(str::to_owned)
         })
         .collect();
-    assert!(names.iter().any(|name| name.starts_with("live:")));
+    let path_prefix = format!("{}:", std::env::var("PATH").unwrap());
+    assert!(names.iter().any(|name| name.starts_with(&path_prefix)));
     assert!(
         names.iter().any(|name| name.contains(":current:")),
         "the new plugin chain should process replayed and live rows: {names:?}"

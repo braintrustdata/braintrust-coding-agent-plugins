@@ -69,7 +69,6 @@ fn envelope(session: &str, event: &str, transcript_path: &str, extra: Value) -> 
         ts_ms: 0,
         managed_run_id: None,
         payload,
-        plugin_env: Default::default(),
         route: None,
         config: None,
         capture: None,
