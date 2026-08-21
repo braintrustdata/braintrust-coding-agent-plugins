@@ -84,6 +84,13 @@ impl AgentSettings {
     pub(crate) fn tracing_enabled(&self) -> bool {
         self.trace_to_braintrust.unwrap_or(false)
     }
+
+    pub(crate) fn configured_span_plugins(source: &str) -> Vec<std::path::PathBuf> {
+        Self::load_from(&paths::agent_settings_path(source, None))
+            .route
+            .map(|route| route.span_plugins)
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

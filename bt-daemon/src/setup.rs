@@ -267,6 +267,13 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
             .filter(|metadata| metadata.is_object())
             .cloned();
     }
+    if route.span_plugins.is_empty() {
+        route.span_plugins = settings
+            .get("route")
+            .and_then(|route| route.get("span_plugins"))
+            .and_then(|plugins| serde_json::from_value(plugins.clone()).ok())
+            .unwrap_or_default();
+    }
     settings.insert("trace_to_braintrust".into(), Value::Bool(true));
     settings.insert("route".into(), serde_json::to_value(route)?);
     settings.remove("traceToBraintrust");
@@ -573,6 +580,34 @@ mod tests {
         assert_eq!(
             settings["route"]["additional_metadata"],
             serde_json::json!({"run_id": "new"})
+        );
+    }
+
+    #[test]
+    fn tracing_settings_preserve_plugins_until_setup_explicitly_replaces_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        std::fs::write(&path, r#"{"route":{"span_plugins":["old.mjs"]}}"#).unwrap();
+
+        enable_tracing_at(&path, SessionRoute::default()).unwrap();
+        let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["route"]["span_plugins"],
+            serde_json::json!(["old.mjs"])
+        );
+
+        enable_tracing_at(
+            &path,
+            SessionRoute {
+                span_plugins: vec![PathBuf::from("first.mjs"), PathBuf::from("second.mjs")],
+                ..SessionRoute::default()
+            },
+        )
+        .unwrap();
+        let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["route"]["span_plugins"],
+            serde_json::json!(["first.mjs", "second.mjs"])
         );
     }
 }

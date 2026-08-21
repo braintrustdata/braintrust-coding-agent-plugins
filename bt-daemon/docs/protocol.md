@@ -188,6 +188,7 @@ Used for version handover and by tests.
   "ts_ms": 1753639552123,
   "managed_run_id": "invocation-uuid",
   "payload": { "…raw agent-native hook payload…": true },
+  "plugin_env": { "CI": "true" },
   "route": {
     "auth": {
       "profile": "work",
@@ -199,7 +200,8 @@ Used for version handover and by tests.
       "project_name": "codex"
     },
     "flush_mode": "fire_and_forget",
-    "additional_metadata": { "…": "…" }
+    "additional_metadata": { "…": "…" },
+    "span_plugins": ["/absolute/path/redact.mjs"]
   }
 }
 ```
@@ -220,6 +222,8 @@ Field notes:
   daemon.
 - **`payload`** is opaque to transport and to everything except the translator
   for `source`.
+- **`plugin_env`** is the event producer's string environment map, exposed to
+  span plugins as `context.env`. It is transported live but never journaled.
 - **`managed_run_id`** is present only for events inherited from a
   `bt trace run` process tree. It groups native sessions for the final
   invocation flush and is not trace metadata.
@@ -247,8 +251,9 @@ Field notes:
 ### Redaction
 
 Live credentials returned by the host provider are **never** written to the
-journal, logs, status, or RPC response. Envelopes journal only their non-secret
-`route`, allowing restart recovery to resolve a fresh lease.
+journal, logs, status, or RPC response. The live plugin environment is likewise
+omitted because it commonly contains secrets. Envelopes journal only their
+non-secret `route`, allowing restart recovery to resolve a fresh lease.
 
 ## Daemon lifecycle
 
@@ -315,8 +320,10 @@ profiles, organizations, and destinations while sharing one daemon.
   `$HOME/.braintrust/state/bt-daemon` on Unix, and
   `%LOCALAPPDATA%\Braintrust\bt-daemon` on Windows. On restart the daemon
   rebuilds each route's unfinished correlation state independently, replaying
-  only the journal entries whose `route` matches that pipeline into a fresh
-  translator. The resulting rows may be resubmitted to repair delivery
+  only the journal entries whose delivery route matches that pipeline into a
+  fresh translator. Span plugin paths are ignored for this comparison so raw
+  events can be replayed through the current plugin chain. The resulting rows
+  may be resubmitted to repair delivery
   interrupted by a crash, but their deterministic ids target the same backend
   rows and must never create duplicate spans, and a route never receives
   another route's rows. Replay streams the journal and is bounded to the

@@ -305,6 +305,7 @@ fn envelope(
         ts_ms,
         managed_run_id: None,
         payload,
+        plugin_env: Default::default(),
         route: None,
         config: None,
     }

@@ -3,6 +3,8 @@
 
 use braintrust_sdk_rust::SpanComponents;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// One captured hook event, forwarded from a shim to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,10 @@ pub struct Envelope {
     pub managed_run_id: Option<String>,
     /// The raw agent-native hook payload; opaque except to the translator.
     pub payload: serde_json::Value,
+    /// Environment visible to span plugins for this live event. It is sent over
+    /// the private daemon transport but deliberately omitted from the journal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugin_env: BTreeMap<String, String>,
     /// Non-secret, immutable routing intent for this session. New clients use
     /// this instead of resolving credentials themselves. The daemon host maps
     /// the selected profile and organization to live credentials.
@@ -63,6 +69,10 @@ pub struct SessionRoute {
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
+    /// Ordered JavaScript span transforms. Paths are resolved by explicit
+    /// setup, run, and import commands before entering persistent settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub span_plugins: Vec<PathBuf>,
 }
 
 impl SessionRoute {
@@ -72,11 +82,22 @@ impl SessionRoute {
             destination: self.destination.clone(),
             flush_mode: self.flush_mode,
             additional_metadata: self.additional_metadata.clone(),
+            span_plugins: self.span_plugins.clone(),
         }
     }
 
     pub fn same_route(&self, other: &Self) -> bool {
         serde_json::to_value(self).ok() == serde_json::to_value(other).ok()
+    }
+
+    /// Raw journal entries can be replayed through a newer plugin chain as
+    /// long as their Braintrust delivery route is otherwise unchanged.
+    pub fn same_replay_route(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.span_plugins.clear();
+        right.span_plugins.clear();
+        left.same_route(&right)
     }
 }
 
@@ -91,6 +112,8 @@ pub struct SessionConfig {
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub span_plugins: Vec<PathBuf>,
 }
 
 /// Where a session's root span should be logged.
@@ -242,6 +265,7 @@ mod tests {
             ts_ms: 1_753_639_552_123,
             managed_run_id: Some("run-1".into()),
             payload: serde_json::json!({ "session_id": "sess-1", "tool_name": "shell" }),
+            plugin_env: BTreeMap::from([("SECRET".into(), "not-journaled".into())]),
             route: Some(SessionRoute {
                 auth: AuthSelection {
                     profile: Some("work".into()),
@@ -264,6 +288,7 @@ mod tests {
                 destination: None,
                 flush_mode: FlushMode::FireAndForget,
                 additional_metadata: None,
+                span_plugins: Vec::new(),
             }),
         }
     }

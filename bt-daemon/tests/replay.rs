@@ -1,3 +1,4 @@
+use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
     import_transcript, import_transcripts, DebugSinkFactory, ImportSource, Registry, ServeOptions,
 };
@@ -67,6 +68,56 @@ fn inserted(rows: &[Value], span_type: &str) -> usize {
     rows.iter()
         .filter(|row| row.pointer("/Insert/span_type").and_then(Value::as_str) == Some(span_type))
         .count()
+}
+
+#[tokio::test]
+async fn import_uses_the_same_span_plugin_stage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("plugin-import.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"plugin-import","cwd":"/tmp/demo"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
+        ],
+    );
+    let plugin = tmp.path().join("import.mjs");
+    std::fs::write(
+        &plugin,
+        "export default span => ({...span, name: `imported:${span.name}`})",
+    )
+    .unwrap();
+    let output = tmp.path().join("spans");
+    import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        options(&output),
+        Some(SessionConfig {
+            auth: BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: None,
+            flush_mode: FlushMode::FireAndForget,
+            additional_metadata: None,
+            span_plugins: vec![plugin],
+        }),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let output = rows(&output.join("plugin-import.ndjson"));
+    assert!(output
+        .iter()
+        .filter_map(|op| op.get("Insert"))
+        .all(|row| row["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("imported:"))));
 }
 
 #[tokio::test]

@@ -263,6 +263,7 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
         ts_ms: r.ts_ms,
         managed_run_id: r.managed_run_id,
         payload: r.payload,
+        plugin_env: std::collections::BTreeMap::new(),
         route,
         config,
     }

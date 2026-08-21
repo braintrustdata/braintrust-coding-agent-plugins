@@ -21,6 +21,7 @@ mod server;
 mod settings;
 mod setup;
 mod sink;
+mod span_processor;
 mod trace_command;
 mod trace_runtime;
 mod transcript_import;
@@ -161,6 +162,10 @@ pub struct ImportArgs {
     /// JSON object merged into every imported root span's metadata.
     #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
+    /// JavaScript span transform for this import. Repeat to compose transforms
+    /// after plugins from the agent's persistent setup.
+    #[arg(long, value_name = "PATH")]
+    pub plugin: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -180,6 +185,10 @@ pub struct RunArgs {
     /// JSON object merged into root-span metadata for this invocation.
     #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
+    /// JavaScript span transform for this invocation. Repeat to compose
+    /// transforms after plugins from persistent setup.
+    #[arg(long, value_name = "PATH")]
+    pub plugin: Vec<PathBuf>,
     /// Arguments forwarded verbatim to the coding agent.
     #[arg(allow_hyphen_values = true)]
     pub agent_args: Vec<OsString>,
@@ -259,6 +268,11 @@ pub async fn run_hook(
             .ok()
             .filter(|value| !value.is_empty()),
         payload,
+        plugin_env: if route.span_plugins.is_empty() {
+            Default::default()
+        } else {
+            span_processor::environment()
+        },
         route: Some(route),
         config: None,
     };
@@ -463,6 +477,23 @@ pub async fn run_import(
     mut config: Option<SessionConfig>,
 ) -> anyhow::Result<()> {
     validate_import_selection(&args)?;
+    let command_plugins = resolve_span_plugin_paths(&args.plugin)?;
+    if !command_plugins.is_empty() {
+        let config = config.get_or_insert_with(|| SessionConfig {
+            auth: wire::BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: None,
+            flush_mode: wire::FlushMode::FireAndForget,
+            additional_metadata: None,
+            span_plugins: Vec::new(),
+        });
+        config.span_plugins.extend(command_plugins);
+    }
     let destination = args
         .parent
         .map(|components| wire::TraceDestination::ParentSpan { components })
@@ -491,8 +522,11 @@ fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
 pub async fn run_traced(
     args: RunArgs,
     hook_command: RunHookCommand,
-    route: SessionRoute,
+    mut route: SessionRoute,
 ) -> anyhow::Result<std::process::ExitStatus> {
+    route
+        .span_plugins
+        .extend(resolve_span_plugin_paths(&args.plugin)?);
     if route.destination.is_none() {
         anyhow::bail!(
             "managed run requires a trace destination; select a project, object destination, or parent span"
@@ -558,6 +592,19 @@ pub async fn run_traced(
         Err(error) => tracing::warn!(managed_run_id, %error, "managed run trace flush failed"),
     }
     status
+}
+
+pub(crate) fn resolve_span_plugin_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let paths: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            path.canonicalize().map_err(|error| {
+                anyhow::anyhow!("could not resolve span plugin {}: {error}", path.display())
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    crate::span_processor::validate(&paths)?;
+    Ok(paths)
 }
 
 fn managed_run_args(
@@ -798,10 +845,13 @@ pub async fn import_transcripts(
 }
 
 struct ImportLive {
+    source: String,
     translator: Box<dyn AgentTranslator>,
     sink: Box<dyn Sink>,
     ctx: SessionCtx,
     pending_ops: usize,
+    plugin_env: std::collections::BTreeMap<String, String>,
+    plugins_disabled: bool,
 }
 
 struct ImportProcessor {
@@ -835,6 +885,7 @@ impl ImportProcessor {
                     self.sessions.insert(
                         sid.clone(),
                         ImportLive {
+                            source: env.source.clone(),
                             translator,
                             sink,
                             ctx: SessionCtx {
@@ -842,6 +893,12 @@ impl ImportProcessor {
                                 config: None,
                             },
                             pending_ops: 0,
+                            plugin_env: if env.plugin_env.is_empty() {
+                                crate::span_processor::environment()
+                            } else {
+                                env.plugin_env.clone()
+                            },
+                            plugins_disabled: false,
                         },
                     );
                     self.sessions.get_mut(&sid).unwrap()
@@ -850,6 +907,9 @@ impl ImportProcessor {
             if let Some(cfg) = &env.config {
                 live.sink.configure(cfg);
                 live.ctx.config = Some(cfg.clone());
+            }
+            if !env.plugin_env.is_empty() {
+                live.plugin_env = env.plugin_env.clone();
             }
             let ops = live.translator.handle(&env, &live.ctx)?;
             Self::emit_translator_batches(live, ops).await?;
@@ -868,7 +928,41 @@ impl ImportProcessor {
             // for every native turn boundary.
             const FLUSH_OPS: usize = 500;
             for chunk in ops.chunks(FLUSH_OPS) {
-                live.sink.emit(chunk).await?;
+                let transformed = if live.plugins_disabled {
+                    chunk.to_vec()
+                } else {
+                    let plugins = live
+                        .ctx
+                        .config
+                        .as_ref()
+                        .map(|config| config.span_plugins.as_slice())
+                        .unwrap_or_default();
+                    let transformed: anyhow::Result<Vec<_>> = chunk
+                        .iter()
+                        .map(|op| {
+                            crate::span_processor::process(
+                                plugins,
+                                op,
+                                &live.source,
+                                &live.ctx.session_id,
+                                &live.plugin_env,
+                            )
+                        })
+                        .collect();
+                    match transformed {
+                        Ok(transformed) => transformed,
+                        Err(error) => {
+                            live.plugins_disabled = true;
+                            tracing::warn!(
+                                session_id = %live.ctx.session_id,
+                                %error,
+                                "span plugin failed during import; disabled for session"
+                            );
+                            chunk.to_vec()
+                        }
+                    }
+                };
+                live.sink.emit(&transformed).await?;
                 live.pending_ops += chunk.len();
                 if live.pending_ops >= FLUSH_OPS {
                     live.sink.flush().await?;
@@ -1035,6 +1129,7 @@ mod tests {
             parent: None,
             attach: true,
             additional_metadata: None,
+            plugin: Vec::new(),
         };
         assert!(validate_import_selection(&args)
             .unwrap_err()
@@ -1093,6 +1188,7 @@ mod tests {
             RunArgs {
                 source: RunSource::Codex,
                 additional_metadata: None,
+                plugin: Vec::new(),
                 agent_args: Vec::new(),
             },
             test_run_hook_command(),

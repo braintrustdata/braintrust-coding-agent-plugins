@@ -59,6 +59,40 @@ the default `bt` profile. Credentials and backend URLs are never stored here;
 production resolves and refreshes them through `bt`. `bt trace run` supplies a
 process-local settings overlay and never changes any of these files.
 
+### JavaScript span plugins
+
+`--plugin PATH` registers a synchronous ES module that transforms each
+sink-neutral span row after translation and immediately before delivery. Repeat
+the flag to compose plugins from left to right. Setup persists its ordered list;
+run and import append invocation plugins after the persisted list.
+
+```bash
+bt trace setup codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
+bt trace run --plugin ./local.mjs codex -- "summarize this change"
+bt trace import codex SESSION_ID --plugin ./sanitize-history.mjs
+```
+
+Each module must default-export a synchronous function. It receives a span and
+`{ operation, source, session_id, env }`, and must return a JSON-compatible span
+object. Span, root, and parent identities cannot be changed:
+
+```js
+export default function mapSpan(span, context) {
+  return {
+    ...span,
+    metadata: { ...span.metadata, deployment: context.env.DEPLOYMENT },
+  };
+}
+```
+
+The environment map comes from the event-producing hook or adapter and is sent
+only over the private daemon transport; it is never written to the recovery
+journal. Plugins execute in bounded, thread-local QuickJS runtimes with no
+filesystem or network host APIs. Modules must be self-contained and transforms
+must be stateless: module globals belong to a worker thread, not a session. A
+runtime failure disables the chain for that session and sends the original
+translator output instead.
+
 ### Additional root metadata
 
 `additional_metadata` is a JSON object merged into each traced session's root

@@ -63,6 +63,7 @@ fn envelope(session: &str, event: &str, transcript_path: &str, extra: Value) -> 
         ts_ms: 0,
         managed_run_id: None,
         payload,
+        plugin_env: Default::default(),
         route: None,
         config: None,
     }
@@ -493,6 +494,7 @@ fn configured_ctx(session_id: &str, additional_metadata: Value) -> SessionCtx {
             }),
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: Some(additional_metadata),
+            span_plugins: Vec::new(),
         }),
     }
 }
