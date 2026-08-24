@@ -22,7 +22,7 @@ codex plugin add braintrust@braintrust-codex-plugins
 The recommended tracing setup is:
 
 ```bash
-bt trace setup codex --project my-coding-agent
+bt trace enable codex --project my-coding-agent
 ```
 
 This installs the tracing plugin and stores only non-secret routing settings.

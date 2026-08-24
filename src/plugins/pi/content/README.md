@@ -65,7 +65,7 @@ Our GitHub Actions compatibility job automatically resolves and tests that compa
 
 ```bash
 bt auth login
-bt trace setup pi
+bt trace enable pi
 pi
 ```
 

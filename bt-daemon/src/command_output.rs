@@ -71,7 +71,8 @@ pub struct StopCommandOutput {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum TraceCommandOutput {
     Status(StatusCommandOutput),
-    Setup(SetupCommandOutput),
+    Enable(SetupCommandOutput),
+    Disable(SetupCommandOutput),
     Stop(StopCommandOutput),
 }
 
@@ -85,7 +86,7 @@ impl TraceCommandOutput {
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
-        Self::Setup(SetupCommandOutput {
+        Self::Enable(SetupCommandOutput {
             source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
@@ -95,6 +96,19 @@ impl TraceCommandOutput {
 
     pub fn stop(running: bool, stopped: bool) -> Self {
         Self::Stop(StopCommandOutput { running, stopped })
+    }
+
+    pub fn disable(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::Disable(SetupCommandOutput {
+            source: source.into(),
+            display_name: display_name.into(),
+            settings_path: settings_path.into(),
+            restart_required: true,
+        })
     }
 
     pub fn render(&self, format: OutputFormat) -> anyhow::Result<String> {
@@ -112,10 +126,15 @@ impl TraceCommandOutput {
                 uptime_ms: status.uptime_ms.unwrap_or_default(),
                 sessions: status.sessions.clone(),
             })?),
-            Self::Setup(setup) => Ok(format!(
+            Self::Enable(setup) => Ok(format!(
                 "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.",
                 setup.display_name,
                 setup.settings_path.display()
+            )),
+            Self::Disable(disable) => Ok(format!(
+                "The Braintrust tracing plugin and configuration were removed for {} from {}.\nRestart the coding agent to apply the change.",
+                disable.display_name,
+                disable.settings_path.display()
             )),
             Self::Stop(stop) if stop.stopped => Ok("Tracing daemon stopped.".into()),
             Self::Stop(_) => Ok("No tracing daemon is running.".into()),
@@ -140,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_json_contains_stable_selection_fields_without_prose() {
+    fn enable_json_contains_stable_selection_fields_without_prose() {
         let output = TraceCommandOutput::setup(
             "opencode",
             "OpenCode",
@@ -148,7 +167,7 @@ mod tests {
         );
         let rendered = output.render(OutputFormat::Json).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(value["command"], "setup");
+        assert_eq!(value["command"], "enable");
         assert_eq!(value["source"], "opencode");
         assert_eq!(value["restart_required"], true);
         assert!(!rendered.contains("installed for"));
