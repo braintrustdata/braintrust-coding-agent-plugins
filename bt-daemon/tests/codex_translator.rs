@@ -17,10 +17,10 @@ fn write_transcript(path: &std::path::Path) {
     let records = vec![
         json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
                 "payload": { "id": "session-1", "cwd": "/whatever/myapp", "cli_version": "1.2.3" } }),
-        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context",
-                "payload": { "model": "gpt-5.5" } }),
-        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
                 "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "turn_context",
+                "payload": { "turn_id": "t1", "model": "gpt-5.5" } }),
         json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
                 "payload": { "type": "user_message", "message": "list the files" } }),
         json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item",
@@ -191,6 +191,11 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
     assert_eq!(turn.parent_span_ids, vec![root.span_id.clone()]);
     assert_eq!(turn.input, Some(json!("list the files")));
     assert_eq!(turn.output, Some(json!("Here are the files.")));
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["model"],
+        json!("gpt-5.5"),
+        "model backfilled from turn_context"
+    );
     assert!(
         turn.end_ms.is_some(),
         "turn should be closed by task_complete"
