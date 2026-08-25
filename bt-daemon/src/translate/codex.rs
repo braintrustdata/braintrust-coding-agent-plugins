@@ -473,6 +473,7 @@ impl CodexTranslator {
             "session_meta" => self.open_root(scope, &payload, ts, ops),
             "turn_context" => {
                 if let Some(m) = str_field(&payload, "model") {
+                    let model_turn_id = str_field(&payload, "turn_id");
                     scope.model = Some(m.clone());
                     if scope.root_created {
                         let input = if scope.kind == ScopeKind::Main {
@@ -488,6 +489,16 @@ impl CodexTranslator {
                             span_id: scope.turn_parent_span_id.clone(),
                             root_span_id: self.root_span_id.clone(),
                             input: Some(input),
+                            metadata: Some(json!({ "model": m })),
+                            ..Default::default()
+                        }));
+                    }
+                    if let Some(turn) = model_turn_id.as_deref().and_then(|turn_id| {
+                        scope.open_turns.iter().find(|turn| turn.turn_id == turn_id)
+                    }) {
+                        ops.push(SpanOp::Merge(SpanRow {
+                            span_id: turn.span_id.clone(),
+                            root_span_id: self.root_span_id.clone(),
                             metadata: Some(json!({ "model": m })),
                             ..Default::default()
                         }));
