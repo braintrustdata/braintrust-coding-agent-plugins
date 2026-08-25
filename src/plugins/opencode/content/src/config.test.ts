@@ -86,6 +86,28 @@ describe("loadConfig", () => {
     });
   });
 
+  it("prefers a canonical route over stale top-level routing", () => {
+    expect(
+      loadConfig({
+        profile: "stale-profile",
+        org_name: "stale-org",
+        project: "stale-project",
+        route: {
+          auth: { profile: "route-profile", org_name: "route-org" },
+          destination: { type: "project_logs", project_name: "route-project" },
+        },
+      }),
+    ).toMatchObject({
+      profile: "route-profile",
+      orgName: "route-org",
+      projectName: "route-project",
+      route: {
+        auth: { profile: "route-profile", org_name: "route-org" },
+        destination: { type: "project_logs", project_name: "route-project" },
+      },
+    });
+  });
+
   it("ignores routing and enablement environment variables, using only the config file", () => {
     process.env.BRAINTRUST_PROFILE = "personal";
     process.env.BRAINTRUST_ORG_NAME = "braintrust";

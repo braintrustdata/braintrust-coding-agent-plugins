@@ -70,6 +70,11 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
     const destination = pluginConfig.route?.destination as
       | { type?: unknown; project_name?: unknown }
       | undefined;
+    if (pluginConfig.profile) defaults.profile = pluginConfig.profile;
+    if (pluginConfig.org_name) defaults.orgName = pluginConfig.org_name;
+    if (pluginConfig.project) defaults.projectName = pluginConfig.project;
+    // A nested route is canonical. Top-level fields are a compatibility
+    // fallback only for files that `bt trace enable` has not migrated yet.
     if (auth?.profile) defaults.profile = auth.profile;
     if (auth?.org_name) defaults.orgName = auth.org_name;
     if (
@@ -79,9 +84,6 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
     ) {
       defaults.projectName = destination.project_name;
     }
-    if (pluginConfig.profile) defaults.profile = pluginConfig.profile;
-    if (pluginConfig.org_name) defaults.orgName = pluginConfig.org_name;
-    if (pluginConfig.project) defaults.projectName = pluginConfig.project;
     if (pluginConfig.trace_to_braintrust !== undefined) {
       defaults.tracingEnabled = pluginConfig.trace_to_braintrust;
     }

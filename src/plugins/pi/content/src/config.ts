@@ -65,22 +65,19 @@ function applyConfig(config: PiConfig, source: ConfigRecord | undefined): void {
   const route = record(source.route) as DaemonSessionRoute | undefined;
   if (route?.destination !== undefined) config.route = route;
   const destination = record(route?.destination);
-  config.profile = nonEmptyString(route?.auth?.profile) ?? config.profile;
-  config.orgName = nonEmptyString(route?.auth?.org_name) ?? config.orgName;
-  if (destination?.type === "project_logs") {
-    config.projectName = nonEmptyString(destination.project_name) ?? config.projectName;
-  }
-  config.profile = nonEmptyString(source.profile) ?? config.profile;
-  config.orgName = nonEmptyString(source.org_name) ?? config.orgName;
-  config.projectName = nonEmptyString(source.project) ?? config.projectName;
+  const profile = nonEmptyString(route?.auth?.profile) ?? nonEmptyString(source.profile);
+  const orgName = nonEmptyString(route?.auth?.org_name) ?? nonEmptyString(source.org_name);
+  const routeProject =
+    destination?.type === "project_logs" ? nonEmptyString(destination.project_name) : undefined;
+  const projectName = routeProject ?? nonEmptyString(source.project);
+  config.profile = profile ?? config.profile;
+  config.orgName = orgName ?? config.orgName;
+  config.projectName = projectName ?? config.projectName;
   config.enabled = boolean(source.trace_to_braintrust) ?? config.enabled;
   config.additionalMetadata = record(source.additional_metadata) ?? config.additionalMetadata;
   config.showUi = boolean(source.show_ui) ?? config.showUi;
   config.showTraceLink = boolean(source.show_trace_link) ?? config.showTraceLink;
 
-  const profile = nonEmptyString(source.profile);
-  const orgName = nonEmptyString(source.org_name);
-  const projectName = nonEmptyString(source.project);
   const additionalMetadata = record(source.additional_metadata);
   if (profile || orgName) {
     config.route.auth = {
