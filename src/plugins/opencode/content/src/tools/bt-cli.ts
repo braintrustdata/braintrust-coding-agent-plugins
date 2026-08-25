@@ -114,7 +114,7 @@ export class BtCliToolsClient {
         input,
         "--root",
         directory,
-        "--fresh",
+        "--force",
         ...this.selection(true),
       ]);
       return data.id;
