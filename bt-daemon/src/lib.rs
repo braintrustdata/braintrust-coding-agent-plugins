@@ -703,18 +703,16 @@ fn codex_managed_run_args(unix_command: &str, windows_command: &str) -> Vec<OsSt
 }
 
 fn claude_managed_run_args(command: &str) -> anyhow::Result<Vec<OsString>> {
-    let hook = serde_json::json!({
+    let matcher_group = serde_json::json!([{
         "hooks": [{
-            "hooks": [{
-                "type": "command",
-                "command": command,
-                "async": false
-            }]
+            "type": "command",
+            "command": command,
+            "async": false
         }]
-    });
+    }]);
     let hooks = CLAUDE_RUN_HOOK_EVENTS
         .iter()
-        .map(|event| ((*event).to_string(), hook.clone()))
+        .map(|event| ((*event).to_string(), matcher_group.clone()))
         .collect::<serde_json::Map<_, _>>();
     Ok(vec![
         OsString::from("--settings"),
@@ -1140,7 +1138,13 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap()).unwrap();
         let hooks = settings["hooks"].as_object().unwrap();
         assert_eq!(hooks.len(), CLAUDE_RUN_HOOK_EVENTS.len());
-        let command = hooks["SessionStart"]["hooks"][0]["hooks"][0]["command"]
+        for event in ["SessionStart", "PreToolUse"] {
+            let matcher_groups = hooks[event].as_array().unwrap();
+            assert_eq!(matcher_groups.len(), 1);
+            assert!(matcher_groups[0]["hooks"].is_array());
+            assert!(matcher_groups[0]["hooks"][0]["hooks"].is_null());
+        }
+        let command = hooks["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
         assert!(command.contains("--managed-run-hook"));
