@@ -5,13 +5,14 @@
 //! behavior, setup, managed runs, imports, and output contracts stay here with
 //! the coding-agent integrations.
 
-use crate::trace_command::TraceCommand;
+use crate::trace_command::{DoctorArgs, TraceCommand};
 use crate::wire::{AuthSelection, SessionConfig, SessionRoute};
 use crate::{
     apply_additional_metadata, braintrust_serve_options, paths, run_disable, run_enable, run_hook,
-    run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthLease, AuthProvider,
-    AuthResolveReason, BraintrustSinkConfig, HostInfo, OutputFormat, Registry, RunHookCommand,
-    ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
+    run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthDiagnostic, AuthLease,
+    AuthProvider, AuthResolveReason, BraintrustSinkConfig, DoctorCommandOutput, HostInfo,
+    OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
+    TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -48,6 +49,43 @@ pub trait TraceHostServices: Send + Sync {
         selection: &AuthSelection,
         reason: AuthResolveReason,
     ) -> anyhow::Result<AuthLease>;
+
+    /// Describe the selected auth without exposing credentials. Hosts may
+    /// override this to report exact profile kind and provenance without
+    /// refreshing a credential.
+    async fn diagnose_auth(&self, selection: &AuthSelection) -> AuthDiagnostic {
+        match self
+            .resolve_auth(selection, AuthResolveReason::Initial)
+            .await
+        {
+            Ok(lease) => AuthDiagnostic {
+                status: "ready".into(),
+                source: if selection.profile.is_some() {
+                    "saved_profile".into()
+                } else {
+                    "command_context".into()
+                },
+                kind: None,
+                profile: Some(lease.profile),
+                org_name: lease.auth.org_name,
+                expires_at_ms: lease.expires_at_ms,
+                error: None,
+            },
+            Err(error) => AuthDiagnostic {
+                status: "error".into(),
+                source: if selection.profile.is_some() {
+                    "saved_profile".into()
+                } else {
+                    "command_context".into()
+                },
+                kind: None,
+                profile: selection.profile.clone(),
+                org_name: selection.org_name.clone(),
+                expires_at_ms: None,
+                error: Some(error.to_string()),
+            },
+        }
+    }
 }
 
 /// Everything the plugin runtime needs from its embedding CLI.
@@ -185,6 +223,84 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
     Ok(())
 }
 
+async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorCommandOutput {
+    let source = args.agent.source();
+    let settings_path = paths::agent_settings_path(source, None);
+    let settings_present = settings_path.exists();
+    let settings = crate::settings::AgentSettings::load(source);
+    let enabled = settings.tracing_enabled();
+    let mut warnings = Vec::new();
+
+    if !settings_present {
+        warnings.push(format!(
+            "settings file is missing; run `bt trace enable {source}`"
+        ));
+    } else if !enabled {
+        warnings.push(format!(
+            "tracing is disabled; run `bt trace enable {source}`"
+        ));
+    }
+
+    let (route, route_source) = match settings.route {
+        Some(route) => (Some(route), "settings_file".to_string()),
+        None => match host
+            .services
+            .resolve_route(RouteRequirements::default())
+            .await
+        {
+            Ok(route) => (Some(route), "command_context".to_string()),
+            Err(error) => {
+                warnings.push(format!("route could not be resolved: {error}"));
+                (None, "unresolved".to_string())
+            }
+        },
+    };
+
+    if route
+        .as_ref()
+        .is_some_and(|route| route.destination.is_none())
+    {
+        warnings.push("trace destination is not configured".into());
+    }
+    if route
+        .as_ref()
+        .and_then(|route| route.auth.profile.as_deref())
+        == Some("environment")
+    {
+        warnings.push(
+            "profile `environment` is not a saved login; rerun setup with --profile <NAME>".into(),
+        );
+    }
+
+    let auth = match &route {
+        Some(route) => host.services.diagnose_auth(&route.auth).await,
+        None => AuthDiagnostic {
+            status: "unresolved".into(),
+            source: "unresolved".into(),
+            kind: None,
+            profile: None,
+            org_name: None,
+            expires_at_ms: None,
+            error: Some("route is unresolved".into()),
+        },
+    };
+    if let Some(error) = &auth.error {
+        warnings.push(format!("authentication is unusable: {error}"));
+    }
+
+    DoctorCommandOutput {
+        source: source.into(),
+        display_name: args.agent.display_name().into(),
+        settings_path,
+        settings_present,
+        enabled,
+        route_source,
+        route,
+        auth,
+        warnings,
+    }
+}
+
 /// Execute the complete mounted trace command.
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
     match args.command {
@@ -224,6 +340,10 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         }
         TraceCommand::Status(status_args) => print_output(
             TraceCommandOutput::status(run_status(status_args).await?),
+            host.output_format,
+        ),
+        TraceCommand::Doctor(doctor_args) => print_output(
+            TraceCommandOutput::doctor(doctor_output(&host, doctor_args).await),
             host.output_format,
         ),
         TraceCommand::Stop(stop_args) => {

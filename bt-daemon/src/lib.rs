@@ -31,13 +31,15 @@ mod transport;
 pub mod wire;
 pub use client::HostInfo;
 pub use command_output::{
-    OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
+    AuthDiagnostic, DoctorCommandOutput, OutputFormat, SetupCommandOutput, StatusCommandOutput,
+    StopCommandOutput, TraceCommandOutput,
 };
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
 pub use setup::{run_disable, run_enable, run_setup};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
 pub use trace_command::{
-    DisableArgs, EnableArgs, SetupAgent, SetupArgs, StopArgs, TraceArgs, TraceCommand,
+    DisableArgs, DoctorAgent, DoctorArgs, EnableArgs, SetupAgent, SetupArgs, StopArgs, TraceArgs,
+    TraceCommand,
 };
 pub use trace_runtime::{run_trace, RouteRequirements, TraceHostContext, TraceHostServices};
 pub use translate::{
