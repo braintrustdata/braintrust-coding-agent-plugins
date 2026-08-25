@@ -10,8 +10,8 @@ mod methods;
 mod rpc;
 
 pub use envelope::{
-    AuthSelection, AuthSource, BackendAuth, Envelope, FlushMode, RedactedEnvelope, SessionConfig,
-    SessionRoute, TraceDestination,
+    AuthSelection, AuthSource, BackendAuth, CaptureContext, Envelope, FlushMode, ProcessIdentity,
+    RedactedEnvelope, SessionConfig, SessionRoute, TraceDestination,
 };
 pub use methods::{
     method, Capabilities, ClientInfo, EventLogResult, FlushParams, FlushResult, InitializeParams,

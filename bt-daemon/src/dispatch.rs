@@ -3,10 +3,11 @@
 //! are processed strictly in arrival order. Different sessions run
 //! concurrently.
 //!
-//! Ack semantics: `event.log` is acked once the event is journaled and handed
-//! to the session's queue (see [`Session::enqueue`]). Delivery to
-//! Braintrust happens later in the actor; a downstream error never fails the
-//! caller's turn.
+//! Ack semantics: `event.log` is acked once the event is journaled and its
+//! first translation batch has updated local correlation state. Tool-start
+//! events drain bounded translator continuations before ack so the spawning
+//! marker is guaranteed visible. A downstream error never fails the caller's
+//! turn.
 
 use crate::sink::SinkFactory;
 use crate::translate::{Registry, SessionCtx};
@@ -30,7 +31,7 @@ pub struct Counters {
 }
 
 enum SessionMsg {
-    Event(Box<Envelope>),
+    Event(Box<Envelope>, oneshot::Sender<()>),
     Configure(Box<crate::wire::SessionConfig>, oneshot::Sender<()>),
     Flush(oneshot::Sender<u64>),
     Shutdown(oneshot::Sender<()>),
@@ -46,6 +47,18 @@ pub struct ReplayPlan {
     pub through: u64,
 }
 
+pub(crate) struct SessionOptions {
+    pub session_id: String,
+    pub source: String,
+    pub plugin_version: Option<String>,
+    pub replay: Option<ReplayPlan>,
+    pub config: crate::wire::SessionConfig,
+    pub correlation_key: String,
+    pub route: SessionRoute,
+    pub correlation: Arc<crate::correlation::CorrelationRegistry>,
+    pub data_dir: PathBuf,
+}
+
 /// Handle to one live session: its queue plus observable counters/state.
 pub struct Session {
     pub source: String,
@@ -59,14 +72,21 @@ pub struct Session {
 impl Session {
     /// Spawn a session's actor task and return its handle.
     pub fn spawn(
-        session_id: String,
-        source: String,
-        plugin_version: Option<String>,
-        replay: Option<ReplayPlan>,
-        config: crate::wire::SessionConfig,
+        options: SessionOptions,
         translators: Arc<Registry>,
         sink_factory: Arc<dyn SinkFactory>,
     ) -> Arc<Session> {
+        let SessionOptions {
+            session_id,
+            source,
+            plugin_version,
+            replay,
+            config,
+            correlation_key,
+            route,
+            correlation,
+            data_dir,
+        } = options;
         let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         let counters = Arc::new(Counters::default());
         let last_error = Arc::new(Mutex::new(None));
@@ -83,6 +103,10 @@ impl Session {
             permalink: permalink.clone(),
             replay,
             config,
+            correlation_key,
+            route,
+            correlation,
+            data_dir,
         };
         tokio::spawn(actor.run(rx));
 
@@ -100,11 +124,14 @@ impl Session {
     pub async fn enqueue(&self, env: Envelope) -> anyhow::Result<()> {
         self.touch();
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(SessionMsg::Event(Box::new(env)))
+            .send(SessionMsg::Event(Box::new(env), reply_tx))
             .await
             .map_err(|_| anyhow::anyhow!("session actor is gone"))?;
-        Ok(())
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("session actor dropped event acknowledgement"))
     }
 
     fn touch(&self) {
@@ -212,6 +239,31 @@ struct SessionActor {
     permalink: Arc<Mutex<Option<String>>>,
     replay: Option<ReplayPlan>,
     config: crate::wire::SessionConfig,
+    correlation_key: String,
+    route: SessionRoute,
+    correlation: Arc<crate::correlation::CorrelationRegistry>,
+    data_dir: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum BatchMode {
+    Live,
+    Replay,
+    Flush,
+}
+
+impl BatchMode {
+    fn errors(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Live => ("translate failed", "sink emit failed"),
+            Self::Replay => ("journal replay failed", "sink replay emit failed"),
+            Self::Flush => ("translate flush failed", "sink emit (flush) failed"),
+        }
+    }
+
+    fn observes_correlation(self) -> bool {
+        !matches!(self, Self::Flush)
+    }
 }
 
 impl SessionActor {
@@ -229,8 +281,9 @@ impl SessionActor {
                 // callers waiting on flush don't hang.
                 while let Some(msg) = rx.recv().await {
                     match msg {
-                        SessionMsg::Event(_) => {
+                        SessionMsg::Event(_, reply) => {
                             self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                            let _ = reply.send(());
                         }
                         SessionMsg::Configure(_, r) => {
                             let _ = r.send(());
@@ -260,22 +313,41 @@ impl SessionActor {
 
         while let Some(msg) = rx.recv().await {
             match msg {
-                SessionMsg::Event(env) => {
+                SessionMsg::Event(env, reply) => {
+                    let correlation_barrier = is_tool_lifecycle_event(&env.event);
+                    let mut reply = Some(reply);
                     if let Some(cfg) = &env.config {
                         sink.configure(cfg);
                         ctx.config = Some(cfg.clone());
                         self.refresh_permalink(sink.as_ref());
                     }
                     let translated = translator.handle(&env, &ctx);
-                    self.emit_translator_batches(
-                        &mut translator,
-                        &mut sink,
-                        &ctx,
-                        translated,
-                        "translate failed",
-                        "sink emit failed",
-                    )
-                    .await;
+                    if !correlation_barrier {
+                        let _ = reply.take().expect("event reply").send(());
+                    }
+                    let correlation_changed = self
+                        .emit_translator_batches(
+                            &mut translator,
+                            &mut sink,
+                            &ctx,
+                            translated,
+                            BatchMode::Live,
+                        )
+                        .await;
+                    if correlation_changed || correlation_barrier {
+                        if let Err(error) = crate::server::persist_active_parent_snapshot(
+                            &self.data_dir,
+                            &self.correlation_key,
+                            &self.correlation,
+                        )
+                        .await
+                        {
+                            self.set_error(error);
+                        }
+                    }
+                    if let Some(reply) = reply {
+                        let _ = reply.send(());
+                    }
                     self.counters.queued.fetch_sub(1, Ordering::Relaxed);
                 }
                 SessionMsg::Configure(config, reply) => {
@@ -306,18 +378,27 @@ impl SessionActor {
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
         first: anyhow::Result<Vec<crate::translate::SpanOp>>,
-        translate_error: &str,
-        emit_error: &str,
-    ) {
+        mode: BatchMode,
+    ) -> bool {
+        let (translate_error, emit_error) = mode.errors();
         let mut next = match first {
             Ok(ops) => Some(ops),
             Err(e) => {
                 self.set_error(format!("{translate_error}: {e}"));
-                return;
+                return false;
             }
         };
+        let mut correlation_changed = false;
         while let Some(ops) = next {
             if !ops.is_empty() {
+                if mode.observes_correlation() {
+                    correlation_changed |= self.correlation.observe_ops(
+                        &self.correlation_key,
+                        &self.route,
+                        ctx.config.as_ref().expect("session config"),
+                        &ops,
+                    );
+                }
                 match sink.emit(&ops).await {
                     Ok(n) => {
                         self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
@@ -333,6 +414,7 @@ impl SessionActor {
                 }
             };
         }
+        correlation_changed
     }
 
     /// Stream the journal through the translator, emitting each entry's spans
@@ -376,15 +458,9 @@ impl SessionActor {
             }
             let env = crate::journal::envelope_from_redacted(entry);
             let translated = translator.handle(&env, ctx);
-            self.emit_translator_batches(
-                translator,
-                sink,
-                ctx,
-                translated,
-                "journal replay failed",
-                "sink replay emit failed",
-            )
-            .await;
+            let _ = self
+                .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Replay)
+                .await;
         }
     }
 
@@ -395,15 +471,9 @@ impl SessionActor {
         ctx: &SessionCtx,
     ) {
         let translated = translator.flush(ctx);
-        self.emit_translator_batches(
-            translator,
-            sink,
-            ctx,
-            translated,
-            "translate flush failed",
-            "sink emit (flush) failed",
-        )
-        .await;
+        let _ = self
+            .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Flush)
+            .await;
         if let Err(e) = sink.flush().await {
             self.set_error(format!("sink flush failed: {e}"));
         }
@@ -420,4 +490,17 @@ impl SessionActor {
         tracing::warn!(session_id = %self.session_id, "{msg}");
         *self.last_error.lock().unwrap() = Some(msg);
     }
+}
+
+pub(crate) fn is_tool_lifecycle_event(event: &str) -> bool {
+    matches!(
+        event,
+        "PreToolUse"
+            | "PostToolUse"
+            | "PostToolUseFailure"
+            | "tool_execution_start"
+            | "tool_execution_end"
+            | "tool.execute.before"
+            | "tool.execute.after"
+    )
 }

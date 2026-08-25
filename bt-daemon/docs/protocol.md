@@ -105,7 +105,13 @@ The hot path. Params are the **Envelope** (see below). Request result:
 ```json
 { "accepted": true }
 ```
-`accepted: true` means enqueued to the session's ordered queue and journaled.
+`accepted: true` means durably recorded: normally journaled and enqueued to the
+session's ordered queue, or held in the daemon's private correlation journal
+while multiple parent calls remain indistinguishable.
+For an event that opens a tool call, it also means the daemon has made that
+active-tool marker visible to local child-session correlation. A child hook
+that runs immediately after its parent's blocking pre-tool hook can therefore
+attach without an intervening flush.
 The daemon never fails the caller's turn for a downstream (Braintrust) error;
 those are handled asynchronously and surfaced via `status.get`. The queue is
 bounded, so a session whose sink has stalled applies backpressure here instead
@@ -223,6 +229,22 @@ Field notes:
 - **`managed_run_id`** is present only for events inherited from a
   `bt trace run` process tree. It groups native sessions for the final
   invocation flush and is not trace metadata.
+- **`capture`** is optional daemon-owned process evidence. After
+  `initialize`, the daemon snapshots the connecting client's PID and bounded
+  ancestry as PID/start-time pairs and adds it before journaling. Hooks do not
+  construct this field and it contains no command line, environment, or
+  working-directory data. The daemon uses it as a local side channel to attach
+  an instrumented child session to an active parent tool span; agent-native
+  input and output payloads are reduced to hashes only when more than one
+  active call is a candidate. For Codex, whose hook payload references its
+  rollout rather than embedding the prompt, matching also considers at most
+  the final 256 KiB of native JSONL records. Active parent-tool state is
+  atomically snapshotted under `<data_dir>/correlation/parents` before a
+  blocking tool lifecycle hook is acknowledged. The compact snapshot contains
+  only process identities, span attachment components, non-secret routing, and
+  hashed matching fingerprints. It contains no raw prompt, tool input/output,
+  command line, environment, or resolved credential, and lets a child attach
+  even if the daemon restarts between the parent spawn and child session start.
 - **`route`** carries non-secret auth selection and trace settings. `profile`
   is optional and resolves through `bt`'s default profile when absent;
   `org_name` optionally constrains organization selection. The daemon resolves

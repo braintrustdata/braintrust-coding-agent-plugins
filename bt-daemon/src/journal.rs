@@ -262,6 +262,7 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
         event: r.event,
         ts_ms: r.ts_ms,
         managed_run_id: r.managed_run_id,
+        capture: r.capture,
         payload: r.payload,
         route,
         config,

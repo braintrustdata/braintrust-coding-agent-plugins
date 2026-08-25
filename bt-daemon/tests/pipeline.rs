@@ -143,6 +143,7 @@ fn envelope(session_id: &str, event: &str, ts_ms: i64) -> Envelope {
             ..SessionRoute::default()
         }),
         config: None,
+        capture: None,
     }
 }
 
