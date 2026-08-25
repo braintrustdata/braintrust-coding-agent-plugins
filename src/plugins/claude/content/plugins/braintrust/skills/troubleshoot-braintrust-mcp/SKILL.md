@@ -7,6 +7,17 @@ version: 1.0.0
 
 This Claude plugin automatically sets up a Braintrust MCP connection. The connection reads the `BRAINTRUST_API_KEY` environment variable to establish the MCP connection.
 
+## Check the Claude surface first
+
+This plugin MCP configuration supports Claude Code CLI and Claude Code mode in
+the desktop app. It does not configure MCP inside the Cowork tab because Cowork
+runs in a separate VM without the host environment variables or network
+context expected by `.mcp.json`.
+
+If the user is in Cowork, stop these plugin troubleshooting steps and direct
+them to add or use the Braintrust connector through Claude. Do not ask them to
+copy `BRAINTRUST_API_KEY` into the Cowork VM.
+
 ## Troubleshooting steps
 
 ### 1. Verify the environment variable is set

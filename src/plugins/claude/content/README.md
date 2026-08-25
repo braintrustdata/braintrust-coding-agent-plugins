@@ -12,6 +12,17 @@ A Claude Code plugin marketplace for [Braintrust](https://braintrust.dev) integr
 - A [Braintrust account](https://braintrust.dev)
 - The `bt` CLI, authenticated with `bt login`
 
+## Supported Claude surfaces
+
+These marketplace plugins support Claude Code CLI and Claude Code mode in the
+desktop app. They do not currently support the Cowork tab, which runs tools and
+hooks inside a separate VM without the host's `bt` installation, Braintrust
+configuration, or environment variables.
+
+In Cowork, use the Braintrust connector provided through Claude for MCP access.
+The connector is separate from the `braintrust` marketplace plugin. Automatic
+Cowork session tracing is not currently supported.
+
 ## Installation
 
 Add the marketplace:
