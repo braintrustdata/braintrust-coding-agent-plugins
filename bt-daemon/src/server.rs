@@ -42,11 +42,12 @@ pub enum AuthResolveReason {
     Unauthorized,
 }
 
-/// A live credential lease. Only the canonical profile name is observable;
-/// the backend credential remains in daemon memory and is never journaled.
+/// A live credential lease. Only the canonical non-secret selection is
+/// observable; the backend credential remains in daemon memory and is never
+/// journaled.
 #[derive(Debug, Clone)]
 pub struct AuthLease {
-    pub profile: String,
+    pub selection: AuthSelection,
     pub auth: BackendAuth,
     /// Epoch milliseconds. `None` is appropriate for non-expiring API keys.
     pub expires_at_ms: Option<i64>,
@@ -54,9 +55,9 @@ pub struct AuthLease {
 
 #[async_trait]
 pub trait AuthProvider: Send + Sync {
-    /// Resolve without prompting. On refresh, `selection.profile` is the
-    /// canonical profile returned by the initial lease, keeping an active
-    /// session pinned even if the user's default profile changes.
+    /// Resolve without prompting. On refresh, `selection` is the canonical
+    /// source returned by the initial lease, keeping an active session pinned
+    /// even if the user's default profile or environment changes.
     async fn resolve(
         &self,
         selection: &AuthSelection,
@@ -140,7 +141,7 @@ impl Daemon {
             );
         }
         let key = DeliveryKey::new(&env.session_id, &route)?;
-        let (selection, reason, expected_profile) = {
+        let (selection, reason, expected_selection) = {
             let states = self.session_auth.lock().await;
             match states.get(&key) {
                 Some(state) => {
@@ -149,12 +150,9 @@ impl Daemon {
                         return Ok(key);
                     }
                     (
-                        AuthSelection {
-                            profile: Some(state.lease.profile.clone()),
-                            org_name: state.lease.auth.org_name.clone(),
-                        },
+                        state.lease.selection.clone(),
                         AuthResolveReason::Expiring,
-                        Some(state.lease.profile.clone()),
+                        Some(state.lease.selection.clone()),
                     )
                 }
                 None => (route.auth.clone(), AuthResolveReason::Initial, None),
@@ -163,7 +161,7 @@ impl Daemon {
 
         let lease = provider.resolve(&selection, reason).await.map_err(|error| {
             let message = format!(
-                "could not resolve Braintrust profile for {}: {error}; run `bt auth login` or select a profile explicitly",
+                "could not resolve Braintrust auth for {}: {error}; run `bt login` or select a profile explicitly",
                 env.source
             );
             self.auth_errors.lock().unwrap().insert(
@@ -172,11 +170,11 @@ impl Daemon {
             );
             anyhow::anyhow!(message)
         })?;
-        if let Some(expected) = expected_profile {
-            if lease.profile != expected {
+        if let Some(expected) = expected_selection {
+            if lease.selection != expected {
                 anyhow::bail!(
-                    "credential refresh changed profile from {expected:?} to {:?}",
-                    lease.profile
+                    "credential refresh changed auth selection from {expected:?} to {:?}",
+                    lease.selection
                 );
             }
         }
@@ -184,7 +182,7 @@ impl Daemon {
             if lease.auth.org_name.as_deref() != Some(expected_org) {
                 anyhow::bail!(
                     "profile {:?} resolved organization {:?}, expected {:?}",
-                    lease.profile,
+                    lease.selection,
                     lease.auth.org_name,
                     expected_org
                 );
@@ -210,15 +208,12 @@ impl Daemon {
         if !lease_is_expiring(&state.lease) {
             return Ok(());
         }
-        let selection = AuthSelection {
-            profile: Some(state.lease.profile.clone()),
-            org_name: state.lease.auth.org_name.clone(),
-        };
+        let selection = state.lease.selection.clone();
         let lease = provider
             .resolve(&selection, AuthResolveReason::Expiring)
             .await?;
-        if lease.profile != state.lease.profile {
-            anyhow::bail!("credential refresh changed the session profile");
+        if lease.selection != state.lease.selection {
+            anyhow::bail!("credential refresh changed the session auth selection");
         }
         let config = state.route.with_auth(lease.auth.clone());
         self.session_auth.lock().await.insert(

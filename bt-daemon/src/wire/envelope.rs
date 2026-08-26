@@ -40,15 +40,63 @@ pub struct Envelope {
     pub config: Option<SessionConfig>,
 }
 
-/// Non-secret profile selection. A profile identifies the stored Braintrust
-/// user credentials; an optional organization constrains profiles that can
-/// address more than one organization.
+/// The non-secret credential source selected for a session route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthSource {
+    /// Resolve using the host's ordinary precedence rules. Retained for old
+    /// profile-less routes; newly resolved command routes are canonicalized.
+    #[default]
+    Auto,
+    /// Resolve a named credential from the host's saved profile store.
+    SavedProfile,
+    /// Resolve BRAINTRUST_API_KEY from the process environment at delivery
+    /// time. The key itself is never serialized into the route.
+    Environment,
+}
+
+/// Non-secret auth selection. An optional organization constrains credentials
+/// that can address more than one organization.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthSelection {
+    #[serde(default, skip_serializing_if = "AuthSource::is_auto")]
+    pub source: AuthSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_name: Option<String>,
+}
+
+impl AuthSource {
+    fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
+impl AuthSelection {
+    /// Interpret old `profile: "environment"` routes as environment auth
+    /// without preserving the synthetic value as a saved profile name.
+    pub fn effective_source(&self) -> AuthSource {
+        match self.source {
+            AuthSource::Auto if self.profile.as_deref() == Some("environment") => {
+                AuthSource::Environment
+            }
+            AuthSource::Auto if self.profile.is_some() => AuthSource::SavedProfile,
+            source => source,
+        }
+    }
+
+    pub fn canonicalized(mut self) -> anyhow::Result<Self> {
+        self.source = self.effective_source();
+        match self.source {
+            AuthSource::SavedProfile if self.profile.is_none() => {
+                anyhow::bail!("saved-profile auth requires a profile name")
+            }
+            AuthSource::Environment => self.profile = None,
+            AuthSource::Auto | AuthSource::SavedProfile => {}
+        }
+        Ok(self)
+    }
 }
 
 /// Immutable, journal-safe routing and trace settings for one agent session.
@@ -244,6 +292,7 @@ mod tests {
             payload: serde_json::json!({ "session_id": "sess-1", "tool_name": "shell" }),
             route: Some(SessionRoute {
                 auth: AuthSelection {
+                    source: AuthSource::SavedProfile,
                     profile: Some("work".into()),
                     org_name: Some("acme".into()),
                 },
@@ -297,6 +346,7 @@ mod tests {
     fn route_is_journal_safe_and_builds_resolved_config() {
         let route = SessionRoute {
             auth: AuthSelection {
+                source: AuthSource::SavedProfile,
                 profile: Some("work".into()),
                 org_name: Some("acme".into()),
             },
@@ -326,6 +376,29 @@ mod tests {
         let journal = serde_json::to_string(&envelope.redacted()).unwrap();
         assert!(journal.contains("work"));
         assert!(!journal.contains("secret"));
+    }
+
+    #[test]
+    fn environment_auth_serializes_without_a_profile_or_secret() {
+        let selection = AuthSelection {
+            source: AuthSource::Environment,
+            profile: None,
+            org_name: Some("acme".into()),
+        };
+        let json = serde_json::to_string(&selection).unwrap();
+        assert_eq!(json, r#"{"source":"environment","org_name":"acme"}"#);
+        assert!(!json.contains("BRAINTRUST_API_KEY"));
+    }
+
+    #[test]
+    fn legacy_environment_profile_canonicalizes_to_environment_auth() {
+        let selection: AuthSelection =
+            serde_json::from_str(r#"{"profile":"environment","org_name":"acme"}"#).unwrap();
+        assert_eq!(selection.effective_source(), AuthSource::Environment);
+        let canonical = selection.canonicalized().unwrap();
+        assert_eq!(canonical.source, AuthSource::Environment);
+        assert_eq!(canonical.profile, None);
+        assert_eq!(canonical.org_name.as_deref(), Some("acme"));
     }
 
     #[test]

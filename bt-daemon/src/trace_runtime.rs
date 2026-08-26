@@ -6,7 +6,7 @@
 //! the coding-agent integrations.
 
 use crate::trace_command::{DoctorArgs, TraceCommand};
-use crate::wire::{AuthSelection, SessionConfig, SessionRoute};
+use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute};
 use crate::{
     apply_additional_metadata, braintrust_serve_options, paths, run_disable, run_enable, run_hook,
     run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthDiagnostic, AuthLease,
@@ -29,6 +29,18 @@ pub struct RouteRequirements {
     /// organizations when the profile has no default. Hooks leave this false
     /// so an agent's turn never blocks on interactive input.
     pub interactive_auth: bool,
+    /// The route will be persisted and replayed by future agent processes, so
+    /// it must use durable saved-profile credentials rather than depending on
+    /// the current process environment.
+    pub persistent_auth: bool,
+}
+
+fn auth_source_label(selection: &AuthSelection) -> &'static str {
+    match selection.effective_source() {
+        AuthSource::SavedProfile => "saved_profile",
+        AuthSource::Environment => "environment",
+        AuthSource::Auto => "command_context",
+    }
 }
 
 /// Host-owned services used by the integration runtime.
@@ -60,24 +72,16 @@ pub trait TraceHostServices: Send + Sync {
         {
             Ok(lease) => AuthDiagnostic {
                 status: "ready".into(),
-                source: if selection.profile.is_some() {
-                    "saved_profile".into()
-                } else {
-                    "command_context".into()
-                },
+                source: auth_source_label(&lease.selection).into(),
                 kind: None,
-                profile: Some(lease.profile),
+                profile: lease.selection.profile,
                 org_name: lease.auth.org_name,
                 expires_at_ms: lease.expires_at_ms,
                 error: None,
             },
             Err(error) => AuthDiagnostic {
                 status: "error".into(),
-                source: if selection.profile.is_some() {
-                    "saved_profile".into()
-                } else {
-                    "command_context".into()
-                },
+                source: auth_source_label(selection).into(),
                 kind: None,
                 profile: selection.profile.clone(),
                 org_name: selection.org_name.clone(),
@@ -213,7 +217,7 @@ async fn resolve_command_route(
         .resolve_auth(&route.auth, AuthResolveReason::Initial)
         .await?;
     let org_name = require_resolved_org(&route, &lease)?;
-    route.auth.profile = Some(lease.profile);
+    route.auth = lease.selection;
     route.auth.org_name = Some(org_name);
     Ok(route)
 }
@@ -310,6 +314,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 RouteRequirements {
                     destination_required: true,
                     interactive_auth: true,
+                    persistent_auth: true,
                 },
             )
             .await?;
@@ -365,6 +370,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                     destination_required: import_args.destination.is_none()
                         && import_args.parent.is_none(),
                     interactive_auth: true,
+                    persistent_auth: false,
                 })
                 .await?;
             apply_additional_metadata(&mut route, import_args.additional_metadata.as_deref())?;
@@ -377,6 +383,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 RouteRequirements {
                     destination_required: true,
                     interactive_auth: true,
+                    persistent_auth: false,
                 },
             )
             .await?;
@@ -499,7 +506,11 @@ mod tests {
                 anyhow::bail!(error);
             }
             Ok(AuthLease {
-                profile: "test".into(),
+                selection: AuthSelection {
+                    source: AuthSource::SavedProfile,
+                    profile: Some("test".into()),
+                    org_name: self.resolved_org.map(str::to_string),
+                },
                 auth: BackendAuth {
                     token: "secret".into(),
                     api_url: None,
@@ -528,20 +539,27 @@ mod tests {
     const COMMAND_REQUIREMENTS: RouteRequirements = RouteRequirements {
         destination_required: true,
         interactive_auth: true,
+        persistent_auth: false,
     };
 
     #[tokio::test]
     async fn setup_and_run_require_a_host_resolved_destination() {
-        for command in [
-            TraceCommand::Setup(SetupArgs {
-                agent: SetupAgent::OpenCode,
-                additional_metadata: None,
-            }),
-            TraceCommand::Run(RunArgs {
-                source: RunSource::Codex,
-                additional_metadata: None,
-                agent_args: Vec::new(),
-            }),
+        for (command, persistent_auth) in [
+            (
+                TraceCommand::Setup(SetupArgs {
+                    agent: SetupAgent::OpenCode,
+                    additional_metadata: None,
+                }),
+                true,
+            ),
+            (
+                TraceCommand::Run(RunArgs {
+                    source: RunSource::Codex,
+                    additional_metadata: None,
+                    agent_args: Vec::new(),
+                }),
+                false,
+            ),
         ] {
             let services = Arc::new(RecordingHost::new(Some("no destination"), None));
             let error = run_trace(TraceArgs { command }, test_host(services.clone()))
@@ -550,7 +568,10 @@ mod tests {
             assert_eq!(error.to_string(), "no destination");
             assert_eq!(
                 *services.route_requests.lock().unwrap(),
-                [COMMAND_REQUIREMENTS]
+                [RouteRequirements {
+                    persistent_auth,
+                    ..COMMAND_REQUIREMENTS
+                }]
             );
         }
     }
@@ -624,6 +645,7 @@ mod tests {
                 [RouteRequirements {
                     destination_required,
                     interactive_auth: true,
+                    persistent_auth: false,
                 }]
             );
         }

@@ -665,6 +665,7 @@ mod tests {
         .unwrap();
         let route = SessionRoute {
             auth: AuthSelection {
+                source: crate::wire::AuthSource::SavedProfile,
                 profile: Some("work".into()),
                 org_name: Some("Braintrust SDKs".into()),
             },

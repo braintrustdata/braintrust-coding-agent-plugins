@@ -394,13 +394,21 @@ pub async fn flush_managed_run(
     socket: &std::path::Path,
     timeout_ms: u64,
 ) -> anyhow::Result<wire::FlushResult> {
+    flush_managed_run_in(managed_run_id, socket, timeout_ms, &paths::data_dir(None)).await
+}
+
+async fn flush_managed_run_in(
+    managed_run_id: &str,
+    socket: &std::path::Path,
+    timeout_ms: u64,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<wire::FlushResult> {
     let stream = match client::connect(socket).await {
         Ok(stream) => stream,
         Err(_) => {
-            let accepted_sessions =
-                journal::read_managed_run_keys(&paths::data_dir(None), managed_run_id)
-                    .await
-                    .len() as u64;
+            let accepted_sessions = journal::read_managed_run_keys(data_dir, managed_run_id)
+                .await
+                .len() as u64;
             return Ok(wire::FlushResult {
                 flushed: true,
                 pending: 0,
@@ -512,6 +520,15 @@ pub async fn run_traced(
         std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
     let injected_args = managed_run_args(args.source, &hook_command)?;
     let managed_run_id = uuid::Uuid::new_v4().to_string();
+    // A caller-supplied socket is already an explicit daemon boundary (for
+    // example an integration harness or a deliberately isolated runtime).
+    // Only create our own boundary when environment auth would otherwise use
+    // the ambient shared daemon.
+    let isolate_daemon = route.auth.effective_source() == wire::AuthSource::Environment
+        && std::env::var_os(paths::SOCKET_ENV).is_none();
+    let isolated_runtime = isolate_daemon
+        .then(|| ManagedRunRuntime::new(&managed_run_id))
+        .transpose()?;
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut command = tokio::process::Command::new(&executable);
     command
@@ -520,6 +537,11 @@ pub async fn run_traced(
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
+    if let Some(runtime) = &isolated_runtime {
+        command
+            .env(paths::SOCKET_ENV, &runtime.socket)
+            .env(paths::DATA_DIR_ENV, runtime.temp_dir.path());
+    }
     if args.source == RunSource::OpenCode {
         command.env(
             "OPENCODE_CONFIG_CONTENT",
@@ -547,8 +569,22 @@ pub async fn run_traced(
             }
         }
     };
-    let socket = paths::socket_path(None);
-    match flush_managed_run(&managed_run_id, &socket, MANAGED_RUN_FLUSH_TIMEOUT_MS).await {
+    let socket = isolated_runtime
+        .as_ref()
+        .map(|runtime| runtime.socket.clone())
+        .unwrap_or_else(|| paths::socket_path(None));
+    let data_dir = isolated_runtime
+        .as_ref()
+        .map(|runtime| runtime.temp_dir.path().to_path_buf())
+        .unwrap_or_else(|| paths::data_dir(None));
+    match flush_managed_run_in(
+        &managed_run_id,
+        &socket,
+        MANAGED_RUN_FLUSH_TIMEOUT_MS,
+        &data_dir,
+    )
+    .await
+    {
         Ok(result) if result.accepted_sessions == 0 => tracing::warn!(
             managed_run_id,
             "managed run produced no accepted trace events"
@@ -561,7 +597,28 @@ pub async fn run_traced(
         ),
         Err(error) => tracing::warn!(managed_run_id, %error, "managed run trace flush failed"),
     }
+    if isolated_runtime.is_some() {
+        let _ = shutdown_daemon(&socket).await;
+    }
     status
+}
+
+struct ManagedRunRuntime {
+    temp_dir: tempfile::TempDir,
+    socket: std::path::PathBuf,
+}
+
+impl ManagedRunRuntime {
+    fn new(_managed_run_id: &str) -> anyhow::Result<Self> {
+        let temp_dir = tempfile::Builder::new().prefix("bt-trace-run-").tempdir()?;
+        #[cfg(unix)]
+        let socket = temp_dir.path().join("daemon.sock");
+        #[cfg(windows)]
+        let socket = std::path::PathBuf::from(format!(
+            r"\\.\pipe\braintrust-bt-daemon-managed-{_managed_run_id}"
+        ));
+        Ok(Self { temp_dir, socket })
+    }
 }
 
 fn managed_run_args(
