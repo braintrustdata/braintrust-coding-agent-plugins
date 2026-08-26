@@ -58,12 +58,7 @@ impl OpenCodeAgent {
         }
         let plugin = std::env::var_os("OPENCODE_PLUGIN")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .expect("repository root")
-                    .join("dist/opencode/dist/index.mjs")
-            });
+            .expect("install the packed OpenCode plugin with its peer dependencies and set OPENCODE_PLUGIN to its dist/index.mjs entrypoint before running integration tests");
         assert!(
             plugin.is_file(),
             "install the packed OpenCode plugin and set OPENCODE_PLUGIN before running integration tests: {}",
