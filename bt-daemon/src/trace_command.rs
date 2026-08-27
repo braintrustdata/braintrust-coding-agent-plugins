@@ -5,7 +5,7 @@
 //! dispatch these commands without duplicating agent-specific CLI knowledge.
 
 use crate::{HookArgs, ImportArgs, RunArgs, ServeArgs, StatusArgs};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Args)]
@@ -33,6 +33,8 @@ pub enum TraceCommand {
     /// Print daemon/session status.
     #[command(hide = true)]
     Status(StatusArgs),
+    /// Explain the effective tracing configuration for a coding agent.
+    Doctor(DoctorArgs),
     /// Gracefully stop the tracing daemon.
     #[command(hide = true)]
     Stop(StopArgs),
@@ -47,6 +49,43 @@ pub struct StopArgs {
     /// Socket path override (default: see the daemon protocol documentation).
     #[arg(long)]
     pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DoctorArgs {
+    /// Coding agent whose tracing configuration should be inspected.
+    #[arg(value_enum)]
+    pub agent: DoctorAgent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DoctorAgent {
+    Codex,
+    #[value(name = "claude", alias = "claude-code")]
+    Claude,
+    #[value(name = "opencode", alias = "open-code")]
+    OpenCode,
+    Pi,
+}
+
+impl DoctorAgent {
+    pub(crate) fn source(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+            Self::Pi => "pi",
+        }
+    }
+
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::OpenCode => "OpenCode",
+            Self::Pi => "Pi",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -167,5 +206,21 @@ mod tests {
                 ..
             }) if value == r#"{"import":true}"#
         ));
+    }
+
+    #[test]
+    fn doctor_accepts_every_supported_agent_alias() {
+        for (agent, expected) in [
+            ("codex", DoctorAgent::Codex),
+            ("claude-code", DoctorAgent::Claude),
+            ("open-code", DoctorAgent::OpenCode),
+            ("pi", DoctorAgent::Pi),
+        ] {
+            let cli = Cli::try_parse_from(["bt", "doctor", agent]).unwrap();
+            assert!(matches!(
+                cli.trace.command,
+                TraceCommand::Doctor(DoctorArgs { agent }) if agent == expected
+            ));
+        }
     }
 }

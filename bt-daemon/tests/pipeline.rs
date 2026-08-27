@@ -3,7 +3,9 @@
 //! spawning, so it's deterministic).
 
 use async_trait::async_trait;
-use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionConfig, SessionRoute};
+use bt_daemon::wire::{
+    AuthSelection, AuthSource, BackendAuth, Envelope, SessionConfig, SessionRoute,
+};
 use bt_daemon::{
     debug_serve_options, flush_managed_run, flush_session, forward_envelope, run_serve, run_status,
     shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs,
@@ -148,12 +150,30 @@ fn routed_envelope(session_id: &str, profile: &str, org: &str, event: &str) -> E
     let mut env = envelope(session_id, event, 1);
     env.route = Some(SessionRoute {
         auth: AuthSelection {
+            source: AuthSource::SavedProfile,
             profile: Some(profile.into()),
             org_name: Some(org.into()),
         },
         destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
             project_id: None,
             project_name: Some(format!("{profile}-traces")),
+        }),
+        ..SessionRoute::default()
+    });
+    env
+}
+
+fn environment_routed_envelope(session_id: &str, org: &str, event: &str) -> Envelope {
+    let mut env = envelope(session_id, event, 1);
+    env.route = Some(SessionRoute {
+        auth: AuthSelection {
+            source: AuthSource::Environment,
+            profile: None,
+            org_name: Some(org.into()),
+        },
+        destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+            project_id: None,
+            project_name: Some("environment-traces".into()),
         }),
         ..SessionRoute::default()
     });
@@ -180,23 +200,24 @@ impl AuthProvider for TestAuthProvider {
         if self.fail {
             anyhow::bail!("profile credential unavailable")
         }
-        let profile = selection
+        let canonical = selection.clone().canonicalized()?;
+        let credential_name = canonical
             .profile
             .clone()
-            .unwrap_or_else(|| "default".into());
+            .unwrap_or_else(|| "environment".into());
         Ok(AuthLease {
-            profile: profile.clone(),
+            selection: canonical.clone(),
             auth: BackendAuth {
-                token: format!("secret-{profile}-{call_index}"),
-                api_url: Some(format!("https://{profile}.example.test")),
+                token: format!("secret-{credential_name}-{call_index}"),
+                api_url: Some(format!("https://{credential_name}.example.test")),
                 app_url: None,
                 // Model a profile with a default organization for selections
                 // that do not constrain one.
                 org_name: selection
                     .org_name
                     .clone()
-                    .or_else(|| Some(format!("{profile}-org"))),
-                org_id: Some(format!("org-{profile}")),
+                    .or_else(|| Some(format!("{credential_name}-org"))),
+                org_id: Some(format!("org-{credential_name}")),
             },
             expires_at_ms: (self.first_lease_expired && call_index == 1).then_some(0),
         })
@@ -460,6 +481,44 @@ async fn routed_sessions_resolve_multiple_profiles_without_journaling_credential
 }
 
 #[tokio::test]
+async fn environment_routes_remain_environment_auth_without_journaling_credentials() {
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let (data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
+    let host = dummy_host();
+
+    forward_envelope(
+        &environment_routed_envelope("environment-session", "env-org", "SessionStart"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session("environment-session", &socket, 5000)
+        .await
+        .unwrap();
+
+    let calls = provider.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0.source, AuthSource::Environment);
+    assert_eq!(calls[0].0.profile, None);
+    assert_eq!(calls[0].0.org_name.as_deref(), Some("env-org"));
+
+    let journal =
+        std::fs::read_to_string(data_dir.join("journal").join("environment-session.ndjson"))
+            .unwrap();
+    assert!(journal.contains(r#""source":"environment""#));
+    assert!(!journal.contains("secret-environment"));
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn expiring_profile_lease_is_refreshed_for_the_pinned_profile() {
     let provider = Arc::new(TestAuthProvider {
         calls: Mutex::new(Vec::new()),
@@ -685,7 +744,7 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("bt auth login"));
+    assert!(error.to_string().contains("bt login"));
     let status = run_status(StatusArgs {
         socket: Some(socket.clone()),
         session_id: Some("login-needed".into()),
@@ -1299,6 +1358,10 @@ esac
     let _agent = EnvVarGuard::set("CODEX_BIN", &agent);
     let _daemon = EnvVarGuard::set("BT_DAEMON_TEST_BIN", env!("CARGO_BIN_EXE_bt-daemon"));
     let route = || SessionRoute {
+        auth: AuthSelection {
+            source: AuthSource::Environment,
+            ..AuthSelection::default()
+        },
         destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
             project_id: None,
             project_name: Some("managed-run-test".into()),

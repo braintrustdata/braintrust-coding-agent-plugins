@@ -95,6 +95,29 @@ describe("loadConfig", () => {
     });
   });
 
+  it("prefers a canonical route over stale top-level routing", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: true,
+      profile: "stale-profile",
+      org_name: "stale-org",
+      project: "stale-project",
+      route: {
+        auth: { profile: "route-profile", org_name: "route-org" },
+        destination: { type: "project_logs", project_name: "route-project" },
+      },
+    });
+
+    expect(loadConfig(cwd)).toMatchObject({
+      profile: "route-profile",
+      orgName: "route-org",
+      projectName: "route-project",
+      route: {
+        auth: { profile: "route-profile", org_name: "route-org" },
+        destination: { type: "project_logs", project_name: "route-project" },
+      },
+    });
+  });
+
   it("ignores routing and enablement environment variables, using only the config file", () => {
     writeJson(join(home, ".pi", "agent", "braintrust.json"), {
       trace_to_braintrust: false,

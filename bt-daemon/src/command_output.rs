@@ -4,7 +4,7 @@
 //! the output shape to this crate so every front-end reports daemon commands
 //! consistently and JSON mode never falls back to human prose.
 
-use crate::wire::StatusResult;
+use crate::wire::{SessionRoute, StatusResult};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -68,9 +68,40 @@ pub struct StopCommandOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AuthDiagnostic {
+    pub status: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorCommandOutput {
+    pub source: String,
+    pub display_name: String,
+    pub settings_path: PathBuf,
+    pub settings_present: bool,
+    pub enabled: bool,
+    pub route_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<SessionRoute>,
+    pub auth: AuthDiagnostic,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum TraceCommandOutput {
     Status(StatusCommandOutput),
+    Doctor(Box<DoctorCommandOutput>),
     Enable(SetupCommandOutput),
     Disable(SetupCommandOutput),
     Stop(StopCommandOutput),
@@ -79,6 +110,10 @@ pub enum TraceCommandOutput {
 impl TraceCommandOutput {
     pub fn status(status: Option<StatusResult>) -> Self {
         Self::Status(status.into())
+    }
+
+    pub fn doctor(output: DoctorCommandOutput) -> Self {
+        Self::Doctor(Box::new(output))
     }
 
     pub fn setup(
@@ -126,6 +161,38 @@ impl TraceCommandOutput {
                 uptime_ms: status.uptime_ms.unwrap_or_default(),
                 sessions: status.sessions.clone(),
             })?),
+            Self::Doctor(doctor) => {
+                let route = doctor
+                    .route
+                    .as_ref()
+                    .map(serde_json::to_string_pretty)
+                    .transpose()?
+                    .unwrap_or_else(|| "(unresolved)".into());
+                let mut rendered = format!(
+                    "Braintrust tracing doctor: {}\nEnabled: {}\nSettings: {}{}\nRoute source: {}\nRoute: {}\nAuth: {} ({})",
+                    doctor.display_name,
+                    doctor.enabled,
+                    doctor.settings_path.display(),
+                    if doctor.settings_present { "" } else { " (missing)" },
+                    doctor.route_source,
+                    route,
+                    doctor.auth.status,
+                    doctor.auth.source,
+                );
+                if let Some(profile) = &doctor.auth.profile {
+                    rendered.push_str(&format!("\nProfile: {profile}"));
+                }
+                if let Some(org_name) = &doctor.auth.org_name {
+                    rendered.push_str(&format!("\nOrganization: {org_name}"));
+                }
+                if let Some(error) = &doctor.auth.error {
+                    rendered.push_str(&format!("\nAuth error: {error}"));
+                }
+                for warning in &doctor.warnings {
+                    rendered.push_str(&format!("\nWarning: {warning}"));
+                }
+                Ok(rendered)
+            }
             Self::Enable(setup) => Ok(format!(
                 "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.",
                 setup.display_name,
@@ -220,5 +287,34 @@ mod tests {
                 .unwrap(),
             "No tracing daemon is running."
         );
+    }
+
+    #[test]
+    fn doctor_json_is_structured_and_contains_no_credentials() {
+        let output = TraceCommandOutput::doctor(DoctorCommandOutput {
+            source: "codex".into(),
+            display_name: "Codex".into(),
+            settings_path: PathBuf::from("/tmp/braintrust.json"),
+            settings_present: true,
+            enabled: true,
+            route_source: "settings_file".into(),
+            route: Some(SessionRoute::default()),
+            auth: AuthDiagnostic {
+                status: "ready".into(),
+                source: "saved_profile".into(),
+                kind: Some("oauth".into()),
+                profile: Some("test-profile".into()),
+                org_name: Some("test-org".into()),
+                expires_at_ms: Some(123),
+                error: None,
+            },
+            warnings: Vec::new(),
+        });
+        let rendered = output.render(OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["command"], "doctor");
+        assert_eq!(value["auth"]["source"], "saved_profile");
+        assert!(!rendered.contains("token"));
+        assert!(!rendered.contains("api_key"));
     }
 }

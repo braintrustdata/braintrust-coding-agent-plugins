@@ -338,13 +338,25 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
         route.additional_metadata = settings
             .get("route")
             .and_then(|route| route.get("additional_metadata"))
+            .or_else(|| settings.get("additional_metadata"))
             .filter(|metadata| metadata.is_object())
             .cloned();
     }
     settings.insert("trace_to_braintrust".into(), Value::Bool(true));
     settings.insert("route".into(), serde_json::to_value(route)?);
-    settings.remove("traceToBraintrust");
-    settings.remove("project");
+    for key in [
+        "traceToBraintrust",
+        "profile",
+        "org_name",
+        "api_key",
+        "api_url",
+        "app_url",
+        "project",
+        "destination",
+        "additional_metadata",
+    ] {
+        settings.remove(key);
+    }
     write_object_atomic(path, settings)?;
 
     #[cfg(unix)]
@@ -637,11 +649,23 @@ mod tests {
         let path = temp.path().join("braintrust.json");
         std::fs::write(
             &path,
-            r#"{"traceToBraintrust":false,"project":"old","auth":{"type":"legacy"}}"#,
+            r#"{
+                "traceToBraintrust": false,
+                "profile": "stale-profile",
+                "org_name": "stale-org",
+                "api_key": "stale-secret",
+                "api_url": "https://stale-api.example",
+                "app_url": "https://stale-app.example",
+                "project": "old",
+                "destination": "old-destination",
+                "additional_metadata": {"migrated": true},
+                "auth": {"type": "legacy"}
+            }"#,
         )
         .unwrap();
         let route = SessionRoute {
             auth: AuthSelection {
+                source: crate::wire::AuthSource::SavedProfile,
                 profile: Some("work".into()),
                 org_name: Some("Braintrust SDKs".into()),
             },
@@ -662,8 +686,20 @@ mod tests {
             "coding-agents"
         );
         assert_eq!(settings["auth"]["type"], "legacy");
-        assert!(settings.get("traceToBraintrust").is_none());
-        assert!(settings.get("project").is_none());
+        assert_eq!(settings["route"]["additional_metadata"]["migrated"], true);
+        for key in [
+            "traceToBraintrust",
+            "profile",
+            "org_name",
+            "api_key",
+            "api_url",
+            "app_url",
+            "project",
+            "destination",
+            "additional_metadata",
+        ] {
+            assert!(settings.get(key).is_none(), "legacy key {key} remained");
+        }
     }
 
     #[test]

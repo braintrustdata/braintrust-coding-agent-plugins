@@ -163,6 +163,7 @@ mod tests {
         let invocation = |profile: &str, project: &str| {
             serde_json::to_string(&InvocationSettings::enabled(SessionRoute {
                 auth: crate::wire::AuthSelection {
+                    source: crate::wire::AuthSource::SavedProfile,
                     profile: Some(profile.to_string()),
                     org_name: Some(format!("{profile}-org")),
                 },

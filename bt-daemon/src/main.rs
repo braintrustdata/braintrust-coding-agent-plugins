@@ -5,7 +5,7 @@
 //! the crate README's "Dual consumption" section.
 
 use async_trait::async_trait;
-use bt_daemon::wire::{AuthSelection, BackendAuth, SessionRoute, TraceDestination};
+use bt_daemon::wire::{AuthSelection, AuthSource, BackendAuth, SessionRoute, TraceDestination};
 use bt_daemon::{
     braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, run_traced,
     AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs,
@@ -45,10 +45,11 @@ impl AuthProvider for EnvironmentAuthProvider {
             anyhow::bail!("BRAINTRUST_API_KEY is not set");
         }
         Ok(AuthLease {
-            profile: selection
-                .profile
-                .clone()
-                .unwrap_or_else(|| "environment".to_string()),
+            selection: AuthSelection {
+                source: AuthSource::Environment,
+                profile: None,
+                org_name: selection.org_name.clone(),
+            },
             auth: BackendAuth {
                 token,
                 api_url: std::env::var("BRAINTRUST_API_URL").ok(),
@@ -130,7 +131,15 @@ fn build_route(
     parent: Option<braintrust_sdk_rust::SpanComponents>,
 ) -> SessionRoute {
     SessionRoute {
-        auth: AuthSelection { profile, org_name },
+        auth: AuthSelection {
+            source: if profile.is_some() {
+                AuthSource::SavedProfile
+            } else {
+                AuthSource::Environment
+            },
+            profile,
+            org_name,
+        },
         destination: parent
             .map(|components| TraceDestination::ParentSpan { components })
             .or(destination)
