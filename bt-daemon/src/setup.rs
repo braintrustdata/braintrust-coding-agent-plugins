@@ -19,6 +19,7 @@ const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
 const OPENCODE_PLUGIN: &str = "@braintrust/trace-opencode@^1";
 const PI_PLUGIN: &str = "npm:@braintrust/pi-extension@^1";
 const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
+#[cfg(unix)]
 const ANTIGRAVITY_PLUGIN_SOURCE: &str =
     "https://github.com/braintrustdata/braintrust-antigravity-plugin";
 
