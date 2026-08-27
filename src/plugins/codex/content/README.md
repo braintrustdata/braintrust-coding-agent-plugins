@@ -1,11 +1,11 @@
-# Braintrust Codex Plugins
+# Braintrust Codex Plugin
 
 > **This repository is generated.** It is built from
 > [braintrustdata/braintrust-coding-agent-plugins](https://github.com/braintrustdata/braintrust-coding-agent-plugins).
 > Don't edit files here — make changes and file issues in that repository, and they
 > will be rebuilt into this one.
 
-Braintrust [Codex plugins](https://developers.openai.com/codex/plugins) — skills and daemon-backed session tracing.
+Daemon-backed Braintrust session tracing for [Codex](https://developers.openai.com/codex/plugins).
 
 ## Quickstart
 
@@ -13,10 +13,7 @@ Add this repo as a Codex plugin marketplace:
 
 ```bash
 codex plugin marketplace add braintrustdata/braintrust-codex-plugin
-# OPTIONAL: TRACE CODEX PLUGIN
 codex plugin add trace-codex@braintrust-codex-plugins
-# OPTIONAL: SKILLS PLUGIN
-codex plugin add braintrust@braintrust-codex-plugins
 ```
 
 The recommended tracing setup is:
@@ -33,6 +30,5 @@ daemon. Restart Codex after setup.
 
 See the plugin's [README](/plugins/trace-codex/README.md) for details.
 
-## skills plugin
-
-see the plugin's [README](/plugins/braintrust-codex-plugin/README.md) for details
+This marketplace does not install or configure the Braintrust MCP server. Use
+Codex's native connector or MCP configuration when you want MCP access.

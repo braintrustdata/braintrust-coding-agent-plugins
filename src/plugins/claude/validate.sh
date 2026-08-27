@@ -3,7 +3,7 @@
 # validate.sh — Sanity-check a built Claude Code dist tree in $1 before publishing.
 #
 # Fails (non-zero) on the mistakes that would ship a broken marketplace:
-#   - missing marketplace manifest / plugin manifests / hooks / skill
+#   - missing marketplace manifest / tracing plugin manifest / hooks
 #   - malformed JSON in any manifest
 #   - marketplace entries whose `source` path does not exist in the tree
 #
@@ -30,9 +30,6 @@ check_json "$MARKETPLACE"
 
 # Required files for each shipped plugin.
 required=(
-  "plugins/braintrust/.claude-plugin/plugin.json"
-  "plugins/braintrust/.mcp.json"
-  "plugins/braintrust/skills/troubleshoot-braintrust-mcp/SKILL.md"
   "plugins/trace-claude-code/.claude-plugin/plugin.json"
   "plugins/trace-claude-code/hooks/hooks.json"
   "plugins/trace-claude-code/hooks/forward.sh"
@@ -41,6 +38,25 @@ for rel in "${required[@]}"; do
   [[ -f "$TARGET_DIR/$rel" ]] || fail "missing $rel"
   case "$rel" in *.json) check_json "$TARGET_DIR/$rel";; esac
 done
+
+python3 - "$MARKETPLACE" "$TARGET_DIR/plugins" <<'PY' \
+  || fail "Claude marketplace must contain only the tracing plugin"
+import json
+import sys
+from pathlib import Path
+
+with open(sys.argv[1]) as f:
+    plugins = json.load(f)["plugins"]
+
+assert [plugin["name"] for plugin in plugins] == ["trace-claude-code"]
+assert sorted(path.name for path in Path(sys.argv[2]).iterdir() if path.is_dir()) == [
+    "trace-claude-code"
+]
+PY
+
+if find "$TARGET_DIR" -name '.mcp.json' -print -quit | grep -q .; then
+  fail "Claude dist still contains an MCP proxy configuration"
+fi
 
 python3 - "$TARGET_DIR/plugins/trace-claude-code/hooks/hooks.json" <<'PY' \
   || fail "Claude hooks do not all use the blocking daemon forwarder"

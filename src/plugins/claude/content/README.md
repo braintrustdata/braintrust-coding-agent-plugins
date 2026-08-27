@@ -5,7 +5,7 @@
 > Don't edit files here — make changes and file issues in that repository, and they
 > will be rebuilt into this one.
 
-A Claude Code plugin marketplace for [Braintrust](https://braintrust.dev) integration - LLM evaluation, logging, observability, and session tracing.
+A Claude Code plugin marketplace for tracing Claude Code sessions to [Braintrust](https://braintrust.dev).
 
 ## Prerequisites
 
@@ -14,14 +14,13 @@ A Claude Code plugin marketplace for [Braintrust](https://braintrust.dev) integr
 
 ## Supported Claude surfaces
 
-These marketplace plugins support Claude Code CLI and Claude Code mode in the
-desktop app. They do not currently support the Cowork tab, which runs tools and
+This marketplace plugin supports Claude Code CLI and Claude Code mode in the
+desktop app. It does not currently support the Cowork tab, which runs tools and
 hooks inside a separate VM without the host's `bt` installation, Braintrust
 configuration, or environment variables.
 
 In Cowork, use the Braintrust connector provided through Claude for MCP access.
-The connector is separate from the `braintrust` marketplace plugin. Automatic
-Cowork session tracing is not currently supported.
+Automatic Cowork session tracing is not currently supported.
 
 ## Installation
 
@@ -31,22 +30,7 @@ Add the marketplace:
 claude plugin marketplace add braintrustdata/braintrust-claude-plugin
 ```
 
-Then install the plugins you need:
-
-## Plugins
-
-### braintrust
-
-Enables AI agents to use Braintrust for LLM evaluation, logging, and observability.
-
-- Query Braintrust projects, experiments, datasets, and logs
-- Instrument your code with the Braintrust SDK and write evals
-
-```bash
-claude plugin install braintrust@braintrust-claude-plugin
-```
-
-### trace-claude-code
+Then enable tracing:
 
 Automatically traces Claude Code conversations to Braintrust through the shared
 Braintrust daemon. The plugin contains only a fail-open hook forwarder; `bt`
@@ -62,6 +46,9 @@ settings under `~/.claude/braintrust.json`. Restart Claude Code after setup.
 Every registered lifecycle event is forwarded synchronously to
 `bt trace hook --source claude-code`, preserving per-session ordering. Hook
 failures never fail a Claude Code turn.
+
+This marketplace does not install or configure the Braintrust MCP server. Use
+your agent's native connector or MCP configuration when you want MCP access.
 
 #### Additional root metadata
 
