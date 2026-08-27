@@ -6,6 +6,7 @@ For further instructions, see the instructions for your desired coding agent
 
 | Agent       | distribution repository |
 |-------------|-------------------------|
+| Google Antigravity | [braintrustdata/braintrust-antigravity-plugin](https://github.com/braintrustdata/braintrust-antigravity-plugin) |
 | Claude Code | [braintrustdata/braintrust-claude-plugin](https://github.com/braintrustdata/braintrust-claude-plugin) |
 | Codex       | [braintrustdata/braintrust-codex-plugin](https://github.com/braintrustdata/braintrust-codex-plugin)   |
 | OpenCode    | npm: [`@braintrust/trace-opencode`](https://www.npmjs.com/package/@braintrust/trace-opencode) |

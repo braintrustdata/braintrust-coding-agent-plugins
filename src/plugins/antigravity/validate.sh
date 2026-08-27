@@ -4,7 +4,7 @@ set -euo pipefail
 TARGET_DIR="${1:?usage: validate.sh <TARGET_DIR>}"
 fail() { echo "validate: $*" >&2; exit 1; }
 
-for file in plugin.json hooks.json bin/antigravity-hook.sh README.md; do
+for file in plugin.json hooks.json bin/antigravity-hook.sh README.md LICENSE; do
   [[ -f "$TARGET_DIR/$file" ]] || fail "missing $file"
 done
 [[ -x "$TARGET_DIR/bin/antigravity-hook.sh" ]] || fail "hook adapter is not executable"

@@ -19,12 +19,8 @@ const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
 const OPENCODE_PLUGIN: &str = "@braintrust/trace-opencode@^1";
 const PI_PLUGIN: &str = "npm:@braintrust/pi-extension@^1";
 const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
-#[cfg(any(unix, test))]
-const ANTIGRAVITY_PLUGIN_JSON: &str = include_str!("../assets/antigravity/plugin.json");
-#[cfg(any(unix, test))]
-const ANTIGRAVITY_HOOKS_JSON: &str = include_str!("../assets/antigravity/hooks.json");
-#[cfg(any(unix, test))]
-const ANTIGRAVITY_HOOK_SCRIPT: &str = include_str!("../assets/antigravity/bin/antigravity-hook.sh");
+const ANTIGRAVITY_PLUGIN_SOURCE: &str =
+    "https://github.com/braintrustdata/braintrust-antigravity-plugin";
 
 trait CommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value>;
@@ -355,65 +351,6 @@ fn disable_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     runner.run("pi", &["uninstall", PI_PLUGIN])
 }
 
-#[cfg(unix)]
-fn write_file(path: &Path, contents: &str) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("file path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory: {}", parent.display()))?;
-    std::fs::write(path, contents)
-        .with_context(|| format!("failed to write file: {}", path.display()))
-}
-
-#[cfg(unix)]
-fn shell_quote(path: &Path) -> anyhow::Result<String> {
-    let path = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Antigravity hook path is not valid UTF-8"))?;
-    Ok(format!("'{}'", path.replace('\'', "'\"'\"'")))
-}
-
-#[cfg(unix)]
-fn rewrite_hook_commands(value: &mut Value, event: &str, adapter: &Path) -> anyhow::Result<()> {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                rewrite_hook_commands(value, event, adapter)?;
-            }
-        }
-        Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str) == Some("command") {
-                object.insert(
-                    "command".into(),
-                    Value::String(format!("sh {} {event}", shell_quote(adapter)?)),
-                );
-            }
-            for value in object.values_mut() {
-                rewrite_hook_commands(value, event, adapter)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn antigravity_hook_registration(adapter: &Path) -> anyhow::Result<Value> {
-    let mut bundled: Value = serde_json::from_str(ANTIGRAVITY_HOOKS_JSON)?;
-    let mut registration = bundled
-        .as_object_mut()
-        .and_then(|hooks| hooks.remove(ANTIGRAVITY_PLUGIN))
-        .ok_or_else(|| anyhow::anyhow!("bundled Antigravity hooks are missing their root entry"))?;
-    let events = registration
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("bundled Antigravity hook entry must be an object"))?;
-    for (event, hooks) in events {
-        rewrite_hook_commands(hooks, event, adapter)?;
-    }
-    Ok(registration)
-}
-
 fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
     if config_dir.file_name().and_then(|part| part.to_str()) != Some("config") {
         bail!(
@@ -441,48 +378,27 @@ fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
     })
 }
 
+fn remove_legacy_antigravity_registration(config_dir: &Path) -> anyhow::Result<()> {
+    let hooks_path = config_dir.join("hooks.json");
+    if !hooks_path.exists() {
+        return Ok(());
+    }
+    let mut hooks = load_object(&hooks_path)?;
+    if hooks.remove(ANTIGRAVITY_PLUGIN).is_some() {
+        write_object_atomic(&hooks_path, hooks)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn setup_antigravity_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
-    let staging = tempfile::tempdir().context("failed to stage the Antigravity tracing plugin")?;
-    write_file(&staging.path().join("plugin.json"), ANTIGRAVITY_PLUGIN_JSON)?;
-    write_file(&staging.path().join("hooks.json"), ANTIGRAVITY_HOOKS_JSON)?;
-    let staged_adapter = staging.path().join("bin/antigravity-hook.sh");
-    write_file(&staged_adapter, ANTIGRAVITY_HOOK_SCRIPT)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged_adapter, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| {
-                format!(
-                    "failed to make Antigravity hook executable: {}",
-                    staged_adapter.display()
-                )
-            })?;
-    }
-
-    let staging_path = staging
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Antigravity plugin staging path is not valid UTF-8"))?;
     runner.run_in_home(
         "agy",
-        &["plugin", "install", staging_path],
+        &["plugin", "install", ANTIGRAVITY_PLUGIN_SOURCE],
         antigravity_home(config_dir)?,
     )?;
 
-    let adapter = config_dir
-        .join("plugins")
-        .join(ANTIGRAVITY_PLUGIN)
-        .join("bin")
-        .join("antigravity-hook.sh");
-    let hooks_path = config_dir.join("hooks.json");
-    let mut hooks = load_object(&hooks_path)?;
-    hooks.insert(
-        ANTIGRAVITY_PLUGIN.into(),
-        antigravity_hook_registration(&adapter)?,
-    );
-    write_object_atomic(&hooks_path, hooks)
+    remove_legacy_antigravity_registration(config_dir)
 }
 
 #[cfg(not(unix))]
@@ -498,24 +414,13 @@ fn disable_antigravity_at(
     runner: &mut impl CommandRunner,
     config_dir: &Path,
 ) -> anyhow::Result<()> {
-    let hooks_path = config_dir.join("hooks.json");
-    let mut hooks = if hooks_path.exists() {
-        Some(load_object(&hooks_path)?)
-    } else {
-        None
-    };
-
     // Antigravity's uninstall command is idempotent when the plugin is absent.
     runner.run_in_home(
         "agy",
         &["plugin", "uninstall", ANTIGRAVITY_PLUGIN],
         antigravity_home(config_dir)?,
     )?;
-    if let Some(hooks) = hooks.as_mut() {
-        hooks.remove(ANTIGRAVITY_PLUGIN);
-        write_object_atomic(&hooks_path, std::mem::take(hooks))?;
-    }
-    Ok(())
+    remove_legacy_antigravity_registration(config_dir)
 }
 
 fn disable_antigravity(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
@@ -663,11 +568,6 @@ mod tests {
 
         fn called(&self, command: &str) -> bool {
             self.calls.iter().any(|call| call == command)
-        }
-
-        #[cfg(unix)]
-        fn called_with_prefix(&self, command: &str) -> bool {
-            self.calls.iter().any(|call| call.starts_with(command))
         }
     }
 
@@ -869,34 +769,28 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn antigravity_installs_and_registers_absolute_hooks_without_clobbering_config() {
+    fn antigravity_installs_published_plugin_and_removes_legacy_registration() {
         let temp = tempfile::tempdir().unwrap();
-        let config_dir = temp.path().join("home with 'quotes'/.gemini/config");
+        let config_dir = temp.path().join(".gemini/config");
         std::fs::create_dir_all(&config_dir).unwrap();
         let hooks_path = config_dir.join("hooks.json");
         std::fs::write(
             &hooks_path,
-            r#"{"other-plugin":{"Stop":[{"type":"command","command":"other"}]}}"#,
+            serde_json::to_vec(&serde_json::json!({
+                ANTIGRAVITY_PLUGIN: {"Stop": []},
+                "other-plugin": {"Stop": [{"type": "command", "command": "other"}]}
+            }))
+            .unwrap(),
         )
         .unwrap();
         let mut runner = FakeRunner::new([]);
 
         setup_antigravity_at(&mut runner, &config_dir).unwrap();
 
-        assert!(runner.called_with_prefix("agy plugin install "));
+        assert!(runner.called(&format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}")));
         let hooks: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
         assert_eq!(hooks["other-plugin"]["Stop"][0]["command"], "other");
-        let managed = &hooks[ANTIGRAVITY_PLUGIN];
-        assert!(managed.get("PreToolUse").is_none());
-        assert!(managed.get("PreInvocation").is_some());
-        assert!(managed.get("PostInvocation").is_some());
-        assert!(managed.get("PostToolUse").is_some());
-        assert!(managed.get("Stop").is_some());
-        let command = managed["Stop"][0]["command"].as_str().unwrap();
-        assert!(command.starts_with("sh '"));
-        assert!(command.contains("plugins/braintrust-antigravity-tracing/bin/antigravity-hook.sh"));
-        assert!(command.contains("'\"'\"'quotes'\"'\"'"));
-        assert!(command.ends_with(" Stop"));
+        assert!(hooks.get(ANTIGRAVITY_PLUGIN).is_none());
     }
 
     #[test]
@@ -904,6 +798,16 @@ mod tests {
     fn antigravity_setup_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".gemini/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("hooks.json"),
+            serde_json::to_vec(&serde_json::json!({
+                ANTIGRAVITY_PLUGIN: {"Stop": []},
+                "other-plugin": {"Stop": []}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let mut runner = FakeRunner::new([]);
 
         setup_antigravity_at(&mut runner, &config_dir).unwrap();
@@ -916,10 +820,25 @@ mod tests {
             runner
                 .calls
                 .iter()
-                .filter(|call| call.starts_with("agy plugin install "))
+                .filter(|call| {
+                    call.as_str() == format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}")
+                })
                 .count(),
             2
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn antigravity_setup_relies_on_native_plugin_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".gemini/config");
+        let mut runner = FakeRunner::new([]);
+
+        setup_antigravity_at(&mut runner, &config_dir).unwrap();
+
+        assert!(!config_dir.join("hooks.json").exists());
+        assert!(runner.called(&format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}")));
     }
 
     #[test]
@@ -964,24 +883,6 @@ mod tests {
         let hooks: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
         assert!(hooks.get(ANTIGRAVITY_PLUGIN).is_none());
         assert_eq!(hooks["other-plugin"]["Stop"][0]["command"], "other");
-    }
-
-    #[test]
-    fn antigravity_setup_assets_match_the_deployable_plugin() {
-        let plugin_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/plugins/antigravity/content");
-        assert_eq!(
-            ANTIGRAVITY_PLUGIN_JSON,
-            std::fs::read_to_string(plugin_root.join("plugin.json")).unwrap()
-        );
-        assert_eq!(
-            ANTIGRAVITY_HOOKS_JSON,
-            std::fs::read_to_string(plugin_root.join("hooks.json")).unwrap()
-        );
-        assert_eq!(
-            ANTIGRAVITY_HOOK_SCRIPT,
-            std::fs::read_to_string(plugin_root.join("bin/antigravity-hook.sh")).unwrap()
-        );
     }
 
     #[test]

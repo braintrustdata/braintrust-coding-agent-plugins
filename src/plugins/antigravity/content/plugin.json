@@ -1,3 +1,5 @@
 {
-  "name": "braintrust-antigravity-tracing"
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "braintrust-antigravity-tracing",
+  "description": "Trace Google Antigravity coding-agent sessions with Braintrust."
 }

@@ -2,8 +2,9 @@
 # release.yml (production repos) and test-release.yml (the shared test repo),
 # which supply `dist_repo` and `record`.
 #
-# Always: bump each of the agent's plugin manifest versions
-# (.<agent>-plugin/plugin.json), build, and `make publish` to <dist_repo>.
+# Always: build and `make publish` to <dist_repo>. Claude and Codex releases
+# also bump each plugin manifest version. Antigravity's native manifest has no
+# version field, so its repository tag is the release version.
 # When record=true (production): commit the bump to main when needed, tag
 # v<version>-<plugin>, and create a GitHub Release on the monorepo. After the
 # distribution is deployed, its repo gets an unsuffixed v<version> tag and
@@ -93,6 +94,7 @@ jobs:
           fi
 
       - name: Bump plugin manifest versions
+        if: ${{ inputs.plugin != 'antigravity' }}
         run: python3 scripts/set-plugin-version.py "${{ inputs.plugin }}" "${{ steps.vars.outputs.version }}"
 
       - name: Record monorepo release
@@ -175,3 +177,10 @@ jobs:
     with:
       dist_repo: ${{ inputs.dist_repo }}
     secrets: inherit
+
+  smoke-antigravity:
+    needs: release
+    if: ${{ inputs.plugin == 'antigravity' }}
+    uses: ./.github/workflows/smoke-antigravity.yml
+    with:
+      dist_repo: ${{ inputs.dist_repo }}

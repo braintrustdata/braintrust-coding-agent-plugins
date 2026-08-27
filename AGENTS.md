@@ -7,7 +7,7 @@ repository that its marketplace installs from.
 ## Layout
 
 ```text
-src/plugins/<agent>/         one directory per agent (claude, codex)
+src/plugins/<agent>/         one directory per agent
   content/                   the deployable plugin tree, verbatim
   build.sh <dir>             assemble the deployable tree into <dir>
   validate.sh <dir>          validate manifests and required files
@@ -41,12 +41,15 @@ cargo test --manifest-path bt-daemon/Cargo.toml --all-features
 
 ## Versioning and distribution
 
-Versioning is per plugin. Each plugin carries its version in its plugin
-manifest, and `scripts/set-plugin-version.py` updates those manifests for a
-release. Marketplace manifests are not versioned.
+Versioning is per distribution. Claude and Codex plugins carry their version in
+their plugin manifests, and `scripts/set-plugin-version.py` updates those
+manifests for a release. Antigravity's schema does not expose a version field,
+so its distribution is versioned by repository tags and GitHub Releases.
+Marketplace manifests are not versioned.
 
 | Agent | Distribution repository |
 |---|---|
+| antigravity | `braintrustdata/braintrust-antigravity-plugin` |
 | claude | `braintrustdata/braintrust-claude-plugin` |
 | codex | `braintrustdata/braintrust-codex-plugin` |
 

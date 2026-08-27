@@ -1,10 +1,12 @@
 # Release a plugin to its PRODUCTION distribution repo:
-#   claude -> braintrustdata/braintrust-claude-plugin
-#   codex  -> braintrustdata/braintrust-codex-plugin
+#   antigravity -> braintrustdata/braintrust-antigravity-plugin
+#   claude      -> braintrustdata/braintrust-claude-plugin
+#   codex       -> braintrustdata/braintrust-codex-plugin
 #
-# Full flow: stamp the version -> commit to main when needed -> monorepo
-# tag/release using v<version>-<plugin> -> deploy -> distribution-repo
-# tag/release using v<version>. For a safe dry run, use test-release.yml
+# Full flow: stamp manifest versions where the agent format supports them ->
+# commit to main when needed -> monorepo tag/release using
+# v<version>-<plugin> -> deploy -> distribution-repo tag/release using
+# v<version>. For a safe dry run, use test-release.yml
 # (deploys to the sandbox repo and skips all commits, tags, and releases).
 
 name: Release plugin
@@ -20,7 +22,7 @@ on:
         description: "Plugin bundle to release"
         required: true
         type: choice
-        options: [claude, codex]
+        options: [antigravity, claude, codex]
 
 permissions:
   contents: write
@@ -31,6 +33,6 @@ jobs:
     with:
       version: ${{ inputs.version }}
       plugin: ${{ inputs.plugin }}
-      dist_repo: ${{ inputs.plugin == 'codex' && 'braintrustdata/braintrust-codex-plugin' || 'braintrustdata/braintrust-claude-plugin' }}
+      dist_repo: ${{ inputs.plugin == 'antigravity' && 'braintrustdata/braintrust-antigravity-plugin' || inputs.plugin == 'codex' && 'braintrustdata/braintrust-codex-plugin' || 'braintrustdata/braintrust-claude-plugin' }}
       record: true
     secrets: inherit

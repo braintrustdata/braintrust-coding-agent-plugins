@@ -15,8 +15,16 @@ confirmed that an empty decision is handled as a denial, while `allow` would
 bypass normal permission checks and `ask` could add prompts.
 
 This package requires a `bt` CLI that exposes `bt trace hook` and a
-Unix-compatible `sh`. Install or refresh it with `bt trace enable antigravity`
-(`setup` remains an alias); remove its managed registration with
-`bt trace disable antigravity`.
-Managed-run injection, transcript import/attach, Windows support, and production
-distribution are not yet part of this feasibility implementation.
+Unix-compatible `sh`. Install or refresh the published plugin and configure its
+Braintrust route with `bt trace enable antigravity` (`setup` remains an alias);
+remove its managed registration with `bt trace disable antigravity`.
+
+The published plugin can also be inspected or installed directly with:
+
+```bash
+agy plugin install https://github.com/braintrustdata/braintrust-antigravity-plugin
+```
+
+The `bt trace enable` command remains the recommended entrypoint because it also
+persists the Braintrust destination. Managed-run injection, transcript
+import/attach, and Windows support are not currently provided.

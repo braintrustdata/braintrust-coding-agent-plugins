@@ -1,0 +1,44 @@
+name: Smoke Antigravity distribution
+
+on:
+  workflow_call:
+    inputs:
+      dist_repo:
+        description: "Distribution repository to install"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install Antigravity CLI
+        run: |
+          curl -fsSL https://antigravity.google/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install published plugin
+        env:
+          DIST_REPO: ${{ inputs.dist_repo }}
+        run: |
+          set -euo pipefail
+          agy plugin install "https://github.com/$DIST_REPO"
+          agy plugin validate "$HOME/.gemini/config/plugins/braintrust-antigravity-tracing"
+          agy plugin list | jq -e '
+            .imports[]
+            | select(
+                .name == "braintrust-antigravity-tracing"
+                and .source == "antigravity"
+                and (.components | index("hooks")) != null
+              )
+          '
+
+      - name: Uninstall published plugin
+        run: |
+          set -euo pipefail
+          agy plugin uninstall braintrust-antigravity-tracing
+          test ! -e "$HOME/.gemini/config/plugins/braintrust-antigravity-tracing"

@@ -54,6 +54,7 @@ fn event(
         route: None,
         config: None,
         managed_run_id: None,
+        capture: None,
     }
 }
 
