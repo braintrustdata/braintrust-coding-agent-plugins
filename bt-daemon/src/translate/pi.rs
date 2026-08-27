@@ -49,6 +49,7 @@ struct PendingLlm {
     first_token_ms: Option<i64>,
     provider: Option<Value>,
 }
+#[derive(Clone)]
 struct ToolStart {
     start_ms: i64,
     name: String,
@@ -90,7 +91,7 @@ impl AgentTranslator for PiTranslator {
                     .map(str::to_owned)
             }
             "message_end" => ops.extend(self.message_end(event, envelope.ts_ms)),
-            "tool_execution_start" => self.tool_start(event, envelope.ts_ms),
+            "tool_execution_start" => ops.extend(self.tool_start(event, envelope.ts_ms)),
             "tool_execution_end" => ops.extend(self.tool_end(event, envelope.ts_ms)),
             "agent_end" if event.get("willRetry").and_then(Value::as_bool) != Some(true) => {
                 ops.extend(self.close_turn(envelope.ts_ms, None));
@@ -348,22 +349,45 @@ impl PiTranslator {
             ..Default::default()
         })]
     }
-    fn tool_start(&mut self, event: &Value, ts: i64) {
+    fn tool_start(&mut self, event: &Value, ts: i64) -> Vec<SpanOp> {
         let Some(id) = event.get("toolCallId").and_then(Value::as_str) else {
-            return;
+            return vec![];
         };
+        let Some((turn, _)) = &self.turn else {
+            return vec![];
+        };
+        let name = event
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .to_string();
+        let args = event.get("args").cloned().unwrap_or(Value::Null);
+        if self.tools.contains_key(id) {
+            return vec![];
+        }
         self.tools.insert(
             id.into(),
             ToolStart {
                 start_ms: ts,
-                name: event
-                    .get("toolName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool")
-                    .into(),
-                args: event.get("args").cloned().unwrap_or(Value::Null),
+                name: name.clone(),
+                args: args.clone(),
             },
         );
+        vec![SpanOp::Insert(SpanRow {
+            span_id: ids::span_id(&self.session_id, &format!("tool:{}:{id}", self.turn_seq)),
+            root_span_id: self.effective_root_span_id.clone(),
+            parent_span_ids: vec![turn.clone()],
+            name,
+            span_type: SpanType::Tool,
+            start_ms: Some(ts),
+            input: Some(args),
+            metadata: Some(json!({
+                "tool_name": event.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
+                "tool_call_id": id,
+                "tool_approval": "approved",
+            })),
+            ..Default::default()
+        })]
     }
     fn tool_end(&mut self, event: &Value, ts: i64) -> Vec<SpanOp> {
         let Some((turn, _)) = &self.turn else {
@@ -373,7 +397,8 @@ impl PiTranslator {
             .get("toolCallId")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let tracked = self.tools.remove(call).unwrap_or(ToolStart {
+        let pending = self.tools.remove(call);
+        let tracked = pending.clone().unwrap_or(ToolStart {
             start_ms: ts,
             name: event
                 .get("toolName")
@@ -389,15 +414,19 @@ impl PiTranslator {
             .as_ref()
             .map(|s| format!("skill: {s}"))
             .unwrap_or_else(|| tracked.name.clone());
-        vec![SpanOp::Insert(SpanRow {
+        let row = SpanRow {
             span_id: ids::span_id(&self.session_id, &format!("tool:{}:{call}", self.turn_seq)),
             root_span_id: self.effective_root_span_id.clone(),
-            parent_span_ids: vec![turn.clone()],
+            parent_span_ids: pending
+                .is_none()
+                .then(|| turn.clone())
+                .into_iter()
+                .collect(),
             name,
             span_type: SpanType::Tool,
-            start_ms: Some(tracked.start_ms),
+            start_ms: pending.is_none().then_some(tracked.start_ms),
             end_ms: Some(ts),
-            input: Some(tracked.args),
+            input: pending.is_none().then_some(tracked.args),
             output: event.get("result").cloned(),
             metadata: Some(json!({
                 "tool_name": if skill.is_some() { "skill" } else { &tracked.name },
@@ -409,7 +438,12 @@ impl PiTranslator {
             })),
             error: failed.then(|| format_error(event.get("result"))),
             ..Default::default()
-        })]
+        };
+        vec![if pending.is_some() {
+            SpanOp::Merge(row)
+        } else {
+            SpanOp::Insert(row)
+        }]
     }
     fn finish_special(
         &mut self,

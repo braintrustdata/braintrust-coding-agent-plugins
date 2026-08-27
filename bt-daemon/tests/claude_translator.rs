@@ -80,6 +80,7 @@ fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
             payload,
             route: None,
             config: None,
+            capture: None,
         };
         ops.extend(translator.handle(&env, &ctx).unwrap());
         while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
@@ -271,6 +272,7 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
                 payload: json!({"session_id":"session","cwd":"/workspace","prompt":"go"}),
                 route: None,
                 config: None,
+                capture: None,
             },
             &ctx,
         )
@@ -370,6 +372,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         payload,
         route: None,
         config: None,
+        capture: None,
     };
     let mut ops = translator
         .handle(
@@ -459,6 +462,7 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
         payload,
         route: None,
         config: None,
+        capture: None,
     };
     let mut ops = Vec::new();
     for envelope in [
@@ -578,6 +582,7 @@ fn claude_groups_streamed_rows_and_reads_late_final_output_at_session_end() {
         payload,
         route: None,
         config: None,
+        capture: None,
     };
     let mut ops = translator
         .handle(
@@ -714,6 +719,7 @@ fn claude_large_catch_up_emits_one_historical_snapshot_per_batch() {
         payload,
         route: None,
         config: None,
+        capture: None,
     };
     translator
         .handle(

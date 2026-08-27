@@ -15,6 +15,7 @@ fn event(name: &str, ts_ms: i64, native: serde_json::Value) -> Envelope {
         payload: json!({"event":native,"extension_version":"1.0.0","cwd":"."}),
         route: None,
         config: None,
+        capture: None,
     }
 }
 
@@ -27,8 +28,14 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
             }
             SpanOp::Merge(update) => {
                 let row: &mut SpanRow = rows.entry(update.span_id.clone()).or_default();
+                if !update.name.is_empty() {
+                    row.name = update.name;
+                }
                 if update.end_ms.is_some() {
                     row.end_ms = update.end_ms;
+                }
+                if update.output.is_some() {
+                    row.output = update.output;
                 }
                 if update.metadata.is_some() {
                     row.metadata = update.metadata;

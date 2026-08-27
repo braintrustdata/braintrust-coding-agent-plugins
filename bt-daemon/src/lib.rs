@@ -14,9 +14,11 @@ pub mod paths;
 
 mod client;
 mod command_output;
+mod correlation;
 mod dispatch;
 mod ids;
 mod journal;
+pub(crate) mod process;
 mod server;
 mod settings;
 mod setup;
@@ -262,6 +264,7 @@ pub async fn run_hook(
         managed_run_id: std::env::var(MANAGED_RUN_ID_ENV)
             .ok()
             .filter(|value| !value.is_empty()),
+        capture: None,
         payload,
         route: Some(route),
         config: None,

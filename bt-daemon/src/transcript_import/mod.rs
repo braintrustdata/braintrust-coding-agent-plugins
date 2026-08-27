@@ -304,6 +304,7 @@ fn envelope(
         event: event.into(),
         ts_ms,
         managed_run_id: None,
+        capture: None,
         payload,
         route: None,
         config: None,

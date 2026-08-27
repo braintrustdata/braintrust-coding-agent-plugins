@@ -65,6 +65,7 @@ fn envelope(session: &str, event: &str, transcript_path: &str, extra: Value) -> 
         payload,
         route: None,
         config: None,
+        capture: None,
     }
 }
 

@@ -449,10 +449,33 @@ impl OpenCodeTranslator {
             return vec![];
         };
         if let Some(s) = self.sessions.get_mut(&sid) {
+            let Some(turn) = s.current_turn_span_id.clone() else {
+                return vec![];
+            };
+            if s.tool_starts.contains_key(call) {
+                return vec![];
+            }
             s.tool_starts.insert(call.into(), event.ts_ms);
             if let Some(a) = event.payload.pointer("/output/args") {
                 s.tool_args.insert(call.into(), a.clone());
             }
+            let tool = event
+                .payload
+                .pointer("/input/tool")
+                .or_else(|| event.payload.get("tool"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            return vec![SpanOp::Insert(SpanRow {
+                span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
+                root_span_id: s.effective_root_span_id.clone(),
+                parent_span_ids: vec![turn],
+                name: tool.into(),
+                span_type: SpanType::Tool,
+                start_ms: Some(event.ts_ms),
+                input: s.tool_args.get(call).cloned(),
+                metadata: Some(json!({"tool_name":tool,"call_id":call})),
+                ..Default::default()
+            })];
         }
         vec![]
     }
@@ -513,20 +536,27 @@ impl OpenCodeTranslator {
                 .cloned()
                 .unwrap_or(Value::Null)
         }
-        vec![SpanOp::Insert(SpanRow {
+        let had_start = s.tool_starts.contains_key(call);
+        let row = SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
             root_span_id: s.effective_root_span_id.clone(),
-            parent_span_ids: vec![turn],
+            parent_span_ids: (!had_start).then_some(turn).into_iter().collect(),
             name,
             span_type: SpanType::Tool,
-            start_ms: s.tool_starts.remove(call).or(Some(event.ts_ms)),
+            start_ms: (!had_start).then(|| s.tool_starts.remove(call).unwrap_or(event.ts_ms)),
             end_ms: Some(event.ts_ms),
-            input: args,
+            input: (!had_start).then_some(args).flatten(),
             output,
             error,
             metadata: Some(metadata),
             ..Default::default()
-        })]
+        };
+        s.tool_starts.remove(call);
+        vec![if had_start {
+            SpanOp::Merge(row)
+        } else {
+            SpanOp::Insert(row)
+        }]
     }
 
     fn permission(&mut self, event: &Envelope) -> Vec<SpanOp> {

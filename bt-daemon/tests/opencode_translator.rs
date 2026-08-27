@@ -15,6 +15,7 @@ fn event(name: &str, ts_ms: i64, payload: serde_json::Value) -> Envelope {
         payload,
         route: None,
         config: None,
+        capture: None,
     }
 }
 
