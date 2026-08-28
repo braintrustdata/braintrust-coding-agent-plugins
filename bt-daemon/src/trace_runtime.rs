@@ -661,6 +661,7 @@ mod tests {
             session_id_field: "session_id".into(),
             event_field: "hook_event_name".into(),
             event: None,
+            transcript_path_field: None,
             no_spawn: false,
             flush_on_turn_end: false,
             flush_timeout_ms: 10_000,

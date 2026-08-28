@@ -18,10 +18,15 @@ const CLAUDE_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-claude-plugin
 const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
 const OPENCODE_PLUGIN: &str = "@braintrust/trace-opencode@^1";
 const PI_PLUGIN: &str = "npm:@braintrust/pi-extension@^1";
+const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
+#[cfg(unix)]
+const ANTIGRAVITY_PLUGIN_SOURCE: &str =
+    "https://github.com/braintrustdata/braintrust-antigravity-plugin";
 
 trait CommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value>;
     fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<()>;
+    fn run_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<()>;
 }
 
 struct SystemCommandRunner;
@@ -51,6 +56,21 @@ impl CommandRunner for SystemCommandRunner {
             })?;
         if !status.success() {
             bail!("`{program} {}` failed with {status}", args.join(" "));
+        }
+        Ok(())
+    }
+
+    fn run_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<()> {
+        let output = ProcessCommand::new(program)
+            .args(args)
+            .env("HOME", home)
+            .output()
+            .with_context(|| {
+                format!("failed to run `{program}`; install {program} and ensure it is on PATH")
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("`{program} {}` failed: {}", args.join(" "), stderr.trim());
         }
         Ok(())
     }
@@ -332,6 +352,82 @@ fn disable_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     runner.run("pi", &["uninstall", PI_PLUGIN])
 }
 
+fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
+    if config_dir.file_name().and_then(|part| part.to_str()) != Some("config") {
+        bail!(
+            "Antigravity configuration directory must end in `.gemini/config`: {}",
+            config_dir.display()
+        );
+    }
+    let gemini_dir = config_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Antigravity configuration directory has no parent: {}",
+            config_dir.display()
+        )
+    })?;
+    if gemini_dir.file_name().and_then(|part| part.to_str()) != Some(".gemini") {
+        bail!(
+            "Antigravity configuration directory must end in `.gemini/config`: {}",
+            config_dir.display()
+        );
+    }
+    gemini_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Antigravity configuration directory has no home parent: {}",
+            config_dir.display()
+        )
+    })
+}
+
+fn remove_legacy_antigravity_registration(config_dir: &Path) -> anyhow::Result<()> {
+    let hooks_path = config_dir.join("hooks.json");
+    if !hooks_path.exists() {
+        return Ok(());
+    }
+    let mut hooks = load_object(&hooks_path)?;
+    if hooks.remove(ANTIGRAVITY_PLUGIN).is_some() {
+        write_object_atomic(&hooks_path, hooks)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn setup_antigravity_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
+    runner.run_in_home(
+        "agy",
+        &["plugin", "install", ANTIGRAVITY_PLUGIN_SOURCE],
+        antigravity_home(config_dir)?,
+    )?;
+
+    remove_legacy_antigravity_registration(config_dir)
+}
+
+#[cfg(not(unix))]
+fn setup_antigravity_at(_: &mut impl CommandRunner, _: &Path) -> anyhow::Result<()> {
+    bail!("Google Antigravity tracing setup currently requires a Unix-compatible `sh`")
+}
+
+fn setup_antigravity(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    setup_antigravity_at(runner, &paths::antigravity_config_dir())
+}
+
+fn disable_antigravity_at(
+    runner: &mut impl CommandRunner,
+    config_dir: &Path,
+) -> anyhow::Result<()> {
+    // Antigravity's uninstall command is idempotent when the plugin is absent.
+    runner.run_in_home(
+        "agy",
+        &["plugin", "uninstall", ANTIGRAVITY_PLUGIN],
+        antigravity_home(config_dir)?,
+    )?;
+    remove_legacy_antigravity_registration(config_dir)
+}
+
+fn disable_antigravity(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    disable_antigravity_at(runner, &paths::antigravity_config_dir())
+}
+
 fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()> {
     let mut settings = load_object(path)?;
     if route.additional_metadata.is_none() {
@@ -392,6 +488,7 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::Claude => disable_claude(&mut runner)?,
         SetupAgent::OpenCode => disable_opencode()?,
         SetupAgent::Pi => disable_pi(&mut runner)?,
+        SetupAgent::Antigravity => disable_antigravity(&mut runner)?,
     }
     let settings_path = paths::agent_settings_path(source, None);
     remove_tracing_settings(&settings_path)?;
@@ -408,6 +505,7 @@ fn agent_details(agent: SetupAgent) -> (&'static str, &'static str) {
         SetupAgent::Claude => ("claude", "Claude Code"),
         SetupAgent::OpenCode => ("opencode", "OpenCode"),
         SetupAgent::Pi => ("pi", "Pi"),
+        SetupAgent::Antigravity => ("antigravity", "Google Antigravity"),
     }
 }
 
@@ -431,6 +529,10 @@ pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<Trace
         SetupAgent::Pi => {
             setup_pi(&mut runner)?;
             ("pi", "Pi")
+        }
+        SetupAgent::Antigravity => {
+            setup_antigravity(&mut runner)?;
+            ("antigravity", "Google Antigravity")
         }
     };
     let settings_path = enable_tracing(source, route)?;
@@ -481,6 +583,29 @@ mod tests {
         fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<()> {
             self.calls.push(format!("{program} {}", args.join(" ")));
             Ok(())
+        }
+
+        fn run_in_home(&mut self, program: &str, args: &[&str], _: &Path) -> anyhow::Result<()> {
+            self.calls.push(format!("{program} {}", args.join(" ")));
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    struct MissingAgyRunner;
+
+    #[cfg(unix)]
+    impl CommandRunner for MissingAgyRunner {
+        fn json(&mut self, _: &str, _: &[&str]) -> anyhow::Result<Value> {
+            unreachable!()
+        }
+
+        fn run(&mut self, _: &str, _: &[&str]) -> anyhow::Result<()> {
+            unreachable!()
+        }
+
+        fn run_in_home(&mut self, program: &str, _: &[&str], _: &Path) -> anyhow::Result<()> {
+            anyhow::bail!("failed to run `{program}`; install {program} and ensure it is on PATH")
         }
     }
 
@@ -641,6 +766,124 @@ mod tests {
         setup_pi(&mut runner).unwrap();
 
         assert!(runner.called("pi install npm:@braintrust/pi-extension@^1"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn antigravity_installs_published_plugin_and_removes_legacy_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".gemini/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let hooks_path = config_dir.join("hooks.json");
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_vec(&serde_json::json!({
+                ANTIGRAVITY_PLUGIN: {"Stop": []},
+                "other-plugin": {"Stop": [{"type": "command", "command": "other"}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut runner = FakeRunner::new([]);
+
+        setup_antigravity_at(&mut runner, &config_dir).unwrap();
+
+        assert!(runner.called(&format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}")));
+        let hooks: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
+        assert_eq!(hooks["other-plugin"]["Stop"][0]["command"], "other");
+        assert!(hooks.get(ANTIGRAVITY_PLUGIN).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn antigravity_setup_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".gemini/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("hooks.json"),
+            serde_json::to_vec(&serde_json::json!({
+                ANTIGRAVITY_PLUGIN: {"Stop": []},
+                "other-plugin": {"Stop": []}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut runner = FakeRunner::new([]);
+
+        setup_antigravity_at(&mut runner, &config_dir).unwrap();
+        let first = std::fs::read(config_dir.join("hooks.json")).unwrap();
+        setup_antigravity_at(&mut runner, &config_dir).unwrap();
+        let second = std::fs::read(config_dir.join("hooks.json")).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            runner
+                .calls
+                .iter()
+                .filter(|call| {
+                    call.as_str() == format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}")
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn antigravity_setup_relies_on_native_plugin_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".gemini/config");
+        let mut runner = FakeRunner::new([]);
+
+        setup_antigravity_at(&mut runner, &config_dir).unwrap();
+
+        assert!(!config_dir.join("hooks.json").exists());
+        assert!(runner.called(&format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn antigravity_setup_reports_a_missing_cli_without_changing_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".gemini/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let hooks_path = config_dir.join("hooks.json");
+        let original = br#"{"other-plugin":{"Stop":[]}}"#;
+        std::fs::write(&hooks_path, original).unwrap();
+
+        let error = setup_antigravity_at(&mut MissingAgyRunner, &config_dir).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "failed to run `agy`; install agy and ensure it is on PATH"
+        );
+        assert_eq!(std::fs::read(hooks_path).unwrap(), original);
+    }
+
+    #[test]
+    fn antigravity_disable_removes_only_the_managed_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".gemini/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let hooks_path = config_dir.join("hooks.json");
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_vec(&serde_json::json!({
+                ANTIGRAVITY_PLUGIN: {"Stop": []},
+                "other-plugin": {"Stop": [{"type": "command", "command": "other"}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut runner = FakeRunner::new([]);
+
+        disable_antigravity_at(&mut runner, &config_dir).unwrap();
+
+        assert!(runner.called("agy plugin uninstall braintrust-antigravity-tracing"));
+        let hooks: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
+        assert!(hooks.get(ANTIGRAVITY_PLUGIN).is_none());
+        assert_eq!(hooks["other-plugin"]["Stop"][0]["command"], "other");
     }
 
     #[test]
