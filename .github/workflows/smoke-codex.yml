@@ -13,7 +13,9 @@ on:
         required: true
         type: string
     secrets:
-      PUBLISH_TOKEN:
+      BRAINTRUST_BOT_APP_ID:
+        required: true
+      BRAINTRUST_BOT_PRIVATE_KEY:
         required: true
       OPENAI_API_KEY:
         required: false
@@ -64,6 +66,18 @@ jobs:
       - name: Checkout monorepo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Split dist repo into owner/name
+        id: dist
+        env:
+          DIST_REPO: ${{ inputs.dist_repo }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$DIST_REPO" | grep -Eq '^[^/[:space:]]+/[^/[:space:]]+$'; then
+            echo "::error::dist_repo '$DIST_REPO' must be owner/name."; exit 1
+          fi
+          echo "owner=${DIST_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${DIST_REPO#*/}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -72,16 +86,27 @@ jobs:
       - name: Install Codex and bt CLIs
         run: |
           npm install -g @openai/codex
-          curl -fsSL https://bt.dev/cli/install.sh | sh
+          curl -fsSL https://bt.dev/cli/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Require daemon-capable bt
         run: |
           "$HOME/.local/bin/bt" trace hook --help
 
+      # Read-only marketplace clone, as braintrust-bot rather than a PAT.
+      - name: Generate distribution-repo token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BRAINTRUST_BOT_APP_ID }}
+          private-key: ${{ secrets.BRAINTRUST_BOT_PRIVATE_KEY }}
+          owner: ${{ steps.dist.outputs.owner }}
+          repositories: ${{ steps.dist.outputs.name }}
+          permission-contents: read
+
       - name: Install plugin from ${{ inputs.dist_repo }}
         env:
-          GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           codex plugin marketplace add "${{ inputs.dist_repo }}"

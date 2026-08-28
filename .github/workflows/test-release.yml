@@ -12,11 +12,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, e.g. v0.0.4"
+        description: "Version to stamp into the build, e.g. v0.0.4. NOTE: nothing mutated or tagged in this monorepo"
         required: true
         type: string
       plugin:
-        description: "Plugin bundle to release"
+        description: "Plugin bundle to release. Overwrites braintrustdata/test-coding-agent-dist"
         required: true
         type: choice
         options: [antigravity, claude, codex]
