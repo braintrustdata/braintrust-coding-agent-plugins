@@ -30,7 +30,11 @@ on:
         required: true
         type: boolean
     secrets:
-      PUBLISH_TOKEN:
+      BRAINTRUST_BOT_APP_ID:
+        description: "braintrust-bot GitHub App id; mints the distribution-repo token."
+        required: true
+      BRAINTRUST_BOT_PRIVATE_KEY:
+        description: "braintrust-bot GitHub App private key."
         required: true
       OPENAI_API_KEY:
         description: "For the post-deploy codex smoke test; skipped if unset."
@@ -75,12 +79,33 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+          dist_repo="${{ inputs.dist_repo }}"
+          if ! printf '%s' "$dist_repo" | grep -Eq '^[^/[:space:]]+/[^/[:space:]]+$'; then
+            echo "::error::dist_repo '$dist_repo' must be owner/name."; exit 1
+          fi
+          echo "dist_owner=${dist_repo%%/*}" >> "$GITHUB_OUTPUT"
+          echo "dist_name=${dist_repo#*/}" >> "$GITHUB_OUTPUT"
           echo "Releasing $tag -> ${{ inputs.dist_repo }}@$dist_tag (record=${{ inputs.record }})"
+
+      # Cross-repo work runs as the braintrust-bot GitHub App instead of a
+      # long-lived PAT: the token is minted per run, expires in an hour, and is
+      # scoped to contents:write on the one distribution repo. Monorepo commits
+      # and tags still use the built-in GITHUB_TOKEN. This step fails loudly if
+      # braintrust-bot is not installed on <dist_repo>.
+      - name: Generate distribution-repo token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BRAINTRUST_BOT_APP_ID }}
+          private-key: ${{ secrets.BRAINTRUST_BOT_PRIVATE_KEY }}
+          owner: ${{ steps.vars.outputs.dist_owner }}
+          repositories: ${{ steps.vars.outputs.dist_name }}
+          permission-contents: write
 
       - name: Validate distribution release tag
         if: ${{ inputs.record }}
         env:
-          GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           DIST_REPO: ${{ inputs.dist_repo }}
           DIST_TAG: ${{ steps.vars.outputs.dist_tag }}
         run: |
@@ -149,13 +174,13 @@ jobs:
       - name: Deploy to distribution repo
         env:
           PUBLISH_TARGETS: "${{ inputs.plugin }}:${{ inputs.dist_repo }}"
-          GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: make publish
 
       - name: Tag and release distribution repo
         if: ${{ inputs.record }}
         env:
-          GH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           DIST_REPO: ${{ inputs.dist_repo }}
           DIST_TAG: ${{ steps.vars.outputs.dist_tag }}
         run: |

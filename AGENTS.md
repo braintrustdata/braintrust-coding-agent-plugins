@@ -83,7 +83,11 @@ branch revision are cancelled.
 
 ## Secrets
 
-- `PUBLISH_TOKEN` grants `contents:write` on distribution repositories.
+- `BRAINTRUST_BOT_APP_ID` / `BRAINTRUST_BOT_PRIVATE_KEY` are the
+  `braintrustdata/braintrust-bot` GitHub App credentials. Release workflows mint
+  a short-lived installation token from them, scoped to `contents:write` on the
+  one distribution repository being deployed. The app must be installed on every
+  distribution repository, or the token step fails.
 - `OPENAI_API_KEY` enables the optional real Codex smoke test.
 
 Braintrust authentication is deliberately not stored in plugin or daemon
