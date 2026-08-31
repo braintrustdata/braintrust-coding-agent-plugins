@@ -577,6 +577,7 @@ impl CodexTranslator {
                 if let Some(project) = &self.project {
                     md.insert("project".into(), json!(project));
                 }
+                md.insert("username".into(), json!(username()));
                 scope.root_created = true;
                 ops.push(SpanOp::Insert(SpanRow {
                     span_id: self.root_span_id.clone(),
@@ -1756,6 +1757,12 @@ fn num_at(v: &Value, path: &str) -> Option<f64> {
         cur = cur.get(part)?;
     }
     cur.as_f64().filter(|n| n.is_finite())
+}
+
+fn username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

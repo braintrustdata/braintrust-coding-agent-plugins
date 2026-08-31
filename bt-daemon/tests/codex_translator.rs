@@ -12,6 +12,12 @@ fn line(v: Value) -> String {
     serde_json::to_string(&v).unwrap()
 }
 
+fn expected_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default()
+}
+
 /// Write the full happy-path transcript to `path`.
 fn write_transcript(path: &std::path::Path) {
     let records = vec![
@@ -186,6 +192,7 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
     );
     assert_eq!(md["source"], json!("startup"));
     assert_eq!(md["permission_mode"], json!("auto"));
+    assert_eq!(md["username"], json!(expected_username()));
 
     // Turn.
     let turn = find(&rows, SpanType::Task, "turn: t1");
