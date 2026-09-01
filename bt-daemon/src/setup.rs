@@ -19,6 +19,7 @@ const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
 const OPENCODE_PLUGIN: &str = "@braintrust/trace-opencode@^1";
 const PI_PLUGIN: &str = "npm:@braintrust/pi-extension@^1";
 const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
+const LEGACY_CLAUDE_TRACING_ENV_KEYS: [&str; 2] = ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"];
 #[cfg(unix)]
 const ANTIGRAVITY_PLUGIN_SOURCE: &str =
     "https://github.com/braintrustdata/braintrust-antigravity-plugin";
@@ -213,6 +214,42 @@ fn setup_claude(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn legacy_claude_tracing_env_keys(path: &Path) -> anyhow::Result<Vec<&'static str>> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect Claude settings: {}", path.display()))
+        }
+    };
+    let value: Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("Claude settings are not valid JSON: {}", path.display()))?;
+    let env = value.get("env").and_then(Value::as_object);
+    Ok(LEGACY_CLAUDE_TRACING_ENV_KEYS
+        .into_iter()
+        .filter(|key| env.is_some_and(|env| env.contains_key(*key)))
+        .collect())
+}
+
+fn warn_legacy_claude_tracing_env() {
+    let path = paths::claude_settings_path();
+    let keys = match legacy_claude_tracing_env_keys(&path) {
+        Ok(keys) => keys,
+        Err(error) => {
+            eprintln!("warning: could not inspect legacy Claude tracing settings: {error}");
+            return;
+        }
+    };
+    if !keys.is_empty() {
+        eprintln!(
+            "warning: obsolete Braintrust tracing settings in {}: {}; remove these keys from env. BRAINTRUST_API_KEY is left unchanged because the Braintrust MCP plugin may use it.",
+            path.display(),
+            keys.join(", ")
+        );
     }
 }
 
@@ -520,6 +557,7 @@ pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<Trace
         }
         SetupAgent::Claude => {
             setup_claude(&mut runner)?;
+            warn_legacy_claude_tracing_env();
             ("claude", "Claude Code")
         }
         SetupAgent::OpenCode => {
@@ -737,6 +775,27 @@ mod tests {
             })
             .unwrap();
         assert!(update < enable);
+    }
+
+    #[test]
+    fn claude_legacy_env_diagnostic_is_read_only_and_preserves_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let contents = r#"{
+            "env": {
+                "BRAINTRUST_CC_PROJECT": "old-project",
+                "BRAINTRUST_CC_DEBUG": "1",
+                "BRAINTRUST_API_KEY": "still-used-by-mcp",
+                "OTHER": "value"
+            }
+        }"#;
+        std::fs::write(&path, contents).unwrap();
+
+        assert_eq!(
+            legacy_claude_tracing_env_keys(&path).unwrap(),
+            ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"]
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
     }
 
     #[test]

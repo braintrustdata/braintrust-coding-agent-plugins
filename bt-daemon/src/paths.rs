@@ -1,6 +1,7 @@
 //! Socket and data-directory resolution. Both `serve` and `hook` must agree on
 //! the defaults, so the logic lives here. See `docs/protocol.md`.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Env override for the socket path (also settable via `--socket`).
@@ -94,7 +95,7 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
     }
     match source {
         "codex" => home().join(".codex").join("braintrust.json"),
-        "claude" | "claude-code" => home().join(".claude").join("braintrust.json"),
+        "claude" | "claude-code" => claude_config_dir().join("braintrust.json"),
         "opencode" => std::env::var_os("XDG_CONFIG_HOME")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
@@ -108,6 +109,24 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
             .join("braintrust.json"),
         other => data_dir(None).join("agents").join(format!("{other}.json")),
     }
+}
+
+/// Claude Code's shared settings file. Braintrust never mutates this file;
+/// setup only inspects it for obsolete tracing-specific environment entries.
+pub(crate) fn claude_settings_path() -> PathBuf {
+    claude_config_dir().join("settings.json")
+}
+
+fn claude_config_dir() -> PathBuf {
+    let home = home();
+    claude_config_dir_from(std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(), &home)
+}
+
+fn claude_config_dir_from(config_dir: Option<&OsStr>, home: &Path) -> PathBuf {
+    config_dir
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"))
 }
 
 /// Resolve Antigravity's native configuration directory.
@@ -163,5 +182,20 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn claude_config_dir_override_selects_the_active_settings_directory() {
+        assert_eq!(
+            claude_config_dir_from(
+                Some(OsStr::new("/tmp/custom-claude")),
+                Path::new("/home/test")
+            ),
+            Path::new("/tmp/custom-claude")
+        );
+        assert_eq!(
+            claude_config_dir_from(Some(OsStr::new("")), Path::new("/home/test")),
+            Path::new("/home/test/.claude")
+        );
     }
 }

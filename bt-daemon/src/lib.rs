@@ -33,8 +33,8 @@ mod transport;
 pub mod wire;
 pub use client::HostInfo;
 pub use command_output::{
-    AuthDiagnostic, DoctorCommandOutput, OutputFormat, SetupCommandOutput, StatusCommandOutput,
-    StopCommandOutput, TraceCommandOutput,
+    AuthDiagnostic, DoctorCommandOutput, ImportSummary, OutputFormat, SetupCommandOutput,
+    StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
 };
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
 pub use setup::{run_disable, run_enable, run_setup};
@@ -49,7 +49,7 @@ pub use translate::{
 };
 
 use anyhow::Context;
-use braintrust_sdk_rust::SpanComponents;
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use clap::{Args, ValueEnum};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -160,11 +160,50 @@ pub struct ImportArgs {
     pub all: bool,
     /// Destination object reference, such as `project_logs:<project-id>` or
     /// `experiment:<experiment-id>`.
-    #[arg(long, value_name = "DESTINATION", conflicts_with = "parent")]
+    #[arg(
+        long,
+        value_name = "DESTINATION",
+        conflicts_with_all = ["parent", "parent_span_id", "parent_root_span_id", "parent_object_type", "parent_object_id", "parent_project"]
+    )]
     pub destination: Option<wire::TraceDestination>,
-    /// Attach the imported session below an exported Braintrust span.
-    #[arg(long, value_name = "SPAN_COMPONENTS", conflicts_with = "destination")]
+    /// Attach below the opaque value returned by a Braintrust SDK span.export().
+    #[arg(
+        long,
+        value_name = "SPAN_EXPORT",
+        conflicts_with_all = ["destination", "parent_span_id", "parent_root_span_id", "parent_object_type", "parent_object_id", "parent_project"]
+    )]
     pub parent: Option<SpanComponents>,
+    /// Attach below this span ID. Also requires --parent-root-span-id and
+    /// --parent-object-type, plus --parent-object-id or --parent-project.
+    #[arg(
+        long,
+        value_name = "SPAN_ID",
+        requires_all = ["parent_root_span_id", "parent_object_type"],
+        conflicts_with_all = ["destination", "parent"]
+    )]
+    pub parent_span_id: Option<String>,
+    /// Root span ID for --parent-span-id.
+    #[arg(long, value_name = "ROOT_SPAN_ID", requires = "parent_span_id")]
+    pub parent_root_span_id: Option<String>,
+    /// Braintrust object type for --parent-span-id.
+    #[arg(long, value_enum, requires = "parent_span_id")]
+    pub parent_object_type: Option<ParentObjectType>,
+    /// Braintrust object ID for --parent-span-id.
+    #[arg(
+        long,
+        value_name = "OBJECT_ID",
+        requires = "parent_span_id",
+        conflicts_with = "parent_project"
+    )]
+    pub parent_object_id: Option<String>,
+    /// Braintrust project name for a project-logs parent.
+    #[arg(
+        long,
+        value_name = "PROJECT",
+        requires = "parent_span_id",
+        conflicts_with = "parent_object_id"
+    )]
+    pub parent_project: Option<String>,
     /// Keep following the transcript until Ctrl-C, importing new turns as the
     /// coding-agent session grows.
     #[arg(long, conflicts_with = "all")]
@@ -179,6 +218,31 @@ pub enum ImportSource {
     Codex,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ParentObjectType {
+    Experiment,
+    #[value(name = "project_logs", alias = "project-logs")]
+    ProjectLogs,
+    #[value(name = "playground_logs", alias = "playground-logs")]
+    PlaygroundLogs,
+}
+
+impl From<ParentObjectType> for SpanObjectType {
+    fn from(value: ParentObjectType) -> Self {
+        match value {
+            ParentObjectType::Experiment => Self::Experiment,
+            ParentObjectType::ProjectLogs => Self::ProjectLogs,
+            ParentObjectType::PlaygroundLogs => Self::PlaygroundLogs,
+        }
+    }
+}
+
+impl ImportArgs {
+    pub fn has_destination_override(&self) -> bool {
+        self.destination.is_some() || self.parent.is_some() || self.parent_span_id.is_some()
+    }
 }
 
 /// Arguments for launching a coding agent with invocation-local live hooks.
@@ -485,12 +549,11 @@ pub async fn run_import(
     args: ImportArgs,
     opts: ServeOptions,
     mut config: Option<SessionConfig>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<ImportSummary>> {
     validate_import_selection(&args)?;
-    let destination = args
-        .parent
+    let destination = import_parent_components(&args)?
         .map(|components| wire::TraceDestination::ParentSpan { components })
-        .or(args.destination);
+        .or_else(|| args.destination.clone());
     apply_import_destination(&mut config, destination)?;
     let files = transcript_import::resolve_transcripts(&args.session_ids, args.all, args.source)?;
     if args.attach {
@@ -506,7 +569,84 @@ fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
     if args.attach && args.session_ids.len() != 1 {
         anyhow::bail!("--attach requires exactly one session id");
     }
+    import_parent_components(args)?;
     Ok(())
+}
+
+fn import_parent_components(args: &ImportArgs) -> anyhow::Result<Option<SpanComponents>> {
+    if let Some(parent) = &args.parent {
+        parent
+            .to_parent_span_info()
+            .map_err(|error| anyhow::anyhow!("invalid --parent value: {error}"))?;
+        return Ok(Some(parent.clone()));
+    }
+
+    let Some(span_id) = args.parent_span_id.as_deref() else {
+        return Ok(None);
+    };
+    let span_id = span_id.trim();
+    if span_id.is_empty() {
+        anyhow::bail!("--parent-span-id must not be empty");
+    }
+    let root_span_id = args
+        .parent_root_span_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--parent-span-id requires --parent-root-span-id"))?;
+    let root_span_id = root_span_id.trim();
+    if root_span_id.is_empty() {
+        anyhow::bail!("--parent-root-span-id must not be empty");
+    }
+    let object_type = args
+        .parent_object_type
+        .ok_or_else(|| anyhow::anyhow!("--parent-span-id requires --parent-object-type"))?;
+
+    let object_id = args
+        .parent_object_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let parent_project = args
+        .parent_project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let compute_object_metadata_args = match object_type {
+        ParentObjectType::ProjectLogs if object_id.is_none() => {
+            let project = parent_project.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "project_logs parent requires --parent-object-id or --parent-project"
+                )
+            })?;
+            Some(serde_json::Map::from_iter([(
+                "project_name".to_string(),
+                serde_json::Value::String(project.to_string()),
+            )]))
+        }
+        ParentObjectType::ProjectLogs => None,
+        _ if parent_project.is_some() => {
+            anyhow::bail!("--parent-project is only valid with --parent-object-type project_logs")
+        }
+        _ if object_id.is_none() => {
+            anyhow::bail!("this parent object type requires --parent-object-id")
+        }
+        _ => None,
+    };
+
+    let components = SpanComponents {
+        object_type: object_type.into(),
+        object_id,
+        compute_object_metadata_args,
+        row_id: None,
+        span_id: Some(span_id.to_string()),
+        root_span_id: Some(root_span_id.to_string()),
+        span_parents: None,
+        propagated_event: None,
+    };
+    components
+        .to_parent_span_info()
+        .map_err(|error| anyhow::anyhow!("invalid parent identifiers: {error}"))?;
+    Ok(Some(components))
 }
 
 /// Launch a coding agent with inherited stdio and inject Braintrust hooks for
@@ -520,6 +660,17 @@ pub async fn run_traced(
     if route.destination.is_none() {
         anyhow::bail!(
             "managed run requires a trace destination; select a project, object destination, or parent span"
+        );
+    }
+    if args.source == RunSource::Codex
+        && args.agent_args.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg == "--dangerously-bypass-hook-trust"
+                || arg.starts_with("--dangerously-bypass-hook-trust=")
+        })
+    {
+        anyhow::bail!(
+            "bt trace run codex cannot be combined with --dangerously-bypass-hook-trust; managed tracing preserves Codex hook trust. Remove the flag, or run Codex directly"
         );
     }
     let (executable_env, default_executable) = match args.source {
@@ -818,7 +969,7 @@ pub async fn import_transcript(
     opts: ServeOptions,
     config: Option<SessionConfig>,
     attach: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<ImportSummary>> {
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
     let mut processor = ImportProcessor::new(opts, config);
     let shutdown = tokio::signal::ctrl_c();
@@ -849,8 +1000,9 @@ pub async fn import_transcripts(
     source: ImportSource,
     opts: ServeOptions,
     config: Option<SessionConfig>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<ImportSummary>> {
     let mut processor = ImportProcessor::new(opts, config);
+    let mut summaries = Vec::new();
     for file in files {
         let mut tail = transcript_import::TranscriptTail::new(file.clone(), source);
         let entries = tail
@@ -862,10 +1014,13 @@ pub async fn import_transcripts(
             .collect::<std::collections::HashSet<_>>();
         processor.process(entries).await?;
         for session_id in session_ids {
-            processor.finish_session(&session_id).await?;
+            if let Some(summary) = processor.finish_session(&session_id).await? {
+                summaries.push(summary);
+            }
         }
     }
-    processor.finish().await
+    summaries.extend(processor.finish().await?);
+    Ok(summaries)
 }
 
 struct ImportLive {
@@ -873,6 +1028,9 @@ struct ImportLive {
     sink: Box<dyn Sink>,
     ctx: SessionCtx,
     pending_ops: usize,
+    span_ids: std::collections::HashSet<String>,
+    root_span_id: Option<String>,
+    destination: Option<wire::TraceDestination>,
 }
 
 struct ImportProcessor {
@@ -913,6 +1071,15 @@ impl ImportProcessor {
                                 config: None,
                             },
                             pending_ops: 0,
+                            span_ids: std::collections::HashSet::new(),
+                            root_span_id: self
+                                .config
+                                .as_ref()
+                                .and_then(|config| config.attached_span_ids().1),
+                            destination: self
+                                .config
+                                .as_ref()
+                                .and_then(|config| config.destination.clone()),
                         },
                     );
                     self.sessions.get_mut(&sid).unwrap()
@@ -939,6 +1106,15 @@ impl ImportProcessor {
             // for every native turn boundary.
             const FLUSH_OPS: usize = 500;
             for chunk in ops.chunks(FLUSH_OPS) {
+                for op in chunk {
+                    let row = match op {
+                        SpanOp::Insert(row) | SpanOp::Merge(row) => row,
+                    };
+                    live.span_ids.insert(row.span_id.clone());
+                    if live.root_span_id.is_none() && !row.root_span_id.is_empty() {
+                        live.root_span_id = Some(row.root_span_id.clone());
+                    }
+                }
                 live.sink.emit(chunk).await?;
                 live.pending_ops += chunk.len();
                 if live.pending_ops >= FLUSH_OPS {
@@ -951,22 +1127,36 @@ impl ImportProcessor {
         Ok(())
     }
 
-    async fn finish(self) -> anyhow::Result<()> {
-        for (_sid, mut live) in self.sessions {
+    async fn finish(self) -> anyhow::Result<Vec<ImportSummary>> {
+        let mut summaries = Vec::new();
+        for (sid, mut live) in self.sessions {
             let ops = live.translator.flush(&live.ctx)?;
             Self::emit_translator_batches(&mut live, ops).await?;
             live.sink.flush().await?;
+            summaries.push(Self::summary(sid, live));
         }
-        Ok(())
+        summaries.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(summaries)
     }
 
-    async fn finish_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+    async fn finish_session(&mut self, session_id: &str) -> anyhow::Result<Option<ImportSummary>> {
         let Some(mut live) = self.sessions.remove(session_id) else {
-            return Ok(());
+            return Ok(None);
         };
         let ops = live.translator.flush(&live.ctx)?;
         Self::emit_translator_batches(&mut live, ops).await?;
-        live.sink.flush().await
+        live.sink.flush().await?;
+        Ok(Some(Self::summary(session_id.to_string(), live)))
+    }
+
+    fn summary(session_id: String, live: ImportLive) -> ImportSummary {
+        ImportSummary {
+            session_id,
+            destination: live.destination,
+            root_span_id: live.root_span_id,
+            span_count: live.span_ids.len(),
+            finalized: true,
+        }
     }
 }
 
@@ -1138,6 +1328,66 @@ mod tests {
     }
 
     #[test]
+    fn import_parent_accepts_complete_cli_identifiers_without_guessing() {
+        let args = ImportCli::try_parse_from([
+            "test",
+            "codex",
+            "session-a",
+            "--parent-span-id",
+            "span-1",
+            "--parent-root-span-id",
+            "root-1",
+            "--parent-object-type",
+            "project_logs",
+            "--parent-project",
+            "Agents",
+        ])
+        .unwrap()
+        .args;
+
+        let components = import_parent_components(&args).unwrap().unwrap();
+        assert_eq!(components.object_type, SpanObjectType::ProjectLogs);
+        assert_eq!(components.span_id.as_deref(), Some("span-1"));
+        assert_eq!(components.root_span_id.as_deref(), Some("root-1"));
+        assert_eq!(
+            components
+                .compute_object_metadata_args
+                .as_ref()
+                .and_then(|value| value.get("project_name"))
+                .and_then(serde_json::Value::as_str),
+            Some("Agents")
+        );
+    }
+
+    #[test]
+    fn import_parent_rejects_incomplete_or_conflicting_identifiers() {
+        assert!(ImportCli::try_parse_from([
+            "test",
+            "codex",
+            "session-a",
+            "--parent-span-id",
+            "span-1",
+        ])
+        .is_err());
+        assert!(ImportCli::try_parse_from([
+            "test",
+            "codex",
+            "session-a",
+            "--destination",
+            "project_logs:project-id",
+            "--parent-span-id",
+            "span-1",
+            "--parent-root-span-id",
+            "root-1",
+            "--parent-object-type",
+            "project_logs",
+            "--parent-project",
+            "Agents",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn attach_requires_one_explicit_session() {
         let args = ImportArgs {
             source: ImportSource::Codex,
@@ -1145,6 +1395,11 @@ mod tests {
             all: false,
             destination: None,
             parent: None,
+            parent_span_id: None,
+            parent_root_span_id: None,
+            parent_object_type: None,
+            parent_object_id: None,
+            parent_project: None,
             attach: true,
             additional_metadata: None,
         };
@@ -1234,6 +1489,31 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("requires a trace destination"));
+    }
+
+    #[tokio::test]
+    async fn codex_managed_run_rejects_global_hook_trust_bypass_before_launch() {
+        let error = run_traced(
+            RunArgs {
+                source: RunSource::Codex,
+                additional_metadata: None,
+                agent_args: vec![OsString::from("--dangerously-bypass-hook-trust")],
+            },
+            test_run_hook_command(),
+            SessionRoute {
+                destination: Some(wire::TraceDestination::ProjectLogs {
+                    project_id: Some("project-id".into()),
+                    project_name: None,
+                }),
+                ..SessionRoute::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot be combined with --dangerously-bypass-hook-trust"));
     }
 
     #[test]

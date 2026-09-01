@@ -4,7 +4,7 @@
 //! the output shape to this crate so every front-end reports daemon commands
 //! consistently and JSON mode never falls back to human prose.
 
-use crate::wire::{SessionRoute, StatusResult};
+use crate::wire::{SessionRoute, StatusResult, TraceDestination};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -68,6 +68,17 @@ pub struct StopCommandOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ImportSummary {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<TraceDestination>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_span_id: Option<String>,
+    pub span_count: usize,
+    pub finalized: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AuthDiagnostic {
     pub status: String,
     pub source: String,
@@ -105,6 +116,7 @@ pub enum TraceCommandOutput {
     Enable(SetupCommandOutput),
     Disable(SetupCommandOutput),
     Stop(StopCommandOutput),
+    Import { summaries: Vec<ImportSummary> },
 }
 
 impl TraceCommandOutput {
@@ -131,6 +143,10 @@ impl TraceCommandOutput {
 
     pub fn stop(running: bool, stopped: bool) -> Self {
         Self::Stop(StopCommandOutput { running, stopped })
+    }
+
+    pub fn import(summaries: Vec<ImportSummary>) -> Self {
+        Self::Import { summaries }
     }
 
     pub fn disable(
@@ -205,7 +221,48 @@ impl TraceCommandOutput {
             )),
             Self::Stop(stop) if stop.stopped => Ok("Tracing daemon stopped.".into()),
             Self::Stop(_) => Ok("No tracing daemon is running.".into()),
+            Self::Import { summaries } => Ok(summaries
+                .iter()
+                .map(|summary| {
+                    let destination = summary
+                        .destination
+                        .as_ref()
+                        .map(render_destination)
+                        .unwrap_or_else(|| "the configured destination".into());
+                    let root = summary
+                        .root_span_id
+                        .as_deref()
+                        .map(|id| format!(", root span {id}"))
+                        .unwrap_or_default();
+                    format!(
+                        "Imported session {} to {}: {} spans{}.",
+                        summary.session_id, destination, summary.span_count, root
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")),
         }
+    }
+}
+
+fn render_destination(destination: &TraceDestination) -> String {
+    match destination {
+        TraceDestination::ProjectLogs {
+            project_id,
+            project_name,
+        } => project_name
+            .as_ref()
+            .map(|name| format!("project {name}"))
+            .or_else(|| project_id.as_ref().map(|id| format!("project {id}")))
+            .unwrap_or_else(|| "project logs".into()),
+        TraceDestination::Experiment { experiment_id } => {
+            format!("experiment {experiment_id}")
+        }
+        TraceDestination::ParentSpan { components } => components
+            .span_id
+            .as_ref()
+            .map(|id| format!("parent span {id}"))
+            .unwrap_or_else(|| "a parent span".into()),
     }
 }
 
@@ -287,6 +344,30 @@ mod tests {
                 "stopped": true
             })
         );
+    }
+
+    #[test]
+    fn import_summary_has_stable_human_and_json_output() {
+        let output = TraceCommandOutput::import(vec![ImportSummary {
+            session_id: "session-1".into(),
+            destination: Some(TraceDestination::ProjectLogs {
+                project_id: None,
+                project_name: Some("Agents".into()),
+            }),
+            root_span_id: Some("root-1".into()),
+            span_count: 3,
+            finalized: true,
+        }]);
+        assert_eq!(
+            output.render(OutputFormat::Human).unwrap(),
+            "Imported session session-1 to project Agents: 3 spans, root span root-1."
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&output.render(OutputFormat::Json).unwrap()).unwrap();
+        assert_eq!(value["command"], "import");
+        assert_eq!(value["summaries"][0]["session_id"], "session-1");
+        assert_eq!(value["summaries"][0]["span_count"], 3);
+        assert_eq!(value["summaries"][0]["finalized"], true);
     }
 
     #[test]
