@@ -190,7 +190,8 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
         json!("gpt-5.5"),
         "model backfilled from turn_context"
     );
-    assert_eq!(md["source"], json!("startup"));
+    assert_eq!(md["source"], json!("codex"));
+    assert_eq!(md["session_source"], json!("startup"));
     assert_eq!(md["permission_mode"], json!("auto"));
     assert_eq!(md["username"], json!(expected_username()));
 
