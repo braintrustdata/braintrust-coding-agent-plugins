@@ -145,9 +145,10 @@ enum PendingWork {
         through_ms: Option<i64>,
         after: DeferredHook,
     },
-    Flush {
+    CatchUp {
         paths: Vec<String>,
         next_path: usize,
+        finalize: bool,
     },
 }
 
@@ -259,24 +260,30 @@ impl AgentTranslator for CodexTranslator {
                     });
                 }
             }
-            PendingWork::Flush {
+            PendingWork::CatchUp {
                 paths,
                 mut next_path,
+                finalize,
             } => {
                 while next_path < paths.len() {
                     let path = &paths[next_path];
                     if self.catch_up_chunk(path, 0, None, &mut ops) {
-                        if let Some(mut scope) = self.scopes.remove(path) {
-                            self.close_dangling(&mut scope, None, &mut ops);
-                            self.scopes.insert(path.clone(), scope);
+                        if finalize {
+                            if let Some(mut scope) = self.scopes.remove(path) {
+                                self.close_dangling(&mut scope, None, &mut ops);
+                                self.scopes.insert(path.clone(), scope);
+                            }
                         }
                         next_path += 1;
                     }
                     // Return after any completed scope or a bounded partial read.
-                    // This keeps a flush over many scopes bounded as well.
+                    // This keeps catch-up over many scopes bounded as well.
                     if !ops.is_empty() || next_path < paths.len() {
-                        self.pending = (next_path < paths.len())
-                            .then_some(PendingWork::Flush { paths, next_path });
+                        self.pending = (next_path < paths.len()).then_some(PendingWork::CatchUp {
+                            paths,
+                            next_path,
+                            finalize,
+                        });
                         break;
                     }
                 }
@@ -285,25 +292,35 @@ impl AgentTranslator for CodexTranslator {
         Ok(Some(ops))
     }
 
-    fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
-        anyhow::ensure!(
-            self.pending.is_none(),
-            "Codex translator has pending catch-up work; drain it before flushing"
-        );
-        // Re-read each scope to catch a late task_complete, then close dangling.
-        let paths: Vec<String> = self.scopes.keys().cloned().collect();
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.pending = Some(PendingWork::Flush {
-            paths,
-            next_path: 0,
-        });
-        Ok(self.drain_pending(ctx)?.unwrap_or_default())
+    fn checkpoint(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        self.start_catch_up(ctx, false)
+    }
+
+    fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        self.start_catch_up(ctx, true)
     }
 }
 
 impl CodexTranslator {
+    fn start_catch_up(&mut self, ctx: &SessionCtx, finalize: bool) -> anyhow::Result<Vec<SpanOp>> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "Codex translator has pending catch-up work; drain it before checkpointing"
+        );
+        // Re-read each scope to catch a late task_complete. Finalization also
+        // closes dangling work whose terminal native event never arrived.
+        let paths: Vec<String> = self.scopes.keys().cloned().collect();
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.pending = Some(PendingWork::CatchUp {
+            paths,
+            next_path: 0,
+            finalize,
+        });
+        Ok(self.drain_pending(ctx)?.unwrap_or_default())
+    }
+
     fn ensure_main_scope(&mut self, path: &str) {
         if self.scopes.contains_key(path) {
             return;

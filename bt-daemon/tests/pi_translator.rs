@@ -166,3 +166,68 @@ fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
     assert!(root.parent_span_ids.is_empty());
     assert_eq!(root.root_span_id, root.span_id);
 }
+
+#[test]
+fn pi_checkpoint_preserves_the_open_session_and_turn() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    translator
+        .handle(&event("session_start", 1, json!({"reason":"new"})), &ctx)
+        .unwrap();
+    translator
+        .handle(
+            &event("before_agent_start", 2, json!({"prompt":"first"})),
+            &ctx,
+        )
+        .unwrap();
+
+    assert!(translator.checkpoint(&ctx).unwrap().is_empty());
+    let ops = translator
+        .handle(&event("agent_end", 3, json!({"messages":[]})), &ctx)
+        .unwrap();
+    assert!(ops.iter().any(
+        |op| matches!(op, SpanOp::Merge(row) if row.name.is_empty() && row.end_ms == Some(3))
+    ));
+    assert!(ops.iter().all(|op| !matches!(
+        op,
+        SpanOp::Merge(row)
+            if row
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.get("total_turns").is_some())
+    )));
+}
+
+#[test]
+fn pi_finalization_closes_missing_llm_and_tool_events() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    for envelope in [
+        event("before_agent_start", 1, json!({"prompt":"work"})),
+        event("context", 2, json!({"messages":[]})),
+        event(
+            "tool_execution_start",
+            3,
+            json!({"toolCallId":"call","toolName":"read","args":{"path":"x"}}),
+        ),
+    ] {
+        translator.handle(&envelope, &ctx).unwrap();
+    }
+    let ops = translator.finalize(&ctx).unwrap();
+    assert!(ops.iter().any(|op| matches!(
+        op,
+        SpanOp::Insert(row) if row.span_type == SpanType::Llm && row.error.is_some()
+    )));
+    assert!(ops.iter().any(|op| matches!(
+        op,
+        SpanOp::Insert(row) if row.span_type == SpanType::Tool && row.error.is_some()
+    )));
+}

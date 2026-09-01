@@ -186,3 +186,68 @@ fn opencode_additional_metadata_reaches_roots_without_overriding_session_fields(
     assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
     assert_eq!(root.metadata.as_ref().unwrap()["source"], "opencode");
 }
+
+#[test]
+fn opencode_checkpoint_preserves_session_state_for_later_turns() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    translator
+        .handle(
+            &event(
+                "session.created",
+                1,
+                json!({"properties":{"info":{"id":"native"}}}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    translator
+        .handle(
+            &event("chat.message", 2, json!({"input":{"sessionID":"native"}})),
+            &ctx,
+        )
+        .unwrap();
+
+    assert!(translator.checkpoint(&ctx).unwrap().is_empty());
+    let ops = translator
+        .handle(
+            &event("chat.message", 3, json!({"input":{"sessionID":"native"}})),
+            &ctx,
+        )
+        .unwrap();
+    assert!(ops
+        .iter()
+        .any(|op| matches!(op, SpanOp::Insert(row) if row.name == "Turn 2")));
+    assert!(ops
+        .iter()
+        .all(|op| !matches!(op, SpanOp::Insert(row) if row.name == "OpenCode")));
+}
+
+#[test]
+fn opencode_finalization_closes_a_missing_tool_completion() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    for envelope in [
+        event("chat.message", 1, json!({"input":{"sessionID":"native"}})),
+        event(
+            "tool.execute.before",
+            2,
+            json!({"input":{"sessionID":"native","callID":"call","tool":"read"},"output":{"args":{"path":"x"}}}),
+        ),
+    ] {
+        translator.handle(&envelope, &ctx).unwrap();
+    }
+    let ops = translator.finalize(&ctx).unwrap();
+    assert!(ops.iter().any(|op| matches!(
+        op,
+        SpanOp::Merge(row) if row.end_ms == Some(2) && row.error.is_some()
+    )));
+}

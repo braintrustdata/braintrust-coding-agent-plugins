@@ -74,7 +74,7 @@ impl AgentTranslator for DebugTranslator {
         Ok(ops)
     }
 
-    fn flush(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         Ok(Vec::new())
     }
 }
