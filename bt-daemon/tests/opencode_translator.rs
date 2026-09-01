@@ -113,7 +113,7 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
         .values()
         .find(|r| r.span_type == SpanType::Tool)
         .unwrap();
-    assert_eq!(tool.metadata.as_ref().unwrap()["tool_outcome"], "success");
+    assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
     assert!(rows
         .values()
         .filter(|r| r.span_type == SpanType::Task)
@@ -250,4 +250,86 @@ fn opencode_finalization_closes_a_missing_tool_completion() {
         op,
         SpanOp::Merge(row) if row.end_ms == Some(2) && row.error.is_some()
     )));
+}
+
+#[test]
+fn opencode_distinguishes_denied_tools_from_failed_executions() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        event(
+            "session.created",
+            1,
+            json!({"properties":{"info":{"id":"native"}}}),
+        ),
+        event("chat.message", 2, json!({"input":{"sessionID":"native"}})),
+        event(
+            "tool.execute.before",
+            3,
+            json!({"input":{"sessionID":"native","callID":"denied","tool":"read"},"output":{"args":{"path":"secret"}}}),
+        ),
+        event(
+            "permission.asked",
+            4,
+            json!({"properties":{"permission":{"id":"perm-1","sessionID":"native","title":"Read secret","type":"tool","tool":{"callID":"denied","name":"read","input":{"path":"secret"}}}}}),
+        ),
+        event(
+            "permission.replied",
+            5,
+            json!({"properties":{"id":"perm-1","reply":"reject"}}),
+        ),
+        event(
+            "tool.execute.after",
+            6,
+            json!({"input":{"sessionID":"native","callID":"denied","tool":"read"}}),
+        ),
+        event(
+            "tool.execute.before",
+            7,
+            json!({"input":{"sessionID":"native","callID":"failed","tool":"read"},"output":{"args":{"path":"missing"}}}),
+        ),
+        event(
+            "message.part.updated",
+            8,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"m","type":"tool","callID":"failed","tool":"read","state":{"status":"error","error":"not found"}}}}),
+        ),
+        event(
+            "tool.execute.after",
+            9,
+            json!({"input":{"sessionID":"native","callID":"failed","tool":"read"}}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for event in events {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let denied = rows
+        .values()
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .is_some_and(|m| m["call_id"] == "denied")
+        })
+        .unwrap();
+    assert_eq!(denied.metadata.as_ref().unwrap()["tool_approval"], "denied");
+    assert_eq!(denied.metadata.as_ref().unwrap()["permission_id"], "perm-1");
+    assert!(denied.error.is_none());
+    let failed = rows
+        .values()
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .is_some_and(|m| m["call_id"] == "failed")
+        })
+        .unwrap();
+    assert_eq!(
+        failed.metadata.as_ref().unwrap()["tool_approval"],
+        "approved"
+    );
+    assert_eq!(failed.error.as_deref(), Some("not found"));
 }

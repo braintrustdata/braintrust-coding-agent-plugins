@@ -376,7 +376,6 @@ impl AntigravityTranslator {
         let error = string_field(&event.payload, "error")
             .filter(|error| !error.is_empty())
             .or(details.error);
-        let outcome = if error.is_some() { "error" } else { "success" };
         if !was_pending {
             ops.push(SpanOp::Insert(SpanRow {
                 span_id: span_id.clone(),
@@ -405,7 +404,7 @@ impl AntigravityTranslator {
             output: details.output,
             metadata: Some(json!({
                 "step_index": step,
-                "tool_outcome": outcome
+                "tool_approval": "approved"
             })),
             error,
             ..Default::default()
@@ -450,7 +449,7 @@ impl AntigravityTranslator {
                 name: tool.name,
                 span_type: SpanType::Tool,
                 end_ms: Some(ts_ms),
-                metadata: Some(json!({"step_index":step,"tool_outcome":"unknown"})),
+                metadata: Some(json!({"step_index":step,"tool_approval":"approved"})),
                 error: error.clone(),
                 ..Default::default()
             }));

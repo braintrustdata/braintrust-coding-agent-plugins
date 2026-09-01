@@ -125,7 +125,7 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
         .find(|r| r.span_type == SpanType::Tool)
         .unwrap();
     assert_eq!(tool.name, "skill: review");
-    assert_eq!(tool.metadata.as_ref().unwrap()["tool_outcome"], "success");
+    assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
     assert!(rows.values().any(|r| r.name == "Compaction"));
     assert!(rows
         .values()

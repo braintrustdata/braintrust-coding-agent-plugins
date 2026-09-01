@@ -190,7 +190,6 @@ impl PiTranslator {
                     "tool_name": tool.name,
                     "tool_call_id": call,
                     "tool_approval": "approved",
-                    "tool_outcome": "error",
                 })),
                 error: Some(error.into()),
                 ..Default::default()
@@ -485,7 +484,6 @@ impl PiTranslator {
                 "original_tool_name": tracked.name,
                 "tool_call_id": call,
                 "tool_approval": "approved",
-                "tool_outcome": if failed { "error" } else { "success" },
                 "skill_name": skill,
             })),
             error: failed.then(|| format_error(event.get("result"))),
