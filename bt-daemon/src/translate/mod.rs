@@ -128,28 +128,18 @@ pub trait TranslatorFactory: Send + Sync {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator>;
 }
 
-/// Maps a `source` string to its factory, with a fallback for unknown sources.
+/// Maps canonical and supported alias source strings to translator factories.
 pub struct Registry {
     factories: HashMap<String, Box<dyn TranslatorFactory>>,
-    fallback: Box<dyn TranslatorFactory>,
 }
 
 impl Registry {
-    /// A registry whose only translator (and fallback) is the debug
-    /// pass-through. This is the Phase 1 default.
-    pub fn debug_only() -> Self {
+    /// The production registry with every real agent translator registered.
+    pub fn default_agents() -> Self {
         let mut r = Registry {
             factories: HashMap::new(),
-            fallback: Box::new(DebugTranslatorFactory),
         };
         r.register(Box::new(DebugTranslatorFactory));
-        r
-    }
-
-    /// The production registry: all real agent translators registered, debug
-    /// as the fallback for unknown sources.
-    pub fn default_agents() -> Self {
-        let mut r = Registry::debug_only();
         let git = Arc::new(git::GitMetadataCache::default());
         r.register(Box::new(AntigravityTranslatorFactory::new(git.clone())));
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
@@ -170,15 +160,50 @@ impl Registry {
         v
     }
 
-    /// Create a translator for `source`, falling back (with a warning) to the
-    /// debug translator for an unknown source.
+    /// Resolve daemon source aliases to one stable identity.
+    pub fn canonical_source<'a>(&'a self, source: &'a str) -> Option<&'a str> {
+        let canonical = match source {
+            "claude" | "claude-code" => "claude-code",
+            "open-code" | "opencode" => "opencode",
+            "antigravity" => "antigravity",
+            "codex" => "codex",
+            "pi" => "pi",
+            "debug" => "debug",
+            _ => return None,
+        };
+        self.factories.contains_key(canonical).then_some(canonical)
+    }
+
+    pub fn create_checked(
+        &self,
+        source: &str,
+        session_id: &str,
+    ) -> anyhow::Result<Box<dyn AgentTranslator>> {
+        let canonical = self
+            .canonical_source(source)
+            .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
+        let namespace = crate::ids::session_namespace(canonical, session_id);
+        self.create_checked_with_session_key(canonical, &namespace)
+    }
+
+    pub(crate) fn create_checked_with_session_key(
+        &self,
+        source: &str,
+        session_key: &str,
+    ) -> anyhow::Result<Box<dyn AgentTranslator>> {
+        let canonical = self
+            .canonical_source(source)
+            .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
+        let factory = self.factories.get(canonical);
+        let factory = factory.expect("canonical source must have a factory");
+        Ok(factory.create(session_key))
+    }
+
+    /// Create a known translator. Production ingress uses
+    /// [`Self::create_checked`] and returns an RPC error for unsupported
+    /// sources; this convenience remains for focused tests.
     pub fn create(&self, source: &str, session_id: &str) -> Box<dyn AgentTranslator> {
-        match self.factories.get(source) {
-            Some(f) => f.create(session_id),
-            None => {
-                tracing::warn!(source, "no translator registered; using debug fallback");
-                self.fallback.create(session_id)
-            }
-        }
+        self.create_checked(source, session_id)
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 }

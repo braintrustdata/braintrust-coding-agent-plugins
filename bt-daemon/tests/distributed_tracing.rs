@@ -10,8 +10,8 @@ mod support;
 use async_trait::async_trait;
 use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionConfig, TraceDestination};
 use bt_daemon::{
-    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, AuthLease,
-    AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs, ServeOptions, Sink,
+    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, source_journal_path,
+    AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs, ServeOptions, Sink,
     SinkFactory, SpanOp, SpanRow, SpanType, StatusArgs,
 };
 use std::collections::HashMap;
@@ -1338,10 +1338,11 @@ async fn ipc_initialize_pid_is_captured_without_hook_metadata() {
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
 
-    let journal = tokio::fs::read_to_string(
-        tmp.path()
-            .join("data/journal/automatic-process-capture.ndjson"),
-    )
+    let journal = tokio::fs::read_to_string(source_journal_path(
+        &tmp.path().join("data"),
+        "claude-code",
+        "automatic-process-capture",
+    ))
     .await
     .unwrap();
     let row: serde_json::Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();

@@ -154,7 +154,7 @@ impl ClaudeTranslator {
             .unwrap_or_default();
         // Internal routing settings must never appear as user metadata.
         metadata.retain(|key, _| !key.starts_with("_bt_"));
-        metadata.insert("session_id".into(), json!(self.session_id));
+        metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("workspace".into(), json!(cwd));
         metadata.insert("source".into(), json!("claude-code"));
         metadata.insert("hostname".into(), json!(hostname()));

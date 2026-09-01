@@ -3,7 +3,7 @@
 //! rebuild session state by replaying the journal through the translator.
 //!
 //! Format: one [`RedactedEnvelope`] JSON value per line in
-//! `<data_dir>/journal/<session_id>.ndjson`.
+//! `<data_dir>/journal/<source>-<session>-<stable-id>.ndjson`.
 //!
 //! Managed-run acceptance records live alongside the journals so a flush can
 //! still tell which delivery pipelines a managed child produced after the
@@ -35,6 +35,41 @@ pub fn journal_path(data_dir: &Path, session_id: &str) -> PathBuf {
     journal_dir(data_dir).join(format!("{}.ndjson", sanitize(session_id)))
 }
 
+/// Source-qualified journal path. The stable suffix prevents sanitized native
+/// ids such as `a/b` and `a_b` from aliasing the same file.
+pub fn source_journal_path(data_dir: &Path, source: &str, session_id: &str) -> PathBuf {
+    journal_dir(data_dir).join(format!(
+        "{}--{}--{}.ndjson",
+        sanitize(source),
+        sanitize(session_id),
+        crate::ids::session_storage_id(source, session_id)
+    ))
+}
+
+/// Return the source-qualified journal, copying the legacy session-only file
+/// on first use so an upgrade retains replay history. The legacy file remains
+/// untouched for rollback and is no longer appended after migration.
+pub async fn ensure_source_journal(
+    data_dir: &Path,
+    source: &str,
+    session_id: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = source_journal_path(data_dir, source, session_id);
+    if tokio::fs::metadata(&path).await.is_ok() {
+        return Ok(path);
+    }
+    let legacy = journal_path(data_dir, session_id);
+    match tokio::fs::metadata(&legacy).await {
+        Ok(_) => {
+            tokio::fs::create_dir_all(journal_dir(data_dir)).await?;
+            tokio::fs::copy(&legacy, &path).await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(path)
+}
+
 pub fn managed_run_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("managed-runs")
 }
@@ -46,6 +81,9 @@ pub fn managed_run_path(data_dir: &Path, managed_run_id: &str) -> PathBuf {
 /// One delivery pipeline accepted from a managed child process tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedRunKey {
+    /// Missing in records written before source-qualified delivery keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub session_id: String,
     pub route: SessionRoute,
 }
@@ -93,6 +131,56 @@ pub async fn read_managed_run_keys(data_dir: &Path, managed_run_id: &str) -> Vec
     keys
 }
 
+/// Recover the source omitted by pre-source-qualified managed-run records.
+/// Route matching avoids selecting an unrelated delivery pipeline when an old
+/// session journal contains more than one destination.
+pub async fn legacy_journal_source(
+    data_dir: &Path,
+    session_id: &str,
+    route: &SessionRoute,
+) -> Option<String> {
+    let path = journal_path(data_dir, session_id);
+    let through = JournalReader::recorded_len(&path).await;
+    let mut reader = JournalReader::open(&path, through).await.ok().flatten()?;
+    while let Ok(Some(entry)) = reader.next_entry().await {
+        if entry
+            .route
+            .as_ref()
+            .is_some_and(|candidate| candidate.same_route(route))
+        {
+            return Some(entry.source);
+        }
+    }
+    None
+}
+
+/// Whether this source owned the session actor recorded by a pre-qualification
+/// daemon. Only the first source recorded for a native session keeps the old
+/// span-id namespace: the legacy daemon had one actor and one namespace per
+/// native session even if its journal later received mixed-source events.
+pub async fn legacy_journal_has_session(
+    data_dir: &Path,
+    canonical_source: &str,
+    session_id: &str,
+) -> bool {
+    let path = journal_path(data_dir, session_id);
+    let through = JournalReader::recorded_len(&path).await;
+    let Ok(Some(mut reader)) = JournalReader::open(&path, through).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = reader.next_entry().await {
+        let recorded_source = match entry.source.as_str() {
+            "claude" => "claude-code",
+            "open-code" => "opencode",
+            source => source,
+        };
+        if entry.session_id == session_id {
+            return recorded_source == canonical_source;
+        }
+    }
+    false
+}
+
 /// Best-effort age-based collection of managed-run records, mirroring journal
 /// GC.
 pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) {
@@ -125,14 +213,14 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
-    pub async fn open(data_dir: &Path, session_id: &str) -> anyhow::Result<Self> {
-        let dir = journal_dir(data_dir);
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = journal_path(data_dir, session_id);
+    pub async fn open_path(path: &Path) -> anyhow::Result<Self> {
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .await?;
         Ok(Self { file })
     }
@@ -266,5 +354,78 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
         payload: r.payload,
         route,
         config,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn source_journals_are_distinct_and_migrate_legacy_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = journal_path(temp.path(), "same/session");
+        tokio::fs::create_dir_all(legacy.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&legacy, b"legacy\n").await.unwrap();
+
+        let codex = ensure_source_journal(temp.path(), "codex", "same/session")
+            .await
+            .unwrap();
+        let claude = ensure_source_journal(temp.path(), "claude-code", "same/session")
+            .await
+            .unwrap();
+        assert_ne!(codex, claude);
+        assert_eq!(tokio::fs::read(&codex).await.unwrap(), b"legacy\n");
+        assert_eq!(tokio::fs::read(&claude).await.unwrap(), b"legacy\n");
+        assert_eq!(tokio::fs::read(&legacy).await.unwrap(), b"legacy\n");
+    }
+
+    #[tokio::test]
+    async fn legacy_managed_run_records_recover_source_from_the_old_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let route = SessionRoute::default();
+        let mut writer = JournalWriter::open_path(&journal_path(temp.path(), "legacy"))
+            .await
+            .unwrap();
+        writer
+            .append(&Envelope {
+                source: "codex".into(),
+                source_version: None,
+                plugin_version: None,
+                session_id: "legacy".into(),
+                event: "SessionStart".into(),
+                ts_ms: 1,
+                managed_run_id: None,
+                payload: serde_json::json!({}),
+                route: Some(route.clone()),
+                config: None,
+                capture: None,
+            })
+            .await
+            .unwrap();
+        writer
+            .append(&Envelope {
+                source: "claude".into(),
+                source_version: None,
+                plugin_version: None,
+                session_id: "legacy".into(),
+                event: "SessionStart".into(),
+                ts_ms: 2,
+                managed_run_id: None,
+                payload: serde_json::json!({}),
+                route: Some(route.clone()),
+                config: None,
+                capture: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy_journal_source(temp.path(), "legacy", &route).await,
+            Some("codex".into())
+        );
+        assert!(legacy_journal_has_session(temp.path(), "codex", "legacy").await);
+        assert!(!legacy_journal_has_session(temp.path(), "claude-code", "legacy").await);
     }
 }
