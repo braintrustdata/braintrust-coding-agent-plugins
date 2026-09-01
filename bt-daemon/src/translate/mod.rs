@@ -92,17 +92,33 @@ pub trait AgentTranslator: Send {
     /// Handle one event, returning span ops to emit.
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>>;
 
-    /// Continue bounded work started by [`Self::handle`] or [`Self::flush`].
+    /// Continue bounded work started by [`Self::handle`], [`Self::checkpoint`],
+    /// or [`Self::finalize`].
     /// `Some` means the caller must emit this batch and call again; `None`
     /// means the translator is fully caught up.
     fn drain_pending(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
         Ok(None)
     }
 
-    /// Emit any pending spans (e.g. close dangling turns) at flush/shutdown.
-    fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    /// Catch up externally buffered observations without ending the logical
+    /// agent session. Delivery barriers call this before flushing the sink.
+    fn checkpoint(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let _ = ctx;
         Ok(Vec::new())
+    }
+
+    /// Finish the logical agent session and defensively close work whose
+    /// terminal native event never arrived. Called only when the actor itself
+    /// is shutting down or being retired.
+    fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        let _ = ctx;
+        Ok(Vec::new())
+    }
+
+    /// Backward-compatible terminal flush used by transcript import callers.
+    /// Live delivery barriers use [`Self::checkpoint`] instead.
+    fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        self.finalize(ctx)
     }
 }
 

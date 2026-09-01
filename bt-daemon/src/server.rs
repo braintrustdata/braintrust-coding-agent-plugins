@@ -478,7 +478,7 @@ impl Daemon {
             let session = { self.sessions.lock().unwrap().get(&key).cloned() };
             if let Some(session) = session {
                 let (flushed, pending) = session
-                    .flush(Duration::from_millis(params.timeout_ms))
+                    .finalize(Duration::from_millis(params.timeout_ms))
                     .await;
                 result.flushed &= flushed;
                 result.pending = result.pending.saturating_add(pending);

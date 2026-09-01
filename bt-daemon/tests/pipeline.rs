@@ -70,6 +70,7 @@ struct RouteSinkRecord {
     destination: Mutex<Option<bt_daemon::wire::TraceDestination>>,
     emitted: std::sync::atomic::AtomicU64,
     flushes: std::sync::atomic::AtomicU64,
+    ops: Mutex<Vec<SpanOp>>,
 }
 
 #[derive(Default)]
@@ -102,6 +103,7 @@ impl Sink for RouteRecordingSink {
     }
 
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        self.record.ops.lock().unwrap().extend_from_slice(ops);
         self.record
             .emitted
             .fetch_add(ops.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1286,6 +1288,50 @@ async fn managed_run_flush_is_scoped_to_its_accepted_sessions() {
     let result = flush_managed_run("run-b", &socket, 5_000).await.unwrap();
     assert!(result.flushed, "managed run did not flush: {result:?}");
     assert_eq!(flushes.lock().unwrap().get("run-b-main"), Some(&1));
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_run_completion_finalizes_an_open_agent_root() {
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let (_data_dir, socket, handle, _tmp) = start_daemon_with(provider, recording.clone()).await;
+    let mut env = envelope("managed-opencode", "session.created", 7);
+    env.source = "opencode".into();
+    env.managed_run_id = Some("managed-run".into());
+    env.payload = serde_json::json!({"properties":{"info":{"id":"native"}}});
+    forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+
+    let checkpoint = flush_session("managed-opencode", &socket, 5_000)
+        .await
+        .unwrap();
+    assert!(checkpoint.flushed);
+    let record = recording.sinks.lock().unwrap()[0].clone();
+    assert!(record
+        .ops
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|op| !matches!(op, SpanOp::Merge(row) if row.end_ms.is_some())));
+
+    let finalized = flush_managed_run("managed-run", &socket, 5_000)
+        .await
+        .unwrap();
+    assert!(finalized.flushed);
+    assert!(record
+        .ops
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|op| matches!(op, SpanOp::Merge(row) if row.end_ms == Some(7))));
 
     shutdown(&socket).await;
     handle.await.unwrap();

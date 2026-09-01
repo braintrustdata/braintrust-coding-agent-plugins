@@ -34,6 +34,7 @@ enum SessionMsg {
     Event(Box<Envelope>, oneshot::Sender<()>),
     Configure(Box<crate::wire::SessionConfig>, oneshot::Sender<()>),
     Flush(oneshot::Sender<u64>),
+    Finalize(oneshot::Sender<u64>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -157,6 +158,20 @@ impl Session {
         }
     }
 
+    /// Finalize an invocation-local session and flush its sink. Unlike a
+    /// delivery checkpoint, a managed-run completion is a terminal boundary.
+    pub async fn finalize(&self, timeout: std::time::Duration) -> (bool, u64) {
+        self.touch();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.tx.send(SessionMsg::Finalize(reply_tx)).await.is_err() {
+            return (false, self.counters.queued.load(Ordering::Relaxed));
+        }
+        match tokio::time::timeout(timeout, reply_rx).await {
+            Ok(Ok(pending)) => (pending == 0, pending),
+            _ => (false, self.counters.queued.load(Ordering::Relaxed)),
+        }
+    }
+
     /// Reconfigure the sink before a refresh-triggered flush. Queue ordering
     /// guarantees that all earlier events are processed first.
     pub async fn configure(&self, config: crate::wire::SessionConfig) -> anyhow::Result<()> {
@@ -249,7 +264,9 @@ struct SessionActor {
 enum BatchMode {
     Live,
     Replay,
-    Flush,
+    Checkpoint,
+    TerminalFinalize,
+    ShutdownFinalize,
 }
 
 impl BatchMode {
@@ -257,12 +274,19 @@ impl BatchMode {
         match self {
             Self::Live => ("translate failed", "sink emit failed"),
             Self::Replay => ("journal replay failed", "sink replay emit failed"),
-            Self::Flush => ("translate flush failed", "sink emit (flush) failed"),
+            Self::Checkpoint => (
+                "translate checkpoint failed",
+                "sink emit (checkpoint) failed",
+            ),
+            Self::TerminalFinalize | Self::ShutdownFinalize => (
+                "translate finalization failed",
+                "sink emit (finalization) failed",
+            ),
         }
     }
 
     fn observes_correlation(self) -> bool {
-        !matches!(self, Self::Flush)
+        !matches!(self, Self::ShutdownFinalize)
     }
 }
 
@@ -289,6 +313,9 @@ impl SessionActor {
                             let _ = r.send(());
                         }
                         SessionMsg::Flush(r) => {
+                            let _ = r.send(0);
+                        }
+                        SessionMsg::Finalize(r) => {
                             let _ = r.send(0);
                         }
                         SessionMsg::Shutdown(r) => {
@@ -357,11 +384,28 @@ impl SessionActor {
                     let _ = reply.send(());
                 }
                 SessionMsg::Flush(reply) => {
-                    self.drain_flush(&mut translator, &mut sink, &ctx).await;
+                    self.checkpoint_and_flush(&mut translator, &mut sink, &ctx)
+                        .await;
+                    let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
+                }
+                SessionMsg::Finalize(reply) => {
+                    self.finalize_and_flush(
+                        &mut translator,
+                        &mut sink,
+                        &ctx,
+                        BatchMode::TerminalFinalize,
+                    )
+                    .await;
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
                 SessionMsg::Shutdown(reply) => {
-                    self.drain_flush(&mut translator, &mut sink, &ctx).await;
+                    self.finalize_and_flush(
+                        &mut translator,
+                        &mut sink,
+                        &ctx,
+                        BatchMode::ShutdownFinalize,
+                    )
+                    .await;
                     let _ = reply.send(());
                     break;
                 }
@@ -464,16 +508,53 @@ impl SessionActor {
         }
     }
 
-    async fn drain_flush(
+    async fn checkpoint_and_flush(
         &self,
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
     ) {
-        let translated = translator.flush(ctx);
-        let _ = self
-            .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Flush)
+        let translated = translator.checkpoint(ctx);
+        let correlation_changed = self
+            .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Checkpoint)
             .await;
+        self.persist_correlation_if_changed(correlation_changed)
+            .await;
+        self.flush_sink(sink).await;
+    }
+
+    async fn finalize_and_flush(
+        &self,
+        translator: &mut Box<dyn crate::translate::AgentTranslator>,
+        sink: &mut Box<dyn crate::sink::Sink>,
+        ctx: &SessionCtx,
+        mode: BatchMode,
+    ) {
+        let translated = translator.finalize(ctx);
+        let correlation_changed = self
+            .emit_translator_batches(translator, sink, ctx, translated, mode)
+            .await;
+        self.persist_correlation_if_changed(correlation_changed)
+            .await;
+        self.flush_sink(sink).await;
+    }
+
+    async fn persist_correlation_if_changed(&self, changed: bool) {
+        if !changed {
+            return;
+        }
+        if let Err(error) = crate::server::persist_active_parent_snapshot(
+            &self.data_dir,
+            &self.correlation_key,
+            &self.correlation,
+        )
+        .await
+        {
+            self.set_error(error);
+        }
+    }
+
+    async fn flush_sink(&self, sink: &mut Box<dyn crate::sink::Sink>) {
         if let Err(e) = sink.flush().await {
             self.set_error(format!("sink flush failed: {e}"));
         }

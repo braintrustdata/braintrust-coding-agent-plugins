@@ -516,7 +516,7 @@ impl AgentTranslator for AntigravityTranslator {
         Ok(ops)
     }
 
-    fn flush(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let mut ops = Vec::new();
         self.close_pending(self.last_ts_ms, None, &mut ops);
         self.close_turn(self.last_ts_ms, None, &mut ops);

@@ -97,6 +97,7 @@ struct ClaudeTranslator {
     git: Arc<GitMetadataCache>,
     current_cwd: Option<String>,
     last_turn_cwd: Option<String>,
+    last_ts_ms: i64,
 }
 
 impl ClaudeTranslator {
@@ -126,6 +127,7 @@ impl ClaudeTranslator {
             git,
             current_cwd: None,
             last_turn_cwd: None,
+            last_ts_ms: 0,
         }
     }
 
@@ -700,6 +702,7 @@ impl ClaudeTranslator {
 
 impl AgentTranslator for ClaudeTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         anyhow::ensure!(
             self.pending_emission.is_none(),
             "Claude translator has pending catch-up work; drain it before handling another event"
@@ -778,8 +781,47 @@ impl AgentTranslator for ClaudeTranslator {
         Ok(Some(ops))
     }
 
-    fn flush(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
-        Ok(Vec::new())
+    fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        let end_ms = self.last_ts_ms;
+        let mut ops = Vec::new();
+        for (_, tool) in self.pending_tools.drain() {
+            ops.push(SpanOp::Merge(SpanRow {
+                span_id: tool.span_id,
+                root_span_id: self.root_span_id.clone(),
+                end_ms: Some(end_ms),
+                error: Some("Session ended before tool completion".into()),
+                ..Default::default()
+            }));
+        }
+        if let Some(turn) = self.turn.take() {
+            ops.push(SpanOp::Merge(SpanRow {
+                span_id: turn.id,
+                root_span_id: self.root_span_id.clone(),
+                end_ms: Some(end_ms),
+                error: Some("Session ended before turn completion".into()),
+                ..Default::default()
+            }));
+        }
+        for (_, subagent) in self.subagents.drain() {
+            ops.push(SpanOp::Merge(SpanRow {
+                span_id: subagent.span_id,
+                root_span_id: self.root_span_id.clone(),
+                end_ms: Some(end_ms),
+                error: Some("Session ended before subagent completion".into()),
+                ..Default::default()
+            }));
+        }
+        if self.root_open && !self.root_ended {
+            self.root_ended = true;
+            ops.push(SpanOp::Merge(SpanRow {
+                span_id: self.session_span_id.clone(),
+                root_span_id: self.root_span_id.clone(),
+                end_ms: Some(end_ms),
+                ..Default::default()
+            }));
+        }
+        self.release_terminal_state();
+        Ok(ops)
     }
 }
 

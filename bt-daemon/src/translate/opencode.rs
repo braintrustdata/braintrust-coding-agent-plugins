@@ -50,6 +50,7 @@ struct NativeSession {
     reasoning_parts: HashMap<String, String>,
     tool_calls: HashMap<String, Vec<Value>>,
     tool_starts: HashMap<String, i64>,
+    tool_names: HashMap<String, String>,
     tool_args: HashMap<String, Value>,
     tool_outputs: HashMap<String, Value>,
     tool_errors: HashMap<String, String>,
@@ -99,7 +100,7 @@ impl AgentTranslator for OpenCodeTranslator {
         Ok(ops)
     }
 
-    fn flush(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let now = self.last_ts_ms;
         let ids: Vec<String> = self.sessions.keys().cloned().collect();
         let mut ops = Vec::new();
@@ -465,6 +466,7 @@ impl OpenCodeTranslator {
                 .or_else(|| event.payload.get("tool"))
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
+            s.tool_names.insert(call.into(), tool.into());
             return vec![SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
                 root_span_id: s.effective_root_span_id.clone(),
@@ -500,6 +502,7 @@ impl OpenCodeTranslator {
             return vec![];
         };
         if s.denied_tools.remove(call) {
+            s.tool_names.remove(call);
             return vec![];
         }
         let Some(turn) = s.current_turn_span_id.clone() else {
@@ -552,6 +555,7 @@ impl OpenCodeTranslator {
             ..Default::default()
         };
         s.tool_starts.remove(call);
+        s.tool_names.remove(call);
         vec![if had_start {
             SpanOp::Merge(row)
         } else {
@@ -582,6 +586,7 @@ impl OpenCodeTranslator {
                 return vec![];
             };
             s.denied_tools.insert(call.into());
+            s.tool_names.remove(call);
             let tool = props.get("tool").and_then(Value::as_str).unwrap_or("tool");
             return vec![SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
@@ -624,6 +629,24 @@ impl OpenCodeTranslator {
             return vec![];
         };
         let mut ops = vec![];
+        for (call, _start_ms) in s.tool_starts.drain() {
+            if s.denied_tools.remove(&call) {
+                continue;
+            }
+            let tool_name = s.tool_names.remove(&call).unwrap_or_else(|| "tool".into());
+            ops.push(SpanOp::Merge(SpanRow {
+                span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
+                root_span_id: s.effective_root_span_id.clone(),
+                end_ms: Some(ts),
+                metadata: Some(json!({
+                    "tool_name": tool_name,
+                    "call_id": call,
+                    "tool_outcome": "error",
+                })),
+                error: Some("Interrupted before tool completion".into()),
+                ..Default::default()
+            }));
+        }
         if let Some(turn) = s.current_turn_span_id.take() {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn,

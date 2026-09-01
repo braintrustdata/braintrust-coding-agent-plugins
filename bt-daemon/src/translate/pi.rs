@@ -137,8 +137,10 @@ impl AgentTranslator for PiTranslator {
         Ok(ops)
     }
 
-    fn flush(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
-        let mut ops = self.close_turn(self.last_ts, Some("Interrupted before completion".into()));
+    fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        let error = "Interrupted before completion";
+        let mut ops = self.close_dangling(self.last_ts, error);
+        ops.extend(self.close_turn(self.last_ts, Some(error.into())));
         if self.opened {
             ops.push(self.close_root(self.last_ts));
         }
@@ -147,6 +149,56 @@ impl AgentTranslator for PiTranslator {
 }
 
 impl PiTranslator {
+    fn close_dangling(&mut self, ts: i64, error: &str) -> Vec<SpanOp> {
+        let Some((turn, _)) = &self.turn else {
+            self.pending_llms.clear();
+            self.tools.clear();
+            return Vec::new();
+        };
+        let mut ops = Vec::new();
+        for pending in self.pending_llms.drain(..) {
+            self.llm_seq += 1;
+            ops.push(SpanOp::Insert(SpanRow {
+                span_id: ids::span_id(
+                    &self.session_id,
+                    &format!("llm:{}:{}", self.turn_seq, self.llm_seq),
+                ),
+                root_span_id: self.effective_root_span_id.clone(),
+                parent_span_ids: vec![turn.clone()],
+                name: "llm".into(),
+                span_type: SpanType::Llm,
+                start_ms: Some(pending.start_ms),
+                end_ms: Some(ts),
+                input: Some(pending.input),
+                metadata: pending.provider,
+                error: Some(error.into()),
+                ..Default::default()
+            }));
+        }
+        for (call, tool) in self.tools.drain() {
+            self.total_tools += 1;
+            ops.push(SpanOp::Insert(SpanRow {
+                span_id: ids::span_id(&self.session_id, &format!("tool:{}:{call}", self.turn_seq)),
+                root_span_id: self.effective_root_span_id.clone(),
+                parent_span_ids: vec![turn.clone()],
+                name: tool.name.clone(),
+                span_type: SpanType::Tool,
+                start_ms: Some(tool.start_ms),
+                end_ms: Some(ts),
+                input: Some(tool.args),
+                metadata: Some(json!({
+                    "tool_name": tool.name,
+                    "tool_call_id": call,
+                    "tool_approval": "approved",
+                    "tool_outcome": "error",
+                })),
+                error: Some(error.into()),
+                ..Default::default()
+            }));
+        }
+        ops
+    }
+
     fn ensure_root(&mut self, envelope: &Envelope, ctx: &SessionCtx) -> Vec<SpanOp> {
         if self.opened {
             return Vec::new();
