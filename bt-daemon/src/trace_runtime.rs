@@ -456,6 +456,7 @@ mod tests {
         route_error: Option<&'static str>,
         auth_error: Option<&'static str>,
         resolved_org: Option<&'static str>,
+        profile_id: Option<&'static str>,
     }
 
     impl RecordingHost {
@@ -465,6 +466,7 @@ mod tests {
                 route_error,
                 auth_error,
                 resolved_org: Some("test-org"),
+                profile_id: None,
             }
         }
 
@@ -474,6 +476,7 @@ mod tests {
                 route_error: None,
                 auth_error: None,
                 resolved_org: None,
+                profile_id: None,
             }
         }
     }
@@ -508,6 +511,7 @@ mod tests {
             Ok(AuthLease {
                 selection: AuthSelection {
                     source: AuthSource::SavedProfile,
+                    profile_id: self.profile_id.map(str::to_string),
                     profile: Some("test".into()),
                     org_name: self.resolved_org.map(str::to_string),
                 },
@@ -584,6 +588,21 @@ mod tests {
             .unwrap();
         assert_eq!(route.auth.profile.as_deref(), Some("test"));
         assert_eq!(route.auth.org_name.as_deref(), Some("test-org"));
+    }
+
+    #[tokio::test]
+    async fn command_routes_prefer_the_resolved_stable_profile_id() {
+        let services = Arc::new(RecordingHost {
+            profile_id: Some("00000000-0000-4000-8000-000000000001"),
+            ..RecordingHost::new(None, None)
+        });
+        let route = resolve_command_route(&test_host(services), COMMAND_REQUIREMENTS)
+            .await
+            .unwrap();
+        assert_eq!(
+            route.auth.profile_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
     }
 
     #[tokio::test]

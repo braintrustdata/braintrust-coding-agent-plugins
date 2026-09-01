@@ -47,6 +47,7 @@ impl AuthProvider for EnvironmentAuthProvider {
         Ok(AuthLease {
             selection: AuthSelection {
                 source: AuthSource::Environment,
+                profile_id: None,
                 profile: None,
                 org_name: selection.org_name.clone(),
             },
@@ -137,6 +138,7 @@ fn build_route(
             } else {
                 AuthSource::Environment
             },
+            profile_id: None,
             profile,
             org_name,
         },

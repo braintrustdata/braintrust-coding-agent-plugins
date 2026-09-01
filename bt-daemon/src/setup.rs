@@ -278,6 +278,10 @@ fn load_object(path: &Path) -> anyhow::Result<Map<String, Value>> {
 }
 
 fn write_object_atomic(path: &Path, object: Map<String, Value>) -> anyhow::Result<()> {
+    crate::settings::with_settings_lock(path, || write_object_atomic_unlocked(path, object))
+}
+
+fn write_object_atomic_unlocked(path: &Path, object: Map<String, Value>) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("configuration path has no parent: {}", path.display()))?;
@@ -968,6 +972,7 @@ mod tests {
         let route = SessionRoute {
             auth: AuthSelection {
                 source: crate::wire::AuthSource::SavedProfile,
+                profile_id: None,
                 profile: Some("work".into()),
                 org_name: Some("Braintrust SDKs".into()),
             },

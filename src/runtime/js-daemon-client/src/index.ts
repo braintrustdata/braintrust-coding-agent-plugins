@@ -8,6 +8,9 @@ export const DAEMON_PROTOCOL_VERSION = 1
 
 export interface DaemonSessionRoute {
   auth?: {
+    /** Immutable saved-profile identifier. Preferred over legacy `profile`. */
+    profile_id?: string
+    /** Mutable display name retained to read settings written before profile IDs. */
     profile?: string
     org_name?: string
   }

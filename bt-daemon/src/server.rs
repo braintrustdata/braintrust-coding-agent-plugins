@@ -119,6 +119,7 @@ pub struct Daemon {
     sink_factory: Arc<dyn SinkFactory>,
     auth_provider: Option<Arc<dyn AuthProvider>>,
     session_auth: tokio::sync::Mutex<HashMap<DeliveryKey, SessionAuthState>>,
+    route_aliases: Mutex<HashMap<DeliveryKey, DeliveryKey>>,
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     journals: Mutex<HashMap<String, Arc<tokio::sync::Mutex<JournalWriter>>>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
@@ -143,6 +144,7 @@ impl Daemon {
             sink_factory: opts.sink_factory,
             auth_provider: opts.auth_provider,
             session_auth: tokio::sync::Mutex::new(HashMap::new()),
+            route_aliases: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
             managed_run_sessions: Mutex::new(HashMap::new()),
@@ -163,16 +165,23 @@ impl Daemon {
         let Some(provider) = &self.auth_provider else {
             anyhow::bail!("daemon host has no Braintrust auth provider");
         };
-        let route = env
+        let requested_route = env
             .route
             .clone()
             .ok_or_else(|| anyhow::anyhow!("event is missing its session route"))?;
-        if route.destination.is_none() {
+        if requested_route.destination.is_none() {
             anyhow::bail!(
                 "session route is missing its trace destination; select a project or destination during `bt trace setup` or `bt trace run`"
             );
         }
-        let key = DeliveryKey::new(&env.source, &env.session_id, &route)?;
+        let requested_key = DeliveryKey::new(&env.source, &env.session_id, &requested_route)?;
+        let key = self
+            .route_aliases
+            .lock()
+            .unwrap()
+            .get(&requested_key)
+            .cloned()
+            .unwrap_or_else(|| requested_key.clone());
         let (selection, reason, expected_selection) = {
             let states = self.session_auth.lock().await;
             match states.get(&key) {
@@ -187,7 +196,11 @@ impl Daemon {
                         Some(state.lease.selection.clone()),
                     )
                 }
-                None => (route.auth.clone(), AuthResolveReason::Initial, None),
+                None => (
+                    requested_route.auth.clone(),
+                    AuthResolveReason::Initial,
+                    None,
+                ),
             }
         };
 
@@ -210,7 +223,7 @@ impl Daemon {
                 );
             }
         }
-        if let Some(expected_org) = route.auth.org_name.as_deref() {
+        if let Some(expected_org) = requested_route.auth.org_name.as_deref() {
             if lease.auth.org_name.as_deref() != Some(expected_org) {
                 anyhow::bail!(
                     "profile {:?} resolved organization {:?}, expected {:?}",
@@ -221,13 +234,35 @@ impl Daemon {
             }
         }
 
+        let mut route = requested_route;
+        if route.auth.effective_source() == crate::wire::AuthSource::SavedProfile
+            && route.auth.profile_id.is_none()
+            && lease.selection.profile_id.is_some()
+        {
+            route.auth = lease.selection.clone();
+            if let Err(error) = crate::settings::migrate_persisted_route(
+                &env.source,
+                env.route.as_ref().expect("route checked above"),
+                &route,
+            ) {
+                tracing::warn!(source = %env.source, "could not migrate legacy profile route: {error}");
+            }
+        }
+        let canonical_key = DeliveryKey::new(&env.source, &env.session_id, &route)?;
+        if canonical_key != requested_key {
+            self.route_aliases
+                .lock()
+                .unwrap()
+                .insert(requested_key, canonical_key.clone());
+        }
+        env.route = Some(route.clone());
         env.config = Some(route.with_auth(lease.auth.clone()));
         self.session_auth
             .lock()
             .await
-            .insert(key.clone(), SessionAuthState { route, lease });
-        self.auth_errors.lock().unwrap().remove(&key);
-        Ok(key)
+            .insert(canonical_key.clone(), SessionAuthState { route, lease });
+        self.auth_errors.lock().unwrap().remove(&canonical_key);
+        Ok(canonical_key)
     }
 
     async fn refresh_session_before_flush(&self, key: &DeliveryKey) -> anyhow::Result<()> {
@@ -348,6 +383,10 @@ impl Daemon {
 
         self.session_auth.lock().await.remove(key);
         self.auth_errors.lock().unwrap().remove(key);
+        self.route_aliases
+            .lock()
+            .unwrap()
+            .retain(|alias, target| alias != key && target != key);
         self.managed_run_sessions.lock().unwrap().retain(|_, keys| {
             keys.remove(key);
             !keys.is_empty()
