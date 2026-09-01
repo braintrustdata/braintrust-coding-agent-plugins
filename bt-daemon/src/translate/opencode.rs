@@ -597,7 +597,8 @@ impl OpenCodeTranslator {
         PermissionRequest {
             id: string(source.get("id"))
                 .or_else(|| string(props.get("id")))
-                .or_else(|| string(props.get("permissionID"))),
+                .or_else(|| string(props.get("permissionID")))
+                .or_else(|| string(props.get("requestID"))),
             session_id: string(source.get("sessionID"))
                 .or_else(|| string(props.get("sessionID")))
                 .or_else(|| tool_record.and_then(|tool| string(tool.get("sessionID")))),
@@ -606,14 +607,18 @@ impl OpenCodeTranslator {
             tool: string(source.get("tool"))
                 .or_else(|| string(source.get("toolName")))
                 .or_else(|| tool_record.and_then(|tool| string(tool.get("name"))))
-                .or_else(|| tool_record.and_then(|tool| string(tool.get("tool")))),
+                .or_else(|| tool_record.and_then(|tool| string(tool.get("tool"))))
+                // OpenCode's native permission events put the requested tool
+                // kind in `permission`, separate from `tool.callID`.
+                .or_else(|| string(source.get("permission"))),
             input: source
                 .get("input")
                 .or_else(|| source.get("args"))
                 .or_else(|| tool_record.and_then(|tool| tool.get("input")))
                 .cloned(),
             title: string(source.get("title")),
-            permission_type: string(source.get("type")),
+            permission_type: string(source.get("type"))
+                .or_else(|| string(source.get("permissionType"))),
         }
     }
 
@@ -676,7 +681,7 @@ impl OpenCodeTranslator {
             span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
             root_span_id: s.effective_root_span_id.clone(),
             parent_span_ids: (!had_start).then_some(turn).into_iter().collect(),
-            name: title.unwrap_or(tool).into(),
+            name: title.unwrap_or(tool),
             span_type: SpanType::Tool,
             start_ms: (!had_start).then(|| s.tool_starts.remove(&call).unwrap_or(event.ts_ms)),
             end_ms: Some(event.ts_ms),

@@ -275,12 +275,12 @@ fn opencode_distinguishes_denied_tools_from_failed_executions() {
         event(
             "permission.asked",
             4,
-            json!({"properties":{"permission":{"id":"perm-1","sessionID":"native","title":"Read secret","type":"tool","tool":{"callID":"denied","name":"read","input":{"path":"secret"}}}}}),
+            json!({"properties":{"requestID":"perm-1","sessionID":"native","title":"Read secret","permission":"read","tool":{"callID":"denied","input":{"path":"secret"}}}}),
         ),
         event(
             "permission.replied",
             5,
-            json!({"properties":{"id":"perm-1","reply":"reject"}}),
+            json!({"properties":{"requestID":"perm-1","reply":"reject"}}),
         ),
         event(
             "tool.execute.after",
@@ -318,6 +318,7 @@ fn opencode_distinguishes_denied_tools_from_failed_executions() {
         .unwrap();
     assert_eq!(denied.metadata.as_ref().unwrap()["tool_approval"], "denied");
     assert_eq!(denied.metadata.as_ref().unwrap()["permission_id"], "perm-1");
+    assert_eq!(denied.metadata.as_ref().unwrap()["tool_name"], "read");
     assert!(denied.error.is_none());
     let failed = rows
         .values()
