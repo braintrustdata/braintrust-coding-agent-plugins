@@ -262,10 +262,15 @@ async fn imports_native_codex_rollout_through_codex_translator() {
     let rows = rows(&output.join("codex-past.ndjson"));
     assert_eq!(inserted(&rows, "task"), 3, "session and two turns");
     assert_eq!(inserted(&rows, "tool"), 1);
-    assert!(rows.iter().any(|row| row
-        .pointer("/Insert/metadata/source")
-        .and_then(Value::as_str)
-        == Some("import")));
+    assert!(rows.iter().any(|row| {
+        row.pointer("/Insert/metadata/source")
+            .and_then(Value::as_str)
+            == Some("codex")
+            && row
+                .pointer("/Insert/metadata/session_source")
+                .and_then(Value::as_str)
+                == Some("import")
+    }));
     let turn_ids = rows
         .iter()
         .filter_map(|row| {
