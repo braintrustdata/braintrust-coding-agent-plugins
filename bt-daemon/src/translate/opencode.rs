@@ -3,6 +3,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::RecentSet;
+use super::tool::{error_text, with_tool_approval, ToolApproval};
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -29,6 +30,7 @@ impl TranslatorFactory for OpenCodeTranslatorFactory {
         Box::new(OpenCodeTranslator {
             daemon_session_id: session_id.to_string(),
             sessions: HashMap::new(),
+            permission_requests: HashMap::new(),
             git: self.git.clone(),
             last_ts_ms: 0,
         })
@@ -59,9 +61,21 @@ struct NativeSession {
     completed_messages: RecentSet<String>,
 }
 
+#[derive(Clone, Default)]
+struct PermissionRequest {
+    id: Option<String>,
+    session_id: Option<String>,
+    call_id: Option<String>,
+    tool: Option<String>,
+    input: Option<Value>,
+    title: Option<String>,
+    permission_type: Option<String>,
+}
+
 struct OpenCodeTranslator {
     daemon_session_id: String,
     sessions: HashMap<String, NativeSession>,
+    permission_requests: HashMap<String, PermissionRequest>,
     git: Arc<GitMetadataCache>,
     last_ts_ms: i64,
 }
@@ -77,7 +91,8 @@ impl AgentTranslator for OpenCodeTranslator {
             "message.updated" => self.message_updated(event),
             "tool.execute.before" => self.tool_before(event, ctx),
             "tool.execute.after" => self.tool_after(event),
-            "permission.asked" | "permission.replied" => self.permission(event),
+            "permission.asked" => self.permission_asked(event),
+            "permission.replied" => self.permission_replied(event),
             "session.idle" => self.finish_session_event(event, false, None),
             "session.deleted" => self.finish_session_event(event, true, None),
             "session.error" => {
@@ -503,6 +518,10 @@ impl OpenCodeTranslator {
         };
         if s.denied_tools.remove(call) {
             s.tool_names.remove(call);
+            s.tool_args.remove(call);
+            s.tool_outputs.remove(call);
+            s.tool_errors.remove(call);
+            s.tool_starts.remove(call);
             return vec![];
         }
         let Some(turn) = s.current_turn_span_id.clone() else {
@@ -530,7 +549,10 @@ impl OpenCodeTranslator {
                 .unwrap_or(tool)
                 .to_string()
         };
-        let mut metadata = json!({"tool_name":tool,"call_id":call,"tool_outcome":if error.is_some(){"error"}else{"success"}});
+        let mut metadata = with_tool_approval(
+            json!({"tool_name":tool,"call_id":call}),
+            Some(ToolApproval::Approved),
+        );
         if tool == "skill" {
             metadata["tool_kind"] = json!("skill");
             metadata["skill_name"] = args
@@ -563,48 +585,117 @@ impl OpenCodeTranslator {
         }]
     }
 
-    fn permission(&mut self, event: &Envelope) -> Vec<SpanOp> {
+    fn permission_record(event: &Envelope) -> PermissionRequest {
         let props = event.payload.get("properties").unwrap_or(&event.payload);
-        let Some(sid) = native_session_id(props) else {
-            return vec![];
-        };
-        let call = props
-            .get("callID")
-            .or_else(|| props.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let source = props
+            .get("permission")
+            .filter(|value| value.is_object())
+            .or_else(|| props.get("info").filter(|value| value.is_object()))
+            .unwrap_or(props);
+        let tool_record = source.get("tool").filter(|value| value.is_object());
+        let string = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
+        PermissionRequest {
+            id: string(source.get("id"))
+                .or_else(|| string(props.get("id")))
+                .or_else(|| string(props.get("permissionID")))
+                .or_else(|| string(props.get("requestID"))),
+            session_id: string(source.get("sessionID"))
+                .or_else(|| string(props.get("sessionID")))
+                .or_else(|| tool_record.and_then(|tool| string(tool.get("sessionID")))),
+            call_id: string(source.get("callID"))
+                .or_else(|| tool_record.and_then(|tool| string(tool.get("callID")))),
+            tool: string(source.get("tool"))
+                .or_else(|| string(source.get("toolName")))
+                .or_else(|| tool_record.and_then(|tool| string(tool.get("name"))))
+                .or_else(|| tool_record.and_then(|tool| string(tool.get("tool"))))
+                // OpenCode's native permission events put the requested tool
+                // kind in `permission`, separate from `tool.callID`.
+                .or_else(|| string(source.get("permission"))),
+            input: source
+                .get("input")
+                .or_else(|| source.get("args"))
+                .or_else(|| tool_record.and_then(|tool| tool.get("input")))
+                .cloned(),
+            title: string(source.get("title")),
+            permission_type: string(source.get("type"))
+                .or_else(|| string(source.get("permissionType"))),
+        }
+    }
+
+    fn permission_asked(&mut self, event: &Envelope) -> Vec<SpanOp> {
+        let request = Self::permission_record(event);
+        if let Some(id) = &request.id {
+            self.permission_requests.insert(id.clone(), request);
+        }
+        vec![]
+    }
+
+    fn permission_replied(&mut self, event: &Envelope) -> Vec<SpanOp> {
+        let props = event.payload.get("properties").unwrap_or(&event.payload);
         let reply = props
-            .get("response")
+            .get("reply")
+            .or_else(|| props.get("response"))
             .or_else(|| props.get("status"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if matches!(reply, "reject" | "denied" | "deny") {
-            let Some(s) = self.sessions.get_mut(&sid) else {
-                return vec![];
-            };
-            let Some(turn) = s.current_turn_span_id.clone() else {
-                return vec![];
-            };
-            s.denied_tools.insert(call.into());
-            s.tool_names.remove(call);
-            let tool = props.get("tool").and_then(Value::as_str).unwrap_or("tool");
-            return vec![SpanOp::Insert(SpanRow {
-                span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
-                root_span_id: s.effective_root_span_id.clone(),
-                parent_span_ids: vec![turn],
-                name: tool.into(),
-                span_type: SpanType::Tool,
-                start_ms: s.tool_starts.remove(call).or(Some(event.ts_ms)),
-                end_ms: Some(event.ts_ms),
-                input: s.tool_args.remove(call),
-                metadata: Some(
-                    json!({"tool_name":tool,"call_id":call,"tool_approval":"denied","tool_outcome":"denied"}),
-                ),
-                error: Some("Permission denied".into()),
-                ..Default::default()
-            })];
+        let direct = Self::permission_record(event);
+        let request = direct
+            .id
+            .as_ref()
+            .and_then(|id| self.permission_requests.remove(id))
+            .unwrap_or_default();
+        if !matches!(reply, "reject" | "denied" | "deny") {
+            return vec![];
         }
-        vec![]
+        let session_id = direct.session_id.or(request.session_id);
+        let call_id = direct.call_id.or(request.call_id);
+        let tool = direct.tool.or(request.tool);
+        let input = direct.input.or(request.input);
+        let title = direct.title.or(request.title);
+        let permission_type = direct.permission_type.or(request.permission_type);
+        let (Some(sid), Some(call), Some(tool)) = (session_id, call_id, tool) else {
+            return vec![];
+        };
+        let Some(s) = self.sessions.get_mut(&sid) else {
+            return vec![];
+        };
+        let Some(turn) = s.current_turn_span_id.clone() else {
+            return vec![];
+        };
+        s.denied_tools.insert(call.clone());
+        let had_start = s.tool_starts.contains_key(&call);
+        let mut metadata = with_tool_approval(
+            json!({"tool_name":tool,"call_id":call}),
+            Some(ToolApproval::Denied),
+        );
+        if let Some(id) = direct.id.or(request.id) {
+            metadata["permission_id"] = json!(id);
+        }
+        if let Some(kind) = permission_type {
+            metadata["permission_type"] = json!(kind);
+        }
+        if let Some(title) = &title {
+            metadata["permission_title"] = json!(title);
+        }
+        let row = SpanRow {
+            span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
+            root_span_id: s.effective_root_span_id.clone(),
+            parent_span_ids: (!had_start).then_some(turn).into_iter().collect(),
+            name: title.unwrap_or(tool),
+            span_type: SpanType::Tool,
+            start_ms: (!had_start).then(|| s.tool_starts.remove(&call).unwrap_or(event.ts_ms)),
+            end_ms: Some(event.ts_ms),
+            input: (!had_start)
+                .then(|| s.tool_args.remove(&call).or(input))
+                .flatten(),
+            metadata: Some(metadata),
+            ..Default::default()
+        };
+        if had_start {
+            vec![SpanOp::Merge(row)]
+        } else {
+            vec![SpanOp::Insert(row)]
+        }
     }
 
     fn finish_session_event(
@@ -638,11 +729,13 @@ impl OpenCodeTranslator {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
                 root_span_id: s.effective_root_span_id.clone(),
                 end_ms: Some(ts),
-                metadata: Some(json!({
-                    "tool_name": tool_name,
-                    "call_id": call,
-                    "tool_outcome": "error",
-                })),
+                metadata: Some(with_tool_approval(
+                    json!({
+                        "tool_name": tool_name,
+                        "call_id": call,
+                    }),
+                    Some(ToolApproval::Approved),
+                )),
                 error: Some("Interrupted before tool completion".into()),
                 ..Default::default()
             }));
@@ -700,9 +793,8 @@ fn format_error(v: Option<&Value>) -> String {
         .unwrap_or("UnknownError");
     let msg = v
         .pointer("/data/message")
-        .or_else(|| v.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or(name);
+        .map(|value| error_text(Some(value), name))
+        .unwrap_or_else(|| error_text(Some(v), name));
     format!("{msg}\n\ntype: {name}")
 }
 fn subagent_name(title: &str) -> String {

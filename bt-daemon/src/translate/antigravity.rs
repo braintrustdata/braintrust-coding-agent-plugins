@@ -6,6 +6,7 @@
 //! so replay observes exactly the records that existed when each hook fired.
 
 use super::git::GitMetadataCache;
+use super::tool::{with_tool_approval, ToolApproval};
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -376,7 +377,6 @@ impl AntigravityTranslator {
         let error = string_field(&event.payload, "error")
             .filter(|error| !error.is_empty())
             .or(details.error);
-        let outcome = if error.is_some() { "error" } else { "success" };
         if !was_pending {
             ops.push(SpanOp::Insert(SpanRow {
                 span_id: span_id.clone(),
@@ -403,10 +403,12 @@ impl AntigravityTranslator {
             end_ms: Some(event.ts_ms),
             input: details.input,
             output: details.output,
-            metadata: Some(json!({
-                "step_index": step,
-                "tool_outcome": outcome
-            })),
+            metadata: Some(with_tool_approval(
+                json!({
+                    "step_index": step,
+                }),
+                Some(ToolApproval::Approved),
+            )),
             error,
             ..Default::default()
         }));
@@ -450,7 +452,10 @@ impl AntigravityTranslator {
                 name: tool.name,
                 span_type: SpanType::Tool,
                 end_ms: Some(ts_ms),
-                metadata: Some(json!({"step_index":step,"tool_outcome":"unknown"})),
+                metadata: Some(with_tool_approval(
+                    json!({"step_index":step}),
+                    Some(ToolApproval::Approved),
+                )),
                 error: error.clone(),
                 ..Default::default()
             }));
@@ -733,6 +738,10 @@ fn tool_details(record: &Value) -> ToolDetails {
         .or_else(|| {
             string_field(record, "status")
                 .filter(|status| matches!(status.to_ascii_lowercase().as_str(), "error" | "failed"))
+                .map(|status| match record_content(record) {
+                    Value::String(content) if !content.is_empty() => content,
+                    _ => status,
+                })
         });
     ToolDetails {
         name,

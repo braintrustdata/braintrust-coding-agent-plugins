@@ -19,6 +19,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
+use super::tool::{error_text, tool_approval_metadata, ToolApproval};
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -947,7 +948,7 @@ impl CodexTranslator {
             root_span_id: self.root_span_id.clone(),
             end_ms: Some(ts),
             output,
-            metadata: Some(json!({ "tool_approval": "approved" })),
+            metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
             error,
             ..Default::default()
         }));
@@ -1077,7 +1078,7 @@ impl CodexTranslator {
                     span_id,
                     root_span_id: self.root_span_id.clone(),
                     end_ms,
-                    metadata: Some(json!({ "tool_approval": "approved" })),
+                    metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
                     error: Some(MISSING_TOOL_OUTPUT_ERROR.to_string()),
                     ..Default::default()
                 }));
@@ -1254,7 +1255,7 @@ impl CodexTranslator {
                 span_id: sid,
                 root_span_id: self.root_span_id.clone(),
                 end_ms,
-                metadata: Some(json!({ "tool_approval": "approved" })),
+                metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
                 error: Some(error),
                 ..Default::default()
             }));
@@ -1358,20 +1359,6 @@ fn args_object(args: Option<&Value>) -> Option<Map<String, Value>> {
     }
 }
 
-fn concise_error(value: &Value, fallback: &str) -> String {
-    if let Some(text) = value.as_str() {
-        return text.lines().next().unwrap_or(fallback).to_string();
-    }
-    if let Some(object) = value.as_object() {
-        for key in ["error", "message", "stderr", "output", "result"] {
-            if let Some(text) = object.get(key).and_then(Value::as_str) {
-                return text.lines().next().unwrap_or(fallback).to_string();
-            }
-        }
-    }
-    fallback.to_string()
-}
-
 fn classify_tool_output(output: &Value) -> Option<String> {
     if let Some(object) = output.as_object() {
         if object.get("is_error").and_then(Value::as_bool) == Some(true)
@@ -1381,10 +1368,10 @@ fn classify_tool_output(output: &Value) -> Option<String> {
                 Some("error" | "failed")
             )
         {
-            return Some(concise_error(output, "Tool execution failed"));
+            return Some(error_text(Some(output), "Tool execution failed"));
         }
         if let Some(error) = object.get("error") {
-            return Some(concise_error(error, "Tool execution failed"));
+            return Some(error_text(Some(error), "Tool execution failed"));
         }
         if let Some(exit_code) = object
             .get("exit_code")
@@ -1392,7 +1379,7 @@ fn classify_tool_output(output: &Value) -> Option<String> {
             .and_then(Value::as_i64)
         {
             if exit_code != 0 {
-                return Some(concise_error(output, &format!("Exit code {exit_code}")));
+                return Some(error_text(Some(output), &format!("Exit code {exit_code}")));
             }
         }
     }

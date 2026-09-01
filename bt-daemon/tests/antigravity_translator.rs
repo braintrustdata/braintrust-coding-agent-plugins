@@ -262,7 +262,7 @@ fn hooks_and_full_transcript_build_model_and_tool_spans() {
     assert_eq!(tool.name, "run_command");
     assert_eq!(tool.input.as_ref().unwrap()["CommandLine"], "ls");
     assert_eq!(tool.output, Some(json!("README.md\nsrc")));
-    assert_eq!(tool.metadata.as_ref().unwrap()["tool_outcome"], "success");
+    assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
     assert_eq!(tool.parent_span_ids, vec![turn.span_id.clone()]);
 }
 
@@ -308,7 +308,7 @@ fn pre_tool_pair_preserves_start_time_and_reports_failure() {
                     path,
                     &transcript,
                     boundary[0],
-                    json!({"stepIdx":4,"error":"permission denied"}),
+                    json!({"stepIdx":4}),
                 ),
                 &ctx,
             )
@@ -322,7 +322,7 @@ fn pre_tool_pair_preserves_start_time_and_reports_failure() {
     assert_eq!(tool.start_ms, Some(10));
     assert_eq!(tool.end_ms, Some(20));
     assert_eq!(tool.error.as_deref(), Some("permission denied"));
-    assert_eq!(tool.metadata.as_ref().unwrap()["tool_outcome"], "error");
+    assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
 }
 
 #[test]
@@ -515,7 +515,7 @@ fn real_cli_schema_recovers_messages_and_post_only_tool() {
     assert_eq!(tool.name, "list_dir");
     assert_eq!(tool.start_ms, Some(1_786_470_380_000));
     assert_eq!(tool.output, Some(json!("{\"name\":\"sample\"}")));
-    assert_eq!(tool.metadata.as_ref().unwrap()["tool_outcome"], "success");
+    assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
 }
 
 #[test]
@@ -698,5 +698,5 @@ fn resumed_process_reuses_invocation_zero_without_reparenting_to_turn_one() {
         .unwrap();
     assert_eq!(tool.name, "list_directory");
     assert_eq!(tool.parent_span_ids, vec![turn_one.span_id.clone()]);
-    assert_eq!(tool.metadata.as_ref().unwrap()["tool_outcome"], "success");
+    assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
 }

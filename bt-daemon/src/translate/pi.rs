@@ -2,6 +2,7 @@
 //! state machine owns all span construction and recovery.
 
 use super::git::GitMetadataCache;
+use super::tool::{error_text, with_tool_approval, ToolApproval};
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -186,12 +187,13 @@ impl PiTranslator {
                 start_ms: Some(tool.start_ms),
                 end_ms: Some(ts),
                 input: Some(tool.args),
-                metadata: Some(json!({
-                    "tool_name": tool.name,
-                    "tool_call_id": call,
-                    "tool_approval": "approved",
-                    "tool_outcome": "error",
-                })),
+                metadata: Some(with_tool_approval(
+                    json!({
+                        "tool_name": tool.name,
+                        "tool_call_id": call,
+                    }),
+                    Some(ToolApproval::Approved),
+                )),
                 error: Some(error.into()),
                 ..Default::default()
             }));
@@ -433,11 +435,13 @@ impl PiTranslator {
             span_type: SpanType::Tool,
             start_ms: Some(ts),
             input: Some(args),
-            metadata: Some(json!({
-                "tool_name": event.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
-                "tool_call_id": id,
-                "tool_approval": "approved",
-            })),
+            metadata: Some(with_tool_approval(
+                json!({
+                    "tool_name": event.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
+                    "tool_call_id": id,
+                }),
+                Some(ToolApproval::Approved),
+            )),
             ..Default::default()
         })]
     }
@@ -480,14 +484,15 @@ impl PiTranslator {
             end_ms: Some(ts),
             input: pending.is_none().then_some(tracked.args),
             output: event.get("result").cloned(),
-            metadata: Some(json!({
-                "tool_name": if skill.is_some() { "skill" } else { &tracked.name },
-                "original_tool_name": tracked.name,
-                "tool_call_id": call,
-                "tool_approval": "approved",
-                "tool_outcome": if failed { "error" } else { "success" },
-                "skill_name": skill,
-            })),
+            metadata: Some(with_tool_approval(
+                json!({
+                    "tool_name": if skill.is_some() { "skill" } else { &tracked.name },
+                    "original_tool_name": tracked.name,
+                    "tool_call_id": call,
+                    "skill_name": skill,
+                }),
+                Some(ToolApproval::Approved),
+            )),
             error: failed.then(|| format_error(event.get("result"))),
             ..Default::default()
         };
@@ -659,14 +664,5 @@ fn explicit_skills(input: &str) -> Vec<String> {
         .collect()
 }
 fn format_error(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.lines().next().unwrap_or(s).into(),
-        Some(v) => v
-            .get("error")
-            .or_else(|| v.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("Tool execution failed")
-            .into(),
-        None => "Tool execution failed".into(),
-    }
+    error_text(v, "Tool execution failed")
 }

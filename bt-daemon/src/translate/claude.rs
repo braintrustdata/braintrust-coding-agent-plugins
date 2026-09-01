@@ -8,6 +8,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::RecentSet;
+use super::tool::{add_tool_approval, nonempty_error_text, ToolApproval};
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -342,7 +343,7 @@ impl ClaudeTranslator {
         }
         let input = tool_input(&event.payload);
         let span_id = ids::span_id(&self.session_id, &format!("tool:{call_id}"));
-        let metadata = tool_metadata(event, &tool_name, &call_id, "approved", &input);
+        let metadata = tool_metadata(event, &tool_name, &call_id, ToolApproval::Approved, &input);
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
@@ -361,7 +362,7 @@ impl ClaudeTranslator {
     fn finish_tool(
         &mut self,
         event: &Envelope,
-        approval: &str,
+        approval: ToolApproval,
         forced_error: Option<String>,
         ops: &mut Vec<SpanOp>,
     ) {
@@ -735,10 +736,10 @@ impl AgentTranslator for ClaudeTranslator {
             }
             "UserPromptExpansion" => self.record_skill(event, &mut ops),
             "PreToolUse" => self.pre_tool(event, &mut ops),
-            "PostToolUse" => self.finish_tool(event, "approved", None, &mut ops),
+            "PostToolUse" => self.finish_tool(event, ToolApproval::Approved, None, &mut ops),
             "PostToolUseFailure" => self.finish_tool(
                 event,
-                "approved",
+                ToolApproval::Approved,
                 tool_error(&event.payload)
                     .or_else(|| {
                         event
@@ -751,7 +752,7 @@ impl AgentTranslator for ClaudeTranslator {
                     .or_else(|| Some("Tool execution failed".into())),
                 &mut ops,
             ),
-            "PermissionDenied" => self.finish_tool(event, "denied", None, &mut ops),
+            "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, None, &mut ops),
             "SubagentStart" => {
                 if let Some(agent_id) = string_field(&event.payload, "agent_id") {
                     self.ensure_subagent(&agent_id, event, &mut ops);
@@ -1205,12 +1206,14 @@ impl TranscriptTool {
             end_ms: Some(self.end_ms),
             input: Some(self.input),
             output: self.output,
-            metadata: Some(json!({
-                "tool_name": self.tool_name,
-                "tool_approval": "approved",
-                "tool_call_id": self.call_id,
-                "recovered_from_transcript": true
-            })),
+            metadata: Some({
+                let mut metadata = Map::new();
+                metadata.insert("tool_name".into(), json!(self.tool_name));
+                add_tool_approval(&mut metadata, Some(ToolApproval::Approved));
+                metadata.insert("tool_call_id".into(), json!(self.call_id));
+                metadata.insert("recovered_from_transcript".into(), json!(true));
+                Value::Object(metadata)
+            }),
             error: self.error,
             ..Default::default()
         }
@@ -1356,12 +1359,12 @@ fn tool_metadata(
     event: &Envelope,
     tool_name: &str,
     call_id: &str,
-    approval: &str,
+    approval: ToolApproval,
     input: &Value,
 ) -> Value {
     let mut metadata = Map::new();
     metadata.insert("tool_name".into(), json!(tool_name));
-    metadata.insert("tool_approval".into(), json!(approval));
+    add_tool_approval(&mut metadata, Some(approval));
     metadata.insert("tool_call_id".into(), json!(call_id));
     for (target, direct, nested) in [
         ("permission_id", "permission_id", "/permission/id"),
@@ -1542,8 +1545,8 @@ fn tool_error(payload: &Value) -> Option<String> {
     .into_iter()
     .flatten()
     {
-        if let Some(text) = value.as_str().filter(|value| !value.is_empty()) {
-            return Some(text.lines().next().unwrap_or(text).to_string());
+        if let Some(text) = nonempty_error_text(value) {
+            return Some(text);
         }
     }
     let response = payload.get("tool_response")?;
@@ -1560,5 +1563,21 @@ fn tool_error(payload: &Value) -> Option<String> {
             .get("status")
             .and_then(Value::as_str)
             .is_some_and(|value| matches!(value, "error" | "failed"));
-    failed.then(|| "Tool execution failed".to_string())
+    if !failed {
+        return None;
+    }
+    for value in [
+        response.get("error"),
+        response.get("stderr"),
+        response.get("message"),
+        response.get("output"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(text) = nonempty_error_text(value) {
+            return Some(text);
+        }
+    }
+    Some("Tool execution failed".to_string())
 }
