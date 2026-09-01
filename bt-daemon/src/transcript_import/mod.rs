@@ -301,7 +301,9 @@ impl IncrementalRecords {
         self.end_offsets.extend(end_offsets);
         self.read_offset = parsed_through;
         self.line_count = parsed_line_count;
-        self.modified = modified;
+        self.modified = std::fs::metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
         self.anchor = read_anchor(path, parsed_through, 64)?;
         if self.values.is_empty() && finalize {
             bail!("transcript {} is empty", path.display());
@@ -337,6 +339,8 @@ pub(crate) struct TranscriptTail {
     source: ImportSource,
     state: TailState,
     records: IncrementalRecords,
+    retry_envelopes: bool,
+    translator_reset: bool,
 }
 
 enum TailState {
@@ -351,6 +355,8 @@ impl TranscriptTail {
             source,
             state: Self::new_state(source),
             records: IncrementalRecords::default(),
+            retry_envelopes: false,
+            translator_reset: false,
         }
     }
 
@@ -362,28 +368,38 @@ impl TranscriptTail {
     }
 
     pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
-        let metadata = match std::fs::metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(_) if !finalize => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let len = metadata.len();
         let refresh = match self.records.refresh(&self.path, finalize) {
             Ok(refresh) => refresh,
             Err(_) if !finalize => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        if refresh == Refresh::Unchanged && !finalize {
+        if refresh == Refresh::Unchanged && !finalize && !self.retry_envelopes {
             return Ok(Vec::new());
         }
         if refresh == Refresh::Reset {
             self.state = Self::new_state(self.source);
+            self.translator_reset = true;
         }
-        let events = envelopes_from_records(&self.path, self.source, &self.records)?;
+        let events = match envelopes_from_records(&self.path, self.source, &self.records) {
+            Ok(events) => events,
+            Err(_) if !finalize => {
+                self.retry_envelopes = true;
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
+        self.retry_envelopes = false;
+        let len = std::fs::metadata(&self.path)
+            .with_context(|| format!("read transcript metadata {}", self.path.display()))?
+            .len();
         match &mut self.state {
             TailState::Codex(state) => state.poll(events, len, finalize),
             TailState::Claude(state) => state.poll(events, len, finalize),
         }
+    }
+
+    pub(crate) fn take_translator_reset(&mut self) -> bool {
+        std::mem::take(&mut self.translator_reset)
     }
 }
 
@@ -767,6 +783,66 @@ mod tests {
                 json!({"type":"second"})
             ]
         );
+    }
+
+    #[test]
+    fn transcript_replacement_requests_a_persistent_translator_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
+        )
+        .unwrap();
+        let mut tail = TranscriptTail::new(path.clone(), ImportSource::Codex);
+        assert!(!tail.poll(false).unwrap().is_empty());
+        assert!(!tail.take_translator_reset());
+
+        std::fs::write(
+            &path,
+            "{\"timestamp\":\"2026-01-01T00:00:01Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/replacement\"}}\n",
+        )
+        .unwrap();
+        let events = tail.poll(false).unwrap();
+        assert_eq!(events.first().unwrap().event, "SessionStart");
+        assert!(tail.take_translator_reset());
+        assert!(!tail.take_translator_reset());
+    }
+
+    #[test]
+    fn nonfinal_poll_retries_transient_related_transcript_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("rollout-parent.jsonl");
+        let child = temp.path().join("rollout-child.jsonl");
+        let parent_records = [
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"parent"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"spawn_agent","arguments":"{}"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"agent_id\":\"child\"}"}}),
+        ];
+        std::fs::write(
+            &parent,
+            parent_records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(&child, "{\"timestamp\":").unwrap();
+
+        let mut tail = TranscriptTail::new(parent, ImportSource::Codex);
+        assert!(tail.poll(false).unwrap().is_empty());
+        assert!(tail.retry_envelopes);
+
+        std::fs::write(
+            child,
+            "{\"timestamp\":\"2026-01-01T00:00:02Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"source\":{\"subagent\":true}}}\n",
+        )
+        .unwrap();
+        let events = tail.poll(false).unwrap();
+        assert!(!events.is_empty());
+        assert!(!tail.retry_envelopes);
     }
 
     #[test]
