@@ -55,7 +55,7 @@ impl TranslatorFactory for CodexTranslatorFactory {
             external_parent_span_id: None,
             root_opened: false,
             root_ended: false,
-            source: None,
+            session_source: None,
             permission_mode: None,
             root_cwd: None,
             project: None,
@@ -157,7 +157,7 @@ struct CodexTranslator {
     external_parent_span_id: Option<String>,
     root_opened: bool,
     root_ended: bool,
-    source: Option<String>,
+    session_source: Option<String>,
     permission_mode: Option<String>,
     root_cwd: Option<String>,
     project: Option<String>,
@@ -195,7 +195,7 @@ impl AgentTranslator for CodexTranslator {
         // --- hook-specific side effects (before catch-up) ---
         match event.event.as_str() {
             "SessionStart" => {
-                self.source = str_field(payload, "source");
+                self.session_source = str_field(payload, "source");
                 self.permission_mode = str_field(payload, "permission_mode");
             }
             "SubagentStart" => self.handle_subagent_start(payload),
@@ -480,7 +480,7 @@ impl CodexTranslator {
                             json!({
                                 "model": m,
                                 "cwd": self.root_cwd,
-                                "source": self.source,
+                                "source": self.session_source,
                             })
                         } else {
                             json!({ "model": m })
@@ -562,8 +562,12 @@ impl CodexTranslator {
                         );
                     }
                 }
-                if let Some(s) = &self.source {
-                    md.insert("source".into(), json!(s));
+                // `source` identifies the agent consistently across all coding-agent
+                // integrations. Codex's SessionStart source (for example, startup or
+                // resume) describes how this session began, so keep it separately.
+                md.insert("source".into(), json!("codex"));
+                if let Some(session_source) = &self.session_source {
+                    md.insert("session_source".into(), json!(session_source));
                 }
                 if let Some(pm) = &self.permission_mode {
                     md.insert("permission_mode".into(), json!(pm));
@@ -589,7 +593,7 @@ impl CodexTranslator {
                     input: Some(json!({
                         "model": scope.model,
                         "cwd": cwd,
-                        "source": self.source,
+                        "source": self.session_source,
                     })),
                     metadata: Some(Value::Object(md)),
                     ..Default::default()
