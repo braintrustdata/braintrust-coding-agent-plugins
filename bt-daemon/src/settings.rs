@@ -7,7 +7,10 @@
 
 use crate::paths;
 use crate::wire::SessionRoute;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::io::Write;
 use std::path::Path;
 
 pub(crate) const INVOCATION_SETTINGS_ENV: &str = "BT_TRACE_INVOCATION_SETTINGS";
@@ -84,6 +87,86 @@ impl AgentSettings {
     pub(crate) fn tracing_enabled(&self) -> bool {
         self.trace_to_braintrust.unwrap_or(false)
     }
+}
+
+/// Replace a still-matching name-only route with the host-canonical route.
+/// The caller must hold the settings lock used by setup while invoking this.
+pub(crate) fn migrate_persisted_route(
+    source: &str,
+    legacy_route: &SessionRoute,
+    canonical_route: &SessionRoute,
+) -> anyhow::Result<bool> {
+    let path = paths::agent_settings_path(source, None);
+    migrate_persisted_route_at(&path, legacy_route, canonical_route)
+}
+
+fn migrate_persisted_route_at(
+    path: &Path,
+    legacy_route: &SessionRoute,
+    canonical_route: &SessionRoute,
+) -> anyhow::Result<bool> {
+    with_settings_lock(path, || {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let mut settings: Map<String, Value> = serde_json::from_str(&raw)?;
+        let Some(stored) = settings.get("route") else {
+            return Ok(false);
+        };
+        let stored: SessionRoute = serde_json::from_value(stored.clone())?;
+        // Do not overwrite a route that setup changed while resolution was in
+        // flight. `same_route` deliberately treats a legacy route and its
+        // stable-ID successor as equivalent for journal replay, so the
+        // persistence guard must compare their exact serialized forms.
+        if serde_json::to_value(&stored)? != serde_json::to_value(legacy_route)? {
+            return Ok(false);
+        }
+        settings.insert("route".into(), serde_json::to_value(canonical_route)?);
+        write_json_atomic(path, &settings)?;
+        Ok(true)
+    })
+}
+
+/// Serialize all Braintrust-owned updates to an agent settings file. The lock
+/// stays separate from the JSON file so atomic replacement never drops it.
+pub(crate) fn with_settings_lock<T>(
+    path: &Path,
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("configuration path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let lock_path = path.with_extension(format!(
+        "{}lock",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+    ));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    let result = action();
+    FileExt::unlock(&lock)?;
+    result
+}
+
+fn write_json_atomic(path: &Path, settings: &Map<String, Value>) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("configuration path has no parent: {}", path.display()))?;
+    let mut encoded = serde_json::to_string_pretty(&Value::Object(settings.clone()))?;
+    encoded.push('\n');
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(encoded.as_bytes())?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -164,6 +247,7 @@ mod tests {
             serde_json::to_string(&InvocationSettings::enabled(SessionRoute {
                 auth: crate::wire::AuthSelection {
                     source: crate::wire::AuthSource::SavedProfile,
+                    profile_id: None,
                     profile: Some(profile.to_string()),
                     org_name: Some(format!("{profile}-org")),
                 },
@@ -226,5 +310,43 @@ mod tests {
         let settings = AgentSettings::load_from_sources(&path, Some("{"));
         assert!(!settings.tracing_enabled());
         assert!(settings.route.is_none());
+    }
+
+    #[test]
+    fn migration_replaces_only_the_matching_legacy_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        let legacy = SessionRoute {
+            auth: crate::wire::AuthSelection {
+                source: crate::wire::AuthSource::Auto,
+                profile_id: None,
+                profile: Some("test-profile".into()),
+                org_name: Some("test-org".into()),
+            },
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: None,
+                project_name: Some("test-project".into()),
+            }),
+            ..SessionRoute::default()
+        };
+        let mut canonical = legacy.clone();
+        canonical.auth.source = crate::wire::AuthSource::SavedProfile;
+        canonical.auth.profile_id = Some("00000000-0000-4000-8000-000000000001".into());
+        let settings = serde_json::json!({
+            "trace_to_braintrust": true,
+            "route": legacy,
+            "unrelated": { "preserved": true },
+        });
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        assert!(migrate_persisted_route_at(&path, &legacy, &canonical).unwrap());
+        let migrated: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            migrated["route"]["auth"]["profile_id"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(migrated["unrelated"]["preserved"], true);
+
+        assert!(!migrate_persisted_route_at(&path, &legacy, &canonical).unwrap());
     }
 }

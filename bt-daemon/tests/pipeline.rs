@@ -154,6 +154,7 @@ fn routed_envelope(session_id: &str, profile: &str, org: &str, event: &str) -> E
     env.route = Some(SessionRoute {
         auth: AuthSelection {
             source: AuthSource::SavedProfile,
+            profile_id: None,
             profile: Some(profile.into()),
             org_name: Some(org.into()),
         },
@@ -171,6 +172,7 @@ fn environment_routed_envelope(session_id: &str, org: &str, event: &str) -> Enve
     env.route = Some(SessionRoute {
         auth: AuthSelection {
             source: AuthSource::Environment,
+            profile_id: None,
             profile: None,
             org_name: Some(org.into()),
         },

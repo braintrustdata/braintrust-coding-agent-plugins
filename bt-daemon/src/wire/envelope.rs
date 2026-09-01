@@ -88,6 +88,9 @@ pub enum AuthSource {
 pub struct AuthSelection {
     #[serde(default, skip_serializing_if = "AuthSource::is_auto")]
     pub source: AuthSource,
+    /// Immutable profile identifier. Preferred over the legacy display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +111,9 @@ impl AuthSelection {
             AuthSource::Auto if self.profile.as_deref() == Some("environment") => {
                 AuthSource::Environment
             }
-            AuthSource::Auto if self.profile.is_some() => AuthSource::SavedProfile,
+            AuthSource::Auto if self.profile_id.is_some() || self.profile.is_some() => {
+                AuthSource::SavedProfile
+            }
             source => source,
         }
     }
@@ -116,10 +121,13 @@ impl AuthSelection {
     pub fn canonicalized(mut self) -> anyhow::Result<Self> {
         self.source = self.effective_source();
         match self.source {
-            AuthSource::SavedProfile if self.profile.is_none() => {
-                anyhow::bail!("saved-profile auth requires a profile name")
+            AuthSource::SavedProfile if self.profile_id.is_none() && self.profile.is_none() => {
+                anyhow::bail!("saved-profile auth requires a profile ID or name")
             }
-            AuthSource::Environment => self.profile = None,
+            AuthSource::Environment => {
+                self.profile_id = None;
+                self.profile = None;
+            }
             AuthSource::Auto | AuthSource::SavedProfile => {}
         }
         Ok(self)
@@ -151,7 +159,17 @@ impl SessionRoute {
     }
 
     pub fn same_route(&self, other: &Self) -> bool {
-        serde_json::to_value(self).ok() == serde_json::to_value(other).ok()
+        let mut left = self.clone();
+        let mut right = other.clone();
+        // A stable-ID route is the canonical successor to an old named route.
+        // Journals can legitimately contain both forms for the same session,
+        // so replay compares their unchanged routing intent, not the newly
+        // learned identifier.
+        left.auth.profile_id = None;
+        right.auth.profile_id = None;
+        left.auth.source = left.auth.effective_source();
+        right.auth.source = right.auth.effective_source();
+        serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
     }
 }
 
@@ -329,6 +347,7 @@ mod tests {
             route: Some(SessionRoute {
                 auth: AuthSelection {
                     source: AuthSource::SavedProfile,
+                    profile_id: None,
                     profile: Some("work".into()),
                     org_name: Some("acme".into()),
                 },
@@ -401,6 +420,7 @@ mod tests {
         let route = SessionRoute {
             auth: AuthSelection {
                 source: AuthSource::SavedProfile,
+                profile_id: None,
                 profile: Some("work".into()),
                 org_name: Some("acme".into()),
             },
@@ -436,6 +456,7 @@ mod tests {
     fn environment_auth_serializes_without_a_profile_or_secret() {
         let selection = AuthSelection {
             source: AuthSource::Environment,
+            profile_id: None,
             profile: None,
             org_name: Some("acme".into()),
         };
@@ -453,6 +474,30 @@ mod tests {
         assert_eq!(canonical.source, AuthSource::Environment);
         assert_eq!(canonical.profile, None);
         assert_eq!(canonical.org_name.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn stable_profile_id_route_matches_its_legacy_name_route() {
+        let legacy = SessionRoute {
+            auth: AuthSelection {
+                source: AuthSource::Auto,
+                profile_id: None,
+                profile: Some("test-profile".into()),
+                org_name: Some("test-org".into()),
+            },
+            destination: Some(TraceDestination::ProjectLogs {
+                project_id: None,
+                project_name: Some("test-project".into()),
+            }),
+            ..SessionRoute::default()
+        };
+        let mut canonical = legacy.clone();
+        canonical.auth.source = AuthSource::SavedProfile;
+        canonical.auth.profile_id = Some("00000000-0000-4000-8000-000000000001".into());
+
+        assert!(legacy.same_route(&canonical));
+        canonical.auth.profile = Some("other-profile".into());
+        assert!(!legacy.same_route(&canonical));
     }
 
     #[test]
