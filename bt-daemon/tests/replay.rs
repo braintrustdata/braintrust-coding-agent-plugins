@@ -1,3 +1,5 @@
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig, TraceDestination};
 use bt_daemon::{
     import_transcript, import_transcripts, DebugSinkFactory, ImportSource, Registry, ServeOptions,
 };
@@ -67,6 +69,58 @@ fn inserted(rows: &[Value], span_type: &str) -> usize {
     rows.iter()
         .filter(|row| row.pointer("/Insert/span_type").and_then(Value::as_str) == Some(span_type))
         .count()
+}
+
+#[tokio::test]
+async fn attached_import_summary_reports_the_effective_parent_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("attached.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"codex-attached","cwd":"/tmp/demo"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-test"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
+        ],
+    );
+    let parent_root = "0123456789abcdef0123456789abcdef";
+    let config = SessionConfig {
+        auth: BackendAuth {
+            token: "test-token".into(),
+            api_url: None,
+            app_url: None,
+            org_name: None,
+            org_id: None,
+        },
+        destination: Some(TraceDestination::ParentSpan {
+            components: SpanComponents {
+                object_type: SpanObjectType::ProjectLogs,
+                object_id: Some("project-id".into()),
+                compute_object_metadata_args: None,
+                row_id: None,
+                span_id: Some("0123456789abcdef".into()),
+                root_span_id: Some(parent_root.into()),
+                span_parents: None,
+                propagated_event: None,
+            },
+        }),
+        flush_mode: FlushMode::FireAndForget,
+        additional_metadata: None,
+    };
+
+    let summaries = import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        options(&tmp.path().join("spans")),
+        Some(config),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].root_span_id.as_deref(), Some(parent_root));
 }
 
 #[tokio::test]

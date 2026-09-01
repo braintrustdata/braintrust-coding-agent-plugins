@@ -1072,7 +1072,10 @@ impl ImportProcessor {
                             },
                             pending_ops: 0,
                             span_ids: std::collections::HashSet::new(),
-                            root_span_id: None,
+                            root_span_id: self
+                                .config
+                                .as_ref()
+                                .and_then(|config| config.attached_span_ids().1),
                             destination: self
                                 .config
                                 .as_ref()
