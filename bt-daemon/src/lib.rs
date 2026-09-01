@@ -978,7 +978,11 @@ pub async fn import_transcript(
     tokio::pin!(shutdown);
     let mut finalizing = !attach;
     loop {
-        processor.process(tail.poll(finalizing)?).await?;
+        let entries = tail.poll(finalizing)?;
+        if tail.take_translator_reset() {
+            processor.reset_translators();
+        }
+        processor.process(entries).await?;
         if finalizing {
             break;
         }
@@ -1026,6 +1030,7 @@ pub async fn import_transcripts(
 }
 
 struct ImportLive {
+    source: String,
     translator: Box<dyn AgentTranslator>,
     sink: Box<dyn Sink>,
     ctx: SessionCtx,
@@ -1066,6 +1071,7 @@ impl ImportProcessor {
                     self.sessions.insert(
                         sid.clone(),
                         ImportLive {
+                            source: env.source.clone(),
                             translator,
                             sink,
                             ctx: SessionCtx {
@@ -1095,6 +1101,12 @@ impl ImportProcessor {
             Self::emit_translator_batches(live, ops).await?;
         }
         Ok(())
+    }
+
+    fn reset_translators(&mut self) {
+        for (session_id, live) in &mut self.sessions {
+            live.translator = self.opts.translators.create(&live.source, session_id);
+        }
     }
 
     async fn emit_translator_batches(
