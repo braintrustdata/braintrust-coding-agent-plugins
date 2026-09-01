@@ -49,6 +49,7 @@ pub struct ReplayPlan {
 
 pub(crate) struct SessionOptions {
     pub session_id: String,
+    pub translator_session_id: String,
     pub source: String,
     pub plugin_version: Option<String>,
     pub replay: Option<ReplayPlan>,
@@ -78,6 +79,7 @@ impl Session {
     ) -> Arc<Session> {
         let SessionOptions {
             session_id,
+            translator_session_id,
             source,
             plugin_version,
             replay,
@@ -94,6 +96,7 @@ impl Session {
 
         let actor = SessionActor {
             session_id: session_id.clone(),
+            translator_session_id,
             source: source.clone(),
             plugin_version,
             translators,
@@ -208,8 +211,9 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
     else {
         return;
     };
+    let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
     let (mirror, through) =
-        match crate::transcript_mirror::capture(data_dir, &env.session_id, &path).await {
+        match crate::transcript_mirror::capture(data_dir, &mirror_session, &path).await {
             Ok(captured) => captured,
             Err(error) => {
                 tracing::debug!(session_id = %env.session_id, %error, "transcript mirror skipped");
@@ -230,6 +234,7 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
 
 struct SessionActor {
     session_id: String,
+    translator_session_id: String,
     source: String,
     plugin_version: Option<String>,
     translators: Arc<Registry>,
@@ -268,7 +273,16 @@ impl BatchMode {
 
 impl SessionActor {
     async fn run(self, mut rx: mpsc::Receiver<SessionMsg>) {
-        let mut translator = self.translators.create(&self.source, &self.session_id);
+        let mut translator = match self
+            .translators
+            .create_checked_with_session_key(&self.source, &self.translator_session_id)
+        {
+            Ok(translator) => translator,
+            Err(error) => {
+                self.set_error(format!("translator init failed: {error}"));
+                return;
+            }
+        };
         let mut sink = match self.sink_factory.create(
             &self.session_id,
             &self.source,
@@ -456,7 +470,14 @@ impl SessionActor {
             {
                 continue;
             }
-            let env = crate::journal::envelope_from_redacted(entry);
+            let mut env = crate::journal::envelope_from_redacted(entry);
+            let Some(canonical_source) = self.translators.canonical_source(&env.source) else {
+                continue;
+            };
+            if canonical_source != self.source {
+                continue;
+            }
+            env.source = self.source.clone();
             let translated = translator.handle(&env, ctx);
             let _ = self
                 .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Replay)

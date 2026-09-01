@@ -169,7 +169,7 @@ impl PiTranslator {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        metadata.insert("session_id".into(), json!(self.session_id));
+        metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("source".into(), json!("pi"));
         metadata.insert("pi_version".into(), json!(envelope.source_version));
         metadata.insert(

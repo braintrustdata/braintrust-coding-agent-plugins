@@ -90,20 +90,25 @@ struct PendingSession {
 /// carried by its hook or import envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DeliveryKey {
+    source: String,
     session_id: String,
     route: String,
 }
 
 impl DeliveryKey {
-    fn new(session_id: &str, route: &SessionRoute) -> anyhow::Result<Self> {
+    fn new(source: &str, session_id: &str, route: &SessionRoute) -> anyhow::Result<Self> {
         Ok(Self {
+            source: source.to_string(),
             session_id: session_id.to_string(),
             route: serde_json::to_string(route)?,
         })
     }
 
     fn correlation_key(&self) -> String {
-        format!("{}\u{1f}{}", self.session_id, self.route)
+        format!(
+            "{}\u{1f}{}\u{1f}{}",
+            self.source, self.session_id, self.route
+        )
     }
 }
 
@@ -167,7 +172,7 @@ impl Daemon {
                 "session route is missing its trace destination; select a project or destination during `bt trace setup` or `bt trace run`"
             );
         }
-        let key = DeliveryKey::new(&env.session_id, &route)?;
+        let key = DeliveryKey::new(&env.source, &env.session_id, &route)?;
         let (selection, reason, expected_selection) = {
             let states = self.session_auth.lock().await;
             match states.get(&key) {
@@ -287,7 +292,16 @@ impl Daemon {
         // cheap and allocation-free here no matter how long the recorded
         // session is. Bound it to what is recorded now, before this event is
         // appended, so replay covers recovery only.
-        let journal_path = journal::journal_path(&self.data_dir, &env.session_id);
+        let journal_path =
+            journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
+        let translator_session_id =
+            if journal::legacy_journal_has_session(&self.data_dir, &env.source, &env.session_id)
+                .await
+            {
+                env.session_id.clone()
+            } else {
+                crate::ids::session_namespace(&env.source, &env.session_id)
+            };
         let replay = ReplayPlan {
             through: journal::JournalReader::recorded_len(&journal_path).await,
             journal_path,
@@ -300,6 +314,7 @@ impl Daemon {
         let session = Session::spawn(
             SessionOptions {
                 session_id: env.session_id.clone(),
+                translator_session_id,
                 source: env.source.clone(),
                 plugin_version: env.plugin_version.clone(),
                 replay: Some(replay),
@@ -321,7 +336,7 @@ impl Daemon {
     /// journal file for the rest of the daemon's life; deterministic span ids
     /// mean a late event simply rebuilds it from the journal.
     async fn retire_session(&self, key: &DeliveryKey) {
-        let lock = self.session_lock(&key.session_id);
+        let lock = self.session_lock(&key.source, &key.session_id);
         let _guard = lock.lock().await;
 
         let session = { self.sessions.lock().unwrap().remove(key) };
@@ -338,18 +353,18 @@ impl Daemon {
             !keys.is_empty()
         });
 
-        // The journal writer and lock are keyed by session id, which several
-        // delivery pipelines can share; only release them once the last one
-        // for that id is gone.
+        // Several delivery routes can share one source session, so release
+        // its journal writer and lock only after its final route retires.
         let last = !self
             .sessions
             .lock()
             .unwrap()
             .keys()
-            .any(|other| other.session_id == key.session_id);
+            .any(|other| other.source == key.source && other.session_id == key.session_id);
         if last {
-            self.journals.lock().unwrap().remove(&key.session_id);
-            self.session_locks.lock().unwrap().remove(&key.session_id);
+            let storage_key = crate::ids::session_namespace(&key.source, &key.session_id);
+            self.journals.lock().unwrap().remove(&storage_key);
+            self.session_locks.lock().unwrap().remove(&storage_key);
         }
         tracing::info!(session_id = %key.session_id, "session retired");
     }
@@ -372,17 +387,21 @@ impl Daemon {
 
     async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<()> {
         hydrate_transcript_reference(&self.data_dir, env).await;
-        let existing = { self.journals.lock().unwrap().get(&env.session_id).cloned() };
+        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
+        let existing = { self.journals.lock().unwrap().get(&storage_key).cloned() };
         let writer = match existing {
             Some(writer) => writer,
             None => {
+                let path =
+                    journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id)
+                        .await?;
                 let writer = Arc::new(tokio::sync::Mutex::new(
-                    JournalWriter::open(&self.data_dir, &env.session_id).await?,
+                    JournalWriter::open_path(&path).await?,
                 ));
                 self.journals
                     .lock()
                     .unwrap()
-                    .entry(env.session_id.clone())
+                    .entry(storage_key)
                     .or_insert_with(|| writer.clone())
                     .clone()
             }
@@ -391,11 +410,12 @@ impl Daemon {
         result
     }
 
-    fn session_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn session_lock(&self, source: &str, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let storage_key = crate::ids::session_namespace(source, session_id);
         self.session_locks
             .lock()
             .unwrap()
-            .entry(session_id.to_string())
+            .entry(storage_key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -428,6 +448,7 @@ impl Daemon {
             return;
         }
         let record = journal::ManagedRunKey {
+            source: Some(key.source.clone()),
             session_id: key.session_id.clone(),
             route: route.clone(),
         };
@@ -455,8 +476,47 @@ impl Daemon {
         // persisted record keeps flush accounting accurate for runs whose
         // events were accepted by an earlier daemon generation.
         for record in journal::read_managed_run_keys(&self.data_dir, &params.managed_run_id).await {
-            if let Ok(key) = DeliveryKey::new(&record.session_id, &record.route) {
-                delivery_keys.insert(key);
+            if let Some(source) = record.source {
+                if let Ok(key) = DeliveryKey::new(&source, &record.session_id, &record.route) {
+                    delivery_keys.insert(key);
+                }
+            } else {
+                // Legacy records predate source-qualified delivery keys. A
+                // matching live pipeline is authoritative; otherwise recover
+                // the source from the legacy journal.
+                let live: Vec<_> = self
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|key| {
+                        key.session_id == record.session_id
+                            && serde_json::from_str::<SessionRoute>(&key.route)
+                                .is_ok_and(|route| route.same_route(&record.route))
+                    })
+                    .cloned()
+                    .collect();
+                if live.is_empty() {
+                    if let Some(source) = journal::legacy_journal_source(
+                        &self.data_dir,
+                        &record.session_id,
+                        &record.route,
+                    )
+                    .await
+                    .and_then(|source| {
+                        self.translators
+                            .canonical_source(&source)
+                            .map(str::to_owned)
+                    }) {
+                        if let Ok(key) =
+                            DeliveryKey::new(&source, &record.session_id, &record.route)
+                        {
+                            delivery_keys.insert(key);
+                        }
+                    }
+                } else {
+                    delivery_keys.extend(live);
+                }
             }
         }
         let mut result = FlushResult {
@@ -678,6 +738,12 @@ fn attach_process_capture(env: &mut Envelope, client: Option<&crate::wire::Clien
 }
 
 async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), String> {
+    let canonical_source = daemon
+        .translators
+        .canonical_source(&env.source)
+        .ok_or_else(|| format!("unsupported coding-agent source {:?}", env.source))?
+        .to_string();
+    env.source = canonical_source;
     daemon.touch();
     let requested_link_key = automatic_link_key(&env);
     let correlation_lock = daemon.correlation_lock(&requested_link_key);
@@ -1064,7 +1130,7 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Resul
     let managed_run_id = env.managed_run_id.clone();
     let route = env.route.clone();
     tracing::info!(source, event, session_id, "event received");
-    let session_lock = daemon.session_lock(&session_id);
+    let session_lock = daemon.session_lock(&source, &session_id);
     let _session_guard = session_lock.lock().await;
 
     let result = async {

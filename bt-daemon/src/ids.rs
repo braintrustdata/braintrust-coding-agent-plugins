@@ -14,6 +14,18 @@ const NAMESPACE: Uuid = Uuid::from_u128(0x8f2b_4e11_9c7a_4d3e_b6a1_5f0c_2d84_71a
 
 const SEP: char = '\u{1f}'; // ASCII unit separator; will not appear in ids/keys.
 
+/// A stable namespace for one agent's native session. Source qualification
+/// prevents two agents that choose the same native session id from sharing
+/// span ids, actor locks, journals, or transcript mirrors.
+pub fn session_namespace(source: &str, session_id: &str) -> String {
+    format!("{source}{SEP}{session_id}")
+}
+
+/// Collision-resistant suffix for source-qualified on-disk session state.
+pub fn session_storage_id(source: &str, session_id: &str) -> String {
+    Uuid::new_v5(&NAMESPACE, session_namespace(source, session_id).as_bytes()).to_string()
+}
+
 /// A deterministic span id for `key` within `session_id`. `key` should encode
 /// the logical span identity, e.g. `turn:{turn_id}` or `tool:{call_id}`.
 pub fn span_id(session_id: &str, key: &str) -> String {
@@ -34,5 +46,16 @@ mod tests {
         assert_eq!(a1, a2, "same inputs must be stable across calls");
         assert_ne!(a1, b);
         assert_ne!(a1, c);
+    }
+
+    #[test]
+    fn source_qualified_sessions_do_not_collide() {
+        let codex = session_namespace("codex", "same");
+        let claude = session_namespace("claude-code", "same");
+        assert_ne!(span_id(&codex, "root"), span_id(&claude, "root"));
+        assert_ne!(
+            session_storage_id("codex", "same"),
+            session_storage_id("claude-code", "same")
+        );
     }
 }

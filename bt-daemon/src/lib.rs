@@ -36,6 +36,8 @@ pub use command_output::{
     AuthDiagnostic, DoctorCommandOutput, OutputFormat, SetupCommandOutput, StatusCommandOutput,
     StopCommandOutput, TraceCommandOutput,
 };
+#[doc(hidden)]
+pub use journal::source_journal_path;
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
 pub use setup::{run_disable, run_enable, run_setup};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};

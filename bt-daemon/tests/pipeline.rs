@@ -8,8 +8,8 @@ use bt_daemon::wire::{
 };
 use bt_daemon::{
     debug_serve_options, flush_managed_run, flush_session, forward_envelope, run_serve, run_status,
-    shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs,
-    ServeOptions, Sink, SinkFactory, SpanOp, StatusArgs,
+    shutdown_daemon, source_journal_path, AuthLease, AuthProvider, AuthResolveReason, HostInfo,
+    Registry, ServeArgs, ServeOptions, Sink, SinkFactory, SpanOp, StatusArgs,
 };
 #[cfg(all(feature = "cli", unix))]
 use bt_daemon::{run_traced, RunArgs, RunHookCommand, RunSource};
@@ -469,8 +469,7 @@ async fn routed_sessions_resolve_multiple_profiles_without_journaling_credential
 
     for session in ["work-session", "personal-session"] {
         let journal =
-            std::fs::read_to_string(data_dir.join("journal").join(format!("{session}.ndjson")))
-                .unwrap();
+            std::fs::read_to_string(source_journal_path(&data_dir, "debug", session)).unwrap();
         assert!(journal.contains("\"route\""));
         assert!(!journal.contains("secret-"));
         assert!(!journal.contains("token_sha256_prefix"));
@@ -509,9 +508,12 @@ async fn environment_routes_remain_environment_auth_without_journaling_credentia
     assert_eq!(calls[0].0.profile, None);
     assert_eq!(calls[0].0.org_name.as_deref(), Some("env-org"));
 
-    let journal =
-        std::fs::read_to_string(data_dir.join("journal").join("environment-session.ndjson"))
-            .unwrap();
+    let journal = std::fs::read_to_string(source_journal_path(
+        &data_dir,
+        "debug",
+        "environment-session",
+    ))
+    .unwrap();
     assert!(journal.contains(r#""source":"environment""#));
     assert!(!journal.contains("secret-environment"));
 
@@ -756,7 +758,7 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     let status_error = status.sessions[0].last_error.as_deref().unwrap();
     assert!(status_error.contains("select a profile explicitly"));
     assert!(!status_error.contains("secret-"));
-    assert!(!data_dir.join("journal/login-needed.ndjson").exists());
+    assert!(!source_journal_path(&data_dir, "debug", "login-needed").exists());
     assert_eq!(provider.calls.lock().unwrap().len(), 1);
 
     shutdown(&socket).await;
@@ -779,7 +781,7 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert_eq!(flushed.pending, 0);
 
     // Journal: three events, in order, with only the non-secret route.
-    let journal = data_dir.join("journal").join("sess-1.ndjson");
+    let journal = source_journal_path(&data_dir, "debug", "sess-1");
     let jtext = std::fs::read_to_string(&journal).unwrap();
     let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
@@ -825,6 +827,88 @@ async fn events_are_ordered_journaled_and_emitted() {
 }
 
 #[tokio::test]
+async fn unknown_sources_are_rejected_before_journaling() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let mut env = envelope("unknown-session", "SessionStart", 1);
+    env.source = "mystery-agent".into();
+    let error = forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unsupported coding-agent source"), "{error}");
+    assert!(!source_journal_path(&data_dir, "mystery-agent", "unknown-session").exists());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn identical_native_ids_from_different_sources_are_isolated() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let host = dummy_host();
+    let mut codex = envelope("shared-native-id", "SessionStart", 1);
+    codex.source = "codex".into();
+    let mut claude = envelope("shared-native-id", "SessionStart", 2);
+    claude.source = "claude".into();
+
+    forward_envelope(&codex, &socket, &host, false)
+        .await
+        .unwrap();
+    forward_envelope(&claude, &socket, &host, false)
+        .await
+        .unwrap();
+    flush_session("shared-native-id", &socket, 5000)
+        .await
+        .unwrap();
+
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("shared-native-id".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let sources = status
+        .sessions
+        .iter()
+        .map(|session| session.source.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(sources, HashSet::from(["codex", "claude-code"]));
+
+    let codex_journal = source_journal_path(&data_dir, "codex", "shared-native-id");
+    let claude_journal = source_journal_path(&data_dir, "claude-code", "shared-native-id");
+    assert_ne!(codex_journal, claude_journal);
+    assert_eq!(
+        std::fs::read_to_string(codex_journal)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(claude_journal)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let rows = std::fs::read_to_string(data_dir.join("spans/shared-native-id.ndjson")).unwrap();
+    let root_ids = rows
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|row| row.get("Insert").cloned())
+        .filter(|row| {
+            row["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(": shared-native-id"))
+        })
+        .filter_map(|row| row["span_id"].as_str().map(str::to_owned))
+        .collect::<HashSet<_>>();
+    assert_eq!(root_ids.len(), 2);
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn distinct_sessions_are_isolated() {
     let (data_dir, socket, handle, _tmp) = start_daemon().await;
     let host = dummy_host();
@@ -842,8 +926,8 @@ async fn distinct_sessions_are_isolated() {
     flush_session("a", &socket, 5000).await.unwrap();
     flush_session("b", &socket, 5000).await.unwrap();
 
-    let a = std::fs::read_to_string(data_dir.join("journal").join("a.ndjson")).unwrap();
-    let b = std::fs::read_to_string(data_dir.join("journal").join("b.ndjson")).unwrap();
+    let a = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "a")).unwrap();
+    let b = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "b")).unwrap();
     assert_eq!(a.lines().filter(|l| !l.trim().is_empty()).count(), 2);
     assert_eq!(b.lines().filter(|l| !l.trim().is_empty()).count(), 1);
 
@@ -1003,7 +1087,8 @@ async fn restart_replays_journal_with_stable_span_ids_before_new_events() {
         .unwrap();
     flush_session("resume", &socket, 5000).await.unwrap();
 
-    let journal = std::fs::read_to_string(data_dir.join("journal/resume.ndjson")).unwrap();
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "resume")).unwrap();
     assert_eq!(journal.lines().count(), 2);
     let spans = std::fs::read_to_string(data_dir.join("spans/resume.ndjson")).unwrap();
     let rows: Vec<serde_json::Value> = spans
@@ -1063,7 +1148,12 @@ async fn claude_boundary_journal_references_a_self_contained_transcript_mirror()
         .await
         .unwrap();
 
-    let journal = std::fs::read_to_string(data_dir.join("journal/claude-journal.ndjson")).unwrap();
+    let journal = std::fs::read_to_string(source_journal_path(
+        &data_dir,
+        "claude-code",
+        "claude-journal",
+    ))
+    .unwrap();
     assert!(!journal.contains("sk-TOP-SECRET-abc123"));
 
     // The journal references the mirror rather than inlining the transcript,
@@ -1164,7 +1254,7 @@ async fn claude_journal_does_not_grow_with_the_transcript_on_every_turn() {
     flush_session("grow", &socket, 5000).await.unwrap();
 
     let transcript_len = std::fs::metadata(&transcript).unwrap().len();
-    let journal_len = std::fs::metadata(data_dir.join("journal/grow.ndjson"))
+    let journal_len = std::fs::metadata(source_journal_path(&data_dir, "claude-code", "grow"))
         .unwrap()
         .len();
 
