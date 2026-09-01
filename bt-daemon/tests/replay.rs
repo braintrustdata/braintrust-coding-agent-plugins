@@ -85,7 +85,7 @@ async fn imports_multiple_transcripts_in_one_invocation() {
     }
 
     let output = tmp.path().join("spans");
-    import_transcripts(
+    let summaries = import_transcripts(
         &[first, second],
         ImportSource::Claude,
         options(&output),
@@ -93,6 +93,17 @@ async fn imports_multiple_transcripts_in_one_invocation() {
     )
     .await
     .unwrap();
+
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|summary| summary.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["claude-first", "claude-second"]
+    );
+    assert!(summaries.iter().all(|summary| {
+        summary.span_count == 3 && summary.root_span_id.is_some() && summary.finalized
+    }));
 
     for session_id in ["claude-first", "claude-second"] {
         let rows = rows(&output.join(format!("{session_id}.ndjson")));

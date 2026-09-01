@@ -367,15 +367,15 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             let mut route = host
                 .services
                 .resolve_route(RouteRequirements {
-                    destination_required: import_args.destination.is_none()
-                        && import_args.parent.is_none(),
+                    destination_required: !import_args.has_destination_override(),
                     interactive_auth: true,
                     persistent_auth: false,
                 })
                 .await?;
             apply_additional_metadata(&mut route, import_args.additional_metadata.as_deref())?;
             let config = session_config(&host, &route).await?;
-            run_import(import_args, serve_options(&host), Some(config)).await
+            let summaries = run_import(import_args, serve_options(&host), Some(config)).await?;
+            print_output(TraceCommandOutput::import(summaries), host.output_format)
         }
         TraceCommand::Run(run_args) => {
             let mut route = resolve_command_route(
@@ -628,6 +628,11 @@ mod tests {
                 all: false,
                 destination,
                 parent: None,
+                parent_span_id: None,
+                parent_root_span_id: None,
+                parent_object_type: None,
+                parent_object_id: None,
+                parent_project: None,
                 attach: false,
                 additional_metadata: None,
             };

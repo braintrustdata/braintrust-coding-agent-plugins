@@ -110,6 +110,12 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Claude Code's shared settings file. Braintrust never mutates this file;
+/// setup only inspects it for obsolete tracing-specific environment entries.
+pub(crate) fn claude_settings_path() -> PathBuf {
+    home().join(".claude").join("settings.json")
+}
+
 /// Resolve Antigravity's native configuration directory.
 pub(crate) fn antigravity_config_dir() -> PathBuf {
     if let Some(path) = std::env::var_os(ANTIGRAVITY_CONFIG_DIR_ENV) {

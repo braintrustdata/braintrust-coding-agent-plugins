@@ -284,9 +284,17 @@ async fn main() {
         Command::Import(args) => {
             let data_dir = paths::data_dir(None);
             let opts = debug_serve_options(VERSION, &data_dir);
-            if let Err(e) = run_import(args, opts, None).await {
-                eprintln!("bt-daemon import: {e}");
-                std::process::exit(1);
+            match run_import(args, opts, None).await {
+                Ok(summaries) => println!(
+                    "{}",
+                    TraceCommandOutput::import(summaries)
+                        .render(OutputFormat::from(cli.json))
+                        .unwrap()
+                ),
+                Err(e) => {
+                    eprintln!("bt-daemon import: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Command::Run { route, args } => {
