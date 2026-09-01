@@ -113,30 +113,15 @@ pub trait TranslatorFactory: Send + Sync {
 }
 
 /// Maps canonical and supported alias source strings to translator factories.
-/// Production rejects unknown sources; the debug registry maps known agent
-/// identities to its pass-through translator for pipeline tests.
 pub struct Registry {
     factories: HashMap<String, Box<dyn TranslatorFactory>>,
-    debug_known_agents: bool,
 }
 
 impl Registry {
-    /// A pass-through registry for debug sinks and pipeline tests. Known agent
-    /// identities are accepted, while arbitrary unknown sources are rejected.
-    pub fn debug_only() -> Self {
-        let mut r = Registry {
-            factories: HashMap::new(),
-            debug_known_agents: true,
-        };
-        r.register(Box::new(DebugTranslatorFactory));
-        r
-    }
-
     /// The production registry with every real agent translator registered.
     pub fn default_agents() -> Self {
         let mut r = Registry {
             factories: HashMap::new(),
-            debug_known_agents: false,
         };
         r.register(Box::new(DebugTranslatorFactory));
         let git = Arc::new(git::GitMetadataCache::default());
@@ -170,9 +155,7 @@ impl Registry {
             "debug" => "debug",
             _ => return None,
         };
-        (self.factories.contains_key(canonical)
-            || (self.debug_known_agents && canonical != "debug"))
-            .then_some(canonical)
+        self.factories.contains_key(canonical).then_some(canonical)
     }
 
     pub fn create_checked(
@@ -195,11 +178,7 @@ impl Registry {
         let canonical = self
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
-        let factory = self.factories.get(canonical).or_else(|| {
-            self.debug_known_agents
-                .then(|| self.factories.get("debug"))
-                .flatten()
-        });
+        let factory = self.factories.get(canonical);
         let factory = factory.expect("canonical source must have a factory");
         Ok(factory.create(session_key))
     }

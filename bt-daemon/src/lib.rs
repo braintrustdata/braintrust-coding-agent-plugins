@@ -972,12 +972,12 @@ impl ImportProcessor {
     }
 }
 
-/// Build a Phase-1 debug [`ServeOptions`]: debug translator registry + a debug
-/// sink writing NDJSON under `<data_dir>/spans/`.
+/// Build debug [`ServeOptions`]: the production translator registry plus a
+/// debug sink writing NDJSON under `<data_dir>/spans/`.
 pub fn debug_serve_options(version: impl Into<String>, data_dir: &std::path::Path) -> ServeOptions {
     ServeOptions {
         version: version.into(),
-        translators: Arc::new(Registry::debug_only()),
+        translators: Arc::new(Registry::default_agents()),
         sink_factory: Arc::new(DebugSinkFactory {
             dir: data_dir.join("spans"),
         }),

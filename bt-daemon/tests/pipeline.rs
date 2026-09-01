@@ -842,12 +842,40 @@ async fn unknown_sources_are_rejected_before_journaling() {
 
 #[tokio::test]
 async fn identical_native_ids_from_different_sources_are_isolated() {
-    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let (data_dir, socket, handle, tmp) = start_daemon().await;
     let host = dummy_host();
+    let codex_transcript = tmp.path().join("codex-rollout.jsonl");
+    std::fs::write(
+        &codex_transcript,
+        serde_json::to_string(&serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "shared-native-id",
+                "cwd": "/workspace/codex",
+                "cli_version": "test"
+            }
+        }))
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
     let mut codex = envelope("shared-native-id", "SessionStart", 1);
     codex.source = "codex".into();
+    codex.payload = serde_json::json!({
+        "session_id": "shared-native-id",
+        "hook_event_name": "SessionStart",
+        "transcript_path": codex_transcript,
+        "source": "startup",
+        "permission_mode": "auto"
+    });
     let mut claude = envelope("shared-native-id", "SessionStart", 2);
     claude.source = "claude".into();
+    claude.payload = serde_json::json!({
+        "session_id": "shared-native-id",
+        "hook_event_name": "SessionStart",
+        "cwd": "/workspace/claude"
+    });
 
     forward_envelope(&codex, &socket, &host, false)
         .await
@@ -896,11 +924,7 @@ async fn identical_native_ids_from_different_sources_are_isolated() {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter_map(|row| row.get("Insert").cloned())
-        .filter(|row| {
-            row["name"]
-                .as_str()
-                .is_some_and(|name| name.ends_with(": shared-native-id"))
-        })
+        .filter(|row| row["root_span_id"] == row["span_id"])
         .filter_map(|row| row["span_id"].as_str().map(str::to_owned))
         .collect::<HashSet<_>>();
     assert_eq!(root_ids.len(), 2);
