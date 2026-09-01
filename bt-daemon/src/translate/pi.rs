@@ -662,9 +662,12 @@ fn format_error(v: Option<&Value>) -> String {
         Some(v) => v
             .get("error")
             .or_else(|| v.get("message"))
+            .or_else(|| v.get("stderr"))
+            .or_else(|| v.get("output"))
+            .or_else(|| v.get("result"))
             .and_then(Value::as_str)
-            .unwrap_or("Tool execution failed")
-            .into(),
+            .map(|text| text.lines().next().unwrap_or(text).to_string())
+            .unwrap_or_else(|| "Tool execution failed".into()),
         None => "Tool execution failed".into(),
     }
 }

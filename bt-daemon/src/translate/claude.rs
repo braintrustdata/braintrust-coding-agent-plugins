@@ -1542,8 +1542,8 @@ fn tool_error(payload: &Value) -> Option<String> {
     .into_iter()
     .flatten()
     {
-        if let Some(text) = value.as_str().filter(|value| !value.is_empty()) {
-            return Some(text.lines().next().unwrap_or(text).to_string());
+        if let Some(text) = concise_error(value) {
+            return Some(text);
         }
     }
     let response = payload.get("tool_response")?;
@@ -1560,5 +1560,30 @@ fn tool_error(payload: &Value) -> Option<String> {
             .get("status")
             .and_then(Value::as_str)
             .is_some_and(|value| matches!(value, "error" | "failed"));
-    failed.then(|| "Tool execution failed".to_string())
+    if !failed {
+        return None;
+    }
+    for value in [
+        response.get("error"),
+        response.get("stderr"),
+        response.get("message"),
+        response.get("output"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(text) = concise_error(value) {
+            return Some(text);
+        }
+    }
+    Some("Tool execution failed".to_string())
+}
+
+fn concise_error(value: &Value) -> Option<String> {
+    let text = value.as_str().or_else(|| {
+        ["error", "message", "stderr", "output", "result"]
+            .iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_str))
+    })?;
+    (!text.is_empty()).then(|| text.lines().next().unwrap_or(text).to_string())
 }

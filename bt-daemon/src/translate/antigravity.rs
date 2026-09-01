@@ -732,6 +732,10 @@ fn tool_details(record: &Value) -> ToolDetails {
         .or_else(|| {
             string_field(record, "status")
                 .filter(|status| matches!(status.to_ascii_lowercase().as_str(), "error" | "failed"))
+                .map(|status| match record_content(record) {
+                    Value::String(content) if !content.is_empty() => content,
+                    _ => status,
+                })
         });
     ToolDetails {
         name,

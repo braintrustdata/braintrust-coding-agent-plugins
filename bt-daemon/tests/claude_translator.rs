@@ -404,6 +404,17 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         translator
             .handle(
                 &event(
+                    "PostToolUse",
+                    json!({"session_id":"s","tool_name":"Write","tool_use_id":"c","tool_input":{"file_path":"x"},"tool_response":{"is_error":true,"stderr":"disk full"}}),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    ops.extend(
+        translator
+            .handle(
+                &event(
                     "PostToolUseFailure",
                     json!({"session_id":"s","tool_name":"Read","tool_use_id":"b","tool_input":{"file_path":"x"},"error":"missing"}),
                 ),
@@ -416,7 +427,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         .values()
         .filter(|row| row.span_type == SpanType::Tool)
         .collect();
-    assert_eq!(tools.len(), 2);
+    assert_eq!(tools.len(), 3);
     assert!(tools
         .iter()
         .any(|row| { row.metadata.as_ref().unwrap()["tool_approval"] == json!("denied") }));
@@ -435,6 +446,9 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
     assert!(tools
         .iter()
         .any(|row| row.error.as_deref() == Some("missing")));
+    assert!(tools
+        .iter()
+        .any(|row| row.error.as_deref() == Some("disk full")));
     assert!(rows.values().all(|row| {
         let metadata = row.metadata.as_ref().and_then(Value::as_object).unwrap();
         metadata.get("git_origin_url") == Some(&json!("https://example.com/acme/app.git"))

@@ -308,7 +308,7 @@ fn pre_tool_pair_preserves_start_time_and_reports_failure() {
                     path,
                     &transcript,
                     boundary[0],
-                    json!({"stepIdx":4,"error":"permission denied"}),
+                    json!({"stepIdx":4}),
                 ),
                 &ctx,
             )

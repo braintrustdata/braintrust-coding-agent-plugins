@@ -91,17 +91,27 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
             json!({"toolCallId":"call-1","toolName":"read","result":"contents","isError":false}),
         ),
         event(
-            "session_before_compact",
+            "tool_execution_start",
             8,
+            json!({"toolCallId":"call-2","toolName":"write","args":{"path":"readonly"}}),
+        ),
+        event(
+            "tool_execution_end",
+            9,
+            json!({"toolCallId":"call-2","toolName":"write","result":{"stderr":"permission denied"},"isError":true}),
+        ),
+        event(
+            "session_before_compact",
+            10,
             json!({"preparation":{"tokensBefore":100}}),
         ),
         event(
             "session_compact",
-            9,
+            11,
             json!({"compactionEntry":{"summary":"short"}}),
         ),
-        event("agent_end", 10, json!({"messages":[]})),
-        event("session_shutdown", 11, json!({"reason":"quit"})),
+        event("agent_end", 12, json!({"messages":[]})),
+        event("session_shutdown", 13, json!({"reason":"quit"})),
     ];
     let mut ops = Vec::new();
     for event in events {
@@ -120,12 +130,11 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
         .unwrap();
     assert_eq!(llm.metrics.as_ref().unwrap()["prompt_tokens"], 8);
     assert_eq!(llm.metrics.as_ref().unwrap()["time_to_first_token"], 0.001);
-    let tool = rows
-        .values()
-        .find(|r| r.span_type == SpanType::Tool)
-        .unwrap();
+    let tool = rows.values().find(|r| r.name == "skill: review").unwrap();
     assert_eq!(tool.name, "skill: review");
     assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
+    let failed_tool = rows.values().find(|r| r.name == "write").unwrap();
+    assert_eq!(failed_tool.error.as_deref(), Some("permission denied"));
     assert!(rows.values().any(|r| r.name == "Compaction"));
     assert!(rows
         .values()
