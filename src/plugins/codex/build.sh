@@ -4,7 +4,6 @@
 #
 # The Codex marketplace consumes a repo whose ROOT is the marketplace:
 #   .agents/plugins/marketplace.json   marketplace manifest
-#   plugins/braintrust-codex-plugin/   skills plugin (MCP + skills)
 #   plugins/trace-codex/               tracing plugin (thin daemon hook shims)
 #
 # The tracing plugin contains no tracing runtime or platform-specific binary;

@@ -30,9 +30,6 @@ check_json "$MARKETPLACE"
 
 # Required files for each shipped plugin.
 required=(
-  "plugins/braintrust-codex-plugin/.codex-plugin/plugin.json"
-  "plugins/braintrust-codex-plugin/.mcp.json"
-  "plugins/braintrust-codex-plugin/skills/braintrust/SKILL.md"
   "plugins/trace-codex/.codex-plugin/plugin.json"
   "plugins/trace-codex/hooks/hooks.json"
   "plugins/trace-codex/bin/codex-hook.sh"
@@ -41,6 +38,23 @@ for rel in "${required[@]}"; do
   [[ -f "$TARGET_DIR/$rel" ]] || fail "missing $rel"
   case "$rel" in *.json) check_json "$TARGET_DIR/$rel";; esac
 done
+
+python3 - "$MARKETPLACE" "$TARGET_DIR/plugins" <<'PY' \
+  || fail "Codex marketplace must contain only the tracing plugin"
+import json
+import sys
+from pathlib import Path
+
+with open(sys.argv[1]) as f:
+    plugins = json.load(f)["plugins"]
+
+assert [plugin["name"] for plugin in plugins] == ["trace-codex"]
+assert sorted(path.name for path in Path(sys.argv[2]).iterdir() if path.is_dir()) == ["trace-codex"]
+PY
+
+if find "$TARGET_DIR" -name '.mcp.json' -print -quit | grep -q .; then
+  fail "Codex dist still contains an MCP proxy configuration"
+fi
 
 python3 - "$TARGET_DIR/plugins/trace-codex/hooks/hooks.json" <<'PY' \
   || fail "Codex hooks do not all use the daemon forwarders"

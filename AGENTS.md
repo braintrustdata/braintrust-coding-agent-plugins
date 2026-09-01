@@ -45,7 +45,9 @@ Versioning is per distribution. Claude and Codex plugins carry their version in
 their plugin manifests, and `scripts/set-plugin-version.py` updates those
 manifests for a release. Antigravity's schema does not expose a version field,
 so its distribution is versioned by repository tags and GitHub Releases.
-Marketplace manifests are not versioned.
+Claude's marketplace manifest carries a separate catalog version; bump it
+independently for breaking marketplace changes. The Codex marketplace manifest
+is unversioned.
 
 | Agent | Distribution repository |
 |---|---|
