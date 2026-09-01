@@ -66,6 +66,7 @@ pub enum DoctorAgent {
     #[value(name = "opencode", alias = "open-code")]
     OpenCode,
     Pi,
+    Antigravity,
 }
 
 impl DoctorAgent {
@@ -75,6 +76,7 @@ impl DoctorAgent {
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -84,6 +86,7 @@ impl DoctorAgent {
             Self::Claude => "Claude Code",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
+            Self::Antigravity => "Google Antigravity",
         }
     }
 }
@@ -212,17 +215,25 @@ mod tests {
 
     #[test]
     fn doctor_accepts_every_supported_agent_alias() {
-        for (agent, expected) in [
-            ("codex", DoctorAgent::Codex),
-            ("claude-code", DoctorAgent::Claude),
-            ("open-code", DoctorAgent::OpenCode),
-            ("pi", DoctorAgent::Pi),
+        for (agent, expected, source, display_name) in [
+            ("codex", DoctorAgent::Codex, "codex", "Codex"),
+            ("claude-code", DoctorAgent::Claude, "claude", "Claude Code"),
+            ("open-code", DoctorAgent::OpenCode, "opencode", "OpenCode"),
+            ("pi", DoctorAgent::Pi, "pi", "Pi"),
+            (
+                "antigravity",
+                DoctorAgent::Antigravity,
+                "antigravity",
+                "Google Antigravity",
+            ),
         ] {
             let cli = Cli::try_parse_from(["bt", "doctor", agent]).unwrap();
             assert!(matches!(
                 cli.trace.command,
                 TraceCommand::Doctor(DoctorArgs { agent }) if agent == expected
             ));
+            assert_eq!(expected.source(), source);
+            assert_eq!(expected.display_name(), display_name);
         }
     }
 
