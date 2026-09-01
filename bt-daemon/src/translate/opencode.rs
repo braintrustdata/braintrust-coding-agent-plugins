@@ -3,6 +3,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::RecentSet;
+use super::tool::{error_text, with_tool_approval, ToolApproval};
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -548,7 +549,10 @@ impl OpenCodeTranslator {
                 .unwrap_or(tool)
                 .to_string()
         };
-        let mut metadata = json!({"tool_name":tool,"call_id":call,"tool_approval":"approved"});
+        let mut metadata = with_tool_approval(
+            json!({"tool_name":tool,"call_id":call}),
+            Some(ToolApproval::Approved),
+        );
         if tool == "skill" {
             metadata["tool_kind"] = json!("skill");
             metadata["skill_name"] = args
@@ -655,7 +659,10 @@ impl OpenCodeTranslator {
         };
         s.denied_tools.insert(call.clone());
         let had_start = s.tool_starts.contains_key(&call);
-        let mut metadata = json!({"tool_name":tool,"call_id":call,"tool_approval":"denied"});
+        let mut metadata = with_tool_approval(
+            json!({"tool_name":tool,"call_id":call}),
+            Some(ToolApproval::Denied),
+        );
         if let Some(id) = direct.id.or(request.id) {
             metadata["permission_id"] = json!(id);
         }
@@ -717,11 +724,13 @@ impl OpenCodeTranslator {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
                 root_span_id: s.effective_root_span_id.clone(),
                 end_ms: Some(ts),
-                metadata: Some(json!({
-                    "tool_name": tool_name,
-                    "call_id": call,
-                    "tool_approval": "approved",
-                })),
+                metadata: Some(with_tool_approval(
+                    json!({
+                        "tool_name": tool_name,
+                        "call_id": call,
+                    }),
+                    Some(ToolApproval::Approved),
+                )),
                 error: Some("Interrupted before tool completion".into()),
                 ..Default::default()
             }));
@@ -779,9 +788,8 @@ fn format_error(v: Option<&Value>) -> String {
         .unwrap_or("UnknownError");
     let msg = v
         .pointer("/data/message")
-        .or_else(|| v.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or(name);
+        .map(|value| error_text(Some(value), name))
+        .unwrap_or_else(|| error_text(Some(v), name));
     format!("{msg}\n\ntype: {name}")
 }
 fn subagent_name(title: &str) -> String {

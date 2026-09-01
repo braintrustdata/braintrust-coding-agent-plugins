@@ -15,6 +15,7 @@ mod git;
 mod opencode;
 mod pi;
 mod recent;
+mod tool;
 
 pub use antigravity::AntigravityTranslatorFactory;
 pub use claude::ClaudeTranslatorFactory;

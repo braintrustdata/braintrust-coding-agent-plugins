@@ -6,6 +6,7 @@
 //! so replay observes exactly the records that existed when each hook fired.
 
 use super::git::GitMetadataCache;
+use super::tool::{with_tool_approval, ToolApproval};
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
 use crate::ids;
 use crate::wire::Envelope;
@@ -402,10 +403,12 @@ impl AntigravityTranslator {
             end_ms: Some(event.ts_ms),
             input: details.input,
             output: details.output,
-            metadata: Some(json!({
-                "step_index": step,
-                "tool_approval": "approved"
-            })),
+            metadata: Some(with_tool_approval(
+                json!({
+                    "step_index": step,
+                }),
+                Some(ToolApproval::Approved),
+            )),
             error,
             ..Default::default()
         }));
@@ -449,7 +452,10 @@ impl AntigravityTranslator {
                 name: tool.name,
                 span_type: SpanType::Tool,
                 end_ms: Some(ts_ms),
-                metadata: Some(json!({"step_index":step,"tool_approval":"approved"})),
+                metadata: Some(with_tool_approval(
+                    json!({"step_index":step}),
+                    Some(ToolApproval::Approved),
+                )),
                 error: error.clone(),
                 ..Default::default()
             }));
