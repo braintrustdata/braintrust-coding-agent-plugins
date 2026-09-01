@@ -12,8 +12,6 @@ import { createBraintrustTools } from "./tools";
 import { BtCliToolsClient } from "./tools/bt-cli";
 import { addTracingHooks, readPluginConfig } from "./tracing/plugin";
 
-export { BraintrustTracingPlugin } from "./tracing/plugin";
-
 export const BraintrustPlugin: Plugin = async (input: PluginInput) => {
   const { client } = input;
 
