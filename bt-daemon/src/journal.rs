@@ -154,9 +154,10 @@ pub async fn legacy_journal_source(
     None
 }
 
-/// Whether this source session was already recorded by a pre-qualification
-/// daemon. Such sessions keep their old span-id namespace so replay continues
-/// merging into existing backend rows rather than creating a second trace.
+/// Whether this source owned the session actor recorded by a pre-qualification
+/// daemon. Only the first source recorded for a native session keeps the old
+/// span-id namespace: the legacy daemon had one actor and one namespace per
+/// native session even if its journal later received mixed-source events.
 pub async fn legacy_journal_has_session(
     data_dir: &Path,
     canonical_source: &str,
@@ -173,8 +174,8 @@ pub async fn legacy_journal_has_session(
             "open-code" => "opencode",
             source => source,
         };
-        if entry.session_id == session_id && recorded_source == canonical_source {
-            return true;
+        if entry.session_id == session_id {
+            return recorded_source == canonical_source;
         }
     }
     false
@@ -396,6 +397,22 @@ mod tests {
                 session_id: "legacy".into(),
                 event: "SessionStart".into(),
                 ts_ms: 1,
+                managed_run_id: None,
+                payload: serde_json::json!({}),
+                route: Some(route.clone()),
+                config: None,
+                capture: None,
+            })
+            .await
+            .unwrap();
+        writer
+            .append(&Envelope {
+                source: "claude".into(),
+                source_version: None,
+                plugin_version: None,
+                session_id: "legacy".into(),
+                event: "SessionStart".into(),
+                ts_ms: 2,
                 managed_run_id: None,
                 payload: serde_json::json!({}),
                 route: Some(route.clone()),

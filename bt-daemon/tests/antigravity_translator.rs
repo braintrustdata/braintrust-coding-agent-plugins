@@ -144,7 +144,7 @@ fn hooks_and_full_transcript_build_model_and_tool_spans() {
     let (transcript, boundary) = jsonl(&records);
     let path = "/tmp/conversation/transcript.jsonl";
     let registry = Registry::default_agents();
-    let mut translator = registry.create("antigravity", "conversation-1");
+    let mut translator = registry.create("antigravity", "antigravity\u{1f}conversation-1");
     let ctx = SessionCtx {
         session_id: "conversation-1".into(),
         config: None,
@@ -225,6 +225,14 @@ fn hooks_and_full_transcript_build_model_and_tool_spans() {
         .find(|row| row.name == "Antigravity: demo")
         .unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["source"], "antigravity");
+    assert_eq!(
+        root.metadata.as_ref().unwrap()["session_id"],
+        "conversation-1"
+    );
+    assert_eq!(
+        root.metadata.as_ref().unwrap()["conversation_id"],
+        "conversation-1"
+    );
     assert!(root.end_ms.is_some());
 
     let turn = rows
