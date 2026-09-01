@@ -21,6 +21,28 @@ export interface DaemonTraceSettings {
   route?: DaemonSessionRoute
 }
 
+const MANAGED_INSTANCE_CLAIMS = Symbol.for("braintrust.coding-agent.managed-instance-claims")
+
+/** Keep one live forwarding adapter when a managed run loads both its
+ * persistent plugin and its invocation-local plugin. Unmanaged plugin
+ * instances are deliberately unaffected. */
+export function claimManagedTracingInstance(
+  source: string,
+  env: NodeJS.ProcessEnv = process.env,
+  target: typeof globalThis = globalThis,
+): boolean {
+  const managedRunId = env.BT_TRACE_MANAGED_RUN_ID
+  if (!managedRunId) return true
+  const globals = target as typeof globalThis & {
+    [MANAGED_INSTANCE_CLAIMS]?: Set<string>
+  }
+  const claims = (globals[MANAGED_INSTANCE_CLAIMS] ??= new Set<string>())
+  const key = `${source}:${managedRunId}`
+  if (claims.has(key)) return false
+  claims.add(key)
+  return true
+}
+
 /**
  * Apply the invocation-only selection created by `bt trace run` without
  * mutating or falling back to an agent's persistent configuration.

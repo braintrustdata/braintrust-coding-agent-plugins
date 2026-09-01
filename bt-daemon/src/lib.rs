@@ -681,7 +681,7 @@ fn opencode_managed_config(existing: Option<&str>) -> anyhow::Result<String> {
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("OPENCODE_CONFIG_CONTENT.plugin must be an array"))?;
     let plugin = std::env::var("BT_TRACE_OPENCODE_PLUGIN_SPEC")
-        .unwrap_or_else(|_| "@braintrust/trace-opencode@^1".to_string());
+        .unwrap_or_else(|_| "@braintrust/trace-opencode/tracing".to_string());
     if !plugins.iter().any(|value| value.as_str() == Some(&plugin)) {
         plugins.push(serde_json::Value::String(plugin));
     }
@@ -1295,7 +1295,7 @@ mod tests {
         assert_eq!(config["model"], "test/model");
         assert_eq!(
             config["plugin"],
-            serde_json::json!(["other", "@braintrust/trace-opencode@^1"])
+            serde_json::json!(["other", "@braintrust/trace-opencode/tracing"])
         );
         assert!(
             managed_run_args(RunSource::OpenCode, &test_run_hook_command())

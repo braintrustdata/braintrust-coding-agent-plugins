@@ -4,9 +4,11 @@ const mockState = vi.hoisted(() => ({
   logs: [] as Array<Record<string, unknown>>,
   flushes: [] as string[],
   closed: 0,
+  claim: true,
 }));
 
 vi.mock("./runtime/daemon-client.ts", () => ({
+  claimManagedTracingInstance: () => mockState.claim,
   DaemonClient: class {
     async log(envelope: Record<string, unknown>): Promise<boolean> {
       mockState.logs.push(envelope);
@@ -60,6 +62,19 @@ describe("Pi daemon adapter", () => {
     mockState.logs.length = 0;
     mockState.flushes.length = 0;
     mockState.closed = 0;
+    mockState.claim = true;
+  });
+
+  it("does not register a duplicate managed adapter instance", async () => {
+    mockState.claim = false;
+    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    const pi = {
+      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
+        handlers.set(name, handler),
+    };
+    const { default: extension } = await import("./index.ts");
+    extension(pi as never);
+    expect(handlers.size).toBe(0);
   });
 
   it("forwards native events and keeps the trace-link UI", async () => {

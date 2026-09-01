@@ -32,9 +32,11 @@ node -e '
 ' "$pack_json"
 (cd "$SOURCE_DIR" && pnpm run publish:dry-run >/dev/null)
 
-for removed in client.ts tracing.ts event-processor.ts replay.ts span-queue.ts span-sink.ts; do
+for removed in client.ts event-processor.ts replay.ts span-queue.ts span-sink.ts; do
   [[ ! -e "$TARGET_DIR/src/$removed" ]] || fail "old JavaScript tracing runtime remains: src/$removed"
 done
+[[ -f "$TARGET_DIR/src/tracing.ts" ]] || fail "missing managed-run trace-only entrypoint"
+[[ -f "$TARGET_DIR/dist/tracing.mjs" ]] || fail "missing built managed-run trace-only entrypoint"
 if grep -R -n -E "fetch\(|/v1/|/btql|apikey/login|from [\"']\.\./tools" "$TARGET_DIR/src/tracing"; then
   fail "daemon tracing performs API access or imports the tools runtime"
 fi

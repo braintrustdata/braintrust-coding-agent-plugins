@@ -6,7 +6,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
-import { DaemonClient } from "./runtime/daemon-client.ts";
+import { claimManagedTracingInstance, DaemonClient } from "./runtime/daemon-client.ts";
 import { EXTENSION_VERSION } from "./version.ts";
 
 const STATUS_KEY = "braintrust-tracing";
@@ -47,6 +47,7 @@ function sessionDescriptor(ctx: ExtensionContext): {
 export default function braintrustPiExtension(pi: ExtensionAPI): void {
   const config = loadConfig(process.cwd());
   if (!config.enabled) return;
+  if (!claimManagedTracingInstance("pi")) return;
 
   let sessionId: string | undefined;
   let lastContext: ExtensionContext | undefined;
