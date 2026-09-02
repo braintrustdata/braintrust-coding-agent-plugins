@@ -377,8 +377,7 @@ impl SessionActor {
         // A failed sink write makes the contiguous delivery boundary unknown.
         // Keep the journal conservative for this actor generation rather than
         // checkpointing past an event that may need recovery delivery.
-        let mut checkpointable = true;
-        self.replay_into(&mut translator, &mut sink, &ctx).await;
+        let mut checkpointable = self.replay_into(&mut translator, &mut sink, &ctx).await;
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -549,26 +548,28 @@ impl SessionActor {
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
-    ) {
+    ) -> bool {
         let Some(plan) = &self.replay else {
-            return;
+            return true;
         };
         let mut reader = match crate::journal::JournalReader::open(&plan.journal_path, plan.through)
             .await
         {
             Ok(Some(reader)) => reader,
-            Ok(None) => return,
+            Ok(None) => return true,
             Err(error) => {
                 tracing::warn!(session_id = %self.session_id, "journal replay skipped: {error}");
-                return;
+                return false;
             }
         };
+        let mut delivered = true;
         loop {
             let entry = match reader.next_record().await {
                 Ok(Some(entry)) => entry,
                 Ok(None) => break,
                 Err(error) => {
                     tracing::warn!(session_id = %self.session_id, "journal replay stopped: {error}");
+                    delivered = false;
                     break;
                 }
             };
@@ -589,11 +590,13 @@ impl SessionActor {
                 self.replay_without_delivery(translator, ctx, translated)
                     .await;
             } else {
-                let _ = self
+                let (_, replayed) = self
                     .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Replay)
                     .await;
+                delivered &= replayed;
             }
         }
+        delivered
     }
 
     /// Continue a replayed translator exactly as usual but deliberately omit
@@ -693,7 +696,10 @@ impl SessionActor {
         through: u64,
         acknowledged_through: &mut u64,
     ) {
-        if through <= *acknowledged_through || !self.flush_sink(sink).await {
+        if !self.flush_sink(sink).await {
+            return;
+        }
+        if through <= *acknowledged_through {
             return;
         }
         if let Err(error) = self
