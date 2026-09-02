@@ -38,7 +38,6 @@ impl DeliveryLedger {
             "org_id": config.auth.org_id,
             "org_name": config.auth.org_name,
             "destination": config.destination,
-            "additional_metadata": config.additional_metadata,
         });
         let digest = Sha256::digest(serde_json::to_vec(&fingerprint)?);
         let fingerprint_id = format!("{digest:x}");
@@ -250,6 +249,8 @@ mod tests {
         first.flush().await.unwrap();
         assert_eq!(first_output.lock().unwrap().len(), 1);
 
+        let mut same_destination = config("project-a");
+        same_destination.additional_metadata = Some(serde_json::json!({"run_id": "new"}));
         let repeated_output = Arc::new(Mutex::new(Vec::new()));
         let repeated = RecordingSink {
             emitted: repeated_output.clone(),
@@ -259,7 +260,7 @@ mod tests {
             temp.path(),
             "codex",
             "session-1",
-            Some(&config("project-a")),
+            Some(&same_destination),
         )
         .await;
         assert_eq!(repeated.emit(&[terminal("span-1")]).await.unwrap(), 0);
