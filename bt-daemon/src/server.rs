@@ -326,7 +326,9 @@ impl Daemon {
         // The actor streams the journal itself, so creating a session stays
         // cheap and allocation-free here no matter how long the recorded
         // session is. Bound it to what is recorded now, before this event is
-        // appended, so replay covers recovery only.
+        // appended, so replay covers prior source observations only. Every
+        // destination consumes that shared observation stream, with its own
+        // delivery checkpoint controlling which rows reach its sink.
         let journal_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
         let translator_session_id =
@@ -347,7 +349,6 @@ impl Daemon {
             .await,
             through,
             journal_path,
-            route: route.clone(),
         };
         let journal = self
             .journal_writer_for(&env.source, &env.session_id)

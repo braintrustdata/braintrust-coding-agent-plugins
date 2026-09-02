@@ -652,7 +652,7 @@ async fn one_session_reports_to_multiple_routes_and_orgs_concurrently() {
 }
 
 #[tokio::test]
-async fn restarted_daemon_replays_each_route_only_to_its_own_destination() {
+async fn a_route_backfills_observations_captured_by_another_route_once() {
     let provider = Arc::new(TestAuthProvider {
         calls: Mutex::new(Vec::new()),
         fail: false,
@@ -685,9 +685,9 @@ async fn restarted_daemon_replays_each_route_only_to_its_own_destination() {
     shutdown(&socket).await;
     handle.await.unwrap();
 
-    // A fresh daemon generation must rebuild each route's pipeline from the
-    // shared journal without cross-delivering one route's events to the other
-    // route's destination.
+    // A fresh daemon generation can activate an existing route after another
+    // route captured an event. It must backfill the missing observation once,
+    // then record a checkpoint for the receiving destination.
     let provider = Arc::new(TestAuthProvider {
         calls: Mutex::new(Vec::new()),
         fail: false,
@@ -725,12 +725,116 @@ async fn restarted_daemon_replays_each_route_only_to_its_own_destination() {
     );
     assert_eq!(
         sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "acknowledged history rebuilds state without re-delivery; only Stop is emitted"
+        2,
+        "work receives the personal-route observation once, then its new Stop"
     );
 
     shutdown(&socket).await;
     second.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let host = dummy_host();
+
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let first_sinks = Arc::new(RouteRecordingSinkFactory::default());
+    let first = start_daemon_at_with(data_dir.clone(), socket.clone(), provider, first_sinks).await;
+    forward_envelope(
+        &routed_envelope("shared-history", "work", "work-org", "SessionStart"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session("shared-history", &socket, 5000)
+        .await
+        .unwrap();
+    shutdown(&socket).await;
+    first.await.unwrap();
+
+    // A managed run or newly configured global route can select a second
+    // destination for the same native session. It gets the complete source
+    // history even though that history was originally captured via work.
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let second_sinks = Arc::new(RouteRecordingSinkFactory::default());
+    let second = start_daemon_at_with(
+        data_dir.clone(),
+        socket.clone(),
+        provider,
+        second_sinks.clone(),
+    )
+    .await;
+    forward_envelope(
+        &routed_envelope("shared-history", "personal", "personal-org", "Stop"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session("shared-history", &socket, 5000)
+        .await
+        .unwrap();
+    let delivered = second_sinks.sinks.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        delivered[0]
+            .emitted
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "personal receives work's root and SessionStart plus its own Stop"
+    );
+    assert_eq!(
+        delivered[0].org.lock().unwrap().clone().as_deref(),
+        Some("personal-org")
+    );
+    shutdown(&socket).await;
+    second.await.unwrap();
+
+    // The same personal destination now has an independent checkpoint. Its
+    // next recovery rebuilds both historical events but emits only SessionEnd.
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let third_sinks = Arc::new(RouteRecordingSinkFactory::default());
+    let third = start_daemon_at_with(data_dir, socket.clone(), provider, third_sinks.clone()).await;
+    forward_envelope(
+        &routed_envelope("shared-history", "personal", "personal-org", "SessionEnd"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session("shared-history", &socket, 5000)
+        .await
+        .unwrap();
+    let delivered = third_sinks.sinks.lock().unwrap().clone();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        delivered[0]
+            .emitted
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "personal's acknowledged history is not re-delivered"
+    );
+    shutdown(&socket).await;
+    third.await.unwrap();
 }
 
 #[tokio::test]

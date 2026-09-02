@@ -42,7 +42,6 @@ enum SessionMsg {
 /// Where to rebuild a session's translator state from, streamed at startup.
 pub struct ReplayPlan {
     pub journal_path: PathBuf,
-    pub route: SessionRoute,
     /// Replay stops here — the journal's length when this session was
     /// created, so the event creating it is not replayed and then delivered
     /// a second time from the queue.
@@ -566,13 +565,6 @@ impl SessionActor {
             let crate::journal::JournalRecord::Event(entry) = entry.record else {
                 continue;
             };
-            if !entry
-                .route
-                .as_ref()
-                .is_some_and(|candidate| candidate.same_route(&plan.route))
-            {
-                continue;
-            }
             let mut env = crate::journal::envelope_from_redacted(entry);
             let Some(canonical_source) = self.translators.canonical_source(&env.source) else {
                 continue;
