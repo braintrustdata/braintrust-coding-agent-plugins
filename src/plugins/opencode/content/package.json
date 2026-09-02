@@ -1,6 +1,6 @@
 {
   "name": "@braintrust/trace-opencode",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Automatically trace OpenCode conversations to Braintrust. Captures user messages, assistant responses, and tool calls for observability.",
   "keywords": [
     "braintrust",
