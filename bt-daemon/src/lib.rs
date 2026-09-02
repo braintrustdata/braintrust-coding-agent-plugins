@@ -220,6 +220,8 @@ pub enum ImportSource {
     Codex,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
+    #[value(name = "antigravity", alias = "agy")]
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

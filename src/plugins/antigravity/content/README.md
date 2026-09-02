@@ -26,5 +26,8 @@ agy plugin install https://github.com/braintrustdata/braintrust-antigravity-plug
 ```
 
 The `bt trace enable` command remains the recommended entrypoint because it also
-persists the Braintrust destination. Managed-run injection, transcript
-import/attach, and Windows support are not currently provided.
+persists the Braintrust destination. Existing conversations can be replayed
+with `bt trace import antigravity <conversation-id>` or followed live with
+`--attach`; both use Antigravity's durable `transcript_full.jsonl` and the same
+daemon translator as hooks. Managed-run injection and Windows support are not
+currently provided.

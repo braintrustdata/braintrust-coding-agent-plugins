@@ -115,14 +115,14 @@ echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./target/debug/bt-
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
 
-`import <codex|claude> <session-id>` has a different purpose from restart
+`import <codex|claude|antigravity> <session-id>` has a different purpose from restart
 recovery. It locates the native transcript in the selected agent's standard
 session store, synthesizes the lifecycle triggers that can be recovered from
 that transcript, and sends them through the normal translator and sink to
 create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
 
-Add `--attach` to keep following an active Codex or Claude transcript until
+Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
 Ctrl-C. `run <codex|claude> [ARGS...]` launches the selected agent with
 inherited stdio and injects live Braintrust hooks for that invocation, so it
 does not depend on the tracing plugin being installed or enabled. Managed runs
