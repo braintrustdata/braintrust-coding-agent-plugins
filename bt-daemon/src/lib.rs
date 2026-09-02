@@ -1589,6 +1589,7 @@ mod tests {
         let spans = first_output.join("spans/ledger-import.ndjson");
         let first_terminals = imported_terminal_span_ids(&spans);
         assert!(!first_terminals.is_empty());
+        let first_operations = std::fs::read_to_string(&spans).unwrap();
 
         import_transcript_with_ledger(
             &transcript,
@@ -1601,6 +1602,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(imported_terminal_span_ids(&spans), first_terminals);
+        assert_eq!(std::fs::read_to_string(&spans).unwrap(), first_operations);
 
         let second_output = temp.path().join("second");
         import_transcript_with_ledger(

@@ -1,11 +1,11 @@
-//! Destination-scoped terminal-span delivery ledger.
+//! Destination-scoped completed-span delivery ledger.
 //!
 //! Hook journals prevent a daemon recovery from re-emitting already flushed
 //! observations. Imports are a second ingress, though: they synthesize the
 //! same source session without using that journal. This ledger records which
-//! terminal span rows a destination has already accepted, so every ingress can
-//! avoid re-reporting a completed span while a new destination still receives
-//! the full trace.
+//! completed span rows a destination has already accepted, so every ingress can
+//! avoid re-reporting any later partial merge for a completed span while a new
+//! destination still receives the full trace.
 
 use crate::sink::Sink;
 use crate::translate::SpanOp;
@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct LedgerFile {
-    #[serde(default)]
-    terminal_span_ids: HashSet<String>,
+    #[serde(default, alias = "terminal_span_ids")]
+    completed_span_ids: HashSet<String>,
 }
 
 struct DeliveryLedger {
@@ -47,7 +47,7 @@ impl DeliveryLedger {
             &fingerprint_id[..32]
         ));
         let known = match tokio::fs::read(&path).await {
-            Ok(bytes) => serde_json::from_slice::<LedgerFile>(&bytes)?.terminal_span_ids,
+            Ok(bytes) => serde_json::from_slice::<LedgerFile>(&bytes)?.completed_span_ids,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
             Err(error) => return Err(error.into()),
         };
@@ -64,8 +64,7 @@ impl DeliveryLedger {
                 let row = match op {
                     SpanOp::Insert(row) | SpanOp::Merge(row) => row,
                 };
-                row.end_ms.is_none()
-                    || (!self.known.contains(&row.span_id) && !self.pending.contains(&row.span_id))
+                !self.known.contains(&row.span_id) && !self.pending.contains(&row.span_id)
             })
             .cloned()
             .collect()
@@ -95,7 +94,7 @@ impl DeliveryLedger {
         tokio::fs::write(
             &temp,
             serde_json::to_vec(&LedgerFile {
-                terminal_span_ids: self.known.clone(),
+                completed_span_ids: self.known.clone(),
             })?,
         )
         .await?;
@@ -230,6 +229,14 @@ mod tests {
         })
     }
 
+    fn partial_merge(span_id: &str) -> SpanOp {
+        SpanOp::Merge(SpanRow {
+            span_id: span_id.into(),
+            root_span_id: "root".into(),
+            ..Default::default()
+        })
+    }
+
     #[tokio::test]
     async fn a_destination_receives_a_terminal_span_only_once_across_sink_instances() {
         let temp = tempfile::tempdir().unwrap();
@@ -264,6 +271,7 @@ mod tests {
         )
         .await;
         assert_eq!(repeated.emit(&[terminal("span-1")]).await.unwrap(), 0);
+        assert_eq!(repeated.emit(&[partial_merge("span-1")]).await.unwrap(), 0);
         repeated.flush().await.unwrap();
         assert!(repeated_output.lock().unwrap().is_empty());
     }
