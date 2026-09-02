@@ -439,6 +439,11 @@ fn setup_antigravity_at(runner: &mut impl CommandRunner, config_dir: &Path) -> a
         &["plugin", "install", ANTIGRAVITY_PLUGIN_SOURCE],
         antigravity_home(config_dir)?,
     )?;
+    runner.run_in_home(
+        "agy",
+        &["plugin", "enable", ANTIGRAVITY_PLUGIN],
+        antigravity_home(config_dir)?,
+    )?;
 
     remove_legacy_antigravity_registration(config_dir)
 }
@@ -852,6 +857,7 @@ mod tests {
         setup_antigravity_at(&mut runner, &config_dir).unwrap();
 
         assert!(runner.called(&format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}")));
+        assert!(runner.called(&format!("agy plugin enable {ANTIGRAVITY_PLUGIN}")));
         let hooks: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
         assert_eq!(hooks["other-plugin"]["Stop"][0]["command"], "other");
         assert!(hooks.get(ANTIGRAVITY_PLUGIN).is_none());
@@ -903,6 +909,7 @@ mod tests {
 
         assert!(!config_dir.join("hooks.json").exists());
         assert!(runner.called(&format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}")));
+        assert!(runner.called(&format!("agy plugin enable {ANTIGRAVITY_PLUGIN}")));
     }
 
     #[test]
