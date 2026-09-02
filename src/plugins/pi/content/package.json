@@ -1,6 +1,6 @@
 {
   "name": "@braintrust/pi-extension",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Braintrust extension for pi. Includes automatic tracing for pi sessions, turns, LLM calls, and tool executions to Braintrust.",
   "keywords": [
     "braintrust",
