@@ -725,8 +725,8 @@ async fn restarted_daemon_replays_each_route_only_to_its_own_destination() {
     );
     assert_eq!(
         sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed),
-        3,
-        "replayed SessionStart (root + span) plus the new Stop span"
+        1,
+        "acknowledged history rebuilds state without re-delivery; only Stop is emitted"
     );
 
     shutdown(&socket).await;
@@ -784,14 +784,15 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
     assert_eq!(flushed.pending, 0);
 
-    // Journal: three events, in order, with only the non-secret route.
+    // Journal: three events plus a durable delivery checkpoint, with only the
+    // non-secret route. Checkpoints are control records, not agent events.
     let journal = source_journal_path(&data_dir, "debug", "sess-1");
     let jtext = std::fs::read_to_string(&journal).unwrap();
     let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         jlines.len(),
-        3,
-        "expected 3 journal lines, got {}",
+        4,
+        "expected 3 event lines plus one checkpoint, got {}",
         jlines.len()
     );
     assert!(
@@ -802,6 +803,7 @@ async fn events_are_ordered_journaled_and_emitted() {
 
     let events: Vec<String> = jlines
         .iter()
+        .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
         .map(|l| {
             serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
                 .as_str()
@@ -913,14 +915,14 @@ async fn identical_native_ids_from_different_sources_are_isolated() {
             .unwrap()
             .lines()
             .count(),
-        1
+        2
     );
     assert_eq!(
         std::fs::read_to_string(claude_journal)
             .unwrap()
             .lines()
             .count(),
-        1
+        2
     );
 
     let rows = std::fs::read_to_string(data_dir.join("spans/shared-native-id.ndjson")).unwrap();
@@ -956,8 +958,8 @@ async fn distinct_sessions_are_isolated() {
 
     let a = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "a")).unwrap();
     let b = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "b")).unwrap();
-    assert_eq!(a.lines().filter(|l| !l.trim().is_empty()).count(), 2);
-    assert_eq!(b.lines().filter(|l| !l.trim().is_empty()).count(), 1);
+    assert_eq!(a.lines().filter(|l| !l.trim().is_empty()).count(), 3);
+    assert_eq!(b.lines().filter(|l| !l.trim().is_empty()).count(), 2);
 
     handle.abort();
 }
@@ -1094,8 +1096,8 @@ async fn spawn_on_demand_runs_the_real_standalone_daemon() {
 }
 
 #[tokio::test]
-async fn restart_replays_journal_with_stable_span_ids_before_new_events() {
-    let (data_dir, socket, first, _tmp) = start_daemon().await;
+async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
+    let (data_dir, socket, first, tmp) = start_daemon().await;
     let host = dummy_host();
     forward_envelope(
         &envelope("resume", "SessionStart", 1),
@@ -1109,24 +1111,35 @@ async fn restart_replays_journal_with_stable_span_ids_before_new_events() {
     shutdown(&socket).await;
     first.await.unwrap();
 
-    let second = start_daemon_at(data_dir.clone(), socket.clone()).await;
+    // A cold worker receives only the saved journal, not the first worker's
+    // daemon state. Its delivery checkpoint must travel with that journal.
+    let recovered_data_dir = tmp.path().join("recovered-data");
+    let source = source_journal_path(&data_dir, "debug", "resume");
+    let recovered_journal = source_journal_path(&recovered_data_dir, "debug", "resume");
+    std::fs::create_dir_all(recovered_journal.parent().unwrap()).unwrap();
+    std::fs::copy(source, &recovered_journal).unwrap();
+
+    let second = start_daemon_at(recovered_data_dir.clone(), socket.clone()).await;
     forward_envelope(&envelope("resume", "Stop", 2), &socket, &host, false)
         .await
         .unwrap();
     flush_session("resume", &socket, 5000).await.unwrap();
 
-    let journal =
-        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "resume")).unwrap();
-    assert_eq!(journal.lines().count(), 2);
-    let spans = std::fs::read_to_string(data_dir.join("spans/resume.ndjson")).unwrap();
+    let journal = std::fs::read_to_string(recovered_journal).unwrap();
+    assert_eq!(
+        journal.lines().count(),
+        4,
+        "two events plus two delivery checkpoints"
+    );
+    let spans = std::fs::read_to_string(recovered_data_dir.join("spans/resume.ndjson")).unwrap();
     let rows: Vec<serde_json::Value> = spans
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(
         rows.len(),
-        5,
-        "first delivery (2) + recovery replay (2) + resumed event (1)"
+        1,
+        "only the new event is delivered; acknowledged history only rebuilds state"
     );
     let span_id = |row: &serde_json::Value| {
         row.get("Insert")
@@ -1136,18 +1149,7 @@ async fn restart_replays_journal_with_stable_span_ids_before_new_events() {
             .unwrap()
             .to_owned()
     };
-    assert_eq!(span_id(&rows[2]), span_id(&rows[0]));
-    assert_eq!(span_id(&rows[3]), span_id(&rows[1]));
-    assert_ne!(span_id(&rows[4]), span_id(&rows[1]));
-    let unique_ids = rows
-        .iter()
-        .map(span_id)
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-        unique_ids.len(),
-        3,
-        "recovery must reuse both historical ids; only the new event gets a new id"
-    );
+    assert!(!span_id(&rows[0]).is_empty());
 
     shutdown(&socket).await;
     second.await.unwrap();
@@ -1345,7 +1347,7 @@ async fn idle_sessions_are_retired_and_can_resume_from_their_journal() {
     assert!(retired, "an idle session was never retired");
 
     // Retirement is not data loss: a later event rebuilds the session from its
-    // journal, and deterministic span ids merge the re-emitted rows.
+    // journal, but acknowledged history is not delivered a second time.
     forward_envelope(&envelope("nap", "Stop", 2), &socket, &host, false)
         .await
         .unwrap();
@@ -1365,13 +1367,13 @@ async fn idle_sessions_are_retired_and_can_resume_from_their_journal() {
         .collect();
     assert_eq!(
         ids.len(),
-        5,
-        "first delivery (2) + replay after retirement (2) + resumed event (1)"
+        3,
+        "first delivery (2) + resumed event (1), without replay redelivery"
     );
     assert_eq!(
         ids.iter().collect::<HashSet<_>>().len(),
         3,
-        "replay after retirement must reuse the original span ids, not mint new ones"
+        "the resumed event adds one new span without duplicating acknowledged history"
     );
     handle.abort();
 }

@@ -210,6 +210,7 @@ pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) 
 /// Append-only journal writer for one session.
 pub struct JournalWriter {
     file: tokio::fs::File,
+    position: u64,
 }
 
 impl JournalWriter {
@@ -222,7 +223,8 @@ impl JournalWriter {
             .append(true)
             .open(path)
             .await?;
-        Ok(Self { file })
+        let position = file.metadata().await?.len();
+        Ok(Self { file, position })
     }
 
     /// Append one event in redacted form and flush to the OS. Not fsync'd per
@@ -234,13 +236,55 @@ impl JournalWriter {
     /// bounded instead by writing each transcript byte once (see
     /// [`crate::transcript_mirror`]) and by age-based GC, and replay reads it
     /// as a stream so a large journal never becomes a large allocation.
-    pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<()> {
+    pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<u64> {
         let mut line = serde_json::to_vec(&env.redacted())?;
         line.push(b'\n');
         self.file.write_all(&line).await?;
         self.file.flush().await?;
+        self.position += line.len() as u64;
+        Ok(self.position)
+    }
+
+    /// Record that the sink durably accepted every event through this byte
+    /// offset for one route. It lives in the event journal so a cold worker
+    /// restores delivery knowledge together with translator state.
+    pub async fn append_delivery_checkpoint(
+        &mut self,
+        route: &SessionRoute,
+        through: u64,
+    ) -> anyhow::Result<()> {
+        let mut line = serde_json::to_vec(&DeliveryCheckpointRecord {
+            record_type: "delivery_checkpoint".into(),
+            route: route.clone(),
+            through,
+        })?;
+        line.push(b'\n');
+        self.file.write_all(&line).await?;
+        self.file.flush().await?;
+        self.position += line.len() as u64;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeliveryCheckpointRecord {
+    #[serde(rename = "_bt_record_type")]
+    record_type: String,
+    route: SessionRoute,
+    through: u64,
+}
+
+#[derive(Debug)]
+pub enum JournalRecord {
+    Event(RedactedEnvelope),
+    DeliveryCheckpoint { route: SessionRoute, through: u64 },
+}
+
+#[derive(Debug)]
+pub struct JournalRecordEntry {
+    pub record: JournalRecord,
+    /// Exclusive byte offset after this record in the journal.
+    pub through: u64,
 }
 
 /// Streaming reader over one session's journal.
@@ -248,9 +292,10 @@ impl JournalWriter {
 /// Replay must never materialize a whole journal: the file is read line by
 /// line so peak memory is one entry, not the entire recorded session.
 pub struct JournalReader {
-    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::Take<tokio::fs::File>>>,
+    reader: tokio::io::BufReader<tokio::io::Take<tokio::fs::File>>,
     path: PathBuf,
     line_no: usize,
+    position: u64,
 }
 
 impl JournalReader {
@@ -268,9 +313,10 @@ impl JournalReader {
             Err(error) => return Err(error.into()),
         };
         Ok(Some(Self {
-            lines: tokio::io::BufReader::new(file.take(through)).lines(),
+            reader: tokio::io::BufReader::new(file.take(through)),
             path: path.to_path_buf(),
             line_no: 0,
+            position: 0,
         }))
     }
 
@@ -285,17 +331,81 @@ impl JournalReader {
 
     /// The next entry, or `None` at end of file.
     pub async fn next_entry(&mut self) -> anyhow::Result<Option<RedactedEnvelope>> {
-        while let Some(line) = self.lines.next_line().await? {
-            self.line_no += 1;
-            if line.trim().is_empty() {
-                continue;
+        while let Some(entry) = self.next_record().await? {
+            if let JournalRecord::Event(env) = entry.record {
+                return Ok(Some(env));
             }
-            let env: RedactedEnvelope = serde_json::from_str(&line).map_err(|error| {
-                anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-            })?;
-            return Ok(Some(env));
         }
         Ok(None)
+    }
+
+    /// The next journal record, including delivery checkpoints written by a
+    /// previous daemon generation.
+    pub async fn next_record(&mut self) -> anyhow::Result<Option<JournalRecordEntry>> {
+        loop {
+            let mut bytes = Vec::new();
+            let read = self.reader.read_until(b'\n', &mut bytes).await?;
+            if read == 0 {
+                return Ok(None);
+            }
+            self.position += read as u64;
+            self.line_no += 1;
+            let line = std::str::from_utf8(&bytes)
+                .map_err(|error| {
+                    anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
+                })?
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+                anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
+            })?;
+            let record = if value
+                .get("_bt_record_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("delivery_checkpoint")
+            {
+                let checkpoint: DeliveryCheckpointRecord =
+                    serde_json::from_value(value).map_err(|error| {
+                        anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
+                    })?;
+                JournalRecord::DeliveryCheckpoint {
+                    route: checkpoint.route,
+                    through: checkpoint.through,
+                }
+            } else {
+                JournalRecord::Event(serde_json::from_value(value).map_err(|error| {
+                    anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
+                })?)
+            };
+            return Ok(Some(JournalRecordEntry {
+                record,
+                through: self.position,
+            }));
+        }
+    }
+
+    /// The latest acknowledged event offset for `route` in the portion of the
+    /// journal being recovered. Older journals contain no checkpoints and
+    /// therefore retain their existing replay behavior.
+    pub async fn acknowledged_through(path: &Path, through: u64, route: &SessionRoute) -> u64 {
+        let Ok(Some(mut reader)) = Self::open(path, through).await else {
+            return 0;
+        };
+        let mut acknowledged = 0;
+        while let Ok(Some(entry)) = reader.next_record().await {
+            if let JournalRecord::DeliveryCheckpoint {
+                route: candidate,
+                through,
+            } = entry.record
+            {
+                if candidate.same_route(route) {
+                    acknowledged = acknowledged.max(through);
+                }
+            }
+        }
+        acknowledged
     }
 }
 
