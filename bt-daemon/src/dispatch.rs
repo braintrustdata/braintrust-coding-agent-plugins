@@ -9,6 +9,7 @@
 //! marker is guaranteed visible. A downstream error never fails the caller's
 //! turn.
 
+use crate::delivery_ledger::LedgerSink;
 use crate::journal::JournalWriter;
 use crate::sink::SinkFactory;
 use crate::translate::{Registry, SessionCtx};
@@ -315,7 +316,7 @@ impl SessionActor {
                 return;
             }
         };
-        let mut sink = match self.sink_factory.create(
+        let sink = match self.sink_factory.create(
             &self.session_id,
             &self.source,
             self.plugin_version.as_deref(),
@@ -349,6 +350,16 @@ impl SessionActor {
                 return;
             }
         };
+        let mut sink: Box<dyn crate::sink::Sink> = Box::new(
+            LedgerSink::new(
+                sink,
+                &self.data_dir,
+                &self.source,
+                &self.session_id,
+                Some(&self.config),
+            )
+            .await,
+        );
         let mut ctx = SessionCtx {
             session_id: self.session_id.clone(),
             config: Some(self.config.clone()),
