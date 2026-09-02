@@ -2,7 +2,7 @@ use super::{envelope, validate_session_id};
 use crate::wire::Envelope;
 use anyhow::bail;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 const TRANSCRIPT_NAME: &str = "transcript_full.jsonl";
@@ -98,7 +98,18 @@ pub(super) fn envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<En
         json!({"conversationId": session_id, "invocationNum": 0, "initialNumSteps": 0,
             "transcriptPath": transcript_path}),
     )];
-    for record in records.iter().filter(|record| is_tool_result(record)) {
+    let mut planned_calls = VecDeque::new();
+    for record in records {
+        if let Some(calls) = record
+            .get("tool_calls")
+            .or_else(|| record.get("toolCalls"))
+            .and_then(Value::as_array)
+        {
+            planned_calls.extend(calls.iter().cloned());
+        }
+        if !is_tool_result(record) {
+            continue;
+        }
         let Some(step) = record
             .get("step_index")
             .or_else(|| record.get("stepIndex"))
@@ -106,9 +117,24 @@ pub(super) fn envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<En
         else {
             continue;
         };
+        let mut payload = json!({
+            "conversationId": session_id,
+            "stepIdx": step,
+            "transcriptPath": transcript_path,
+        });
+        if let Some(call) = planned_calls.pop_front() {
+            payload["toolCall"] = call;
+        }
+        if is_denied(record) {
+            payload["toolApproval"] = json!("denied");
+        }
         events.push(envelope(
-            "antigravity", None, &session_id, "PostToolUse", created_at_ms(record).unwrap_or(end_ms),
-            json!({"conversationId": session_id, "stepIdx": step, "transcriptPath": transcript_path}),
+            "antigravity",
+            None,
+            &session_id,
+            "PostToolUse",
+            created_at_ms(record).unwrap_or(end_ms),
+            payload,
         ));
     }
     events.push(envelope(
@@ -126,6 +152,13 @@ pub(super) fn envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<En
             "transcriptPath": transcript_path}),
     ));
     Ok(events)
+}
+
+fn is_denied(record: &Value) -> bool {
+    record
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| content.to_ascii_lowercase().contains("denied"))
 }
 
 fn is_tool_result(record: &Value) -> bool {

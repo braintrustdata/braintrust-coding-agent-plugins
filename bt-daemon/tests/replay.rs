@@ -59,7 +59,9 @@ async fn importing_antigravity_transcript_uses_the_production_translator() {
         &transcript,
         &[
             json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-01-01T00:00:01Z","content":"<USER_REQUEST>\ntrace this\n</USER_REQUEST>"}),
-            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-01T00:00:02Z","content":"done"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-01T00:00:02Z","tool_calls":[{"name":"list_dir","args":{"DirectoryPath":"/tmp"}}]}),
+            json!({"step_index":2,"source":"MODEL","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-01-01T00:00:03Z","content":"tool call denied"}),
+            json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-01T00:00:04Z","content":"done"}),
         ],
     );
     let output = tmp.path().join("spans");
@@ -78,6 +80,14 @@ async fn importing_antigravity_transcript_uses_the_production_translator() {
     assert!(output_rows
         .iter()
         .any(|row| { row.pointer("/Insert/input").and_then(Value::as_str) == Some("trace this") }));
+    assert!(output_rows
+        .iter()
+        .any(|row| { row.pointer("/Insert/name").and_then(Value::as_str) == Some("list_dir") }));
+    assert!(output_rows.iter().any(|row| {
+        row.pointer("/Merge/metadata/tool_approval")
+            .and_then(Value::as_str)
+            == Some("denied")
+    }));
 }
 
 fn options(output: &std::path::Path) -> ServeOptions {
