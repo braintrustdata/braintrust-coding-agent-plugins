@@ -103,6 +103,7 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
             .join("opencode")
             .join("braintrust.json"),
         "pi" => home().join(".pi").join("agent").join("braintrust.json"),
+        "grok" => home().join(".grok").join("braintrust.json"),
         "antigravity" => home()
             .join(".gemini")
             .join("config")
