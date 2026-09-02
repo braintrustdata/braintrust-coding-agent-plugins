@@ -1,0 +1,2 @@
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"partial"}},"_meta":{"modelId":"grok-edge","promptIndex":0,"agentTimestampMs":1000}}}
+{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"wait"}},"_meta":{"promptId":"partial-prompt"

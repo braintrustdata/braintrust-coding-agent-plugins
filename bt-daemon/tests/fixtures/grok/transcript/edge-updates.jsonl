@@ -1,0 +1,12 @@
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"first"}},"_meta":{"modelId":"grok-edge","promptIndex":0,"agentTimestampMs":1000}}}
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"first"}},"_meta":{"modelId":"grok-edge","promptIndex":0,"agentTimestampMs":1000}}}
+{"params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"thinking"}},"_meta":{"promptId":"prompt-a","agentTimestampMs":1010,"chunkId":1}}}
+{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"answer-a"}},"_meta":{"promptId":"prompt-a","agentTimestampMs":1020,"chunkId":2}}}
+{malformed complete record}
+{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"answer-b"}},"_meta":{"promptId":"prompt-b","agentTimestampMs":1040,"chunkId":3}}}
+{"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-b","stop_reason":"end_turn","usage":{"inputTokens":30,"outputTokens":6,"totalTokens":36,"modelCalls":3}},"_meta":{"agentTimestampMs":1050}}}
+{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"second"}},"_meta":{"modelId":"grok-edge","promptIndex":1,"agentTimestampMs":2000}}}
+{"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"second answer"}},"_meta":{"promptId":"prompt-c","streamStartMs":2100,"agentTimestampMs":2110,"chunkId":4}}}
+{"params":{"update":{"sessionUpdate":"tool_call","toolCallId":"cancelled-call","title":"shell","rawInput":{"command":"sleep 1"}},"_meta":{"agentTimestampMs":2200}}}
+{"params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"cancelled-call","status":"cancelled","rawOutput":"interrupted"},"_meta":{"agentTimestampMs":2210}}}
+{"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-c","stop_reason":"cancelled","usage":{"inputTokens":10,"outputTokens":2,"totalTokens":12,"modelCalls":1}},"_meta":{"agentTimestampMs":2300}}}

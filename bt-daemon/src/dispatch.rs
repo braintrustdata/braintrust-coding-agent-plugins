@@ -214,12 +214,15 @@ impl Session {
 }
 
 /// Agent transcript files are external mutable state. Mirror them into
-/// daemon-owned storage at lifecycle boundaries and journal only a reference,
-/// so recovery/replay does not depend on a path that Claude may later rewrite
-/// or delete — and so the transcript is stored once rather than re-copied into
-/// every event. Fail open: without a reference the translator reads the live
-/// path exactly as before.
+/// daemon-owned storage at lifecycle boundaries and journal only bounded
+/// references, so recovery sees exactly the bytes that live translation
+/// observed instead of depending on mutable external paths or copying a full
+/// transcript into every event. Capture failures remain fail-open.
 pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env: &mut Envelope) {
+    if env.source == "grok" {
+        hydrate_grok_transcript_references(data_dir, env).await;
+        return;
+    }
     let should_capture = match env.source.as_str() {
         "codex" => true,
         "claude-code" => matches!(
@@ -262,6 +265,57 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
                 "through": through,
             }),
         );
+    }
+}
+
+async fn hydrate_grok_transcript_references(data_dir: &std::path::Path, env: &mut Envelope) {
+    let Some(transcript) = env
+        .payload
+        .get("transcriptPath")
+        .or_else(|| env.payload.get("transcript_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let Some(session_dir) = transcript.parent() else {
+        return;
+    };
+
+    let mut mirrors = serde_json::Map::new();
+    for (name, key) in [
+        ("updates.jsonl", "updates"),
+        ("events.jsonl", "events"),
+        ("system_prompt.txt", "system_prompt"),
+    ] {
+        let source = session_dir.join(name);
+        let Some(source_str) = source.to_str() else {
+            continue;
+        };
+        let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
+        match crate::transcript_mirror::capture(data_dir, &mirror_session, source_str).await {
+            Ok((mirror, through)) => {
+                mirrors.insert(
+                    key.to_string(),
+                    serde_json::json!({
+                        "path": source,
+                        "mirror": mirror,
+                        "through": through,
+                    }),
+                );
+            }
+            Err(error) => {
+                tracing::debug!(session_id = %env.session_id, %error, file = name, "Grok transcript mirror skipped");
+            }
+        }
+    }
+    if !mirrors.is_empty() {
+        if let Some(payload) = env.payload.as_object_mut() {
+            payload.insert(
+                "_bt_grok_transcript_mirrors".to_string(),
+                serde_json::Value::Object(mirrors),
+            );
+        }
     }
 }
 
@@ -752,4 +806,52 @@ pub(crate) fn is_tool_lifecycle_event(event: &str) -> bool {
             | "tool.execute.before"
             | "tool.execute.after"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn grok_hydration_mirrors_transcripts_and_system_prompt_at_one_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join("native-session");
+        tokio::fs::create_dir(&session).await.unwrap();
+        tokio::fs::write(session.join("chat_history.jsonl"), b"")
+            .await
+            .unwrap();
+        tokio::fs::write(session.join("updates.jsonl"), b"{\"update\":1}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(session.join("events.jsonl"), b"{\"event\":1}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(session.join("system_prompt.txt"), b"You are Grok.")
+            .await
+            .unwrap();
+        let mut env = Envelope {
+            source: "grok".into(),
+            source_version: None,
+            plugin_version: None,
+            session_id: "session-1".into(),
+            event: "stop".into(),
+            ts_ms: 1,
+            managed_run_id: None,
+            capture: None,
+            payload: serde_json::json!({
+                "transcriptPath": session.join("chat_history.jsonl")
+            }),
+            route: None,
+            config: None,
+        };
+
+        hydrate_transcript_reference(tmp.path(), &mut env).await;
+
+        let mirrors = &env.payload["_bt_grok_transcript_mirrors"];
+        for name in ["updates", "events", "system_prompt"] {
+            let path = mirrors[name]["mirror"].as_str().unwrap();
+            assert!(std::path::Path::new(path).is_file());
+            assert!(mirrors[name]["through"].as_u64().unwrap() > 0);
+        }
+    }
 }

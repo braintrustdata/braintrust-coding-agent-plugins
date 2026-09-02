@@ -6,10 +6,12 @@ use async_trait::async_trait;
 use bt_daemon::wire::{
     AuthSelection, AuthSource, BackendAuth, Envelope, SessionConfig, SessionRoute,
 };
+#[cfg(all(feature = "cli", unix))]
+use bt_daemon::DebugSinkFactory;
 use bt_daemon::{
     debug_serve_options, flush_managed_run, flush_session, forward_envelope, run_serve, run_status,
     shutdown_daemon, source_journal_path, AuthLease, AuthProvider, AuthResolveReason, HostInfo,
-    Registry, ServeArgs, ServeOptions, Sink, SinkFactory, SpanOp, StatusArgs,
+    Registry, ServeArgs, ServeOptions, Sink, SinkFactory, SpanOp, SpanType, StatusArgs,
 };
 #[cfg(all(feature = "cli", unix))]
 use bt_daemon::{run_traced, RunArgs, RunHookCommand, RunSource};
@@ -1990,4 +1992,759 @@ esac
 
     shutdown(&socket).await;
     handle.await.unwrap();
+}
+
+#[cfg(all(feature = "cli", unix))]
+type CreatedDebugSinks = Arc<Mutex<Vec<(String, String, Option<String>)>>>;
+
+#[cfg(all(feature = "cli", unix))]
+struct FlushTrackingDebugSinkFactory {
+    inner: DebugSinkFactory,
+    flushes: Arc<Mutex<HashMap<String, usize>>>,
+    created: CreatedDebugSinks,
+}
+
+#[cfg(all(feature = "cli", unix))]
+impl SinkFactory for FlushTrackingDebugSinkFactory {
+    fn create(
+        &self,
+        session_id: &str,
+        source: &str,
+        plugin_version: Option<&str>,
+    ) -> anyhow::Result<Box<dyn Sink>> {
+        self.created.lock().unwrap().push((
+            session_id.to_string(),
+            source.to_string(),
+            plugin_version.map(str::to_string),
+        ));
+        Ok(Box::new(FlushTrackingDebugSink {
+            inner: self.inner.create(session_id, source, plugin_version)?,
+            session_id: session_id.to_string(),
+            flushes: self.flushes.clone(),
+        }))
+    }
+}
+
+#[cfg(all(feature = "cli", unix))]
+struct FlushTrackingDebugSink {
+    inner: Box<dyn Sink>,
+    session_id: String,
+    flushes: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[async_trait]
+impl Sink for FlushTrackingDebugSink {
+    fn configure(&mut self, config: &SessionConfig) {
+        self.inner.configure(config);
+    }
+
+    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        self.inner.emit(ops).await
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.inner.flush().await?;
+        *self
+            .flushes
+            .lock()
+            .unwrap()
+            .entry(self.session_id.clone())
+            .or_default() += 1;
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "cli", unix))]
+async fn start_grok_debug_daemon_at(
+    data_dir: PathBuf,
+    socket: PathBuf,
+    flushes: Arc<Mutex<HashMap<String, usize>>>,
+    created: CreatedDebugSinks,
+) -> tokio::task::JoinHandle<()> {
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let opts = ServeOptions {
+        version: env!("CARGO_PKG_VERSION").into(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory: Arc::new(FlushTrackingDebugSinkFactory {
+            inner: DebugSinkFactory {
+                dir: data_dir.join("spans"),
+            },
+            flushes,
+            created,
+        }),
+        auth_provider: Some(Arc::new(TestAuthProvider {
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+            first_lease_expired: false,
+        })),
+    };
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    handle
+}
+
+#[cfg(all(feature = "cli", unix))]
+fn grok_package_path(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../src/plugins/grok/content")
+        .join(relative)
+}
+
+#[cfg(all(feature = "cli", unix))]
+fn grok_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/grok/transcript")
+        .join(name)
+}
+
+#[cfg(all(feature = "cli", unix))]
+fn prefix_through_lines(bytes: &[u8], line_count: usize) -> usize {
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'\n')
+        .nth(line_count - 1)
+        .map(|(index, _)| index + 1)
+        .expect("fixture must contain the requested line boundary")
+}
+
+#[cfg(all(feature = "cli", unix))]
+async fn assert_packaged_grok_hook_mapping(
+    temp: &Path,
+    plugin_version: &str,
+    payload: &serde_json::Value,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncWriteExt;
+
+    let fake_bt = temp.join("record-bt.sh");
+    let args_file = temp.join("packaged-args.txt");
+    let stdin_file = temp.join("packaged-stdin.json");
+    std::fs::write(
+        &fake_bt,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BT_ARGS_FILE\"\ncat > \"$BT_STDIN_FILE\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_bt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut child = tokio::process::Command::new("bash")
+        .arg(grok_package_path("hooks/forward.sh"))
+        .env("BT_BIN", &fake_bt)
+        .env("BT_ARGS_FILE", &args_file)
+        .env("BT_STDIN_FILE", &stdin_file)
+        .env("GROK_VERSION", "1.0.13")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let encoded = serde_json::to_vec(payload).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&encoded)
+        .await
+        .unwrap();
+    let output = child.wait_with_output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "packaged Grok hook failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let args: Vec<_> = std::fs::read_to_string(args_file)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "trace",
+            "hook",
+            "--source",
+            "grok",
+            "--plugin-version",
+            plugin_version,
+            "--session-id-field",
+            "sessionId",
+            "--event-field",
+            "hookEventName",
+            "--transcript-path-field",
+            "transcriptPath",
+            "--source-version",
+            "1.0.13",
+        ]
+    );
+    let forwarded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(stdin_file).unwrap()).unwrap();
+    assert_eq!(
+        &forwarded, payload,
+        "the adapter must forward stdin unchanged"
+    );
+}
+
+#[cfg(all(feature = "cli", unix))]
+async fn invoke_grok_hook(
+    socket: &Path,
+    plugin_version: &str,
+    route_marker: &str,
+    project: &str,
+    payload: &serde_json::Value,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let invocation_settings = serde_json::json!({
+        "trace_to_braintrust": true,
+        "route": {
+            "auth": {"source": "environment"},
+            "destination": {"type": "project_logs", "project_name": project},
+            "additional_metadata": {"route_marker": route_marker}
+        }
+    });
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_bt-daemon"))
+        .args([
+            "hook",
+            "--source",
+            "grok",
+            "--source-version",
+            "1.0.13",
+            "--plugin-version",
+            plugin_version,
+            "--session-id-field",
+            "sessionId",
+            "--event-field",
+            "hookEventName",
+            "--transcript-path-field",
+            "transcriptPath",
+            "--no-spawn",
+        ])
+        .env("BT_DAEMON_SOCKET", socket)
+        .env(
+            "BT_TRACE_INVOCATION_SETTINGS",
+            invocation_settings.to_string(),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(payload).unwrap())
+        .await
+        .unwrap();
+    let output = child.wait_with_output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "Grok hook failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(all(feature = "cli", unix))]
+async fn wait_for_grok_translation(socket: &Path, session_id: &str) {
+    let mut last_sessions = Vec::new();
+    for _ in 0..200 {
+        let status = run_status(StatusArgs {
+            socket: Some(socket.to_path_buf()),
+            session_id: Some(session_id.to_string()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        if status
+            .sessions
+            .iter()
+            .any(|session| session.queued == 0 && session.spans_emitted > 0)
+        {
+            return;
+        }
+        last_sessions = status.sessions;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("Grok session {session_id} was not translated: {last_sessions:?}");
+}
+
+#[cfg(all(feature = "cli", unix))]
+async fn wait_for_grok_flushes(
+    flushes: &Arc<Mutex<HashMap<String, usize>>>,
+    session_id: &str,
+    expected: usize,
+) -> usize {
+    for _ in 0..200 {
+        let observed = match flushes.lock() {
+            Ok(flushes) => flushes.get(session_id).copied().unwrap_or_default(),
+            Err(error) => panic!("Grok flush counter lock poisoned: {error}"),
+        };
+        if observed >= expected {
+            return observed;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("Grok session {session_id} did not reach {expected} flushes");
+}
+
+#[cfg(all(feature = "cli", unix))]
+async fn wait_for_grok_enrichment(path: &Path) {
+    for _ in 0..200 {
+        if std::fs::read_to_string(path).is_ok_and(|contents| {
+            contents.contains("\"duration_ms\":100") && contents.contains("\"outcome\":\"success\"")
+        }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("Grok tool enrichment was not written to {}", path.display());
+}
+
+#[cfg(all(feature = "cli", unix))]
+fn read_span_ops(path: &Path) -> Vec<SpanOp> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[tokio::test]
+async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    let socket = test_endpoint(temp.path());
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(grok_package_path(".grok-plugin/plugin.json")).unwrap(),
+    )
+    .unwrap();
+    let plugin_version = manifest["version"].as_str().unwrap();
+
+    let updates = std::fs::read(grok_fixture("updates.jsonl")).unwrap();
+    let events = std::fs::read(grok_fixture("events.jsonl")).unwrap();
+    let first_updates_through = prefix_through_lines(&updates, 5);
+    let system_prompt = "You are Grok, a test coding assistant.\n";
+
+    let primary_dir = temp.path().join("native-primary");
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let primary_chat = primary_dir.join("chat_history.jsonl");
+    let primary_updates = primary_dir.join("updates.jsonl");
+    let primary_events = primary_dir.join("events.jsonl");
+    let primary_system_prompt = primary_dir.join("system_prompt.txt");
+    std::fs::write(&primary_chat, "").unwrap();
+    std::fs::write(&primary_updates, &updates[..first_updates_through]).unwrap();
+    std::fs::write(&primary_system_prompt, system_prompt).unwrap();
+
+    let primary_stop = serde_json::json!({
+        "sessionId": "grok-primary",
+        "hookEventName": "stop",
+        "transcriptPath": primary_chat,
+        "cwd": "/repo/primary",
+        "workspaceRoot": "/repo"
+    });
+    assert_packaged_grok_hook_mapping(temp.path(), plugin_version, &primary_stop).await;
+
+    let flushes = Arc::new(Mutex::new(HashMap::new()));
+    let created = Arc::new(Mutex::new(Vec::new()));
+    let first = start_grok_debug_daemon_at(
+        data_dir.clone(),
+        socket.clone(),
+        flushes.clone(),
+        created.clone(),
+    )
+    .await;
+    invoke_grok_hook(
+        &socket,
+        plugin_version,
+        "primary-route",
+        "primary-project",
+        &primary_stop,
+    )
+    .await;
+    wait_for_grok_translation(&socket, "grok-primary").await;
+    assert_eq!(
+        flushes
+            .lock()
+            .unwrap()
+            .get("grok-primary")
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "stop alone must not masquerade as the terminal flush"
+    );
+
+    let primary_spans_path = data_dir.join("spans/grok-primary.ndjson");
+    let first_ops = read_span_ops(&primary_spans_path);
+    let first_llm = first_ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.span_type == SpanType::Llm => Some(row),
+            _ => None,
+        })
+        .expect("partial boundary must emit the first LLM");
+    assert_eq!(
+        first_llm.input,
+        Some(serde_json::json!([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "inspect the fixture"}
+        ]))
+    );
+    assert_eq!(
+        first_llm.metadata.as_ref().unwrap()["input_scope"],
+        "system_and_user"
+    );
+    assert_eq!(
+        first_llm.metadata.as_ref().unwrap()["user_message_included"],
+        true
+    );
+    let first_insert_ids: Vec<_> = first_ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Insert(row) => Some(row.span_id.clone()),
+            SpanOp::Merge(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        first_insert_ids.len(),
+        4,
+        "the partial boundary should contain root, turn, first LLM, and tool"
+    );
+
+    let decoy_dir = temp.path().join("native-decoy");
+    std::fs::create_dir_all(&decoy_dir).unwrap();
+    let decoy_chat = decoy_dir.join("chat_history.jsonl");
+    std::fs::write(&decoy_chat, "").unwrap();
+    std::fs::write(
+        decoy_dir.join("updates.jsonl"),
+        &updates[..prefix_through_lines(&updates, 1)],
+    )
+    .unwrap();
+    std::fs::write(decoy_dir.join("events.jsonl"), "").unwrap();
+    let decoy_end = serde_json::json!({
+        "sessionId": "grok-decoy",
+        "hookEventName": "session_end",
+        "transcriptPath": decoy_chat,
+        "cwd": "/repo/decoy"
+    });
+    invoke_grok_hook(
+        &socket,
+        plugin_version,
+        "decoy-route",
+        "decoy-project",
+        &decoy_end,
+    )
+    .await;
+    wait_for_grok_translation(&socket, "grok-decoy").await;
+    assert_eq!(
+        wait_for_grok_flushes(&flushes, "grok-decoy", 1).await,
+        1,
+        "the native session_end event must trigger one daemon-owned flush"
+    );
+    let decoy_journal_text =
+        std::fs::read_to_string(source_journal_path(&data_dir, "grok", "grok-decoy")).unwrap();
+    let decoy_spans_path = data_dir.join("spans/grok-decoy.ndjson");
+    let decoy_before_restart = std::fs::read(&decoy_spans_path).unwrap();
+    let decoy_text = String::from_utf8(decoy_before_restart.clone()).unwrap();
+    assert!(
+        decoy_text.contains("decoy-route"),
+        "decoy span output did not contain route metadata; journal={decoy_journal_text}; spans={decoy_text}"
+    );
+    assert!(!decoy_text.contains("primary-route"));
+
+    shutdown(&socket).await;
+    first.await.unwrap();
+
+    std::fs::write(&primary_updates, &updates).unwrap();
+    std::fs::write(&primary_events, &events).unwrap();
+    let second = start_grok_debug_daemon_at(
+        data_dir.clone(),
+        socket.clone(),
+        flushes.clone(),
+        created.clone(),
+    )
+    .await;
+    let primary_end = serde_json::json!({
+        "sessionId": "grok-primary",
+        "hookEventName": "session_end",
+        "transcriptPath": primary_chat,
+        "cwd": "/repo/primary",
+        "workspaceRoot": "/repo"
+    });
+    invoke_grok_hook(
+        &socket,
+        plugin_version,
+        "primary-route",
+        "primary-project",
+        &primary_end,
+    )
+    .await;
+    let flushed = flush_session("grok-primary", &socket, 5_000).await.unwrap();
+    assert!(
+        flushed.flushed,
+        "explicit delivery barrier did not flush the terminal Grok event: {flushed:?}"
+    );
+    assert_eq!(
+        std::fs::read(&decoy_spans_path).unwrap(),
+        decoy_before_restart,
+        "replaying the primary route must not emit into the decoy debug sink"
+    );
+
+    let journal_text =
+        std::fs::read_to_string(source_journal_path(&data_dir, "grok", "grok-primary")).unwrap();
+    assert!(!journal_text.contains("secret-environment"));
+    assert!(!journal_text.contains("token_sha256_prefix"));
+    assert!(!journal_text.contains("decoy-route"));
+    let journal: Vec<serde_json::Value> = journal_text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|record: &serde_json::Value| record["_bt_record_type"] != "delivery_checkpoint")
+        .collect();
+    assert_eq!(journal.len(), 2);
+    assert_eq!(journal[0]["source"], "grok");
+    assert_eq!(journal[1]["source"], "grok");
+    assert_eq!(journal[0]["source_version"], "1.0.13");
+    assert_eq!(journal[1]["source_version"], "1.0.13");
+    assert_eq!(journal[0]["plugin_version"], plugin_version);
+    assert_eq!(journal[1]["plugin_version"], plugin_version);
+    assert_eq!(journal[0]["event"], "stop");
+    assert_eq!(journal[1]["event"], "session_end");
+    assert_eq!(
+        journal[0]["route"]["additional_metadata"]["route_marker"],
+        "primary-route"
+    );
+
+    let first_mirrors = &journal[0]["payload"]["_bt_grok_transcript_mirrors"];
+    let second_mirrors = &journal[1]["payload"]["_bt_grok_transcript_mirrors"];
+    assert_eq!(
+        first_mirrors.as_object().unwrap().len(),
+        2,
+        "the first hook must journal the available updates and system prompt mirrors"
+    );
+    assert!(first_mirrors.get("events").is_none());
+    assert_eq!(
+        first_mirrors["updates"]["through"],
+        first_updates_through as u64
+    );
+    assert_eq!(second_mirrors["updates"]["through"], updates.len() as u64);
+    assert!(
+        first_updates_through < updates.len(),
+        "updates must advance between lifecycle boundaries"
+    );
+    assert_eq!(
+        first_mirrors["updates"]["path"],
+        primary_updates.to_str().unwrap()
+    );
+    assert_eq!(
+        first_mirrors["updates"]["mirror"], second_mirrors["updates"]["mirror"],
+        "updates must append to one stable daemon-owned mirror"
+    );
+    let updates_mirror = PathBuf::from(second_mirrors["updates"]["mirror"].as_str().unwrap());
+    assert!(updates_mirror.starts_with(data_dir.join("transcripts")));
+    assert_eq!(
+        std::fs::metadata(updates_mirror).unwrap().len(),
+        updates.len() as u64
+    );
+    assert_eq!(
+        first_mirrors["system_prompt"]["through"],
+        system_prompt.len() as u64
+    );
+    assert_eq!(
+        second_mirrors["system_prompt"]["through"],
+        system_prompt.len() as u64
+    );
+    assert_eq!(
+        first_mirrors["system_prompt"]["path"],
+        primary_system_prompt.to_str().unwrap()
+    );
+    assert_eq!(
+        first_mirrors["system_prompt"]["mirror"], second_mirrors["system_prompt"]["mirror"],
+        "the system prompt must retain one stable daemon-owned snapshot"
+    );
+    let system_prompt_mirror =
+        PathBuf::from(second_mirrors["system_prompt"]["mirror"].as_str().unwrap());
+    assert!(system_prompt_mirror.starts_with(data_dir.join("transcripts")));
+    assert_eq!(
+        std::fs::read_to_string(system_prompt_mirror).unwrap(),
+        system_prompt
+    );
+
+    assert_eq!(second_mirrors["events"]["through"], events.len() as u64);
+    assert_eq!(
+        second_mirrors["events"]["path"],
+        primary_events.to_str().unwrap()
+    );
+    let events_mirror = PathBuf::from(second_mirrors["events"]["mirror"].as_str().unwrap());
+    assert!(events_mirror.starts_with(data_dir.join("transcripts")));
+    assert_eq!(
+        std::fs::metadata(events_mirror).unwrap().len(),
+        events.len() as u64
+    );
+
+    wait_for_grok_enrichment(&primary_spans_path).await;
+    let all_ops = read_span_ops(&primary_spans_path);
+    let mut inserts_by_id: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    for op in &all_ops {
+        if let SpanOp::Insert(row) = op {
+            inserts_by_id
+                .entry(row.span_id.clone())
+                .or_default()
+                .push(serde_json::to_value(row).unwrap());
+        }
+    }
+    assert_eq!(
+        inserts_by_id.len(),
+        5,
+        "restart recovery must retain four prior ids and add only the second LLM"
+    );
+    for id in &first_insert_ids {
+        let copies = inserts_by_id.get(id).unwrap();
+        assert_eq!(
+            copies.len(),
+            1,
+            "checkpointed historical insert {id} must not be replayed"
+        );
+    }
+    let new_insert_ids: Vec<_> = inserts_by_id
+        .iter()
+        .filter(|(id, _)| !first_insert_ids.contains(id))
+        .collect();
+    assert_eq!(new_insert_ids.len(), 1);
+    assert_eq!(
+        new_insert_ids[0].1.len(),
+        1,
+        "the newly observed second LLM must not be duplicated after recovery"
+    );
+
+    let unique_rows: Vec<_> = inserts_by_id.values().map(|copies| &copies[0]).collect();
+    let root = unique_rows
+        .iter()
+        .find(|row| row["name"] == "Grok")
+        .unwrap();
+    assert_eq!(root["span_type"], "task");
+    assert_eq!(root["metadata"]["source"], "grok");
+    assert_eq!(root["metadata"]["grok_version"], "1.0.13");
+    assert_eq!(root["metadata"]["plugin_version"], plugin_version);
+    assert_eq!(root["metadata"]["route_marker"], "primary-route");
+    assert_eq!(root["metadata"]["trace_source"], "session_transcript");
+    assert_eq!(root["root_span_id"], root["span_id"]);
+    assert!(
+        root.get("parent_span_ids").is_none(),
+        "an unattached Grok root must not acquire a parent"
+    );
+    let root_id = root["span_id"].as_str().unwrap();
+
+    let turn = unique_rows
+        .iter()
+        .find(|row| row["name"] == "Turn 1")
+        .unwrap();
+    assert_eq!(turn["parent_span_ids"], serde_json::json!([root_id]));
+    let turn_id = turn["span_id"].as_str().unwrap();
+    let turn_close = all_ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Merge(row) if row.span_id == turn_id && row.metrics.is_some() => Some(row),
+            _ => None,
+        })
+        .expect("native session_end must deliver the final turn metrics");
+    let metrics = turn_close.metrics.as_ref().unwrap();
+    assert_eq!(metrics["prompt_tokens"], 100);
+    assert_eq!(metrics["completion_tokens"], 20);
+    assert_eq!(metrics["tokens"], 120);
+    assert_eq!(metrics["prompt_cached_tokens"], 40);
+    assert_eq!(metrics["model_calls"], 2);
+    assert_eq!(metrics["cost_usd_ticks"], 12);
+    assert!(metrics.get("estimated_cost").is_none());
+    let children: Vec<_> = unique_rows
+        .iter()
+        .filter(|row| row["span_type"] == "llm" || row["span_type"] == "tool")
+        .collect();
+    assert_eq!(children.len(), 3);
+    assert!(children
+        .iter()
+        .all(|row| row["parent_span_ids"] == serde_json::json!([turn_id])));
+    let llm_names: HashSet<_> = children
+        .iter()
+        .filter(|row| row["span_type"] == "llm")
+        .map(|row| row["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        llm_names,
+        HashSet::from(["grok-4.6-build call 1", "grok-4.6-build call 2"])
+    );
+    let first_llm_id = children
+        .iter()
+        .find(|row| row["name"] == "grok-4.6-build call 1")
+        .unwrap()["span_id"]
+        .as_str()
+        .unwrap();
+    let first_llm_close = all_ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Merge(row) if row.span_id == first_llm_id && row.output.is_some() => Some(row),
+            _ => None,
+        })
+        .expect("the first LLM must close with a renderable assistant response");
+    assert_eq!(
+        first_llm_close.output,
+        Some(serde_json::json!([{
+            "role": "assistant",
+            "content": "Reading the fixture.",
+            "reasoning": [{
+                "id": "reasoning",
+                "content": "I will read it."
+            }]
+        }]))
+    );
+    let tool_id = children
+        .iter()
+        .find(|row| row["span_type"] == "tool")
+        .unwrap()["span_id"]
+        .as_str()
+        .unwrap();
+    let tool_enrichment = all_ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Merge(row)
+                if row.span_id == tool_id
+                    && row.metadata.as_ref().is_some_and(|metadata| {
+                        metadata["duration_ms"] == 100 && metadata["outcome"] == "success"
+                    }) =>
+            {
+                Some(row)
+            }
+            _ => None,
+        })
+        .expect("late events mirror must enrich the existing deterministic tool span");
+    assert_eq!(tool_enrichment.span_id, tool_id);
+    assert!(all_ops.iter().any(|op| {
+        matches!(
+            op,
+            SpanOp::Merge(row)
+                if row.span_id == root_id && row.end_ms.is_some()
+        )
+    }));
+    let primary_text = std::fs::read_to_string(&primary_spans_path).unwrap();
+    assert!(primary_text.contains("primary-route"));
+    assert!(!primary_text.contains("decoy-route"));
+
+    let created = created.lock().unwrap().clone();
+    assert_eq!(created.len(), 3);
+    assert!(created.iter().all(|(_, source, version)| {
+        source == "grok" && version.as_deref() == Some(plugin_version)
+    }));
+
+    shutdown(&socket).await;
+    second.await.unwrap();
 }

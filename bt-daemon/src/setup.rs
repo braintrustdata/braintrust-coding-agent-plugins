@@ -16,6 +16,8 @@ const CODEX_PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
 const CLAUDE_MARKETPLACE: &str = "braintrust-claude-plugin";
 const CLAUDE_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-claude-plugin";
 const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
+const GROK_PLUGIN: &str = "trace-grok";
+const GROK_PLUGIN_SOURCE: &str = "braintrustdata/braintrust-grok-plugin";
 const OPENCODE_PLUGIN: &str = "@braintrust/trace-opencode@^1";
 const PI_PLUGIN: &str = "npm:@braintrust/pi-extension@^1";
 const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
@@ -257,6 +259,50 @@ fn disable_claude(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     let plugins = runner.json("claude", &["plugin", "list", "--json"])?;
     if claude_plugin(&plugins).is_some() {
         runner.run("claude", &["plugin", "uninstall", CLAUDE_PLUGIN])?;
+    }
+    Ok(())
+}
+
+fn grok_plugin(value: &Value) -> Option<&Value> {
+    value
+        .as_array()?
+        .iter()
+        .find(|item| item.get("name").and_then(Value::as_str) == Some(GROK_PLUGIN))
+}
+
+fn grok_plugin_is_published(item: &Value) -> bool {
+    item.get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| github_repo_matches(source, GROK_PLUGIN_SOURCE))
+}
+
+fn setup_grok(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    let plugins = runner.json("grok", &["plugin", "list", "--json"])?;
+    // `bt trace enable grok` is the user's trust boundary. Grok's `--trust`
+    // applies to this plugin installation and does not change folder trust.
+    match grok_plugin(&plugins) {
+        Some(plugin) if grok_plugin_is_published(plugin) => {
+            runner.run("grok", &["plugin", "update", GROK_PLUGIN])?;
+        }
+        Some(_) => {
+            runner.run("grok", &["plugin", "uninstall", GROK_PLUGIN, "--confirm"])?;
+            runner.run(
+                "grok",
+                &["plugin", "install", GROK_PLUGIN_SOURCE, "--trust"],
+            )?;
+        }
+        None => runner.run(
+            "grok",
+            &["plugin", "install", GROK_PLUGIN_SOURCE, "--trust"],
+        )?,
+    }
+    runner.run("grok", &["plugin", "enable", GROK_PLUGIN])
+}
+
+fn disable_grok(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    let plugins = runner.json("grok", &["plugin", "list", "--json"])?;
+    if grok_plugin(&plugins).is_some_and(grok_plugin_is_published) {
+        runner.run("grok", &["plugin", "uninstall", GROK_PLUGIN, "--confirm"])?;
     }
     Ok(())
 }
@@ -534,6 +580,7 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::Claude => disable_claude(&mut runner)?,
         SetupAgent::OpenCode => disable_opencode()?,
         SetupAgent::Pi => disable_pi(&mut runner)?,
+        SetupAgent::Grok => disable_grok(&mut runner)?,
         SetupAgent::Antigravity => disable_antigravity(&mut runner)?,
     }
     let settings_path = paths::agent_settings_path(source, None);
@@ -551,6 +598,7 @@ fn agent_details(agent: SetupAgent) -> (&'static str, &'static str) {
         SetupAgent::Claude => ("claude", "Claude Code"),
         SetupAgent::OpenCode => ("opencode", "OpenCode"),
         SetupAgent::Pi => ("pi", "Pi"),
+        SetupAgent::Grok => ("grok", "Grok"),
         SetupAgent::Antigravity => ("antigravity", "Google Antigravity"),
     }
 }
@@ -576,6 +624,10 @@ pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<Trace
         SetupAgent::Pi => {
             setup_pi(&mut runner)?;
             ("pi", "Pi")
+        }
+        SetupAgent::Grok => {
+            setup_grok(&mut runner)?;
+            ("grok", "Grok")
         }
         SetupAgent::Antigravity => {
             setup_antigravity(&mut runner)?;
@@ -805,6 +857,101 @@ mod tests {
             ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"]
         );
         assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn grok_installs_published_plugin_then_enables_it_when_missing() {
+        let mut runner = FakeRunner::new([serde_json::json!([
+            {"name": "other-plugin", "source": "somebody/other-plugin"}
+        ])]);
+
+        setup_grok(&mut runner).unwrap();
+
+        assert_eq!(
+            runner.calls,
+            [
+                "grok plugin list --json",
+                "grok plugin install braintrustdata/braintrust-grok-plugin --trust",
+                "grok plugin enable trace-grok",
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_repeated_enable_updates_and_enables_the_published_plugin() {
+        let mut runner = FakeRunner::new([serde_json::json!([
+            {
+                "name": GROK_PLUGIN,
+                "source": "https://github.com/braintrustdata/braintrust-grok-plugin.git",
+                "status": "installed"
+            },
+            {"name": "other-plugin", "source": "somebody/other-plugin"}
+        ])]);
+
+        setup_grok(&mut runner).unwrap();
+
+        assert_eq!(
+            runner.calls,
+            [
+                "grok plugin list --json",
+                "grok plugin update trace-grok",
+                "grok plugin enable trace-grok",
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_enable_reconciles_only_a_conflicting_same_name_plugin() {
+        let mut runner = FakeRunner::new([serde_json::json!([
+            {
+                "name": GROK_PLUGIN,
+                "source": "/tmp/local-trace-grok",
+                "status": "installed"
+            },
+            {"name": "other-plugin", "source": "somebody/other-plugin"}
+        ])]);
+
+        setup_grok(&mut runner).unwrap();
+
+        assert_eq!(
+            runner.calls,
+            [
+                "grok plugin list --json",
+                "grok plugin uninstall trace-grok --confirm",
+                "grok plugin install braintrustdata/braintrust-grok-plugin --trust",
+                "grok plugin enable trace-grok",
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_disable_removes_only_the_published_braintrust_plugin() {
+        let mut runner = FakeRunner::new([serde_json::json!([
+            {
+                "name": GROK_PLUGIN,
+                "source": GROK_PLUGIN_SOURCE,
+                "status": "installed"
+            },
+            {"name": "other-plugin", "source": "somebody/other-plugin"}
+        ])]);
+
+        disable_grok(&mut runner).unwrap();
+
+        assert_eq!(
+            runner.calls,
+            [
+                "grok plugin list --json",
+                "grok plugin uninstall trace-grok --confirm",
+            ]
+        );
+
+        let mut local = FakeRunner::new([serde_json::json!([{
+            "name": GROK_PLUGIN,
+            "source": "/tmp/local-trace-grok",
+            "status": "installed"
+        }])]);
+        disable_grok(&mut local).unwrap();
+        assert_eq!(local.calls, ["grok plugin list --json"]);
     }
 
     #[test]

@@ -2,9 +2,9 @@
 # release.yml (production repos) and test-release.yml (the shared test repo),
 # which supply `dist_repo` and `record`.
 #
-# Always: build and `make publish` to <dist_repo>. Claude and Codex releases
-# also bump each plugin manifest version. Antigravity's native manifest has no
-# version field, so its repository tag is the release version.
+# Always: build and `make publish` to <dist_repo>. Claude, Codex, and Grok
+# releases also bump each plugin manifest version. Antigravity's native
+# manifest has no version field, so its repository tag is the release version.
 # When record=true (production): commit the bump to main when needed, tag
 # v<version>-<plugin>, and create a GitHub Release on the monorepo. After the
 # distribution is deployed, its repo gets an unsuffixed v<version> tag and
