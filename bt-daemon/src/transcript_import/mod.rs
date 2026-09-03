@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Seek};
 use std::path::{Path, PathBuf};
 
+mod antigravity;
 mod claude;
 mod codex;
 
@@ -41,6 +42,7 @@ fn transcript_roots(source: ImportSource) -> Vec<PathBuf> {
     match source {
         ImportSource::Codex => codex::roots(&home),
         ImportSource::Claude => claude::roots(&home),
+        ImportSource::Antigravity => antigravity::roots(&home),
     }
 }
 
@@ -123,6 +125,7 @@ fn transcript_session_id(path: &Path, source: ImportSource) -> Option<String> {
     match source {
         ImportSource::Codex => codex::transcript_session_id(path),
         ImportSource::Claude => claude::transcript_session_id(path),
+        ImportSource::Antigravity => antigravity::transcript_session_id(path),
     }
 }
 
@@ -139,6 +142,7 @@ fn resolve_transcript_in(
         matches.extend(candidates.into_iter().filter(|path| match source {
             ImportSource::Codex => codex::filename_matches(path, session_id),
             ImportSource::Claude => claude::filename_matches(path, session_id),
+            ImportSource::Antigravity => antigravity::filename_matches(path, session_id),
         }));
     }
     matches.sort();
@@ -185,6 +189,7 @@ fn source_name(source: ImportSource) -> &'static str {
     match source {
         ImportSource::Codex => "Codex",
         ImportSource::Claude => "Claude Code",
+        ImportSource::Antigravity => "Google Antigravity",
     }
 }
 
@@ -211,6 +216,7 @@ fn envelopes_from_records(
             &records.end_offsets,
             records.read_offset,
         ),
+        ImportSource::Antigravity => antigravity::envelopes(path, &records.values),
     }
 }
 
@@ -346,6 +352,7 @@ pub(crate) struct TranscriptTail {
 enum TailState {
     Codex(codex::Tail),
     Claude(claude::Tail),
+    Antigravity(antigravity::Tail),
 }
 
 impl TranscriptTail {
@@ -364,6 +371,7 @@ impl TranscriptTail {
         match source {
             ImportSource::Codex => TailState::Codex(codex::Tail::default()),
             ImportSource::Claude => TailState::Claude(claude::Tail::default()),
+            ImportSource::Antigravity => TailState::Antigravity(antigravity::Tail::default()),
         }
     }
 
@@ -395,6 +403,7 @@ impl TranscriptTail {
         match &mut self.state {
             TailState::Codex(state) => state.poll(events, len, finalize),
             TailState::Claude(state) => state.poll(events, len, finalize),
+            TailState::Antigravity(state) => state.poll(events, len, finalize),
         }
     }
 
@@ -501,6 +510,27 @@ mod tests {
 
         assert_eq!(
             resolve_transcript_in("session-123", ImportSource::Claude, &[root]).unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn finds_only_exact_antigravity_conversation_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("brain");
+        let transcript = root
+            .join("conversation-123")
+            .join(".system_generated/logs/transcript_full.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let unrelated = root
+            .join("conversation-123-other")
+            .join(".system_generated/logs/transcript_full.jsonl");
+        std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        std::fs::write(unrelated, "{}\n").unwrap();
+
+        assert_eq!(
+            resolve_transcript_in("conversation-123", ImportSource::Antigravity, &[root]).unwrap(),
             transcript
         );
     }
@@ -747,6 +777,61 @@ mod tests {
         assert!(second.iter().all(|event| event.event != "SessionStart"));
         assert_eq!(second.last().unwrap().event, "ImportCheckpoint");
         assert_eq!(tail.poll(true).unwrap().last().unwrap().event, "Stop");
+    }
+
+    #[test]
+    fn antigravity_tail_keeps_session_open_and_reports_new_records_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("conversation-123/.system_generated/logs/transcript_full.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut records = vec![
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-01-01T00:00:01Z","content":"one"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-01-01T00:00:02Z","content":"answer"}),
+        ];
+        let write = |records: &[Value]| {
+            std::fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .unwrap()
+        };
+        write(&records);
+        let mut tail = TranscriptTail::new(path.clone(), ImportSource::Antigravity);
+        assert_eq!(
+            tail.poll(false)
+                .unwrap()
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PreInvocation"]
+        );
+
+        records.push(json!({"step_index":2,"source":"MODEL","type":"LIST_DIRECTORY","created_at":"2026-01-01T00:00:03Z","content":"result"}));
+        write(&records);
+        assert_eq!(
+            tail.poll(false)
+                .unwrap()
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ImportCheckpoint", "PostToolUse"]
+        );
+        assert!(tail.poll(false).unwrap().is_empty());
+        assert_eq!(
+            tail.poll(true)
+                .unwrap()
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PostInvocation", "Stop"]
+        );
     }
 
     #[test]

@@ -48,6 +48,48 @@ async fn importing_large_codex_rollout_drains_translator_continuations() {
     assert_eq!(inserted(&output_rows, "llm"), CALLS);
 }
 
+#[tokio::test]
+async fn importing_antigravity_transcript_uses_the_production_translator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp
+        .path()
+        .join("brain/antigravity-import/.system_generated/logs/transcript_full.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-01-01T00:00:01Z","content":"<USER_REQUEST>\ntrace this\n</USER_REQUEST>"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-01T00:00:02Z","tool_calls":[{"name":"list_dir","args":{"DirectoryPath":"/tmp"}}]}),
+            json!({"step_index":2,"source":"MODEL","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-01-01T00:00:03Z","content":"tool call denied"}),
+            json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-01T00:00:04Z","content":"done"}),
+        ],
+    );
+    let output = tmp.path().join("spans");
+    import_transcript(
+        &transcript,
+        ImportSource::Antigravity,
+        options(&output),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let output_rows = rows(&output.join("antigravity-import.ndjson"));
+    assert_eq!(inserted(&output_rows, "task"), 2);
+    assert_eq!(inserted(&output_rows, "llm"), 1);
+    assert!(output_rows
+        .iter()
+        .any(|row| { row.pointer("/Insert/input").and_then(Value::as_str) == Some("trace this") }));
+    assert!(output_rows
+        .iter()
+        .any(|row| { row.pointer("/Insert/name").and_then(Value::as_str) == Some("list_dir") }));
+    assert!(output_rows.iter().any(|row| {
+        row.pointer("/Merge/metadata/tool_approval")
+            .and_then(Value::as_str)
+            == Some("denied")
+    }));
+}
+
 fn options(output: &std::path::Path) -> ServeOptions {
     ServeOptions {
         version: "test".into(),

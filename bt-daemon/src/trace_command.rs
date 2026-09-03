@@ -38,7 +38,7 @@ pub enum TraceCommand {
     /// Gracefully stop the tracing daemon.
     #[command(hide = true)]
     Stop(StopArgs),
-    /// Import a past Codex or Claude Code session by its resume id.
+    /// Import a past coding-agent session by its resume id.
     Import(ImportArgs),
     /// Launch a coding agent with tracing enabled for this invocation.
     Run(RunArgs),

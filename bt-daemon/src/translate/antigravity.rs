@@ -407,7 +407,7 @@ impl AntigravityTranslator {
                 json!({
                     "step_index": step,
                 }),
-                Some(ToolApproval::Approved),
+                tool_approval_from_event(event).or(Some(ToolApproval::Approved)),
             )),
             error,
             ..Default::default()
@@ -527,6 +527,14 @@ impl AgentTranslator for AntigravityTranslator {
         self.close_turn(self.last_ts_ms, None, &mut ops);
         self.close_root(self.last_ts_ms, None, &mut ops);
         Ok(ops)
+    }
+}
+
+fn tool_approval_from_event(event: &Envelope) -> Option<ToolApproval> {
+    match string_field(&event.payload, "toolApproval").as_deref() {
+        Some("approved") => Some(ToolApproval::Approved),
+        Some("denied") => Some(ToolApproval::Denied),
+        _ => None,
     }
 }
 
