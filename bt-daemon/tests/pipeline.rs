@@ -1333,13 +1333,13 @@ async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment()
 }
 
 #[tokio::test]
-async fn a_failing_span_plugin_is_reported_and_fails_open() {
+async fn a_failing_span_plugin_discards_rows_and_persists_the_raw_exception() {
     let (data_dir, socket, handle, tmp) = start_daemon().await;
     let plugin = tmp.path().join("bad.mjs");
     let later_plugin = tmp.path().join("later.mjs");
     std::fs::write(
         &plugin,
-        "export default span => ({...span, span_id: 'corrupt'})",
+        "export default () => { throw new Error('raw local secret') }",
     )
     .unwrap();
     std::fs::write(
@@ -1352,7 +1352,7 @@ async fn a_failing_span_plugin_is_reported_and_fails_open() {
         .as_mut()
         .unwrap()
         .span_plugins
-        .extend([plugin, later_plugin]);
+        .extend([plugin.clone(), later_plugin.clone()]);
     forward_envelope(&env, &socket, &dummy_host(), false)
         .await
         .unwrap();
@@ -1371,20 +1371,48 @@ async fn a_failing_span_plugin_is_reported_and_fails_open() {
         status.sessions[0]
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("failed; disabled on this worker")),
+            .is_some_and(|error| error.contains("span operations are being discarded")),
         "unexpected plugin status: {:?}",
         status.sessions[0].last_error
     );
     let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
-    assert!(!spans.contains("corrupt"));
-    assert!(spans.contains("after-failure:"));
     assert!(
-        !spans.is_empty(),
-        "the original rows should still be delivered"
+        spans.is_empty(),
+        "no untransformed rows should be delivered"
     );
+    assert!(!spans.contains("after-failure:"));
+
+    let diagnostics =
+        std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json")).unwrap();
+    assert!(diagnostics.contains("Error: raw local secret"));
+    assert!(diagnostics.contains("bad.mjs"));
 
     shutdown(&socket).await;
     handle.await.unwrap();
+
+    std::fs::write(&plugin, "export default span => span").unwrap();
+    let restarted = start_daemon_at(data_dir.clone(), socket.clone()).await;
+    let mut stop = envelope("plugin-failure", "Stop", 2);
+    stop.route
+        .as_mut()
+        .unwrap()
+        .span_plugins
+        .extend([plugin, later_plugin]);
+    forward_envelope(&stop, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    flush_session("plugin-failure", &socket, 5000)
+        .await
+        .unwrap();
+
+    let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+    assert!(
+        spans.contains("after-failure:"),
+        "fixing the plugin and restarting should replay withheld journal rows"
+    );
+
+    shutdown(&socket).await;
+    restarted.await.unwrap();
 }
 
 #[tokio::test]

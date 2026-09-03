@@ -217,6 +217,7 @@ mod tests {
             }),
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: None,
+            span_plugins: Vec::new(),
         }
     }
 

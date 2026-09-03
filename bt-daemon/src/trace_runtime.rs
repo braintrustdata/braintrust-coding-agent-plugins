@@ -293,6 +293,24 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
         warnings.push(format!("authentication is unusable: {error}"));
     }
 
+    let plugin_diagnostics = match crate::plugin_diagnostics::read(&paths::data_dir(None)) {
+        Ok(diagnostics) => {
+            let mut diagnostics: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.source == source
+                        || (source == "claude" && diagnostic.source == "claude-code")
+                })
+                .collect();
+            diagnostics.sort_by_key(|diagnostic| std::cmp::Reverse(diagnostic.last_seen_ms));
+            diagnostics
+        }
+        Err(error) => {
+            warnings.push(format!("plugin diagnostics could not be read: {error}"));
+            Vec::new()
+        }
+    };
+
     DoctorCommandOutput {
         source: source.into(),
         display_name: args.agent.display_name().into(),
@@ -303,6 +321,7 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
         route,
         auth,
         warnings,
+        plugin_diagnostics,
     }
 }
 

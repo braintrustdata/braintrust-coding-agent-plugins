@@ -106,6 +106,7 @@ pub struct DoctorCommandOutput {
     pub route: Option<SessionRoute>,
     pub auth: AuthDiagnostic,
     pub warnings: Vec<String>,
+    pub plugin_diagnostics: Vec<crate::PluginDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +208,17 @@ impl TraceCommandOutput {
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
                 }
+                for diagnostic in &doctor.plugin_diagnostics {
+                    rendered.push_str(&format!(
+                        "\nPlugin error: {} ({} occurrence{})\nFirst seen: {}\nLast seen: {}\n{}",
+                        diagnostic.plugin_path.display(),
+                        diagnostic.occurrences,
+                        if diagnostic.occurrences == 1 { "" } else { "s" },
+                        render_timestamp(diagnostic.first_seen_ms),
+                        render_timestamp(diagnostic.last_seen_ms),
+                        diagnostic.exception
+                    ));
+                }
                 Ok(rendered)
             }
             Self::Enable(setup) => Ok(format!(
@@ -243,6 +255,12 @@ impl TraceCommandOutput {
                 .join("\n")),
         }
     }
+}
+
+fn render_timestamp(timestamp_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|| timestamp_ms.to_string())
 }
 
 fn render_destination(destination: &TraceDestination) -> String {
@@ -406,6 +424,15 @@ mod tests {
                 error: None,
             },
             warnings: Vec::new(),
+            plugin_diagnostics: vec![crate::PluginDiagnostic {
+                source: "codex".into(),
+                plugin_path: PathBuf::from("/tmp/redact.mjs"),
+                plugin_digest: Some("abc".into()),
+                exception: "Error: raw secret\n    at redact (redact.mjs:1)".into(),
+                first_seen_ms: 1,
+                last_seen_ms: 2,
+                occurrences: 3,
+            }],
         });
         let rendered = output.render(OutputFormat::Json).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
@@ -413,5 +440,9 @@ mod tests {
         assert_eq!(value["auth"]["source"], "saved_profile");
         assert!(!rendered.contains("token"));
         assert!(!rendered.contains("api_key"));
+        assert_eq!(
+            value["plugin_diagnostics"][0]["exception"],
+            "Error: raw secret\n    at redact (redact.mjs:1)"
+        );
     }
 }

@@ -19,6 +19,7 @@ mod delivery_ledger;
 mod dispatch;
 mod ids;
 mod journal;
+mod plugin_diagnostics;
 pub(crate) mod process;
 mod server;
 mod settings;
@@ -40,6 +41,7 @@ pub use command_output::{
 };
 #[doc(hidden)]
 pub use journal::source_journal_path;
+pub use plugin_diagnostics::PluginDiagnostic;
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
 pub use setup::{run_disable, run_enable, run_setup};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
@@ -810,8 +812,13 @@ pub async fn run_traced(
         ),
         Err(error) => tracing::warn!(managed_run_id, %error, "managed run trace flush failed"),
     }
-    if isolated_runtime.is_some() {
+    if let Some(runtime) = &isolated_runtime {
         let _ = shutdown_daemon(&socket).await;
+        if let Err(error) =
+            crate::plugin_diagnostics::merge(runtime.temp_dir.path(), &paths::data_dir(None))
+        {
+            tracing::warn!(managed_run_id, %error, "failed to preserve managed-run plugin diagnostics");
+        }
     }
     status
 }
@@ -1125,6 +1132,7 @@ struct ImportLive {
     span_ids: std::collections::HashSet<String>,
     root_span_id: Option<String>,
     destination: Option<wire::TraceDestination>,
+    diagnostics_dir: Option<PathBuf>,
 }
 
 struct ImportProcessor {
@@ -1190,6 +1198,7 @@ impl ImportProcessor {
                                 .config
                                 .as_ref()
                                 .and_then(|config| config.destination.clone()),
+                            diagnostics_dir: self.ledger_dir.clone(),
                         },
                     );
                     self.sessions.get_mut(&sid).unwrap()
@@ -1246,28 +1255,61 @@ impl ImportProcessor {
                         &live.ctx.session_id,
                     ) {
                         Ok(result) => {
-                            for failure in result.failures {
-                                tracing::warn!(
-                                    session_id = %live.ctx.session_id,
-                                    plugin = %failure.path.display(),
-                                    error = %failure.message,
-                                    "span plugin failed during import; disabled on this worker"
-                                );
+                            if let Some(failure) = result.failure {
+                                if failure.newly_seen {
+                                    if let Some(data_dir) = &live.diagnostics_dir {
+                                        if let Err(error) = crate::plugin_diagnostics::record(
+                                            data_dir,
+                                            &live.source,
+                                            &failure.path,
+                                            &failure.message,
+                                        ) {
+                                            tracing::warn!(
+                                                session_id = %live.ctx.session_id,
+                                                "failed to persist span plugin diagnostic: {error}"
+                                            );
+                                        }
+                                    }
+                                    tracing::warn!(
+                                        session_id = %live.ctx.session_id,
+                                        plugin = %failure.path.display(),
+                                        error = %failure.message,
+                                        "span plugin failed during import; span operations are being discarded"
+                                    );
+                                }
                             }
-                            transformed.push(result.op);
+                            if let Some(op) = result.op {
+                                transformed.push(op);
+                            }
                         }
                         Err(error) => {
+                            if let (Some(data_dir), Some(plugin)) =
+                                (&live.diagnostics_dir, plugins.first())
+                            {
+                                if let Err(diagnostic_error) = crate::plugin_diagnostics::record(
+                                    data_dir,
+                                    &live.source,
+                                    plugin,
+                                    &error.to_string(),
+                                ) {
+                                    tracing::warn!(
+                                        session_id = %live.ctx.session_id,
+                                        "failed to persist span plugin diagnostic: {diagnostic_error}"
+                                    );
+                                }
+                            }
                             tracing::warn!(
                                 session_id = %live.ctx.session_id,
                                 %error,
-                                "span plugin processor failed during import"
+                                "span plugin processor failed during import; span operation discarded"
                             );
-                            transformed.push(op.clone());
                         }
                     }
                 }
-                live.sink.emit(&transformed).await?;
-                live.pending_ops += chunk.len();
+                if !transformed.is_empty() {
+                    live.sink.emit(&transformed).await?;
+                }
+                live.pending_ops += transformed.len();
                 if live.pending_ops >= FLUSH_OPS {
                     live.sink.flush().await?;
                     live.pending_ops = 0;
@@ -1697,6 +1739,7 @@ mod tests {
             }),
             flush_mode: wire::FlushMode::FireAndForget,
             additional_metadata: None,
+            span_plugins: Vec::new(),
         }
     }
 

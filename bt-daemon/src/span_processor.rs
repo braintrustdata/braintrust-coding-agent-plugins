@@ -5,11 +5,11 @@
 //! cross threads and unrelated workers can transform spans concurrently.
 
 use crate::translate::{SpanOp, SpanRow};
-use rquickjs::{Context, Function, Module, Persistent, Runtime};
+use rquickjs::{CatchResultExt, Context, Function, Module, Persistent, Runtime};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -40,7 +40,7 @@ struct PluginContext<'a> {
 
 struct Engine {
     modules: HashMap<PathBuf, CachedModule>,
-    failed_plugins: HashSet<PathBuf>,
+    failed_plugins: HashMap<PathBuf, FailedPlugin>,
     env: BTreeMap<String, String>,
     context: Context,
     started: Instant,
@@ -53,6 +53,18 @@ struct CachedModule {
     modified: Option<SystemTime>,
     len: u64,
     function: Persistent<Function<'static>>,
+}
+
+#[derive(Clone)]
+struct FailedPlugin {
+    fingerprint: Option<PluginFingerprint>,
+    message: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PluginFingerprint {
+    modified: Option<SystemTime>,
+    len: u64,
 }
 
 impl Engine {
@@ -71,7 +83,7 @@ impl Engine {
         let context = Context::full(&runtime)?;
         Ok(Self {
             modules: HashMap::new(),
-            failed_plugins: HashSet::new(),
+            failed_plugins: HashMap::new(),
             env: environment(),
             context,
             started,
@@ -95,10 +107,19 @@ impl Engine {
         let name = format!("bt-span-plugin:{digest:x}");
         self.arm_deadline();
         let function = self.context.with(|ctx| -> anyhow::Result<_> {
-            let (module, promise) = Module::declare(ctx.clone(), name, source)?.eval()?;
-            promise.finish::<()>()?;
+            let (module, promise) = Module::declare(ctx.clone(), name, source)
+                .catch(&ctx)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                .eval()
+                .catch(&ctx)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            promise
+                .finish::<()>()
+                .catch(&ctx)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let function: Function<'_> = module
                 .get("default")
+                .catch(&ctx)
                 .map_err(|error| anyhow::anyhow!("default export is not a function: {error}"))?;
             Ok(Persistent::save(&ctx, function))
         });
@@ -135,7 +156,10 @@ impl Engine {
             let function = function.restore(&ctx)?;
             let row = rquickjs_serde::to_value(ctx.clone(), row)?;
             let context = rquickjs_serde::to_value(ctx.clone(), &context)?;
-            let result = function.call::<_, rquickjs::Value<'_>>((row, context))?;
+            let result = function
+                .call::<_, rquickjs::Value<'_>>((row, context))
+                .catch(&ctx)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             if result.as_promise().is_some() {
                 anyhow::bail!("plugin returned a Promise; span plugins must be synchronous");
             }
@@ -159,16 +183,21 @@ impl Engine {
 pub struct PluginFailure {
     pub path: PathBuf,
     pub message: String,
+    /// Only the first failure on this worker needs to be logged and persisted.
+    pub newly_seen: bool,
 }
 
 pub struct ProcessResult {
-    pub op: SpanOp,
-    pub failures: Vec<PluginFailure>,
+    /// `None` means the operation was withheld because every configured plugin
+    /// is mandatory and one did not complete successfully.
+    pub op: Option<SpanOp>,
+    pub failure: Option<PluginFailure>,
 }
 
 /// Apply an ordered plugin chain on the worker thread currently executing the
-/// session actor. A failing plugin is skipped on subsequent calls handled by
-/// this worker, while the rest of the ordered chain continues to run.
+/// session actor. Every plugin is mandatory: a failure withholds the operation,
+/// and subsequent calls on this worker remain withheld instead of bypassing the
+/// failed transform.
 pub fn process(
     plugins: &[PathBuf],
     op: &SpanOp,
@@ -177,8 +206,8 @@ pub fn process(
 ) -> anyhow::Result<ProcessResult> {
     if plugins.is_empty() {
         return Ok(ProcessResult {
-            op: op.clone(),
-            failures: Vec::new(),
+            op: Some(op.clone()),
+            failure: None,
         });
     }
     let (operation, mut row) = match op {
@@ -190,15 +219,23 @@ pub fn process(
         row.root_span_id.clone(),
         row.parent_span_ids.clone(),
     );
-    let mut failures = Vec::new();
+    let mut failure = None;
     ENGINE.with_borrow_mut(|slot| -> anyhow::Result<()> {
         if slot.is_none() {
             *slot = Some(Engine::new()?);
         }
         let engine = slot.as_mut().expect("engine initialized");
         for plugin in plugins {
-            if engine.failed_plugins.contains(plugin) {
-                continue;
+            if let Some(failed) = engine.failed_plugins.get(plugin).cloned() {
+                if failed.fingerprint == plugin_fingerprint(plugin) {
+                    failure = Some(PluginFailure {
+                        path: plugin.clone(),
+                        message: failed.message,
+                        newly_seen: false,
+                    });
+                    break;
+                }
+                engine.failed_plugins.remove(plugin);
             }
             let candidate = engine.call(plugin, &row, operation, source, session_id);
             let candidate = match candidate {
@@ -217,20 +254,27 @@ pub fn process(
                 }
                 Ok(_) => {
                     let message = "changed immutable span identity fields".to_owned();
-                    engine.failed_plugins.insert(plugin.clone());
-                    failures.push(PluginFailure {
+                    engine
+                        .failed_plugins
+                        .insert(plugin.clone(), failed_plugin(plugin, &message));
+                    failure = Some(PluginFailure {
                         path: plugin.clone(),
                         message,
+                        newly_seen: true,
                     });
-                    continue;
+                    break;
                 }
                 Err(error) => {
-                    engine.failed_plugins.insert(plugin.clone());
-                    failures.push(PluginFailure {
+                    let message = error.to_string();
+                    engine
+                        .failed_plugins
+                        .insert(plugin.clone(), failed_plugin(plugin, &message));
+                    failure = Some(PluginFailure {
                         path: plugin.clone(),
-                        message: error.to_string(),
+                        message,
+                        newly_seen: true,
                     });
-                    continue;
+                    break;
                 }
             };
             row = candidate;
@@ -238,11 +282,26 @@ pub fn process(
         Ok(())
     })?;
     Ok(ProcessResult {
-        op: match op {
+        op: failure.is_none().then_some(match op {
             SpanOp::Insert(_) => SpanOp::Insert(row),
             SpanOp::Merge(_) => SpanOp::Merge(row),
-        },
-        failures,
+        }),
+        failure,
+    })
+}
+
+fn failed_plugin(path: &Path, message: &str) -> FailedPlugin {
+    FailedPlugin {
+        fingerprint: plugin_fingerprint(path),
+        message: message.to_owned(),
+    }
+}
+
+fn plugin_fingerprint(path: &Path) -> Option<PluginFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(PluginFingerprint {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
     })
 }
 
@@ -305,8 +364,8 @@ mod tests {
         )
         .unwrap();
         let result = process(&[first, second], &SpanOp::Insert(row()), "codex", "session").unwrap();
-        assert!(result.failures.is_empty());
-        let SpanOp::Insert(processed) = result.op else {
+        assert!(result.failure.is_none());
+        let Some(SpanOp::Insert(processed)) = result.op else {
             panic!("expected insert")
         };
         assert_eq!(
@@ -317,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_identity_changes_without_dropping_the_span() {
+    fn rejects_identity_changes_and_drops_the_operation() {
         let dir = tempfile::tempdir().unwrap();
         let plugin = dir.path().join("identity.mjs");
         std::fs::write(
@@ -326,14 +385,13 @@ mod tests {
         )
         .unwrap();
         let result = process(&[plugin], &SpanOp::Insert(row()), "codex", "session").unwrap();
-        assert_eq!(result.failures.len(), 1);
-        assert!(result.failures[0]
+        assert!(result
+            .failure
+            .as_ref()
+            .unwrap()
             .message
             .contains("immutable span identity"));
-        let SpanOp::Insert(processed) = result.op else {
-            panic!("expected insert")
-        };
-        assert_eq!(processed.span_id, "span");
+        assert!(result.op.is_none());
     }
 
     #[test]
@@ -343,7 +401,8 @@ mod tests {
         std::fs::write(&runaway, "export default span => { while (true) {} }").unwrap();
         let started = Instant::now();
         let result = process(&[runaway], &SpanOp::Insert(row()), "codex", "session").unwrap();
-        assert_eq!(result.failures.len(), 1);
+        assert!(result.failure.is_some());
+        assert!(result.op.is_none());
         assert!(started.elapsed() < Duration::from_secs(2));
 
         let asynchronous = dir.path().join("async.mjs");
@@ -353,17 +412,22 @@ mod tests {
         )
         .unwrap();
         let result = process(&[asynchronous], &SpanOp::Insert(row()), "codex", "session").unwrap();
-        assert_eq!(result.failures.len(), 1);
-        assert!(result.failures[0].message.contains("must be synchronous"));
+        assert!(result
+            .failure
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("must be synchronous"));
 
         let non_json = dir.path().join("non-json.mjs");
         std::fs::write(&non_json, "export default () => Symbol('not-json')").unwrap();
         let result = process(&[non_json], &SpanOp::Insert(row()), "codex", "session").unwrap();
-        assert_eq!(result.failures.len(), 1);
+        assert!(result.failure.is_some());
+        assert!(result.op.is_none());
     }
 
     #[test]
-    fn skips_only_the_failed_plugin_and_continues_the_chain() {
+    fn a_failed_plugin_keeps_dropping_without_running_later_plugins() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.mjs");
         let broken = dir.path().join("broken.mjs");
@@ -386,18 +450,17 @@ mod tests {
         let plugins = [first, broken.clone(), last];
 
         let first_result = process(&plugins, &SpanOp::Insert(row()), "codex", "session").unwrap();
-        assert_eq!(first_result.failures.len(), 1);
-        assert_eq!(first_result.failures[0].path, broken);
-        let SpanOp::Insert(first_row) = first_result.op else {
-            panic!("expected insert")
-        };
-        assert_eq!(first_row.name, "last:first:original");
+        let first_failure = first_result.failure.unwrap();
+        assert_eq!(first_failure.path, broken);
+        assert!(first_failure.newly_seen);
+        assert!(first_failure.message.contains("Error: broken"));
+        assert!(first_result.op.is_none());
 
         let second_result = process(&plugins, &SpanOp::Insert(row()), "codex", "session").unwrap();
-        assert!(second_result.failures.is_empty());
-        let SpanOp::Insert(second_row) = second_result.op else {
-            panic!("expected insert")
-        };
-        assert_eq!(second_row.name, "last:first:original");
+        let second_failure = second_result.failure.unwrap();
+        assert_eq!(second_failure.path, broken);
+        assert!(!second_failure.newly_seen);
+        assert_eq!(second_failure.message, first_failure.message);
+        assert!(second_result.op.is_none());
     }
 }

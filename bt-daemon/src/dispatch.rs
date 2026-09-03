@@ -531,28 +531,61 @@ impl SessionActor {
                         &self.session_id,
                     ) {
                         Ok(result) => {
-                            for failure in result.failures {
-                                self.set_error(format!(
-                                    "span plugin {} failed; disabled on this worker: {}",
-                                    failure.path.display(),
-                                    failure.message
-                                ));
+                            if let Some(failure) = result.failure {
+                                delivered = false;
+                                if failure.newly_seen {
+                                    if let Err(error) = crate::plugin_diagnostics::record(
+                                        &self.data_dir,
+                                        &self.source,
+                                        &failure.path,
+                                        &failure.message,
+                                    ) {
+                                        tracing::warn!(
+                                            session_id = %self.session_id,
+                                            "failed to persist span plugin diagnostic: {error}"
+                                        );
+                                    }
+                                    self.set_error(format!(
+                                        "span plugin {} failed; span operations are being discarded: {}",
+                                        failure.path.display(),
+                                        failure.message
+                                    ));
+                                }
                             }
-                            processed.push(result.op);
+                            if let Some(op) = result.op {
+                                processed.push(op);
+                            }
                         }
                         Err(error) => {
-                            self.set_error(format!("span plugin processor failed: {error}"));
-                            processed.push(op.clone());
+                            delivered = false;
+                            if let Some(plugin) = plugin_paths.first() {
+                                if let Err(diagnostic_error) = crate::plugin_diagnostics::record(
+                                    &self.data_dir,
+                                    &self.source,
+                                    plugin,
+                                    &error.to_string(),
+                                ) {
+                                    tracing::warn!(
+                                        session_id = %self.session_id,
+                                        "failed to persist span plugin diagnostic: {diagnostic_error}"
+                                    );
+                                }
+                            }
+                            self.set_error(format!(
+                                "span plugin processor failed; span operation discarded: {error}"
+                            ));
                         }
                     }
                 }
-                match sink.emit(&processed).await {
-                    Ok(n) => {
-                        self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        delivered = false;
-                        self.set_error(format!("{emit_error}: {e}"));
+                if !processed.is_empty() {
+                    match sink.emit(&processed).await {
+                        Ok(n) => {
+                            self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            delivered = false;
+                            self.set_error(format!("{emit_error}: {e}"));
+                        }
                     }
                 }
             }
