@@ -59,6 +59,116 @@ the default `bt` profile. Credentials and backend URLs are never stored here;
 production resolves and refreshes them through `bt`. `bt trace run` supplies a
 process-local settings overlay and never changes any of these files.
 
+### JavaScript span plugins
+
+`--plugin PATH` registers a synchronous ES module that transforms each
+sink-neutral span row after translation and immediately before delivery. Repeat
+the flag to compose plugins from left to right. `enable` persists its ordered list
+for ordinary agent sessions. Managed runs and imports are isolated from that
+list and use only the `--plugin` flags passed to their command. Each path is
+canonicalized to an absolute path before it is validated or stored.
+
+Each module must default-export a synchronous function. It receives a span and
+`{ operation, source, session_id, env }`, and must return a JSON-compatible span
+object. Span, root, and parent identities cannot be changed:
+
+```js
+// redact.mjs
+function redact(value) {
+  if (typeof value === "string") {
+    return value.replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED]");
+  }
+  if (Array.isArray(value)) return value.map(redact);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [key, redact(child)]),
+    );
+  }
+  return value;
+}
+
+export default function redactSpan(span) {
+  const next = { ...span };
+  for (const field of ["input", "output", "error"]) {
+    if (field in next) next[field] = redact(next[field]);
+  }
+  return next;
+}
+```
+
+The context can drive a second transform without changing the first one:
+
+```js
+// tag-ci.mjs
+export default function tagCi(span, context) {
+  if (!context.env.CI) return span;
+
+  return {
+    ...span,
+    tags: [...new Set([...(span.tags ?? []), "ci"])],
+    metadata: {
+      ...(span.metadata ?? {}),
+      deployment: context.env.DEPLOYMENT_ENV ?? "unknown",
+      trace_source: context.source,
+    },
+  };
+}
+```
+
+Register both transforms persistently for ordinary Codex sessions. The
+redactor runs first and its returned span becomes the tagger's input:
+
+```bash
+bt trace enable codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
+```
+
+`run` and `import` plugins apply only to that command. They replace, rather than
+merge with, plugins saved by `enable`:
+
+```bash
+# Only local.mjs runs; redact.mjs and tag-ci.mjs remain global enable behavior.
+bt trace run --plugin ./local.mjs codex -- "summarize this change"
+
+# Only sanitize-history.mjs transforms spans produced by this import.
+bt trace import codex SESSION_ID --plugin ./sanitize-history.mjs
+```
+
+The journal stores raw input events, not transformed spans. After daemon
+recovery, replayed events therefore pass through the resumed session's current
+route: ordinary sessions use the current globally configured plugins, while a
+managed session continues using only that run's isolated plugins.
+
+`context.operation` is `"insert"` or `"merge"`; `context.source` and
+`context.session_id` identify the translated event stream; and `context.env`
+contains the daemon process environment. Environment variable names are
+uppercased on Windows so common lookups such as `context.env.PATH` remain
+portable.
+
+The environment map is captured from the daemon process when each worker-local
+span processor is constructed. Plugins execute in bounded, thread-local
+QuickJS runtimes with no filesystem or network host APIs. Modules must be
+self-contained and transforms must be stateless: module globals belong to a
+worker thread, not a session. Every configured plugin is mandatory. If any
+plugin fails, the daemon discards that span operation instead of delivering
+untransformed data, and that worker continues discarding operations that would
+use the failed plugin. Modifying the plugin file causes workers to retry it. The
+raw event remains journaled, so restarting the daemon after fixing the plugin
+replays the withheld data through the current chain.
+
+Plugin failures are deduplicated in the daemon's private local state, including
+the raw QuickJS exception and stack. Inspect them with:
+
+```bash
+bt trace doctor codex
+```
+
+The doctor output reports the plugin path, exception, occurrence count, and
+timestamps. Managed-run diagnostics are copied out of their temporary daemon
+directory before it is removed.
+Plugins are trusted local code: although they have no host APIs, they can copy
+environment values into spans that are delivered to Braintrust. Read only the
+specific variables needed by the transform; never attach `context.env` itself.
+
 ### Additional root metadata
 
 `additional_metadata` is a JSON object merged into each traced session's root

@@ -178,6 +178,7 @@ async fn session_config(
         destination: route.destination.clone(),
         flush_mode: route.flush_mode,
         additional_metadata: route.additional_metadata.clone(),
+        span_plugins: route.span_plugins.clone(),
     })
 }
 
@@ -292,6 +293,24 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
         warnings.push(format!("authentication is unusable: {error}"));
     }
 
+    let plugin_diagnostics = match crate::plugin_diagnostics::read(&paths::data_dir(None)) {
+        Ok(diagnostics) => {
+            let mut diagnostics: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.source == source
+                        || (source == "claude" && diagnostic.source == "claude-code")
+                })
+                .collect();
+            diagnostics.sort_by_key(|diagnostic| std::cmp::Reverse(diagnostic.last_seen_ms));
+            diagnostics
+        }
+        Err(error) => {
+            warnings.push(format!("plugin diagnostics could not be read: {error}"));
+            Vec::new()
+        }
+    };
+
     DoctorCommandOutput {
         source: source.into(),
         display_name: args.agent.display_name().into(),
@@ -302,6 +321,7 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
         route,
         auth,
         warnings,
+        plugin_diagnostics,
     }
 }
 
@@ -319,6 +339,9 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             )
             .await?;
             apply_additional_metadata(&mut route, enable_args.additional_metadata.as_deref())?;
+            if !enable_args.plugin.is_empty() {
+                route.span_plugins = crate::resolve_span_plugin_paths(&enable_args.plugin)?;
+            }
             print_output(run_enable(enable_args, route)?, host.output_format)
         }
         TraceCommand::Disable(disable_args) => {
@@ -553,6 +576,7 @@ mod tests {
                 TraceCommand::Setup(SetupArgs {
                     agent: SetupAgent::OpenCode,
                     additional_metadata: None,
+                    plugin: Vec::new(),
                 }),
                 true,
             ),
@@ -560,6 +584,7 @@ mod tests {
                 TraceCommand::Run(RunArgs {
                     source: RunSource::Codex,
                     additional_metadata: None,
+                    plugin: Vec::new(),
                     agent_args: Vec::new(),
                 }),
                 false,
@@ -654,6 +679,7 @@ mod tests {
                 parent_project: None,
                 attach: false,
                 additional_metadata: None,
+                plugin: Vec::new(),
             };
             let error = run_trace(
                 TraceArgs {

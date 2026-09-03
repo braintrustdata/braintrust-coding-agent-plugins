@@ -149,6 +149,7 @@ async fn attached_import_summary_reports_the_effective_parent_root() {
         }),
         flush_mode: FlushMode::FireAndForget,
         additional_metadata: None,
+        span_plugins: Vec::new(),
     };
 
     let summaries = import_transcript(
@@ -163,6 +164,56 @@ async fn attached_import_summary_reports_the_effective_parent_root() {
 
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].root_span_id.as_deref(), Some(parent_root));
+}
+
+#[tokio::test]
+async fn import_uses_the_same_span_plugin_stage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("plugin-import.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"plugin-import","cwd":"/tmp/demo"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
+        ],
+    );
+    let plugin = tmp.path().join("import.mjs");
+    std::fs::write(
+        &plugin,
+        "export default span => ({...span, name: `imported:${span.name}`})",
+    )
+    .unwrap();
+    let output = tmp.path().join("spans");
+    import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        options(&output),
+        Some(SessionConfig {
+            auth: BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: None,
+            flush_mode: FlushMode::FireAndForget,
+            additional_metadata: None,
+            span_plugins: vec![plugin],
+        }),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let output = rows(&output.join("plugin-import.ndjson"));
+    assert!(output
+        .iter()
+        .filter_map(|op| op.get("Insert"))
+        .all(|row| row["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("imported:"))));
 }
 
 #[tokio::test]

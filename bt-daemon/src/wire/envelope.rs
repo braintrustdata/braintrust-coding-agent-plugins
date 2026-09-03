@@ -3,6 +3,7 @@
 
 use braintrust_sdk_rust::SpanComponents;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// One operating-system process observed while capturing an event.
 ///
@@ -146,6 +147,10 @@ pub struct SessionRoute {
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
+    /// Ordered JavaScript span transforms. Paths are resolved by explicit
+    /// setup, run, and import commands before entering a session route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub span_plugins: Vec<PathBuf>,
 }
 
 impl SessionRoute {
@@ -155,6 +160,7 @@ impl SessionRoute {
             destination: self.destination.clone(),
             flush_mode: self.flush_mode,
             additional_metadata: self.additional_metadata.clone(),
+            span_plugins: self.span_plugins.clone(),
         }
     }
 
@@ -171,6 +177,16 @@ impl SessionRoute {
         right.auth.source = right.auth.effective_source();
         serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
     }
+
+    /// Raw journal entries can be replayed through a newer plugin chain as
+    /// long as their Braintrust delivery route is otherwise unchanged.
+    pub fn same_replay_route(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.span_plugins.clear();
+        right.span_plugins.clear();
+        left.same_route(&right)
+    }
 }
 
 /// Trace settings and backend credentials resolved by the shim.
@@ -184,6 +200,8 @@ pub struct SessionConfig {
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub span_plugins: Vec<PathBuf>,
 }
 
 /// Where a session's root span should be logged.
@@ -368,6 +386,7 @@ mod tests {
                 destination: None,
                 flush_mode: FlushMode::FireAndForget,
                 additional_metadata: None,
+                span_plugins: Vec::new(),
             }),
         }
     }
