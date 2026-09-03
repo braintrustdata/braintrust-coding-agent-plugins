@@ -326,7 +326,9 @@ impl Daemon {
         // The actor streams the journal itself, so creating a session stays
         // cheap and allocation-free here no matter how long the recorded
         // session is. Bound it to what is recorded now, before this event is
-        // appended, so replay covers recovery only.
+        // appended, so replay covers prior source observations only. Every
+        // destination consumes that shared observation stream, with its own
+        // delivery checkpoint controlling which rows reach its sink.
         let journal_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
         let translator_session_id =
@@ -337,11 +339,20 @@ impl Daemon {
             } else {
                 crate::ids::session_namespace(&env.source, &env.session_id)
             };
+        let through = journal::JournalReader::recorded_len(&journal_path).await;
         let replay = ReplayPlan {
-            through: journal::JournalReader::recorded_len(&journal_path).await,
+            acknowledged_through: journal::JournalReader::acknowledged_through(
+                &journal_path,
+                through,
+                route,
+            )
+            .await,
+            through,
             journal_path,
-            route: route.clone(),
         };
+        let journal = self
+            .journal_writer_for(&env.source, &env.session_id)
+            .await?;
         let mut map = self.sessions.lock().unwrap();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
@@ -358,6 +369,7 @@ impl Daemon {
                 route: route.clone(),
                 correlation: self.correlation.clone(),
                 data_dir: self.data_dir.clone(),
+                journal,
             },
             self.translators.clone(),
             self.sink_factory.clone(),
@@ -424,29 +436,36 @@ impl Daemon {
             .collect()
     }
 
-    async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<()> {
+    async fn journal_writer_for(
+        &self,
+        source: &str,
+        session_id: &str,
+    ) -> anyhow::Result<Arc<tokio::sync::Mutex<JournalWriter>>> {
+        let storage_key = crate::ids::session_namespace(source, session_id);
+        if let Some(writer) = self.journals.lock().unwrap().get(&storage_key).cloned() {
+            return Ok(writer);
+        }
+        let path = journal::ensure_source_journal(&self.data_dir, source, session_id).await?;
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            JournalWriter::open_path(&path).await?,
+        ));
+        Ok(self
+            .journals
+            .lock()
+            .unwrap()
+            .entry(storage_key)
+            .or_insert_with(|| writer.clone())
+            .clone())
+    }
+
+    async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<u64> {
         hydrate_transcript_reference(&self.data_dir, env).await;
-        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
-        let existing = { self.journals.lock().unwrap().get(&storage_key).cloned() };
-        let writer = match existing {
-            Some(writer) => writer,
-            None => {
-                let path =
-                    journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id)
-                        .await?;
-                let writer = Arc::new(tokio::sync::Mutex::new(
-                    JournalWriter::open_path(&path).await?,
-                ));
-                self.journals
-                    .lock()
-                    .unwrap()
-                    .entry(storage_key)
-                    .or_insert_with(|| writer.clone())
-                    .clone()
-            }
-        };
-        let result = writer.lock().await.append(env).await;
-        result
+        self.journal_writer_for(&env.source, &env.session_id)
+            .await?
+            .lock()
+            .await
+            .append(env)
+            .await
     }
 
     fn session_lock(&self, source: &str, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1195,12 +1214,12 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Resul
         daemon
             .correlation
             .observe_session(&delivery_key.correlation_key(), env.capture.as_ref());
-        daemon
+        let journal_through = daemon
             .append_to_journal(&mut env)
             .await
             .map_err(|error| format!("journal failed: {error}"))?;
         session
-            .enqueue(env)
+            .enqueue(env, journal_through)
             .await
             .map_err(|error| format!("enqueue failed: {error}"))?;
         Ok(delivery_key)

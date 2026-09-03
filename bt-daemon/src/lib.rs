@@ -15,6 +15,7 @@ pub mod paths;
 mod client;
 mod command_output;
 mod correlation;
+mod delivery_ledger;
 mod dispatch;
 mod ids;
 mod journal;
@@ -558,10 +559,19 @@ pub async fn run_import(
         .or_else(|| args.destination.clone());
     apply_import_destination(&mut config, destination)?;
     let files = transcript_import::resolve_transcripts(&args.session_ids, args.all, args.source)?;
+    let ledger_dir = paths::data_dir(None);
     if args.attach {
-        return import_transcript(&files[0], args.source, opts, config, true).await;
+        return import_transcript_with_ledger(
+            &files[0],
+            args.source,
+            opts,
+            config,
+            true,
+            Some(ledger_dir),
+        )
+        .await;
     }
-    import_transcripts(&files, args.source, opts, config).await
+    import_transcripts_with_ledger(&files, args.source, opts, config, Some(ledger_dir)).await
 }
 
 fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
@@ -972,8 +982,19 @@ pub async fn import_transcript(
     config: Option<SessionConfig>,
     attach: bool,
 ) -> anyhow::Result<Vec<ImportSummary>> {
+    import_transcript_with_ledger(file, source, opts, config, attach, None).await
+}
+
+async fn import_transcript_with_ledger(
+    file: &std::path::Path,
+    source: ImportSource,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    attach: bool,
+    ledger_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
-    let mut processor = ImportProcessor::new(opts, config);
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut finalizing = !attach;
@@ -1007,7 +1028,17 @@ pub async fn import_transcripts(
     opts: ServeOptions,
     config: Option<SessionConfig>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
-    let mut processor = ImportProcessor::new(opts, config);
+    import_transcripts_with_ledger(files, source, opts, config, None).await
+}
+
+async fn import_transcripts_with_ledger(
+    files: &[PathBuf],
+    source: ImportSource,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    ledger_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
     let mut summaries = Vec::new();
     for file in files {
         let mut tail = transcript_import::TranscriptTail::new(file.clone(), source);
@@ -1044,14 +1075,16 @@ struct ImportProcessor {
     sessions: std::collections::HashMap<String, ImportLive>,
     opts: ServeOptions,
     config: Option<SessionConfig>,
+    ledger_dir: Option<PathBuf>,
 }
 
 impl ImportProcessor {
-    fn new(opts: ServeOptions, config: Option<SessionConfig>) -> Self {
+    fn new(opts: ServeOptions, config: Option<SessionConfig>, ledger_dir: Option<PathBuf>) -> Self {
         Self {
             sessions: std::collections::HashMap::new(),
             opts,
             config,
+            ledger_dir,
         }
     }
 
@@ -1068,6 +1101,19 @@ impl ImportProcessor {
                         &env.source,
                         env.plugin_version.as_deref(),
                     )?;
+                    let sink: Box<dyn Sink> = match &self.ledger_dir {
+                        Some(ledger_dir) => Box::new(
+                            delivery_ledger::LedgerSink::new(
+                                sink,
+                                ledger_dir,
+                                &env.source,
+                                &sid,
+                                env.config.as_ref(),
+                            )
+                            .await,
+                        ),
+                        None => sink,
+                    };
                     self.sessions.insert(
                         sid.clone(),
                         ImportLive {
@@ -1276,6 +1322,7 @@ fn add_transcript_observation(payload: &mut serde_json::Value, field: &str) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use serde_json::json;
 
     #[derive(Debug, Parser)]
     struct ImportCli {
@@ -1479,6 +1526,99 @@ mod tests {
         assert!(error
             .to_string()
             .contains("import destination requires a resolved Braintrust session configuration"));
+    }
+
+    fn import_test_config(project_id: &str) -> SessionConfig {
+        SessionConfig {
+            auth: wire::BackendAuth {
+                token: "test".into(),
+                api_url: Some("https://api.example.test".into()),
+                app_url: None,
+                org_name: Some("test-org".into()),
+                org_id: Some("test-org-id".into()),
+            },
+            destination: Some(wire::TraceDestination::ProjectLogs {
+                project_id: Some(project_id.into()),
+                project_name: None,
+            }),
+            flush_mode: wire::FlushMode::FireAndForget,
+            additional_metadata: None,
+        }
+    }
+
+    fn imported_terminal_span_ids(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|op| {
+                let row = op.get("Insert").or_else(|| op.get("Merge"))?;
+                row.get("end_ms")?.as_i64()?;
+                row.get("span_id")?.as_str().map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn imports_share_destination_delivery_ledger_and_replay_to_new_destinations() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"ledger-import","cwd":"/tmp/demo"}}),
+                json!({"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-test"}}),
+                json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+                json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
+            ),
+        )
+        .unwrap();
+        let ledger_dir = temp.path().join("ledger");
+        let first_output = temp.path().join("first");
+        import_transcript_with_ledger(
+            &transcript,
+            ImportSource::Codex,
+            debug_serve_options("test", &first_output),
+            Some(import_test_config("project-a")),
+            false,
+            Some(ledger_dir.clone()),
+        )
+        .await
+        .unwrap();
+        let spans = first_output.join("spans/ledger-import.ndjson");
+        let first_terminals = imported_terminal_span_ids(&spans);
+        assert!(!first_terminals.is_empty());
+        let first_operations = std::fs::read_to_string(&spans).unwrap();
+
+        import_transcript_with_ledger(
+            &transcript,
+            ImportSource::Codex,
+            debug_serve_options("test", &first_output),
+            Some(import_test_config("project-a")),
+            false,
+            Some(ledger_dir.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(imported_terminal_span_ids(&spans), first_terminals);
+        assert_eq!(std::fs::read_to_string(&spans).unwrap(), first_operations);
+
+        let second_output = temp.path().join("second");
+        import_transcript_with_ledger(
+            &transcript,
+            ImportSource::Codex,
+            debug_serve_options("test", &second_output),
+            Some(import_test_config("project-b")),
+            false,
+            Some(ledger_dir),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            imported_terminal_span_ids(&second_output.join("spans/ledger-import.ndjson")),
+            first_terminals
+        );
     }
 
     fn test_run_hook_command() -> RunHookCommand {
