@@ -121,6 +121,131 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
 }
 
 #[test]
+fn opencode_compaction_replaces_old_prefix_and_preserves_native_tail() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = vec![
+        event(
+            "session.created",
+            1,
+            json!({"properties":{"info":{"id":"native"}}}),
+        ),
+        event(
+            "chat.message",
+            2,
+            json!({"input":{"sessionID":"native"},"output":{"message":{"id":"old-user"},"parts":[{"type":"text","text":"old question"}]}}),
+        ),
+        event(
+            "message.part.updated",
+            3,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"old-assistant","type":"text","text":"old answer","time":{"end":3}}}}),
+        ),
+        event(
+            "message.updated",
+            4,
+            json!({"properties":{"info":{"id":"old-assistant","sessionID":"native","role":"assistant","providerID":"openai","modelID":"gpt-5","time":{"created":2,"completed":4},"tokens":{}}}}),
+        ),
+        event(
+            "chat.message",
+            5,
+            json!({"input":{"sessionID":"native"},"output":{"message":{"id":"recent-user"},"parts":[{"type":"text","text":"recent question"}]}}),
+        ),
+        event(
+            "message.part.updated",
+            6,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"recent-assistant","type":"text","text":"recent answer"}}}),
+        ),
+        event(
+            "message.part.updated",
+            7,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"recent-assistant","type":"tool","callID":"tool-1","tool":"read","state":{"status":"completed","input":{"path":"README.md"},"output":"contents"}}}}),
+        ),
+        event(
+            "message.updated",
+            8,
+            json!({"properties":{"info":{"id":"recent-assistant","sessionID":"native","role":"assistant","providerID":"openai","modelID":"gpt-5","time":{"created":5,"completed":8},"tokens":{}}}}),
+        ),
+        event(
+            "message.updated",
+            9,
+            json!({"properties":{"info":{"id":"compact-trigger","sessionID":"native","role":"user","time":{"created":9}}}}),
+        ),
+        event(
+            "message.part.updated",
+            10,
+            json!({"properties":{"part":{"id":"compaction-part","sessionID":"native","messageID":"compact-trigger","type":"compaction","auto":true,"overflow":false,"tail_start_id":"recent-user"}}}),
+        ),
+        event(
+            "message.part.updated",
+            11,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"compact-summary","type":"text","text":"summary of old work","time":{"end":11}}}}),
+        ),
+        event(
+            "message.updated",
+            12,
+            json!({"properties":{"info":{"id":"compact-summary","parentID":"compact-trigger","sessionID":"native","role":"assistant","mode":"compaction","summary":true,"providerID":"openai","modelID":"gpt-5","time":{"created":10,"completed":12},"tokens":{}}}}),
+        ),
+        event(
+            "session.compacted",
+            13,
+            json!({"properties":{"sessionID":"native"}}),
+        ),
+        event(
+            "message.updated",
+            14,
+            json!({"properties":{"info":{"id":"continue-user","sessionID":"native","role":"user","time":{"created":14}}}}),
+        ),
+        event(
+            "message.part.updated",
+            15,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"continue-user","type":"text","text":"Continue if there are next steps","synthetic":true}}}),
+        ),
+        event(
+            "message.part.updated",
+            16,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"new-assistant","type":"text","text":"new answer","time":{"end":16}}}}),
+        ),
+        event(
+            "message.updated",
+            17,
+            json!({"properties":{"info":{"id":"new-assistant","sessionID":"native","role":"assistant","providerID":"openai","modelID":"gpt-5","time":{"created":15,"completed":17},"tokens":{}}}}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for event in events {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let llm = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm
+                && row.metadata.as_ref().unwrap()["message_id"] == "new-assistant"
+        })
+        .unwrap();
+    let messages = llm.input.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[0]["message_type"], "compaction_summary");
+    assert_eq!(messages[0]["content"], "summary of old work");
+    assert_eq!(messages[1]["content"], "recent question");
+    assert_eq!(messages[2]["content"], "recent answer");
+    assert_eq!(messages[2]["tool_calls"][0]["id"], "tool-1");
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["content"], "contents");
+    assert_eq!(messages[4]["content"], "Continue if there are next steps");
+    assert!(!messages.iter().any(|message| {
+        matches!(
+            message.get("content").and_then(serde_json::Value::as_str),
+            Some("old question" | "old answer")
+        )
+    }));
+}
+
+#[test]
 fn opencode_child_sessions_share_the_parent_trace_root() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("opencode", "root-session");

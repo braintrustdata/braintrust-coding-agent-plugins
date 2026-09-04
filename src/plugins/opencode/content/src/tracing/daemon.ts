@@ -17,6 +17,7 @@ interface TracingRouteConfig {
 const FORWARDED_NATIVE_EVENTS = new Set([
   "session.created",
   "session.idle",
+  "session.compacted",
   "session.deleted",
   "session.error",
   "message.part.updated",

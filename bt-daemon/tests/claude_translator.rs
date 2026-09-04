@@ -777,7 +777,7 @@ fn claude_large_catch_up_emits_one_historical_snapshot_per_batch() {
 }
 
 #[test]
-fn claude_post_compact_advances_llm_history_to_summary() {
+fn claude_post_compact_replaces_old_prefix_and_preserves_recent_window() {
     let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
         .unwrap()
         .timestamp_millis();
@@ -795,6 +795,36 @@ fn claude_post_compact_advances_llm_history_to_summary() {
             "uuid":"old-assistant",
             "timestamp":"2026-01-01T00:00:02Z",
             "message":{"id":"old-request","model":"claude-test","role":"assistant","content":[{"type":"text","text":"old answer"}],"usage":{"input_tokens":1,"output_tokens":1}}
+        }),
+        json!({
+            "type":"user",
+            "uuid":"recent-user",
+            "timestamp":"2026-01-01T00:00:02.100Z",
+            "message":{"role":"user","content":"recent question"}
+        }),
+        json!({
+            "type":"assistant",
+            "uuid":"recent-assistant-text",
+            "timestamp":"2026-01-01T00:00:02.200Z",
+            "message":{"id":"recent-request","model":"claude-test","role":"assistant","content":[{"type":"text","text":"recent answer"}],"usage":{"input_tokens":1,"output_tokens":1}}
+        }),
+        json!({
+            "type":"assistant",
+            "uuid":"recent-assistant-tool",
+            "timestamp":"2026-01-01T00:00:02.300Z",
+            "message":{"id":"recent-request","model":"claude-test","role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"README.md"}}],"usage":{"input_tokens":1,"output_tokens":1}}
+        }),
+        json!({
+            "type":"user",
+            "uuid":"recent-tool-result",
+            "timestamp":"2026-01-01T00:00:02.400Z",
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"contents"}]}
+        }),
+        json!({
+            "type":"attachment",
+            "uuid":"recent-attachment",
+            "timestamp":"2026-01-01T00:00:02.500Z",
+            "message":{"role":"user","content":"attachment metadata"}
         }),
     ];
     std::fs::write(
@@ -848,11 +878,34 @@ fn claude_post_compact_advances_llm_history_to_summary() {
             "timestamp":"2026-01-01T00:00:03Z",
             "compactMetadata":{
                 "trigger":"manual",
-                "preservedMessages":{"uuids":["old-assistant"]}
+                "preservedSegment":{
+                    "headUuid":"recent-user",
+                    "anchorUuid":"compact-summary",
+                    "tailUuid":"recent-attachment"
+                },
+                "preservedMessages":{
+                    "anchorUuid":"compact-summary",
+                    "uuids":[
+                        "recent-user",
+                        "recent-assistant-text",
+                        "recent-assistant-tool",
+                        "recent-tool-result",
+                        "recent-attachment"
+                    ],
+                    "allUuids":[
+                        "recent-user",
+                        "recent-assistant-text",
+                        "recent-assistant-tool",
+                        "recent-tool-result",
+                        "internal-queue-record",
+                        "recent-attachment"
+                    ]
+                }
             }
         }),
         json!({
             "type":"user",
+            "uuid":"compact-summary",
             "isCompactSummary":true,
             "timestamp":"2026-01-01T00:00:04Z",
             "message":{"role":"user","content":"compact summary"}
@@ -924,16 +977,22 @@ fn claude_post_compact_advances_llm_history_to_summary() {
         })
         .unwrap();
     let messages = llm.input.as_ref().unwrap().as_array().unwrap();
-    assert_eq!(messages.len(), 3);
+    assert_eq!(messages.len(), 5);
     assert_eq!(messages[0]["message_type"], "compaction_summary");
     assert_eq!(messages[0]["content"], "compact summary");
-    assert_eq!(messages[1]["role"], "assistant");
-    assert_eq!(messages[1]["content"], "old answer");
-    assert_eq!(messages[2]["content"], "new question");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "recent question");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["content"], "recent answer");
+    assert_eq!(messages[2]["tool_calls"][0]["id"], "tool-1");
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "tool-1");
+    assert_eq!(messages[3]["content"], "contents");
+    assert_eq!(messages[4]["content"], "new question");
     assert!(!messages.iter().any(|message| {
         matches!(
             message.get("content").and_then(Value::as_str),
-            Some("old question")
+            Some("old question" | "old answer" | "attachment metadata")
         )
     }));
 }
