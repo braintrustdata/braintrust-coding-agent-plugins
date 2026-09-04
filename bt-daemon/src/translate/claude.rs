@@ -52,6 +52,7 @@ struct TranscriptCursor {
 
 struct Subagent {
     span_id: String,
+    parent_span_id: String,
     transcript_path: Option<String>,
 }
 
@@ -78,6 +79,7 @@ struct ClaudeTranslator {
     session_id: String,
     session_span_id: String,
     root_span_id: String,
+    session_parent_span_ids: Vec<String>,
     root_open: bool,
     root_ended: bool,
     turn: Option<Turn>,
@@ -108,6 +110,7 @@ impl ClaudeTranslator {
             session_id: session_id.to_string(),
             session_span_id: root.clone(),
             root_span_id: root,
+            session_parent_span_ids: Vec::new(),
             root_open: false,
             root_ended: false,
             turn: None,
@@ -145,6 +148,7 @@ impl ClaudeTranslator {
         if let Some(root) = root_span_id {
             self.root_span_id = root.clone();
         }
+        self.session_parent_span_ids = parent_span_id.into_iter().collect();
         let cwd = string_field(&event.payload, "cwd").unwrap_or_default();
         let workspace = basename(&cwd);
         let mut metadata = ctx
@@ -180,7 +184,7 @@ impl ClaudeTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: parent_span_id.into_iter().collect(),
+            parent_span_ids: self.session_parent_span_ids.clone(),
             name: format!("Claude Code: {workspace}"),
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
@@ -216,6 +220,7 @@ impl ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: old.id,
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![self.session_span_id.clone()],
                 end_ms: Some(event.ts_ms),
                 ..Default::default()
             }));
@@ -279,6 +284,7 @@ impl ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.id.clone(),
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![self.session_span_id.clone()],
                 metadata: explicit_skill_metadata(&self.pending_skills),
                 ..Default::default()
             }));
@@ -324,6 +330,7 @@ impl ClaudeTranslator {
             agent_id.to_string(),
             Subagent {
                 span_id: span_id.clone(),
+                parent_span_id: parent_id,
                 transcript_path: None,
             },
         );
@@ -378,6 +385,7 @@ impl ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: pending.span_id,
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![pending.parent_id],
                 end_ms: Some(event.ts_ms),
                 output,
                 metadata: Some(metadata),
@@ -424,6 +432,11 @@ impl ClaudeTranslator {
             return;
         };
         let parent = self.ensure_subagent(&agent_id, event, ops);
+        let parent_span_ids = self
+            .subagents
+            .get(&agent_id)
+            .map(|agent| vec![agent.parent_span_id.clone()])
+            .unwrap_or_else(|| vec![self.session_span_id.clone()]);
         let path = string_field(&event.payload, "agent_transcript_path");
         if let Some(agent) = self.subagents.get_mut(&agent_id) {
             agent.transcript_path = path.clone();
@@ -453,6 +466,7 @@ impl ClaudeTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: parent.clone(),
             root_span_id: self.root_span_id.clone(),
+            parent_span_ids,
             end_ms: Some(event.ts_ms),
             output: event.payload.get("last_assistant_message").cloned(),
             ..Default::default()
@@ -618,6 +632,7 @@ impl ClaudeTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn_id.clone(),
             root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![self.session_span_id.clone()],
             end_ms: Some(event.ts_ms),
             output: event
                 .payload
@@ -652,6 +667,7 @@ impl ClaudeTranslator {
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id: tool.span_id,
                     root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: vec![tool.parent_id],
                     end_ms: Some(end_ms),
                     error: Some(error.to_string()),
                     ..Default::default()
@@ -679,6 +695,7 @@ impl ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.id.clone(),
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![self.session_span_id.clone()],
                 end_ms: Some(event.ts_ms),
                 ..Default::default()
             }));
@@ -689,6 +706,7 @@ impl ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: self.session_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: self.session_parent_span_ids.clone(),
                 end_ms: Some(event.ts_ms),
                 ..Default::default()
             }));
@@ -720,6 +738,7 @@ impl AgentTranslator for ClaudeTranslator {
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id: self.session_span_id.clone(),
                     root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: self.session_parent_span_ids.clone(),
                     metadata: Some(json!({ "claude_code_version": version })),
                     ..Default::default()
                 }));
@@ -789,6 +808,7 @@ impl AgentTranslator for ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: tool.span_id,
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![tool.parent_id],
                 end_ms: Some(end_ms),
                 error: Some("Session ended before tool completion".into()),
                 ..Default::default()
@@ -798,6 +818,7 @@ impl AgentTranslator for ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.id,
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![self.session_span_id.clone()],
                 end_ms: Some(end_ms),
                 error: Some("Session ended before turn completion".into()),
                 ..Default::default()
@@ -807,6 +828,7 @@ impl AgentTranslator for ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: subagent.span_id,
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![subagent.parent_span_id],
                 end_ms: Some(end_ms),
                 error: Some("Session ended before subagent completion".into()),
                 ..Default::default()
@@ -817,6 +839,7 @@ impl AgentTranslator for ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: self.session_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: self.session_parent_span_ids.clone(),
                 end_ms: Some(end_ms),
                 ..Default::default()
             }));

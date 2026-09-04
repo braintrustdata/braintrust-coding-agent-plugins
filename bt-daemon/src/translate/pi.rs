@@ -473,11 +473,7 @@ impl PiTranslator {
         let row = SpanRow {
             span_id: ids::span_id(&self.session_id, &format!("tool:{}:{call}", self.turn_seq)),
             root_span_id: self.effective_root_span_id.clone(),
-            parent_span_ids: pending
-                .is_none()
-                .then(|| turn.clone())
-                .into_iter()
-                .collect(),
+            parent_span_ids: vec![turn.clone()],
             name,
             span_type: SpanType::Tool,
             start_ms: pending.is_none().then_some(tracked.start_ms),
@@ -554,6 +550,7 @@ impl PiTranslator {
         vec![SpanOp::Merge(SpanRow {
             span_id: id,
             root_span_id: self.effective_root_span_id.clone(),
+            parent_span_ids: vec![self.root_span_id.clone()],
             end_ms: Some(ts),
             error,
             ..Default::default()
@@ -566,6 +563,7 @@ impl PiTranslator {
         SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
+            parent_span_ids: self.external_parent.clone().into_iter().collect(),
             end_ms: Some(ts),
             metadata: Some(
                 json!({"total_turns":self.turn_seq,"total_tool_calls":self.total_tools}),

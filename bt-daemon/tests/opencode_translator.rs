@@ -1,6 +1,11 @@
-use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute};
+#[path = "support/span_identity.rs"]
+mod span_identity;
+
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::json;
+use span_identity::assert_merges_preserve_insert_identity;
 use std::collections::HashMap;
 
 fn event(name: &str, ts_ms: i64, payload: serde_json::Value) -> Envelope {
@@ -20,6 +25,7 @@ fn event(name: &str, ts_ms: i64, payload: serde_json::Value) -> Envelope {
 }
 
 fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
+    assert_merges_preserve_insert_identity(&ops);
     let mut rows = HashMap::new();
     for op in ops {
         match op {
@@ -140,6 +146,18 @@ fn opencode_child_sessions_share_the_parent_trace_root() {
         .unwrap();
     ops.extend(translator.handle(&event("chat.message", 2, json!({"input":{"sessionID":"parent"},"output":{"parts":[{"type":"text","text":"delegate"}]}})), &ctx).unwrap());
     ops.extend(translator.handle(&event("session.created", 3, json!({"properties":{"info":{"id":"child","parentID":"parent","title":"find docs (@research subagent)"}}})), &ctx).unwrap());
+    ops.extend(
+        translator
+            .handle(
+                &event(
+                    "session.deleted",
+                    4,
+                    json!({"properties":{"sessionID":"child"}}),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
     let rows = reduce(ops);
     let parent = rows.values().find(|r| r.name == "OpenCode").unwrap();
     let child = rows
@@ -154,10 +172,14 @@ fn opencode_child_sessions_share_the_parent_trace_root() {
 fn opencode_additional_metadata_reaches_roots_without_overriding_session_fields() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("opencode", "root-session");
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
     let ctx = SessionCtx {
         session_id: "root-session".into(),
         config: Some(
             SessionRoute {
+                destination: Some(TraceDestination::ParentSpan { components }),
                 additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
                 ..SessionRoute::default()
             }
@@ -170,21 +192,44 @@ fn opencode_additional_metadata_reaches_roots_without_overriding_session_fields(
             }),
         ),
     };
-    let rows = reduce(
+    let mut ops = translator
+        .handle(
+            &event(
+                "session.created",
+                1,
+                json!({"properties":{"info":{"id":"native"}}}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(
         translator
             .handle(
                 &event(
-                    "session.created",
-                    1,
-                    json!({"properties":{"info":{"id":"native"}}}),
+                    "session.deleted",
+                    2,
+                    json!({"properties":{"sessionID":"native"}}),
                 ),
                 &ctx,
             )
             .unwrap(),
     );
+    let inserted_root = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "OpenCode" => Some(row),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(inserted_root.metadata.as_ref().unwrap()["team"], "platform");
+    assert_eq!(
+        inserted_root.metadata.as_ref().unwrap()["source"],
+        "opencode"
+    );
+    let rows = reduce(ops);
     let root = rows.values().next().unwrap();
-    assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
-    assert_eq!(root.metadata.as_ref().unwrap()["source"], "opencode");
+    assert_eq!(root.root_span_id, "external-root");
+    assert_eq!(root.parent_span_ids, ["external-parent"]);
 }
 
 #[test]
@@ -235,6 +280,7 @@ fn opencode_finalization_closes_a_missing_tool_completion() {
         session_id: "root-session".into(),
         config: None,
     };
+    let mut ops = Vec::new();
     for envelope in [
         event("chat.message", 1, json!({"input":{"sessionID":"native"}})),
         event(
@@ -242,13 +288,15 @@ fn opencode_finalization_closes_a_missing_tool_completion() {
             2,
             json!({"input":{"sessionID":"native","callID":"call","tool":"read"},"output":{"args":{"path":"x"}}}),
         ),
+        event("chat.message", 3, json!({"input":{"sessionID":"native"}})),
     ] {
-        translator.handle(&envelope, &ctx).unwrap();
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
     }
-    let ops = translator.finalize(&ctx).unwrap();
+    ops.extend(translator.finalize(&ctx).unwrap());
+    assert_merges_preserve_insert_identity(&ops);
     assert!(ops.iter().any(|op| matches!(
         op,
-        SpanOp::Merge(row) if row.end_ms == Some(2) && row.error.is_some()
+        SpanOp::Merge(row) if row.end_ms == Some(3) && row.error.is_some()
     )));
 }
 

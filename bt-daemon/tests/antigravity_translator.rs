@@ -1,6 +1,11 @@
-use bt_daemon::wire::Envelope;
+#[path = "support/span_identity.rs"]
+mod span_identity;
+
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
+use span_identity::assert_merges_preserve_insert_identity;
 use std::collections::HashMap;
 
 fn jsonl(records: &[Value]) -> (String, Vec<u64>) {
@@ -59,6 +64,7 @@ fn event(
 }
 
 fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
+    assert_merges_preserve_insert_identity(&ops);
     let mut rows: HashMap<String, SpanRow> = HashMap::new();
     for op in ops {
         match op {
@@ -107,6 +113,51 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
         }
     }
     rows
+}
+
+#[test]
+fn attached_antigravity_root_merge_preserves_external_identity() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("antigravity", "conversation-1");
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    let ctx = SessionCtx {
+        session_id: "conversation-1".into(),
+        config: Some(
+            SessionRoute {
+                destination: Some(TraceDestination::ParentSpan { components }),
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
+    };
+    let ops = translator
+        .handle(
+            &event(
+                "Stop",
+                1,
+                "/tmp/test-antigravity/transcript.jsonl",
+                "",
+                0,
+                json!({"fullyIdle":true}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    let rows = reduce(ops);
+    let root = rows
+        .values()
+        .find(|row| row.name.starts_with("Antigravity:"))
+        .unwrap();
+    assert_eq!(root.root_span_id, "external-root");
+    assert_eq!(root.parent_span_ids, ["external-parent"]);
 }
 
 #[test]

@@ -1,6 +1,11 @@
-use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute};
+#[path = "support/span_identity.rs"]
+mod span_identity;
+
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::json;
+use span_identity::assert_merges_preserve_insert_identity;
 use std::collections::HashMap;
 
 fn event(name: &str, ts_ms: i64, native: serde_json::Value) -> Envelope {
@@ -20,6 +25,7 @@ fn event(name: &str, ts_ms: i64, native: serde_json::Value) -> Envelope {
 }
 
 fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
+    assert_merges_preserve_insert_identity(&ops);
     let mut rows = HashMap::new();
     for op in ops {
         match op {
@@ -146,10 +152,14 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
 fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("pi", "pi-session");
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
     let ctx = SessionCtx {
         session_id: "pi-session".into(),
         config: Some(
             SessionRoute {
+                destination: Some(TraceDestination::ParentSpan { components }),
                 additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
                 ..SessionRoute::default()
             }
@@ -162,18 +172,34 @@ fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
             }),
         ),
     };
-    let mut event = event("session_start", 1, json!({"reason":"new"}));
-    event.payload["trace_settings"] = json!({
+    let mut start_event = event("session_start", 1, json!({"reason":"new"}));
+    start_event.payload["trace_settings"] = json!({
         "additional_metadata": {"team": "payload"},
         "parent_span_id": "payload-parent",
         "root_span_id": "payload-root",
     });
-    let rows = reduce(translator.handle(&event, &ctx).unwrap());
+    let mut ops = translator.handle(&start_event, &ctx).unwrap();
+    ops.extend(
+        translator
+            .handle(
+                &event("session_shutdown", 2, json!({"reason":"quit"})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    let inserted_root = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "Pi" => Some(row),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(inserted_root.metadata.as_ref().unwrap()["team"], "platform");
+    assert_eq!(inserted_root.metadata.as_ref().unwrap()["source"], "pi");
+    let rows = reduce(ops);
     let root = rows.values().next().unwrap();
-    assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
-    assert_eq!(root.metadata.as_ref().unwrap()["source"], "pi");
-    assert!(root.parent_span_ids.is_empty());
-    assert_eq!(root.root_span_id, root.span_id);
+    assert_eq!(root.parent_span_ids, ["external-parent"]);
+    assert_eq!(root.root_span_id, "external-root");
 }
 
 #[test]

@@ -1,6 +1,11 @@
-use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute};
+#[path = "support/span_identity.rs"]
+mod span_identity;
+
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
+use span_identity::assert_merges_preserve_insert_identity;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -95,6 +100,7 @@ fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
 }
 
 fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
+    assert_merges_preserve_insert_identity(&ops);
     let mut rows = HashMap::<String, SpanRow>::new();
     for op in ops {
         match op {
@@ -243,10 +249,14 @@ fn claude_real_fixture_matches_session_turn_tool_and_token_contract() {
 fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", "session");
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
     let ctx = SessionCtx {
         session_id: "session".into(),
         config: Some(
             SessionRoute {
+                destination: Some(TraceDestination::ParentSpan { components }),
                 additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
                 ..SessionRoute::default()
             }
@@ -259,33 +269,32 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
             }),
         ),
     };
-    let ops = translator
-        .handle(
-            &Envelope {
-                source: "claude-code".into(),
-                source_version: None,
-                plugin_version: None,
-                session_id: "session".into(),
-                event: "UserPromptSubmit".into(),
-                ts_ms: 1,
-                managed_run_id: None,
-                payload: json!({"session_id":"session","cwd":"/workspace","prompt":"go"}),
-                route: None,
-                config: None,
-                capture: None,
-            },
-            &ctx,
-        )
+    let event = |name: &str, ts_ms: i64| Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "session".into(),
+        event: name.into(),
+        ts_ms,
+        managed_run_id: None,
+        payload: json!({"session_id":"session","cwd":"/workspace","prompt":"go"}),
+        route: None,
+        config: None,
+        capture: None,
+    };
+    let mut ops = translator
+        .handle(&event("UserPromptSubmit", 1), &ctx)
         .unwrap();
-    let root = ops
-        .into_iter()
-        .find_map(|op| match op {
-            SpanOp::Insert(row) if row.name.starts_with("Claude Code:") => Some(row),
-            _ => None,
-        })
+    ops.extend(translator.handle(&event("SessionEnd", 2), &ctx).unwrap());
+    let rows = reduce(ops);
+    let root = rows
+        .values()
+        .find(|row| row.name.starts_with("Claude Code:"))
         .unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
     assert_eq!(root.metadata.as_ref().unwrap()["source"], "claude-code");
+    assert_eq!(root.root_span_id, "external-root");
+    assert_eq!(root.parent_span_ids, ["external-parent"]);
 }
 
 #[test]
