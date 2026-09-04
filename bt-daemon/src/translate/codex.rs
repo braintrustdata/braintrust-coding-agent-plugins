@@ -109,7 +109,7 @@ struct Scope {
     model: Option<String>,
     current_cwd: Option<String>,
     open_turns: Vec<OpenTurn>,
-    conversation_history: Vec<Value>,
+    message_history: Vec<Value>,
     open_llm: Option<OpenLlm>,
     open_tools: HashMap<String, (String, String)>, // call_id -> (tool span_id, turn_id)
     last_turn_end_ms: Option<i64>,
@@ -724,7 +724,7 @@ impl CodexTranslator {
         let Some(index) = index else {
             return;
         };
-        let input = Value::Array(scope.conversation_history.clone());
+        let input = Value::Array(scope.message_history.clone());
         let turn = &mut scope.open_turns[index];
         let seq = turn.llm_seq;
         turn.llm_seq += 1;
@@ -788,7 +788,7 @@ impl CodexTranslator {
                 }
             }
         }
-        scope.conversation_history.push(msg);
+        scope.message_history.push(msg);
     }
 
     fn on_reasoning(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
@@ -816,7 +816,7 @@ impl CodexTranslator {
         if let Some(llm) = &mut scope.open_llm {
             llm.output.push(item.clone());
         }
-        scope.conversation_history.push(item);
+        scope.message_history.push(item);
     }
 
     fn on_tool_call(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
@@ -849,8 +849,6 @@ impl CodexTranslator {
                 "function": { "name": tool_name, "arguments": args_string },
             }],
         });
-        scope.conversation_history.push(tool_call_message.clone());
-
         let Some(call_id) = call_id else { return };
         let turn_id = payload
             .get("metadata")
@@ -872,9 +870,10 @@ impl CodexTranslator {
 
         self.ensure_llm(scope, Some(&turn_id), ts, ops);
         if let Some(llm) = &mut scope.open_llm {
-            llm.output.push(tool_call_message);
+            llm.output.push(tool_call_message.clone());
             llm.last_output_ms = llm.last_output_ms.max(ts);
         }
+        scope.message_history.push(tool_call_message);
 
         let span_id = ids::span_id(&self.session_id, &format!("tool:{call_id}"));
         // spawn_agent: remember which turn ran it, so a later SubagentStart can
@@ -1147,9 +1146,10 @@ impl CodexTranslator {
             ..Default::default()
         }));
 
-        // Synthetic llm span for the compaction call: before/after context.
+        // Synthetic llm span for the compaction call. The transcript exposes
+        // the replacement context, but not the exact request that produced it,
+        // so do not attach reconstructed pre-compaction history as LLM input.
         let start = turn_last_child.unwrap_or(turn_start);
-        let before = scope.conversation_history.clone();
         let span_id = ids::span_id(&self.session_id, &format!("llm:{turn_id}:compaction"));
         let name = scope
             .model
@@ -1162,17 +1162,16 @@ impl CodexTranslator {
             name: name.clone(),
             span_type: SpanType::Llm,
             start_ms: Some(start),
-            input: Some(json!({ "messages_before_compaction": before.len(), "history": before })),
             output: Some(compaction_output(replacement.as_ref())),
             metadata: Some(json!({ "model": scope.model, "turn_id": turn_id, "compaction": true })),
             ..Default::default()
         }));
-        if let Some(replacement) = replacement {
-            // Native compaction is a semantic memory barrier: future requests
-            // use only the replacement context, so the pre-compaction Values
-            // can be dropped as soon as their one compaction span is emitted.
-            scope.conversation_history = replacement;
-        }
+        // The ordered Compacted record is the history cutoff. The journal is
+        // still append-only, but translator state only needs the active window.
+        scope.message_history.clear();
+        scope
+            .message_history
+            .extend(compaction_history(payload, replacement.as_ref()));
         let _ = (turn_span, name);
         scope.open_llm = Some(OpenLlm {
             span_id,
@@ -1309,7 +1308,7 @@ impl Scope {
             model: None,
             current_cwd: None,
             open_turns: Vec::new(),
-            conversation_history: Vec::new(),
+            message_history: Vec::new(),
             open_llm: None,
             open_tools: HashMap::new(),
             last_turn_end_ms: None,
@@ -1369,7 +1368,7 @@ fn push_tool_result(scope: &mut Scope, call_id: Option<&str>, payload: &Value) {
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()));
-    scope.conversation_history.push(json!({
+    scope.message_history.push(json!({
         "role": "tool",
         "content": content,
         "tool_call_id": call_id.unwrap_or_default(),
@@ -1637,6 +1636,50 @@ fn compaction_output(replacement: Option<&Vec<Value>>) -> Value {
         },
         "kept_messages": kept,
     })
+}
+
+fn compaction_history(payload: &Value, replacement: Option<&Vec<Value>>) -> Vec<Value> {
+    let items = replacement.map(Vec::as_slice).unwrap_or_default();
+    if let Some(summary_index) = items
+        .iter()
+        .rposition(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+    {
+        let mut active = Vec::with_capacity(items.len());
+        active.push(items[summary_index].clone());
+        active.extend(
+            items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != summary_index)
+                .map(|(_, item)| item.clone()),
+        );
+        return active;
+    }
+    if let Some(message) = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+    {
+        let mut active = Vec::with_capacity(items.len() + 1);
+        active.push(json!({
+            "role": "user",
+            "content": message,
+            "message_type": "compaction_summary",
+        }));
+        active.extend(items.iter().cloned());
+        return active;
+    }
+    if let Some((summary, kept)) = items.split_last() {
+        let mut active = Vec::with_capacity(items.len());
+        active.push(summary.clone());
+        active.extend(kept.iter().cloned());
+        return active;
+    }
+    vec![json!({
+        "role": "user",
+        "content": "[compaction summary unavailable]",
+        "message_type": "compaction_summary",
+    })]
 }
 
 fn parse_ts(rec: &Value) -> Option<i64> {

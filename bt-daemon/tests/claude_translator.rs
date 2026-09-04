@@ -775,3 +775,165 @@ fn claude_large_catch_up_emits_one_historical_snapshot_per_batch() {
     }
     assert_eq!(llm_count, CALLS);
 }
+
+#[test]
+fn claude_post_compact_advances_llm_history_to_summary() {
+    let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let transcript = tempfile::NamedTempFile::new().unwrap();
+    let transcript_path = transcript.path().to_str().unwrap();
+    let initial = [
+        json!({
+            "type":"user",
+            "uuid":"old-user",
+            "timestamp":"2026-01-01T00:00:01Z",
+            "message":{"role":"user","content":"old question"}
+        }),
+        json!({
+            "type":"assistant",
+            "uuid":"old-assistant",
+            "timestamp":"2026-01-01T00:00:02Z",
+            "message":{"id":"old-request","model":"claude-test","role":"assistant","content":[{"type":"text","text":"old answer"}],"usage":{"input_tokens":1,"output_tokens":1}}
+        }),
+    ];
+    std::fs::write(
+        transcript.path(),
+        initial
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "compacted");
+    let ctx = SessionCtx {
+        session_id: "compacted".into(),
+        config: None,
+    };
+    let envelope = |event: &str, ts_ms: i64, prompt: Option<&str>| Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "compacted".into(),
+        event: event.into(),
+        ts_ms,
+        managed_run_id: None,
+        payload: json!({
+            "session_id":"compacted",
+            "transcript_path":transcript_path,
+            "prompt":prompt,
+        }),
+        route: None,
+        config: None,
+        capture: None,
+    };
+    let mut ops = Vec::new();
+    for event in [
+        envelope("UserPromptSubmit", base + 1_000, Some("old question")),
+        envelope("Stop", base + 2_000, None),
+    ] {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+        while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+            ops.extend(batch);
+        }
+    }
+
+    let compacted = [
+        json!({
+            "type":"system",
+            "subtype":"compact_boundary",
+            "timestamp":"2026-01-01T00:00:03Z",
+            "compactMetadata":{
+                "trigger":"manual",
+                "preservedMessages":{"uuids":["old-assistant"]}
+            }
+        }),
+        json!({
+            "type":"user",
+            "isCompactSummary":true,
+            "timestamp":"2026-01-01T00:00:04Z",
+            "message":{"role":"user","content":"compact summary"}
+        }),
+    ];
+    let previous = std::fs::read_to_string(transcript.path()).unwrap();
+    std::fs::write(
+        transcript.path(),
+        format!(
+            "{previous}\n{}",
+            compacted
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .unwrap();
+    ops.extend(
+        translator
+            .handle(&envelope("PostCompact", base + 4_000, None), &ctx)
+            .unwrap(),
+    );
+    while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+        ops.extend(batch);
+    }
+
+    let post_compact = [
+        json!({
+            "type":"user",
+            "timestamp":"2026-01-01T00:00:05Z",
+            "message":{"role":"user","content":"new question"}
+        }),
+        json!({
+            "type":"assistant",
+            "timestamp":"2026-01-01T00:00:06Z",
+            "message":{"id":"new-request","model":"claude-test","role":"assistant","content":[{"type":"text","text":"new answer"}],"usage":{"input_tokens":2,"output_tokens":1}}
+        }),
+    ];
+    let previous = std::fs::read_to_string(transcript.path()).unwrap();
+    std::fs::write(
+        transcript.path(),
+        format!(
+            "{previous}\n{}",
+            post_compact
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .unwrap();
+    for event in [
+        envelope("UserPromptSubmit", base + 5_000, Some("new question")),
+        envelope("Stop", base + 6_000, None),
+    ] {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+        while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+            ops.extend(batch);
+        }
+    }
+
+    let rows = reduce(ops);
+    let llm = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm
+                && row.metadata.as_ref().unwrap()["request_id"] == "new-request"
+        })
+        .unwrap();
+    let messages = llm.input.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["message_type"], "compaction_summary");
+    assert_eq!(messages[0]["content"], "compact summary");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "old answer");
+    assert_eq!(messages[2]["content"], "new question");
+    assert!(!messages.iter().any(|message| {
+        matches!(
+            message.get("content").and_then(Value::as_str),
+            Some("old question")
+        )
+    }));
+}

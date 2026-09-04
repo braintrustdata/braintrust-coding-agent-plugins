@@ -383,6 +383,9 @@ fn is_real_user(record: &Value) -> bool {
     if record.get("type").and_then(Value::as_str) != Some("user") {
         return false;
     }
+    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
     !record
         .pointer("/message/content")
         .and_then(Value::as_array)

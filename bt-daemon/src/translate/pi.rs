@@ -36,6 +36,7 @@ impl TranslatorFactory for PiTranslatorFactory {
             pending_llms: Vec::new(),
             tools: HashMap::new(),
             compaction: None,
+            active_compaction_message: None,
             branch_summary: None,
             last_ts: 0,
             thinking_level: None,
@@ -69,6 +70,7 @@ struct PiTranslator {
     pending_llms: Vec<PendingLlm>,
     tools: HashMap<String, ToolStart>,
     compaction: Option<(String, i64, Value)>,
+    active_compaction_message: Option<Value>,
     branch_summary: Option<(String, i64, Value)>,
     last_ts: i64,
     thinking_level: Option<String>,
@@ -101,10 +103,11 @@ impl AgentTranslator for PiTranslator {
                 self.compaction = Some((
                     ids::span_id(&self.session_id, &format!("compaction:{}", envelope.ts_ms)),
                     envelope.ts_ms,
-                    event.clone(),
+                    special_input(event, true),
                 ))
             }
             "session_compact" => {
+                self.active_compaction_message = compaction_message(event);
                 ops.extend(self.finish_special("Compaction", true, event, envelope.ts_ms))
             }
             "session_before_tree"
@@ -119,13 +122,17 @@ impl AgentTranslator for PiTranslator {
                         &format!("branch-summary:{}", envelope.ts_ms),
                     ),
                     envelope.ts_ms,
-                    event.clone(),
+                    special_input(event, false),
                 ))
             }
-            "session_tree"
-                if event.get("summaryEntry").is_some() || self.branch_summary.is_some() =>
-            {
-                ops.extend(self.finish_special("Branch Summary", false, event, envelope.ts_ms))
+            "session_tree" => {
+                // Tree navigation can select a branch with a different (or no)
+                // active compaction. The next native context event is
+                // authoritative for that branch.
+                self.active_compaction_message = None;
+                if event.get("summaryEntry").is_some() || self.branch_summary.is_some() {
+                    ops.extend(self.finish_special("Branch Summary", false, event, envelope.ts_ms))
+                }
             }
             "session_shutdown" => {
                 ops.extend(self.close_turn(envelope.ts_ms, None));
@@ -294,7 +301,28 @@ impl PiTranslator {
         ops
     }
     fn capture_context(&mut self, event: &Value, ts: i64) {
-        let input = event.get("messages").cloned().unwrap_or_else(|| json!([]));
+        let mut messages = event
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let native_compaction = messages.iter().position(|message| {
+            message.get("role").and_then(Value::as_str) == Some("compactionSummary")
+        });
+        match native_compaction {
+            Some(0) => self.active_compaction_message = messages.first().cloned(),
+            Some(index) => {
+                let message = messages.remove(index);
+                self.active_compaction_message = Some(message.clone());
+                messages.insert(0, message);
+            }
+            None => {
+                if let Some(compaction) = &self.active_compaction_message {
+                    messages.insert(0, compaction.clone());
+                }
+            }
+        }
+        let input = Value::Array(messages);
         self.pending_llms.push(PendingLlm {
             start_ms: ts,
             input,
@@ -562,6 +590,7 @@ impl PiTranslator {
     fn close_root(&mut self, ts: i64) -> SpanOp {
         self.opened = false;
         self.compaction = None;
+        self.active_compaction_message = None;
         self.branch_summary = None;
         SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
@@ -571,6 +600,58 @@ impl PiTranslator {
                 json!({"total_turns":self.turn_seq,"total_tool_calls":self.total_tools}),
             ),
             ..Default::default()
+        })
+    }
+}
+
+fn compaction_message(event: &Value) -> Option<Value> {
+    let entry = event.get("compactionEntry")?;
+    let summary = entry.get("summary")?.clone();
+    Some(json!({
+        "role": "compactionSummary",
+        "summary": summary,
+        "tokensBefore": entry.get("tokensBefore").cloned().unwrap_or(Value::Null),
+        "timestamp": entry.get("timestamp").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+fn special_input(event: &Value, compaction: bool) -> Value {
+    if compaction {
+        let preparation = event.get("preparation");
+        json!({
+            "reason": event.get("reason"),
+            "willRetry": event.get("willRetry"),
+            "customInstructions": event.get("customInstructions"),
+            "tokensBefore": preparation.and_then(|value| value.get("tokensBefore")),
+            "firstKeptEntryId": preparation.and_then(|value| value.get("firstKeptEntryId")),
+            "isSplitTurn": preparation.and_then(|value| value.get("isSplitTurn")),
+            "messagesToSummarizeCount": preparation
+                .and_then(|value| value.get("messagesToSummarize"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            "turnPrefixMessagesCount": preparation
+                .and_then(|value| value.get("turnPrefixMessages"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            "branchEntryCount": event
+                .get("branchEntries")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+        })
+    } else {
+        let preparation = event.get("preparation");
+        json!({
+            "targetId": preparation.and_then(|value| value.get("targetId")),
+            "oldLeafId": preparation.and_then(|value| value.get("oldLeafId")),
+            "commonAncestorId": preparation.and_then(|value| value.get("commonAncestorId")),
+            "userWantsSummary": preparation.and_then(|value| value.get("userWantsSummary")),
+            "customInstructions": preparation.and_then(|value| value.get("customInstructions")),
+            "replaceInstructions": preparation.and_then(|value| value.get("replaceInstructions")),
+            "label": preparation.and_then(|value| value.get("label")),
+            "entriesToSummarizeCount": preparation
+                .and_then(|value| value.get("entriesToSummarize"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
         })
     }
 }

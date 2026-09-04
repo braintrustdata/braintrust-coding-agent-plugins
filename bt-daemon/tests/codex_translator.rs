@@ -753,6 +753,14 @@ fn tool_and_llm_payloads_preserve_original_contract() {
         .collect();
     llms.sort_by_key(|row| row.start_ms);
     assert_eq!(llms.len(), 2);
+    assert!(llms[0]
+        .input
+        .as_ref()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message.get("tool_calls").is_none()));
     assert_eq!(
         llms[0].output.as_ref().unwrap()["tool_calls"][0]["function"]["arguments"],
         json!("{\"cmd\":\"cat /tmp/review/SKILL.md\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need access\",\"prefix_rule\":[\"cat\"]}")
@@ -910,10 +918,14 @@ fn codex_compaction_replaces_history_for_following_llms() {
         json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t1" } }),
         json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "discard me" }] } }),
         json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 10, "output_tokens": 2 } } } }),
-        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "compacted", "payload": { "replacement_history": [{ "role": "user", "content": "compacted context" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "compacted", "payload": { "replacement_history": [
+            { "role": "developer", "content": "retained preamble" },
+            { "type": "compaction", "encrypted_content": "opaque-summary" }
+        ] } }),
         json!({ "timestamp": "2026-01-01T00:00:07Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 5, "output_tokens": 1 } } } }),
         json!({ "timestamp": "2026-01-01T00:00:08Z", "type": "event_msg", "payload": { "type": "task_complete", "turn_id": "t1" } }),
         json!({ "timestamp": "2026-01-01T00:00:09Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t2" } }),
+        json!({ "timestamp": "2026-01-01T00:00:09.500Z", "type": "response_item", "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "after compaction" }] } }),
         json!({ "timestamp": "2026-01-01T00:00:10Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "after" }] } }),
         json!({ "timestamp": "2026-01-01T00:00:11Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 6, "output_tokens": 1 } } } }),
     ] {
@@ -947,7 +959,11 @@ fn codex_compaction_replaces_history_for_following_llms() {
     let input = following.input.as_ref().unwrap().as_array().unwrap();
     assert_eq!(
         input,
-        &[json!({ "role": "user", "content": "compacted context" })]
+        &[
+            json!({ "type": "compaction", "encrypted_content": "opaque-summary" }),
+            json!({ "role": "developer", "content": "retained preamble" }),
+            json!({ "role": "user", "content": "after compaction" })
+        ]
     );
 }
 
