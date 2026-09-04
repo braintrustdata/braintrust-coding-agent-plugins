@@ -64,15 +64,13 @@ not found, `-32602` invalid params, `-32603` internal); application errors use
 
 ### Ordering & delivery
 
-A subprocess-style shim opens a connection, does one `event.log`, and exits.
-Per-session ordering is guaranteed because (a) the agent runs hooks in blocking
-mode, so it does not fire the next hook until the current one returns, and (b)
-`event.log` is a **request** whose success response means *the event has been
-appended to that session's ordered queue* (not that it has been delivered to
-Braintrust). The shim must await that response before exiting. Long-lived
-in-process clients (opencode/pi, later) hold one connection and may send
-`event.log` as a **notification** for the hot path, relying on the single
-connection for ordering.
+A capture adapter sends `event.log` as a **request** and waits only for the raw
+event and any transcript high-water reference to be flushed to the daemon's
+journal. The daemon then queues correlation, translation, and reporting on its
+own workers. Per-session journal appends are serialized, and the daemon keeps
+derived processing ordered without making the hook wait for it. Subprocess
+shims may exit as soon as they receive the response; long-lived in-process
+clients use the same request boundary.
 
 ## Methods
 
@@ -105,18 +103,14 @@ The hot path. Params are the **Envelope** (see below). Request result:
 ```json
 { "accepted": true }
 ```
-`accepted: true` means durably recorded: normally journaled and enqueued to the
-session's ordered queue, or held in the daemon's private correlation journal
-while multiple parent calls remain indistinguishable.
-For an event that opens a tool call, it also means the daemon has made that
-active-tool marker visible to local child-session correlation. A child hook
-that runs immediately after its parent's blocking pre-tool hook can therefore
-attach without an intervening flush.
-The daemon never fails the caller's turn for a downstream (Braintrust) error;
-those are handled asynchronously and surfaced via `status.get`. The queue is
-bounded, so a session whose sink has stalled applies backpressure here instead
-of accumulating events without limit; the event is already journaled by then,
-so this costs latency, never data.
+`accepted: true` means the raw capture is durably recorded in the source
+journal. It does not mean authentication, correlation, translation, session
+queueing, or Braintrust delivery has completed. Those steps run out-of-band;
+errors are surfaced via `status.get`. A child that arrives before its parent's
+tool marker is translated is held in durable pending-correlation state and
+reconciled by the daemon. On restart, uncheckpointed journal entries are queued
+again automatically. Explicit status and flush requests act as daemon-worker
+barriers, but hook capture never does.
 
 ### `session.flush` (request)
 

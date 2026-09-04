@@ -3,11 +3,9 @@
 //! are processed strictly in arrival order. Different sessions run
 //! concurrently.
 //!
-//! Ack semantics: `event.log` is acked once the event is journaled and its
-//! first translation batch has updated local correlation state. Tool-start
-//! events drain bounded translator continuations before ack so the spawning
-//! marker is guaranteed visible. A downstream error never fails the caller's
-//! turn.
+//! Hook acknowledgement happens before this layer, immediately after the raw
+//! event is durably journaled. Translation, correlation, and delivery here are
+//! entirely out-of-band from hook execution.
 
 use crate::delivery_ledger::LedgerSink;
 use crate::journal::JournalWriter;
@@ -33,8 +31,9 @@ pub struct Counters {
 }
 
 enum SessionMsg {
-    Event(Box<Envelope>, u64, oneshot::Sender<()>),
+    Event(Box<Envelope>, u64),
     Configure(Box<crate::wire::SessionConfig>, oneshot::Sender<()>),
+    Barrier(oneshot::Sender<()>),
     Flush(oneshot::Sender<u64>),
     Finalize(oneshot::Sender<u64>),
     Shutdown(oneshot::Sender<()>),
@@ -65,6 +64,7 @@ pub(crate) struct SessionOptions {
     pub correlation: Arc<crate::correlation::CorrelationRegistry>,
     pub data_dir: PathBuf,
     pub journal: Arc<tokio::sync::Mutex<JournalWriter>>,
+    pub correlation_changed: Arc<tokio::sync::Notify>,
 }
 
 /// Handle to one live session: its queue plus observable counters/state.
@@ -96,6 +96,7 @@ impl Session {
             correlation,
             data_dir,
             journal,
+            correlation_changed,
         } = options;
         let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
         let counters = Arc::new(Counters::default());
@@ -119,6 +120,7 @@ impl Session {
             correlation,
             data_dir,
             journal,
+            correlation_changed,
         };
         tokio::spawn(actor.run(rx));
 
@@ -132,22 +134,27 @@ impl Session {
         })
     }
 
-    /// Enqueue an event after the daemon has journaled it.
+    /// Queue a journaled event without waiting for translation or delivery.
     pub async fn enqueue(&self, env: Envelope, journal_through: u64) -> anyhow::Result<()> {
         self.touch();
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(SessionMsg::Event(Box::new(env), journal_through, reply_tx))
+            .send(SessionMsg::Event(Box::new(env), journal_through))
             .await
-            .map_err(|_| anyhow::anyhow!("session actor is gone"))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("session actor dropped event acknowledgement"))
+            .map_err(|_| anyhow::anyhow!("session actor is gone"))
     }
 
     fn touch(&self) {
         *self.last_activity.lock().unwrap() = Instant::now();
+    }
+
+    /// Wait until events already accepted by this daemon worker have updated
+    /// translator and correlation state. Hook capture never calls this.
+    pub async fn barrier(&self) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.tx.send(SessionMsg::Barrier(reply_tx)).await.is_ok() {
+            let _ = reply_rx.await;
+        }
     }
 
     /// How long since this session last saw traffic. Drives idle retirement.
@@ -206,19 +213,22 @@ impl Session {
     }
 }
 
-/// Claude transcript files are external mutable state. Mirror them into
+/// Agent transcript files are external mutable state. Mirror them into
 /// daemon-owned storage at lifecycle boundaries and journal only a reference,
 /// so recovery/replay does not depend on a path that Claude may later rewrite
 /// or delete — and so the transcript is stored once rather than re-copied into
 /// every event. Fail open: without a reference the translator reads the live
 /// path exactly as before.
 pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env: &mut Envelope) {
-    if env.source != "claude-code"
-        || !matches!(
+    let should_capture = match env.source.as_str() {
+        "codex" => true,
+        "claude-code" => matches!(
             env.event.as_str(),
             "UserPromptSubmit" | "Stop" | "StopFailure" | "SubagentStop" | "SessionEnd"
-        )
-    {
+        ),
+        _ => false,
+    };
+    if !should_capture {
         return;
     }
     let field = if env.event == "SubagentStop" {
@@ -272,6 +282,7 @@ struct SessionActor {
     correlation: Arc<crate::correlation::CorrelationRegistry>,
     data_dir: PathBuf,
     journal: Arc<tokio::sync::Mutex<JournalWriter>>,
+    correlation_changed: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone, Copy)]
@@ -328,11 +339,13 @@ impl SessionActor {
                 // callers waiting on flush don't hang.
                 while let Some(msg) = rx.recv().await {
                     match msg {
-                        SessionMsg::Event(_, _, reply) => {
+                        SessionMsg::Event(_, _) => {
                             self.counters.queued.fetch_sub(1, Ordering::Relaxed);
-                            let _ = reply.send(());
                         }
                         SessionMsg::Configure(_, r) => {
+                            let _ = r.send(());
+                        }
+                        SessionMsg::Barrier(r) => {
                             let _ = r.send(());
                         }
                         SessionMsg::Flush(r) => {
@@ -381,18 +394,14 @@ impl SessionActor {
 
         while let Some(msg) = rx.recv().await {
             match msg {
-                SessionMsg::Event(env, journal_through, reply) => {
+                SessionMsg::Event(env, journal_through) => {
                     let correlation_barrier = is_tool_lifecycle_event(&env.event);
-                    let mut reply = Some(reply);
                     if let Some(cfg) = &env.config {
                         sink.configure(cfg);
                         ctx.config = Some(cfg.clone());
                         self.refresh_permalink(sink.as_ref());
                     }
                     let translated = translator.handle(&env, &ctx);
-                    if !correlation_barrier {
-                        let _ = reply.take().expect("event reply").send(());
-                    }
                     let (correlation_changed, delivered) = self
                         .emit_translator_batches(
                             &mut translator,
@@ -412,9 +421,7 @@ impl SessionActor {
                         {
                             self.set_error(error);
                         }
-                    }
-                    if let Some(reply) = reply {
-                        let _ = reply.send(());
+                        self.correlation_changed.notify_one();
                     }
                     self.counters.queued.fetch_sub(1, Ordering::Relaxed);
                     if delivered && checkpointable {
@@ -427,6 +434,9 @@ impl SessionActor {
                     sink.configure(&config);
                     ctx.config = Some(*config);
                     self.refresh_permalink(sink.as_ref());
+                    let _ = reply.send(());
+                }
+                SessionMsg::Barrier(reply) => {
                     let _ = reply.send(());
                 }
                 SessionMsg::Flush(reply) => {
@@ -510,12 +520,16 @@ impl SessionActor {
         while let Some(ops) = next {
             if !ops.is_empty() {
                 if mode.observes_correlation() {
-                    correlation_changed |= self.correlation.observe_ops(
+                    let changed = self.correlation.observe_ops(
                         &self.correlation_key,
                         &self.route,
                         ctx.config.as_ref().expect("session config"),
                         &ops,
                     );
+                    correlation_changed |= changed;
+                    if changed {
+                        self.persist_correlation_if_changed(true).await;
+                    }
                 }
                 match sink.emit(&ops).await {
                     Ok(n) => {

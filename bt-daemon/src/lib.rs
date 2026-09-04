@@ -115,12 +115,14 @@ pub struct HookArgs {
     /// Fail instead of spawning a daemon if none is running.
     #[arg(long)]
     pub no_spawn: bool,
-    /// Flush the session after a turn-ending event. Intended for short-lived
-    /// CI hosts; SessionEnd is always flushed.
+    /// Ask the daemon to flush the session after a turn-ending event. The
+    /// flush is scheduled out-of-band; hook capture still returns immediately
+    /// after the durable journal write.
     #[arg(long)]
     pub flush_on_turn_end: bool,
-    /// Bound an explicit turn/session-end flush.
-    #[arg(long, default_value_t = 10_000)]
+    /// Deprecated compatibility option. Hook capture never waits for daemon
+    /// translation, reporting, or flushing.
+    #[arg(long, default_value_t = 10_000, hide = true)]
     pub flush_timeout_ms: u64,
     /// JSON object merged into root-span metadata. Deliberately not read from
     /// the environment: a hook fires automatically on every event, so its
@@ -293,7 +295,7 @@ pub async fn run_serve(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()
 /// Capture one hook event from `stdin` and forward it to the daemon.
 ///
 /// `route` contains only non-secret profile and destination selection.
-/// Returns `Ok` once the daemon has acked (journaled + enqueued). Callers that
+/// Returns `Ok` once the daemon has durably journaled the event. Callers that
 /// must never fail the agent's turn should treat any `Err` as non-fatal and
 /// exit 0.
 pub async fn run_hook(
@@ -350,14 +352,6 @@ pub async fn run_hook(
 
     let socket = paths::socket_path(args.socket.as_deref());
     forward_envelope(&env, &socket, &host, args.no_spawn).await?;
-    let should_flush = env.event == "SessionEnd"
-        || (matches!(
-            env.route.as_ref().map(|r| r.flush_mode),
-            Some(wire::FlushMode::FlushOnTurnEnd)
-        ) && matches!(env.event.as_str(), "Stop" | "SubagentStop"));
-    if should_flush {
-        flush_session(&env.session_id, &socket, args.flush_timeout_ms).await?;
-    }
     Ok(())
 }
 

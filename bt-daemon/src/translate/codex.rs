@@ -144,6 +144,7 @@ enum PendingWork {
         path: String,
         hook_ts: i64,
         through_ms: Option<i64>,
+        through_bytes: Option<u64>,
         after: DeferredHook,
     },
     CatchUp {
@@ -207,12 +208,19 @@ impl AgentTranslator for CodexTranslator {
 
         // --- pick the scope and catch up its transcript ---
         let agent_id = str_field(payload, "agent_id");
-        let path = if event.event == "SubagentStop" {
-            str_field(payload, "agent_transcript_path")
-        } else {
-            str_field(payload, "transcript_path")
-                .or_else(|| str_field(payload, "agent_transcript_path"))
-        };
+        let path = event
+            .payload
+            .pointer("/_bt_transcript_mirror/mirror")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                if event.event == "SubagentStop" {
+                    str_field(payload, "agent_transcript_path")
+                } else {
+                    str_field(payload, "transcript_path")
+                        .or_else(|| str_field(payload, "agent_transcript_path"))
+                }
+            });
 
         if let Some(path) = path {
             if agent_id.is_none() {
@@ -220,14 +228,24 @@ impl AgentTranslator for CodexTranslator {
                 self.ensure_main_scope(&path);
             }
             let import_through_ms = payload.get("_bt_import_through_ms").and_then(Value::as_i64);
+            let through_bytes = payload
+                .pointer("/_bt_transcript_mirror/through")
+                .and_then(Value::as_u64);
             let after = self.deferred_hook(event, agent_id.is_none());
-            if self.catch_up_chunk(&path, event.ts_ms, import_through_ms, &mut ops) {
+            if self.catch_up_chunk(
+                &path,
+                event.ts_ms,
+                import_through_ms,
+                through_bytes,
+                &mut ops,
+            ) {
                 self.finish_deferred_hook(after, &mut ops);
             } else {
                 self.pending = Some(PendingWork::Hook {
                     path,
                     hook_ts: event.ts_ms,
                     through_ms: import_through_ms,
+                    through_bytes,
                     after,
                 });
             }
@@ -248,15 +266,17 @@ impl AgentTranslator for CodexTranslator {
                 path,
                 hook_ts,
                 through_ms,
+                through_bytes,
                 after,
             } => {
-                if self.catch_up_chunk(&path, hook_ts, through_ms, &mut ops) {
+                if self.catch_up_chunk(&path, hook_ts, through_ms, through_bytes, &mut ops) {
                     self.finish_deferred_hook(after, &mut ops);
                 } else {
                     self.pending = Some(PendingWork::Hook {
                         path,
                         hook_ts,
                         through_ms,
+                        through_bytes,
                         after,
                     });
                 }
@@ -268,7 +288,7 @@ impl AgentTranslator for CodexTranslator {
             } => {
                 while next_path < paths.len() {
                     let path = &paths[next_path];
-                    if self.catch_up_chunk(path, 0, None, &mut ops) {
+                    if self.catch_up_chunk(path, 0, None, None, &mut ops) {
                         if finalize {
                             if let Some(mut scope) = self.scopes.remove(path) {
                                 self.close_dangling(&mut scope, None, &mut ops);
@@ -450,6 +470,7 @@ impl CodexTranslator {
         path: &str,
         hook_ts: i64,
         through_ms: Option<i64>,
+        through_bytes: Option<u64>,
         ops: &mut Vec<SpanOp>,
     ) -> bool {
         let Some(mut scope) = self.scopes.remove(path) else {
@@ -459,6 +480,7 @@ impl CodexTranslator {
             &scope.path,
             &mut scope.offset,
             through_ms,
+            through_bytes,
             CATCH_UP_BYTE_BUDGET,
         );
         for line in read.lines {
@@ -1628,6 +1650,7 @@ fn read_new_lines(
     path: &str,
     offset: &mut u64,
     through_ms: Option<i64>,
+    through_bytes: Option<u64>,
     byte_budget: usize,
 ) -> ReadLines {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -1652,6 +1675,9 @@ fn read_new_lines(
     let mut lines = Vec::new();
     let mut consumed = 0usize;
     loop {
+        if through_bytes.is_some_and(|limit| *offset >= limit) {
+            break;
+        }
         if consumed >= byte_budget && !lines.is_empty() {
             return ReadLines {
                 lines,
@@ -1663,6 +1689,9 @@ fn read_new_lines(
             break;
         };
         if bytes == 0 || !line.ends_with('\n') {
+            break;
+        }
+        if through_bytes.is_some_and(|limit| offset.saturating_add(bytes as u64) > limit) {
             break;
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);

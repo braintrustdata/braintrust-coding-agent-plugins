@@ -43,6 +43,28 @@ struct TrackingSink {
     flushes: Arc<Mutex<HashMap<String, usize>>>,
 }
 
+struct SlowSink;
+
+#[async_trait]
+impl Sink for SlowSink {
+    fn configure(&mut self, _config: &SessionConfig) {}
+    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Ok(ops.len() as u64)
+    }
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct SlowSinkFactory;
+
+impl SinkFactory for SlowSinkFactory {
+    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+        Ok(Box::new(SlowSink))
+    }
+}
+
 #[async_trait]
 impl Sink for TrackingSink {
     fn configure(&mut self, _config: &SessionConfig) {}
@@ -413,6 +435,33 @@ async fn start_tracking_daemon(
     (socket, handle, flushes, tmp)
 }
 
+async fn start_slow_daemon() -> (PathBuf, tokio::task::JoinHandle<()>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let opts = ServeOptions {
+        version: "test".into(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory: Arc::new(SlowSinkFactory),
+        auth_provider: Some(Arc::new(TestAuthProvider {
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+            first_lease_expired: false,
+        })),
+    };
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    (socket, handle, tmp)
+}
+
 async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::JoinHandle<()> {
     let args = ServeArgs {
         socket: Some(socket.clone()),
@@ -551,6 +600,7 @@ async fn expiring_profile_lease_is_refreshed_for_the_pinned_profile() {
     )
     .await
     .unwrap();
+    flush_session("refresh", &socket, 5000).await.unwrap();
 
     let calls = provider.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 2);
@@ -847,15 +897,14 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     let (data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
     let host = dummy_host();
 
-    let error = forward_envelope(
+    forward_envelope(
         &routed_envelope("login-needed", "missing", "missing-org", "SessionStart"),
         &socket,
         &host,
         false,
     )
     .await
-    .unwrap_err();
-    assert!(error.to_string().contains("bt login"));
+    .unwrap();
     let status = run_status(StatusArgs {
         socket: Some(socket.clone()),
         session_id: Some("login-needed".into()),
@@ -866,7 +915,10 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     let status_error = status.sessions[0].last_error.as_deref().unwrap();
     assert!(status_error.contains("select a profile explicitly"));
     assert!(!status_error.contains("secret-"));
-    assert!(!source_journal_path(&data_dir, "debug", "login-needed").exists());
+    assert!(
+        source_journal_path(&data_dir, "debug", "login-needed").exists(),
+        "capture must remain durable even when background auth fails"
+    );
     assert_eq!(provider.calls.lock().unwrap().len(), 1);
 
     shutdown(&socket).await;
@@ -1069,6 +1121,46 @@ async fn distinct_sessions_are_isolated() {
 }
 
 #[tokio::test]
+async fn hook_capture_stops_at_the_durable_journal_boundary() {
+    let (socket, handle, tmp) = start_slow_daemon().await;
+    let host = dummy_host();
+    forward_envelope(
+        &envelope("fast-capture", "SessionStart", 1),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let mut turn_end = envelope("fast-capture", "Stop", 2);
+    turn_end.route.as_mut().unwrap().flush_mode = bt_daemon::wire::FlushMode::FlushOnTurnEnd;
+    let accepted = tokio::time::timeout(
+        Duration::from_millis(100),
+        forward_envelope(&turn_end, &socket, &host, false),
+    )
+    .await;
+    assert!(
+        matches!(accepted, Ok(Ok(()))),
+        "turn-end capture waited for translation or flushing: {accepted:?}"
+    );
+    let journal = std::fs::read_to_string(source_journal_path(
+        &tmp.path().join("data"),
+        "debug",
+        "fast-capture",
+    ))
+    .unwrap();
+    assert_eq!(
+        journal.lines().count(),
+        2,
+        "hook returned before journaling"
+    );
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn status_reports_sessions_and_filters_by_session_id() {
     let (_data_dir, socket, handle, _tmp) = start_daemon().await;
     let host = dummy_host();
@@ -1257,6 +1349,35 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
 
     shutdown(&socket).await;
     second.await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_startup_recovers_an_event_journaled_before_worker_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let journal = source_journal_path(&data_dir, "debug", "crash-window");
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    let mut raw =
+        serde_json::to_vec(&envelope("crash-window", "SessionStart", 1).redacted()).unwrap();
+    raw.push(b'\n');
+    std::fs::write(&journal, raw).unwrap();
+
+    let daemon = start_daemon_at(data_dir.clone(), socket.clone()).await;
+    let flushed = flush_session("crash-window", &socket, 5000).await.unwrap();
+    assert!(
+        flushed.flushed,
+        "recovered event did not drain: {flushed:?}"
+    );
+    let spans = std::fs::read_to_string(data_dir.join("spans/crash-window.ndjson")).unwrap();
+    assert_eq!(
+        spans.lines().count(),
+        2,
+        "startup must translate the uncheckpointed journal event"
+    );
+
+    shutdown(&socket).await;
+    daemon.await.unwrap();
 }
 
 #[tokio::test]
