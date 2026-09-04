@@ -71,6 +71,11 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
             json!({"messages":[{"role":"user","content":"inspect"}]}),
         ),
         event(
+            "before_provider_request",
+            3,
+            json!({"payload":{"model":"gpt-5","messages":[{"role":"user","content":"inspect"}]}}),
+        ),
+        event(
             "message_update",
             4,
             json!({"assistantMessageEvent":{"type":"text_delta"}}),
@@ -103,15 +108,37 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
         event(
             "session_before_compact",
             10,
-            json!({"preparation":{"tokensBefore":100}}),
+            json!({
+                "preparation":{
+                    "tokensBefore":100,
+                    "firstKeptEntryId":"kept-1",
+                    "messagesToSummarize":[{"role":"user","content":"large history"}],
+                    "turnPrefixMessages":[{"role":"assistant","content":"prefix"}]
+                },
+                "branchEntries":[{"type":"message","message":{"role":"user","content":"large history"}}]
+            }),
         ),
         event(
             "session_compact",
             11,
-            json!({"compactionEntry":{"summary":"short"}}),
+            json!({"compactionEntry":{"summary":"short","tokensBefore":100,"timestamp":"2026-01-01T00:00:11Z"}}),
         ),
         event("agent_end", 12, json!({"messages":[]})),
-        event("session_shutdown", 13, json!({"reason":"quit"})),
+        event("before_agent_start", 13, json!({"prompt":"continue"})),
+        // Pi normally puts compactionSummary first itself. Omitting it here
+        // verifies that session_compact still establishes the active base.
+        event(
+            "context",
+            14,
+            json!({"messages":[{"role":"user","content":"continue"}]}),
+        ),
+        event(
+            "message_end",
+            15,
+            json!({"message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"text","text":"continued"}],"usage":{"input":3,"output":1,"totalTokens":4}}}),
+        ),
+        event("agent_end", 16, json!({"messages":[]})),
+        event("session_shutdown", 17, json!({"reason":"quit"})),
     ];
     let mut ops = Vec::new();
     for event in events {
@@ -122,20 +149,77 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
         rows.values()
             .filter(|r| r.span_type == SpanType::Llm)
             .count(),
-        1
+        2
     );
-    let llm = rows
+    let compacted_llm = rows
         .values()
-        .find(|r| r.span_type == SpanType::Llm)
+        .find(|r| {
+            r.span_type == SpanType::Llm
+                && r.input.as_ref().is_some_and(|input| {
+                    input
+                        .as_array()
+                        .and_then(|messages| messages.first())
+                        .and_then(|message| message.get("role"))
+                        == Some(&json!("compactionSummary"))
+                })
+        })
         .unwrap();
-    assert_eq!(llm.metrics.as_ref().unwrap()["prompt_tokens"], 8);
-    assert_eq!(llm.metrics.as_ref().unwrap()["time_to_first_token"], 0.001);
+    assert_eq!(compacted_llm.input.as_ref().unwrap()[0]["summary"], "short");
+    assert_eq!(
+        compacted_llm.input.as_ref().unwrap()[1]["content"],
+        "continue"
+    );
+    let first_llm = rows
+        .values()
+        .find(|r| {
+            r.span_type == SpanType::Llm
+                && r.input
+                    .as_ref()
+                    .is_some_and(|input| input[0]["content"] == "inspect")
+        })
+        .unwrap();
+    assert_eq!(first_llm.metrics.as_ref().unwrap()["prompt_tokens"], 8);
+    assert_eq!(
+        first_llm.metrics.as_ref().unwrap()["time_to_first_token"],
+        0.001
+    );
+    assert_eq!(
+        first_llm.metadata.as_ref().unwrap()["provider_request"]["payload"]["model"],
+        "gpt-5"
+    );
+    assert!(
+        first_llm.metadata.as_ref().unwrap()["provider_request"]["payload"]
+            .get("messages")
+            .is_none()
+    );
     let tool = rows.values().find(|r| r.name == "skill: review").unwrap();
     assert_eq!(tool.name, "skill: review");
     assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
     let failed_tool = rows.values().find(|r| r.name == "write").unwrap();
     assert_eq!(failed_tool.error.as_deref(), Some("permission denied"));
     assert!(rows.values().any(|r| r.name == "Compaction"));
+    let compaction = rows.values().find(|r| r.name == "Compaction").unwrap();
+    assert_eq!(
+        compaction.input.as_ref().unwrap()["messagesToSummarizeCount"],
+        1
+    );
+    assert_eq!(
+        compaction.input.as_ref().unwrap()["turnPrefixMessagesCount"],
+        1
+    );
+    assert_eq!(compaction.input.as_ref().unwrap()["branchEntryCount"], 1);
+    assert!(compaction
+        .input
+        .as_ref()
+        .unwrap()
+        .get("preparation")
+        .is_none());
+    assert!(compaction
+        .input
+        .as_ref()
+        .unwrap()
+        .get("branchEntries")
+        .is_none());
     assert!(rows
         .values()
         .filter(|r| r.span_type == SpanType::Task)

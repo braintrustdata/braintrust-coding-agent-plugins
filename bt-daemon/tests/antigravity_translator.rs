@@ -519,6 +519,117 @@ fn real_cli_schema_recovers_messages_and_post_only_tool() {
 }
 
 #[test]
+fn checkpoint_replaces_prior_llm_history() {
+    let records = vec![
+        json!({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "content": "Old request that was compacted"
+        }),
+        json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "content": "Old response that was compacted"
+        }),
+        json!({
+            "step_index": 2,
+            "source": "SYSTEM",
+            "type": "CHECKPOINT",
+            "status": "DONE",
+            "content": "The earlier parts of this conversation have been truncated due to its long length. Summary of the retained context."
+        }),
+        json!({
+            "step_index": 3,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "content": "Continue from the checkpoint"
+        }),
+        json!({
+            "step_index": 4,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "content": "Continued response"
+        }),
+    ];
+    let (transcript, boundary) = jsonl(&records);
+    let path = "/tmp/conversation/transcript_full.jsonl";
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("antigravity", "checkpoint-conversation");
+    let ctx = SessionCtx {
+        session_id: "checkpoint-conversation".into(),
+        config: None,
+    };
+
+    let mut ops = translator
+        .handle(
+            &event(
+                "PreInvocation",
+                100,
+                path,
+                &transcript,
+                boundary[3],
+                json!({"invocationNum":0,"initialNumSteps":4}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(
+        translator
+            .handle(
+                &event(
+                    "PostInvocation",
+                    200,
+                    path,
+                    &transcript,
+                    boundary[4],
+                    json!({"invocationNum":0,"initialNumSteps":4}),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+
+    let rows = reduce(ops);
+    let llm = rows
+        .values()
+        .find(|row| row.span_type == SpanType::Llm)
+        .unwrap();
+    assert_eq!(
+        llm.input,
+        Some(json!([
+            {
+                "role": "system",
+                "content": "The earlier parts of this conversation have been truncated due to its long length. Summary of the retained context.",
+                "step_type": "CHECKPOINT",
+                "message_type": "compaction_summary"
+            },
+            {
+                "role": "user",
+                "content": "Continue from the checkpoint",
+                "step_type": "USER_INPUT"
+            }
+        ]))
+    );
+    assert_eq!(
+        llm.output,
+        Some(json!([{
+            "role": "assistant",
+            "content": "Continued response",
+            "step_type": "PLANNER_RESPONSE"
+        }]))
+    );
+    let input = serde_json::to_string(llm.input.as_ref().unwrap()).unwrap();
+    assert!(!input.contains("Old request"));
+    assert!(!input.contains("Old response"));
+}
+
+#[test]
 fn resumed_process_reuses_invocation_zero_without_reparenting_to_turn_one() {
     let records = vec![
         json!({

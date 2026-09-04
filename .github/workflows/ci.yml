@@ -183,6 +183,32 @@ jobs:
           rustup component add clippy rustfmt
       - name: Install latest coding agents
         run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest @earendil-works/pi-coding-agent@latest
+      - name: Ensure Codex platform binary is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          agent_dir="${{ runner.temp }}/coding-agents"
+          codex_version="$(node -p 'require(process.argv[1]).version' "$(npm root --prefix "$agent_dir")/@openai/codex/package.json")"
+          codex_platform="$(node -p '`${process.platform}-${process.arch}`')"
+          platform_dir="$agent_dir/node_modules/@openai/codex-$codex_platform"
+          platform_spec="@openai/codex-$codex_platform@npm:@openai/codex@$codex_version-$codex_platform"
+          if test -d "$platform_dir"; then
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5 6; do
+            if npm install --prefix "$agent_dir" --no-save --no-package-lock --no-audit --no-fund \
+              --cache "${{ runner.temp }}/npm-cache" \
+              "@openai/codex@$codex_version" "$platform_spec" \
+              @anthropic-ai/claude-code@latest opencode-ai@latest \
+              @earendil-works/pi-coding-agent@latest; then
+              exit 0
+            fi
+            if test "$attempt" = 6; then
+              echo "Codex platform package remained unavailable: $platform_spec" >&2
+              exit 1
+            fi
+            sleep 10
+          done
       - name: Set up pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
         with:

@@ -2,48 +2,36 @@ use super::{envelope, validate_session_id};
 use crate::wire::Envelope;
 use anyhow::bail;
 use serde_json::{json, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 const TRANSCRIPT_NAME: &str = "transcript_full.jsonl";
 
 #[derive(Default)]
 pub(super) struct Tail {
-    started: bool,
-    reported_tools: HashSet<i64>,
-    last_len: u64,
+    emitted: usize,
+    stopped: bool,
 }
 
 impl Tail {
     pub(super) fn poll(
         &mut self,
         events: Vec<Envelope>,
-        len: u64,
+        _len: u64,
         finalize: bool,
     ) -> anyhow::Result<Vec<Envelope>> {
-        if events.len() < 3 {
-            bail!("Antigravity import did not produce session boundary events");
+        let Some((stop, active)) = events.split_last() else {
+            bail!("Antigravity import did not produce a session boundary event");
+        };
+        if self.emitted > active.len() {
+            bail!("Antigravity import event stream shrank without a reset");
         }
-        let mut out = Vec::new();
-        if !self.started {
-            out.push(events[0].clone());
-            self.started = true;
-        } else if len != self.last_len {
-            let mut checkpoint = events[0].clone();
-            checkpoint.event = "ImportCheckpoint".into();
-            out.push(checkpoint);
+        let mut out = active[self.emitted..].to_vec();
+        self.emitted = active.len();
+        if finalize && !self.stopped {
+            out.push(stop.clone());
+            self.stopped = true;
         }
-        let end = events.len() - 2;
-        for event in &events[1..end] {
-            let step = event.payload.get("stepIdx").and_then(Value::as_i64);
-            if step.is_some_and(|step| self.reported_tools.insert(step)) {
-                out.push(event.clone());
-            }
-        }
-        if finalize {
-            out.extend_from_slice(&events[end..]);
-        }
-        self.last_len = len;
         Ok(out)
     }
 }
@@ -81,25 +69,66 @@ fn is_transcript_path(path: &Path, session_id: &str) -> bool {
             == Some(session_id)
 }
 
-pub(super) fn envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelope>> {
+pub(super) fn envelopes(
+    path: &Path,
+    records: &[Value],
+    record_end_offsets: &[u64],
+) -> anyhow::Result<Vec<Envelope>> {
+    if records.len() != record_end_offsets.len() {
+        bail!("Antigravity transcript record offsets do not match parsed records");
+    }
     let session_id = transcript_session_id(path)
         .ok_or_else(|| anyhow::anyhow!("invalid Antigravity transcript path {}", path.display()))?;
     if records.is_empty() {
         bail!("Antigravity transcript {} is empty", path.display());
     }
     let (start_ms, end_ms) = timestamp_bounds_created(records);
-    let transcript_path = path.to_string_lossy();
-    let mut events = vec![envelope(
-        "antigravity",
-        None,
-        &session_id,
-        "PreInvocation",
-        start_ms,
-        json!({"conversationId": session_id, "invocationNum": 0, "initialNumSteps": 0,
-            "transcriptPath": transcript_path}),
-    )];
+    let transcript_path = path.to_string_lossy().into_owned();
+    let mut events = Vec::new();
     let mut planned_calls = VecDeque::new();
-    for record in records {
+    let mut invocation_num = 0i64;
+    for (index, record) in records.iter().enumerate() {
+        let record_type = record.get("type").and_then(Value::as_str);
+        let step = record
+            .get("step_index")
+            .or_else(|| record.get("stepIndex"))
+            .and_then(Value::as_i64)
+            .unwrap_or(index as i64);
+        let ts = created_at_ms(record).unwrap_or(start_ms);
+        if record_type == Some("PLANNER_RESPONSE") {
+            let before = index
+                .checked_sub(1)
+                .and_then(|index| record_end_offsets.get(index))
+                .copied()
+                .unwrap_or(0);
+            events.push(envelope(
+                "antigravity",
+                None,
+                &session_id,
+                "PreInvocation",
+                ts,
+                bounded_payload(
+                    &session_id,
+                    &transcript_path,
+                    before,
+                    json!({"invocationNum": invocation_num, "initialNumSteps": step}),
+                ),
+            ));
+            events.push(envelope(
+                "antigravity",
+                None,
+                &session_id,
+                "PostInvocation",
+                ts,
+                bounded_payload(
+                    &session_id,
+                    &transcript_path,
+                    record_end_offsets[index],
+                    json!({"invocationNum": invocation_num, "initialNumSteps": step}),
+                ),
+            ));
+            invocation_num += 1;
+        }
         if let Some(calls) = record
             .get("tool_calls")
             .or_else(|| record.get("toolCalls"))
@@ -110,48 +139,56 @@ pub(super) fn envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<En
         if !is_tool_result(record) {
             continue;
         }
-        let Some(step) = record
-            .get("step_index")
-            .or_else(|| record.get("stepIndex"))
-            .and_then(Value::as_i64)
-        else {
-            continue;
-        };
-        let mut payload = json!({
-            "conversationId": session_id,
-            "stepIdx": step,
-            "transcriptPath": transcript_path,
-        });
+        let mut extra = json!({"stepIdx": step});
         if let Some(call) = planned_calls.pop_front() {
-            payload["toolCall"] = call;
+            extra["toolCall"] = call;
         }
         if is_denied(record) {
-            payload["toolApproval"] = json!("denied");
+            extra["toolApproval"] = json!("denied");
         }
         events.push(envelope(
             "antigravity",
             None,
             &session_id,
             "PostToolUse",
-            created_at_ms(record).unwrap_or(end_ms),
-            payload,
+            ts,
+            bounded_payload(
+                &session_id,
+                &transcript_path,
+                record_end_offsets[index],
+                extra,
+            ),
         ));
     }
     events.push(envelope(
         "antigravity",
         None,
         &session_id,
-        "PostInvocation",
-        end_ms,
-        json!({"conversationId": session_id, "invocationNum": 0, "initialNumSteps": 0,
-            "transcriptPath": transcript_path}),
-    ));
-    events.push(envelope(
-        "antigravity", None, &session_id, "Stop", end_ms.saturating_add(1),
-        json!({"conversationId": session_id, "fullyIdle": true, "terminationReason": "transcript_import",
-            "transcriptPath": transcript_path}),
+        "Stop",
+        end_ms.saturating_add(1),
+        bounded_payload(
+            &session_id,
+            &transcript_path,
+            record_end_offsets.last().copied().unwrap_or(0),
+            json!({"fullyIdle": true, "terminationReason": "transcript_import"}),
+        ),
     ));
     Ok(events)
+}
+
+fn bounded_payload(session_id: &str, transcript_path: &str, through: u64, extra: Value) -> Value {
+    let mut payload = json!({
+        "conversationId": session_id,
+        "transcriptPath": transcript_path,
+        "_bt_transcript_observation": {
+            "path": transcript_path,
+            "observed_bytes": through,
+        }
+    });
+    if let (Value::Object(payload), Value::Object(extra)) = (&mut payload, extra) {
+        payload.extend(extra);
+    }
+    payload
 }
 
 fn is_denied(record: &Value) -> bool {
