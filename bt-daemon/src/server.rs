@@ -132,6 +132,10 @@ enum IngressMsg {
     Barrier(oneshot::Sender<()>),
 }
 
+/// The hook path never waits for this queue. Once it fills, the append-only
+/// journals become the overflow queue and the worker catches them up in place.
+const INGRESS_QUEUE_CAPACITY: usize = 64;
+
 /// One independent delivery pipeline for a source session and the exact route
 /// carried by its hook or import envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -166,7 +170,11 @@ pub struct Daemon {
     auth_provider: Option<Arc<dyn AuthProvider>>,
     session_auth: tokio::sync::Mutex<HashMap<DeliveryKey, SessionAuthState>>,
     route_aliases: Mutex<HashMap<DeliveryKey, DeliveryKey>>,
+    /// Serializes only capture-side journal appends for a source session.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes daemon-side routing and actor creation independently of
+    /// capture, which must never inherit actor or sink backpressure.
+    dispatch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     journals: Mutex<HashMap<String, Arc<tokio::sync::Mutex<JournalWriter>>>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
     auth_errors: Mutex<HashMap<DeliveryKey, (String, String)>>,
@@ -177,7 +185,9 @@ pub struct Daemon {
     pending_reconcile_lock: tokio::sync::Mutex<()>,
     correlation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     correlation_changed: Arc<Notify>,
-    ingress_tx: mpsc::UnboundedSender<IngressMsg>,
+    ingress_tx: mpsc::Sender<IngressMsg>,
+    ingress_overflow: AtomicBool,
+    ingress_dispatched: Mutex<HashMap<DeliveryKey, u64>>,
     started: Instant,
     last_activity: Mutex<Instant>,
     shutting_down: AtomicBool,
@@ -186,7 +196,7 @@ pub struct Daemon {
 
 impl Daemon {
     fn new(opts: ServeOptions, data_dir: PathBuf) -> Arc<Self> {
-        let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
+        let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_QUEUE_CAPACITY);
         let daemon = Arc::new(Daemon {
             version: opts.version,
             data_dir,
@@ -196,6 +206,7 @@ impl Daemon {
             session_auth: tokio::sync::Mutex::new(HashMap::new()),
             route_aliases: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
+            dispatch_locks: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
             managed_run_sessions: Mutex::new(HashMap::new()),
             auth_errors: Mutex::new(HashMap::new()),
@@ -207,6 +218,8 @@ impl Daemon {
             correlation_locks: Mutex::new(HashMap::new()),
             correlation_changed: Arc::new(Notify::new()),
             ingress_tx,
+            ingress_overflow: AtomicBool::new(false),
+            ingress_dispatched: Mutex::new(HashMap::new()),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
             shutting_down: AtomicBool::new(false),
@@ -444,7 +457,7 @@ impl Daemon {
     /// journal file for the rest of the daemon's life; deterministic span ids
     /// mean a late event simply rebuilds it from the journal.
     async fn retire_session(&self, key: &DeliveryKey) {
-        let lock = self.session_lock(&key.source, &key.session_id);
+        let lock = self.dispatch_lock(&key.source, &key.session_id);
         let _guard = lock.lock().await;
 
         let session = { self.sessions.lock().unwrap().remove(key) };
@@ -475,8 +488,19 @@ impl Daemon {
             .any(|other| other.source == key.source && other.session_id == key.session_id);
         if last {
             let storage_key = crate::ids::session_namespace(&key.source, &key.session_id);
+            // Capture can proceed while the actor flushes above. Only take its
+            // lock for the brief writer-map cleanup after daemon work ends.
+            let capture_lock = self.session_lock(&key.source, &key.session_id);
+            let _capture_guard = capture_lock.lock().await;
             self.journals.lock().unwrap().remove(&storage_key);
             self.session_locks.lock().unwrap().remove(&storage_key);
+            self.dispatch_locks.lock().unwrap().remove(&storage_key);
+            self.ingress_dispatched
+                .lock()
+                .unwrap()
+                .retain(|candidate, _| {
+                    candidate.source != key.source || candidate.session_id != key.session_id
+                });
         }
         tracing::info!(session_id = %key.session_id, "session retired");
     }
@@ -540,6 +564,16 @@ impl Daemon {
             .clone()
     }
 
+    fn dispatch_lock(&self, source: &str, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let storage_key = crate::ids::session_namespace(source, session_id);
+        self.dispatch_locks
+            .lock()
+            .unwrap()
+            .entry(storage_key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     fn total_queued(&self) -> u64 {
         self.sessions
             .lock()
@@ -562,23 +596,28 @@ impl Daemon {
             .append_to_journal(&mut env)
             .await
             .map_err(|error| format!("journal failed: {error}"))?;
-        if self
+        match self
             .ingress_tx
-            .send(IngressMsg::Event(Box::new(PendingEvent {
+            .try_send(IngressMsg::Event(Box::new(PendingEvent {
                 env,
                 replay_through,
                 journal_through,
-            })))
-            .is_err()
-        {
-            tracing::warn!("journaled event will be recovered after ingress worker restart");
+            }))) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.ingress_overflow.store(true, Ordering::Release);
+                tracing::debug!("ingress queue full; journal will be drained by daemon worker");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("journaled event will be recovered after daemon restart");
+            }
         }
         Ok(())
     }
 
     async fn ingress_barrier(&self) {
         let (tx, rx) = oneshot::channel();
-        if self.ingress_tx.send(IngressMsg::Barrier(tx)).is_ok() {
+        if self.ingress_tx.send(IngressMsg::Barrier(tx)).await.is_ok() {
             let _ = rx.await;
         }
     }
@@ -760,48 +799,172 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::UnboundedReceiver<IngressMsg>) {
+fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::Receiver<IngressMsg>) {
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        loop {
+            if daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
+                recover_ingress_overflow(&daemon).await;
+                continue;
+            }
+            let Some(msg) = rx.recv().await else {
+                break;
+            };
             match msg {
                 IngressMsg::Event(event) => {
-                    let schedule_flush = event.env.event == "SessionEnd"
-                        || (matches!(
-                            event.env.route.as_ref().map(|route| route.flush_mode),
-                            Some(crate::wire::FlushMode::FlushOnTurnEnd)
-                        ) && matches!(event.env.event.as_str(), "Stop" | "SubagentStop"));
-                    let flush_source = event.env.source.clone();
-                    let flush_session_id = event.env.session_id.clone();
-                    // A child may arrive immediately after a parent's tool
-                    // hook. Catch prior session actors up before resolving a
-                    // new session, entirely within the daemon worker.
-                    if is_session_start(&event.env.event) {
-                        daemon.settle_session_actors().await;
-                    }
-                    if let Err(error) = accept_event(&daemon, *event).await {
-                        tracing::warn!(%error, "journaled ingress event could not be dispatched");
-                    }
-                    if schedule_flush {
-                        let daemon = daemon.clone();
-                        tokio::spawn(async move {
-                            daemon
-                                .flush_source_session(
-                                    &flush_source,
-                                    &flush_session_id,
-                                    Duration::from_secs(10),
-                                )
-                                .await;
-                        });
-                    }
+                    dispatch_ingress_event(&daemon, *event).await;
                 }
                 IngressMsg::Barrier(reply) => {
-                    daemon.settle_session_actors().await;
-                    let _ = retry_pending_sessions(&daemon).await;
+                    loop {
+                        daemon.settle_session_actors().await;
+                        let _ = retry_pending_sessions(&daemon).await;
+                        if !daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
+                            break;
+                        }
+                        recover_ingress_overflow(&daemon).await;
+                    }
                     let _ = reply.send(());
                 }
             }
         }
     });
+}
+
+async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
+    let ingress_key =
+        event.env.route.as_ref().and_then(|route| {
+            DeliveryKey::new(&event.env.source, &event.env.session_id, route).ok()
+        });
+    if ingress_key.as_ref().is_some_and(|key| {
+        daemon
+            .ingress_dispatched
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|through| *through >= event.journal_through)
+    }) {
+        return;
+    }
+
+    let schedule_flush = event.env.event == "SessionEnd"
+        || (matches!(
+            event.env.route.as_ref().map(|route| route.flush_mode),
+            Some(crate::wire::FlushMode::FlushOnTurnEnd)
+        ) && matches!(event.env.event.as_str(), "Stop" | "SubagentStop"));
+    let flush_source = event.env.source.clone();
+    let flush_session_id = event.env.session_id.clone();
+    let journal_through = event.journal_through;
+    // A child may arrive immediately after a parent's tool hook. Catch prior
+    // session actors up before resolving a new session, entirely in the daemon.
+    if is_session_start(&event.env.event) {
+        daemon.settle_session_actors().await;
+    }
+    match accept_event(daemon, event).await {
+        Ok(()) => {
+            if let Some(key) = ingress_key {
+                let mut dispatched = daemon.ingress_dispatched.lock().unwrap();
+                let through = dispatched.entry(key).or_default();
+                *through = (*through).max(journal_through);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "journaled ingress event could not be dispatched");
+            return;
+        }
+    }
+    if schedule_flush {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            daemon
+                .flush_source_session(&flush_source, &flush_session_id, Duration::from_secs(10))
+                .await;
+        });
+    }
+}
+
+/// Drain events omitted from the bounded in-memory queue. The queue contains
+/// only a latency fast path; journals remain the complete source of ingress.
+async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
+    let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
+        return;
+    };
+    let mut recovered = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
+            continue;
+        }
+        let recorded_len = journal::JournalReader::recorded_len(&path).await;
+        let Ok(Some(mut checkpoints)) = journal::JournalReader::open(&path, recorded_len).await
+        else {
+            continue;
+        };
+        let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
+        while let Ok(Some(entry)) = checkpoints.next_record().await {
+            if let journal::JournalRecord::DeliveryCheckpoint { route, through } = entry.record {
+                let key = serde_json::to_string(&route).unwrap_or_default();
+                let acknowledged = acknowledged_by_route.entry(key).or_default();
+                *acknowledged = (*acknowledged).max(through);
+            }
+        }
+
+        let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded_len).await else {
+            continue;
+        };
+        let mut before = 0u64;
+        while let Ok(Some(entry)) = reader.next_record().await {
+            let through = entry.through;
+            let journal::JournalRecord::Event(redacted) = entry.record else {
+                before = through;
+                continue;
+            };
+            let mut env = journal::envelope_from_redacted(redacted);
+            let Some(source) = daemon.translators.canonical_source(&env.source) else {
+                before = through;
+                continue;
+            };
+            env.source = source.to_string();
+            let Some(route) = env.route.as_ref() else {
+                before = through;
+                continue;
+            };
+            let route_json = recovered_delivery_route(daemon, &env)
+                .await
+                .as_ref()
+                .and_then(|route| serde_json::to_string(route).ok())
+                .unwrap_or_else(|| serde_json::to_string(route).unwrap_or_default());
+            let key = match DeliveryKey::new(&env.source, &env.session_id, route) {
+                Ok(key) => key,
+                Err(_) => {
+                    before = through;
+                    continue;
+                }
+            };
+            let dispatched = daemon
+                .ingress_dispatched
+                .lock()
+                .unwrap()
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+            let acknowledged = acknowledged_by_route.get(&route_json).copied().unwrap_or(0);
+            if through > dispatched.max(acknowledged) {
+                dispatch_ingress_event(
+                    daemon,
+                    PendingEvent {
+                        env,
+                        replay_through: before,
+                        journal_through: through,
+                    },
+                )
+                .await;
+                recovered += 1;
+            }
+            before = through;
+        }
+    }
+    if recovered > 0 {
+        tracing::info!(recovered, "drained journal-backed ingress overflow");
+    }
 }
 
 fn spawn_pending_reconciler(daemon: Arc<Daemon>) {
@@ -1469,7 +1632,7 @@ async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             continue;
         };
         let mut before = 0u64;
-        let mut acknowledged_through = 0u64;
+        let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
         let mut latest_by_route: HashMap<String, PendingEvent> = HashMap::new();
         while let Ok(Some(entry)) = reader.next_record().await {
             let through = entry.through;
@@ -1493,8 +1656,10 @@ async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                         );
                     }
                 }
-                journal::JournalRecord::DeliveryCheckpoint { through, .. } => {
-                    acknowledged_through = acknowledged_through.max(through);
+                journal::JournalRecord::DeliveryCheckpoint { route, through } => {
+                    let key = serde_json::to_string(&route).unwrap_or_default();
+                    let acknowledged = acknowledged_by_route.entry(key).or_default();
+                    *acknowledged = (*acknowledged).max(through);
                 }
             }
             before = through;
@@ -1507,7 +1672,12 @@ async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             )) {
                 continue;
             }
-            if acknowledged_through < event.journal_through {
+            let route = recovered_delivery_route(daemon, &event.env)
+                .await
+                .as_ref()
+                .and_then(|route| serde_json::to_string(route).ok())
+                .unwrap_or_default();
+            if acknowledged_by_route.get(&route).copied().unwrap_or(0) < event.journal_through {
                 candidates.push(event);
             }
         }
@@ -1515,13 +1685,16 @@ async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
     candidates.sort_by_key(|event| event.env.ts_ms);
     let recovered = candidates.len();
     for event in candidates {
-        let _ = daemon.ingress_tx.send(IngressMsg::Event(Box::new(event)));
+        let _ = daemon
+            .ingress_tx
+            .send(IngressMsg::Event(Box::new(event)))
+            .await;
     }
     // Reconciliation stays in the daemon worker and follows every recovered
     // event in queue order. Dropping the receiver is intentional: startup and
     // hook capture do not wait for translation or reporting.
     let (reply, _ignored) = oneshot::channel();
-    let _ = daemon.ingress_tx.send(IngressMsg::Barrier(reply));
+    let _ = daemon.ingress_tx.send(IngressMsg::Barrier(reply)).await;
     if recovered > 0 {
         tracing::info!(
             recovered,
@@ -1542,7 +1715,7 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Res
     let managed_run_id = env.managed_run_id.clone();
     let route = env.route.clone();
     tracing::info!(source, event, session_id, "event received");
-    let session_lock = daemon.session_lock(&source, &session_id);
+    let session_lock = daemon.dispatch_lock(&source, &session_id);
     let _session_guard = session_lock.lock().await;
 
     let result = async {
@@ -1601,6 +1774,29 @@ fn automatic_link_key(env: &Envelope) -> String {
         .and_then(|route| serde_json::to_string(route).ok())
         .unwrap_or_default();
     format!("{}\u{1f}{}\u{1f}{route}", env.source, env.session_id)
+}
+
+/// Correlated child events retain their setup route in the immutable journal,
+/// while their delivery checkpoint belongs to the resolved parent route.
+/// Recover against that effective route without rewriting the captured event.
+async fn recovered_delivery_route(daemon: &Arc<Daemon>, env: &Envelope) -> Option<SessionRoute> {
+    let key = automatic_link_key(env);
+    if let Some(route) = daemon.automatic_links.lock().unwrap().get(&key).cloned() {
+        return Some(route);
+    }
+    if let Some(route) = daemon
+        .pending_sessions
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|state| state.linked_route.clone())
+    {
+        return Some(route);
+    }
+    read_correlation_state(&daemon.data_dir, &key)
+        .await
+        .and_then(|state| state.linked_route)
+        .or_else(|| env.route.clone())
 }
 
 async fn handle_request(

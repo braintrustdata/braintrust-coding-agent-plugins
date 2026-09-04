@@ -201,26 +201,14 @@ impl AgentTranslator for CodexTranslator {
                 self.session_source = str_field(payload, "source");
                 self.permission_mode = str_field(payload, "permission_mode");
             }
-            "SubagentStart" => self.handle_subagent_start(payload),
+            "SubagentStart" => self.handle_subagent_start(event),
             "PreCompact" | "PostCompact" => self.record_compaction_trigger(payload, &mut ops),
             _ => {}
         }
 
         // --- pick the scope and catch up its transcript ---
         let agent_id = str_field(payload, "agent_id");
-        let path = event
-            .payload
-            .pointer("/_bt_transcript_mirror/mirror")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                if event.event == "SubagentStop" {
-                    str_field(payload, "agent_transcript_path")
-                } else {
-                    str_field(payload, "transcript_path")
-                        .or_else(|| str_field(payload, "agent_transcript_path"))
-                }
-            });
+        let path = effective_transcript_path(event);
 
         if let Some(path) = path {
             if agent_id.is_none() {
@@ -393,10 +381,11 @@ impl CodexTranslator {
         }
     }
 
-    fn handle_subagent_start(&mut self, payload: &Value) {
+    fn handle_subagent_start(&mut self, event: &Envelope) {
+        let payload = &event.payload;
         let (Some(agent_id), Some(path)) = (
             str_field(payload, "agent_id"),
-            str_field(payload, "transcript_path"),
+            effective_transcript_path(event),
         ) else {
             return;
         };
@@ -421,7 +410,7 @@ impl CodexTranslator {
             // the spawn_agent transcript record that establishes call -> turn.
             "PostToolUse" => DeferredHook::PostToolUse(event.payload.clone()),
             "SubagentStop" => DeferredHook::SubagentStop {
-                path: str_field(&event.payload, "agent_transcript_path"),
+                path: effective_transcript_path(event),
                 ts: event.ts_ms,
             },
             // Codex writes task_complete slightly after the Stop hook in real
@@ -1291,6 +1280,22 @@ impl CodexTranslator {
             }));
         }
     }
+}
+
+fn effective_transcript_path(event: &Envelope) -> Option<String> {
+    event
+        .payload
+        .pointer("/_bt_transcript_mirror/mirror")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            if event.event == "SubagentStop" {
+                str_field(&event.payload, "agent_transcript_path")
+            } else {
+                str_field(&event.payload, "transcript_path")
+                    .or_else(|| str_field(&event.payload, "agent_transcript_path"))
+            }
+        })
 }
 
 impl Scope {
