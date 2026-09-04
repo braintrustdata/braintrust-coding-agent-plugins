@@ -60,6 +60,7 @@ struct AntigravityTranslator {
     session_id: String,
     session_span_id: String,
     root_span_id: String,
+    session_parent_span_ids: Vec<String>,
     root_open: bool,
     root_ended: bool,
     turn: Option<Turn>,
@@ -81,6 +82,7 @@ impl AntigravityTranslator {
             session_id: session_id.to_string(),
             session_span_id: root.clone(),
             root_span_id: root,
+            session_parent_span_ids: Vec::new(),
             root_open: false,
             root_ended: false,
             turn: None,
@@ -109,6 +111,7 @@ impl AntigravityTranslator {
         if let Some(external_root) = external_root_span_id {
             self.root_span_id = external_root;
         }
+        self.session_parent_span_ids = parent_span_id.into_iter().collect();
 
         let workspace = event
             .payload
@@ -147,7 +150,7 @@ impl AntigravityTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: parent_span_id.into_iter().collect(),
+            parent_span_ids: self.session_parent_span_ids.clone(),
             name: format!("Antigravity: {label}"),
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
@@ -467,6 +470,7 @@ impl AntigravityTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.span_id,
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![self.session_span_id.clone()],
                 end_ms: Some(ts_ms),
                 output: turn.last_output,
                 metadata: Some(json!({"turn_number":turn.number})),
@@ -484,6 +488,7 @@ impl AntigravityTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
+            parent_span_ids: self.session_parent_span_ids.clone(),
             end_ms: Some(ts_ms),
             error,
             ..Default::default()
