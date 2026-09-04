@@ -968,6 +968,63 @@ fn codex_compaction_replaces_history_for_following_llms() {
 }
 
 #[test]
+fn codex_untagged_replacement_history_preserves_native_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta", "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context", "payload": { "model": "gpt-5.5" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "compacted", "payload": { "replacement_history": [
+            { "role": "developer", "content": "first retained message" },
+            { "role": "user", "content": "second retained message" },
+            { "role": "assistant", "content": "third retained message" }
+        ] } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg", "payload": { "type": "task_complete", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t2" } }),
+        json!({ "timestamp": "2026-01-01T00:00:07Z", "type": "response_item", "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "after compaction" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:08Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "after" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:09Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 6, "output_tokens": 1 } } } }),
+    ] {
+        append(&transcript, record);
+    }
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let rows = reduce(
+        translator
+            .handle(
+                &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    let following = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm
+                && row
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["turn_id"] == json!("t2"))
+        })
+        .unwrap();
+    assert_eq!(
+        following.input.as_ref().unwrap(),
+        &json!([
+            { "role": "developer", "content": "first retained message" },
+            { "role": "user", "content": "second retained message" },
+            { "role": "assistant", "content": "third retained message" },
+            { "role": "user", "content": "after compaction" }
+        ])
+    );
+}
+
+#[test]
 fn codex_subagent_nests_under_spawning_turn() {
     let tmp = tempfile::tempdir().unwrap();
     let main_t = tmp.path().join("main.jsonl");

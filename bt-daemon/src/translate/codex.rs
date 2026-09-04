@@ -1669,11 +1669,11 @@ fn compaction_history(payload: &Value, replacement: Option<&Vec<Value>>) -> Vec<
         active.extend(items.iter().cloned());
         return active;
     }
-    if let Some((summary, kept)) = items.split_last() {
-        let mut active = Vec::with_capacity(items.len());
-        active.push(summary.clone());
-        active.extend(kept.iter().cloned());
-        return active;
+    if !items.is_empty() {
+        // Without a typed compaction item or explicit summary message, there
+        // is no evidence that any ordinary entry is the summary. Preserve the
+        // native replacement history order exactly.
+        return items.to_vec();
     }
     vec![json!({
         "role": "user",
