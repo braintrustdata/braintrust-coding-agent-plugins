@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { type DaemonSessionRoute, resolveDaemonTraceSettings } from "./runtime/daemon-client.ts";
+import { loadPiPackageMetadata } from "./pi-package.ts";
 
 export interface PiConfig {
   enabled: boolean;
@@ -17,10 +17,7 @@ export interface PiConfig {
 
 type ConfigRecord = Record<string, unknown>;
 
-const PROJECT_CONFIG_DIR_NAME =
-  typeof (piCodingAgent as { CONFIG_DIR_NAME?: unknown }).CONFIG_DIR_NAME === "string"
-    ? (piCodingAgent as { CONFIG_DIR_NAME: string }).CONFIG_DIR_NAME
-    : ".pi";
+const PROJECT_CONFIG_DIR_NAME = loadPiPackageMetadata().configDir;
 
 function record(value: unknown): ConfigRecord | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)

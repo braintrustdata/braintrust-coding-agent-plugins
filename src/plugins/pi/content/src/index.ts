@@ -1,16 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import {
-  VERSION as PI_VERSION,
-  type ExtensionAPI,
-  type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
+import { loadPiPackageMetadata } from "./pi-package.ts";
 import { claimManagedTracingInstance, DaemonClient } from "./runtime/daemon-client.ts";
 import { EXTENSION_VERSION } from "./version.ts";
 
 const STATUS_KEY = "braintrust-tracing";
 const WIDGET_KEY = "braintrust-trace-link";
+const PI_VERSION = loadPiPackageMetadata().version;
 
 function sessionKeyFor(
   sessionFile: string | undefined,
@@ -96,7 +94,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     if (!sessionId) return;
     await client.log({
       source: "pi",
-      source_version: PI_VERSION,
+      ...(PI_VERSION ? { source_version: PI_VERSION } : {}),
       session_id: sessionId,
       event: name,
       ts_ms: Date.now(),
