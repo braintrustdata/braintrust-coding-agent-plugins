@@ -95,6 +95,10 @@ pub struct HookArgs {
     /// Optional agent version, forwarded for payload-drift handling.
     #[arg(long)]
     pub source_version: Option<String>,
+    /// Optional instrumentation package version, forwarded independently from
+    /// the coding agent version.
+    #[arg(long)]
+    pub plugin_version: Option<String>,
     /// Socket path override.
     #[arg(long)]
     pub socket: Option<PathBuf>,
@@ -292,6 +296,46 @@ pub async fn run_serve(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()
     server::run(args, opts).await
 }
 
+fn build_hook_envelope(
+    args: &HookArgs,
+    route: SessionRoute,
+    payload: serde_json::Value,
+    session_id: String,
+    event: String,
+) -> Envelope {
+    Envelope {
+        source: args.source.clone(),
+        source_version: args.source_version.clone(),
+        plugin_version: args.plugin_version.clone(),
+        session_id,
+        event,
+        ts_ms: now_ms(),
+        managed_run_id: std::env::var(MANAGED_RUN_ID_ENV)
+            .ok()
+            .filter(|value| !value.is_empty()),
+        capture: None,
+        payload,
+        route: Some(route),
+        config: None,
+    }
+}
+
+pub(crate) fn should_flush_hook_event(event: &str, flush_on_turn_end: bool) -> bool {
+    matches!(event, "SessionEnd" | "session_end")
+        || (flush_on_turn_end
+            && matches!(
+                event,
+                "Stop"
+                    | "stop"
+                    | "StopFailure"
+                    | "stop_failure"
+                    | "StopCancelled"
+                    | "stop_cancelled"
+                    | "SubagentStop"
+                    | "subagent_stop"
+            ))
+}
+
 /// Capture one hook event from `stdin` and forward it to the daemon.
 ///
 /// `route` contains only non-secret profile and destination selection.
@@ -334,24 +378,11 @@ pub async fn run_hook(
         route.flush_mode = wire::FlushMode::FlushOnTurnEnd;
     }
     apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
-    let env = Envelope {
-        source: args.source.clone(),
-        source_version: args.source_version.clone(),
-        plugin_version: None,
-        session_id,
-        event,
-        ts_ms: now_ms(),
-        managed_run_id: std::env::var(MANAGED_RUN_ID_ENV)
-            .ok()
-            .filter(|value| !value.is_empty()),
-        capture: None,
-        payload,
-        route: Some(route),
-        config: None,
-    };
+    let env = build_hook_envelope(&args, route, payload, session_id, event);
 
     let socket = paths::socket_path(args.socket.as_deref());
     forward_envelope(&env, &socket, &host, args.no_spawn).await?;
+
     Ok(())
 }
 
@@ -376,6 +407,17 @@ pub(crate) fn apply_additional_metadata(
     Ok(())
 }
 
+fn initialize_params(env: &Envelope) -> serde_json::Value {
+    serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "client": {
+            "source": env.source,
+            "plugin_version": env.plugin_version,
+            "pid": std::process::id()
+        }
+    })
+}
+
 /// Ensure a daemon is up and forward one already-built [`Envelope`] to it
 /// (`initialize` handshake + `event.log`). Also the seam in-process clients and
 /// tests use to send events without going through stdin.
@@ -388,17 +430,7 @@ pub async fn forward_envelope(
     let stream = client::ensure_daemon(socket, host, no_spawn).await?;
     let mut conn = client::Conn::new(stream);
     let initialized = conn
-        .request(
-            method::INITIALIZE,
-            serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "client": {
-                    "source": env.source,
-                    "plugin_version": env.source_version,
-                    "pid": std::process::id()
-                }
-            }),
-        )
+        .request(method::INITIALIZE, initialize_params(env))
         .await?;
     let initialized: wire::InitializeResult = serde_json::from_value(initialized)?;
     if initialized.daemon_version != host.version {
@@ -420,18 +452,8 @@ pub async fn forward_envelope(
         }
         let stream = client::ensure_daemon(socket, host, false).await?;
         conn = client::Conn::new(stream);
-        conn.request(
-            method::INITIALIZE,
-            serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "client": {
-                    "source": env.source,
-                    "plugin_version": env.source_version,
-                    "pid": std::process::id()
-                }
-            }),
-        )
-        .await?;
+        conn.request(method::INITIALIZE, initialize_params(env))
+            .await?;
     }
     conn.request(method::EVENT_LOG, env).await?;
     Ok(())
@@ -1332,10 +1354,73 @@ mod tests {
         args: ServeArgs,
     }
 
+    #[derive(Debug, Parser)]
+    struct HookCli {
+        #[command(flatten)]
+        args: HookArgs,
+    }
+
     #[test]
     fn serve_defaults_to_short_journal_backed_session_retirement() {
         let args = ServeCli::try_parse_from(["test"]).unwrap().args;
         assert_eq!(args.session_idle_timeout_secs, 30);
+    }
+
+    #[test]
+    fn hook_plugin_version_reaches_envelope_and_every_initialize_attempt() {
+        let args = HookCli::try_parse_from([
+            "test",
+            "--source",
+            "grok",
+            "--source-version",
+            "1.0.13",
+            "--plugin-version",
+            "0.1.0",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(args.source_version.as_deref(), Some("1.0.13"));
+        assert_eq!(args.plugin_version.as_deref(), Some("0.1.0"));
+
+        let payload = serde_json::json!({"native": "unchanged"});
+        let env = build_hook_envelope(
+            &args,
+            SessionRoute::default(),
+            payload.clone(),
+            "session-1".into(),
+            "SessionEnd".into(),
+        );
+        assert_eq!(env.source_version.as_deref(), Some("1.0.13"));
+        assert_eq!(env.plugin_version.as_deref(), Some("0.1.0"));
+        assert_eq!(env.payload, payload);
+
+        // Both the initial connection and the post-restart retry use this
+        // shared parameter builder.
+        let initialize = initialize_params(&env);
+        assert_eq!(initialize["client"]["source"], "grok");
+        assert_eq!(initialize["client"]["plugin_version"], "0.1.0");
+        assert_ne!(initialize["client"]["plugin_version"], "1.0.13");
+    }
+
+    #[test]
+    fn hook_flush_recognizes_native_and_documented_terminal_events() {
+        for event in ["session_end", "SessionEnd"] {
+            assert!(should_flush_hook_event(event, false));
+        }
+        for event in [
+            "stop",
+            "Stop",
+            "stop_failure",
+            "StopFailure",
+            "stop_cancelled",
+            "StopCancelled",
+            "subagent_stop",
+            "SubagentStop",
+        ] {
+            assert!(!should_flush_hook_event(event, false));
+            assert!(should_flush_hook_event(event, true));
+        }
+        assert!(!should_flush_hook_event("turn_completed", true));
     }
 
     #[test]

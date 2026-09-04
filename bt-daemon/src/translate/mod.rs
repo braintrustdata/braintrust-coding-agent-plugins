@@ -12,6 +12,7 @@ mod claude;
 mod codex;
 mod debug;
 mod git;
+mod grok;
 mod opencode;
 mod pi;
 mod recent;
@@ -21,6 +22,7 @@ pub use antigravity::AntigravityTranslatorFactory;
 pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;
 pub use debug::DebugTranslatorFactory;
+pub use grok::GrokTranslatorFactory;
 pub use opencode::OpenCodeTranslatorFactory;
 pub use pi::PiTranslatorFactory;
 
@@ -63,6 +65,11 @@ pub struct SpanRow {
     pub metrics: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Sink-only directive for a deterministic enrichment that may arrive
+    /// after this span's terminal row was durably delivered.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub allow_late_merge: bool,
     /// Labels for filtering in Braintrust (e.g. `compaction`, `permission-request`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
@@ -145,6 +152,7 @@ impl Registry {
         r.register(Box::new(AntigravityTranslatorFactory::new(git.clone())));
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
         r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
+        r.register(Box::new(GrokTranslatorFactory));
         r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));
         r.register(Box::new(PiTranslatorFactory::new(git)));
         r
@@ -168,6 +176,7 @@ impl Registry {
             "open-code" | "opencode" => "opencode",
             "antigravity" => "antigravity",
             "codex" => "codex",
+            "grok" => "grok",
             "pi" => "pi",
             "debug" => "debug",
             _ => return None,

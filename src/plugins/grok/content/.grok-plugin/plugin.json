@@ -1,0 +1,8 @@
+{
+  "name": "trace-grok",
+  "description": "Beta Braintrust tracing for Grok sessions with transcript-reconstructed LLM and tool spans.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Braintrust"
+  }
+}

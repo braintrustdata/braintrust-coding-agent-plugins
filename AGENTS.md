@@ -41,7 +41,7 @@ cargo test --manifest-path bt-daemon/Cargo.toml --all-features
 
 ## Versioning and distribution
 
-Versioning is per distribution. Claude and Codex plugins carry their version in
+Versioning is per distribution. Claude, Codex, and Grok plugins carry their version in
 their plugin manifests, and `scripts/set-plugin-version.py` updates those
 manifests for a release. Antigravity's schema does not expose a version field,
 so its distribution is versioned by repository tags and GitHub Releases.
@@ -54,6 +54,7 @@ is unversioned.
 | antigravity | `braintrustdata/braintrust-antigravity-plugin` |
 | claude | `braintrustdata/braintrust-claude-plugin` |
 | codex | `braintrustdata/braintrust-codex-plugin` |
+| grok | `braintrustdata/braintrust-grok-plugin` |
 
 A distribution repository is a generated artifact. Each deploy clones it,
 replaces the tracked tree with a fresh build, and pushes the result.
