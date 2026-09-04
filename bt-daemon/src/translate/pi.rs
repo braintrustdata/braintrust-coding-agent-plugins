@@ -332,7 +332,13 @@ impl PiTranslator {
     }
     fn provider_request(&mut self, event: &Value) {
         if let Some(call) = self.pending_llms.last_mut() {
-            call.provider = Some(event.clone())
+            let mut provider = event.clone();
+            if let Some(payload) = provider.get_mut("payload").and_then(Value::as_object_mut) {
+                // The authoritative provider-visible messages are already the
+                // LLM span input captured by the preceding context event.
+                payload.remove("messages");
+            }
+            call.provider = Some(provider)
         }
     }
     fn streaming_update(&mut self, event: &Value, ts: i64) {

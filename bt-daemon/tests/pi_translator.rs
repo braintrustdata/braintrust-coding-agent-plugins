@@ -71,6 +71,11 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
             json!({"messages":[{"role":"user","content":"inspect"}]}),
         ),
         event(
+            "before_provider_request",
+            3,
+            json!({"payload":{"model":"gpt-5","messages":[{"role":"user","content":"inspect"}]}}),
+        ),
+        event(
             "message_update",
             4,
             json!({"assistantMessageEvent":{"type":"text_delta"}}),
@@ -177,6 +182,15 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
     assert_eq!(
         first_llm.metrics.as_ref().unwrap()["time_to_first_token"],
         0.001
+    );
+    assert_eq!(
+        first_llm.metadata.as_ref().unwrap()["provider_request"]["payload"]["model"],
+        "gpt-5"
+    );
+    assert!(
+        first_llm.metadata.as_ref().unwrap()["provider_request"]["payload"]
+            .get("messages")
+            .is_none()
     );
     let tool = rows.values().find(|r| r.name == "skill: review").unwrap();
     assert_eq!(tool.name, "skill: review");
