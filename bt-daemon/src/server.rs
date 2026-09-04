@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// Injected dependencies for `serve`, so `bt` / tests can supply a sink
 /// factory (Braintrust in production, debug in tests) and a version string.
@@ -79,12 +79,62 @@ struct PendingSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     linked_route: Option<SessionRoute>,
     #[serde(default)]
-    events: Vec<Envelope>,
+    events: Vec<PendingEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     candidate_span_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence: Vec<Value>,
 }
+
+#[derive(Clone, Serialize)]
+struct PendingEvent {
+    env: Envelope,
+    replay_through: u64,
+    journal_through: u64,
+}
+
+impl<'de> Deserialize<'de> for PendingEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StoredPendingEvent {
+            Current {
+                env: Envelope,
+                replay_through: u64,
+                journal_through: u64,
+            },
+            Legacy(Envelope),
+        }
+        Ok(match StoredPendingEvent::deserialize(deserializer)? {
+            StoredPendingEvent::Current {
+                env,
+                replay_through,
+                journal_through,
+            } => Self {
+                env,
+                replay_through,
+                journal_through,
+            },
+            StoredPendingEvent::Legacy(env) => Self {
+                env,
+                replay_through: 0,
+                journal_through: 0,
+            },
+        })
+    }
+}
+
+enum IngressMsg {
+    Event(Box<PendingEvent>),
+    Barrier(oneshot::Sender<()>),
+}
+
+/// The hook path never waits for this queue. Once it fills, the append-only
+/// journals become the overflow queue and the worker catches them up in place.
+const INGRESS_QUEUE_CAPACITY: usize = 64;
 
 /// One independent delivery pipeline for a source session and the exact route
 /// carried by its hook or import envelope.
@@ -120,7 +170,11 @@ pub struct Daemon {
     auth_provider: Option<Arc<dyn AuthProvider>>,
     session_auth: tokio::sync::Mutex<HashMap<DeliveryKey, SessionAuthState>>,
     route_aliases: Mutex<HashMap<DeliveryKey, DeliveryKey>>,
+    /// Serializes only capture-side journal appends for a source session.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes daemon-side routing and actor creation independently of
+    /// capture, which must never inherit actor or sink backpressure.
+    dispatch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     journals: Mutex<HashMap<String, Arc<tokio::sync::Mutex<JournalWriter>>>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
     auth_errors: Mutex<HashMap<DeliveryKey, (String, String)>>,
@@ -128,7 +182,12 @@ pub struct Daemon {
     correlation: Arc<crate::correlation::CorrelationRegistry>,
     automatic_links: Mutex<HashMap<String, SessionRoute>>,
     pending_sessions: Mutex<HashMap<String, PendingSession>>,
+    pending_reconcile_lock: tokio::sync::Mutex<()>,
     correlation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    correlation_changed: Arc<Notify>,
+    ingress_tx: mpsc::Sender<IngressMsg>,
+    ingress_overflow: AtomicBool,
+    ingress_dispatched: Mutex<HashMap<DeliveryKey, u64>>,
     started: Instant,
     last_activity: Mutex<Instant>,
     shutting_down: AtomicBool,
@@ -137,7 +196,8 @@ pub struct Daemon {
 
 impl Daemon {
     fn new(opts: ServeOptions, data_dir: PathBuf) -> Arc<Self> {
-        Arc::new(Daemon {
+        let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_QUEUE_CAPACITY);
+        let daemon = Arc::new(Daemon {
             version: opts.version,
             data_dir,
             translators: opts.translators,
@@ -146,6 +206,7 @@ impl Daemon {
             session_auth: tokio::sync::Mutex::new(HashMap::new()),
             route_aliases: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
+            dispatch_locks: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
             managed_run_sessions: Mutex::new(HashMap::new()),
             auth_errors: Mutex::new(HashMap::new()),
@@ -153,12 +214,20 @@ impl Daemon {
             correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
             automatic_links: Mutex::new(HashMap::new()),
             pending_sessions: Mutex::new(HashMap::new()),
+            pending_reconcile_lock: tokio::sync::Mutex::new(()),
             correlation_locks: Mutex::new(HashMap::new()),
+            correlation_changed: Arc::new(Notify::new()),
+            ingress_tx,
+            ingress_overflow: AtomicBool::new(false),
+            ingress_dispatched: Mutex::new(HashMap::new()),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
             shutting_down: AtomicBool::new(false),
             shutdown: Notify::new(),
-        })
+        });
+        spawn_ingress_worker(daemon.clone(), ingress_rx);
+        spawn_pending_reconciler(daemon.clone());
+        daemon
     }
 
     async fn configure_event(&self, env: &mut Envelope) -> anyhow::Result<DeliveryKey> {
@@ -309,7 +378,12 @@ impl Daemon {
             .clone()
     }
 
-    async fn session_for(&self, env: &Envelope, key: &DeliveryKey) -> anyhow::Result<Arc<Session>> {
+    async fn session_for(
+        &self,
+        env: &Envelope,
+        key: &DeliveryKey,
+        replay_through: u64,
+    ) -> anyhow::Result<Arc<Session>> {
         {
             let map = self.sessions.lock().unwrap();
             if let Some(session) = map.get(key) {
@@ -339,15 +413,14 @@ impl Daemon {
             } else {
                 crate::ids::session_namespace(&env.source, &env.session_id)
             };
-        let through = journal::JournalReader::recorded_len(&journal_path).await;
         let replay = ReplayPlan {
             acknowledged_through: journal::JournalReader::acknowledged_through(
                 &journal_path,
-                through,
+                replay_through,
                 route,
             )
             .await,
-            through,
+            through: replay_through,
             journal_path,
         };
         let journal = self
@@ -370,6 +443,7 @@ impl Daemon {
                 correlation: self.correlation.clone(),
                 data_dir: self.data_dir.clone(),
                 journal,
+                correlation_changed: self.correlation_changed.clone(),
             },
             self.translators.clone(),
             self.sink_factory.clone(),
@@ -383,7 +457,7 @@ impl Daemon {
     /// journal file for the rest of the daemon's life; deterministic span ids
     /// mean a late event simply rebuilds it from the journal.
     async fn retire_session(&self, key: &DeliveryKey) {
-        let lock = self.session_lock(&key.source, &key.session_id);
+        let lock = self.dispatch_lock(&key.source, &key.session_id);
         let _guard = lock.lock().await;
 
         let session = { self.sessions.lock().unwrap().remove(key) };
@@ -414,8 +488,19 @@ impl Daemon {
             .any(|other| other.source == key.source && other.session_id == key.session_id);
         if last {
             let storage_key = crate::ids::session_namespace(&key.source, &key.session_id);
+            // Capture can proceed while the actor flushes above. Only take its
+            // lock for the brief writer-map cleanup after daemon work ends.
+            let capture_lock = self.session_lock(&key.source, &key.session_id);
+            let _capture_guard = capture_lock.lock().await;
             self.journals.lock().unwrap().remove(&storage_key);
             self.session_locks.lock().unwrap().remove(&storage_key);
+            self.dispatch_locks.lock().unwrap().remove(&storage_key);
+            self.ingress_dispatched
+                .lock()
+                .unwrap()
+                .retain(|candidate, _| {
+                    candidate.source != key.source || candidate.session_id != key.session_id
+                });
         }
         tracing::info!(session_id = %key.session_id, "session retired");
     }
@@ -458,19 +543,30 @@ impl Daemon {
             .clone())
     }
 
-    async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<u64> {
+    async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<(u64, u64)> {
         hydrate_transcript_reference(&self.data_dir, env).await;
-        self.journal_writer_for(&env.source, &env.session_id)
-            .await?
-            .lock()
-            .await
-            .append(env)
-            .await
+        let writer = self
+            .journal_writer_for(&env.source, &env.session_id)
+            .await?;
+        let mut writer = writer.lock().await;
+        let before = writer.position();
+        let through = writer.append(env).await?;
+        Ok((before, through))
     }
 
     fn session_lock(&self, source: &str, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let storage_key = crate::ids::session_namespace(source, session_id);
         self.session_locks
+            .lock()
+            .unwrap()
+            .entry(storage_key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn dispatch_lock(&self, source: &str, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let storage_key = crate::ids::session_namespace(source, session_id);
+        self.dispatch_locks
             .lock()
             .unwrap()
             .entry(storage_key)
@@ -485,6 +581,58 @@ impl Daemon {
             .values()
             .map(|s| s.counters.queued.load(Ordering::Relaxed))
             .sum()
+    }
+
+    async fn capture_event(&self, mut env: Envelope) -> Result<(), String> {
+        env.source = self
+            .translators
+            .canonical_source(&env.source)
+            .ok_or_else(|| format!("unsupported coding-agent source {:?}", env.source))?
+            .to_string();
+        self.touch();
+        let lock = self.session_lock(&env.source, &env.session_id);
+        let _guard = lock.lock().await;
+        let (replay_through, journal_through) = self
+            .append_to_journal(&mut env)
+            .await
+            .map_err(|error| format!("journal failed: {error}"))?;
+        match self
+            .ingress_tx
+            .try_send(IngressMsg::Event(Box::new(PendingEvent {
+                env,
+                replay_through,
+                journal_through,
+            }))) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.ingress_overflow.store(true, Ordering::Release);
+                tracing::debug!("ingress queue full; journal will be drained by daemon worker");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("journaled event will be recovered after daemon restart");
+            }
+        }
+        Ok(())
+    }
+
+    async fn ingress_barrier(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.ingress_tx.send(IngressMsg::Barrier(tx)).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    async fn settle_ingress(self: &Arc<Self>) {
+        self.ingress_barrier().await;
+        self.settle_session_actors().await;
+        let _ = retry_pending_sessions(self).await;
+    }
+
+    async fn settle_session_actors(&self) {
+        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        for session in sessions {
+            session.barrier().await;
+        }
     }
 
     fn record_managed_run_session(&self, managed_run_id: &str, key: &DeliveryKey) -> bool {
@@ -605,6 +753,31 @@ impl Daemon {
         result
     }
 
+    /// Flush every live delivery route for one source session. This is used
+    /// only by the daemon worker after a turn-ending event has already been
+    /// durably captured and acknowledged to the hook client.
+    async fn flush_source_session(&self, source: &str, session_id: &str, timeout: Duration) {
+        let sessions: Vec<_> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.source == source && key.session_id == session_id)
+            .map(|(_, session)| session.clone())
+            .collect();
+        for session in sessions {
+            let (flushed, pending) = session.flush(timeout).await;
+            if !flushed {
+                tracing::warn!(
+                    source,
+                    session_id,
+                    pending,
+                    "out-of-band turn-end flush did not complete"
+                );
+            }
+        }
+    }
+
     fn trigger_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
@@ -624,6 +797,189 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::Receiver<IngressMsg>) {
+    tokio::spawn(async move {
+        loop {
+            if daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
+                recover_ingress_overflow(&daemon).await;
+                continue;
+            }
+            let Some(msg) = rx.recv().await else {
+                break;
+            };
+            match msg {
+                IngressMsg::Event(event) => {
+                    dispatch_ingress_event(&daemon, *event).await;
+                }
+                IngressMsg::Barrier(reply) => {
+                    loop {
+                        daemon.settle_session_actors().await;
+                        let _ = retry_pending_sessions(&daemon).await;
+                        if !daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
+                            break;
+                        }
+                        recover_ingress_overflow(&daemon).await;
+                    }
+                    let _ = reply.send(());
+                }
+            }
+        }
+    });
+}
+
+async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
+    let ingress_key =
+        event.env.route.as_ref().and_then(|route| {
+            DeliveryKey::new(&event.env.source, &event.env.session_id, route).ok()
+        });
+    if ingress_key.as_ref().is_some_and(|key| {
+        daemon
+            .ingress_dispatched
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|through| *through >= event.journal_through)
+    }) {
+        return;
+    }
+
+    let schedule_flush = event.env.event == "SessionEnd"
+        || (matches!(
+            event.env.route.as_ref().map(|route| route.flush_mode),
+            Some(crate::wire::FlushMode::FlushOnTurnEnd)
+        ) && matches!(event.env.event.as_str(), "Stop" | "SubagentStop"));
+    let flush_source = event.env.source.clone();
+    let flush_session_id = event.env.session_id.clone();
+    let journal_through = event.journal_through;
+    // A child may arrive immediately after a parent's tool hook. Catch prior
+    // session actors up before resolving a new session, entirely in the daemon.
+    if is_session_start(&event.env.event) {
+        daemon.settle_session_actors().await;
+    }
+    match accept_event(daemon, event).await {
+        Ok(()) => {
+            if let Some(key) = ingress_key {
+                let mut dispatched = daemon.ingress_dispatched.lock().unwrap();
+                let through = dispatched.entry(key).or_default();
+                *through = (*through).max(journal_through);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "journaled ingress event could not be dispatched");
+            return;
+        }
+    }
+    if schedule_flush {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            daemon
+                .flush_source_session(&flush_source, &flush_session_id, Duration::from_secs(10))
+                .await;
+        });
+    }
+}
+
+/// Drain events omitted from the bounded in-memory queue. The queue contains
+/// only a latency fast path; journals remain the complete source of ingress.
+async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
+    let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
+        return;
+    };
+    let mut recovered = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
+            continue;
+        }
+        let recorded_len = journal::JournalReader::recorded_len(&path).await;
+        let Ok(Some(mut checkpoints)) = journal::JournalReader::open(&path, recorded_len).await
+        else {
+            continue;
+        };
+        let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
+        while let Ok(Some(entry)) = checkpoints.next_record().await {
+            if let journal::JournalRecord::DeliveryCheckpoint { route, through } = entry.record {
+                let key = serde_json::to_string(&route).unwrap_or_default();
+                let acknowledged = acknowledged_by_route.entry(key).or_default();
+                *acknowledged = (*acknowledged).max(through);
+            }
+        }
+
+        let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded_len).await else {
+            continue;
+        };
+        let mut before = 0u64;
+        while let Ok(Some(entry)) = reader.next_record().await {
+            let through = entry.through;
+            let journal::JournalRecord::Event(redacted) = entry.record else {
+                before = through;
+                continue;
+            };
+            let mut env = journal::envelope_from_redacted(redacted);
+            let Some(source) = daemon.translators.canonical_source(&env.source) else {
+                before = through;
+                continue;
+            };
+            env.source = source.to_string();
+            let Some(route) = env.route.as_ref() else {
+                before = through;
+                continue;
+            };
+            let route_json = recovered_delivery_route(daemon, &env)
+                .await
+                .as_ref()
+                .and_then(|route| serde_json::to_string(route).ok())
+                .unwrap_or_else(|| serde_json::to_string(route).unwrap_or_default());
+            let key = match DeliveryKey::new(&env.source, &env.session_id, route) {
+                Ok(key) => key,
+                Err(_) => {
+                    before = through;
+                    continue;
+                }
+            };
+            let dispatched = daemon
+                .ingress_dispatched
+                .lock()
+                .unwrap()
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+            let acknowledged = acknowledged_by_route.get(&route_json).copied().unwrap_or(0);
+            if through > dispatched.max(acknowledged) {
+                dispatch_ingress_event(
+                    daemon,
+                    PendingEvent {
+                        env,
+                        replay_through: before,
+                        journal_through: through,
+                    },
+                )
+                .await;
+                recovered += 1;
+            }
+            before = through;
+        }
+    }
+    if recovered > 0 {
+        tracing::info!(recovered, "drained journal-backed ingress overflow");
+    }
+}
+
+fn spawn_pending_reconciler(daemon: Arc<Daemon>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = daemon.shutdown.notified() => return,
+                _ = daemon.correlation_changed.notified() => {
+                    if let Err(error) = retry_pending_sessions(&daemon).await {
+                        tracing::warn!(%error, "pending child-session reconciliation failed");
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Bind the socket (handling a stale/rival socket), serve until shutdown, then
@@ -652,6 +1008,8 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
     let daemon = Daemon::new(opts, data_dir);
     collect_garbage(&daemon.data_dir).await;
     restore_active_parent_snapshots(&daemon.data_dir, &daemon.correlation).await;
+    restore_pending_sessions(&daemon).await;
+    recover_unprocessed_journals(&daemon).await;
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
     spawn_idle_watchdog(daemon.clone(), idle_timeout);
     spawn_session_reaper(
@@ -750,7 +1108,7 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
                         match serde_json::from_value::<Envelope>(params) {
                             Ok(mut env) => {
                                 attach_process_capture(&mut env, client.as_ref());
-                                let _ = accept_event(&daemon, env).await;
+                                let _ = daemon.capture_event(env).await;
                             }
                             Err(error) => tracing::warn!(
                                 method = %note.method,
@@ -795,14 +1153,12 @@ fn attach_process_capture(env: &mut Envelope, client: Option<&crate::wire::Clien
     }
 }
 
-async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), String> {
-    let canonical_source = daemon
-        .translators
-        .canonical_source(&env.source)
-        .ok_or_else(|| format!("unsupported coding-agent source {:?}", env.source))?
-        .to_string();
-    env.source = canonical_source;
-    daemon.touch();
+async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), String> {
+    let PendingEvent {
+        mut env,
+        replay_through,
+        journal_through,
+    } = event;
     let requested_link_key = automatic_link_key(&env);
     let correlation_lock = daemon.correlation_lock(&requested_link_key);
     let _correlation_guard = correlation_lock.lock().await;
@@ -832,7 +1188,7 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
     if let Some(mut state) = state {
         if let Some(route) = state.linked_route.clone() {
             for mut pending in std::mem::take(&mut state.events) {
-                pending.route = Some(route.clone());
+                pending.env.route = Some(route.clone());
                 accept_resolved_event(daemon, pending).await?;
             }
             write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
@@ -843,14 +1199,22 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
                 .insert(requested_link_key, route.clone());
             env.route = Some(route);
             drop(_correlation_guard);
-            return accept_resolved_and_retry_pending(daemon, env).await;
+            return accept_resolved_and_retry_pending(
+                daemon,
+                PendingEvent {
+                    env,
+                    replay_through,
+                    journal_through,
+                },
+            )
+            .await;
         }
 
         let capture = env.capture.as_ref().or_else(|| {
             state
                 .events
                 .first()
-                .and_then(|event| event.capture.as_ref())
+                .and_then(|event| event.env.capture.as_ref())
         });
         state.evidence.push(correlation_evidence(&env).await);
         let evidence = Value::Array(state.evidence.clone());
@@ -862,10 +1226,14 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
         ) {
             crate::correlation::Resolution::Parent(parent) => {
                 state.linked_route = Some(parent.route.clone());
-                state.events.push(env);
+                state.events.push(PendingEvent {
+                    env,
+                    replay_through,
+                    journal_through,
+                });
                 write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
                 for mut event in std::mem::take(&mut state.events) {
-                    event.route = Some(parent.route.clone());
+                    event.env.route = Some(parent.route.clone());
                     accept_resolved_event(daemon, event).await?;
                 }
                 write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
@@ -878,13 +1246,18 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
             }
             crate::correlation::Resolution::Ambiguous(_)
             | crate::correlation::Resolution::Standalone => {
-                state.events.push(env);
+                state.events.push(PendingEvent {
+                    env,
+                    replay_through,
+                    journal_through,
+                });
                 write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
                 daemon
                     .pending_sessions
                     .lock()
                     .unwrap()
                     .insert(requested_link_key, state);
+                daemon.correlation_changed.notify_one();
                 return Ok(());
             }
         }
@@ -915,7 +1288,11 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
                 let evidence = correlation_evidence(&env).await;
                 let state = PendingSession {
                     linked_route: None,
-                    events: vec![env],
+                    events: vec![PendingEvent {
+                        env,
+                        replay_through,
+                        journal_through,
+                    }],
                     candidate_span_ids,
                     evidence: vec![evidence],
                 };
@@ -925,6 +1302,7 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
                     .lock()
                     .unwrap()
                     .insert(requested_link_key, state);
+                daemon.correlation_changed.notify_one();
                 return Ok(());
             }
             crate::correlation::Resolution::Standalone => {}
@@ -932,18 +1310,27 @@ async fn accept_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), Str
     }
 
     drop(_correlation_guard);
-    accept_resolved_and_retry_pending(daemon, env).await
+    accept_resolved_and_retry_pending(
+        daemon,
+        PendingEvent {
+            env,
+            replay_through,
+            journal_through,
+        },
+    )
+    .await
 }
 
 async fn accept_resolved_and_retry_pending(
     daemon: &Arc<Daemon>,
-    env: Envelope,
+    event: PendingEvent,
 ) -> Result<(), String> {
-    accept_resolved_event(daemon, env).await?;
+    accept_resolved_event(daemon, event).await?;
     retry_pending_sessions(daemon).await
 }
 
 async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
+    let _reconcile_guard = daemon.pending_reconcile_lock.lock().await;
     let keys: Vec<String> = daemon
         .pending_sessions
         .lock()
@@ -961,13 +1348,16 @@ async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
             daemon.pending_sessions.lock().unwrap().insert(key, state);
             continue;
         }
-        let capture = state.events.iter().find_map(|event| event.capture.as_ref());
+        let capture = state
+            .events
+            .iter()
+            .find_map(|event| event.env.capture.as_ref());
         let evidence = Value::Array(state.evidence.clone());
         match daemon.correlation.resolve_pending(
             state
                 .events
                 .first()
-                .map(|event| event.source.as_str())
+                .map(|event| event.env.source.as_str())
                 .unwrap_or(""),
             capture,
             &evidence,
@@ -977,7 +1367,7 @@ async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
                 state.linked_route = Some(parent.route.clone());
                 write_correlation_state(&daemon.data_dir, &key, &state).await?;
                 for mut event in std::mem::take(&mut state.events) {
-                    event.route = Some(parent.route.clone());
+                    event.env.route = Some(parent.route.clone());
                     accept_resolved_event(daemon, event).await?;
                 }
                 write_correlation_state(&daemon.data_dir, &key, &state).await?;
@@ -1181,14 +1571,151 @@ async fn restore_active_parent_snapshots(
     }
 }
 
-async fn accept_resolved_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Result<(), String> {
+async fn restore_pending_sessions(daemon: &Arc<Daemon>) {
+    let Ok(mut entries) = tokio::fs::read_dir(daemon.data_dir.join("correlation")).await else {
+        return;
+    };
+    let mut restored = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_slice::<PendingSession>(&bytes) else {
+            continue;
+        };
+        let Some(key) = state
+            .events
+            .first()
+            .map(|event| automatic_link_key(&event.env))
+        else {
+            continue;
+        };
+        daemon.pending_sessions.lock().unwrap().insert(key, state);
+        restored += 1;
+    }
+    if restored > 0 {
+        tracing::info!(restored, "restored pending child sessions");
+    }
+}
+
+async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
+    let pending: HashSet<(String, String, u64)> = daemon
+        .pending_sessions
+        .lock()
+        .unwrap()
+        .values()
+        .flat_map(|state| {
+            state.events.iter().map(|event| {
+                (
+                    event.env.source.clone(),
+                    event.env.session_id.clone(),
+                    event.journal_through,
+                )
+            })
+        })
+        .collect();
+    let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
+        return;
+    };
+    let mut candidates = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
+            continue;
+        }
+        let recorded_len = journal::JournalReader::recorded_len(&path).await;
+        let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded_len).await else {
+            continue;
+        };
+        let mut before = 0u64;
+        let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
+        let mut latest_by_route: HashMap<String, PendingEvent> = HashMap::new();
+        while let Ok(Some(entry)) = reader.next_record().await {
+            let through = entry.through;
+            match entry.record {
+                journal::JournalRecord::Event(redacted) => {
+                    let mut env = journal::envelope_from_redacted(redacted);
+                    let Some(source) = daemon.translators.canonical_source(&env.source) else {
+                        before = through;
+                        continue;
+                    };
+                    env.source = source.to_string();
+                    if let Some(route) = env.route.as_ref() {
+                        let key = serde_json::to_string(route).unwrap_or_default();
+                        latest_by_route.insert(
+                            key,
+                            PendingEvent {
+                                env,
+                                replay_through: before,
+                                journal_through: through,
+                            },
+                        );
+                    }
+                }
+                journal::JournalRecord::DeliveryCheckpoint { route, through } => {
+                    let key = serde_json::to_string(&route).unwrap_or_default();
+                    let acknowledged = acknowledged_by_route.entry(key).or_default();
+                    *acknowledged = (*acknowledged).max(through);
+                }
+            }
+            before = through;
+        }
+        for event in latest_by_route.into_values() {
+            if pending.contains(&(
+                event.env.source.clone(),
+                event.env.session_id.clone(),
+                event.journal_through,
+            )) {
+                continue;
+            }
+            let route = recovered_delivery_route(daemon, &event.env)
+                .await
+                .as_ref()
+                .and_then(|route| serde_json::to_string(route).ok())
+                .unwrap_or_default();
+            if acknowledged_by_route.get(&route).copied().unwrap_or(0) < event.journal_through {
+                candidates.push(event);
+            }
+        }
+    }
+    candidates.sort_by_key(|event| event.env.ts_ms);
+    let recovered = candidates.len();
+    for event in candidates {
+        let _ = daemon
+            .ingress_tx
+            .send(IngressMsg::Event(Box::new(event)))
+            .await;
+    }
+    // Reconciliation stays in the daemon worker and follows every recovered
+    // event in queue order. Dropping the receiver is intentional: startup and
+    // hook capture do not wait for translation or reporting.
+    let (reply, _ignored) = oneshot::channel();
+    let _ = daemon.ingress_tx.send(IngressMsg::Barrier(reply)).await;
+    if recovered > 0 {
+        tracing::info!(
+            recovered,
+            "queued unprocessed journal sessions for recovery"
+        );
+    }
+}
+
+async fn accept_resolved_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), String> {
+    let PendingEvent {
+        mut env,
+        replay_through,
+        journal_through,
+    } = event;
     let source = env.source.clone();
     let event = env.event.clone();
     let session_id = env.session_id.clone();
     let managed_run_id = env.managed_run_id.clone();
     let route = env.route.clone();
     tracing::info!(source, event, session_id, "event received");
-    let session_lock = daemon.session_lock(&source, &session_id);
+    let session_lock = daemon.dispatch_lock(&source, &session_id);
     let _session_guard = session_lock.lock().await;
 
     let result = async {
@@ -1208,16 +1735,12 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, mut env: Envelope) -> Resul
             }
         }
         let session = daemon
-            .session_for(&env, &delivery_key)
+            .session_for(&env, &delivery_key, replay_through)
             .await
             .map_err(|error| format!("session init failed: {error}"))?;
         daemon
             .correlation
             .observe_session(&delivery_key.correlation_key(), env.capture.as_ref());
-        let journal_through = daemon
-            .append_to_journal(&mut env)
-            .await
-            .map_err(|error| format!("journal failed: {error}"))?;
         session
             .enqueue(env, journal_through)
             .await
@@ -1251,6 +1774,29 @@ fn automatic_link_key(env: &Envelope) -> String {
         .and_then(|route| serde_json::to_string(route).ok())
         .unwrap_or_default();
     format!("{}\u{1f}{}\u{1f}{route}", env.source, env.session_id)
+}
+
+/// Correlated child events retain their setup route in the immutable journal,
+/// while their delivery checkpoint belongs to the resolved parent route.
+/// Recover against that effective route without rewriting the captured event.
+async fn recovered_delivery_route(daemon: &Arc<Daemon>, env: &Envelope) -> Option<SessionRoute> {
+    let key = automatic_link_key(env);
+    if let Some(route) = daemon.automatic_links.lock().unwrap().get(&key).cloned() {
+        return Some(route);
+    }
+    if let Some(route) = daemon
+        .pending_sessions
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|state| state.linked_route.clone())
+    {
+        return Some(route);
+    }
+    read_correlation_state(&daemon.data_dir, &key)
+        .await
+        .and_then(|state| state.linked_route)
+        .or_else(|| env.route.clone())
 }
 
 async fn handle_request(
@@ -1303,7 +1849,7 @@ async fn handle_request(
         method::EVENT_LOG => {
             let mut env = parse!(Envelope);
             attach_process_capture(&mut env, client.as_ref());
-            match accept_event(daemon, env).await {
+            match daemon.capture_event(env).await {
                 Ok(()) => Response::ok(
                     id,
                     serde_json::to_value(EventLogResult { accepted: true }).unwrap(),
@@ -1313,6 +1859,9 @@ async fn handle_request(
         }
         method::SESSION_FLUSH => {
             let p = parse!(FlushParams);
+            // Explicit flushes wait for the daemon-owned ingress queue. Hook
+            // capture never waits on this barrier.
+            daemon.settle_ingress().await;
             let delivery_keys: Vec<_> = daemon
                 .sessions
                 .lock()
@@ -1354,11 +1903,13 @@ async fn handle_request(
         }
         method::MANAGED_RUN_FLUSH => {
             let params = parse!(ManagedRunFlushParams);
+            daemon.settle_ingress().await;
             let result = daemon.flush_managed_run(params).await;
             Response::ok(id, serde_json::to_value(result).unwrap())
         }
         method::STATUS_GET => {
             let p = parse!(StatusParams);
+            daemon.settle_ingress().await;
             Response::ok(id, serde_json::to_value(daemon.status(p)).unwrap())
         }
         method::DAEMON_SHUTDOWN => {
@@ -1522,6 +2073,7 @@ fn spawn_idle_watchdog(daemon: Arc<Daemon>, idle_timeout: Duration) {
 }
 
 async fn drain_all(daemon: &Arc<Daemon>) {
+    daemon.settle_ingress().await;
     let sessions: Vec<Arc<Session>> = daemon.sessions.lock().unwrap().values().cloned().collect();
     for s in sessions {
         s.shutdown().await;

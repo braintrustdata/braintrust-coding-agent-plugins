@@ -227,6 +227,10 @@ impl JournalWriter {
         Ok(Self { file, position })
     }
 
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
     /// Append one event in redacted form and flush to the OS. Not fsync'd per
     /// event (that would dominate hook latency); an OS crash can lose the last
     /// few lines, which replay tolerates.

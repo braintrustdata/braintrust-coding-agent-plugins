@@ -43,6 +43,69 @@ struct TrackingSink {
     flushes: Arc<Mutex<HashMap<String, usize>>>,
 }
 
+struct SlowSink;
+
+#[async_trait]
+impl Sink for SlowSink {
+    fn configure(&mut self, _config: &SessionConfig) {}
+    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Ok(ops.len() as u64)
+    }
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct SlowSinkFactory;
+
+impl SinkFactory for SlowSinkFactory {
+    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+        Ok(Box::new(SlowSink))
+    }
+}
+
+struct GateSinkFactory {
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<tokio::sync::Notify>,
+    emitted: Arc<std::sync::atomic::AtomicU64>,
+}
+
+struct GateSink {
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<tokio::sync::Notify>,
+    emitted: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[async_trait]
+impl Sink for GateSink {
+    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        if self
+            .blocked
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.gate.notified().await;
+        }
+        self.emitted
+            .fetch_add(ops.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(ops.len() as u64)
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl SinkFactory for GateSinkFactory {
+    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+        Ok(Box::new(GateSink {
+            blocked: self.blocked.clone(),
+            gate: self.gate.clone(),
+            emitted: self.emitted.clone(),
+        }))
+    }
+}
+
 #[async_trait]
 impl Sink for TrackingSink {
     fn configure(&mut self, _config: &SessionConfig) {}
@@ -413,6 +476,72 @@ async fn start_tracking_daemon(
     (socket, handle, flushes, tmp)
 }
 
+async fn start_slow_daemon() -> (PathBuf, tokio::task::JoinHandle<()>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let opts = ServeOptions {
+        version: "test".into(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory: Arc::new(SlowSinkFactory),
+        auth_provider: Some(Arc::new(TestAuthProvider {
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+            first_lease_expired: false,
+        })),
+    };
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    (socket, handle, tmp)
+}
+
+async fn start_gated_daemon(
+    gate: Arc<tokio::sync::Notify>,
+    emitted: Arc<std::sync::atomic::AtomicU64>,
+) -> (
+    PathBuf,
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let opts = ServeOptions {
+        version: "test".into(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory: Arc::new(GateSinkFactory {
+            blocked: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            gate,
+            emitted,
+        }),
+        auth_provider: Some(Arc::new(TestAuthProvider {
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+            first_lease_expired: false,
+        })),
+    };
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let handle = tokio::spawn(async move {
+        let _ = run_serve(args, opts).await;
+    });
+    wait_for(&socket).await;
+    (data_dir, socket, handle, tmp)
+}
+
 async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::JoinHandle<()> {
     let args = ServeArgs {
         socket: Some(socket.clone()),
@@ -551,6 +680,7 @@ async fn expiring_profile_lease_is_refreshed_for_the_pinned_profile() {
     )
     .await
     .unwrap();
+    flush_session("refresh", &socket, 5000).await.unwrap();
 
     let calls = provider.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 2);
@@ -645,6 +775,60 @@ async fn one_session_reports_to_multiple_routes_and_orgs_concurrently() {
     assert_eq!(
         status_orgs,
         HashSet::from(["work-org".to_string(), "personal-org".to_string()])
+    );
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_checkpoints_are_scoped_to_their_delivery_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let journal = source_journal_path(&data_dir, "debug", "route-recovery");
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+
+    let personal = routed_envelope("route-recovery", "personal", "personal-org", "SessionStart");
+    let work = routed_envelope("route-recovery", "work", "work-org", "Stop");
+    let personal_line = serde_json::to_vec(&personal.redacted()).unwrap();
+    let work_line = serde_json::to_vec(&work.redacted()).unwrap();
+    let work_through = (personal_line.len() + 1 + work_line.len() + 1) as u64;
+    let checkpoint = serde_json::to_vec(&serde_json::json!({
+        "_bt_record_type": "delivery_checkpoint",
+        "route": work.route.as_ref().unwrap(),
+        "through": work_through,
+    }))
+    .unwrap();
+    let mut contents = Vec::new();
+    for line in [&personal_line, &work_line, &checkpoint] {
+        contents.extend_from_slice(line);
+        contents.push(b'\n');
+    }
+    std::fs::write(&journal, contents).unwrap();
+
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let handle = start_daemon_at_with(data_dir, socket.clone(), provider, recording.clone()).await;
+    let flushed = flush_session("route-recovery", &socket, 5000)
+        .await
+        .unwrap();
+    assert!(flushed.flushed, "flush did not complete: {flushed:?}");
+
+    let sinks = recording.sinks.lock().unwrap().clone();
+    assert_eq!(sinks.len(), 1, "only the unacknowledged route is recovered");
+    assert_eq!(
+        sinks[0].org.lock().unwrap().as_deref(),
+        Some("personal-org"),
+        "a later checkpoint for work must not suppress personal recovery"
+    );
+    assert!(
+        sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the unacknowledged route must reach its sink"
     );
 
     shutdown(&socket).await;
@@ -847,15 +1031,14 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     let (data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
     let host = dummy_host();
 
-    let error = forward_envelope(
+    forward_envelope(
         &routed_envelope("login-needed", "missing", "missing-org", "SessionStart"),
         &socket,
         &host,
         false,
     )
     .await
-    .unwrap_err();
-    assert!(error.to_string().contains("bt login"));
+    .unwrap();
     let status = run_status(StatusArgs {
         socket: Some(socket.clone()),
         session_id: Some("login-needed".into()),
@@ -866,7 +1049,10 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     let status_error = status.sessions[0].last_error.as_deref().unwrap();
     assert!(status_error.contains("select a profile explicitly"));
     assert!(!status_error.contains("secret-"));
-    assert!(!source_journal_path(&data_dir, "debug", "login-needed").exists());
+    assert!(
+        source_journal_path(&data_dir, "debug", "login-needed").exists(),
+        "capture must remain durable even when background auth fails"
+    );
     assert_eq!(provider.calls.lock().unwrap().len(), 1);
 
     shutdown(&socket).await;
@@ -1069,6 +1255,97 @@ async fn distinct_sessions_are_isolated() {
 }
 
 #[tokio::test]
+async fn hook_capture_stops_at_the_durable_journal_boundary() {
+    let (socket, handle, tmp) = start_slow_daemon().await;
+    let host = dummy_host();
+    forward_envelope(
+        &envelope("fast-capture", "SessionStart", 1),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let mut turn_end = envelope("fast-capture", "Stop", 2);
+    turn_end.route.as_mut().unwrap().flush_mode = bt_daemon::wire::FlushMode::FlushOnTurnEnd;
+    let accepted = tokio::time::timeout(
+        Duration::from_millis(100),
+        forward_envelope(&turn_end, &socket, &host, false),
+    )
+    .await;
+    assert!(
+        matches!(accepted, Ok(Ok(()))),
+        "turn-end capture waited for translation or flushing: {accepted:?}"
+    );
+    let journal = std::fs::read_to_string(source_journal_path(
+        &tmp.path().join("data"),
+        "debug",
+        "fast-capture",
+    ))
+    .unwrap();
+    assert_eq!(
+        journal.lines().count(),
+        2,
+        "hook returned before journaling"
+    );
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn saturated_ingress_uses_the_journal_as_its_bounded_overflow_queue() {
+    const EVENT_COUNT: i64 = 1_100;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (data_dir, socket, handle, _tmp) = start_gated_daemon(gate.clone(), emitted.clone()).await;
+    let host = dummy_host();
+
+    forward_envelope(
+        &envelope("bounded-overflow", "SessionStart", 0),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    for ts in 1..EVENT_COUNT {
+        forward_envelope(
+            &envelope("bounded-overflow", "PostToolUse", ts),
+            &socket,
+            &host,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "bounded-overflow"))
+            .unwrap();
+    assert_eq!(
+        journal.lines().count(),
+        EVENT_COUNT as usize,
+        "every hook returns only after its event reaches the journal"
+    );
+
+    gate.notify_one();
+    let flushed = flush_session("bounded-overflow", &socket, 15_000)
+        .await
+        .unwrap();
+    assert!(flushed.flushed, "flush did not complete: {flushed:?}");
+    assert_eq!(
+        emitted.load(std::sync::atomic::Ordering::Relaxed),
+        EVENT_COUNT as u64 + 1,
+        "the root plus every journaled event must reach the sink exactly once"
+    );
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn status_reports_sessions_and_filters_by_session_id() {
     let (_data_dir, socket, handle, _tmp) = start_daemon().await;
     let host = dummy_host();
@@ -1257,6 +1534,35 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
 
     shutdown(&socket).await;
     second.await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_startup_recovers_an_event_journaled_before_worker_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let journal = source_journal_path(&data_dir, "debug", "crash-window");
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    let mut raw =
+        serde_json::to_vec(&envelope("crash-window", "SessionStart", 1).redacted()).unwrap();
+    raw.push(b'\n');
+    std::fs::write(&journal, raw).unwrap();
+
+    let daemon = start_daemon_at(data_dir.clone(), socket.clone()).await;
+    let flushed = flush_session("crash-window", &socket, 5000).await.unwrap();
+    assert!(
+        flushed.flushed,
+        "recovered event did not drain: {flushed:?}"
+    );
+    let spans = std::fs::read_to_string(data_dir.join("spans/crash-window.ndjson")).unwrap();
+    assert_eq!(
+        spans.lines().count(),
+        2,
+        "startup must translate the uncheckpointed journal event"
+    );
+
+    shutdown(&socket).await;
+    daemon.await.unwrap();
 }
 
 #[tokio::test]

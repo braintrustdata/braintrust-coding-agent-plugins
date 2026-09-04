@@ -958,6 +958,14 @@ fn codex_subagent_nests_under_spawning_turn() {
     let sub_t = tmp.path().join("sub.jsonl");
     let main_p = main_t.to_str().unwrap();
     let sub_p = sub_t.to_str().unwrap();
+    let original_sub_p = "/rollouts/subagent-a1.jsonl";
+    let mirrored_subagent = || {
+        json!({
+            "path": original_sub_p,
+            "mirror": sub_p,
+            "through": std::fs::metadata(&sub_t).map(|meta| meta.len()).unwrap_or(0),
+        })
+    };
 
     // Main session opens a turn and runs a spawn_agent tool.
     for v in [
@@ -993,7 +1001,12 @@ fn codex_subagent_nests_under_spawning_turn() {
                 "s",
                 "SubagentStart",
                 main_p,
-                json!({ "agent_id": "a1", "transcript_path": sub_p, "agent_type": "reviewer" }),
+                json!({
+                    "agent_id": "a1",
+                    "transcript_path": original_sub_p,
+                    "agent_type": "reviewer",
+                    "_bt_transcript_mirror": mirrored_subagent(),
+                }),
             ),
             &ctx,
         )
@@ -1020,7 +1033,11 @@ fn codex_subagent_nests_under_spawning_turn() {
                 "s",
                 "PostToolUse",
                 main_p,
-                json!({ "agent_id": "a1", "transcript_path": sub_p }),
+                json!({
+                    "agent_id": "a1",
+                    "transcript_path": original_sub_p,
+                    "_bt_transcript_mirror": mirrored_subagent(),
+                }),
             ),
             &ctx,
         )
@@ -1032,7 +1049,11 @@ fn codex_subagent_nests_under_spawning_turn() {
                 "s",
                 "SubagentStop",
                 main_p,
-                json!({ "agent_id": "a1", "agent_transcript_path": sub_p }),
+                json!({
+                    "agent_id": "a1",
+                    "agent_transcript_path": original_sub_p,
+                    "_bt_transcript_mirror": mirrored_subagent(),
+                }),
             ),
             &ctx,
         )

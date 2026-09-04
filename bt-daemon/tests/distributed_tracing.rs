@@ -156,9 +156,9 @@ async fn every_instrumented_parent_child_agent_pair_shares_one_trace() {
             )
             .await;
 
-            // The child starts immediately after the blocking start-tool hook.
-            // No parent flush is inserted here: forwarding the start event must
-            // not return until its correlation marker is visible.
+            // The child starts immediately after the journal-only start-tool
+            // hook. Daemon ingress orders the parent's correlation update
+            // before resolving the child; hook execution does not wait for it.
             forward_all(
                 &mut fixtures.start_turn(
                     child_kind,
@@ -272,6 +272,11 @@ async fn every_agent_pair_links_when_the_daemon_restarts_between_spawn_and_child
                 &host,
             )
             .await;
+
+            // Hook capture guarantees only durable journaling. This explicit
+            // daemon barrier makes the derived snapshot observable to the
+            // restart assertion below.
+            flush(&parent_session, &socket).await;
 
             let parent_snapshot_dir = data_dir.join("correlation").join("parents");
             let mut snapshots = tokio::fs::read_dir(&parent_snapshot_dir).await.unwrap();
@@ -989,6 +994,7 @@ async fn ambiguous_child_evidence_survives_daemon_restart() {
         1_700_500_000_020,
     );
     forward(child_start.remove(0), &socket, &host).await;
+    flush("pending-child", &socket).await;
     assert!(tokio::fs::read_dir(data_dir.join("correlation"))
         .await
         .unwrap()
@@ -1622,6 +1628,7 @@ async fn concurrent_agent_sessions_in_one_process_choose_their_own_tools() {
     }
 
     for (_, _, parent_session, _, _, _, _, _, _) in &cases {
+        flush(parent_session, &socket).await;
         let parent = recording.session(parent_session);
         assert!(
             parent
