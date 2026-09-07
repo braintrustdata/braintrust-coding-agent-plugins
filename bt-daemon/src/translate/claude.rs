@@ -62,7 +62,78 @@ struct PendingTool {
 
 enum PendingHistory {
     Main,
-    Owned(Vec<Value>),
+    Owned(MessageHistory),
+}
+
+#[derive(Default)]
+struct MessageHistory {
+    messages: Vec<HistoryMessage>,
+    preserved_after_compaction: Vec<String>,
+}
+
+struct HistoryMessage {
+    value: Value,
+    source_uuids: Vec<String>,
+}
+
+impl MessageHistory {
+    fn active(&self) -> Vec<Value> {
+        self.messages
+            .iter()
+            .map(|message| message.value.clone())
+            .collect()
+    }
+
+    fn push(&mut self, value: Value, source_uuid: Option<String>) -> usize {
+        let index = self.messages.len();
+        self.messages.push(HistoryMessage {
+            value,
+            source_uuids: source_uuid.into_iter().collect(),
+        });
+        index
+    }
+
+    fn update(&mut self, index: usize, value: Value, source_uuid: Option<String>) {
+        let Some(message) = self.messages.get_mut(index) else {
+            return;
+        };
+        message.value = value;
+        if let Some(source_uuid) = source_uuid {
+            if !message.source_uuids.contains(&source_uuid) {
+                message.source_uuids.push(source_uuid);
+            }
+        }
+    }
+
+    fn observe_compact_boundary(&mut self, record: &Value) {
+        self.preserved_after_compaction = record
+            .pointer("/compactMetadata/preservedMessages/uuids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+    }
+
+    fn begin_compacted(&mut self, summary: Value, source_uuid: Option<String>) {
+        let preserved = std::mem::take(&mut self.preserved_after_compaction);
+        let kept = self
+            .messages
+            .drain(..)
+            .filter(|message| {
+                message
+                    .source_uuids
+                    .iter()
+                    .any(|uuid| preserved.contains(uuid))
+            })
+            .collect::<Vec<_>>();
+        self.messages.push(HistoryMessage {
+            value: summary,
+            source_uuids: source_uuid.into_iter().collect(),
+        });
+        self.messages.extend(kept);
+    }
 }
 
 struct PendingEmission {
@@ -86,7 +157,7 @@ struct ClaudeTranslator {
     tool_seq: u32,
     main_transcript: Option<String>,
     transcripts: HashMap<String, TranscriptCursor>,
-    main_history: Vec<Value>,
+    main_history: MessageHistory,
     emitted_requests: RecentSet<String>,
     emitted_tools: RecentSet<String>,
     pending_tools: HashMap<String, PendingTool>,
@@ -116,7 +187,7 @@ impl ClaudeTranslator {
             tool_seq: 0,
             main_transcript: None,
             transcripts: HashMap::new(),
-            main_history: Vec::new(),
+            main_history: MessageHistory::default(),
             emitted_requests: RecentSet::default(),
             emitted_tools: RecentSet::default(),
             pending_tools: HashMap::new(),
@@ -436,7 +507,7 @@ impl ClaudeTranslator {
             let records = std::mem::take(&mut cursor.buffered);
             self.queue_transcript(
                 records,
-                PendingHistory::Owned(Vec::new()),
+                PendingHistory::Owned(MessageHistory::default()),
                 format!("subagent:{agent_id}"),
                 parent.clone(),
                 self.current_cwd.clone(),
@@ -539,7 +610,7 @@ impl ClaudeTranslator {
     }
 
     fn release_terminal_state(&mut self) {
-        self.main_history.clear();
+        self.main_history = MessageHistory::default();
         self.transcripts.clear();
         self.subagents.clear();
         self.pending_tools.clear();
@@ -753,6 +824,19 @@ impl AgentTranslator for ClaudeTranslator {
                 &mut ops,
             ),
             "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, None, &mut ops),
+            "PostCompact" => {
+                if let Some(parent) = self
+                    .turn
+                    .as_ref()
+                    .map(|turn| turn.id.clone())
+                    .or_else(|| self.last_turn_id.clone())
+                {
+                    // PostCompact is the durable point at which Claude's
+                    // synthetic compact-summary transcript record becomes the
+                    // first message in the active history window.
+                    self.emit_main(&parent, &mut ops);
+                }
+            }
             "SubagentStart" => {
                 if let Some(agent_id) = string_field(&event.payload, "agent_id") {
                     self.ensure_subagent(&agent_id, event, &mut ops);
@@ -867,10 +951,10 @@ fn assistant_request_id(record: &Value) -> Option<String> {
 struct ParsedTranscript {
     calls: Vec<LlmCall>,
     tools: Vec<TranscriptTool>,
-    history: Vec<Value>,
+    history: MessageHistory,
 }
 
-fn parse_transcript(records: &[Value], mut history: Vec<Value>) -> ParsedTranscript {
+fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTranscript {
     let mut calls = Vec::<LlmCall>::new();
     let mut call_indexes = HashMap::<String, usize>::new();
     let mut assistant_history_indexes = HashMap::<String, usize>::new();
@@ -894,17 +978,18 @@ fn parse_transcript(records: &[Value], mut history: Vec<Value>) -> ParsedTranscr
                     calls.push(LlmCall::new(
                         request_id.clone(),
                         parse_timestamp_ms(record).unwrap_or(0),
-                        history.clone(),
+                        history.active(),
                     ));
                     index
                 });
                 calls[index].observe(record);
                 let output = calls[index].output_message();
+                let source_uuid = string_field(record, "uuid");
                 if let Some(history_index) = assistant_history_indexes.get(&request_id) {
-                    history[*history_index] = output;
+                    history.update(*history_index, output, source_uuid);
                 } else {
-                    assistant_history_indexes.insert(request_id.clone(), history.len());
-                    history.push(output);
+                    let history_index = history.push(output, source_uuid);
+                    assistant_history_indexes.insert(request_id.clone(), history_index);
                 }
                 if let Some(content) = record.pointer("/message/content").and_then(Value::as_array)
                 {
@@ -937,6 +1022,28 @@ fn parse_transcript(records: &[Value], mut history: Vec<Value>) -> ParsedTranscr
                 }
             }
             Some("user") => {
+                // Claude persists a synthetic user message containing the new
+                // active context immediately after a compact_boundary record.
+                // It is the first model-visible message after the boundary.
+                if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+                    let content = record
+                        .pointer("/message/content")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    history.begin_compacted(
+                        json!({
+                            "role": "user",
+                            "content": if content.is_null() {
+                                json!("[compaction summary unavailable]")
+                            } else {
+                                content
+                            },
+                            "message_type": "compaction_summary"
+                        }),
+                        string_field(record, "uuid"),
+                    );
+                    continue;
+                }
                 let content = record
                     .pointer("/message/content")
                     .cloned()
@@ -950,11 +1057,14 @@ fn parse_transcript(records: &[Value], mut history: Vec<Value>) -> ParsedTranscr
                         had_tool_result = true;
                         let call_id = string_field(block, "tool_use_id").unwrap_or_default();
                         let result = block.get("content").cloned().unwrap_or(Value::Null);
-                        history.push(json!({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": result
-                        }));
+                        history.push(
+                            json!({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": result
+                            }),
+                            string_field(record, "uuid"),
+                        );
                         if let Some(tool) = tools.get_mut(&call_id) {
                             tool.output = Some(result);
                             tool.end_ms = parse_timestamp_ms(record).unwrap_or(tool.start_ms);
@@ -968,11 +1078,22 @@ fn parse_transcript(records: &[Value], mut history: Vec<Value>) -> ParsedTranscr
                         }
                     }
                     if !had_tool_result {
-                        history.push(json!({ "role": "user", "content": content }));
+                        history.push(
+                            json!({ "role": "user", "content": content }),
+                            string_field(record, "uuid"),
+                        );
                     }
                 } else if !content.is_null() {
-                    history.push(json!({ "role": "user", "content": content }));
+                    history.push(
+                        json!({ "role": "user", "content": content }),
+                        string_field(record, "uuid"),
+                    );
                 }
+            }
+            Some("system")
+                if record.get("subtype").and_then(Value::as_str) == Some("compact_boundary") =>
+            {
+                history.observe_compact_boundary(record);
             }
             _ => {}
         }
@@ -989,6 +1110,9 @@ fn parse_transcript(records: &[Value], mut history: Vec<Value>) -> ParsedTranscr
 
 fn is_real_user_record(record: &Value) -> bool {
     if record.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
         return false;
     }
     !record

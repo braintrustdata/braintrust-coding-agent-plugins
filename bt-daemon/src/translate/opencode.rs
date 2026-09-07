@@ -59,6 +59,114 @@ struct NativeSession {
     tool_message_ids: HashMap<String, String>,
     denied_tools: HashSet<String>,
     completed_messages: RecentSet<String>,
+    history: MessageHistory,
+    user_message_ids: HashSet<String>,
+    user_parts: HashMap<String, Vec<(String, String)>>,
+    history_tool_results: HashMap<String, HashMap<String, Value>>,
+}
+
+#[derive(Default)]
+struct MessageHistory {
+    entries: Vec<HistoryEntry>,
+    pending_compaction: Option<CompactionBoundary>,
+}
+
+struct HistoryEntry {
+    message_id: String,
+    values: Vec<Value>,
+}
+
+struct CompactionBoundary {
+    tail_start_id: Option<String>,
+}
+
+impl MessageHistory {
+    fn active(&self) -> Vec<Value> {
+        self.entries
+            .iter()
+            .flat_map(|entry| entry.values.iter().cloned())
+            .collect()
+    }
+
+    fn upsert(&mut self, message_id: &str, values: Vec<Value>) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.message_id == message_id)
+        {
+            entry.values = values;
+            return;
+        }
+        self.entries.push(HistoryEntry {
+            message_id: message_id.to_string(),
+            values,
+        });
+    }
+
+    fn ensure(&mut self, message_id: &str) {
+        if !self
+            .entries
+            .iter()
+            .any(|entry| entry.message_id == message_id)
+        {
+            self.entries.push(HistoryEntry {
+                message_id: message_id.to_string(),
+                values: Vec::new(),
+            });
+        }
+    }
+
+    fn remove(&mut self, message_id: &str) {
+        self.entries.retain(|entry| entry.message_id != message_id);
+    }
+
+    fn observe_compaction(&mut self, message_id: &str, tail_start_id: Option<String>) {
+        // The native compaction trigger is control flow, not part of the
+        // provider-visible conversational history we expose on later spans.
+        self.remove(message_id);
+        self.pending_compaction = Some(CompactionBoundary { tail_start_id });
+    }
+
+    fn compaction_input(&self) -> Vec<Value> {
+        let Some(tail_start_id) = self
+            .pending_compaction
+            .as_ref()
+            .and_then(|boundary| boundary.tail_start_id.as_deref())
+        else {
+            return self.active();
+        };
+        let end = self
+            .entries
+            .iter()
+            .position(|entry| entry.message_id == tail_start_id)
+            .unwrap_or(self.entries.len());
+        self.entries[..end]
+            .iter()
+            .flat_map(|entry| entry.values.iter().cloned())
+            .collect()
+    }
+
+    fn begin_compacted(&mut self, message_id: &str, summary: Value) {
+        let tail_start_id = self
+            .pending_compaction
+            .take()
+            .and_then(|boundary| boundary.tail_start_id);
+        let kept = tail_start_id
+            .as_deref()
+            .and_then(|tail| {
+                self.entries
+                    .iter()
+                    .position(|entry| entry.message_id == tail)
+            })
+            .map(|start| self.entries.drain(start..).collect::<Vec<_>>())
+            .unwrap_or_default();
+        self.entries.clear();
+        self.entries.push(HistoryEntry {
+            message_id: message_id.to_string(),
+            values: vec![summary],
+        });
+        self.entries.extend(kept);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -94,6 +202,7 @@ impl AgentTranslator for OpenCodeTranslator {
             "permission.asked" => self.permission_asked(event),
             "permission.replied" => self.permission_replied(event),
             "session.idle" => self.finish_session_event(event, false, None),
+            "session.compacted" => Vec::new(),
             "session.deleted" => self.finish_session_event(event, true, None),
             "session.error" => {
                 let error = format_error(
@@ -265,6 +374,42 @@ impl OpenCodeTranslator {
                     .join("\n")
             })
             .unwrap_or_default();
+        let message_id = output
+            .get("message")
+            .and_then(|message| message.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("turn:{}:user", state.turn_number + 1));
+        {
+            state.user_message_ids.insert(message_id.to_string());
+            state.user_parts.insert(
+                message_id.clone(),
+                output
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .filter(|(_, part)| part.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|(index, part)| {
+                        let text = part.get("text").and_then(Value::as_str)?;
+                        let id = part
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("text:{index}"));
+                        Some((id, text.to_string()))
+                    })
+                    .collect(),
+            );
+            state.history.upsert(
+                &message_id,
+                (!input.is_empty())
+                    .then(|| json!({"role":"user","content":input}))
+                    .into_iter()
+                    .collect(),
+            );
+        }
         state.current_input = Some(input.clone());
         state.current_turn_span_id = Some(turn_id.clone());
         let model = event
@@ -323,9 +468,31 @@ impl OpenCodeTranslator {
         match part.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    state.output_parts.insert(message_id.into(), text.into());
-                    if part.pointer("/time/end").is_some() {
-                        state.current_output = Some(text.into());
+                    if state.user_message_ids.contains(message_id) {
+                        let part_id = part.get("id").and_then(Value::as_str).unwrap_or("text");
+                        let parts = state.user_parts.entry(message_id.into()).or_default();
+                        if let Some((_, current)) = parts.iter_mut().find(|(id, _)| id == part_id) {
+                            *current = text.to_string();
+                        } else {
+                            parts.push((part_id.to_string(), text.to_string()));
+                        }
+                        let content = parts
+                            .iter()
+                            .map(|(_, text)| text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        state.history.upsert(
+                            message_id,
+                            (!content.is_empty())
+                                .then(|| json!({"role":"user","content":content}))
+                                .into_iter()
+                                .collect(),
+                        );
+                    } else {
+                        state.output_parts.insert(message_id.into(), text.into());
+                        if part.pointer("/time/end").is_some() {
+                            state.current_output = Some(text.into());
+                        }
                     }
                 }
             }
@@ -356,15 +523,33 @@ impl OpenCodeTranslator {
                     Some("completed") => {
                         if let Some(v) = part.pointer("/state/output") {
                             state.tool_outputs.insert(call_id.into(), v.clone());
+                            state
+                                .history_tool_results
+                                .entry(message_id.into())
+                                .or_default()
+                                .insert(call_id.into(), v.clone());
                         }
                     }
                     Some("error") => {
+                        let error = format_error(part.pointer("/state/error"));
+                        state.tool_errors.insert(call_id.into(), error.clone());
                         state
-                            .tool_errors
-                            .insert(call_id.into(), format_error(part.pointer("/state/error")));
+                            .history_tool_results
+                            .entry(message_id.into())
+                            .or_default()
+                            .insert(call_id.into(), Value::String(error));
                     }
                     _ => {}
                 }
+            }
+            Some("compaction") => {
+                state.user_parts.remove(message_id);
+                state.history.observe_compaction(
+                    message_id,
+                    part.get("tail_start_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
             }
             _ => {}
         }
@@ -377,11 +562,6 @@ impl OpenCodeTranslator {
             .pointer("/properties/info")
             .or_else(|| event.payload.get("info"));
         let Some(info) = info else { return Vec::new() };
-        if info.get("role").and_then(Value::as_str) != Some("assistant")
-            || info.pointer("/time/completed").is_none()
-        {
-            return Vec::new();
-        }
         let Some(sid) = info.get("sessionID").and_then(Value::as_str) else {
             return Vec::new();
         };
@@ -391,20 +571,29 @@ impl OpenCodeTranslator {
         let Some(state) = self.sessions.get_mut(sid) else {
             return Vec::new();
         };
+        match info.get("role").and_then(Value::as_str) {
+            Some("user") => {
+                state.user_message_ids.insert(mid.to_string());
+                state.history.ensure(mid);
+                return Vec::new();
+            }
+            Some("assistant") if info.pointer("/time/completed").is_some() => {}
+            _ => return Vec::new(),
+        }
         if !state.completed_messages.insert(mid.into()) {
             return Vec::new();
         }
-        let Some(turn) = state.current_turn_span_id.clone() else {
-            return Vec::new();
-        };
+        let turn = state.current_turn_span_id.clone();
         let cache_read = num(info, "/tokens/cache/read");
         let cache_write = num(info, "/tokens/cache/write");
         let prompt = num(info, "/tokens/input") + cache_read + cache_write;
         let completion = num(info, "/tokens/output");
         let reasoning = num(info, "/tokens/reasoning");
-        let mut assistant = json!({"role":"assistant","content":state.output_parts.remove(mid).unwrap_or_default()});
-        if let Some(calls) = state.tool_calls.remove(mid) {
-            assistant["tool_calls"] = Value::Array(calls)
+        let content = state.output_parts.remove(mid).unwrap_or_default();
+        let calls = state.tool_calls.remove(mid).unwrap_or_default();
+        let mut assistant = json!({"role":"assistant","content":content});
+        if !calls.is_empty() {
+            assistant["tool_calls"] = Value::Array(calls.clone())
         }
         if let Some(reason) = state.reasoning_parts.remove(mid) {
             assistant["reasoning"] = json!([{"id":"reasoning","content":reason}])
@@ -412,13 +601,45 @@ impl OpenCodeTranslator {
         state
             .tool_message_ids
             .retain(|_, message_id| message_id != mid);
+        let mut history_values = (!content.is_empty() || !calls.is_empty())
+            .then(|| assistant.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut results = state.history_tool_results.remove(mid).unwrap_or_default();
+        for call in &calls {
+            let Some(call_id) = call.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(result) = results.remove(call_id) {
+                history_values.push(json!({
+                    "role":"tool",
+                    "tool_call_id":call_id,
+                    "content":result
+                }));
+            }
+        }
         let mut input = Vec::new();
         if let Some(system) = &state.system_prompt {
             input.push(json!({"role":"system","content":system}))
         }
-        if let Some(user) = &state.current_input {
-            input.push(json!({"role":"user","content":user}))
+        let is_compaction_summary = info.get("summary").and_then(Value::as_bool) == Some(true);
+        if is_compaction_summary {
+            input.extend(state.history.compaction_input());
+            state.history.begin_compacted(
+                mid,
+                json!({
+                    "role":"assistant",
+                    "content":content,
+                    "message_type":"compaction_summary"
+                }),
+            );
+        } else {
+            input.extend(state.history.active());
+            state.history.upsert(mid, history_values);
         }
+        let Some(turn) = turn else {
+            return Vec::new();
+        };
         let provider = info
             .get("providerID")
             .and_then(Value::as_str)

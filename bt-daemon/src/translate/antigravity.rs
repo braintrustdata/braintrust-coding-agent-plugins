@@ -189,7 +189,20 @@ impl AntigravityTranslator {
             self.start_turn(clean_user_input(record_content(&record)), ts_ms, ops);
         }
 
-        if let Some(message) = transcript_message(&record, &record_type, &source) {
+        if record_type == "CHECKPOINT" {
+            if let Some(mut message) = transcript_message(&record, &record_type, &source) {
+                if let Some(message) = message.as_object_mut() {
+                    message.insert("message_type".into(), json!("compaction_summary"));
+                }
+                self.history.clear();
+                self.history.push(message);
+                // A checkpoint can be observed while an invocation is open. Its
+                // replacement window becomes the new origin for output slicing.
+                for invocation in self.invocations.values_mut() {
+                    invocation.history_start = 0;
+                }
+            }
+        } else if let Some(message) = transcript_message(&record, &record_type, &source) {
             if record_type == "PLANNER_RESPONSE" {
                 if let Some(turn) = &mut self.turn {
                     turn.last_output = message.get("content").cloned();

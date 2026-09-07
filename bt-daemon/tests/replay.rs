@@ -76,7 +76,7 @@ async fn importing_antigravity_transcript_uses_the_production_translator() {
     .unwrap();
     let output_rows = rows(&output.join("antigravity-import.ndjson"));
     assert_eq!(inserted(&output_rows, "task"), 2);
-    assert_eq!(inserted(&output_rows, "llm"), 1);
+    assert_eq!(inserted(&output_rows, "llm"), 2);
     assert!(output_rows
         .iter()
         .any(|row| { row.pointer("/Insert/input").and_then(Value::as_str) == Some("trace this") }));
@@ -87,6 +87,79 @@ async fn importing_antigravity_transcript_uses_the_production_translator() {
         row.pointer("/Merge/metadata/tool_approval")
             .and_then(Value::as_str)
             == Some("denied")
+    }));
+}
+
+#[tokio::test]
+async fn antigravity_import_applies_checkpoint_only_to_following_llms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp
+        .path()
+        .join("brain/antigravity-compact-import/.system_generated/logs/transcript_full.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-01-01T00:00:01Z","content":"old request"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-01T00:00:02Z","content":"old response"}),
+            json!({"step_index":2,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","created_at":"2026-01-01T00:00:03Z","content":"summary of old context"}),
+            json!({"step_index":3,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-01-01T00:00:04Z","content":"new request"}),
+            json!({"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-01T00:00:05Z","content":"new response"}),
+            json!({"step_index":5,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","created_at":"2026-01-01T00:00:06Z","content":"newer summary"}),
+            json!({"step_index":6,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-01-01T00:00:07Z","content":"newest request"}),
+            json!({"step_index":7,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-01-01T00:00:08Z","content":"newest response"}),
+        ],
+    );
+    let output = tmp.path().join("spans");
+    import_transcript(
+        &transcript,
+        ImportSource::Antigravity,
+        options(&output),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let output_rows = rows(&output.join("antigravity-compact-import.ndjson"));
+    let llm_inputs = output_rows
+        .iter()
+        .filter(|row| row.pointer("/Insert/span_type").and_then(Value::as_str) == Some("llm"))
+        .filter_map(|row| row.pointer("/Insert/input"))
+        .collect::<Vec<_>>();
+    assert_eq!(llm_inputs.len(), 3);
+    assert_eq!(
+        llm_inputs[0],
+        &json!([{"role":"user","content":"old request","step_type":"USER_INPUT"}])
+    );
+    assert_eq!(
+        llm_inputs[1],
+        &json!([
+            {"role":"system","content":"summary of old context","step_type":"CHECKPOINT","message_type":"compaction_summary"},
+            {"role":"user","content":"new request","step_type":"USER_INPUT"}
+        ])
+    );
+    assert_eq!(
+        llm_inputs[2],
+        &json!([
+            {"role":"system","content":"newer summary","step_type":"CHECKPOINT","message_type":"compaction_summary"},
+            {"role":"user","content":"newest request","step_type":"USER_INPUT"}
+        ])
+    );
+    assert!(output_rows.iter().any(|row| {
+        row.pointer("/Merge/output/0/content")
+            .and_then(Value::as_str)
+            == Some("old response")
+    }));
+    assert!(output_rows.iter().any(|row| {
+        row.pointer("/Merge/output/0/content")
+            .and_then(Value::as_str)
+            == Some("new response")
+    }));
+    assert!(output_rows.iter().any(|row| {
+        row.pointer("/Merge/output/0/content")
+            .and_then(Value::as_str)
+            == Some("newest response")
     }));
 }
 

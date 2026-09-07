@@ -216,7 +216,9 @@ fn envelopes_from_records(
             &records.end_offsets,
             records.read_offset,
         ),
-        ImportSource::Antigravity => antigravity::envelopes(path, &records.values),
+        ImportSource::Antigravity => {
+            antigravity::envelopes(path, &records.values, &records.end_offsets)
+        }
     }
 }
 
@@ -810,7 +812,7 @@ mod tests {
                 .iter()
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
-            vec!["PreInvocation"]
+            vec!["PreInvocation", "PostInvocation"]
         );
 
         records.push(json!({"step_index":2,"source":"MODEL","type":"LIST_DIRECTORY","created_at":"2026-01-01T00:00:03Z","content":"result"}));
@@ -821,7 +823,7 @@ mod tests {
                 .iter()
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ImportCheckpoint", "PostToolUse"]
+            vec!["PostToolUse"]
         );
         assert!(tail.poll(false).unwrap().is_empty());
         assert_eq!(
@@ -830,7 +832,7 @@ mod tests {
                 .iter()
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
-            vec!["PostInvocation", "Stop"]
+            vec!["Stop"]
         );
     }
 
