@@ -7,7 +7,7 @@ use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig, TraceDestination};
 use bt_daemon::{
     BraintrustSinkConfig, BraintrustSinkFactory, SinkFactory, SpanOp, SpanRow, SpanType,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -88,6 +88,22 @@ async fn logs3_bodies(server: &MockServer) -> String {
         .map(|r| String::from_utf8_lossy(&r.body).into_owned())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+async fn logs3_rows(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/logs3")
+        .flat_map(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap()["rows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -253,18 +269,20 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
 
     sink.emit(&[SpanOp::Insert(row(
         "finished",
-        "finished",
-        &[],
+        "trace-root",
+        &["turn-parent"],
         "original name",
-        SpanType::Task,
+        SpanType::Tool,
         1,
         Some(2),
     ))])
     .await
     .unwrap();
+    sink.flush().await.unwrap();
     let mut late = SpanRow {
         span_id: "finished".into(),
-        root_span_id: "finished".into(),
+        root_span_id: "trace-root".into(),
+        parent_span_ids: vec!["turn-parent".into()],
         output: Some(json!({"status":"late"})),
         ..Default::default()
     };
@@ -277,7 +295,18 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
         bodies.contains("original name"),
         "initial row absent: {bodies}"
     );
-    assert!(bodies.contains("late"), "late merge absent: {bodies}");
+    let rows = logs3_rows(&server).await;
+    let late = rows
+        .iter()
+        .find(|row| row.pointer("/output/status") == Some(&json!("late")))
+        .unwrap_or_else(|| panic!("late merge absent: {bodies}"));
+    assert_eq!(late["_is_merge"], true);
+    assert_eq!(late["root_span_id"], "trace-root");
+    assert_eq!(
+        late["span_parents"],
+        json!(["turn-parent"]),
+        "stateless merge did not repeat the child parent identity: {bodies}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
