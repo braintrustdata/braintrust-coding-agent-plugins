@@ -310,6 +310,7 @@ fn opencode_additional_metadata_reaches_roots_without_overriding_session_fields(
     let root = rows.values().next().unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
     assert_eq!(root.metadata.as_ref().unwrap()["source"], "opencode");
+    assert!(root.metadata.as_ref().unwrap().get("username").is_some());
 }
 
 #[test]

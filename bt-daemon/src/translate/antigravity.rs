@@ -7,7 +7,9 @@
 
 use super::git::GitMetadataCache;
 use super::tool::{with_tool_approval, ToolApproval};
-use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
+use super::{
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+};
 use crate::ids;
 use crate::wire::Envelope;
 use serde_json::{json, Map, Value};
@@ -126,6 +128,7 @@ impl AntigravityTranslator {
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("conversation_id".into(), json!(ctx.session_id));
         metadata.insert("source".into(), json!("antigravity"));
+        metadata.insert("username".into(), json!(local_username()));
         if let Some(model) = string_field(&event.payload, "modelName") {
             metadata.insert("model".into(), json!(model));
         }

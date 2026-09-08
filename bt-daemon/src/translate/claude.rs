@@ -9,7 +9,9 @@
 use super::git::GitMetadataCache;
 use super::recent::RecentSet;
 use super::tool::{add_tool_approval, nonempty_error_text, ToolApproval};
-use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
+use super::{
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+};
 use crate::ids;
 use crate::wire::Envelope;
 use serde_json::{json, Map, Value};
@@ -230,7 +232,7 @@ impl ClaudeTranslator {
         metadata.insert("workspace".into(), json!(cwd));
         metadata.insert("source".into(), json!("claude-code"));
         metadata.insert("hostname".into(), json!(hostname()));
-        metadata.insert("username".into(), json!(username()));
+        metadata.insert("username".into(), json!(local_username()));
         metadata.insert(
             "os".into(),
             json!(command_output("", "uname", &["-s"])
@@ -1608,12 +1610,6 @@ fn hostname() -> String {
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| command_output("", "hostname", &[]))
-        .unwrap_or_default()
-}
-
-fn username() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default()
 }
 

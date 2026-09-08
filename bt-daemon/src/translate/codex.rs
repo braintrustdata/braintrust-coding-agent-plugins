@@ -20,7 +20,9 @@
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
 use super::tool::{error_text, tool_approval_metadata, ToolApproval};
-use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
+use super::{
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+};
 use crate::ids;
 use crate::wire::Envelope;
 use regex::Regex;
@@ -610,7 +612,7 @@ impl CodexTranslator {
                 if let Some(project) = &self.project {
                     md.insert("project".into(), json!(project));
                 }
-                md.insert("username".into(), json!(username()));
+                md.insert("username".into(), json!(local_username()));
                 scope.root_created = true;
                 ops.push(SpanOp::Insert(SpanRow {
                     span_id: self.root_span_id.clone(),
@@ -1842,12 +1844,6 @@ fn num_at(v: &Value, path: &str) -> Option<f64> {
         cur = cur.get(part)?;
     }
     cur.as_f64().filter(|n| n.is_finite())
-}
-
-fn username() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
