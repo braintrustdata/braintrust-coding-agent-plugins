@@ -248,6 +248,7 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
         config: Some(
             SessionRoute {
                 additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
+                tags: vec!["ci".into(), "docs".into()],
                 ..SessionRoute::default()
             }
             .with_auth(BackendAuth {
@@ -286,6 +287,7 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
         .unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
     assert_eq!(root.metadata.as_ref().unwrap()["source"], "claude-code");
+    assert_eq!(root.tags, Some(vec!["ci".into(), "docs".into()]));
 }
 
 #[test]

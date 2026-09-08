@@ -10,7 +10,8 @@ use super::git::GitMetadataCache;
 use super::recent::RecentSet;
 use super::tool::{add_tool_approval, nonempty_error_text, ToolApproval};
 use super::{
-    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
+    TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
@@ -259,6 +260,7 @@ impl ClaudeTranslator {
             start_ms: Some(event.ts_ms),
             input: Some(json!(format!("Session: {workspace}"))),
             metadata: Some(Value::Object(metadata)),
+            tags: root_tags(ctx),
             ..Default::default()
         }));
     }

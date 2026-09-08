@@ -235,6 +235,7 @@ fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
         config: Some(
             SessionRoute {
                 additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
+                tags: vec!["ci".into(), "docs".into()],
                 ..SessionRoute::default()
             }
             .with_auth(BackendAuth {
@@ -259,6 +260,7 @@ fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
     assert!(root.metadata.as_ref().unwrap().get("username").is_some());
     assert!(root.parent_span_ids.is_empty());
     assert_eq!(root.root_span_id, root.span_id);
+    assert_eq!(root.tags, Some(vec!["ci".into(), "docs".into()]));
 }
 
 #[test]

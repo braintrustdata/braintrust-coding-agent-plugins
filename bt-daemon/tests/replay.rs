@@ -222,6 +222,7 @@ async fn attached_import_summary_reports_the_effective_parent_root() {
         }),
         flush_mode: FlushMode::FireAndForget,
         additional_metadata: None,
+        tags: Vec::new(),
     };
 
     let summaries = import_transcript(

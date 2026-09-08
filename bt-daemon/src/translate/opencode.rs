@@ -5,7 +5,8 @@ use super::git::GitMetadataCache;
 use super::recent::RecentSet;
 use super::tool::{error_text, with_tool_approval, ToolApproval};
 use super::{
-    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
+    TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
@@ -330,6 +331,7 @@ impl OpenCodeTranslator {
             span_type: SpanType::Task,
             start_ms: Some(ts),
             metadata: Some(Value::Object(metadata)),
+            tags: root_tags(ctx),
             ..Default::default()
         })]
     }

@@ -63,6 +63,7 @@ impl TranslatorFactory for CodexTranslatorFactory {
             root_cwd: None,
             project: None,
             additional_metadata: Map::new(),
+            tags: Vec::new(),
             main_path: None,
             // The main scope is created lazily once we learn its transcript path.
             scopes: HashMap::new(),
@@ -167,6 +168,7 @@ struct CodexTranslator {
     root_cwd: Option<String>,
     project: Option<String>,
     additional_metadata: Map<String, Value>,
+    tags: Vec<String>,
     main_path: Option<String>,
     scopes: HashMap<String, Scope>,
     spawn_turn_by_call_id: RecentMap<String, String>,
@@ -195,6 +197,7 @@ impl AgentTranslator for CodexTranslator {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
+            self.tags = config.tags.clone();
         }
 
         // --- hook-specific side effects (before catch-up) ---
@@ -627,6 +630,7 @@ impl CodexTranslator {
                         "source": self.session_source,
                     })),
                     metadata: Some(Value::Object(md)),
+                    tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
                     ..Default::default()
                 }));
             }
@@ -652,6 +656,7 @@ impl CodexTranslator {
                         "agent_type": scope.agent_type,
                         "transcript_path": scope.path,
                     })),
+                    tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
                     ..Default::default()
                 }));
             }

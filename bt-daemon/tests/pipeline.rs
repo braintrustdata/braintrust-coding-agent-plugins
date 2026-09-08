@@ -1950,6 +1950,7 @@ esac
             RunArgs {
                 source: RunSource::Codex,
                 additional_metadata: None,
+                tags: Vec::new(),
                 agent_args: vec![session_id.into(), mode.into()],
             },
             RunHookCommand {
