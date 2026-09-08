@@ -256,6 +256,7 @@ fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
     let root = rows.values().next().unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
     assert_eq!(root.metadata.as_ref().unwrap()["source"], "pi");
+    assert!(root.metadata.as_ref().unwrap().get("username").is_some());
     assert!(root.parent_span_ids.is_empty());
     assert_eq!(root.root_span_id, root.span_id);
 }

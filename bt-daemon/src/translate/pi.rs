@@ -3,7 +3,9 @@
 
 use super::git::GitMetadataCache;
 use super::tool::{error_text, with_tool_approval, ToolApproval};
-use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
+use super::{
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+};
 use crate::ids;
 use crate::wire::Envelope;
 use serde_json::{json, Value};
@@ -232,6 +234,7 @@ impl PiTranslator {
             .unwrap_or_default();
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("source".into(), json!("pi"));
+        metadata.insert("username".into(), json!(local_username()));
         metadata.insert("pi_version".into(), json!(envelope.source_version));
         metadata.insert(
             "extension_version".into(),

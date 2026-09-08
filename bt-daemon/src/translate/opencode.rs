@@ -4,7 +4,9 @@
 use super::git::GitMetadataCache;
 use super::recent::RecentSet;
 use super::tool::{error_text, with_tool_approval, ToolApproval};
-use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
+use super::{
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+};
 use crate::ids;
 use crate::wire::Envelope;
 use serde_json::{json, Value};
@@ -306,6 +308,7 @@ impl OpenCodeTranslator {
             .unwrap_or_default();
         metadata.insert("session_id".into(), Value::String(native_id.to_string()));
         metadata.insert("source".into(), Value::String("opencode".into()));
+        metadata.insert("username".into(), Value::String(local_username()));
         if let Some(parent) = parent_id {
             metadata.insert("parent_session_id".into(), Value::String(parent.into()));
             metadata.insert("is_subagent".into(), Value::Bool(true));

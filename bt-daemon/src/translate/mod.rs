@@ -29,6 +29,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// The local account name supplied by the shell environment. Translators add
+/// this to the agent session root, which is the only place that can identify
+/// that root correctly when the session is attached to an existing trace.
+pub(crate) fn local_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default()
+}
+
 /// Braintrust span kinds we emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

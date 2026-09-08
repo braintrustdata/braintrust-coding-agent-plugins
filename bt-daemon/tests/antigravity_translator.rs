@@ -225,6 +225,7 @@ fn hooks_and_full_transcript_build_model_and_tool_spans() {
         .find(|row| row.name == "Antigravity: demo")
         .unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["source"], "antigravity");
+    assert!(root.metadata.as_ref().unwrap().get("username").is_some());
     assert_eq!(
         root.metadata.as_ref().unwrap()["session_id"],
         "conversation-1"
