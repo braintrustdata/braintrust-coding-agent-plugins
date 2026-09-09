@@ -61,7 +61,7 @@ struct CompactHook {
 struct SubagentStartHook {
     agent_id: String,
     #[serde(default)]
-    agent_type: Option<String>,
+    agent_type: Option<Value>,
 }
 
 /// The stable outer shape of a rollout JSONL row. The payload deliberately
@@ -70,7 +70,7 @@ struct SubagentStartHook {
 #[derive(Deserialize)]
 struct RolloutRecord {
     #[serde(default)]
-    timestamp: Option<String>,
+    timestamp: Option<Value>,
     #[serde(rename = "type", default)]
     kind: Option<String>,
     #[serde(default)]
@@ -471,7 +471,11 @@ impl CodexTranslator {
         let subagent_root = ids::span_id(&self.session_id, &format!("subagent:{agent_id}"));
         let mut scope = Scope::new(&path, ScopeKind::Subagent, subagent_root);
         scope.agent_id = Some(agent_id);
-        scope.agent_type = hook.agent_type;
+        scope.agent_type = hook
+            .agent_type
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         scope.spawning_turn_span_id = Some(parent);
         self.scopes.insert(path, scope);
     }
@@ -563,7 +567,8 @@ impl CodexTranslator {
         let op_start = ops.len();
         let ts = rec
             .timestamp
-            .as_deref()
+            .as_ref()
+            .and_then(Value::as_str)
             .and_then(parse_timestamp)
             .unwrap_or(hook_ts);
         let kind = rec.kind.as_deref().unwrap_or("");

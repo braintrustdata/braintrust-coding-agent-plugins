@@ -1025,7 +1025,7 @@ fn codex_untagged_replacement_history_preserves_native_order() {
 }
 
 #[test]
-fn codex_subagent_nests_under_spawning_turn() {
+fn codex_subagent_with_malformed_optional_type_nests_under_spawning_turn() {
     let tmp = tempfile::tempdir().unwrap();
     let main_t = tmp.path().join("main.jsonl");
     let sub_t = tmp.path().join("sub.jsonl");
@@ -1077,7 +1077,7 @@ fn codex_subagent_nests_under_spawning_turn() {
                 json!({
                     "agent_id": "a1",
                     "transcript_path": original_sub_p,
-                    "agent_type": "reviewer",
+                    "agent_type": { "name": "reviewer" },
                     "_bt_transcript_mirror": mirrored_subagent(),
                 }),
             ),
@@ -1152,7 +1152,7 @@ fn codex_subagent_nests_under_spawning_turn() {
     assert_eq!(subagent.parent_span_ids, vec![main_turn.span_id.clone()]);
     assert_eq!(
         subagent.metadata.as_ref().unwrap()["agent_type"],
-        json!("reviewer")
+        Value::Null
     );
     assert!(
         subagent.end_ms.is_some(),
@@ -1178,7 +1178,7 @@ fn codex_rollout_routing_ignores_future_fields() {
             "payload": { "id": "session-1", "cwd": "/work/app", "future_payload_field": [1, 2] },
         }),
         json!({
-            "timestamp": "2026-01-01T00:00:02Z",
+            "timestamp": 1_704_067_202_000_i64,
             "type": "event_msg",
             "payload": { "type": "task_started", "turn_id": "t1", "future_event_field": {} },
         }),
