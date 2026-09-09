@@ -8,7 +8,9 @@ use super::{
 };
 use crate::ids;
 use crate::wire::Envelope;
-use serde_json::{json, Value};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -45,6 +47,246 @@ impl TranslatorFactory for PiTranslatorFactory {
             git: self.git.clone(),
         })
     }
+}
+
+// These are deliberately partial native event types. Serde ignores fields we
+// do not model, while `Value` remains at the user-controlled JSON boundaries
+// that we forward without interpreting (messages, tool arguments, results).
+// Keeping this vocabulary local lets the raw journal remain forward-compatible
+// and makes each translator reducer explicit about the fields it consumes.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeforeAgentStart {
+    #[serde(default)]
+    prompt: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ContextEvent {
+    #[serde(default)]
+    messages: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderRequest {
+    #[serde(flatten)]
+    fields: Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageUpdate {
+    #[serde(default)]
+    assistant_message_event: Option<MessageDelta>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MessageDelta {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ThinkingLevel {
+    #[serde(default)]
+    level: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistantMessage {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    api: Option<String>,
+    #[serde(default)]
+    response_model: Option<String>,
+    #[serde(default)]
+    routed_model: Option<String>,
+    #[serde(default)]
+    resolved_model: Option<String>,
+    #[serde(default)]
+    actual_model: Option<String>,
+    #[serde(default)]
+    concrete_model: Option<String>,
+    #[serde(default)]
+    output_model: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Usage,
+    #[serde(default)]
+    content: Vec<AssistantContent>,
+    #[serde(default)]
+    error_message: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    response_id: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Usage {
+    #[serde(default)]
+    input: i64,
+    #[serde(default)]
+    output: i64,
+    #[serde(default)]
+    reasoning: i64,
+    #[serde(default)]
+    cache_read: i64,
+    #[serde(default)]
+    cache_write: i64,
+    #[serde(default)]
+    cache_write1h: i64,
+    #[serde(default)]
+    total_tokens: Option<i64>,
+    #[serde(default)]
+    cost: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum AssistantContent {
+    #[serde(rename = "text")]
+    Text {
+        #[serde(default)]
+        text: Option<String>,
+    },
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: Option<String>,
+    },
+    #[serde(rename = "toolCall")]
+    ToolCall {
+        #[serde(default)]
+        id: Option<Value>,
+        #[serde(default)]
+        name: Option<Value>,
+        #[serde(default)]
+        arguments: Option<Value>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolExecutionStart {
+    tool_call_id: String,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    args: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolExecutionEnd {
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    is_error: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentEnd {
+    #[serde(default)]
+    will_retry: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionCompact {
+    #[serde(default)]
+    compaction_entry: Option<CompactionEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactionEntry {
+    #[serde(default)]
+    summary: Option<Value>,
+    #[serde(default)]
+    tokens_before: Option<Value>,
+    #[serde(default)]
+    timestamp: Option<Value>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Preparation {
+    #[serde(default)]
+    tokens_before: Option<Value>,
+    #[serde(default)]
+    first_kept_entry_id: Option<Value>,
+    #[serde(default)]
+    is_split_turn: Option<Value>,
+    #[serde(default)]
+    messages_to_summarize: Option<Vec<Value>>,
+    #[serde(default)]
+    turn_prefix_messages: Option<Vec<Value>>,
+    #[serde(default)]
+    target_id: Option<Value>,
+    #[serde(default)]
+    old_leaf_id: Option<Value>,
+    #[serde(default)]
+    common_ancestor_id: Option<Value>,
+    #[serde(default)]
+    user_wants_summary: Option<bool>,
+    #[serde(default)]
+    custom_instructions: Option<Value>,
+    #[serde(default)]
+    replace_instructions: Option<Value>,
+    #[serde(default)]
+    label: Option<Value>,
+    #[serde(default)]
+    entries_to_summarize: Option<Vec<Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeforeCompact {
+    #[serde(default)]
+    reason: Option<Value>,
+    #[serde(default)]
+    will_retry: Option<Value>,
+    #[serde(default)]
+    custom_instructions: Option<Value>,
+    #[serde(default)]
+    preparation: Option<Preparation>,
+    #[serde(default)]
+    branch_entries: Option<Vec<Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeforeTree {
+    #[serde(default)]
+    preparation: Option<Preparation>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTree {
+    #[serde(default)]
+    summary_entry: Option<Value>,
+}
+
+fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
+    serde_json::from_value(value.clone()).ok()
 }
 
 struct PendingLlm {
@@ -85,54 +327,89 @@ impl AgentTranslator for PiTranslator {
         let event = envelope.payload.get("event").unwrap_or(&envelope.payload);
         let mut ops = self.ensure_root(envelope, ctx);
         match envelope.event.as_str() {
-            "before_agent_start" => ops.extend(self.start_turn(event, envelope.ts_ms)),
-            "context" => self.capture_context(event, envelope.ts_ms),
-            "before_provider_request" => self.provider_request(event),
-            "message_update" => self.streaming_update(event, envelope.ts_ms),
+            "before_agent_start" => {
+                if let Some(event) = decode(event) {
+                    ops.extend(self.start_turn(event, envelope.ts_ms));
+                }
+            }
+            "context" => {
+                if let Some(event) = decode(event) {
+                    self.capture_context(event, envelope.ts_ms);
+                }
+            }
+            "before_provider_request" => {
+                if let Some(event) = decode(event) {
+                    self.provider_request(event);
+                }
+            }
+            "message_update" => {
+                if let Some(event) = decode(event) {
+                    self.streaming_update(event, envelope.ts_ms);
+                }
+            }
             "thinking_level_select" => {
-                self.thinking_level = event
-                    .get("level")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
+                if let Some(event) = decode::<ThinkingLevel>(event) {
+                    self.thinking_level = event.level;
+                }
             }
             "message_end" => ops.extend(self.message_end(event, envelope.ts_ms)),
-            "tool_execution_start" => ops.extend(self.tool_start(event, envelope.ts_ms)),
-            "tool_execution_end" => ops.extend(self.tool_end(event, envelope.ts_ms)),
-            "agent_end" if event.get("willRetry").and_then(Value::as_bool) != Some(true) => {
+            "tool_execution_start" => {
+                if let Some(event) = decode(event) {
+                    ops.extend(self.tool_start(event, envelope.ts_ms));
+                }
+            }
+            "tool_execution_end" => {
+                if let Some(event) = decode(event) {
+                    ops.extend(self.tool_end(event, envelope.ts_ms));
+                }
+            }
+            "agent_end" if decode::<AgentEnd>(event).is_none_or(|event| !event.will_retry) => {
                 ops.extend(self.close_turn(envelope.ts_ms, None));
             }
             "session_before_compact" => {
-                self.compaction = Some((
-                    ids::span_id(&self.session_id, &format!("compaction:{}", envelope.ts_ms)),
-                    envelope.ts_ms,
-                    special_input(event, true),
-                ))
+                if let Some(event) = decode(event) {
+                    self.compaction = Some((
+                        ids::span_id(&self.session_id, &format!("compaction:{}", envelope.ts_ms)),
+                        envelope.ts_ms,
+                        compaction_input(&event),
+                    ));
+                }
             }
             "session_compact" => {
-                self.active_compaction_message = compaction_message(event);
+                if let Some(typed) = decode::<SessionCompact>(event) {
+                    self.active_compaction_message = compaction_message(&typed);
+                }
                 ops.extend(self.finish_special("Compaction", true, event, envelope.ts_ms))
             }
-            "session_before_tree"
-                if event
-                    .pointer("/preparation/userWantsSummary")
-                    .and_then(Value::as_bool)
-                    == Some(true) =>
-            {
-                self.branch_summary = Some((
-                    ids::span_id(
-                        &self.session_id,
-                        &format!("branch-summary:{}", envelope.ts_ms),
-                    ),
-                    envelope.ts_ms,
-                    special_input(event, false),
-                ))
+            "session_before_tree" => {
+                if let Some(event) = decode::<BeforeTree>(event) {
+                    if event
+                        .preparation
+                        .as_ref()
+                        .and_then(|preparation| preparation.user_wants_summary)
+                        == Some(true)
+                    {
+                        self.branch_summary = Some((
+                            ids::span_id(
+                                &self.session_id,
+                                &format!("branch-summary:{}", envelope.ts_ms),
+                            ),
+                            envelope.ts_ms,
+                            branch_summary_input(&event),
+                        ));
+                    }
+                }
             }
             "session_tree" => {
                 // Tree navigation can select a branch with a different (or no)
                 // active compaction. The next native context event is
                 // authoritative for that branch.
                 self.active_compaction_message = None;
-                if event.get("summaryEntry").is_some() || self.branch_summary.is_some() {
+                if decode::<SessionTree>(event)
+                    .and_then(|event| event.summary_entry)
+                    .is_some()
+                    || self.branch_summary.is_some()
+                {
                     ops.extend(self.finish_special("Branch Summary", false, event, envelope.ts_ms))
                 }
             }
@@ -272,19 +549,15 @@ impl PiTranslator {
         })]
     }
 
-    fn start_turn(&mut self, event: &Value, ts: i64) -> Vec<SpanOp> {
+    fn start_turn(&mut self, event: BeforeAgentStart, ts: i64) -> Vec<SpanOp> {
         let mut ops = self.close_turn(ts, None);
         self.turn_seq += 1;
         self.llm_seq = 0;
         self.pending_llms.clear();
         self.tools.clear();
         let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_seq));
-        let input = event.get("prompt").cloned().unwrap_or(Value::Null);
-        let skills = event
-            .get("prompt")
-            .and_then(Value::as_str)
-            .map(explicit_skills)
-            .unwrap_or_default();
+        let input = event.prompt.unwrap_or(Value::Null);
+        let skills = input.as_str().map(explicit_skills).unwrap_or_default();
         self.turn = Some((id.clone(), input.clone()));
         ops.push(SpanOp::Insert(SpanRow {
             span_id: id,
@@ -303,12 +576,8 @@ impl PiTranslator {
         }));
         ops
     }
-    fn capture_context(&mut self, event: &Value, ts: i64) {
-        let mut messages = event
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+    fn capture_context(&mut self, event: ContextEvent, ts: i64) {
+        let mut messages = event.messages;
         let native_compaction = messages.iter().position(|message| {
             message.get("role").and_then(Value::as_str) == Some("compactionSummary")
         });
@@ -333,24 +602,24 @@ impl PiTranslator {
             provider: None,
         });
     }
-    fn provider_request(&mut self, event: &Value) {
+    fn provider_request(&mut self, event: ProviderRequest) {
         if let Some(call) = self.pending_llms.last_mut() {
-            let mut provider = event.clone();
+            let mut provider = event.fields;
             if let Some(payload) = provider.get_mut("payload").and_then(Value::as_object_mut) {
                 // The authoritative provider-visible messages are already the
                 // LLM span input captured by the preceding context event.
                 payload.remove("messages");
             }
-            call.provider = Some(provider)
+            call.provider = Some(Value::Object(provider))
         }
     }
-    fn streaming_update(&mut self, event: &Value, ts: i64) {
+    fn streaming_update(&mut self, event: MessageUpdate, ts: i64) {
         if let Some(call) = self.pending_llms.last_mut() {
             let kind = event
-                .pointer("/assistantMessageEvent/type")
-                .or_else(|| event.get("type"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+                .assistant_message_event
+                .and_then(|event| event.kind)
+                .or(event.kind);
+            let kind = kind.as_deref().unwrap_or("");
             if matches!(kind, "text_delta" | "thinking_delta" | "text" | "thinking")
                 && call.first_token_ms.is_none()
             {
@@ -360,7 +629,10 @@ impl PiTranslator {
     }
     fn message_end(&mut self, event: &Value, ts: i64) -> Vec<SpanOp> {
         let message = event.get("message").unwrap_or(event);
-        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        let Some(message) = decode::<AssistantMessage>(message) else {
+            return vec![];
+        };
+        if message.role.as_deref() != Some("assistant") {
             return vec![];
         };
         let Some((turn, _)) = &self.turn else {
@@ -377,29 +649,22 @@ impl PiTranslator {
         } else {
             self.pending_llms.remove(0)
         };
-        let model = response_model(message);
-        let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
-        let prompt = num(&usage, "input")
-            + num(&usage, "cacheRead")
-            + num(&usage, "cacheWrite")
-            + num(&usage, "cacheWrite1h");
-        let completion = num(&usage, "output");
-        let reasoning = num(&usage, "reasoning");
-        let total = usage
-            .get("totalTokens")
-            .and_then(Value::as_i64)
+        let model = response_model(&message);
+        let prompt = message.usage.input
+            + message.usage.cache_read
+            + message.usage.cache_write
+            + message.usage.cache_write1h;
+        let completion = message.usage.output;
+        let reasoning = message.usage.reasoning;
+        let total = message
+            .usage
+            .total_tokens
             .unwrap_or(prompt + completion + reasoning);
-        let output = normalize_assistant(message);
+        let output = normalize_assistant(&message);
         let error = message
-            .get("errorMessage")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .filter(|_| {
-                matches!(
-                    message.get("stopReason").and_then(Value::as_str),
-                    Some("error" | "aborted")
-                )
-            });
+            .error_message
+            .clone()
+            .filter(|_| matches!(message.stop_reason.as_deref(), Some("error" | "aborted")));
         let ttft = pending
             .first_token_ms
             .map(|first| (first - pending.start_ms) as f64 / 1000.0);
@@ -418,46 +683,40 @@ impl PiTranslator {
             output: Some(json!([output])),
             metadata: Some(json!({
                 "model": model,
-                "provider": message.get("provider"),
-                "api": message.get("api"),
-                "stop_reason": message.get("stopReason"),
+                "provider": message.provider,
+                "api": message.api,
+                "stop_reason": message.stop_reason,
                 "thinking_level": self.thinking_level,
                 "provider_request": pending.provider,
-                "response_id": message.get("responseId"),
+                "response_id": message.response_id,
             })),
             metrics: Some(json!({
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
                 "reasoning_tokens": reasoning,
                 "tokens": total,
-                "prompt_cached_tokens": num(&usage, "cacheRead"),
-                "prompt_cache_creation_tokens": num(&usage, "cacheWrite")
-                    + num(&usage, "cacheWrite1h"),
+                "prompt_cached_tokens": message.usage.cache_read,
+                "prompt_cache_creation_tokens": message.usage.cache_write
+                    + message.usage.cache_write1h,
                 "time_to_first_token": ttft,
-                "cost": usage.get("cost"),
+                "cost": message.usage.cost,
             })),
             error,
             ..Default::default()
         })]
     }
-    fn tool_start(&mut self, event: &Value, ts: i64) -> Vec<SpanOp> {
-        let Some(id) = event.get("toolCallId").and_then(Value::as_str) else {
-            return vec![];
-        };
+    fn tool_start(&mut self, event: ToolExecutionStart, ts: i64) -> Vec<SpanOp> {
+        let id = event.tool_call_id;
         let Some((turn, _)) = &self.turn else {
             return vec![];
         };
-        let name = event
-            .get("toolName")
-            .and_then(Value::as_str)
-            .unwrap_or("tool")
-            .to_string();
-        let args = event.get("args").cloned().unwrap_or(Value::Null);
-        if self.tools.contains_key(id) {
+        let name = event.tool_name.unwrap_or_else(|| "tool".into());
+        let args = event.args;
+        if self.tools.contains_key(&id) {
             return vec![];
         }
         self.tools.insert(
-            id.into(),
+            id.clone(),
             ToolStart {
                 start_ms: ts,
                 name: name.clone(),
@@ -468,13 +727,13 @@ impl PiTranslator {
             span_id: ids::span_id(&self.session_id, &format!("tool:{}:{id}", self.turn_seq)),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![turn.clone()],
-            name,
+            name: name.clone(),
             span_type: SpanType::Tool,
             start_ms: Some(ts),
             input: Some(args),
             metadata: Some(with_tool_approval(
                 json!({
-                    "tool_name": event.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
+                    "tool_name": name,
                     "tool_call_id": id,
                 }),
                 Some(ToolApproval::Approved),
@@ -482,26 +741,19 @@ impl PiTranslator {
             ..Default::default()
         })]
     }
-    fn tool_end(&mut self, event: &Value, ts: i64) -> Vec<SpanOp> {
+    fn tool_end(&mut self, event: ToolExecutionEnd, ts: i64) -> Vec<SpanOp> {
         let Some((turn, _)) = &self.turn else {
             return vec![];
         };
-        let call = event
-            .get("toolCallId")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let pending = self.tools.remove(call);
+        let call = event.tool_call_id.unwrap_or_default();
+        let pending = self.tools.remove(&call);
         let tracked = pending.clone().unwrap_or(ToolStart {
             start_ms: ts,
-            name: event
-                .get("toolName")
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .into(),
+            name: event.tool_name.unwrap_or_else(|| "tool".into()),
             args: Value::Null,
         });
         self.total_tools += 1;
-        let failed = event.get("isError").and_then(Value::as_bool) == Some(true);
+        let failed = event.is_error;
         let skill = skill_from_read(&tracked.name, &tracked.args);
         let name = skill
             .as_ref()
@@ -520,7 +772,7 @@ impl PiTranslator {
             start_ms: pending.is_none().then_some(tracked.start_ms),
             end_ms: Some(ts),
             input: pending.is_none().then_some(tracked.args),
-            output: event.get("result").cloned(),
+            output: event.result.clone(),
             metadata: Some(with_tool_approval(
                 json!({
                     "tool_name": if skill.is_some() { "skill" } else { &tracked.name },
@@ -530,7 +782,7 @@ impl PiTranslator {
                 }),
                 Some(ToolApproval::Approved),
             )),
-            error: failed.then(|| format_error(event.get("result"))),
+            error: failed.then(|| format_error(event.result.as_ref())),
             ..Default::default()
         };
         vec![if pending.is_some() {
@@ -613,105 +865,90 @@ impl PiTranslator {
     }
 }
 
-fn compaction_message(event: &Value) -> Option<Value> {
-    let entry = event.get("compactionEntry")?;
-    let summary = entry.get("summary")?.clone();
+fn compaction_message(event: &SessionCompact) -> Option<Value> {
+    let entry = event.compaction_entry.as_ref()?;
+    let summary = entry.summary.clone()?;
     Some(json!({
         "role": "compactionSummary",
         "summary": summary,
-        "tokensBefore": entry.get("tokensBefore").cloned().unwrap_or(Value::Null),
-        "timestamp": entry.get("timestamp").cloned().unwrap_or(Value::Null),
+        "tokensBefore": entry.tokens_before.clone().unwrap_or(Value::Null),
+        "timestamp": entry.timestamp.clone().unwrap_or(Value::Null),
     }))
 }
 
-fn special_input(event: &Value, compaction: bool) -> Value {
-    if compaction {
-        let preparation = event.get("preparation");
-        json!({
-            "reason": event.get("reason"),
-            "willRetry": event.get("willRetry"),
-            "customInstructions": event.get("customInstructions"),
-            "tokensBefore": preparation.and_then(|value| value.get("tokensBefore")),
-            "firstKeptEntryId": preparation.and_then(|value| value.get("firstKeptEntryId")),
-            "isSplitTurn": preparation.and_then(|value| value.get("isSplitTurn")),
-            "messagesToSummarizeCount": preparation
-                .and_then(|value| value.get("messagesToSummarize"))
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            "turnPrefixMessagesCount": preparation
-                .and_then(|value| value.get("turnPrefixMessages"))
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            "branchEntryCount": event
-                .get("branchEntries")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-        })
-    } else {
-        let preparation = event.get("preparation");
-        json!({
-            "targetId": preparation.and_then(|value| value.get("targetId")),
-            "oldLeafId": preparation.and_then(|value| value.get("oldLeafId")),
-            "commonAncestorId": preparation.and_then(|value| value.get("commonAncestorId")),
-            "userWantsSummary": preparation.and_then(|value| value.get("userWantsSummary")),
-            "customInstructions": preparation.and_then(|value| value.get("customInstructions")),
-            "replaceInstructions": preparation.and_then(|value| value.get("replaceInstructions")),
-            "label": preparation.and_then(|value| value.get("label")),
-            "entriesToSummarizeCount": preparation
-                .and_then(|value| value.get("entriesToSummarize"))
-                .and_then(Value::as_array)
-                .map(Vec::len),
-        })
-    }
+fn compaction_input(event: &BeforeCompact) -> Value {
+    let preparation = event.preparation.as_ref();
+    json!({
+        "reason": event.reason.clone(),
+        "willRetry": event.will_retry.clone(),
+        "customInstructions": event.custom_instructions.clone(),
+        "tokensBefore": preparation.and_then(|value| value.tokens_before.clone()),
+        "firstKeptEntryId": preparation.and_then(|value| value.first_kept_entry_id.clone()),
+        "isSplitTurn": preparation.and_then(|value| value.is_split_turn.clone()),
+        "messagesToSummarizeCount": preparation
+            .and_then(|value| value.messages_to_summarize.as_ref())
+            .map(Vec::len),
+        "turnPrefixMessagesCount": preparation
+            .and_then(|value| value.turn_prefix_messages.as_ref())
+            .map(Vec::len),
+        "branchEntryCount": event.branch_entries.as_ref().map(Vec::len),
+    })
 }
 
-fn num(v: &Value, key: &str) -> i64 {
-    v.get(key).and_then(Value::as_i64).unwrap_or(0)
+fn branch_summary_input(event: &BeforeTree) -> Value {
+    let preparation = event.preparation.as_ref();
+    json!({
+        "targetId": preparation.and_then(|value| value.target_id.clone()),
+        "oldLeafId": preparation.and_then(|value| value.old_leaf_id.clone()),
+        "commonAncestorId": preparation.and_then(|value| value.common_ancestor_id.clone()),
+        "userWantsSummary": preparation.and_then(|value| value.user_wants_summary),
+        "customInstructions": preparation.and_then(|value| value.custom_instructions.clone()),
+        "replaceInstructions": preparation.and_then(|value| value.replace_instructions.clone()),
+        "label": preparation.and_then(|value| value.label.clone()),
+        "entriesToSummarizeCount": preparation
+            .and_then(|value| value.entries_to_summarize.as_ref())
+            .map(Vec::len),
+    })
 }
-fn response_model(v: &Value) -> Option<String> {
-    for key in [
-        "responseModel",
-        "routedModel",
-        "resolvedModel",
-        "actualModel",
-        "concreteModel",
-        "outputModel",
-        "model",
-    ] {
-        if let Some(s) = v.get(key).and_then(Value::as_str) {
-            return Some(s.into());
-        }
-    }
-    None
+
+fn response_model(message: &AssistantMessage) -> Option<String> {
+    [
+        &message.response_model,
+        &message.routed_model,
+        &message.resolved_model,
+        &message.actual_model,
+        &message.concrete_model,
+        &message.output_model,
+        &message.model,
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    .cloned()
 }
-fn normalize_assistant(v: &Value) -> Value {
+fn normalize_assistant(message: &AssistantMessage) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut calls = Vec::new();
-    for part in v
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        match part.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(s) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(s);
-                }
-            }
-            Some("thinking") => {
-                if let Some(s) = part.get("thinking").and_then(Value::as_str) {
-                    reasoning.push_str(s);
-                }
-            }
-            Some("toolCall") => calls.push(json!({
-                "id": part.get("id"),
+    for part in &message.content {
+        match part {
+            AssistantContent::Text {
+                text: Some(content),
+            } => text.push_str(content),
+            AssistantContent::Thinking {
+                thinking: Some(content),
+            } => reasoning.push_str(content),
+            AssistantContent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => calls.push(json!({
+                "id": id,
                 "type": "function",
                 "function": {
-                    "name": part.get("name"),
+                    "name": name,
                     "arguments": serde_json::to_string(
-                        part.get("arguments").unwrap_or(&Value::Null),
+                        arguments.as_ref().unwrap_or(&Value::Null),
                     )
                     .unwrap_or_default(),
                 },

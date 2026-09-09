@@ -325,3 +325,84 @@ fn pi_finalization_closes_missing_llm_and_tool_events() {
         SpanOp::Insert(row) if row.span_type == SpanType::Tool && row.error.is_some()
     )));
 }
+
+#[test]
+fn pi_ignores_unknown_native_fields_at_typed_event_boundaries() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for envelope in [
+        event(
+            "before_agent_start",
+            1,
+            json!({"prompt":"inspect", "futureTurnField":{"version":2}}),
+        ),
+        event(
+            "context",
+            2,
+            json!({"messages":[{"role":"user","content":"inspect","futureMessageField":true}], "futureContextField":true}),
+        ),
+        event(
+            "message_end",
+            3,
+            json!({"message":{"role":"assistant","model":"gpt-5","content":[{"type":"text","text":"done","futurePartField":true},{"type":"future_content_part","ignored":true}],"usage":{"input":1,"output":1,"futureUsageField":1},"futureMessageField":true}}),
+        ),
+        event(
+            "tool_execution_start",
+            4,
+            json!({"toolCallId":"call","toolName":"read","args":{"path":"x","futureArgField":true},"futureToolField":true}),
+        ),
+        event(
+            "tool_execution_end",
+            5,
+            json!({"toolCallId":"call","toolName":"read","result":"ok","isError":false,"futureToolField":true}),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    assert!(rows.values().any(|row| row.span_type == SpanType::Llm));
+    assert!(rows.values().any(|row| row.span_type == SpanType::Tool));
+}
+
+#[test]
+fn pi_ignores_malformed_typed_events_without_failing_the_session() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    translator
+        .handle(
+            &event("before_agent_start", 1, json!({"prompt":"inspect"})),
+            &ctx,
+        )
+        .unwrap();
+
+    // A future Pi version could change this identifier's representation. The
+    // raw event remains journaled, but a typed reducer must not fail the actor.
+    let ops = translator
+        .handle(
+            &event(
+                "tool_execution_start",
+                2,
+                json!({"toolCallId":42,"toolName":"read","args":{}}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    assert!(ops
+        .iter()
+        .all(|op| !matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Tool)));
+
+    assert!(translator
+        .handle(&event("agent_end", 3, json!({})), &ctx)
+        .unwrap()
+        .iter()
+        .any(|op| matches!(op, SpanOp::Merge(row) if row.end_ms == Some(3))));
+}
