@@ -1,7 +1,7 @@
 #!/bin/bash
 # Thin, fail-open bridge from Grok hooks to the shared Braintrust daemon.
 
-PLUGIN_VERSION="0.1.0"
+PLUGIN_VERSION="0.0.1"
 
 resolve_bt() {
   if [[ -n "${BT_BIN:-}" && -x "$BT_BIN" ]]; then
