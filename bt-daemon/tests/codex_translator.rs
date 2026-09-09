@@ -1165,3 +1165,70 @@ fn codex_subagent_nests_under_spawning_turn() {
     let sub_llm = find(&rows, SpanType::Llm, "gpt-5.5-mini");
     assert_eq!(sub_llm.parent_span_ids, vec![sub_turn.span_id.clone()]);
 }
+
+#[test]
+fn codex_rollout_routing_ignores_future_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let records = [
+        json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "session_meta",
+            "future_record_field": { "preserve": true },
+            "payload": { "id": "session-1", "cwd": "/work/app", "future_payload_field": [1, 2] },
+        }),
+        json!({
+            "timestamp": "2026-01-01T00:00:02Z",
+            "type": "event_msg",
+            "payload": { "type": "task_started", "turn_id": "t1", "future_event_field": {} },
+        }),
+        json!({
+            "timestamp": "2026-01-01T00:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "shell",
+                "arguments": "{\"command\":\"pwd\"}",
+                "future_response_field": "new Codex field",
+            },
+        }),
+        json!({
+            "timestamp": "2026-01-01T00:00:04Z",
+            "type": "response_item",
+            "payload": { "type": "function_call_output", "call_id": "c1", "output": "/work/app" },
+        }),
+        json!({
+            "timestamp": "2026-01-01T00:00:05Z",
+            "type": "event_msg",
+            "payload": { "type": "task_complete", "last_agent_message": "done" },
+        }),
+    ];
+    let mut file = std::fs::File::create(&transcript).unwrap();
+    for record in records {
+        writeln!(file, "{}", line(record)).unwrap();
+    }
+
+    let reg = Registry::default_agents();
+    let mut translator = reg.create("codex", "sess-1");
+    let ctx = SessionCtx {
+        session_id: "sess-1".into(),
+        config: None,
+    };
+    let ops = translator
+        .handle(
+            &envelope(
+                "sess-1",
+                "SessionStart",
+                transcript.to_str().unwrap(),
+                json!({ "source": "startup" }),
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let rows = reduce(ops);
+    let tool = find(&rows, SpanType::Tool, "shell");
+    assert_eq!(tool.input, Some(json!("{\"command\":\"pwd\"}")));
+    assert_eq!(tool.output, Some(json!("/work/app")));
+}

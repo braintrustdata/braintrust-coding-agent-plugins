@@ -64,6 +64,40 @@ struct SubagentStartHook {
     agent_type: Option<String>,
 }
 
+/// The stable outer shape of a rollout JSONL row. The payload deliberately
+/// stays untyped here: Codex adds response-item fields regularly and several
+/// handlers preserve those native objects in span input/output.
+#[derive(Deserialize)]
+struct RolloutRecord {
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    payload: Value,
+}
+
+/// Event and response rows use a second discriminator inside their payload.
+#[derive(Deserialize)]
+struct PayloadKind {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkingDirectoryPayload {
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TurnContextPayload {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    turn_id: Option<String>,
+}
+
 fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
@@ -511,7 +545,7 @@ impl CodexTranslator {
             CATCH_UP_BYTE_BUDGET,
         );
         for line in read.lines {
-            if let Ok(rec) = serde_json::from_str::<Value>(&line) {
+            if let Ok(rec) = serde_json::from_str::<RolloutRecord>(&line) {
                 self.process_record(&mut scope, &rec, hook_ts, ops);
             }
         }
@@ -522,81 +556,91 @@ impl CodexTranslator {
     fn process_record(
         &mut self,
         scope: &mut Scope,
-        rec: &Value,
+        rec: &RolloutRecord,
         hook_ts: i64,
         ops: &mut Vec<SpanOp>,
     ) {
         let op_start = ops.len();
-        let ts = parse_ts(rec).unwrap_or(hook_ts);
-        let ty = rec.get("type").and_then(Value::as_str).unwrap_or("");
-        let payload = rec.get("payload").cloned().unwrap_or(Value::Null);
-        if matches!(ty, "session_meta" | "turn_context") {
-            if let Some(cwd) = str_field(&payload, "cwd") {
+        let ts = rec
+            .timestamp
+            .as_deref()
+            .and_then(parse_timestamp)
+            .unwrap_or(hook_ts);
+        let kind = rec.kind.as_deref().unwrap_or("");
+        let payload = &rec.payload;
+        if matches!(kind, "session_meta" | "turn_context") {
+            if let Some(cwd) = decode::<WorkingDirectoryPayload>(payload).and_then(|v| v.cwd) {
                 scope.current_cwd = Some(cwd);
             }
         }
 
-        match ty {
-            "session_meta" => self.open_root(scope, &payload, ts, ops),
+        match kind {
+            "session_meta" => self.open_root(scope, payload, ts, ops),
             "turn_context" => {
-                if let Some(m) = str_field(&payload, "model") {
-                    let model_turn_id = str_field(&payload, "turn_id");
-                    scope.model = Some(m.clone());
-                    if scope.root_created {
-                        let input = if scope.kind == ScopeKind::Main {
-                            json!({
-                                "model": m,
-                                "cwd": self.root_cwd,
-                                "source": self.session_source,
-                            })
-                        } else {
-                            json!({ "model": m })
-                        };
-                        ops.push(SpanOp::Merge(SpanRow {
-                            span_id: scope.turn_parent_span_id.clone(),
-                            root_span_id: self.root_span_id.clone(),
-                            input: Some(input),
-                            metadata: Some(json!({ "model": m })),
-                            ..Default::default()
-                        }));
-                    }
-                    if let Some(turn) = model_turn_id.as_deref().and_then(|turn_id| {
-                        scope.open_turns.iter().find(|turn| turn.turn_id == turn_id)
-                    }) {
-                        ops.push(SpanOp::Merge(SpanRow {
-                            span_id: turn.span_id.clone(),
-                            root_span_id: self.root_span_id.clone(),
-                            metadata: Some(json!({ "model": m })),
-                            ..Default::default()
-                        }));
+                if let Some(context) = decode::<TurnContextPayload>(payload) {
+                    if let Some(m) = context.model {
+                        let model_turn_id = context.turn_id;
+                        scope.model = Some(m.clone());
+                        if scope.root_created {
+                            let input = if scope.kind == ScopeKind::Main {
+                                json!({
+                                    "model": m,
+                                    "cwd": self.root_cwd,
+                                    "source": self.session_source,
+                                })
+                            } else {
+                                json!({ "model": m })
+                            };
+                            ops.push(SpanOp::Merge(SpanRow {
+                                span_id: scope.turn_parent_span_id.clone(),
+                                root_span_id: self.root_span_id.clone(),
+                                input: Some(input),
+                                metadata: Some(json!({ "model": m })),
+                                ..Default::default()
+                            }));
+                        }
+                        if let Some(turn) = model_turn_id.as_deref().and_then(|turn_id| {
+                            scope.open_turns.iter().find(|turn| turn.turn_id == turn_id)
+                        }) {
+                            ops.push(SpanOp::Merge(SpanRow {
+                                span_id: turn.span_id.clone(),
+                                root_span_id: self.root_span_id.clone(),
+                                metadata: Some(json!({ "model": m })),
+                                ..Default::default()
+                            }));
+                        }
                     }
                 }
             }
             "event_msg" => {
-                let sub = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                match sub {
-                    "task_started" => self.open_turn(scope, &payload, ts, ops),
-                    "user_message" => self.set_turn_input(scope, &payload, ops),
-                    "token_count" => self.close_llm_with_tokens(scope, &payload, ts, ops),
-                    "task_complete" => self.close_turn(scope, &payload, ts, ops),
+                let sub = decode::<PayloadKind>(payload)
+                    .and_then(|v| v.kind)
+                    .unwrap_or_default();
+                match sub.as_str() {
+                    "task_started" => self.open_turn(scope, payload, ts, ops),
+                    "user_message" => self.set_turn_input(scope, payload, ops),
+                    "token_count" => self.close_llm_with_tokens(scope, payload, ts, ops),
+                    "task_complete" => self.close_turn(scope, payload, ts, ops),
                     _ => {}
                 }
             }
             "response_item" => {
-                let sub = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                match sub {
-                    "message" => self.on_message(scope, &payload, ts, ops),
-                    "reasoning" => self.on_reasoning(scope, &payload, ts, ops),
+                let sub = decode::<PayloadKind>(payload)
+                    .and_then(|v| v.kind)
+                    .unwrap_or_default();
+                match sub.as_str() {
+                    "message" => self.on_message(scope, payload, ts, ops),
+                    "reasoning" => self.on_reasoning(scope, payload, ts, ops),
                     "function_call" | "custom_tool_call" | "tool_search_call" => {
-                        self.on_tool_call(scope, &payload, ts, ops)
+                        self.on_tool_call(scope, payload, ts, ops)
                     }
                     "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
-                        self.on_tool_output(scope, &payload, ts, ops)
+                        self.on_tool_output(scope, payload, ts, ops)
                     }
                     _ => {}
                 }
             }
-            "compacted" => self.on_compacted(scope, rec, &payload, ts, ops),
+            "compacted" => self.on_compacted(scope, payload, ts, ops),
             _ => {}
         }
         let cwd = scope.current_cwd.as_deref().or(self.root_cwd.as_deref());
@@ -1145,14 +1189,7 @@ impl CodexTranslator {
         self.scopes.insert(path, scope);
     }
 
-    fn on_compacted(
-        &mut self,
-        scope: &mut Scope,
-        _rec: &Value,
-        payload: &Value,
-        ts: i64,
-        ops: &mut Vec<SpanOp>,
-    ) {
+    fn on_compacted(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
         let Some(turn) = scope.open_turns.last() else {
             return;
         };
@@ -1722,6 +1759,10 @@ fn compaction_history(payload: &Value, replacement: Option<&Vec<Value>>) -> Vec<
 
 fn parse_ts(rec: &Value) -> Option<i64> {
     let s = rec.get("timestamp").and_then(Value::as_str)?;
+    parse_timestamp(s)
+}
+
+fn parse_timestamp(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp_millis())
