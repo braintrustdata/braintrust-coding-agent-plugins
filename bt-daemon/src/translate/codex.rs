@@ -26,6 +26,8 @@ use super::{
 use crate::ids;
 use crate::wire::Envelope;
 use regex::Regex;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,6 +38,35 @@ const MISSING_TOOL_OUTPUT_ERROR: &str = "Tool output missing before turn ended";
 /// A hook can arrive after a daemon restart or against an existing rollout.
 /// Keep a single translator batch small even when the unread suffix is large.
 const CATCH_UP_BYTE_BUDGET: usize = 64 * 1024;
+
+// Codex hooks are triggers for the rollout reader. These partial types cover
+// the hook-owned correlation fields while preserving raw rollout JSON for the
+// separately bounded transcript reducer.
+#[derive(Deserialize)]
+struct SessionStartHook {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    permission_mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompactHook {
+    turn_id: String,
+    #[serde(default)]
+    trigger: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SubagentStartHook {
+    agent_id: String,
+    #[serde(default)]
+    agent_type: Option<String>,
+}
+
+fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
+    serde_json::from_value(value.clone()).ok()
+}
 
 pub struct CodexTranslatorFactory {
     git: Arc<GitMetadataCache>,
@@ -200,11 +231,21 @@ impl AgentTranslator for CodexTranslator {
         // --- hook-specific side effects (before catch-up) ---
         match event.event.as_str() {
             "SessionStart" => {
-                self.session_source = str_field(payload, "source");
-                self.permission_mode = str_field(payload, "permission_mode");
+                if let Some(hook) = decode::<SessionStartHook>(payload) {
+                    self.session_source = hook.source;
+                    self.permission_mode = hook.permission_mode;
+                }
             }
-            "SubagentStart" => self.handle_subagent_start(event),
-            "PreCompact" | "PostCompact" => self.record_compaction_trigger(payload, &mut ops),
+            "SubagentStart" => {
+                if let Some(hook) = decode::<SubagentStartHook>(payload) {
+                    self.handle_subagent_start(event, hook);
+                }
+            }
+            "PreCompact" | "PostCompact" => {
+                if let Some(hook) = decode::<CompactHook>(payload) {
+                    self.record_compaction_trigger(hook, &mut ops);
+                }
+            }
             _ => {}
         }
 
@@ -343,11 +384,9 @@ impl CodexTranslator {
         );
     }
 
-    fn record_compaction_trigger(&mut self, payload: &Value, ops: &mut Vec<SpanOp>) {
-        let Some(turn_id) = str_field(payload, "turn_id") else {
-            return;
-        };
-        let trigger = str_field(payload, "trigger").unwrap_or_else(|| "manual".to_string());
+    fn record_compaction_trigger(&mut self, hook: CompactHook, ops: &mut Vec<SpanOp>) {
+        let turn_id = hook.turn_id;
+        let trigger = hook.trigger.unwrap_or_else(|| "manual".to_string());
         self.compaction_trigger_by_turn
             .insert(turn_id.clone(), trigger.clone());
         // Back-fill onto an already-built compaction span.
@@ -383,14 +422,11 @@ impl CodexTranslator {
         }
     }
 
-    fn handle_subagent_start(&mut self, event: &Envelope) {
-        let payload = &event.payload;
-        let (Some(agent_id), Some(path)) = (
-            str_field(payload, "agent_id"),
-            effective_transcript_path(event),
-        ) else {
+    fn handle_subagent_start(&mut self, event: &Envelope, hook: SubagentStartHook) {
+        let Some(path) = effective_transcript_path(event) else {
             return;
         };
+        let agent_id = hook.agent_id;
         if self.scopes.contains_key(&path) {
             return;
         }
@@ -401,7 +437,7 @@ impl CodexTranslator {
         let subagent_root = ids::span_id(&self.session_id, &format!("subagent:{agent_id}"));
         let mut scope = Scope::new(&path, ScopeKind::Subagent, subagent_root);
         scope.agent_id = Some(agent_id);
-        scope.agent_type = str_field(payload, "agent_type");
+        scope.agent_type = hook.agent_type;
         scope.spawning_turn_span_id = Some(parent);
         self.scopes.insert(path, scope);
     }
