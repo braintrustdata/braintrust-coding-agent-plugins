@@ -747,13 +747,37 @@ fn tool_and_llm_payloads_preserve_original_contract() {
     assert_eq!(tool.tags, Some(vec!["permission-request".into()]));
     assert_eq!(tool.error.as_deref(), Some("boom"));
 
-    let mut llms: Vec<&SpanRow> = rows
+    let llms: Vec<&SpanRow> = rows
         .values()
         .filter(|row| row.span_type == SpanType::Llm)
         .collect();
-    llms.sort_by_key(|row| row.start_ms);
     assert_eq!(llms.len(), 2);
-    assert!(llms[0]
+    let first = llms
+        .iter()
+        .copied()
+        .find(|row| {
+            row.output
+                .as_ref()
+                .and_then(|output| output.get("tool_calls"))
+                .is_some()
+        })
+        .expect("LLM that emitted the tool call");
+    let second = llms
+        .iter()
+        .copied()
+        .find(|row| {
+            row.input
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|input| {
+                    input
+                        .iter()
+                        .any(|message| message.get("tool_calls").is_some())
+                })
+        })
+        .expect("LLM that received the tool call result");
+    assert_ne!(first.span_id, second.span_id);
+    assert!(first
         .input
         .as_ref()
         .unwrap()
@@ -762,19 +786,19 @@ fn tool_and_llm_payloads_preserve_original_contract() {
         .iter()
         .all(|message| message.get("tool_calls").is_none()));
     assert_eq!(
-        llms[0].output.as_ref().unwrap()["tool_calls"][0]["function"]["arguments"],
+        first.output.as_ref().unwrap()["tool_calls"][0]["function"]["arguments"],
         json!("{\"cmd\":\"cat /tmp/review/SKILL.md\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need access\",\"prefix_rule\":[\"cat\"]}")
     );
-    assert_eq!(llms[0].metrics.as_ref().unwrap()["cost"], json!(0.25));
+    assert_eq!(first.metrics.as_ref().unwrap()["cost"], json!(0.25));
     assert_eq!(
-        llms[0].metrics.as_ref().unwrap()["estimated_cost"],
+        first.metrics.as_ref().unwrap()["estimated_cost"],
         json!(0.25)
     );
-    let second_input = llms[1].input.as_ref().unwrap().as_array().unwrap();
+    let second_input = second.input.as_ref().unwrap().as_array().unwrap();
     assert_eq!(second_input.last().unwrap()["role"], json!("tool"));
     assert_eq!(second_input.last().unwrap()["tool_call_id"], json!("c1"));
     assert_eq!(
-        llms[1].metadata.as_ref().unwrap()["usage_unavailable_reason"],
+        second.metadata.as_ref().unwrap()["usage_unavailable_reason"],
         json!("codex_token_count_missing_usage")
     );
 }
