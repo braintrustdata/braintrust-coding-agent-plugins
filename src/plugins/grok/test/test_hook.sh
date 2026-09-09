@@ -5,6 +5,16 @@ HOOK="${1:?usage: test_hook.sh <hook-adapter>}"
 HOOK_DIR="${HOOK%/*}"
 [[ "$HOOK_DIR" != "$HOOK" ]] || HOOK_DIR="."
 HOOKS_JSON="$HOOK_DIR/hooks.json"
+MANIFEST="$HOOK_DIR/../.grok-plugin/plugin.json"
+PLUGIN_VERSION="$(
+  python3 - "$MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["version"])
+PY
+)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -34,21 +44,21 @@ cat "$payload_file" | env \
   BT_STUB_STATUS=0 \
   "$HOOK"
 
-cat >"$expected_args" <<'ARGS'
-12
-trace
-hook
---source
-grok
---plugin-version
-0.1.0
---session-id-field
-sessionId
---event-field
-hookEventName
---transcript-path-field
-transcriptPath
-ARGS
+printf '%s\n' \
+  12 \
+  trace \
+  hook \
+  --source \
+  grok \
+  --plugin-version \
+  "$PLUGIN_VERSION" \
+  --session-id-field \
+  sessionId \
+  --event-field \
+  hookEventName \
+  --transcript-path-field \
+  transcriptPath \
+  >"$expected_args"
 cmp -s "$expected_args" "$args" \
   || { echo "test: unexpected bt arguments" >&2; exit 1; }
 cmp -s "$payload_file" "$stdin" \
@@ -62,23 +72,23 @@ cat "$payload_file" | env \
   BT_STUB_STATUS=0 \
   GROK_VERSION="1.0.13 beta" \
   "$HOOK"
-cat >"$expected_args" <<'ARGS'
-14
-trace
-hook
---source
-grok
---plugin-version
-0.1.0
---session-id-field
-sessionId
---event-field
-hookEventName
---transcript-path-field
-transcriptPath
---source-version
-1.0.13 beta
-ARGS
+printf '%s\n' \
+  14 \
+  trace \
+  hook \
+  --source \
+  grok \
+  --plugin-version \
+  "$PLUGIN_VERSION" \
+  --session-id-field \
+  sessionId \
+  --event-field \
+  hookEventName \
+  --transcript-path-field \
+  transcriptPath \
+  --source-version \
+  "1.0.13 beta" \
+  >"$expected_args"
 cmp -s "$expected_args" "$args" \
   || { echo "test: unexpected source-version arguments" >&2; exit 1; }
 cmp -s "$payload_file" "$stdin" \
