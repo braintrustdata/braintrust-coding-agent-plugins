@@ -168,6 +168,8 @@ struct ClaudeTranslator {
     pending_emission: Option<PendingEmission>,
     claude_version: Option<String>,
     claude_version_logged: bool,
+    session_source: Option<String>,
+    session_model: Option<String>,
     git: Arc<GitMetadataCache>,
     current_cwd: Option<String>,
     last_turn_cwd: Option<String>,
@@ -198,6 +200,8 @@ impl ClaudeTranslator {
             pending_emission: None,
             claude_version: None,
             claude_version_logged: false,
+            session_source: None,
+            session_model: None,
             git,
             current_cwd: None,
             last_turn_cwd: None,
@@ -244,10 +248,14 @@ impl ClaudeTranslator {
         if let Some(version) = &self.claude_version {
             metadata.insert("claude_code_version".into(), json!(version));
         }
-        if let Some(source) = string_field(&event.payload, "source") {
+        if let Some(source) =
+            string_field(&event.payload, "source").or_else(|| self.session_source.clone())
+        {
             metadata.insert("session_source".into(), json!(source));
         }
-        if let Some(model) = string_field(&event.payload, "model") {
+        if let Some(model) =
+            string_field(&event.payload, "model").or_else(|| self.session_model.clone())
+        {
             metadata.insert("model".into(), json!(model));
         }
         ops.push(SpanOp::Insert(SpanRow {
@@ -276,6 +284,31 @@ impl ClaudeTranslator {
             self.claude_version = rows.iter().find_map(|row| string_field(row, "version"));
         }
         cursor.buffered.extend(rows);
+    }
+
+    fn observe_session_details(&mut self, event: &Envelope) {
+        if let Some(source) = string_field(&event.payload, "source") {
+            self.session_source = Some(source);
+        }
+        if let Some(model) = string_field(&event.payload, "model") {
+            self.session_model = Some(model);
+        }
+    }
+
+    /// Passive Claude hooks must not create a trace. In particular, Claude
+    /// emits idle notifications after a completed turn, and it may start or
+    /// resume a session long before the user submits a prompt.
+    fn starts_trace(event: &Envelope) -> bool {
+        matches!(
+            event.event.as_str(),
+            "UserPromptSubmit"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "PermissionDenied"
+                | "SubagentStart"
+                | "SubagentStop"
+        )
     }
 
     fn open_turn(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
@@ -786,8 +819,11 @@ impl AgentTranslator for ClaudeTranslator {
             self.current_cwd = Some(cwd);
         }
         self.tail_main(event);
-        self.ensure_root(event, ctx, &mut ops);
-        if !self.claude_version_logged {
+        self.observe_session_details(event);
+        if Self::starts_trace(event) {
+            self.ensure_root(event, ctx, &mut ops);
+        }
+        if self.root_open && !self.claude_version_logged {
             if let Some(version) = &self.claude_version {
                 self.claude_version_logged = true;
                 ops.push(SpanOp::Merge(SpanRow {
@@ -798,13 +834,11 @@ impl AgentTranslator for ClaudeTranslator {
                 }));
             }
         }
-        self.git.enrich_rows(self.current_cwd.as_deref(), &mut ops);
-        let mut event_op_start = ops.len();
+        let event_op_start = 0;
         match event.event.as_str() {
             "SessionStart" => {}
             "UserPromptSubmit" => {
                 self.flush_previous_turn_rows(&mut ops);
-                event_op_start = ops.len();
                 self.open_turn(event, &mut ops);
             }
             "UserPromptExpansion" => self.record_skill(event, &mut ops),

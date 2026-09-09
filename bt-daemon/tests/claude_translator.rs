@@ -289,6 +289,73 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
 }
 
 #[test]
+fn claude_passive_hooks_do_not_create_blank_session_traces() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "idle-session");
+    let ctx = SessionCtx {
+        session_id: "idle-session".into(),
+        config: None,
+    };
+    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "idle-session".into(),
+        event: name.into(),
+        ts_ms,
+        managed_run_id: None,
+        payload,
+        route: None,
+        config: None,
+        capture: None,
+    };
+
+    let mut ops = Vec::new();
+    for event in [
+        event(
+            "SessionStart",
+            1,
+            json!({"cwd":"/workspace/demo", "source":"resume", "model":"claude-test"}),
+        ),
+        event(
+            "Notification",
+            2,
+            json!({"cwd":"/workspace/demo", "notification_type":"idle_prompt"}),
+        ),
+        event(
+            "TeammateIdle",
+            3,
+            json!({"cwd":"/workspace/demo", "teammate_name":"researcher"}),
+        ),
+        event("SessionEnd", 4, json!({"cwd":"/workspace/demo"})),
+    ] {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    assert!(ops.is_empty(), "passive Claude hooks must not emit a trace");
+
+    let ops = translator
+        .handle(
+            &event(
+                "UserPromptSubmit",
+                5,
+                json!({"cwd":"/workspace/demo", "prompt":"trace this"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    let root = ops
+        .into_iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "Claude Code: demo" => Some(row),
+            _ => None,
+        })
+        .expect("a user prompt starts a trace");
+    let metadata = root.metadata.as_ref().unwrap();
+    assert_eq!(metadata["session_source"], "resume");
+    assert_eq!(metadata["model"], "claude-test");
+}
+
+#[test]
 fn claude_subagent_fixture_builds_nested_subagent_llms() {
     let rows = reduce(replay("subagent-compact"));
     let subagents: Vec<_> = rows
