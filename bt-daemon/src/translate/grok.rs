@@ -4,13 +4,17 @@
 //! trace data source; `events.jsonl` is independently tailed, best-effort tool
 //! enrichment. Both are mirrored into daemon-owned storage at hook boundaries.
 
+use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
-use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
+use super::{
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+};
 use crate::ids;
 use crate::wire::Envelope;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 const CATCH_UP_BYTE_BUDGET: u64 = 64 * 1024;
 const CATCH_UP_RECORD_BUDGET: usize = 256;
@@ -21,7 +25,15 @@ const MAX_OUTPUT_CHUNKS: usize = 2_048;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: u64 = 2 * 1024 * 1024;
 
-pub struct GrokTranslatorFactory;
+pub struct GrokTranslatorFactory {
+    git: Arc<GitMetadataCache>,
+}
+
+impl GrokTranslatorFactory {
+    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
+        Self { git }
+    }
+}
 
 impl TranslatorFactory for GrokTranslatorFactory {
     fn source(&self) -> &str {
@@ -29,7 +41,7 @@ impl TranslatorFactory for GrokTranslatorFactory {
     }
 
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(GrokTranslator::new(session_id))
+        Box::new(GrokTranslator::new(session_id, self.git.clone()))
     }
 }
 
@@ -214,11 +226,13 @@ struct GrokTranslator {
     first_llm_span_id: Option<String>,
     first_llm_user_input: Option<Value>,
     pending: Option<PendingWork>,
+    cwd: Option<String>,
+    git: Arc<GitMetadataCache>,
     last_ts_ms: i64,
 }
 
 impl GrokTranslator {
-    fn new(session_id: &str) -> Self {
+    fn new(session_id: &str, git: Arc<GitMetadataCache>) -> Self {
         let root = ids::span_id(session_id, "session");
         Self {
             session_id: session_id.to_string(),
@@ -241,6 +255,8 @@ impl GrokTranslator {
             first_llm_span_id: None,
             first_llm_user_input: None,
             pending: None,
+            cwd: None,
+            git,
             last_ts_ms: 0,
         }
     }
@@ -305,6 +321,7 @@ impl GrokTranslator {
         metadata.insert("source".into(), json!("grok"));
         metadata.insert("session_id".into(), json!(self.session_id));
         metadata.insert("trace_source".into(), json!("session_transcript"));
+        metadata.insert("username".into(), json!(local_username()));
         for field in ["cwd", "workspaceRoot", "permissionMode", "transcriptPath"] {
             if let Some(value) = event.payload.get(field) {
                 metadata.insert(field.into(), value.clone());
@@ -1180,6 +1197,9 @@ impl AgentTranslator for GrokTranslator {
             self.pending.is_none(),
             "Grok translator has pending catch-up work; drain it before handling another event"
         );
+        if let Some(cwd) = event.payload.get("cwd").and_then(Value::as_str) {
+            self.cwd = Some(cwd.to_string());
+        }
         let (mut ops, complete) = self.process_transcripts(event, ctx)?;
         if complete {
             self.finish_hook(event, &mut ops);
@@ -1188,6 +1208,7 @@ impl AgentTranslator for GrokTranslator {
                 event: event.clone(),
             });
         }
+        self.git.enrich_rows(self.cwd.as_deref(), &mut ops);
         Ok(ops)
     }
 
@@ -1200,6 +1221,7 @@ impl AgentTranslator for GrokTranslator {
             self.pending = None;
             self.finish_hook(&pending.event, &mut ops);
         }
+        self.git.enrich_rows(self.cwd.as_deref(), &mut ops);
         Ok(Some(ops))
     }
 
@@ -1221,6 +1243,7 @@ impl AgentTranslator for GrokTranslator {
                 ..Default::default()
             }));
         }
+        self.git.enrich_rows(self.cwd.as_deref(), &mut ops);
         Ok(ops)
     }
 }
