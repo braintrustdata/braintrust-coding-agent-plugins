@@ -834,11 +834,16 @@ impl AgentTranslator for ClaudeTranslator {
                 }));
             }
         }
-        let event_op_start = 0;
+        // Root creation moved below the passive-hook gate. Enrich it before
+        // handling the event so a later prompt can retain the prior turn's
+        // cwd while flushing its deferred transcript rows.
+        self.git.enrich_rows(self.current_cwd.as_deref(), &mut ops);
+        let mut event_op_start = ops.len();
         match event.event.as_str() {
             "SessionStart" => {}
             "UserPromptSubmit" => {
                 self.flush_previous_turn_rows(&mut ops);
+                event_op_start = ops.len();
                 self.open_turn(event, &mut ops);
             }
             "UserPromptExpansion" => self.record_skill(event, &mut ops),
