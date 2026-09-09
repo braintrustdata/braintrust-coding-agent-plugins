@@ -1,47 +1,34 @@
 # Braintrust tracing for Grok
 
+> **This repository is generated.** It is built from
+> [braintrustdata/braintrust-coding-agent-plugins](https://github.com/braintrustdata/braintrust-coding-agent-plugins).
+> Don't edit files here — make changes and file issues in that repository, and they
+> will be rebuilt into this one.
+
 Trace Grok coding sessions in Braintrust.
 
 ## Quickstart
 
-### Prerequisites
+Prerequisites:
 
-- Grok CLI 1.0.13
-- A recent `bt` CLI with `bt trace enable grok`
-- Braintrust authentication configured in `bt`
-- macOS or Linux with Bash
+- The latest [Grok CLI](https://grok.com/build)
+- The latest [Braintrust CLI (`bt`)](https://www.braintrust.dev/docs/reference/cli/quickstart)
 
-### 1. Install the plugin
-
-The published plugin lives at
-[`braintrustdata/braintrust-grok-plugin`](https://github.com/braintrustdata/braintrust-grok-plugin).
+Install:
 
 ```bash
 grok plugin install braintrustdata/braintrust-grok-plugin --trust
 grok plugin enable trace-grok
+bt login --profile myprofile
+bt trace --profile myprofile -p my-coding-agent-project enable grok
 ```
 
-`--trust` allows Grok to run the plugin's tracing hooks. Review the repository
-before installing if required by your security policy.
+This causes `grok` sessions to report to your configured project.
 
-### 2. Enable Braintrust tracing
-
-```bash
-bt trace enable grok
-```
-
-This saves a non-secret Braintrust destination, updates the published plugin
-when necessary, and enables it. The command is safe to repeat.
-
-If Grok was already open during installation or an update, activate the new
-hooks in that session:
-
-```text
-/reload-plugins
-```
-
-New Grok sessions load the plugin automatically. Start Grok normally and use it
-as usual; completed turns will appear in your configured Braintrust project.
+> **Note:** Due to a bug in the Grok CLI, you must run `/reload-plugins` at the
+> start of each session for traces to be reported. You can use
+> `alias grok="grok /reload-plugins"` until the
+> [issue is resolved](https://github.com/xai-org/plugin-marketplace/issues/236).
 
 ## What is captured
 
@@ -68,8 +55,8 @@ native boundaries for every model call. As a result:
 - token and usage totals are accurate at the **turn** level, but are not
   available for each individual LLM call; the turn aggregate is also attached
   to the final reconstructed LLM span and labeled as turn-level usage;
-- exact model input is available only for the first reconstructed LLM when the
-  system prompt and first user message can be recovered;
+- exact model input is available only for the first reconstructed LLM span when
+  the system prompt and first user message can be recovered;
 - LLM boundaries are reconstructed from Grok stream timing and may not match
   provider-side spans exactly;
 - permission, compaction, and subagent activity do not receive dedicated span
