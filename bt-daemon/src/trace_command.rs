@@ -24,6 +24,8 @@ pub enum TraceCommand {
     Setup(EnableArgs),
     /// Uninstall the Braintrust tracing plugin and remove its saved configuration.
     Disable(DisableArgs),
+    /// Update an already installed Braintrust tracing plugin without changing its configuration.
+    Update(UpdateArgs),
     /// Run the tracing daemon (foreground).
     #[command(hide = true)]
     Daemon(ServeArgs),
@@ -108,6 +110,12 @@ pub type SetupArgs = EnableArgs;
 
 #[derive(Debug, Clone, Args)]
 pub struct DisableArgs {
+    #[command(subcommand)]
+    pub agent: SetupAgent,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct UpdateArgs {
     #[command(subcommand)]
     pub agent: SetupAgent,
 }
@@ -298,5 +306,18 @@ mod tests {
 
         assert_eq!(DoctorAgent::Grok.source(), "grok");
         assert_eq!(DoctorAgent::Grok.display_name(), "Grok");
+    }
+
+    #[test]
+    fn update_accepts_every_setup_agent() {
+        for agent in ["codex", "claude", "opencode", "pi", "grok", "antigravity"] {
+            assert!(matches!(
+                Cli::try_parse_from(["bt", "update", agent])
+                    .unwrap()
+                    .trace
+                    .command,
+                TraceCommand::Update(_)
+            ));
+        }
     }
 }

@@ -29,12 +29,17 @@ const LEGACY_CLAUDE_TRACING_ENV_KEYS: [&str; 2] = ["BRAINTRUST_CC_PROJECT", "BRA
 const ANTIGRAVITY_PLUGIN_SOURCE: &str =
     "https://github.com/braintrustdata/braintrust-antigravity-plugin";
 
-fn npm_major_spec(package: &str, manifest: &str) -> anyhow::Result<String> {
+fn package_version(manifest: &str) -> anyhow::Result<String> {
     let manifest = serde_json::from_str::<Value>(manifest)?;
-    let version = manifest
+    manifest
         .get("version")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("package manifest has no string version"))?;
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("package manifest has no string version"))
+}
+
+fn npm_major_spec(package: &str, manifest: &str) -> anyhow::Result<String> {
+    let version = package_version(manifest)?;
     let major = version
         .split_once('.')
         .map(|(major, _)| major)
@@ -55,8 +60,96 @@ fn pi_plugin_spec() -> anyhow::Result<String> {
     ))
 }
 
+fn version_is_older(installed: &str, expected: &str) -> bool {
+    let parse = |version: &str| {
+        let mut parts = version.split(['.', '-', '+']);
+        Some((
+            parts.next()?.parse::<u64>().ok()?,
+            parts.next().unwrap_or("0").parse::<u64>().ok()?,
+            parts.next().unwrap_or("0").parse::<u64>().ok()?,
+        ))
+    };
+    parse(installed)
+        .zip(parse(expected))
+        .is_some_and(|(installed, expected)| installed < expected)
+}
+
+pub(crate) fn update_warning(source: &str) -> Option<String> {
+    let stale = match source {
+        "codex" => installed_json_version("codex", &["plugin", "list", "--json"], |value| {
+            codex_plugin(value).and_then(|plugin| plugin.get("version")).and_then(Value::as_str)
+        }, &package_version(include_str!("../../src/plugins/codex/content/plugins/trace-codex/.codex-plugin/plugin.json")).ok()?),
+        "claude" => installed_json_version("claude", &["plugin", "list", "--json"], |value| {
+            claude_plugin(value).and_then(|plugin| plugin.get("version")).and_then(Value::as_str)
+        }, &package_version(include_str!("../../src/plugins/claude/content/plugins/trace-claude-code/.claude-plugin/plugin.json")).ok()?),
+        "opencode" => opencode_update_required(),
+        "pi" => pi_update_required(),
+        _ => false,
+    };
+    stale.then(|| format!("tracing plugin is out of date; run `bt trace update {source}`"))
+}
+
+fn installed_json_version(
+    program: &str,
+    args: &[&str],
+    find_version: impl Fn(&Value) -> Option<&str>,
+    expected: &str,
+) -> bool {
+    let output = ProcessCommand::new(program).args(args).output();
+    let Ok(output) = output else { return false };
+    if !output.status.success() {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&output.stdout)
+        .ok()
+        .and_then(|value| find_version(&value).map(str::to_owned))
+        .is_some_and(|installed| version_is_older(&installed, expected))
+}
+
+fn opencode_update_required() -> bool {
+    let settings_path = paths::agent_settings_path("opencode", None);
+    let path = settings_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("opencode.json");
+    let Ok(raw) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    let expected = opencode_plugin_spec().ok();
+    config
+        .get("plugin")
+        .and_then(Value::as_array)
+        .and_then(|plugins| {
+            plugins.iter().find_map(|plugin| {
+                plugin
+                    .as_str()
+                    .filter(|plugin| plugin.starts_with(OPENCODE_PACKAGE))
+            })
+        })
+        .is_some_and(|plugin| Some(plugin) != expected.as_deref())
+}
+
+fn pi_update_required() -> bool {
+    let output = ProcessCommand::new("pi").arg("list").output();
+    let Ok(output) = output else { return false };
+    if !output.status.success() {
+        return false;
+    }
+    let installed = String::from_utf8_lossy(&output.stdout);
+    installed.lines().any(|line| {
+        let plugin = line.trim();
+        plugin.starts_with("npm:@braintrust/pi-extension")
+            && Some(plugin) != pi_plugin_spec().ok().as_deref()
+    })
+}
+
 trait CommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value>;
+    #[cfg(unix)]
+    fn json_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<Value>;
     fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<()>;
     fn run_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<()>;
 }
@@ -67,6 +160,23 @@ impl CommandRunner for SystemCommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value> {
         let output = ProcessCommand::new(program)
             .args(args)
+            .output()
+            .with_context(|| {
+                format!("failed to run `{program}`; install {program} and ensure it is on PATH")
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("`{program} {}` failed: {}", args.join(" "), stderr.trim());
+        }
+        serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("`{program} {}` returned invalid JSON", args.join(" ")))
+    }
+
+    #[cfg(unix)]
+    fn json_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<Value> {
+        let output = ProcessCommand::new(program)
+            .args(args)
+            .env("HOME", home)
             .output()
             .with_context(|| {
                 format!("failed to run `{program}`; install {program} and ensure it is on PATH")
@@ -175,6 +285,25 @@ fn disable_codex(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
         runner.run("codex", &["plugin", "remove", CODEX_PLUGIN, "--json"])?;
     }
     Ok(())
+}
+
+fn update_codex(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    let plugins = runner.json("codex", &["plugin", "list", "--json"])?;
+    if codex_plugin(&plugins).is_none() {
+        bail!("Codex tracing plugin is not installed; run `bt trace enable codex`");
+    }
+    let marketplaces = runner.json("codex", &["plugin", "marketplace", "list", "--json"])?;
+    let marketplace = codex_marketplace(&marketplaces).ok_or_else(|| {
+        anyhow::anyhow!("Codex tracing marketplace is not installed; run `bt trace enable codex`")
+    })?;
+    if !codex_marketplace_is_published(marketplace) {
+        bail!("Codex tracing marketplace is not the published Braintrust marketplace; run `bt trace enable codex`");
+    }
+    runner.run(
+        "codex",
+        &["plugin", "marketplace", "upgrade", CODEX_MARKETPLACE],
+    )?;
+    runner.run("codex", &["plugin", "add", CODEX_PLUGIN])
 }
 
 fn claude_marketplace(value: &Value) -> Option<&Value> {
@@ -336,6 +465,38 @@ fn disable_grok(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn update_grok(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    let plugins = runner.json("grok", &["plugin", "list", "--json"])?;
+    let plugin = grok_plugin(&plugins).ok_or_else(|| {
+        anyhow::anyhow!("Grok tracing plugin is not installed; run `bt trace enable grok`")
+    })?;
+    if !grok_plugin_is_published(plugin) {
+        bail!("Grok tracing plugin is not the published Braintrust plugin; run `bt trace enable grok`");
+    }
+    runner.run("grok", &["plugin", "update", GROK_PLUGIN])
+}
+
+fn update_claude(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    let plugins = runner.json("claude", &["plugin", "list", "--json"])?;
+    if claude_plugin(&plugins).is_none() {
+        bail!("Claude Code tracing plugin is not installed; run `bt trace enable claude`");
+    }
+    let marketplaces = runner.json("claude", &["plugin", "marketplace", "list", "--json"])?;
+    let marketplace = claude_marketplace(&marketplaces).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Claude Code tracing marketplace is not installed; run `bt trace enable claude`"
+        )
+    })?;
+    if !claude_marketplace_is_published(marketplace) {
+        bail!("Claude Code tracing marketplace is not the published Braintrust marketplace; run `bt trace enable claude`");
+    }
+    runner.run(
+        "claude",
+        &["plugin", "marketplace", "update", CLAUDE_MARKETPLACE],
+    )?;
+    runner.run("claude", &["plugin", "update", CLAUDE_PLUGIN])
+}
+
 fn load_object(path: &Path) -> anyhow::Result<Map<String, Value>> {
     match std::fs::read(path) {
         Ok(raw) => {
@@ -414,6 +575,57 @@ fn setup_opencode() -> anyhow::Result<()> {
     setup_opencode_at(&path)
 }
 
+fn update_opencode_at(path: &Path) -> anyhow::Result<()> {
+    let mut config = match std::fs::read(path) {
+        Ok(raw) => serde_json::from_slice::<Value>(&raw)
+            .with_context(|| format!("invalid JSON configuration: {}", path.display()))?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("configuration must be a JSON object: {}", path.display())
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("OpenCode tracing plugin is not installed; run `bt trace enable opencode`")
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read configuration: {}", path.display()))
+        }
+    };
+    let plugins = config
+        .get_mut("plugin")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenCode tracing plugin is not installed; run `bt trace enable opencode`"
+            )
+        })?;
+    let found = plugins.iter().any(|plugin| {
+        plugin.as_str().is_some_and(|plugin| {
+            plugin == OPENCODE_PACKAGE || plugin.starts_with(&format!("{OPENCODE_PACKAGE}@"))
+        })
+    });
+    if !found {
+        bail!("OpenCode tracing plugin is not installed; run `bt trace enable opencode`");
+    }
+    plugins.retain(|plugin| {
+        plugin.as_str().is_none_or(|plugin| {
+            plugin != OPENCODE_PACKAGE && !plugin.starts_with(&format!("{OPENCODE_PACKAGE}@"))
+        })
+    });
+    plugins.push(Value::String(opencode_plugin_spec()?));
+    write_object_atomic(path, config)
+}
+
+fn update_opencode() -> anyhow::Result<()> {
+    let settings_path = paths::agent_settings_path("opencode", None);
+    let path = settings_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("opencode.json");
+    update_opencode_at(&path)
+}
+
 fn remove_opencode_plugin_at(path: &Path) -> anyhow::Result<()> {
     let mut config = match std::fs::read(path) {
         Ok(raw) => serde_json::from_slice::<Value>(&raw)
@@ -468,6 +680,10 @@ fn setup_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
 fn disable_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     let plugin = pi_plugin_spec()?;
     runner.run("pi", &["uninstall", &plugin])
+}
+
+fn update_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    runner.run("pi", &["update", PI_PACKAGE])
 }
 
 fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
@@ -551,6 +767,40 @@ fn disable_antigravity(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     disable_antigravity_at(runner, &paths::antigravity_config_dir())
 }
 
+#[cfg(unix)]
+fn update_antigravity_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
+    let home = antigravity_home(config_dir)?;
+    let plugins = runner.json_in_home("agy", &["plugin", "list"], home)?;
+    let installed = plugins
+        .get("imports")
+        .and_then(Value::as_array)
+        .is_some_and(|imports| {
+            imports.iter().any(|plugin| {
+                plugin.get("name").and_then(Value::as_str) == Some(ANTIGRAVITY_PLUGIN)
+            })
+        });
+    if !installed {
+        bail!(
+            "Google Antigravity tracing plugin is not installed; run `bt trace enable antigravity`"
+        );
+    }
+    runner.run_in_home(
+        "agy",
+        &["plugin", "install", ANTIGRAVITY_PLUGIN_SOURCE],
+        home,
+    )
+}
+
+#[cfg(unix)]
+fn update_antigravity(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+    update_antigravity_at(runner, &paths::antigravity_config_dir())
+}
+
+#[cfg(not(unix))]
+fn update_antigravity(_: &mut impl CommandRunner) -> anyhow::Result<()> {
+    bail!("Google Antigravity tracing updates currently require a Unix-compatible `sh`")
+}
+
 fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()> {
     let mut settings = load_object(path)?;
     if route.additional_metadata.is_none() {
@@ -628,6 +878,22 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
     ))
 }
 
+/// Update an already installed tracing adapter without writing tracing settings,
+/// enabling a disabled plugin, or creating an agent configuration file.
+pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
+    let mut runner = SystemCommandRunner;
+    let (source, display_name) = agent_details(agent);
+    match agent {
+        SetupAgent::Codex => update_codex(&mut runner)?,
+        SetupAgent::Claude => update_claude(&mut runner)?,
+        SetupAgent::OpenCode => update_opencode()?,
+        SetupAgent::Pi => update_pi(&mut runner)?,
+        SetupAgent::Grok => update_grok(&mut runner)?,
+        SetupAgent::Antigravity => update_antigravity(&mut runner)?,
+    }
+    Ok(TraceCommandOutput::update(source, display_name))
+}
+
 fn agent_details(agent: SetupAgent) -> (&'static str, &'static str) {
     match agent {
         SetupAgent::Codex => ("codex", "Codex"),
@@ -692,6 +958,7 @@ mod tests {
     struct FakeRunner {
         responses: VecDeque<Value>,
         calls: Vec<String>,
+        home_calls: Vec<(String, PathBuf)>,
     }
 
     impl FakeRunner {
@@ -699,6 +966,7 @@ mod tests {
             Self {
                 responses: responses.into_iter().collect(),
                 calls: Vec::new(),
+                home_calls: Vec::new(),
             }
         }
 
@@ -715,13 +983,30 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("missing fake JSON response"))
         }
 
+        #[cfg(unix)]
+        fn json_in_home(
+            &mut self,
+            program: &str,
+            args: &[&str],
+            home: &Path,
+        ) -> anyhow::Result<Value> {
+            self.calls.push(format!("{program} {}", args.join(" ")));
+            self.home_calls
+                .push((format!("{program} {}", args.join(" ")), home.to_path_buf()));
+            self.responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("missing fake JSON response"))
+        }
+
         fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<()> {
             self.calls.push(format!("{program} {}", args.join(" ")));
             Ok(())
         }
 
-        fn run_in_home(&mut self, program: &str, args: &[&str], _: &Path) -> anyhow::Result<()> {
+        fn run_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<()> {
             self.calls.push(format!("{program} {}", args.join(" ")));
+            self.home_calls
+                .push((format!("{program} {}", args.join(" ")), home.to_path_buf()));
             Ok(())
         }
     }
@@ -732,6 +1017,11 @@ mod tests {
     #[cfg(unix)]
     impl CommandRunner for MissingAgyRunner {
         fn json(&mut self, _: &str, _: &[&str]) -> anyhow::Result<Value> {
+            unreachable!()
+        }
+
+        #[cfg(unix)]
+        fn json_in_home(&mut self, _: &str, _: &[&str], _: &Path) -> anyhow::Result<Value> {
             unreachable!()
         }
 
@@ -937,6 +1227,22 @@ mod tests {
     }
 
     #[test]
+    fn grok_update_requires_the_published_plugin_without_enabling_it() {
+        let mut runner = FakeRunner::new([serde_json::json!([{
+            "name": GROK_PLUGIN,
+            "source": GROK_PLUGIN_SOURCE,
+            "status": "installed"
+        }])]);
+
+        update_grok(&mut runner).unwrap();
+
+        assert_eq!(
+            runner.calls,
+            ["grok plugin list --json", "grok plugin update trace-grok"]
+        );
+    }
+
+    #[test]
     fn grok_enable_reconciles_only_a_conflicting_same_name_plugin() {
         let mut runner = FakeRunner::new([serde_json::json!([
             {
@@ -1020,6 +1326,54 @@ mod tests {
     }
 
     #[test]
+    fn pi_update_does_not_install_the_extension() {
+        let mut runner = FakeRunner::new([]);
+
+        update_pi(&mut runner).unwrap();
+
+        assert!(runner.called("pi update @braintrust/pi-extension"));
+        assert!(!runner
+            .calls
+            .iter()
+            .any(|call| call.starts_with("pi install ")));
+    }
+
+    #[test]
+    fn opencode_update_requires_an_existing_plugin_and_preserves_other_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.json");
+        std::fs::write(
+            &path,
+            r#"{"plugin":["other","@braintrust/trace-opencode@^1"],"model":"test/model"}"#,
+        )
+        .unwrap();
+
+        update_opencode_at(&path).unwrap();
+
+        let config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(config["model"], "test/model");
+        assert_eq!(
+            config["plugin"],
+            serde_json::json!(["other", opencode_plugin_spec().unwrap()])
+        );
+
+        let missing = temp.path().join("missing.json");
+        assert!(update_opencode_at(&missing).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn codex_update_refuses_to_install_a_missing_plugin() {
+        let mut runner = FakeRunner::new([serde_json::json!({"installed": []})]);
+
+        assert!(update_codex(&mut runner).is_err());
+        assert!(!runner
+            .calls
+            .iter()
+            .any(|call| call.starts_with("codex plugin add ")));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn antigravity_installs_published_plugin_and_removes_legacy_registration() {
         let temp = tempfile::tempdir().unwrap();
@@ -1044,6 +1398,31 @@ mod tests {
         let hooks: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
         assert_eq!(hooks["other-plugin"]["Stop"][0]["command"], "other");
         assert!(hooks.get(ANTIGRAVITY_PLUGIN).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn antigravity_update_checks_and_updates_the_same_overridden_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".gemini/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let expected_home = temp.path().to_path_buf();
+        let mut runner = FakeRunner::new([serde_json::json!({
+            "imports": [{"name": ANTIGRAVITY_PLUGIN}],
+        })]);
+
+        update_antigravity_at(&mut runner, &config_dir).unwrap();
+
+        assert_eq!(
+            runner.home_calls,
+            vec![
+                ("agy plugin list".into(), expected_home.clone()),
+                (
+                    format!("agy plugin install {ANTIGRAVITY_PLUGIN_SOURCE}"),
+                    expected_home,
+                ),
+            ]
+        );
     }
 
     #[test]
