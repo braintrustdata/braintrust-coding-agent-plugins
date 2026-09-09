@@ -8,7 +8,7 @@
 //! destination still receives the full trace.
 
 use crate::sink::Sink;
-use crate::translate::SpanOp;
+use crate::translate::{SpanOp, SpanRow};
 use crate::wire::SessionConfig;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -18,12 +18,16 @@ use std::path::{Path, PathBuf};
 struct LedgerFile {
     #[serde(default, alias = "terminal_span_ids")]
     completed_span_ids: HashSet<String>,
+    #[serde(default, alias = "late_merge_span_ids")]
+    late_merge_ids: HashSet<String>,
 }
 
 struct DeliveryLedger {
     path: PathBuf,
     known: HashSet<String>,
     pending: HashSet<String>,
+    known_late_merges: HashSet<String>,
+    pending_late_merges: HashSet<String>,
 }
 
 impl DeliveryLedger {
@@ -46,15 +50,17 @@ impl DeliveryLedger {
             crate::ids::session_storage_id(source, session_id),
             &fingerprint_id[..32]
         ));
-        let known = match tokio::fs::read(&path).await {
-            Ok(bytes) => serde_json::from_slice::<LedgerFile>(&bytes)?.completed_span_ids,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+        let persisted = match tokio::fs::read(&path).await {
+            Ok(bytes) => serde_json::from_slice::<LedgerFile>(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => LedgerFile::default(),
             Err(error) => return Err(error.into()),
         };
         Ok(Self {
             path,
-            known,
+            known: persisted.completed_span_ids,
             pending: HashSet::new(),
+            known_late_merges: persisted.late_merge_ids,
+            pending_late_merges: HashSet::new(),
         })
     }
 
@@ -64,7 +70,12 @@ impl DeliveryLedger {
                 let row = match op {
                     SpanOp::Insert(row) | SpanOp::Merge(row) => row,
                 };
-                !self.known.contains(&row.span_id) && !self.pending.contains(&row.span_id)
+                if let Some(key) = &row.late_merge_key {
+                    let id = late_merge_id(row, key);
+                    !self.known_late_merges.contains(&id) && !self.pending_late_merges.contains(&id)
+                } else {
+                    !self.known.contains(&row.span_id) && !self.pending.contains(&row.span_id)
+                }
             })
             .cloned()
             .collect()
@@ -78,14 +89,19 @@ impl DeliveryLedger {
             if row.end_ms.is_some() {
                 self.pending.insert(row.span_id.clone());
             }
+            if let Some(key) = &row.late_merge_key {
+                self.pending_late_merges.insert(late_merge_id(row, key));
+            }
         }
     }
 
     async fn commit(&mut self) -> anyhow::Result<()> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.pending_late_merges.is_empty() {
             return Ok(());
         }
         self.known.extend(self.pending.drain());
+        self.known_late_merges
+            .extend(self.pending_late_merges.drain());
         let parent = self.path.parent().expect("ledger path has a parent");
         tokio::fs::create_dir_all(parent).await?;
         let temp = self
@@ -95,6 +111,7 @@ impl DeliveryLedger {
             &temp,
             serde_json::to_vec(&LedgerFile {
                 completed_span_ids: self.known.clone(),
+                late_merge_ids: self.known_late_merges.clone(),
             })?,
         )
         .await?;
@@ -110,6 +127,10 @@ impl DeliveryLedger {
         }
         Ok(())
     }
+}
+
+fn late_merge_id(row: &SpanRow, key: &str) -> String {
+    format!("{}\u{1f}{key}", row.span_id)
 }
 
 /// Wrap a sink with destination-scoped terminal-span suppression. If durable
@@ -237,6 +258,15 @@ mod tests {
         })
     }
 
+    fn late_merge(span_id: &str, key: &str) -> SpanOp {
+        SpanOp::Merge(SpanRow {
+            span_id: span_id.into(),
+            root_span_id: "root".into(),
+            late_merge_key: Some(key.into()),
+            ..Default::default()
+        })
+    }
+
     #[tokio::test]
     async fn a_destination_receives_a_terminal_span_only_once_across_sink_instances() {
         let temp = tempfile::tempdir().unwrap();
@@ -277,6 +307,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_completed_span_receives_each_distinct_late_merge_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = RecordingSink::default();
+        let mut first = LedgerSink::new(
+            Box::new(first),
+            temp.path(),
+            "grok",
+            "session-1",
+            Some(&config("project-a")),
+        )
+        .await;
+        assert_eq!(first.emit(&[terminal("span-1")]).await.unwrap(), 1);
+        first.flush().await.unwrap();
+
+        let second = RecordingSink::default();
+        let mut second = LedgerSink::new(
+            Box::new(second),
+            temp.path(),
+            "grok",
+            "session-1",
+            Some(&config("project-a")),
+        )
+        .await;
+        assert_eq!(
+            second
+                .emit(&[late_merge("span-1", "output")])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            second.emit(&[late_merge("span-1", "usage")]).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            second
+                .emit(&[late_merge("span-1", "output")])
+                .await
+                .unwrap(),
+            0
+        );
+        second.flush().await.unwrap();
+
+        let third = RecordingSink::default();
+        let mut third = LedgerSink::new(
+            Box::new(third),
+            temp.path(),
+            "grok",
+            "session-1",
+            Some(&config("project-a")),
+        )
+        .await;
+        assert_eq!(
+            third.emit(&[late_merge("span-1", "output")]).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            third.emit(&[late_merge("span-1", "usage")]).await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn a_different_destination_replays_the_same_terminal_span() {
         let temp = tempfile::tempdir().unwrap();
         let initial_output = Arc::new(Mutex::new(Vec::new()));
@@ -309,5 +402,43 @@ mod tests {
         assert_eq!(replay.emit(&[terminal("span-1")]).await.unwrap(), 1);
         replay.flush().await.unwrap();
         assert_eq!(replay_output.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn an_authoritative_terminal_merge_records_completion_and_late_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = RecordingSink::default();
+        let mut first = LedgerSink::new(
+            Box::new(first),
+            temp.path(),
+            "grok",
+            "session-1",
+            Some(&config("project-a")),
+        )
+        .await;
+        let mut authoritative = terminal("span-1");
+        let SpanOp::Insert(row) = &mut authoritative else {
+            unreachable!();
+        };
+        row.late_merge_key = Some("authoritative".into());
+        assert_eq!(first.emit(&[authoritative]).await.unwrap(), 1);
+        first.flush().await.unwrap();
+
+        let repeated = RecordingSink::default();
+        let mut repeated = LedgerSink::new(
+            Box::new(repeated),
+            temp.path(),
+            "grok",
+            "session-1",
+            Some(&config("project-a")),
+        )
+        .await;
+        assert_eq!(repeated.emit(&[terminal("span-1")]).await.unwrap(), 0);
+        assert_eq!(
+            repeated
+                .emit(&[late_merge("span-1", "authoritative")])
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

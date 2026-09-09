@@ -48,6 +48,7 @@ impl AgentTranslator for DebugTranslator {
                 metadata: Some(serde_json::json!({ "session_id": ctx.session_id })),
                 metrics: None,
                 error: None,
+                late_merge_key: None,
                 tags: None,
             }));
         }
@@ -68,6 +69,7 @@ impl AgentTranslator for DebugTranslator {
             metadata: Some(serde_json::json!({ "seq": seq, "source": event.source })),
             metrics: None,
             error: None,
+            late_merge_key: None,
             tags: None,
         }));
 

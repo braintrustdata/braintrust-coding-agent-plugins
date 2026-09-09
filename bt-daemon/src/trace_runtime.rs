@@ -5,7 +5,7 @@
 //! behavior, setup, managed runs, imports, and output contracts stay here with
 //! the coding-agent integrations.
 
-use crate::trace_command::{DoctorArgs, TraceCommand};
+use crate::trace_command::{DoctorAgent, DoctorArgs, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute};
 use crate::{
     apply_additional_metadata, braintrust_serve_options, paths, run_disable, run_enable, run_hook,
@@ -227,6 +227,12 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
     Ok(())
 }
 
+fn plugin_activation_warning(agent: DoctorAgent, enabled: bool) -> Option<&'static str> {
+    (agent == DoctorAgent::Grok && enabled).then_some(
+        "Grok 1.0.13 requires `/reload-plugins` in each active session after plugin installation or update before its hooks become active",
+    )
+}
+
 async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorCommandOutput {
     let source = args.agent.source();
     let settings_path = paths::agent_settings_path(source, None);
@@ -243,6 +249,9 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
         warnings.push(format!(
             "tracing is disabled; run `bt trace enable {source}`"
         ));
+    }
+    if let Some(warning) = plugin_activation_warning(args.agent, enabled) {
+        warnings.push(warning.into());
     }
 
     let (route, route_source) = match settings.route {
@@ -428,10 +437,20 @@ mod tests {
             command: mounted,
             services: Arc::new(PanicHost),
         };
+
         assert_eq!(
             host_info(&context).serve_argv,
             ["/path with spaces/bt", "trace", "daemon"]
         );
+    }
+
+    #[test]
+    fn doctor_warns_about_grok_1_0_13_plugin_activation_after_enable() {
+        let warning = plugin_activation_warning(DoctorAgent::Grok, true).unwrap();
+        assert!(warning.contains("Grok 1.0.13"));
+        assert!(warning.contains("/reload-plugins"));
+        assert_eq!(plugin_activation_warning(DoctorAgent::Grok, false), None);
+        assert_eq!(plugin_activation_warning(DoctorAgent::Codex, true), None);
     }
 
     struct PanicHost;
@@ -681,6 +700,7 @@ mod tests {
         let args = crate::HookArgs {
             source: "codex".into(),
             source_version: None,
+            plugin_version: None,
             socket: None,
             session_id_field: "session_id".into(),
             event_field: "hook_event_name".into(),

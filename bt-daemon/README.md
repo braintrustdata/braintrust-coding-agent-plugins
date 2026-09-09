@@ -49,6 +49,7 @@ Each coding agent reads an independent non-credential `braintrust.json` file:
 - OpenCode: `$XDG_CONFIG_HOME/opencode/braintrust.json`, falling back to
   `~/.config/opencode/braintrust.json`
 - Pi: `~/.pi/agent/braintrust.json`
+- Grok: `~/.grok/braintrust.json`
 
 `BT_DAEMON_CONFIG` can override the path for isolated tests and managed hosts.
 
@@ -140,16 +141,17 @@ different profiles, organizations, projects, experiments, or parent spans.
 ## Status
 
 Phases 0–5 are implemented: protocol, daemon lifecycle, Braintrust sink,
-Codex and Claude translators, `bt daemon` integration, and thin hook shims for
-both shipped plugins. Every coding-agent capture request returns after the raw
+Codex, Claude, and Grok translators, `bt daemon` integration, and thin hook shims for
+all shipped plugins. Every coding-agent capture request returns after the raw
 event is flushed to its journal; authentication, correlation, translation, and
 reporting run on daemon-owned workers. Restart recovery replays the redacted
 journal with deterministic span ids, so resubmitted rows merge into the same
 spans instead of creating duplicates. Claude and Codex lifecycle entries
-reference a daemon-owned transcript mirror, so recovery does not depend on
-mutable external paths without re-recording the transcript on every turn.
-Explicit turn/session-end flushes are bounded, and sessions can target project
-logs or an experiment.
+reference a daemon-owned transcript mirror; Grok records independent bounded
+updates and events mirrors. Recovery therefore does not depend on mutable
+external paths or copy a full transcript into every event. Explicit
+turn/session-end flushes are bounded, and sessions can target project logs or
+an experiment.
 
 Memory is bounded end to end, while on-disk records stay complete: the daemon
 never holds a transcript or a whole journal in memory, mirroring and replay

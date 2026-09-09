@@ -2,6 +2,7 @@
 #   antigravity -> braintrustdata/braintrust-antigravity-plugin
 #   claude      -> braintrustdata/braintrust-claude-plugin
 #   codex       -> braintrustdata/braintrust-codex-plugin
+#   grok        -> braintrustdata/braintrust-grok-plugin
 #
 # Full flow: stamp manifest versions where the agent format supports them ->
 # commit to main when needed -> monorepo tag/release using
@@ -22,7 +23,7 @@ on:
         description: "Plugin bundle to release"
         required: true
         type: choice
-        options: [antigravity, claude, codex]
+        options: [antigravity, claude, codex, grok]
 
 permissions:
   contents: write
@@ -33,6 +34,6 @@ jobs:
     with:
       version: ${{ inputs.version }}
       plugin: ${{ inputs.plugin }}
-      dist_repo: ${{ inputs.plugin == 'antigravity' && 'braintrustdata/braintrust-antigravity-plugin' || inputs.plugin == 'codex' && 'braintrustdata/braintrust-codex-plugin' || 'braintrustdata/braintrust-claude-plugin' }}
+      dist_repo: ${{ inputs.plugin == 'antigravity' && 'braintrustdata/braintrust-antigravity-plugin' || inputs.plugin == 'codex' && 'braintrustdata/braintrust-codex-plugin' || inputs.plugin == 'grok' && 'braintrustdata/braintrust-grok-plugin' || 'braintrustdata/braintrust-claude-plugin' }}
       record: true
     secrets: inherit

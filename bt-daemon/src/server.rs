@@ -845,11 +845,13 @@ async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
         return;
     }
 
-    let schedule_flush = event.env.event == "SessionEnd"
-        || (matches!(
+    let schedule_flush = crate::should_flush_hook_event(
+        &event.env.event,
+        matches!(
             event.env.route.as_ref().map(|route| route.flush_mode),
             Some(crate::wire::FlushMode::FlushOnTurnEnd)
-        ) && matches!(event.env.event.as_str(), "Stop" | "SubagentStop"));
+        ),
+    );
     let flush_source = event.env.source.clone();
     let flush_session_id = event.env.session_id.clone();
     let journal_through = event.journal_through;

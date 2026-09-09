@@ -67,6 +67,7 @@ pub enum DoctorAgent {
     OpenCode,
     Pi,
     Antigravity,
+    Grok,
 }
 
 impl DoctorAgent {
@@ -77,6 +78,7 @@ impl DoctorAgent {
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
             Self::Antigravity => "antigravity",
+            Self::Grok => "grok",
         }
     }
 
@@ -87,6 +89,7 @@ impl DoctorAgent {
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
             Self::Antigravity => "Google Antigravity",
+            Self::Grok => "Grok",
         }
     }
 }
@@ -120,6 +123,8 @@ pub enum SetupAgent {
     OpenCode,
     /// Install the published Pi tracing extension.
     Pi,
+    /// Install the published Grok tracing plugin.
+    Grok,
     /// Install the Google Antigravity tracing hooks.
     Antigravity,
 }
@@ -226,6 +231,7 @@ mod tests {
                 "antigravity",
                 "Google Antigravity",
             ),
+            ("grok", DoctorAgent::Grok, "grok", "Grok"),
         ] {
             let cli = Cli::try_parse_from(["bt", "doctor", agent]).unwrap();
             assert!(matches!(
@@ -259,5 +265,38 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["bt", "setup", "antigravity", "--disable"]).is_err());
+    }
+
+    #[test]
+    fn grok_uses_shared_enable_disable_and_doctor_commands() {
+        for command in ["enable", "setup"] {
+            let parsed = Cli::try_parse_from(["bt", command, "grok"]).unwrap();
+            assert!(matches!(
+                parsed.trace.command,
+                TraceCommand::Setup(SetupArgs {
+                    agent: SetupAgent::Grok,
+                    ..
+                })
+            ));
+        }
+
+        let parsed = Cli::try_parse_from(["bt", "disable", "grok"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Disable(DisableArgs {
+                agent: SetupAgent::Grok
+            })
+        ));
+
+        let parsed = Cli::try_parse_from(["bt", "doctor", "grok"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Doctor(DoctorArgs {
+                agent: DoctorAgent::Grok
+            })
+        ));
+
+        assert_eq!(DoctorAgent::Grok.source(), "grok");
+        assert_eq!(DoctorAgent::Grok.display_name(), "Grok");
     }
 }

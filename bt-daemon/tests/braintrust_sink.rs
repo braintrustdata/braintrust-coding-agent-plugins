@@ -51,6 +51,7 @@ fn row(
         metadata: None,
         metrics: None,
         error: None,
+        late_merge_key: None,
         tags: None,
     }
 }
