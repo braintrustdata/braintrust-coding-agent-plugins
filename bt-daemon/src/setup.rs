@@ -16,13 +16,42 @@ const CODEX_PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
 const CLAUDE_MARKETPLACE: &str = "braintrust-claude-plugin";
 const CLAUDE_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-claude-plugin";
 const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
-const OPENCODE_PLUGIN: &str = "@braintrust/trace-opencode@^1";
-const PI_PLUGIN: &str = "npm:@braintrust/pi-extension@^1";
+const OPENCODE_PACKAGE: &str = "@braintrust/trace-opencode";
+const PI_PACKAGE: &str = "@braintrust/pi-extension";
+const OPENCODE_PACKAGE_MANIFEST: &str =
+    include_str!("../../src/plugins/opencode/content/package.json");
+const PI_PACKAGE_MANIFEST: &str = include_str!("../../src/plugins/pi/content/package.json");
 const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
 const LEGACY_CLAUDE_TRACING_ENV_KEYS: [&str; 2] = ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"];
 #[cfg(unix)]
 const ANTIGRAVITY_PLUGIN_SOURCE: &str =
     "https://github.com/braintrustdata/braintrust-antigravity-plugin";
+
+fn npm_major_spec(package: &str, manifest: &str) -> anyhow::Result<String> {
+    let manifest = serde_json::from_str::<Value>(manifest)?;
+    let version = manifest
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("package manifest has no string version"))?;
+    let major = version
+        .split_once('.')
+        .map(|(major, _)| major)
+        .ok_or_else(|| anyhow::anyhow!("package version is not semver: {version}"))?
+        .parse::<u64>()
+        .with_context(|| format!("package version is not semver: {version}"))?;
+    Ok(format!("{package}@^{major}"))
+}
+
+fn opencode_plugin_spec() -> anyhow::Result<String> {
+    npm_major_spec(OPENCODE_PACKAGE, OPENCODE_PACKAGE_MANIFEST)
+}
+
+fn pi_plugin_spec() -> anyhow::Result<String> {
+    Ok(format!(
+        "npm:{}",
+        npm_major_spec(PI_PACKAGE, PI_PACKAGE_MANIFEST)?
+    ))
+}
 
 trait CommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value>;
@@ -326,7 +355,7 @@ fn setup_opencode_at(path: &Path) -> anyhow::Result<()> {
                 && !plugin.starts_with("@braintrust/trace-opencode@")
         })
     });
-    plugins.push(Value::String(OPENCODE_PLUGIN.into()));
+    plugins.push(Value::String(opencode_plugin_spec()?));
     write_object_atomic(path, config)
 }
 
@@ -386,11 +415,13 @@ fn disable_opencode() -> anyhow::Result<()> {
 }
 
 fn setup_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    runner.run("pi", &["install", PI_PLUGIN])
+    let plugin = pi_plugin_spec()?;
+    runner.run("pi", &["install", &plugin])
 }
 
 fn disable_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    runner.run("pi", &["uninstall", PI_PLUGIN])
+    let plugin = pi_plugin_spec()?;
+    runner.run("pi", &["uninstall", &plugin])
 }
 
 fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
@@ -823,7 +854,7 @@ mod tests {
         assert_eq!(config["model"], "test/model");
         assert_eq!(
             config["plugin"],
-            serde_json::json!(["other", "@braintrust/trace-opencode@^1"])
+            serde_json::json!(["other", opencode_plugin_spec().unwrap()])
         );
     }
 
@@ -833,7 +864,7 @@ mod tests {
 
         setup_pi(&mut runner).unwrap();
 
-        assert!(runner.called("pi install npm:@braintrust/pi-extension@^1"));
+        assert!(runner.called(&format!("pi install {}", pi_plugin_spec().unwrap())));
     }
 
     #[test]
@@ -1070,7 +1101,7 @@ mod tests {
 
         let mut pi = FakeRunner::new([]);
         disable_pi(&mut pi).unwrap();
-        assert!(pi.called("pi uninstall npm:@braintrust/pi-extension@^1"));
+        assert!(pi.called(&format!("pi uninstall {}", pi_plugin_spec().unwrap())));
     }
 
     #[test]
@@ -1079,7 +1110,11 @@ mod tests {
         let path = temp.path().join("opencode.json");
         std::fs::write(
             &path,
-            r#"{"plugin":["other","@braintrust/trace-opencode@^1"],"model":"test/model"}"#,
+            serde_json::to_vec(&serde_json::json!({
+                "plugin": ["other", opencode_plugin_spec().unwrap()],
+                "model": "test/model",
+            }))
+            .unwrap(),
         )
         .unwrap();
 
