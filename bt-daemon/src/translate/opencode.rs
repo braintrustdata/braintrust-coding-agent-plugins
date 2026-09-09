@@ -9,6 +9,8 @@ use super::{
 };
 use crate::ids;
 use crate::wire::Envelope;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -37,6 +39,307 @@ impl TranslatorFactory for OpenCodeTranslatorFactory {
             last_ts_ms: 0,
         })
     }
+}
+
+// Partial DTOs describe only the native fields this reducer interprets. Serde
+// deliberately accepts future fields, while tool inputs, outputs, and message
+// content remain raw JSON where Braintrust preserves the native representation.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolInput {
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    #[serde(default, rename = "callID")]
+    call_id: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ToolBeforeOutput {
+    #[serde(default)]
+    args: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ToolAfterResult {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    output: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolBeforePayload {
+    Wrapped {
+        input: ToolInput,
+        #[serde(default)]
+        output: Option<ToolBeforeOutput>,
+    },
+    Flattened {
+        #[serde(flatten)]
+        input: ToolInput,
+        #[serde(default)]
+        output: Option<ToolBeforeOutput>,
+    },
+}
+
+struct ToolBefore {
+    input: ToolInput,
+    output: Option<ToolBeforeOutput>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolAfterPayload {
+    Wrapped {
+        input: ToolInput,
+        #[serde(default)]
+        result: Option<ToolAfterResult>,
+        #[serde(default)]
+        output: Option<Value>,
+    },
+    Flattened {
+        #[serde(flatten)]
+        input: ToolInput,
+        #[serde(default)]
+        result: Option<ToolAfterResult>,
+        #[serde(default)]
+        output: Option<Value>,
+    },
+}
+
+struct ToolAfter {
+    input: ToolInput,
+    result: Option<ToolAfterResult>,
+    output: Option<Value>,
+}
+
+impl From<ToolBeforePayload> for ToolBefore {
+    fn from(payload: ToolBeforePayload) -> Self {
+        match payload {
+            ToolBeforePayload::Wrapped { input, output }
+            | ToolBeforePayload::Flattened { input, output } => Self { input, output },
+        }
+    }
+}
+
+impl From<ToolAfterPayload> for ToolAfter {
+    fn from(payload: ToolAfterPayload) -> Self {
+        match payload {
+            ToolAfterPayload::Wrapped {
+                input,
+                result,
+                output,
+            }
+            | ToolAfterPayload::Flattened {
+                input,
+                result,
+                output,
+            } => Self {
+                input,
+                result,
+                output,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct PermissionToolRecord {
+    #[serde(default, rename = "sessionID")]
+    session_id: Option<String>,
+    #[serde(default, rename = "callID")]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum PermissionTool {
+    Name(String),
+    Record(PermissionToolRecord),
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct PermissionFields {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "sessionID")]
+    session_id: Option<String>,
+    #[serde(default, rename = "callID")]
+    call_id: Option<String>,
+    #[serde(default)]
+    tool: Option<PermissionTool>,
+    #[serde(default, rename = "toolName")]
+    tool_name: Option<String>,
+    #[serde(default, rename = "permission")]
+    permission: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
+    #[serde(default)]
+    args: Option<Value>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, rename = "type", alias = "permissionType")]
+    permission_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PermissionPayload {
+    Record(Box<PermissionFields>),
+    Kind(String),
+}
+
+#[derive(Default, Deserialize)]
+struct PermissionProperties {
+    #[serde(default)]
+    permission: Option<PermissionPayload>,
+    #[serde(default)]
+    info: Option<PermissionFields>,
+    #[serde(default, rename = "permissionID")]
+    permission_id: Option<String>,
+    #[serde(default, rename = "requestID")]
+    request_id: Option<String>,
+    #[serde(default)]
+    reply: Option<String>,
+    #[serde(default)]
+    response: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(flatten)]
+    direct: PermissionFields,
+}
+
+impl PermissionTool {
+    fn record(&self) -> Option<&PermissionToolRecord> {
+        match self {
+            Self::Record(record) => Some(record),
+            Self::Name(_) => None,
+        }
+    }
+
+    fn name(&self) -> Option<&str> {
+        match self {
+            Self::Name(name) => Some(name),
+            Self::Record(_) => None,
+        }
+    }
+}
+
+fn permission_properties(payload: &Value) -> Option<PermissionProperties> {
+    decode(payload.get("properties").unwrap_or(payload))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PartEvent {
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    #[serde(default, rename = "messageID")]
+    message_id: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    time: Option<PartTime>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default, rename = "callID")]
+    call_id: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    state: Option<ToolPartState>,
+    #[serde(default, rename = "tail_start_id")]
+    tail_start_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PartTime {
+    #[serde(default)]
+    end: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ToolPartState {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
+    #[serde(default)]
+    output: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageInfo {
+    id: String,
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    role: String,
+    #[serde(default, rename = "providerID")]
+    provider_id: Option<String>,
+    #[serde(default, rename = "modelID")]
+    model_id: Option<String>,
+    #[serde(default)]
+    time: Option<MessageTime>,
+    #[serde(default)]
+    tokens: Option<MessageTokens>,
+    #[serde(default)]
+    summary: bool,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct MessageTime {
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    completed: Option<i64>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct MessageTokens {
+    #[serde(default)]
+    input: i64,
+    #[serde(default)]
+    output: i64,
+    #[serde(default)]
+    reasoning: i64,
+    #[serde(default)]
+    cache: MessageCacheTokens,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct MessageCacheTokens {
+    #[serde(default)]
+    read: i64,
+    #[serde(default)]
+    write: i64,
+}
+
+fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn properties<T: DeserializeOwned>(payload: &Value, field: &str) -> Option<T> {
+    payload
+        .get("properties")
+        .and_then(|properties| properties.get(field))
+        .or_else(|| payload.get(field))
+        .and_then(decode)
 }
 
 #[derive(Default)]
@@ -197,12 +500,26 @@ impl AgentTranslator for OpenCodeTranslator {
             "session.created" => self.session_created(event, ctx),
             "chat.message" => self.chat_message(event, ctx),
             "experimental.chat.system.transform" => self.system_prompt(event),
-            "message.part.updated" => self.part_updated(event),
-            "message.updated" => self.message_updated(event),
-            "tool.execute.before" => self.tool_before(event, ctx),
-            "tool.execute.after" => self.tool_after(event),
-            "permission.asked" => self.permission_asked(event),
-            "permission.replied" => self.permission_replied(event),
+            "message.part.updated" => properties::<PartEvent>(&event.payload, "part")
+                .map(|part| self.part_updated(part, event.ts_ms))
+                .unwrap_or_default(),
+            "message.updated" => properties::<MessageInfo>(&event.payload, "info")
+                .map(|info| self.message_updated(info, event.ts_ms))
+                .unwrap_or_default(),
+            "tool.execute.before" => decode::<ToolBeforePayload>(&event.payload)
+                .map(ToolBefore::from)
+                .map(|tool| self.tool_before(tool, event.ts_ms, ctx))
+                .unwrap_or_default(),
+            "tool.execute.after" => decode::<ToolAfterPayload>(&event.payload)
+                .map(ToolAfter::from)
+                .map(|tool| self.tool_after(tool, event.ts_ms))
+                .unwrap_or_default(),
+            "permission.asked" => permission_properties(&event.payload)
+                .map(|permission| self.permission_asked(permission))
+                .unwrap_or_default(),
+            "permission.replied" => permission_properties(&event.payload)
+                .map(|permission| self.permission_replied(permission, event.ts_ms))
+                .unwrap_or_default(),
             "session.idle" => self.finish_session_event(event, false, None),
             "session.compacted" => Vec::new(),
             "session.deleted" => self.finish_session_event(event, true, None),
@@ -455,59 +772,50 @@ impl OpenCodeTranslator {
         Vec::new()
     }
 
-    fn part_updated(&mut self, event: &Envelope) -> Vec<SpanOp> {
-        let part = event
-            .payload
-            .pointer("/properties/part")
-            .or_else(|| event.payload.get("part"));
-        let Some(part) = part else { return Vec::new() };
-        let Some(sid) = part.get("sessionID").and_then(Value::as_str) else {
+    fn part_updated(&mut self, part: PartEvent, _ts_ms: i64) -> Vec<SpanOp> {
+        let Some(state) = self.sessions.get_mut(&part.session_id) else {
             return Vec::new();
         };
-        let Some(state) = self.sessions.get_mut(sid) else {
-            return Vec::new();
-        };
-        let message_id = part.get("messageID").and_then(Value::as_str).unwrap_or("");
-        match part.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    if state.user_message_ids.contains(message_id) {
-                        let part_id = part.get("id").and_then(Value::as_str).unwrap_or("text");
-                        let parts = state.user_parts.entry(message_id.into()).or_default();
-                        if let Some((_, current)) = parts.iter_mut().find(|(id, _)| id == part_id) {
-                            *current = text.to_string();
-                        } else {
-                            parts.push((part_id.to_string(), text.to_string()));
-                        }
-                        let content = parts
-                            .iter()
-                            .map(|(_, text)| text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        state.history.upsert(
-                            message_id,
-                            (!content.is_empty())
-                                .then(|| json!({"role":"user","content":content}))
-                                .into_iter()
-                                .collect(),
-                        );
+        let message_id = part.message_id.as_deref().unwrap_or("");
+        match part.kind.as_deref() {
+            Some("text") if part.text.is_some() => {
+                let text = part.text.unwrap_or_default();
+                if state.user_message_ids.contains(message_id) {
+                    let part_id = part.id.as_deref().unwrap_or("text");
+                    let parts = state.user_parts.entry(message_id.into()).or_default();
+                    if let Some((_, current)) = parts.iter_mut().find(|(id, _)| id == part_id) {
+                        *current = text.clone();
                     } else {
-                        state.output_parts.insert(message_id.into(), text.into());
-                        if part.pointer("/time/end").is_some() {
-                            state.current_output = Some(text.into());
-                        }
+                        parts.push((part_id.to_string(), text.clone()));
+                    }
+                    let content = parts
+                        .iter()
+                        .map(|(_, text)| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    state.history.upsert(
+                        message_id,
+                        (!content.is_empty())
+                            .then(|| json!({"role":"user","content":content}))
+                            .into_iter()
+                            .collect(),
+                    );
+                } else {
+                    state.output_parts.insert(message_id.into(), text.clone());
+                    if part.time.and_then(|time| time.end).is_some() {
+                        state.current_output = Some(text);
                     }
                 }
             }
-            Some("reasoning") => {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    state.reasoning_parts.insert(message_id.into(), text.into());
-                }
+            Some("reasoning") if part.text.is_some() => {
+                let text = part.text.unwrap_or_default();
+                state.reasoning_parts.insert(message_id.into(), text);
             }
             Some("tool") => {
-                let call_id = part.get("callID").and_then(Value::as_str).unwrap_or("");
-                let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
-                if let Some(input) = part.pointer("/state/input") {
+                let call_id = part.call_id.as_deref().unwrap_or("");
+                let tool = part.tool.as_deref().unwrap_or("tool");
+                let tool_state = part.state;
+                if let Some(input) = tool_state.as_ref().and_then(|state| state.input.as_ref()) {
                     let call = json!({"id":call_id,"type":"function","function":{"name":tool,"arguments":serde_json::to_string(input).unwrap_or_default()}});
                     let calls = state.tool_calls.entry(message_id.into()).or_default();
                     if let Some(i) = calls
@@ -522,19 +830,22 @@ impl OpenCodeTranslator {
                         .tool_message_ids
                         .insert(call_id.into(), message_id.into());
                 }
-                match part.pointer("/state/status").and_then(Value::as_str) {
+                match tool_state
+                    .as_ref()
+                    .and_then(|state| state.status.as_deref())
+                {
                     Some("completed") => {
-                        if let Some(v) = part.pointer("/state/output") {
+                        if let Some(v) = tool_state.and_then(|state| state.output) {
                             state.tool_outputs.insert(call_id.into(), v.clone());
                             state
                                 .history_tool_results
                                 .entry(message_id.into())
                                 .or_default()
-                                .insert(call_id.into(), v.clone());
+                                .insert(call_id.into(), v);
                         }
                     }
                     Some("error") => {
-                        let error = format_error(part.pointer("/state/error"));
+                        let error = format_error(tool_state.and_then(|state| state.error).as_ref());
                         state.tool_errors.insert(call_id.into(), error.clone());
                         state
                             .history_tool_results
@@ -547,51 +858,40 @@ impl OpenCodeTranslator {
             }
             Some("compaction") => {
                 state.user_parts.remove(message_id);
-                state.history.observe_compaction(
-                    message_id,
-                    part.get("tail_start_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                );
+                state
+                    .history
+                    .observe_compaction(message_id, part.tail_start_id);
             }
             _ => {}
         }
         Vec::new()
     }
 
-    fn message_updated(&mut self, event: &Envelope) -> Vec<SpanOp> {
-        let info = event
-            .payload
-            .pointer("/properties/info")
-            .or_else(|| event.payload.get("info"));
-        let Some(info) = info else { return Vec::new() };
-        let Some(sid) = info.get("sessionID").and_then(Value::as_str) else {
-            return Vec::new();
-        };
-        let Some(mid) = info.get("id").and_then(Value::as_str) else {
-            return Vec::new();
-        };
+    fn message_updated(&mut self, info: MessageInfo, ts_ms: i64) -> Vec<SpanOp> {
+        let sid = &info.session_id;
+        let mid = &info.id;
         let Some(state) = self.sessions.get_mut(sid) else {
             return Vec::new();
         };
-        match info.get("role").and_then(Value::as_str) {
-            Some("user") => {
+        match info.role.as_str() {
+            "user" => {
                 state.user_message_ids.insert(mid.to_string());
                 state.history.ensure(mid);
                 return Vec::new();
             }
-            Some("assistant") if info.pointer("/time/completed").is_some() => {}
+            "assistant" if info.time.as_ref().and_then(|time| time.completed).is_some() => {}
             _ => return Vec::new(),
         }
         if !state.completed_messages.insert(mid.into()) {
             return Vec::new();
         }
         let turn = state.current_turn_span_id.clone();
-        let cache_read = num(info, "/tokens/cache/read");
-        let cache_write = num(info, "/tokens/cache/write");
-        let prompt = num(info, "/tokens/input") + cache_read + cache_write;
-        let completion = num(info, "/tokens/output");
-        let reasoning = num(info, "/tokens/reasoning");
+        let tokens = info.tokens.as_ref().cloned().unwrap_or_default();
+        let cache_read = tokens.cache.read;
+        let cache_write = tokens.cache.write;
+        let prompt = tokens.input + cache_read + cache_write;
+        let completion = tokens.output;
+        let reasoning = tokens.reasoning;
         let content = state.output_parts.remove(mid).unwrap_or_default();
         let calls = state.tool_calls.remove(mid).unwrap_or_default();
         let mut assistant = json!({"role":"assistant","content":content});
@@ -625,8 +925,7 @@ impl OpenCodeTranslator {
         if let Some(system) = &state.system_prompt {
             input.push(json!({"role":"system","content":system}))
         }
-        let is_compaction_summary = info.get("summary").and_then(Value::as_bool) == Some(true);
-        if is_compaction_summary {
+        if info.summary {
             input.extend(state.history.compaction_input());
             state.history.begin_compacted(
                 mid,
@@ -643,14 +942,8 @@ impl OpenCodeTranslator {
         let Some(turn) = turn else {
             return Vec::new();
         };
-        let provider = info
-            .get("providerID")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let model = info
-            .get("modelID")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
+        let provider = info.provider_id.as_deref().unwrap_or("unknown");
+        let model = info.model_id.as_deref().unwrap_or("unknown");
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("llm:{sid}:{mid}")),
             root_span_id: state.effective_root_span_id.clone(),
@@ -658,62 +951,52 @@ impl OpenCodeTranslator {
             name: format!("{provider}/{model}"),
             span_type: SpanType::Llm,
             start_ms: info
-                .pointer("/time/created")
-                .and_then(Value::as_i64)
-                .or(Some(event.ts_ms)),
+                .time
+                .as_ref()
+                .and_then(|time| time.created)
+                .or(Some(ts_ms)),
             end_ms: info
-                .pointer("/time/completed")
-                .and_then(Value::as_i64)
-                .or(Some(event.ts_ms)),
+                .time
+                .as_ref()
+                .and_then(|time| time.completed)
+                .or(Some(ts_ms)),
             input: Some(Value::Array(input)),
             output: Some(Value::Array(vec![assistant])),
             metadata: Some(json!({"model":model,"provider":provider,"message_id":mid})),
             metrics: Some(
                 json!({"prompt_tokens":prompt,"completion_tokens":completion,"tokens":prompt+completion+reasoning,"prompt_cached_tokens":cache_read,"prompt_cache_creation_tokens":cache_write,"reasoning_tokens":reasoning}),
             ),
-            error: info.get("error").map(|e| format_error(Some(e))),
+            error: info.error.as_ref().map(|error| format_error(Some(error))),
             ..Default::default()
         })]
     }
 
-    fn tool_before(&mut self, event: &Envelope, _ctx: &SessionCtx) -> Vec<SpanOp> {
-        let Some(sid) = native_session_id(&event.payload) else {
+    fn tool_before(&mut self, event: ToolBefore, ts_ms: i64, _ctx: &SessionCtx) -> Vec<SpanOp> {
+        let sid = event.input.session_id;
+        let Some(call) = event.input.call_id else {
             return vec![];
         };
-        let Some(call) = event
-            .payload
-            .pointer("/input/callID")
-            .or_else(|| event.payload.get("callID"))
-            .and_then(Value::as_str)
-        else {
-            return vec![];
-        };
+        let tool = event.input.tool.unwrap_or_else(|| "tool".into());
         if let Some(s) = self.sessions.get_mut(&sid) {
             let Some(turn) = s.current_turn_span_id.clone() else {
                 return vec![];
             };
-            if s.tool_starts.contains_key(call) {
+            if s.tool_starts.contains_key(&call) {
                 return vec![];
             }
-            s.tool_starts.insert(call.into(), event.ts_ms);
-            if let Some(a) = event.payload.pointer("/output/args") {
-                s.tool_args.insert(call.into(), a.clone());
+            s.tool_starts.insert(call.clone(), ts_ms);
+            if let Some(args) = event.output.and_then(|output| output.args) {
+                s.tool_args.insert(call.clone(), args);
             }
-            let tool = event
-                .payload
-                .pointer("/input/tool")
-                .or_else(|| event.payload.get("tool"))
-                .and_then(Value::as_str)
-                .unwrap_or("tool");
-            s.tool_names.insert(call.into(), tool.into());
+            s.tool_names.insert(call.clone(), tool.clone());
             return vec![SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
                 root_span_id: s.effective_root_span_id.clone(),
                 parent_span_ids: vec![turn],
-                name: tool.into(),
+                name: tool.clone(),
                 span_type: SpanType::Tool,
-                start_ms: Some(event.ts_ms),
-                input: s.tool_args.get(call).cloned(),
+                start_ms: Some(ts_ms),
+                input: s.tool_args.get(&call).cloned(),
                 metadata: Some(json!({"tool_name":tool,"call_id":call})),
                 ..Default::default()
             })];
@@ -721,31 +1004,19 @@ impl OpenCodeTranslator {
         vec![]
     }
 
-    fn tool_after(&mut self, event: &Envelope) -> Vec<SpanOp> {
-        let Some(sid) = native_session_id(&event.payload) else {
-            return vec![];
-        };
-        let call = event
-            .payload
-            .pointer("/input/callID")
-            .or_else(|| event.payload.get("callID"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let tool = event
-            .payload
-            .pointer("/input/tool")
-            .or_else(|| event.payload.get("tool"))
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
+    fn tool_after(&mut self, event: ToolAfter, ts_ms: i64) -> Vec<SpanOp> {
+        let sid = event.input.session_id;
+        let call = event.input.call_id.unwrap_or_default();
+        let tool = event.input.tool.unwrap_or_else(|| "tool".into());
         let Some(s) = self.sessions.get_mut(&sid) else {
             return vec![];
         };
-        if s.denied_tools.remove(call) {
-            s.tool_names.remove(call);
-            s.tool_args.remove(call);
-            s.tool_outputs.remove(call);
-            s.tool_errors.remove(call);
-            s.tool_starts.remove(call);
+        if s.denied_tools.remove(&call) {
+            s.tool_names.remove(&call);
+            s.tool_args.remove(&call);
+            s.tool_outputs.remove(&call);
+            s.tool_errors.remove(&call);
+            s.tool_starts.remove(&call);
             return vec![];
         }
         let Some(turn) = s.current_turn_span_id.clone() else {
@@ -754,11 +1025,16 @@ impl OpenCodeTranslator {
         s.tool_call_count += 1;
         let output = s
             .tool_outputs
-            .remove(call)
-            .or_else(|| event.payload.pointer("/result/output").cloned())
-            .or_else(|| event.payload.get("output").cloned());
-        let error = s.tool_errors.remove(call);
-        let args = s.tool_args.remove(call);
+            .remove(&call)
+            .or_else(|| {
+                event
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.output.clone())
+            })
+            .or(event.output);
+        let error = s.tool_errors.remove(&call);
+        let args = s.tool_args.remove(&call);
         let name = if tool == "skill" {
             args.as_ref()
                 .and_then(|v| v.get("name"))
@@ -767,10 +1043,10 @@ impl OpenCodeTranslator {
                 .unwrap_or_else(|| "skill".into())
         } else {
             event
-                .payload
-                .pointer("/result/title")
-                .and_then(Value::as_str)
-                .unwrap_or(tool)
+                .result
+                .as_ref()
+                .and_then(|result| result.title.as_deref())
+                .unwrap_or(&tool)
                 .to_string()
         };
         let mut metadata = with_tool_approval(
@@ -785,23 +1061,23 @@ impl OpenCodeTranslator {
                 .cloned()
                 .unwrap_or(Value::Null)
         }
-        let had_start = s.tool_starts.contains_key(call);
+        let had_start = s.tool_starts.contains_key(&call);
         let row = SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
             root_span_id: s.effective_root_span_id.clone(),
             parent_span_ids: (!had_start).then_some(turn).into_iter().collect(),
             name,
             span_type: SpanType::Tool,
-            start_ms: (!had_start).then(|| s.tool_starts.remove(call).unwrap_or(event.ts_ms)),
-            end_ms: Some(event.ts_ms),
+            start_ms: (!had_start).then(|| s.tool_starts.remove(&call).unwrap_or(ts_ms)),
+            end_ms: Some(ts_ms),
             input: (!had_start).then_some(args).flatten(),
             output,
             error,
             metadata: Some(metadata),
             ..Default::default()
         };
-        s.tool_starts.remove(call);
-        s.tool_names.remove(call);
+        s.tool_starts.remove(&call);
+        s.tool_names.remove(&call);
         vec![if had_start {
             SpanOp::Merge(row)
         } else {
@@ -809,60 +1085,70 @@ impl OpenCodeTranslator {
         }]
     }
 
-    fn permission_record(event: &Envelope) -> PermissionRequest {
-        let props = event.payload.get("properties").unwrap_or(&event.payload);
-        let source = props
-            .get("permission")
-            .filter(|value| value.is_object())
-            .or_else(|| props.get("info").filter(|value| value.is_object()))
-            .unwrap_or(props);
-        let tool_record = source.get("tool").filter(|value| value.is_object());
-        let string = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
+    fn permission_record(properties: &PermissionProperties) -> PermissionRequest {
+        let permission_kind = match &properties.permission {
+            Some(PermissionPayload::Kind(kind)) => Some(kind.clone()),
+            _ => None,
+        };
+        let source = match &properties.permission {
+            Some(PermissionPayload::Record(record)) => record,
+            _ => properties.info.as_ref().unwrap_or(&properties.direct),
+        };
+        let tool_record = source.tool.as_ref().and_then(PermissionTool::record);
         PermissionRequest {
-            id: string(source.get("id"))
-                .or_else(|| string(props.get("id")))
-                .or_else(|| string(props.get("permissionID")))
-                .or_else(|| string(props.get("requestID"))),
-            session_id: string(source.get("sessionID"))
-                .or_else(|| string(props.get("sessionID")))
-                .or_else(|| tool_record.and_then(|tool| string(tool.get("sessionID")))),
-            call_id: string(source.get("callID"))
-                .or_else(|| tool_record.and_then(|tool| string(tool.get("callID")))),
-            tool: string(source.get("tool"))
-                .or_else(|| string(source.get("toolName")))
-                .or_else(|| tool_record.and_then(|tool| string(tool.get("name"))))
-                .or_else(|| tool_record.and_then(|tool| string(tool.get("tool"))))
+            id: source
+                .id
+                .clone()
+                .or_else(|| properties.direct.id.clone())
+                .or_else(|| properties.permission_id.clone())
+                .or_else(|| properties.request_id.clone()),
+            session_id: source
+                .session_id
+                .clone()
+                .or_else(|| properties.direct.session_id.clone())
+                .or_else(|| tool_record.and_then(|tool| tool.session_id.clone())),
+            call_id: source
+                .call_id
+                .clone()
+                .or_else(|| tool_record.and_then(|tool| tool.call_id.clone())),
+            tool: source
+                .tool
+                .as_ref()
+                .and_then(PermissionTool::name)
+                .map(str::to_owned)
+                .or_else(|| source.tool_name.clone())
+                .or_else(|| tool_record.and_then(|tool| tool.name.clone()))
+                .or_else(|| tool_record.and_then(|tool| tool.tool.clone()))
                 // OpenCode's native permission events put the requested tool
                 // kind in `permission`, separate from `tool.callID`.
-                .or_else(|| string(source.get("permission"))),
+                .or_else(|| source.permission.clone())
+                .or(permission_kind),
             input: source
-                .get("input")
-                .or_else(|| source.get("args"))
-                .or_else(|| tool_record.and_then(|tool| tool.get("input")))
-                .cloned(),
-            title: string(source.get("title")),
-            permission_type: string(source.get("type"))
-                .or_else(|| string(source.get("permissionType"))),
+                .input
+                .clone()
+                .or_else(|| source.args.clone())
+                .or_else(|| tool_record.and_then(|tool| tool.input.clone())),
+            title: source.title.clone(),
+            permission_type: source.permission_type.clone(),
         }
     }
 
-    fn permission_asked(&mut self, event: &Envelope) -> Vec<SpanOp> {
-        let request = Self::permission_record(event);
+    fn permission_asked(&mut self, properties: PermissionProperties) -> Vec<SpanOp> {
+        let request = Self::permission_record(&properties);
         if let Some(id) = &request.id {
             self.permission_requests.insert(id.clone(), request);
         }
         vec![]
     }
 
-    fn permission_replied(&mut self, event: &Envelope) -> Vec<SpanOp> {
-        let props = event.payload.get("properties").unwrap_or(&event.payload);
-        let reply = props
-            .get("reply")
-            .or_else(|| props.get("response"))
-            .or_else(|| props.get("status"))
-            .and_then(Value::as_str)
+    fn permission_replied(&mut self, properties: PermissionProperties, ts_ms: i64) -> Vec<SpanOp> {
+        let reply = properties
+            .reply
+            .as_deref()
+            .or(properties.response.as_deref())
+            .or(properties.status.as_deref())
             .unwrap_or("");
-        let direct = Self::permission_record(event);
+        let direct = Self::permission_record(&properties);
         let request = direct
             .id
             .as_ref()
@@ -907,8 +1193,8 @@ impl OpenCodeTranslator {
             parent_span_ids: (!had_start).then_some(turn).into_iter().collect(),
             name: title.unwrap_or(tool),
             span_type: SpanType::Tool,
-            start_ms: (!had_start).then(|| s.tool_starts.remove(&call).unwrap_or(event.ts_ms)),
-            end_ms: Some(event.ts_ms),
+            start_ms: (!had_start).then(|| s.tool_starts.remove(&call).unwrap_or(ts_ms)),
+            end_ms: Some(ts_ms),
             input: (!had_start)
                 .then(|| s.tool_args.remove(&call).or(input))
                 .flatten(),
@@ -1000,9 +1286,6 @@ fn native_session_id(v: &Value) -> Option<String> {
         .or_else(|| v.pointer("/part/sessionID"))
         .and_then(Value::as_str)
         .map(str::to_owned)
-}
-fn num(v: &Value, p: &str) -> i64 {
-    v.pointer(p).and_then(Value::as_i64).unwrap_or(0)
 }
 fn format_error(v: Option<&Value>) -> String {
     let Some(v) = v else {
