@@ -228,6 +228,7 @@ pub struct ImportArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ImportSource {
     Codex,
+    Muse,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
     #[value(name = "antigravity", alias = "agy")]
@@ -602,6 +603,24 @@ pub async fn run_import(
         .map(|components| wire::TraceDestination::ParentSpan { components })
         .or_else(|| args.destination.clone());
     apply_import_destination(&mut config, destination)?;
+    if args.source == ImportSource::Muse {
+        if args.attach {
+            anyhow::bail!(
+                "Muse import does not support --attach yet; use a completed export-v1 session"
+            )
+        }
+        if args.all {
+            anyhow::bail!("Muse import does not support --all yet; pass one or more session ids")
+        }
+        let exports = export_muse_sessions(&args.session_ids)?;
+        return import_muse_exports_with_ledger(
+            &exports,
+            opts,
+            config,
+            Some(paths::data_dir(None)),
+        )
+        .await;
+    }
     let files = transcript_import::resolve_transcripts(&args.session_ids, args.all, args.source)?;
     let ledger_dir = paths::data_dir(None);
     if args.attach {
@@ -616,6 +635,68 @@ pub async fn run_import(
         .await;
     }
     import_transcripts_with_ledger(&files, args.source, opts, config, Some(ledger_dir)).await
+}
+
+fn export_muse_sessions(session_ids: &[String]) -> anyhow::Result<tempfile::TempDir> {
+    let directory = tempfile::Builder::new()
+        .prefix("bt-muse-import-")
+        .tempdir()?;
+    let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
+    for (index, session_id) in session_ids.iter().enumerate() {
+        let output = std::process::Command::new(&executable)
+            .args([
+                OsString::from("export"),
+                OsString::from("--session"),
+                OsString::from(session_id),
+                OsString::from("--out"),
+            ])
+            .arg(directory.path().join(format!("{index}.json")))
+            .output()
+            .with_context(|| {
+                format!(
+                    "run {} export for Muse session {session_id}",
+                    executable.to_string_lossy()
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Muse export for session {session_id} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    Ok(directory)
+}
+
+async fn import_muse_exports_with_ledger(
+    directory: &tempfile::TempDir,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    ledger_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+    let mut exports = std::fs::read_dir(directory.path())
+        .with_context(|| format!("read Muse exports {}", directory.path().display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    exports.sort();
+    let mut summaries = Vec::new();
+    for export in exports {
+        let entries = transcript_import::muse::envelopes(&export)?;
+        let session_ids = entries
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        processor.process(entries).await?;
+        for session_id in session_ids {
+            if let Some(summary) = processor.finish_session(&session_id).await? {
+                summaries.push(summary);
+            }
+        }
+    }
+    summaries.extend(processor.finish().await?);
+    Ok(summaries)
 }
 
 fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
@@ -1505,6 +1586,11 @@ mod tests {
             .args;
         assert!(all.session_ids.is_empty());
         assert!(all.all);
+
+        let muse = ImportCli::try_parse_from(["test", "muse", "session-a"])
+            .unwrap()
+            .args;
+        assert_eq!(muse.source, ImportSource::Muse);
 
         assert!(ImportCli::try_parse_from(["test", "codex"]).is_err());
         assert!(ImportCli::try_parse_from(["test", "codex", "session-a", "--all"]).is_err());

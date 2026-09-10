@@ -110,7 +110,7 @@ enum Command {
     },
     /// Print daemon/session status.
     Status(StatusArgs),
-    /// Import a past Codex or Claude Code session by its resume id.
+    /// Import a past coding-agent session by its resume id.
     Import(ImportArgs),
     /// Launch a coding agent with live tracing hooks for this invocation.
     Run {
