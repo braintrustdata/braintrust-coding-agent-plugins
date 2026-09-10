@@ -1,5 +1,5 @@
 # Reusable release implementation. Not dispatchable on its own — called by
-# release-merged.yml (production repos) and test-release.yml (the shared test
+# release.yml (production repos) and test-release.yml (the shared test
 # repo), which supply `source_sha`, `dist_repo`, and `record`.
 #
 # Always: build and `make publish` to <dist_repo> from the selected source SHA.
