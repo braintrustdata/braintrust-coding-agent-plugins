@@ -45,6 +45,8 @@ hook processes or JavaScript plugins.
 Each coding agent reads an independent non-credential `braintrust.json` file:
 
 - Codex: `~/.codex/braintrust.json`
+- Muse Code: `$XDG_CONFIG_HOME/muse/braintrust.json`, falling back to
+  `~/.config/muse/braintrust.json`
 - Claude Code: `~/.claude/braintrust.json`
 - OpenCode: `$XDG_CONFIG_HOME/opencode/braintrust.json`, falling back to
   `~/.config/opencode/braintrust.json`
@@ -135,12 +137,18 @@ echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./target/debug/bt-
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
 
-`import <codex|claude|antigravity> <session-id>` has a different purpose from restart
+`import <codex|claude|antigravity|muse> <session-id>` has a different purpose from restart
 recovery. It locates the native transcript in the selected agent's standard
 session store, synthesizes the lifecycle triggers that can be recovered from
 that transcript, and sends them through the normal translator and sink to
 create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
+
+Muse imports invoke its documented local `muse export --session` interface and
+read export schema version 1. They import completed sessions only: `--attach`
+and `--all` require MSP session enumeration and cursor support, which are not
+implemented yet. Muse also has no safe invocation-local configuration overlay,
+so `run muse` is deliberately unavailable; use persistent `enable muse` setup.
 
 Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
 Ctrl-C. `run <codex|claude> [ARGS...]` launches the selected agent with
