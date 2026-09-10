@@ -358,6 +358,72 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
 }
 
 #[test]
+fn claude_subagent_routing_tolerates_malformed_optional_metadata() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "subagent-session");
+    let ctx = SessionCtx {
+        session_id: "subagent-session".into(),
+        config: None,
+    };
+    let event = Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "subagent-session".into(),
+        event: "SubagentStart".into(),
+        ts_ms: 1,
+        managed_run_id: None,
+        payload: json!({
+            "cwd": "/workspace/demo",
+            "agent_id": "agent-1",
+            "agent_type": { "future": "object shape" },
+            "future_field": true,
+        }),
+        route: None,
+        config: None,
+        capture: None,
+    };
+
+    let rows = reduce(translator.handle(&event, &ctx).unwrap());
+    assert!(rows.values().any(|row| row.name == "Claude Code: demo"));
+    let subagent = rows
+        .values()
+        .find(|row| row.name == "subagent: agent")
+        .expect("valid agent_id must create a subagent span");
+    assert_eq!(subagent.metadata.as_ref().unwrap()["agent_id"], "agent-1");
+}
+
+#[test]
+fn claude_ignores_empty_subagent_identifier() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "empty-subagent-session");
+    let ctx = SessionCtx {
+        session_id: "empty-subagent-session".into(),
+        config: None,
+    };
+    let event = Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "empty-subagent-session".into(),
+        event: "SubagentStart".into(),
+        ts_ms: 1,
+        managed_run_id: None,
+        payload: json!({
+            "cwd": "/workspace/demo",
+            "agent_id": "",
+            "agent_type": "reviewer",
+        }),
+        route: None,
+        config: None,
+        capture: None,
+    };
+
+    let rows = reduce(translator.handle(&event, &ctx).unwrap());
+    assert!(rows.values().all(|row| !row.name.starts_with("subagent:")));
+}
+
+#[test]
 fn claude_subagent_fixture_builds_nested_subagent_llms() {
     let rows = reduce(replay("subagent-compact"));
     let subagents: Vec<_> = rows
