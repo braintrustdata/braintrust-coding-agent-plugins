@@ -253,6 +253,9 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
     if let Some(warning) = plugin_activation_warning(args.agent, enabled) {
         warnings.push(warning.into());
     }
+    if let Some(warning) = crate::setup::update_warning(source) {
+        warnings.push(warning);
+    }
 
     let (route, route_source) = match settings.route {
         Some(route) => (Some(route), "settings_file".to_string()),
@@ -332,6 +335,9 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         }
         TraceCommand::Disable(disable_args) => {
             print_output(run_disable(disable_args.agent)?, host.output_format)
+        }
+        TraceCommand::Update(update_args) => {
+            print_output(crate::run_update(update_args.agent)?, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
             init_daemon_logging(host.verbose);

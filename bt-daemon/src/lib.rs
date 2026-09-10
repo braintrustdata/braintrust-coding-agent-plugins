@@ -40,11 +40,11 @@ pub use command_output::{
 #[doc(hidden)]
 pub use journal::source_journal_path;
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
-pub use setup::{run_disable, run_enable, run_setup};
+pub use setup::{run_disable, run_enable, run_setup, run_update};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
 pub use trace_command::{
     DisableArgs, DoctorAgent, DoctorArgs, EnableArgs, SetupAgent, SetupArgs, StopArgs, TraceArgs,
-    TraceCommand,
+    TraceCommand, UpdateArgs,
 };
 pub use trace_runtime::{run_trace, RouteRequirements, TraceHostContext, TraceHostServices};
 pub use translate::{

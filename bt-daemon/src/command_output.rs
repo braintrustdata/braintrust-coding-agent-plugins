@@ -62,6 +62,13 @@ pub struct SetupCommandOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct UpdateCommandOutput {
+    pub source: String,
+    pub display_name: String,
+    pub restart_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StopCommandOutput {
     pub running: bool,
     pub stopped: bool,
@@ -115,6 +122,7 @@ pub enum TraceCommandOutput {
     Doctor(Box<DoctorCommandOutput>),
     Enable(SetupCommandOutput),
     Disable(SetupCommandOutput),
+    Update(UpdateCommandOutput),
     Stop(StopCommandOutput),
     Import { summaries: Vec<ImportSummary> },
 }
@@ -158,6 +166,14 @@ impl TraceCommandOutput {
             source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
+            restart_required: true,
+        })
+    }
+
+    pub fn update(source: impl Into<String>, display_name: impl Into<String>) -> Self {
+        Self::Update(UpdateCommandOutput {
+            source: source.into(),
+            display_name: display_name.into(),
             restart_required: true,
         })
     }
@@ -218,6 +234,10 @@ impl TraceCommandOutput {
                 "The Braintrust tracing plugin and configuration were removed for {} from {}.\nRestart the coding agent to apply the change.",
                 disable.display_name,
                 disable.settings_path.display()
+            )),
+            Self::Update(update) => Ok(format!(
+                "The Braintrust tracing plugin was updated for {}.\nRestart the coding agent to load the update.",
+                update.display_name,
             )),
             Self::Stop(stop) if stop.stopped => Ok("Tracing daemon stopped.".into()),
             Self::Stop(_) => Ok("No tracing daemon is running.".into()),
