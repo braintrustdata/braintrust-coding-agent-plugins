@@ -162,7 +162,7 @@ impl Registry {
         r.register(Box::new(AntigravityTranslatorFactory::new(git.clone())));
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
         r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
-        r.register(Box::new(GrokTranslatorFactory));
+        r.register(Box::new(GrokTranslatorFactory::new(git.clone())));
         r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));
         r.register(Box::new(PiTranslatorFactory::new(git)));
         r

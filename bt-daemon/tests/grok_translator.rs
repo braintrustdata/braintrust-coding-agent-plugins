@@ -49,6 +49,11 @@ fn ctx() -> SessionCtx {
         config: None,
     }
 }
+fn expected_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default()
+}
 
 fn point_at(event: &mut Envelope, updates: &Path, events: &Path) {
     event.payload["_bt_grok_transcript_mirrors"]["updates"]["mirror"] = json!(updates);
@@ -225,6 +230,68 @@ fn grok_transcript_builds_turn_llm_and_tool_spans_with_aggregate_usage() {
             "usage_attribution": "last_llm"
         })
     );
+}
+#[test]
+fn grok_enriches_emitted_spans_from_the_captured_working_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join("README.md"), "test").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "initial"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://secret@example.com/acme/app.git",
+    ]);
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let commit = String::from_utf8(commit.stdout).unwrap().trim().to_string();
+
+    let updates = std::fs::metadata(fixture("updates.jsonl")).unwrap().len();
+    let events = std::fs::metadata(fixture("events.jsonl")).unwrap().len();
+    let mut event = envelope(updates, events);
+    event.payload["cwd"] = json!(repo);
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("grok", "grok-session");
+    let ops = translator.handle(&event, &ctx()).unwrap();
+
+    let inserts: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Insert(row) => Some(row),
+            SpanOp::Merge(_) => None,
+        })
+        .collect();
+    let root = inserts.iter().find(|row| row.name == "Grok").unwrap();
+    assert_eq!(
+        root.metadata.as_ref().unwrap()["username"],
+        json!(expected_username())
+    );
+    assert!(inserts.iter().all(|row| {
+        row.metadata.as_ref().is_some_and(|metadata| {
+            metadata["git_origin_url"] == "https://example.com/acme/app.git"
+                && metadata["git_branch"] == "main"
+                && metadata["git_commit_sha"] == commit
+        })
+    }));
 }
 
 #[test]
