@@ -13,6 +13,7 @@ mod codex;
 mod debug;
 mod git;
 mod grok;
+mod muse;
 mod opencode;
 mod pi;
 mod recent;
@@ -23,6 +24,7 @@ pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;
 pub use debug::DebugTranslatorFactory;
 pub use grok::GrokTranslatorFactory;
+pub use muse::MuseTranslatorFactory;
 pub use opencode::OpenCodeTranslatorFactory;
 pub use pi::PiTranslatorFactory;
 
@@ -171,6 +173,7 @@ impl Registry {
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
         r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
         r.register(Box::new(GrokTranslatorFactory::new(git.clone())));
+        r.register(Box::new(MuseTranslatorFactory::new(git.clone())));
         r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));
         r.register(Box::new(PiTranslatorFactory::new(git)));
         r
@@ -195,6 +198,7 @@ impl Registry {
             "antigravity" => "antigravity",
             "codex" => "codex",
             "grok" => "grok",
+            "muse" | "muse-code" => "muse",
             "pi" => "pi",
             "debug" => "debug",
             _ => return None,
