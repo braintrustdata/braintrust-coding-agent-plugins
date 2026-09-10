@@ -26,6 +26,8 @@ use super::{
 use crate::ids;
 use crate::wire::Envelope;
 use regex::Regex;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,6 +38,69 @@ const MISSING_TOOL_OUTPUT_ERROR: &str = "Tool output missing before turn ended";
 /// A hook can arrive after a daemon restart or against an existing rollout.
 /// Keep a single translator batch small even when the unread suffix is large.
 const CATCH_UP_BYTE_BUDGET: usize = 64 * 1024;
+
+// Codex hooks are triggers for the rollout reader. These partial types cover
+// the hook-owned correlation fields while preserving raw rollout JSON for the
+// separately bounded transcript reducer.
+#[derive(Deserialize)]
+struct SessionStartHook {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    permission_mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompactHook {
+    turn_id: String,
+    #[serde(default)]
+    trigger: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SubagentStartHook {
+    agent_id: String,
+    #[serde(default)]
+    agent_type: Option<Value>,
+}
+
+/// The stable outer shape of a rollout JSONL row. The payload deliberately
+/// stays untyped here: Codex adds response-item fields regularly and several
+/// handlers preserve those native objects in span input/output.
+#[derive(Deserialize)]
+struct RolloutRecord {
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
+    timestamp_ms: Option<i64>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    payload: Value,
+}
+
+/// Event and response rows use a second discriminator inside their payload.
+#[derive(Deserialize)]
+struct PayloadKind {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkingDirectoryPayload {
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TurnContextPayload {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    turn_id: Option<String>,
+}
+
+fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
+    serde_json::from_value(value.clone()).ok()
+}
 
 pub struct CodexTranslatorFactory {
     git: Arc<GitMetadataCache>,
@@ -200,11 +265,21 @@ impl AgentTranslator for CodexTranslator {
         // --- hook-specific side effects (before catch-up) ---
         match event.event.as_str() {
             "SessionStart" => {
-                self.session_source = str_field(payload, "source");
-                self.permission_mode = str_field(payload, "permission_mode");
+                if let Some(hook) = decode::<SessionStartHook>(payload) {
+                    self.session_source = hook.source;
+                    self.permission_mode = hook.permission_mode;
+                }
             }
-            "SubagentStart" => self.handle_subagent_start(event),
-            "PreCompact" | "PostCompact" => self.record_compaction_trigger(payload, &mut ops),
+            "SubagentStart" => {
+                if let Some(hook) = decode::<SubagentStartHook>(payload) {
+                    self.handle_subagent_start(event, hook);
+                }
+            }
+            "PreCompact" | "PostCompact" => {
+                if let Some(hook) = decode::<CompactHook>(payload) {
+                    self.record_compaction_trigger(hook, &mut ops);
+                }
+            }
             _ => {}
         }
 
@@ -343,11 +418,9 @@ impl CodexTranslator {
         );
     }
 
-    fn record_compaction_trigger(&mut self, payload: &Value, ops: &mut Vec<SpanOp>) {
-        let Some(turn_id) = str_field(payload, "turn_id") else {
-            return;
-        };
-        let trigger = str_field(payload, "trigger").unwrap_or_else(|| "manual".to_string());
+    fn record_compaction_trigger(&mut self, hook: CompactHook, ops: &mut Vec<SpanOp>) {
+        let turn_id = hook.turn_id;
+        let trigger = hook.trigger.unwrap_or_else(|| "manual".to_string());
         self.compaction_trigger_by_turn
             .insert(turn_id.clone(), trigger.clone());
         // Back-fill onto an already-built compaction span.
@@ -383,14 +456,11 @@ impl CodexTranslator {
         }
     }
 
-    fn handle_subagent_start(&mut self, event: &Envelope) {
-        let payload = &event.payload;
-        let (Some(agent_id), Some(path)) = (
-            str_field(payload, "agent_id"),
-            effective_transcript_path(event),
-        ) else {
+    fn handle_subagent_start(&mut self, event: &Envelope, hook: SubagentStartHook) {
+        let Some(path) = effective_transcript_path(event) else {
             return;
         };
+        let agent_id = hook.agent_id;
         if self.scopes.contains_key(&path) {
             return;
         }
@@ -401,7 +471,11 @@ impl CodexTranslator {
         let subagent_root = ids::span_id(&self.session_id, &format!("subagent:{agent_id}"));
         let mut scope = Scope::new(&path, ScopeKind::Subagent, subagent_root);
         scope.agent_id = Some(agent_id);
-        scope.agent_type = str_field(payload, "agent_type");
+        scope.agent_type = hook
+            .agent_type
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         scope.spawning_turn_span_id = Some(parent);
         self.scopes.insert(path, scope);
     }
@@ -475,7 +549,7 @@ impl CodexTranslator {
             CATCH_UP_BYTE_BUDGET,
         );
         for line in read.lines {
-            if let Ok(rec) = serde_json::from_str::<Value>(&line) {
+            if let Ok(rec) = serde_json::from_str::<RolloutRecord>(&line) {
                 self.process_record(&mut scope, &rec, hook_ts, ops);
             }
         }
@@ -486,81 +560,87 @@ impl CodexTranslator {
     fn process_record(
         &mut self,
         scope: &mut Scope,
-        rec: &Value,
+        rec: &RolloutRecord,
         hook_ts: i64,
         ops: &mut Vec<SpanOp>,
     ) {
         let op_start = ops.len();
-        let ts = parse_ts(rec).unwrap_or(hook_ts);
-        let ty = rec.get("type").and_then(Value::as_str).unwrap_or("");
-        let payload = rec.get("payload").cloned().unwrap_or(Value::Null);
-        if matches!(ty, "session_meta" | "turn_context") {
-            if let Some(cwd) = str_field(&payload, "cwd") {
+        let ts = rec.timestamp_ms.unwrap_or(hook_ts);
+        let kind = rec.kind.as_deref().unwrap_or("");
+        let payload = &rec.payload;
+        if matches!(kind, "session_meta" | "turn_context") {
+            if let Some(cwd) = decode::<WorkingDirectoryPayload>(payload).and_then(|v| v.cwd) {
                 scope.current_cwd = Some(cwd);
             }
         }
 
-        match ty {
-            "session_meta" => self.open_root(scope, &payload, ts, ops),
+        match kind {
+            "session_meta" => self.open_root(scope, payload, ts, ops),
             "turn_context" => {
-                if let Some(m) = str_field(&payload, "model") {
-                    let model_turn_id = str_field(&payload, "turn_id");
-                    scope.model = Some(m.clone());
-                    if scope.root_created {
-                        let input = if scope.kind == ScopeKind::Main {
-                            json!({
-                                "model": m,
-                                "cwd": self.root_cwd,
-                                "source": self.session_source,
-                            })
-                        } else {
-                            json!({ "model": m })
-                        };
-                        ops.push(SpanOp::Merge(SpanRow {
-                            span_id: scope.turn_parent_span_id.clone(),
-                            root_span_id: self.root_span_id.clone(),
-                            input: Some(input),
-                            metadata: Some(json!({ "model": m })),
-                            ..Default::default()
-                        }));
-                    }
-                    if let Some(turn) = model_turn_id.as_deref().and_then(|turn_id| {
-                        scope.open_turns.iter().find(|turn| turn.turn_id == turn_id)
-                    }) {
-                        ops.push(SpanOp::Merge(SpanRow {
-                            span_id: turn.span_id.clone(),
-                            root_span_id: self.root_span_id.clone(),
-                            metadata: Some(json!({ "model": m })),
-                            ..Default::default()
-                        }));
+                if let Some(context) = decode::<TurnContextPayload>(payload) {
+                    if let Some(m) = context.model {
+                        let model_turn_id = context.turn_id;
+                        scope.model = Some(m.clone());
+                        if scope.root_created {
+                            let input = if scope.kind == ScopeKind::Main {
+                                json!({
+                                    "model": m,
+                                    "cwd": self.root_cwd,
+                                    "source": self.session_source,
+                                })
+                            } else {
+                                json!({ "model": m })
+                            };
+                            ops.push(SpanOp::Merge(SpanRow {
+                                span_id: scope.turn_parent_span_id.clone(),
+                                root_span_id: self.root_span_id.clone(),
+                                input: Some(input),
+                                metadata: Some(json!({ "model": m })),
+                                ..Default::default()
+                            }));
+                        }
+                        if let Some(turn) = model_turn_id.as_deref().and_then(|turn_id| {
+                            scope.open_turns.iter().find(|turn| turn.turn_id == turn_id)
+                        }) {
+                            ops.push(SpanOp::Merge(SpanRow {
+                                span_id: turn.span_id.clone(),
+                                root_span_id: self.root_span_id.clone(),
+                                metadata: Some(json!({ "model": m })),
+                                ..Default::default()
+                            }));
+                        }
                     }
                 }
             }
             "event_msg" => {
-                let sub = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                match sub {
-                    "task_started" => self.open_turn(scope, &payload, ts, ops),
-                    "user_message" => self.set_turn_input(scope, &payload, ops),
-                    "token_count" => self.close_llm_with_tokens(scope, &payload, ts, ops),
-                    "task_complete" => self.close_turn(scope, &payload, ts, ops),
+                let sub = decode::<PayloadKind>(payload)
+                    .and_then(|v| v.kind)
+                    .unwrap_or_default();
+                match sub.as_str() {
+                    "task_started" => self.open_turn(scope, payload, ts, ops),
+                    "user_message" => self.set_turn_input(scope, payload, ops),
+                    "token_count" => self.close_llm_with_tokens(scope, payload, ts, ops),
+                    "task_complete" => self.close_turn(scope, payload, ts, ops),
                     _ => {}
                 }
             }
             "response_item" => {
-                let sub = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                match sub {
-                    "message" => self.on_message(scope, &payload, ts, ops),
-                    "reasoning" => self.on_reasoning(scope, &payload, ts, ops),
+                let sub = decode::<PayloadKind>(payload)
+                    .and_then(|v| v.kind)
+                    .unwrap_or_default();
+                match sub.as_str() {
+                    "message" => self.on_message(scope, payload, ts, ops),
+                    "reasoning" => self.on_reasoning(scope, payload, ts, ops),
                     "function_call" | "custom_tool_call" | "tool_search_call" => {
-                        self.on_tool_call(scope, &payload, ts, ops)
+                        self.on_tool_call(scope, payload, ts, ops)
                     }
                     "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
-                        self.on_tool_output(scope, &payload, ts, ops)
+                        self.on_tool_output(scope, payload, ts, ops)
                     }
                     _ => {}
                 }
             }
-            "compacted" => self.on_compacted(scope, rec, &payload, ts, ops),
+            "compacted" => self.on_compacted(scope, payload, ts, ops),
             _ => {}
         }
         let cwd = scope.current_cwd.as_deref().or(self.root_cwd.as_deref());
@@ -1109,14 +1189,7 @@ impl CodexTranslator {
         self.scopes.insert(path, scope);
     }
 
-    fn on_compacted(
-        &mut self,
-        scope: &mut Scope,
-        _rec: &Value,
-        payload: &Value,
-        ts: i64,
-        ops: &mut Vec<SpanOp>,
-    ) {
+    fn on_compacted(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
         let Some(turn) = scope.open_turns.last() else {
             return;
         };
@@ -1685,8 +1758,84 @@ fn compaction_history(payload: &Value, replacement: Option<&Vec<Value>>) -> Vec<
 }
 
 fn parse_ts(rec: &Value) -> Option<i64> {
-    let s = rec.get("timestamp").and_then(Value::as_str)?;
-    chrono::DateTime::parse_from_rfc3339(s)
+    rec.get("timestamp").and_then(normalize_timestamp)
+}
+
+/// Deserialize Codex rollout timestamps into Unix milliseconds. Rollouts have
+/// historically used RFC 3339 strings, but imported or newer producers may
+/// supply numeric epoch seconds, milliseconds, microseconds, or nanoseconds.
+/// Unknown values remain absent so the caller can use the hook timestamp.
+fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(normalize_timestamp))
+}
+
+fn normalize_timestamp(value: &Value) -> Option<i64> {
+    match value {
+        Value::String(value) => {
+            parse_rfc3339_timestamp(value).or_else(|| normalize_numeric_timestamp(value))
+        }
+        Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                normalize_epoch_integer(value)
+            } else if let Some(value) = value.as_u64() {
+                i64::try_from(value).ok().and_then(normalize_epoch_integer)
+            } else {
+                value.as_f64().and_then(normalize_epoch_float)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn normalize_numeric_timestamp(value: &str) -> Option<i64> {
+    value
+        .parse::<i64>()
+        .ok()
+        .and_then(normalize_epoch_integer)
+        .or_else(|| value.parse::<f64>().ok().and_then(normalize_epoch_float))
+}
+
+fn normalize_epoch_integer(value: i64) -> Option<i64> {
+    let magnitude = value.unsigned_abs();
+    if magnitude < 100_000_000_000 {
+        value.checked_mul(1_000)
+    } else if magnitude < 100_000_000_000_000 {
+        Some(value)
+    } else if magnitude < 100_000_000_000_000_000 {
+        Some(value / 1_000)
+    } else {
+        Some(value / 1_000_000)
+    }
+}
+
+fn normalize_epoch_float(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let magnitude = value.abs();
+    let milliseconds = if magnitude < 100_000_000_000.0 {
+        value * 1_000.0
+    } else if magnitude < 100_000_000_000_000.0 {
+        value
+    } else if magnitude < 100_000_000_000_000_000.0 {
+        value / 1_000.0
+    } else {
+        value / 1_000_000.0
+    };
+    if milliseconds < i64::MIN as f64 || milliseconds > i64::MAX as f64 {
+        None
+    } else {
+        Some(milliseconds.trunc() as i64)
+    }
+}
+
+fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|dt| dt.timestamp_millis())
 }
@@ -1848,12 +1997,58 @@ fn num_at(v: &Value, path: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::basename;
+    use super::{basename, normalize_timestamp, RolloutRecord};
+    use serde_json::json;
 
     #[test]
     fn basename_accepts_unix_and_windows_paths() {
         assert_eq!(basename("/tmp/project"), "project");
         assert_eq!(basename(r"C:\Users\agent\project"), "project");
         assert_eq!(basename(r"C:\Users\agent\project\\"), "project");
+    }
+
+    #[test]
+    fn rollout_timestamps_normalize_supported_formats() {
+        let milliseconds = 1_704_067_202_000_i64;
+        assert_eq!(
+            normalize_timestamp(&json!(1_704_067_202_i64)),
+            Some(milliseconds)
+        );
+        assert_eq!(
+            normalize_timestamp(&json!(milliseconds)),
+            Some(milliseconds)
+        );
+        assert_eq!(
+            normalize_timestamp(&json!(1_704_067_202_000_000_i64)),
+            Some(milliseconds)
+        );
+        assert_eq!(
+            normalize_timestamp(&json!(1_704_067_202_000_000_000_i64)),
+            Some(milliseconds)
+        );
+        assert_eq!(
+            normalize_timestamp(&json!("2024-01-01T00:00:02Z")),
+            Some(milliseconds)
+        );
+        assert_eq!(
+            normalize_timestamp(&json!("1704067202000")),
+            Some(milliseconds)
+        );
+        assert_eq!(
+            normalize_timestamp(&json!(1_704_067_202.25_f64)),
+            Some(milliseconds + 250)
+        );
+        assert_eq!(normalize_timestamp(&json!({ "seconds": 1 })), None);
+    }
+
+    #[test]
+    fn rollout_record_treats_unknown_timestamp_formats_as_missing() {
+        let record: RolloutRecord = serde_json::from_value(json!({
+            "timestamp": { "future": "format" },
+            "type": "event_msg",
+            "payload": { "type": "task_started" },
+        }))
+        .unwrap();
+        assert_eq!(record.timestamp_ms, None);
     }
 }

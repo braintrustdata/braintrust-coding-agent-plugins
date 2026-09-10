@@ -747,13 +747,37 @@ fn tool_and_llm_payloads_preserve_original_contract() {
     assert_eq!(tool.tags, Some(vec!["permission-request".into()]));
     assert_eq!(tool.error.as_deref(), Some("boom"));
 
-    let mut llms: Vec<&SpanRow> = rows
+    let llms: Vec<&SpanRow> = rows
         .values()
         .filter(|row| row.span_type == SpanType::Llm)
         .collect();
-    llms.sort_by_key(|row| row.start_ms);
     assert_eq!(llms.len(), 2);
-    assert!(llms[0]
+    let first = llms
+        .iter()
+        .copied()
+        .find(|row| {
+            row.output
+                .as_ref()
+                .and_then(|output| output.get("tool_calls"))
+                .is_some()
+        })
+        .expect("LLM that emitted the tool call");
+    let second = llms
+        .iter()
+        .copied()
+        .find(|row| {
+            row.input
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|input| {
+                    input
+                        .iter()
+                        .any(|message| message.get("tool_calls").is_some())
+                })
+        })
+        .expect("LLM that received the tool call result");
+    assert_ne!(first.span_id, second.span_id);
+    assert!(first
         .input
         .as_ref()
         .unwrap()
@@ -762,19 +786,19 @@ fn tool_and_llm_payloads_preserve_original_contract() {
         .iter()
         .all(|message| message.get("tool_calls").is_none()));
     assert_eq!(
-        llms[0].output.as_ref().unwrap()["tool_calls"][0]["function"]["arguments"],
+        first.output.as_ref().unwrap()["tool_calls"][0]["function"]["arguments"],
         json!("{\"cmd\":\"cat /tmp/review/SKILL.md\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need access\",\"prefix_rule\":[\"cat\"]}")
     );
-    assert_eq!(llms[0].metrics.as_ref().unwrap()["cost"], json!(0.25));
+    assert_eq!(first.metrics.as_ref().unwrap()["cost"], json!(0.25));
     assert_eq!(
-        llms[0].metrics.as_ref().unwrap()["estimated_cost"],
+        first.metrics.as_ref().unwrap()["estimated_cost"],
         json!(0.25)
     );
-    let second_input = llms[1].input.as_ref().unwrap().as_array().unwrap();
+    let second_input = second.input.as_ref().unwrap().as_array().unwrap();
     assert_eq!(second_input.last().unwrap()["role"], json!("tool"));
     assert_eq!(second_input.last().unwrap()["tool_call_id"], json!("c1"));
     assert_eq!(
-        llms[1].metadata.as_ref().unwrap()["usage_unavailable_reason"],
+        second.metadata.as_ref().unwrap()["usage_unavailable_reason"],
         json!("codex_token_count_missing_usage")
     );
 }
@@ -1025,7 +1049,7 @@ fn codex_untagged_replacement_history_preserves_native_order() {
 }
 
 #[test]
-fn codex_subagent_nests_under_spawning_turn() {
+fn codex_subagent_with_malformed_optional_type_nests_under_spawning_turn() {
     let tmp = tempfile::tempdir().unwrap();
     let main_t = tmp.path().join("main.jsonl");
     let sub_t = tmp.path().join("sub.jsonl");
@@ -1077,7 +1101,7 @@ fn codex_subagent_nests_under_spawning_turn() {
                 json!({
                     "agent_id": "a1",
                     "transcript_path": original_sub_p,
-                    "agent_type": "reviewer",
+                    "agent_type": { "name": "reviewer" },
                     "_bt_transcript_mirror": mirrored_subagent(),
                 }),
             ),
@@ -1152,7 +1176,7 @@ fn codex_subagent_nests_under_spawning_turn() {
     assert_eq!(subagent.parent_span_ids, vec![main_turn.span_id.clone()]);
     assert_eq!(
         subagent.metadata.as_ref().unwrap()["agent_type"],
-        json!("reviewer")
+        Value::Null
     );
     assert!(
         subagent.end_ms.is_some(),
@@ -1164,4 +1188,71 @@ fn codex_subagent_nests_under_spawning_turn() {
     // subagent's llm is its own model, under its turn.
     let sub_llm = find(&rows, SpanType::Llm, "gpt-5.5-mini");
     assert_eq!(sub_llm.parent_span_ids, vec![sub_turn.span_id.clone()]);
+}
+
+#[test]
+fn codex_rollout_routing_ignores_future_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let records = [
+        json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "session_meta",
+            "future_record_field": { "preserve": true },
+            "payload": { "id": "session-1", "cwd": "/work/app", "future_payload_field": [1, 2] },
+        }),
+        json!({
+            "timestamp": 1_704_067_202_000_i64,
+            "type": "event_msg",
+            "payload": { "type": "task_started", "turn_id": "t1", "future_event_field": {} },
+        }),
+        json!({
+            "timestamp": "2026-01-01T00:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "shell",
+                "arguments": "{\"command\":\"pwd\"}",
+                "future_response_field": "new Codex field",
+            },
+        }),
+        json!({
+            "timestamp": "2026-01-01T00:00:04Z",
+            "type": "response_item",
+            "payload": { "type": "function_call_output", "call_id": "c1", "output": "/work/app" },
+        }),
+        json!({
+            "timestamp": "2026-01-01T00:00:05Z",
+            "type": "event_msg",
+            "payload": { "type": "task_complete", "last_agent_message": "done" },
+        }),
+    ];
+    let mut file = std::fs::File::create(&transcript).unwrap();
+    for record in records {
+        writeln!(file, "{}", line(record)).unwrap();
+    }
+
+    let reg = Registry::default_agents();
+    let mut translator = reg.create("codex", "sess-1");
+    let ctx = SessionCtx {
+        session_id: "sess-1".into(),
+        config: None,
+    };
+    let ops = translator
+        .handle(
+            &envelope(
+                "sess-1",
+                "SessionStart",
+                transcript.to_str().unwrap(),
+                json!({ "source": "startup" }),
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let rows = reduce(ops);
+    let tool = find(&rows, SpanType::Tool, "shell");
+    assert_eq!(tool.input, Some(json!("{\"command\":\"pwd\"}")));
+    assert_eq!(tool.output, Some(json!("/work/app")));
 }
