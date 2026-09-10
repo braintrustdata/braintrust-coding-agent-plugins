@@ -44,6 +44,24 @@ struct SubagentHook {
     agent_transcript_path: Option<String>,
 }
 
+/// Stable routing fields from one Claude transcript row. Message and tool
+/// blocks intentionally remain raw because they are preserved in span I/O.
+#[derive(Deserialize)]
+struct TranscriptEnvelope {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    subtype: Option<String>,
+    #[serde(rename = "isCompactSummary", default)]
+    is_compact_summary: bool,
+    #[serde(
+        rename = "timestamp",
+        default,
+        deserialize_with = "deserialize_optional_timestamp"
+    )]
+    timestamp_ms: Option<i64>,
+}
+
 fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
@@ -55,6 +73,22 @@ where
     Ok(Option::<Value>::deserialize(deserializer)?
         .as_ref()
         .and_then(value_as_nonempty_string))
+}
+
+fn deserialize_optional_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_timestamp))
+}
+
+fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.timestamp_millis())
 }
 
 fn value_as_nonempty_string(value: &Value) -> Option<String> {
@@ -1027,16 +1061,19 @@ fn transcript_segments(records: Vec<Value>) -> VecDeque<Vec<Value>> {
 }
 
 fn assistant_request_id(record: &Value) -> Option<String> {
-    (record.get("type").and_then(Value::as_str) == Some("assistant"))
-        .then(|| {
-            record
-                .get("message")
-                .and_then(|message| string_field(message, "id"))
-                .or_else(|| string_field(record, "requestId"))
-                .or_else(|| string_field(record, "uuid"))
-        })
-        .flatten()
-        .filter(|id| !id.is_empty())
+    (decode::<TranscriptEnvelope>(record)
+        .and_then(|record| record.kind)
+        .as_deref()
+        == Some("assistant"))
+    .then(|| {
+        record
+            .get("message")
+            .and_then(|message| string_field(message, "id"))
+            .or_else(|| string_field(record, "requestId"))
+            .or_else(|| string_field(record, "uuid"))
+    })
+    .flatten()
+    .filter(|id| !id.is_empty())
 }
 
 struct ParsedTranscript {
@@ -1053,7 +1090,10 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
     let mut tool_order = Vec::<String>::new();
 
     for record in records {
-        match record.get("type").and_then(Value::as_str) {
+        let Some(envelope) = decode::<TranscriptEnvelope>(record) else {
+            continue;
+        };
+        match envelope.kind.as_deref() {
             Some("assistant") => {
                 let request_id = record
                     .get("message")
@@ -1116,7 +1156,7 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
                 // Claude persists a synthetic user message containing the new
                 // active context immediately after a compact_boundary record.
                 // It is the first model-visible message after the boundary.
-                if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+                if envelope.is_compact_summary {
                     let content = record
                         .pointer("/message/content")
                         .cloned()
@@ -1181,9 +1221,7 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
                     );
                 }
             }
-            Some("system")
-                if record.get("subtype").and_then(Value::as_str) == Some("compact_boundary") =>
-            {
+            Some("system") if envelope.subtype.as_deref() == Some("compact_boundary") => {
                 history.observe_compact_boundary(record);
             }
             _ => {}
@@ -1200,10 +1238,13 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
 }
 
 fn is_real_user_record(record: &Value) -> bool {
-    if record.get("type").and_then(Value::as_str) != Some("user") {
+    let Some(envelope) = decode::<TranscriptEnvelope>(record) else {
+        return false;
+    };
+    if envelope.kind.as_deref() != Some("user") {
         return false;
     }
-    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+    if envelope.is_compact_summary {
         return false;
     }
     !record
@@ -1628,9 +1669,7 @@ fn tool_name(payload: &Value) -> Option<String> {
 }
 
 fn parse_timestamp_ms(value: &Value) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value.get("timestamp")?.as_str()?)
-        .ok()
-        .map(|timestamp| timestamp.timestamp_millis())
+    decode::<TranscriptEnvelope>(value).and_then(|value| value.timestamp_ms)
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -1789,4 +1828,32 @@ fn tool_error(payload: &Value) -> Option<String> {
         }
     }
     Some("Tool execution failed".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode, TranscriptEnvelope};
+
+    #[test]
+    fn transcript_envelope_decodes_native_fixture_rows() {
+        let contents = include_str!("../../tests/fixtures/claude/test-fixture/transcripts/4381b0d7-d67e-4187-bb2d-86a101d3b955.jsonl");
+        let rows = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode::<TranscriptEnvelope>(&rows[2]).and_then(|row| row.kind),
+            Some("user".into())
+        );
+        assert_eq!(
+            decode::<TranscriptEnvelope>(&rows[6]).map(|row| (row.kind, row.timestamp_ms)),
+            Some((Some("assistant".into()), Some(1_779_843_127_934)))
+        );
+        let mut future_row = rows[6].clone();
+        future_row["future_field"] = serde_json::json!({ "nested": true });
+        assert_eq!(
+            decode::<TranscriptEnvelope>(&future_row).and_then(|row| row.kind),
+            Some("assistant".into())
+        );
+    }
 }
