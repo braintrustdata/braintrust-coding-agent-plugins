@@ -8,11 +8,11 @@
 use crate::trace_command::{DoctorAgent, DoctorArgs, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute};
 use crate::{
-    apply_additional_metadata, braintrust_serve_options, paths, run_disable, run_enable, run_hook,
-    run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthDiagnostic, AuthLease,
-    AuthProvider, AuthResolveReason, BraintrustSinkConfig, DoctorCommandOutput, HostInfo,
-    OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
-    TraceCommandOutput,
+    apply_additional_metadata, apply_tags, braintrust_serve_options, paths, run_disable,
+    run_enable, run_hook, run_import, run_serve, run_status, run_traced, shutdown_daemon,
+    AuthDiagnostic, AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig,
+    DoctorCommandOutput, HostInfo, OutputFormat, Registry, RunHookCommand, ServeOptions,
+    StatusArgs, TraceArgs, TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -178,6 +178,7 @@ async fn session_config(
         destination: route.destination.clone(),
         flush_mode: route.flush_mode,
         additional_metadata: route.additional_metadata.clone(),
+        tags: route.tags.clone(),
     })
 }
 
@@ -331,6 +332,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             )
             .await?;
             apply_additional_metadata(&mut route, enable_args.additional_metadata.as_deref())?;
+            apply_tags(&mut route, &enable_args.tags)?;
             print_output(run_enable(enable_args, route)?, host.output_format)
         }
         TraceCommand::Disable(disable_args) => {
@@ -388,6 +390,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 })
                 .await?;
             apply_additional_metadata(&mut route, import_args.additional_metadata.as_deref())?;
+            apply_tags(&mut route, &import_args.tags)?;
             let config = session_config(&host, &route).await?;
             let summaries = run_import(import_args, serve_options(&host), Some(config)).await?;
             print_output(TraceCommandOutput::import(summaries), host.output_format)
@@ -403,6 +406,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             )
             .await?;
             apply_additional_metadata(&mut route, run_args.additional_metadata.as_deref())?;
+            apply_tags(&mut route, &run_args.tags)?;
             let hook_command = child_command(&host.command, "hook");
             let status = run_traced(run_args, hook_command, route).await?;
             if status.success() {
@@ -578,6 +582,7 @@ mod tests {
                 TraceCommand::Setup(SetupArgs {
                     agent: SetupAgent::OpenCode,
                     additional_metadata: None,
+                    tags: Vec::new(),
                 }),
                 true,
             ),
@@ -585,6 +590,7 @@ mod tests {
                 TraceCommand::Run(RunArgs {
                     source: RunSource::Codex,
                     additional_metadata: None,
+                    tags: Vec::new(),
                     agent_args: Vec::new(),
                 }),
                 false,
@@ -679,6 +685,7 @@ mod tests {
                 parent_project: None,
                 attach: false,
                 additional_metadata: None,
+                tags: Vec::new(),
             };
             let error = run_trace(
                 TraceArgs {

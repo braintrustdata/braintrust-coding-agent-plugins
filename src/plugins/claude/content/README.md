@@ -60,3 +60,22 @@ For one invocation without changing the persistent configuration, use
 `bt trace run --additional-metadata '{"ci":true,"run_id":"abc-123"}' claude`,
 or set `BRAINTRUST_ADDITIONAL_METADATA` before that command (`bt trace run`
 still accepts it; a launched `claude` session's live hooks do not).
+
+#### Root-span tags
+
+Use repeatable `--tag` options to apply filterable tags to every root span in a
+route. Tags can be persisted with setup, supplied to one invocation, or added
+while importing a transcript:
+
+```bash
+bt trace enable claude --tag ci --tag release-validation
+bt trace run claude --tag ci -- "review this change"
+bt trace import claude session-id --tag historical-import
+```
+
+For automation, set `BRAINTRUST_TAGS` to a comma-separated list before
+invoking setup, a run, or an import:
+
+```bash
+BRAINTRUST_TAGS=ci,release-validation bt trace run claude -- "review this change"
+```

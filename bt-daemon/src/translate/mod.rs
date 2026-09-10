@@ -104,6 +104,14 @@ pub struct SessionCtx {
     pub config: Option<SessionConfig>,
 }
 
+/// Tags configured for every root span in the current agent session.
+pub(crate) fn root_tags(ctx: &SessionCtx) -> Option<Vec<String>> {
+    ctx.config
+        .as_ref()
+        .map(|config| config.tags.clone())
+        .filter(|tags| !tags.is_empty())
+}
+
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
 pub trait AgentTranslator: Send {

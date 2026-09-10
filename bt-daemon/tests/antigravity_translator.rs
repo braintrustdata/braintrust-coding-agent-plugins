@@ -1,4 +1,4 @@
-use bt_daemon::wire::Envelope;
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -147,7 +147,19 @@ fn hooks_and_full_transcript_build_model_and_tool_spans() {
     let mut translator = registry.create("antigravity", "antigravity\u{1f}conversation-1");
     let ctx = SessionCtx {
         session_id: "conversation-1".into(),
-        config: None,
+        config: Some(
+            SessionRoute {
+                tags: vec!["ci".into(), "docs".into()],
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
     };
     let mut ops = Vec::new();
     ops.extend(
@@ -235,6 +247,7 @@ fn hooks_and_full_transcript_build_model_and_tool_spans() {
         "conversation-1"
     );
     assert!(root.end_ms.is_some());
+    assert_eq!(root.tags, Some(vec!["ci".into(), "docs".into()]));
 
     let turn = rows
         .values()

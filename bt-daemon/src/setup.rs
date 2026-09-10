@@ -811,6 +811,20 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
             .filter(|metadata| metadata.is_object())
             .cloned();
     }
+    if route.tags.is_empty() {
+        route.tags = settings
+            .get("route")
+            .and_then(|route| route.get("tags"))
+            .or_else(|| settings.get("tags"))
+            .and_then(Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
     settings.insert("trace_to_braintrust".into(), Value::Bool(true));
     settings.insert("route".into(), serde_json::to_value(route)?);
     for key in [
@@ -823,6 +837,7 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
         "project",
         "destination",
         "additional_metadata",
+        "tags",
     ] {
         settings.remove(key);
     }
@@ -1582,7 +1597,11 @@ mod tests {
     fn tracing_settings_preserve_metadata_until_setup_explicitly_replaces_it() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("braintrust.json");
-        std::fs::write(&path, r#"{"route":{"additional_metadata":{"ci":true}}}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"route":{"additional_metadata":{"ci":true},"tags":["saved"]}}"#,
+        )
+        .unwrap();
 
         let route = SessionRoute::default();
         enable_tracing_at(&path, route).unwrap();
@@ -1591,9 +1610,11 @@ mod tests {
             settings["route"]["additional_metadata"],
             serde_json::json!({"ci": true})
         );
+        assert_eq!(settings["route"]["tags"], serde_json::json!(["saved"]));
 
         let route = SessionRoute {
             additional_metadata: Some(serde_json::json!({"run_id": "new"})),
+            tags: vec!["replacement".to_string()],
             ..SessionRoute::default()
         };
         enable_tracing_at(&path, route).unwrap();
@@ -1601,6 +1622,10 @@ mod tests {
         assert_eq!(
             settings["route"]["additional_metadata"],
             serde_json::json!({"run_id": "new"})
+        );
+        assert_eq!(
+            settings["route"]["tags"],
+            serde_json::json!(["replacement"])
         );
     }
 

@@ -507,6 +507,7 @@ fn configured_ctx(session_id: &str, additional_metadata: Value) -> SessionCtx {
             }),
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: Some(additional_metadata),
+            tags: vec!["ci".into(), "docs".into()],
         }),
     }
 }
@@ -657,6 +658,7 @@ fn root_preserves_config_input_and_git_metadata() {
     assert_eq!(root.input.as_ref().unwrap()["model"], json!("gpt-5.5"));
     assert_eq!(root.input.as_ref().unwrap()["source"], json!("resume"));
     assert_eq!(root.input.as_ref().unwrap()["cwd"], json!(repo));
+    assert_eq!(root.tags, Some(vec!["ci".into(), "docs".into()]));
     assert!(rows.values().all(|row| {
         let metadata = row.metadata.as_ref().and_then(Value::as_object).unwrap();
         metadata.get("git_origin_url") == Some(&json!("https://example.com/acme/app.git"))

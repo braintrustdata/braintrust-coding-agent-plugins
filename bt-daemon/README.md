@@ -85,6 +85,25 @@ run`, from that invocation's settings. An explicit `--additional-metadata`
 flag or environment variable on `bt trace run` overrides the persisted route
 for that invocation only, without mutating the file.
 
+### Root-span tags
+
+Use repeatable `--tag` options to add filterable Braintrust tags to every root
+span produced by a route. The option is available on persistent setup, one-off
+runs, and transcript imports.
+
+```bash
+bt trace enable claude --tag ci --tag release-validation
+bt trace run codex --tag ci -- "summarize this change"
+bt trace import claude session-id --tag historical-import
+```
+
+For automation, set `BRAINTRUST_TAGS` to a comma-separated list before running
+one of those commands:
+
+```bash
+BRAINTRUST_TAGS=ci,release-validation bt trace run codex -- "summarize this change"
+```
+
 Use `bt trace disable <agent>` to remove the installed tracing plugin and its
 Braintrust settings. `bt trace setup <agent>` remains an alias for `bt trace
 enable <agent>` for backwards compatibility.

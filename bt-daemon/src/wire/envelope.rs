@@ -146,6 +146,9 @@ pub struct SessionRoute {
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
+    /// Tags applied to each root span for this session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 impl SessionRoute {
@@ -155,6 +158,7 @@ impl SessionRoute {
             destination: self.destination.clone(),
             flush_mode: self.flush_mode,
             additional_metadata: self.additional_metadata.clone(),
+            tags: self.tags.clone(),
         }
     }
 
@@ -184,6 +188,8 @@ pub struct SessionConfig {
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// Where a session's root span should be logged.
@@ -367,6 +373,7 @@ mod tests {
                 },
                 destination: None,
                 flush_mode: FlushMode::FireAndForget,
+                tags: Vec::new(),
                 additional_metadata: None,
             }),
         }

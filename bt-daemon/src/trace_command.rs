@@ -103,6 +103,14 @@ pub struct EnableArgs {
     /// JSON object persisted in this agent's tracing route and merged into root-span metadata.
     #[arg(long, global = true, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
+    /// Tag applied to each root span. May be repeated or comma-separated.
+    #[arg(
+        long = "tag",
+        global = true,
+        env = "BRAINTRUST_TAGS",
+        value_delimiter = ','
+    )]
+    pub tags: Vec<String>,
 }
 
 /// Backwards-compatible API name for hosts that mounted the former setup command.
@@ -163,6 +171,7 @@ mod tests {
             TraceCommand::Setup(SetupArgs {
                 agent: SetupAgent::Claude,
                 additional_metadata: Some(ref value),
+                ..
             }) if value == r#"{"setup":true}"#
         ));
 
@@ -223,6 +232,37 @@ mod tests {
                 additional_metadata: Some(ref value),
                 ..
             }) if value == r#"{"import":true}"#
+        ));
+    }
+
+    #[test]
+    fn setup_run_and_import_accept_tags() {
+        let setup =
+            Cli::try_parse_from(["bt", "setup", "claude", "--tag", "ci", "--tag", "docs"]).unwrap();
+        assert!(matches!(
+            setup.trace.command,
+            TraceCommand::Setup(SetupArgs { ref tags, .. }) if tags.as_slice() == ["ci", "docs"]
+        ));
+
+        let run = Cli::try_parse_from(["bt", "run", "codex", "--tag", "ci,docs", "--", "status"])
+            .unwrap();
+        assert!(matches!(
+            run.trace.command,
+            TraceCommand::Run(RunArgs { ref tags, .. }) if tags.as_slice() == ["ci", "docs"]
+        ));
+
+        let import = Cli::try_parse_from([
+            "bt",
+            "import",
+            "claude",
+            "session-id",
+            "--tag",
+            "historical",
+        ])
+        .unwrap();
+        assert!(matches!(
+            import.trace.command,
+            TraceCommand::Import(ImportArgs { ref tags, .. }) if tags.as_slice() == ["historical"]
         ));
     }
 

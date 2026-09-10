@@ -220,6 +220,9 @@ pub struct ImportArgs {
     /// JSON object merged into every imported root span's metadata.
     #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
+    /// Tag applied to each imported root span. May be repeated or comma-separated.
+    #[arg(long = "tag", env = "BRAINTRUST_TAGS", value_delimiter = ',')]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -266,6 +269,9 @@ pub struct RunArgs {
     /// JSON object merged into root-span metadata for this invocation.
     #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
+    /// Tag applied to each root span for this invocation. May be repeated or comma-separated.
+    #[arg(long = "tag", env = "BRAINTRUST_TAGS", value_delimiter = ',')]
+    pub tags: Vec<String>,
     /// Arguments forwarded verbatim to the coding agent.
     #[arg(allow_hyphen_values = true)]
     pub agent_args: Vec<OsString>,
@@ -404,6 +410,26 @@ pub(crate) fn apply_additional_metadata(
         anyhow::bail!("--additional-metadata must be a JSON object");
     }
     route.additional_metadata = Some(value);
+    Ok(())
+}
+
+/// Apply invocation-local root-span tags to a route. Tags are normalized once
+/// at the CLI boundary so hook shims and translators only receive valid values.
+pub(crate) fn apply_tags(route: &mut SessionRoute, tags: &[String]) -> anyhow::Result<()> {
+    if tags.is_empty() {
+        return Ok(());
+    }
+    let mut normalized = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            anyhow::bail!("--tag must not be empty");
+        }
+        if !normalized.iter().any(|existing| existing == tag) {
+            normalized.push(tag.to_string());
+        }
+    }
+    route.tags = normalized;
     Ok(())
 }
 
@@ -1444,6 +1470,19 @@ mod tests {
     }
 
     #[test]
+    fn tags_override_a_route_and_are_normalized() {
+        let mut route = SessionRoute {
+            tags: vec!["saved".into()],
+            ..SessionRoute::default()
+        };
+        apply_tags(&mut route, &[" ci ".into(), "ci".into(), "docs".into()]).unwrap();
+        assert_eq!(route.tags, ["ci", "docs"]);
+
+        let error = apply_tags(&mut route, &[" ".into()]).unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
     fn import_args_accept_multiple_sessions_or_all() {
         let explicit = ImportCli::try_parse_from([
             "test",
@@ -1544,6 +1583,7 @@ mod tests {
             parent_project: None,
             attach: true,
             additional_metadata: None,
+            tags: Vec::new(),
         };
         assert!(validate_import_selection(&args)
             .unwrap_err()
@@ -1624,6 +1664,7 @@ mod tests {
             }),
             flush_mode: wire::FlushMode::FireAndForget,
             additional_metadata: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1715,6 +1756,7 @@ mod tests {
             RunArgs {
                 source: RunSource::Codex,
                 additional_metadata: None,
+                tags: Vec::new(),
                 agent_args: Vec::new(),
             },
             test_run_hook_command(),
@@ -1732,6 +1774,7 @@ mod tests {
             RunArgs {
                 source: RunSource::Codex,
                 additional_metadata: None,
+                tags: Vec::new(),
                 agent_args: vec![OsString::from("--dangerously-bypass-hook-trust")],
             },
             test_run_hook_command(),
