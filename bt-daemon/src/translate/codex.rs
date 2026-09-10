@@ -19,7 +19,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
-use super::tool::{error_text, tool_approval_metadata, ToolApproval};
+use super::tool::{error_text, nonempty_error_text, tool_approval_metadata, ToolApproval};
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
@@ -1465,6 +1465,17 @@ fn args_object(args: Option<&Value>) -> Option<Map<String, Value>> {
     }
 }
 
+fn has_error_marker(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::String(_) => nonempty_error_text(value).is_some(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        Value::Number(_) => true,
+    }
+}
+
 fn classify_tool_output(output: &Value) -> Option<String> {
     if let Some(object) = output.as_object() {
         if object.get("is_error").and_then(Value::as_bool) == Some(true)
@@ -1476,7 +1487,7 @@ fn classify_tool_output(output: &Value) -> Option<String> {
         {
             return Some(error_text(Some(output), "Tool execution failed"));
         }
-        if let Some(error) = object.get("error") {
+        if let Some(error) = object.get("error").filter(|error| has_error_marker(error)) {
             return Some(error_text(Some(error), "Tool execution failed"));
         }
         if let Some(exit_code) = object
