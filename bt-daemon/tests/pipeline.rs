@@ -1167,12 +1167,13 @@ async fn identical_native_ids_from_different_sources_are_isolated() {
         "source": "startup",
         "permission_mode": "auto"
     });
-    let mut claude = envelope("shared-native-id", "SessionStart", 2);
+    let mut claude = envelope("shared-native-id", "UserPromptSubmit", 2);
     claude.source = "claude".into();
     claude.payload = serde_json::json!({
         "session_id": "shared-native-id",
-        "hook_event_name": "SessionStart",
-        "cwd": "/workspace/claude"
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": "/workspace/claude",
+        "prompt": "trace this"
     });
 
     forward_envelope(&codex, &socket, &host, false)
