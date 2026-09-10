@@ -53,7 +53,7 @@ fn opencode_plugin_spec() -> anyhow::Result<String> {
     npm_major_spec(OPENCODE_PACKAGE, OPENCODE_PACKAGE_MANIFEST)
 }
 
-fn pi_plugin_spec() -> anyhow::Result<String> {
+pub(crate) fn pi_plugin_spec() -> anyhow::Result<String> {
     Ok(format!(
         "npm:{}",
         npm_major_spec(PI_PACKAGE, PI_PACKAGE_MANIFEST)?
