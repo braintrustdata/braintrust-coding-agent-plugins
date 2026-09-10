@@ -19,7 +19,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
-use super::tool::{error_text, tool_approval_metadata, ToolApproval};
+use super::tool::{error_text, nonempty_error_text, tool_approval_metadata, ToolApproval};
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
@@ -1476,8 +1476,8 @@ fn classify_tool_output(output: &Value) -> Option<String> {
         {
             return Some(error_text(Some(output), "Tool execution failed"));
         }
-        if let Some(error) = object.get("error") {
-            return Some(error_text(Some(error), "Tool execution failed"));
+        if let Some(error) = object.get("error").and_then(nonempty_error_text) {
+            return Some(error);
         }
         if let Some(exit_code) = object
             .get("exit_code")

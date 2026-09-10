@@ -10,6 +10,22 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn claude_event(session_id: &str, event: &str, ts_ms: i64, payload: Value) -> Envelope {
+    Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: session_id.into(),
+        event: event.into(),
+        ts_ms,
+        managed_run_id: None,
+        payload,
+        route: None,
+        config: None,
+        capture: None,
+    }
+}
+
 /// How a replayed event points at its transcript bytes.
 #[derive(Clone, Copy, PartialEq)]
 enum Source {
@@ -496,19 +512,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         session_id: "s".into(),
         config: None,
     };
-    let event = |name: &str, payload: Value| Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "s".into(),
-        event: name.into(),
-        ts_ms: 1,
-        managed_run_id: None,
-        payload,
-        route: None,
-        config: None,
-        capture: None,
-    };
+    let event = |name: &str, payload: Value| claude_event("s", name, 1, payload);
     let mut ops = translator
         .handle(
             &event(
@@ -540,7 +544,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
             .handle(
                 &event(
                     "PostToolUse",
-                    json!({"session_id":"s","tool_name":"Write","tool_use_id":"c","tool_input":{"file_path":"x"},"tool_response":{"is_error":true,"stderr":"disk full"}}),
+                    json!({"session_id":"s","tool_name":"Write","tool_use_id":"c","tool_input":{"file_path":"x"},"tool_response":{"is_error":true,"stderr":"\ndisk full"}}),
                 ),
                 &ctx,
             )
@@ -593,6 +597,78 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
 }
 
 #[test]
+fn claude_successful_tool_outputs_do_not_populate_error() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "successful-tools");
+    let ctx = SessionCtx {
+        session_id: "successful-tools".into(),
+        config: None,
+    };
+    let event = |name: &str, ts_ms: i64, payload: Value| {
+        claude_event("successful-tools", name, ts_ms, payload)
+    };
+    let mut ops = translator
+        .handle(
+            &event(
+                "UserPromptSubmit",
+                10,
+                json!({"session_id":"successful-tools","prompt":"run tools"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    for envelope in [
+        event(
+            "PostToolUse",
+            20,
+            json!({
+                "session_id":"successful-tools",
+                "tool_name":"Bash",
+                "tool_use_id":"bash-1",
+                "tool_input":{"command":"pwd"},
+                "tool_response":{
+                    "stdout":"/tmp",
+                    "stderr":"\nShell cwd was reset to /tmp",
+                    "interrupted":false
+                }
+            }),
+        ),
+        event(
+            "PostToolUse",
+            30,
+            json!({
+                "session_id":"successful-tools",
+                "tool_name":"TaskStop",
+                "tool_use_id":"stop-1",
+                "tool_input":{"task_id":"abc"},
+                "tool_response":{
+                    "task_id":"abc",
+                    "message":"Successfully stopped task: abc"
+                }
+            }),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+
+    let rows = reduce(ops);
+    let tools = rows
+        .values()
+        .filter(|row| row.span_type == SpanType::Tool)
+        .collect::<Vec<_>>();
+    assert_eq!(tools.len(), 2);
+    assert!(tools.iter().all(|row| row.error.is_none()));
+    assert!(tools.iter().any(|row| {
+        row.metadata.as_ref().unwrap()["tool_name"] == json!("Bash")
+            && row.output.as_ref().unwrap()["stdout"] == json!("/tmp")
+    }));
+    assert!(tools.iter().any(|row| {
+        row.metadata.as_ref().unwrap()["tool_name"] == json!("TaskStop")
+            && row.output.as_ref().unwrap()["message"] == json!("Successfully stopped task: abc")
+    }));
+}
+
+#[test]
 fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", "lifecycle");
@@ -600,18 +676,10 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
         session_id: "lifecycle".into(),
         config: None,
     };
-    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
-        source: "claude-code".into(),
-        source_version: Some("2.0.0".into()),
-        plugin_version: None,
-        session_id: "lifecycle".into(),
-        event: name.into(),
-        ts_ms,
-        managed_run_id: None,
-        payload,
-        route: None,
-        config: None,
-        capture: None,
+    let event = |name: &str, ts_ms: i64, payload: Value| {
+        let mut event = claude_event("lifecycle", name, ts_ms, payload);
+        event.source_version = Some("2.0.0".into());
+        event
     };
     let mut ops = Vec::new();
     for envelope in [
@@ -633,7 +701,7 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
         event(
             "StopFailure",
             40,
-            json!({"session_id":"lifecycle","error":"model process exited"}),
+            json!({"session_id":"lifecycle","message":"model process exited"}),
         ),
     ] {
         ops.extend(translator.handle(&envelope, &ctx).unwrap());

@@ -949,16 +949,7 @@ impl AgentTranslator for ClaudeTranslator {
             "PostToolUseFailure" => self.finish_tool(
                 event,
                 ToolApproval::Approved,
-                tool_error(&event.payload)
-                    .or_else(|| {
-                        event
-                            .payload
-                            .pointer("/tool_response/output")
-                            .and_then(Value::as_str)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_owned)
-                    })
-                    .or_else(|| Some("Tool execution failed".into())),
+                tool_failure_text(&event.payload).or_else(|| Some("Tool execution failed".into())),
                 &mut ops,
             ),
             "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, None, &mut ops),
@@ -988,7 +979,8 @@ impl AgentTranslator for ClaudeTranslator {
             "Stop" => self.stop_turn(event, None, &mut ops),
             "StopFailure" => self.stop_turn(
                 event,
-                tool_error(&event.payload).or_else(|| Some("Claude Code turn failed".into())),
+                tool_failure_text(&event.payload)
+                    .or_else(|| Some("Claude Code turn failed".into())),
                 &mut ops,
             ),
             "SessionEnd" => self.end_session(event, &mut ops),
@@ -1800,51 +1792,48 @@ fn tool_span_name(tool: &str, input: &Value) -> String {
 }
 
 fn tool_error(payload: &Value) -> Option<String> {
-    for value in [
+    let response = payload.get("tool_response");
+    let explicit_error = [
+        payload.get("error"),
+        response.and_then(|response| response.get("error")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(nonempty_error_text);
+    if let Some(error) = explicit_error {
+        return Some(error);
+    }
+    let failed = response.is_some_and(|response| {
+        response
+            .get("interrupted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || response
+                .get("is_error")
+                .or_else(|| response.get("isError"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || response
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|value| matches!(value, "error" | "failed"))
+    });
+    failed
+        .then(|| tool_failure_text(payload).unwrap_or_else(|| "Tool execution failed".to_string()))
+}
+
+fn tool_failure_text(payload: &Value) -> Option<String> {
+    [
         payload.get("error"),
         payload.get("message"),
         payload.pointer("/tool_response/error"),
         payload.pointer("/tool_response/stderr"),
         payload.pointer("/tool_response/message"),
+        payload.pointer("/tool_response/output"),
     ]
     .into_iter()
     .flatten()
-    {
-        if let Some(text) = nonempty_error_text(value) {
-            return Some(text);
-        }
-    }
-    let response = payload.get("tool_response")?;
-    let failed = response
-        .get("interrupted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || response
-            .get("is_error")
-            .or_else(|| response.get("isError"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        || response
-            .get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|value| matches!(value, "error" | "failed"));
-    if !failed {
-        return None;
-    }
-    for value in [
-        response.get("error"),
-        response.get("stderr"),
-        response.get("message"),
-        response.get("output"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(text) = nonempty_error_text(value) {
-            return Some(text);
-        }
-    }
-    Some("Tool execution failed".to_string())
+    .find_map(nonempty_error_text)
 }
 
 #[cfg(test)]

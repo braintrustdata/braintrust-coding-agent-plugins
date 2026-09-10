@@ -52,27 +52,17 @@ pub fn error_text(value: Option<&Value>, fallback: &str) -> String {
 /// Extracts a concise message when the source has already identified a value
 /// as an error. Callers must not use this to infer failure from normal output.
 pub fn nonempty_error_text(value: &Value) -> Option<String> {
-    if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
-        return Some(text.lines().next().unwrap_or(text).to_string());
+    if let Some(text) = value.as_str() {
+        return text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string);
     }
     let object = value.as_object()?;
     for key in ["error", "message", "stderr", "output", "result"] {
-        let Some(candidate) = object.get(key) else {
-            continue;
-        };
-        if let Some(text) = candidate.as_str().filter(|text| !text.is_empty()) {
-            return Some(text.lines().next().unwrap_or(text).to_string());
-        }
-        if let Some(nested) = candidate.as_object() {
-            for key in ["error", "message"] {
-                if let Some(text) = nested
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                {
-                    return Some(text.lines().next().unwrap_or(text).to_string());
-                }
-            }
+        if let Some(text) = object.get(key).and_then(nonempty_error_text) {
+            return Some(text);
         }
     }
     None
@@ -101,5 +91,9 @@ mod tests {
             "disk full"
         );
         assert_eq!(error_text(None, "fallback"), "fallback");
+        assert_eq!(
+            nonempty_error_text(&json!("\n  disk full\ntrace")),
+            Some("disk full".into())
+        );
     }
 }

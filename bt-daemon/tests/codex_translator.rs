@@ -806,6 +806,55 @@ fn tool_and_llm_payloads_preserve_original_contract() {
 }
 
 #[test]
+fn codex_successful_structured_tool_outputs_do_not_populate_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
+                "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+                "payload": { "type": "function_call", "call_id": "c1", "name": "first_tool",
+                             "arguments": "{}", "metadata": { "turn_id": "t1" } } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+                "payload": { "type": "function_call_output", "call_id": "c1",
+                             "output": { "result": "ok", "error": null } } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item",
+                "payload": { "type": "function_call", "call_id": "c2", "name": "second_tool",
+                             "arguments": "{}", "metadata": { "turn_id": "t1" } } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "response_item",
+                "payload": { "type": "function_call_output", "call_id": "c2",
+                             "output": { "result": "ok", "error": "" } } }),
+        json!({ "timestamp": "2026-01-01T00:00:07Z", "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "t1",
+                             "last_agent_message": "done" } }),
+    ] {
+        append(&transcript, record);
+    }
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let rows = reduce(
+        translator
+            .handle(
+                &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+
+    for name in ["first_tool", "second_tool"] {
+        let tool = find(&rows, SpanType::Tool, name);
+        assert_eq!(tool.error, None, "{name} should be successful");
+        assert_eq!(tool.output.as_ref().unwrap()["result"], json!("ok"));
+    }
+}
+
+#[test]
 fn missing_tool_output_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout.jsonl");
