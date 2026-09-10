@@ -1,16 +1,7 @@
-# Release a plugin to its PRODUCTION distribution repo:
-#   antigravity -> braintrustdata/braintrust-antigravity-plugin
-#   claude      -> braintrustdata/braintrust-claude-plugin
-#   codex       -> braintrustdata/braintrust-codex-plugin
-#   grok        -> braintrustdata/braintrust-grok-plugin
-#
-# Full flow: stamp manifest versions where the agent format supports them ->
-# commit to main when needed -> monorepo tag/release using
-# v<version>-<plugin> -> deploy -> distribution-repo tag/release using
-# v<version>. For a safe dry run, use test-release.yml
-# (deploys to the sandbox repo and skips all commits, tags, and releases).
-
-name: Release plugin
+# Prepare a reviewable release PR. Human merge authorizes release-merged.yml
+# to tag the approved commit and publish the production distribution.
+# For deploy-only sandbox runs, use test-release.yml.
+name: Prepare plugin release
 
 on:
   workflow_dispatch:
@@ -26,14 +17,128 @@ on:
         options: [antigravity, claude, codex, grok]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: prepare-release-${{ inputs.plugin }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    uses: ./.github/workflows/_release.yml
-    with:
-      version: ${{ inputs.version }}
-      plugin: ${{ inputs.plugin }}
-      dist_repo: ${{ inputs.plugin == 'antigravity' && 'braintrustdata/braintrust-antigravity-plugin' || inputs.plugin == 'codex' && 'braintrustdata/braintrust-codex-plugin' || inputs.plugin == 'grok' && 'braintrustdata/braintrust-grok-plugin' || 'braintrustdata/braintrust-claude-plugin' }}
-      record: true
-    secrets: inherit
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Validate release request
+        id: vars
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          PLUGIN: ${{ inputs.plugin }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
+            echo "::error::Release preparation must run on main."
+            exit 1
+          fi
+          version="${REQUESTED_VERSION#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be semver (MAJOR.MINOR.PATCH)."
+            exit 1
+          fi
+          case "$PLUGIN" in
+            antigravity) dist_repo=braintrustdata/braintrust-antigravity-plugin ;;
+            claude) dist_repo=braintrustdata/braintrust-claude-plugin ;;
+            codex) dist_repo=braintrustdata/braintrust-codex-plugin ;;
+            grok) dist_repo=braintrustdata/braintrust-grok-plugin ;;
+            *) echo "::error::Unsupported release plugin."; exit 1 ;;
+          esac
+          {
+            printf 'version=%s\n' "$version"
+            printf 'tag=v%s-%s\n' "$version" "$PLUGIN"
+            printf 'dist_repo=%s\n' "$dist_repo"
+            printf 'paths<<EOF\n.github/release-versions/%s\n' "$PLUGIN"
+            case "$PLUGIN" in
+              claude) printf '%s\n' 'src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json' ;;
+              codex) printf '%s\n' 'src/plugins/codex/content/plugins/*/.codex-plugin/plugin.json' ;;
+              grok) printf '%s\n' 'src/plugins/grok/content/.grok-plugin/plugin.json' 'src/plugins/grok/content/hooks/forward.sh' ;;
+            esac
+            printf 'EOF\n'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Reject existing release requests
+        id: preflight
+        env:
+          PLUGIN: ${{ inputs.plugin }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if cmp -s <(printf '%s\n' "$VERSION") ".github/release-versions/$PLUGIN"; then
+            echo "::error::Release version is already merged; rerun its post-merge release workflow."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Source release tag $TAG already exists."
+            exit 1
+          fi
+
+      # The App must be installed on this monorepo with both permissions.
+      # Its short-lived token lets the release PR trigger normal pull-request CI.
+      - name: Generate monorepo token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BRAINTRUST_BOT_APP_ID }}
+          private-key: ${{ secrets.BRAINTRUST_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Prepare release files
+        id: prepare
+        env:
+          PLUGIN: ${{ inputs.plugin }}
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$PLUGIN" != "antigravity" ]; then
+            python3 scripts/set-plugin-version.py "$PLUGIN" "$VERSION"
+          fi
+          mkdir -p .github/release-versions
+          printf '%s\n' "$VERSION" > ".github/release-versions/$PLUGIN"
+
+      - name: Create release pull request
+        id: release-pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          base: main
+          branch: release/${{ inputs.plugin }}/v${{ steps.vars.outputs.version }}
+          add-paths: ${{ steps.vars.outputs.paths }}
+          commit-message: "chore(${{ inputs.plugin }}): release v${{ steps.vars.outputs.version }}"
+          title: "chore(${{ inputs.plugin }}): release v${{ steps.vars.outputs.version }}"
+          body: |
+            Prepare `${{ inputs.plugin }}` version `${{ steps.vars.outputs.version }}`.
+
+            Production destination: `${{ steps.vars.outputs.dist_repo }}`.
+
+            Human approval and merge into `main` authorize tagging the merge commit and publishing this version to the production destination. This preparation does not tag or deploy anything.
+
+      - name: Summarize release pull request
+        id: summary
+        env:
+          PR_URL: ${{ steps.release-pr.outputs.pull-request-url }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PR_URL" ]; then
+            echo "::error::No release pull request was created or updated."
+            exit 1
+          fi
+          printf 'Release pull request: %s\n' "$PR_URL" >> "$GITHUB_STEP_SUMMARY"
