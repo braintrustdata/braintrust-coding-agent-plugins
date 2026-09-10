@@ -178,7 +178,7 @@ fn resolve_transcript_in(
     }
 }
 
-fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
     if session_id.is_empty()
         || !session_id
             .bytes()
