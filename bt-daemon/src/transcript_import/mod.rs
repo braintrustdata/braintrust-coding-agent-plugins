@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 mod antigravity;
 mod claude;
 mod codex;
+pub(crate) mod muse;
 
 pub(crate) fn resolve_transcripts(
     session_ids: &[String],
@@ -41,6 +42,7 @@ fn transcript_roots(source: ImportSource) -> Vec<PathBuf> {
         .unwrap_or_else(|| PathBuf::from("."));
     match source {
         ImportSource::Codex => codex::roots(&home),
+        ImportSource::Muse => Vec::new(),
         ImportSource::Claude => claude::roots(&home),
         ImportSource::Antigravity => antigravity::roots(&home),
     }
@@ -124,6 +126,7 @@ fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
 fn transcript_session_id(path: &Path, source: ImportSource) -> Option<String> {
     match source {
         ImportSource::Codex => codex::transcript_session_id(path),
+        ImportSource::Muse => None,
         ImportSource::Claude => claude::transcript_session_id(path),
         ImportSource::Antigravity => antigravity::transcript_session_id(path),
     }
@@ -141,6 +144,7 @@ fn resolve_transcript_in(
         find_jsonl_files(root, &mut candidates);
         matches.extend(candidates.into_iter().filter(|path| match source {
             ImportSource::Codex => codex::filename_matches(path, session_id),
+            ImportSource::Muse => false,
             ImportSource::Claude => claude::filename_matches(path, session_id),
             ImportSource::Antigravity => antigravity::filename_matches(path, session_id),
         }));
@@ -188,6 +192,7 @@ fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
 fn source_name(source: ImportSource) -> &'static str {
     match source {
         ImportSource::Codex => "Codex",
+        ImportSource::Muse => "Muse Code",
         ImportSource::Claude => "Claude Code",
         ImportSource::Antigravity => "Google Antigravity",
     }
@@ -210,6 +215,7 @@ fn envelopes_from_records(
 ) -> anyhow::Result<Vec<Envelope>> {
     match source {
         ImportSource::Codex => codex::envelopes(path, &records.values),
+        ImportSource::Muse => muse::envelopes(path),
         ImportSource::Claude => claude::envelopes(
             path,
             &records.values,
@@ -353,6 +359,7 @@ pub(crate) struct TranscriptTail {
 
 enum TailState {
     Codex(codex::Tail),
+    Muse,
     Claude(claude::Tail),
     Antigravity(antigravity::Tail),
 }
@@ -372,6 +379,7 @@ impl TranscriptTail {
     fn new_state(source: ImportSource) -> TailState {
         match source {
             ImportSource::Codex => TailState::Codex(codex::Tail::default()),
+            ImportSource::Muse => TailState::Muse,
             ImportSource::Claude => TailState::Claude(claude::Tail::default()),
             ImportSource::Antigravity => TailState::Antigravity(antigravity::Tail::default()),
         }
@@ -404,6 +412,7 @@ impl TranscriptTail {
             .len();
         match &mut self.state {
             TailState::Codex(state) => state.poll(events, len, finalize),
+            TailState::Muse => Ok(events),
             TailState::Claude(state) => state.poll(events, len, finalize),
             TailState::Antigravity(state) => state.poll(events, len, finalize),
         }

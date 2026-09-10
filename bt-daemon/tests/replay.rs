@@ -15,6 +15,43 @@ fn write_jsonl(path: &std::path::Path, records: &[Value]) {
 }
 
 #[tokio::test]
+async fn importing_muse_export_uses_the_production_translator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let export = tmp.path().join("muse-export.json");
+    std::fs::write(&export, serde_json::to_vec(&json!({
+        "export_schema_version": 1,
+        "exporter_version": "1.1.1",
+        "sessions": [{
+            "session_id": "muse-import",
+            "trajectory_id": "trajectory-muse-import",
+            "root_session_id": "muse-import",
+            "session_end": {"exit_reason": "clean"}
+        }],
+        "events": [
+            {"recorded_at": 1_000_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"started", "prompt":"trace this"}}}},
+            {"recorded_at": 1_001_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"model_input_trace_recorded", "request_record_id":"request-1", "bounded":{"request_digest":"sha256:test"}}}}},
+            {"recorded_at": 1_002_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"model_completed", "usage":{"input_tokens":3, "output_tokens":2}}}}},
+            {"recorded_at": 1_003_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"assistant_message_committed", "text":"traced"}}}},
+            {"recorded_at": 1_004_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"terminal"}}}}
+        ]
+    })).unwrap()).unwrap();
+    let output = tmp.path().join("spans");
+    import_transcript(&export, ImportSource::Muse, options(&output), None, false)
+        .await
+        .unwrap();
+    let output_rows = rows(&output.join("muse-import.ndjson"));
+    assert_eq!(inserted(&output_rows, "llm"), 1);
+    assert!(output_rows
+        .iter()
+        .any(|row| { row.pointer("/Insert/output").and_then(Value::as_str) == Some("traced") }));
+    assert!(output_rows.iter().any(|row| {
+        row.pointer("/Insert/metrics/input_tokens")
+            .and_then(Value::as_i64)
+            == Some(3)
+    }));
+}
+
+#[tokio::test]
 async fn importing_large_codex_rollout_drains_translator_continuations() {
     const CALLS: usize = 32;
     let tmp = tempfile::tempdir().unwrap();
