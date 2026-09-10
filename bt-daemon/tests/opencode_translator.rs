@@ -460,3 +460,196 @@ fn opencode_distinguishes_denied_tools_from_failed_executions() {
     );
     assert_eq!(failed.error.as_deref(), Some("not found"));
 }
+
+#[test]
+fn opencode_permission_dtos_accept_wrapped_request_and_info_reply() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for envelope in [
+        event(
+            "session.created",
+            1,
+            json!({"properties":{"info":{"id":"native"}}}),
+        ),
+        event("chat.message", 2, json!({"input":{"sessionID":"native"}})),
+        event(
+            "permission.asked",
+            3,
+            json!({"properties":{"permission":{"id":"perm","sessionID":"native","tool":{"callID":"call","name":"read","input":{"path":"secret"}},"permissionType":"filesystem","futurePermissionField":true}}}),
+        ),
+        event(
+            "permission.replied",
+            4,
+            json!({"properties":{"info":{"id":"perm"},"response":"denied"}}),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let denied = rows
+        .values()
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata["permission_id"] == "perm")
+        })
+        .unwrap();
+    assert_eq!(denied.metadata.as_ref().unwrap()["tool_approval"], "denied");
+    assert_eq!(
+        denied.metadata.as_ref().unwrap()["permission_type"],
+        "filesystem"
+    );
+    assert_eq!(denied.input.as_ref().unwrap()["path"], "secret");
+}
+
+#[test]
+fn opencode_ignores_unknown_fields_at_typed_reducer_boundaries() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for envelope in [
+        event(
+            "session.created",
+            1,
+            json!({"properties":{"info":{"id":"native"}}}),
+        ),
+        event(
+            "chat.message",
+            2,
+            json!({"input":{"sessionID":"native"},"output":{"parts":[{"type":"text","text":"hello"}]}}),
+        ),
+        event(
+            "tool.execute.before",
+            3,
+            json!({"input":{"sessionID":"native","callID":"call","tool":"read","futureToolField":true},"output":{"args":{"path":"README.md","futureArgField":true}},"futureEnvelopeField":true}),
+        ),
+        event(
+            "message.part.updated",
+            4,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"message","type":"text","text":"done","time":{"end":4},"futurePartField":true},"futurePropertiesField":true}}),
+        ),
+        event(
+            "message.updated",
+            5,
+            json!({"properties":{"info":{"id":"message","sessionID":"native","role":"assistant","modelID":"gpt-5","time":{"completed":5},"tokens":{"input":1,"output":1,"futureTokenField":true},"futureInfoField":true}}}),
+        ),
+        event(
+            "tool.execute.after",
+            6,
+            json!({"input":{"sessionID":"native","callID":"call","tool":"read"},"result":{"output":"ok","futureResultField":true}}),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    assert!(rows.values().any(|row| row.span_type == SpanType::Llm));
+    assert!(rows.values().any(|row| row.span_type == SpanType::Tool));
+}
+
+#[test]
+fn opencode_ignores_malformed_typed_events_without_failing_the_session() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    translator
+        .handle(
+            &event(
+                "session.created",
+                1,
+                json!({"properties":{"info":{"id":"native"}}}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    translator
+        .handle(
+            &event(
+                "chat.message",
+                2,
+                json!({"input":{"sessionID":"native"},"output":{"parts":[]}}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let ops = translator
+        .handle(
+            &event(
+                "tool.execute.before",
+                3,
+                json!({"input":{"sessionID":"native","callID":42,"tool":"read"}}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    assert!(ops
+        .iter()
+        .all(|op| !matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Tool)));
+    assert!(translator
+        .handle(
+            &event(
+                "session.deleted",
+                4,
+                json!({"properties":{"sessionID":"native"}})
+            ),
+            &ctx,
+        )
+        .unwrap()
+        .iter()
+        .any(|op| matches!(op, SpanOp::Merge(row) if row.end_ms == Some(4))));
+}
+
+#[test]
+fn opencode_accepts_flattened_tool_hook_payloads() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for envelope in [
+        event(
+            "session.created",
+            1,
+            json!({"properties":{"info":{"id":"native"}}}),
+        ),
+        event(
+            "chat.message",
+            2,
+            json!({"input":{"sessionID":"native"},"output":{"parts":[]}}),
+        ),
+        event(
+            "tool.execute.before",
+            3,
+            json!({"sessionID":"native","callID":"call","tool":"read","output":{"args":{"path":"README.md"}}}),
+        ),
+        event(
+            "tool.execute.after",
+            4,
+            json!({"sessionID":"native","callID":"call","tool":"read","output":"contents"}),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let tool = rows
+        .values()
+        .find(|row| row.span_type == SpanType::Tool)
+        .unwrap();
+    assert_eq!(tool.input.as_ref().unwrap()["path"], "README.md");
+    assert_eq!(tool.output.as_ref().unwrap(), "contents");
+    assert_eq!(tool.end_ms, Some(4));
+}
