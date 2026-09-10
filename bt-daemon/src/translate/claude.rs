@@ -37,6 +37,7 @@ struct HookContext {
 
 #[derive(Deserialize)]
 struct SubagentHook {
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     agent_id: String,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     agent_type: Option<String>,
@@ -54,6 +55,13 @@ struct TranscriptEnvelope {
     subtype: Option<String>,
     #[serde(rename = "isCompactSummary", default)]
     is_compact_summary: bool,
+}
+
+/// Timestamp decoding is deliberately separate from transcript routing. A
+/// future change to an unrelated routing field must not cause bounded reads to
+/// consume records from after a hook's capture point.
+#[derive(Deserialize)]
+struct TimestampEnvelope {
     #[serde(
         rename = "timestamp",
         default,
@@ -73,6 +81,15 @@ where
     Ok(Option::<Value>::deserialize(deserializer)?
         .as_ref()
         .and_then(value_as_nonempty_string))
+}
+
+fn deserialize_nonempty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    value_as_nonempty_string(&value)
+        .ok_or_else(|| serde::de::Error::custom("expected a non-empty string or number"))
 }
 
 fn deserialize_optional_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
@@ -1669,7 +1686,7 @@ fn tool_name(payload: &Value) -> Option<String> {
 }
 
 fn parse_timestamp_ms(value: &Value) -> Option<i64> {
-    decode::<TranscriptEnvelope>(value).and_then(|value| value.timestamp_ms)
+    decode::<TimestampEnvelope>(value).and_then(|value| value.timestamp_ms)
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -1832,7 +1849,10 @@ fn tool_error(payload: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, TranscriptEnvelope};
+    use super::{
+        decode, parse_rfc3339_timestamp, parse_timestamp_ms, read_snapshot_bounded,
+        TranscriptEnvelope,
+    };
 
     #[test]
     fn transcript_envelope_decodes_native_fixture_rows() {
@@ -1845,15 +1865,33 @@ mod tests {
             decode::<TranscriptEnvelope>(&rows[2]).and_then(|row| row.kind),
             Some("user".into())
         );
-        assert_eq!(
-            decode::<TranscriptEnvelope>(&rows[6]).map(|row| (row.kind, row.timestamp_ms)),
-            Some((Some("assistant".into()), Some(1_779_843_127_934)))
-        );
+        assert_eq!(parse_timestamp_ms(&rows[6]), Some(1_779_843_127_934));
         let mut future_row = rows[6].clone();
         future_row["future_field"] = serde_json::json!({ "nested": true });
         assert_eq!(
             decode::<TranscriptEnvelope>(&future_row).and_then(|row| row.kind),
             Some("assistant".into())
         );
+    }
+
+    #[test]
+    fn transcript_cutoff_is_independent_of_routing_schema_drift() {
+        let future_record = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "subtype": { "future": "object shape" },
+            "isCompactSummary": null,
+        });
+        let contents = format!("{future_record}\n");
+        let mut offset = 0;
+        let records = read_snapshot_bounded(
+            &contents,
+            &mut offset,
+            Some(parse_rfc3339_timestamp("2026-01-01T00:00:00Z").unwrap()),
+            None,
+        );
+
+        assert!(records.is_empty());
+        assert_eq!(offset, 0, "the future record remains unread");
     }
 }

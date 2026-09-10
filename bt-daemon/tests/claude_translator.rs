@@ -394,6 +394,36 @@ fn claude_subagent_routing_tolerates_malformed_optional_metadata() {
 }
 
 #[test]
+fn claude_ignores_empty_subagent_identifier() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "empty-subagent-session");
+    let ctx = SessionCtx {
+        session_id: "empty-subagent-session".into(),
+        config: None,
+    };
+    let event = Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "empty-subagent-session".into(),
+        event: "SubagentStart".into(),
+        ts_ms: 1,
+        managed_run_id: None,
+        payload: json!({
+            "cwd": "/workspace/demo",
+            "agent_id": "",
+            "agent_type": "reviewer",
+        }),
+        route: None,
+        config: None,
+        capture: None,
+    };
+
+    let rows = reduce(translator.handle(&event, &ctx).unwrap());
+    assert!(rows.values().all(|row| !row.name.starts_with("subagent:")));
+}
+
+#[test]
 fn claude_subagent_fixture_builds_nested_subagent_llms() {
     let rows = reduce(replay("subagent-compact"));
     let subagents: Vec<_> = rows
