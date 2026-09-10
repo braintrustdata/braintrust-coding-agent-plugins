@@ -71,10 +71,31 @@ Cross-repository pushes use `GH_TOKEN` or ambient Git credentials.
 
 ## Releasing
 
-The manual `release.yml` workflow deploys a production release, records the
-version bump on `main`, tags it, and creates a GitHub Release. The manual
-`test-release.yml` workflow exercises the same deployment against the test
-repository without committing or tagging. Both call `_release.yml`.
+Run **Prepare plugin release** (`release.yml`) on `main` with a plugin and
+version. It opens or updates `release/<plugin>/v<version>` using Braintrust Bot,
+with the manifest changes and a monorepo-only
+`.github/release-versions/<plugin>` approval record. The record gives Antigravity
+a reviewable diff without adding a native manifest version. Preparation never
+tags or deploys.
+
+A human approves and merges the PR under the existing branch protection rules.
+`release-merged.yml` then calls `_release.yml` with that PR's exact merge SHA,
+verifies the reviewed versions, creates `v<version>-<plugin>` and its GitHub
+Release, deploys the distribution, and creates its `v<version>` tag/release.
+It never pushes source changes to `main`. CI runs on release PRs; the current
+rules require one approval but do not require passing CI.
+
+If publishing is interrupted, rerun the post-merge workflow rather than
+preparing the merged version again. An existing source tag must match the
+approved merge SHA; an existing distribution tag still rejects publication.
+An unchanged Antigravity artifact may reuse its previous distribution commit
+under the new version tag.
+
+The manual `test-release.yml` workflow calls `_release.yml` at the selected
+commit, stamps versions only on the runner, and **overwrites the shared test
+distribution repository** without committing source changes or creating tags
+or releases. It does not require a PR. Pi and OpenCode retain their separate
+npm workflows, dispatched against an already-merged version-bump SHA.
 
 A Codex deployment can run `smoke-codex.yml`, which installs the deployed
 plugin and runs a real Codex session through the daemon when
@@ -87,10 +108,13 @@ branch revision are cancelled.
 ## Secrets
 
 - `BRAINTRUST_BOT_APP_ID` / `BRAINTRUST_BOT_PRIVATE_KEY` are the
-  `braintrustdata/braintrust-bot` GitHub App credentials. Release workflows mint
-  a short-lived installation token from them, scoped to `contents:write` on the
-  one distribution repository being deployed. The app must be installed on every
-  distribution repository, or the token step fails.
+  `braintrustdata/braintrust-bot` GitHub App credentials. Preparation mints a
+  monorepo-scoped token with `contents:write` and `pull_requests:write` so
+  bot-created PRs trigger CI. The app must be installed on this monorepo with
+  both permissions. Deployment separately mints a token scoped to
+  `contents:write` on the one distribution repository being deployed; the app
+  must also be installed there. Missing installation or permissions fail the
+  token step; do not bypass branch protection. Source tags use `GITHUB_TOKEN`.
 - `OPENAI_API_KEY` enables the optional real Codex smoke test.
 
 Braintrust authentication is deliberately not stored in plugin or daemon

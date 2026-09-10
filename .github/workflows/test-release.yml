@@ -30,6 +30,7 @@ jobs:
     with:
       version: ${{ inputs.version }}
       plugin: ${{ inputs.plugin }}
+      source_sha: ${{ github.sha }}
       dist_repo: braintrustdata/test-coding-agent-dist
       record: false
     secrets: inherit
