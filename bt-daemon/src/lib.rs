@@ -55,7 +55,9 @@ use anyhow::Context;
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use clap::{Args, ValueEnum};
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wire::{
@@ -609,10 +611,15 @@ pub async fn run_import(
                 "Muse import does not support --attach yet; use a completed export-v1 session"
             )
         }
-        if args.all {
-            anyhow::bail!("Muse import does not support --all yet; pass one or more session ids")
+        let session_ids = if args.all {
+            muse_msp_session_ids()?
+        } else {
+            args.session_ids.clone()
+        };
+        if session_ids.is_empty() {
+            anyhow::bail!("no durable Muse sessions found to import")
         }
-        let exports = export_muse_sessions(&args.session_ids)?;
+        let exports = export_muse_sessions(&session_ids)?;
         return import_muse_exports_with_ledger(
             &exports,
             opts,
@@ -666,6 +673,127 @@ fn export_muse_sessions(session_ids: &[String]) -> anyhow::Result<tempfile::Temp
         }
     }
     Ok(directory)
+}
+
+/// List durable Muse sessions through the read-only MSP surface. This never
+/// resumes a session, obtains a writer lease, or subscribes to its view; the
+/// export command remains the authoritative content reader.
+fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
+    const MAX_PAGES: usize = 1_000;
+    let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
+    let mut child = ProcessCommand::new(&executable)
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "run {} serve to list Muse sessions",
+                executable.to_string_lossy()
+            )
+        })?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut request_id = 1u64;
+    muse_msp_request(
+        &mut stdin,
+        &mut reader,
+        request_id,
+        "initialize",
+        serde_json::json!({"clientInfo":{"name":"braintrust_muse_import","version":"1"}}),
+    )?;
+    // Muse follows the JSON-RPC/MSP initialization handshake: requests after
+    // `initialize` are rejected until this notification has been flushed.
+    muse_msp_notify(&mut stdin, "initialized")?;
+    let mut cursor = None;
+    let mut sessions = Vec::new();
+    for _ in 0..MAX_PAGES {
+        request_id += 1;
+        let result = muse_msp_request(
+            &mut stdin,
+            &mut reader,
+            request_id,
+            "session/list",
+            serde_json::json!({"cursor": cursor, "limit": 200}),
+        )?;
+        let page = result
+            .get("sessions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Muse session/list response has no sessions array"))?;
+        sessions.extend(page.iter().filter_map(|session| {
+            session
+                .get("sessionId")
+                .or_else(|| session.get("session_id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| transcript_import::validate_session_id(id).is_ok())
+                .map(str::to_owned)
+        }));
+        cursor = result
+            .get("nextCursor")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Muse MSP session listing failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    sessions.sort();
+    sessions.dedup();
+    Ok(sessions)
+}
+
+fn muse_msp_notify(stdin: &mut impl Write, method: &str) -> anyhow::Result<()> {
+    serde_json::to_writer(
+        &mut *stdin,
+        &serde_json::json!({"jsonrpc":"2.0", "method":method}),
+    )?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn muse_msp_request(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    serde_json::to_writer(
+        &mut *stdin,
+        &serde_json::json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
+    )?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    let mut line = String::new();
+    for _ in 0..10_000 {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            anyhow::bail!("Muse MSP closed before responding to {method}")
+        }
+        let frame: serde_json::Value = serde_json::from_str(&line)
+            .with_context(|| format!("parse Muse MSP frame while waiting for {method}"))?;
+        if frame.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = frame.get("error") {
+            anyhow::bail!("Muse MSP {method} failed: {error}")
+        }
+        return frame
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Muse MSP {method} response has no result"));
+    }
+    anyhow::bail!("Muse MSP sent too many frames before responding to {method}")
 }
 
 async fn import_muse_exports_with_ledger(
@@ -1450,6 +1578,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+    use std::io::Cursor;
 
     #[derive(Debug, Parser)]
     struct ImportCli {
@@ -1530,6 +1659,31 @@ mod tests {
             assert!(should_flush_hook_event(event, true));
         }
         assert!(!should_flush_hook_event("turn_completed", true));
+    }
+
+    #[test]
+    fn muse_msp_handshake_writes_notification_and_skips_notifications() {
+        let mut stdin = Vec::new();
+        muse_msp_notify(&mut stdin, "initialized").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stdin).unwrap(),
+            json!({"jsonrpc": "2.0", "method": "initialized"})
+        );
+
+        let mut reader = BufReader::new(Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"session/changed\"}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"sessions\":[]}}\n",
+        ));
+        let result = muse_msp_request(
+            &mut stdin,
+            &mut reader,
+            7,
+            "session/list",
+            json!({"cursor": null, "limit": 200}),
+        )
+        .unwrap();
+        assert_eq!(result, json!({"sessions": []}));
+        let frames = String::from_utf8(stdin).unwrap();
+        assert!(frames.contains("\"method\":\"session/list\""));
     }
 
     #[test]

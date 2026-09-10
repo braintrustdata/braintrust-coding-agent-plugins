@@ -145,10 +145,12 @@ create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
 
 Muse imports invoke its documented local `muse export --session` interface and
-read export schema version 1. They import completed sessions only: `--attach`
-and `--all` require MSP session enumeration and cursor support, which are not
-implemented yet. Muse also has no safe invocation-local configuration overlay,
-so `run muse` is deliberately unavailable; use persistent `enable muse` setup.
+read export schema version 1. `import muse --all` enumerates durable session
+IDs through Muse's read-only MSP `session/list` interface, then exports each
+completed session. `--attach` is not available yet because it needs a durable
+MSP subscription and cursor-following implementation. Muse also has no safe
+invocation-local configuration overlay, so `run muse` is deliberately
+unavailable; use persistent `enable muse` setup.
 
 Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
 Ctrl-C. `run <codex|claude> [ARGS...]` launches the selected agent with
