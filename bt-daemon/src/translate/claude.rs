@@ -15,11 +15,55 @@ use super::{
 };
 use crate::ids;
 use crate::wire::Envelope;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Seek, SeekFrom};
 use std::process::Command;
 use std::sync::Arc;
+
+#[derive(Default, Deserialize)]
+struct HookContext {
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    transcript_path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    source: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SubagentHook {
+    agent_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    agent_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    agent_transcript_path: Option<String>,
+}
+
+fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(value_as_nonempty_string))
+}
+
+fn value_as_nonempty_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
 
 pub struct ClaudeTranslatorFactory {
     git: Arc<GitMetadataCache>,
@@ -210,7 +254,13 @@ impl ClaudeTranslator {
         }
     }
 
-    fn ensure_root(&mut self, event: &Envelope, ctx: &SessionCtx, ops: &mut Vec<SpanOp>) {
+    fn ensure_root(
+        &mut self,
+        event: &Envelope,
+        ctx: &SessionCtx,
+        hook: &HookContext,
+        ops: &mut Vec<SpanOp>,
+    ) {
         if self.root_open {
             return;
         }
@@ -223,7 +273,7 @@ impl ClaudeTranslator {
         if let Some(root) = root_span_id {
             self.root_span_id = root.clone();
         }
-        let cwd = string_field(&event.payload, "cwd").unwrap_or_default();
+        let cwd = hook.cwd.clone().unwrap_or_default();
         let workspace = basename(&cwd);
         let mut metadata = ctx
             .config
@@ -249,14 +299,10 @@ impl ClaudeTranslator {
         if let Some(version) = &self.claude_version {
             metadata.insert("claude_code_version".into(), json!(version));
         }
-        if let Some(source) =
-            string_field(&event.payload, "source").or_else(|| self.session_source.clone())
-        {
+        if let Some(source) = hook.source.clone().or_else(|| self.session_source.clone()) {
             metadata.insert("session_source".into(), json!(source));
         }
-        if let Some(model) =
-            string_field(&event.payload, "model").or_else(|| self.session_model.clone())
-        {
+        if let Some(model) = hook.model.clone().or_else(|| self.session_model.clone()) {
             metadata.insert("model".into(), json!(model));
         }
         ops.push(SpanOp::Insert(SpanRow {
@@ -273,9 +319,9 @@ impl ClaudeTranslator {
         }));
     }
 
-    fn tail_main(&mut self, event: &Envelope) {
-        if let Some(path) = string_field(&event.payload, "transcript_path") {
-            self.main_transcript = Some(path);
+    fn tail_main(&mut self, event: &Envelope, hook: &HookContext) {
+        if let Some(path) = &hook.transcript_path {
+            self.main_transcript = Some(path.clone());
         }
         let Some(path) = self.main_transcript.clone() else {
             return;
@@ -288,12 +334,12 @@ impl ClaudeTranslator {
         cursor.buffered.extend(rows);
     }
 
-    fn observe_session_details(&mut self, event: &Envelope) {
-        if let Some(source) = string_field(&event.payload, "source") {
-            self.session_source = Some(source);
+    fn observe_session_details(&mut self, hook: &HookContext) {
+        if let Some(source) = &hook.source {
+            self.session_source = Some(source.clone());
         }
-        if let Some(model) = string_field(&event.payload, "model") {
-            self.session_model = Some(model);
+        if let Some(model) = &hook.model {
+            self.session_model = Some(model.clone());
         }
     }
 
@@ -394,19 +440,19 @@ impl ClaudeTranslator {
     }
 
     fn parent_for(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) -> Option<String> {
-        if let Some(agent_id) = string_field(&event.payload, "agent_id") {
-            return Some(self.ensure_subagent(&agent_id, event, ops));
+        if let Some(hook) = decode::<SubagentHook>(&event.payload) {
+            return Some(self.ensure_subagent(&hook, event, ops));
         }
         self.turn.as_ref().map(|turn| turn.id.clone())
     }
 
     fn ensure_subagent(
         &mut self,
-        agent_id: &str,
+        hook: &SubagentHook,
         event: &Envelope,
         ops: &mut Vec<SpanOp>,
     ) -> String {
-        if let Some(agent) = self.subagents.get(agent_id) {
+        if let Some(agent) = self.subagents.get(&hook.agent_id) {
             return agent.span_id.clone();
         }
         let parent_id = self
@@ -415,9 +461,8 @@ impl ClaudeTranslator {
             .map(|turn| turn.id.clone())
             .or_else(|| self.last_turn_id.clone())
             .unwrap_or_else(|| self.session_span_id.clone());
-        let agent_type =
-            string_field(&event.payload, "agent_type").unwrap_or_else(|| "agent".into());
-        let span_id = ids::span_id(&self.session_id, &format!("subagent:{agent_id}"));
+        let agent_type = hook.agent_type.clone().unwrap_or_else(|| "agent".into());
+        let span_id = ids::span_id(&self.session_id, &format!("subagent:{}", hook.agent_id));
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
@@ -425,11 +470,11 @@ impl ClaudeTranslator {
             name: format!("subagent: {agent_type}"),
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
-            metadata: Some(json!({ "agent_id": agent_id, "agent_type": agent_type })),
+            metadata: Some(json!({ "agent_id": hook.agent_id, "agent_type": agent_type })),
             ..Default::default()
         }));
         self.subagents.insert(
-            agent_id.to_string(),
+            hook.agent_id.clone(),
             Subagent {
                 span_id: span_id.clone(),
                 transcript_path: None,
@@ -527,12 +572,10 @@ impl ClaudeTranslator {
         })
     }
 
-    fn stop_subagent(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
-        let Some(agent_id) = string_field(&event.payload, "agent_id") else {
-            return;
-        };
-        let parent = self.ensure_subagent(&agent_id, event, ops);
-        let path = string_field(&event.payload, "agent_transcript_path");
+    fn stop_subagent(&mut self, event: &Envelope, hook: SubagentHook, ops: &mut Vec<SpanOp>) {
+        let agent_id = hook.agent_id.clone();
+        let parent = self.ensure_subagent(&hook, event, ops);
+        let path = hook.agent_transcript_path;
         if let Some(agent) = self.subagents.get_mut(&agent_id) {
             agent.transcript_path = path.clone();
         }
@@ -817,13 +860,14 @@ impl AgentTranslator for ClaudeTranslator {
             "Claude translator has pending catch-up work; drain it before handling another event"
         );
         let mut ops = Vec::new();
-        if let Some(cwd) = string_field(&event.payload, "cwd") {
-            self.current_cwd = Some(cwd);
+        let hook = decode::<HookContext>(&event.payload).unwrap_or_default();
+        if let Some(cwd) = &hook.cwd {
+            self.current_cwd = Some(cwd.clone());
         }
-        self.tail_main(event);
-        self.observe_session_details(event);
+        self.tail_main(event, &hook);
+        self.observe_session_details(&hook);
         if Self::starts_trace(event) {
-            self.ensure_root(event, ctx, &mut ops);
+            self.ensure_root(event, ctx, &hook, &mut ops);
         }
         if self.root_open && !self.claude_version_logged {
             if let Some(version) = &self.claude_version {
@@ -881,11 +925,15 @@ impl AgentTranslator for ClaudeTranslator {
                 }
             }
             "SubagentStart" => {
-                if let Some(agent_id) = string_field(&event.payload, "agent_id") {
-                    self.ensure_subagent(&agent_id, event, &mut ops);
+                if let Some(hook) = decode::<SubagentHook>(&event.payload) {
+                    self.ensure_subagent(&hook, event, &mut ops);
                 }
             }
-            "SubagentStop" => self.stop_subagent(event, &mut ops),
+            "SubagentStop" => {
+                if let Some(hook) = decode::<SubagentHook>(&event.payload) {
+                    self.stop_subagent(event, hook, &mut ops);
+                }
+            }
             "Stop" => self.stop_turn(event, None, &mut ops),
             "StopFailure" => self.stop_turn(
                 event,
