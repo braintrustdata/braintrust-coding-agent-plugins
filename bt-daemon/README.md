@@ -88,14 +88,20 @@ for that invocation only, without mutating the file.
 ### Root-span tags
 
 Use repeatable `--tag` options to add filterable Braintrust tags to every root
-span produced by a route. The same option is available on persistent setup,
-one-off runs, and transcript imports; `BRAINTRUST_TAGS` accepts comma-separated
-values.
+span produced by a route. The option is available on persistent setup, one-off
+runs, and transcript imports.
 
 ```bash
-bt trace enable claude --tag docs-gap-analysis --tag ci
+bt trace enable claude --tag ci --tag release-validation
 bt trace run codex --tag ci -- "summarize this change"
 bt trace import claude session-id --tag historical-import
+```
+
+For automation, set `BRAINTRUST_TAGS` to a comma-separated list before running
+one of those commands:
+
+```bash
+BRAINTRUST_TAGS=ci,release-validation bt trace run codex -- "summarize this change"
 ```
 
 Use `bt trace disable <agent>` to remove the installed tracing plugin and its

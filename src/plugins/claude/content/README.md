@@ -68,9 +68,14 @@ route. Tags can be persisted with setup, supplied to one invocation, or added
 while importing a transcript:
 
 ```bash
-bt trace enable claude --tag docs-gap-analysis --tag ci
+bt trace enable claude --tag ci --tag release-validation
 bt trace run claude --tag ci -- "review this change"
 bt trace import claude session-id --tag historical-import
 ```
 
-`BRAINTRUST_TAGS` accepts comma-separated values for setup, runs, and imports.
+For automation, set `BRAINTRUST_TAGS` to a comma-separated list before
+invoking setup, a run, or an import:
+
+```bash
+BRAINTRUST_TAGS=ci,release-validation bt trace run claude -- "review this change"
+```
