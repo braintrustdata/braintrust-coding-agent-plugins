@@ -865,11 +865,13 @@ fn managed_run_args(
             }
         }
         RunSource::OpenCode => Ok(Vec::new()),
-        RunSource::Pi => Ok(vec![
-            OsString::from("-e"),
-            std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC")
-                .unwrap_or_else(|| OsString::from("npm:@braintrust/pi-extension@^1")),
-        ]),
+        RunSource::Pi => {
+            let extension = match std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC") {
+                Some(extension) => extension,
+                None => OsString::from(crate::setup::pi_plugin_spec()?),
+            };
+            Ok(vec![OsString::from("-e"), extension])
+        }
     }
 }
 
@@ -1866,7 +1868,10 @@ mod tests {
     fn pi_managed_run_loads_the_npm_extension() {
         assert_eq!(
             managed_run_args(RunSource::Pi, &test_run_hook_command()).unwrap(),
-            ["-e", "npm:@braintrust/pi-extension@^1"]
+            vec![
+                OsString::from("-e"),
+                OsString::from(crate::setup::pi_plugin_spec().unwrap()),
+            ]
         );
     }
 
