@@ -1274,6 +1274,18 @@ impl OpenCodeTranslator {
                 ..Default::default()
             }));
         } else {
+            // An idle session remains resumable, but its root is still the
+            // session-level summary users see between turns. Keep that summary
+            // current without dropping the state needed for the next turn.
+            ops.push(SpanOp::Merge(SpanRow {
+                span_id: s.root_span_id.clone(),
+                root_span_id: s.effective_root_span_id.clone(),
+                end_ms: Some(ts),
+                metadata: Some(
+                    json!({"total_turns":s.turn_number,"total_tool_calls":s.tool_call_count}),
+                ),
+                ..Default::default()
+            }));
             self.sessions.insert(sid.into(), s);
         }
         ops
