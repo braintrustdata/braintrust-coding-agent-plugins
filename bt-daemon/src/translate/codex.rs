@@ -69,7 +69,11 @@ struct SubagentStartHook {
 /// handlers preserve those native objects in span input/output.
 #[derive(Deserialize)]
 struct RolloutRecord {
-    #[serde(default, deserialize_with = "deserialize_timestamp")]
+    #[serde(
+        rename = "timestamp",
+        default,
+        deserialize_with = "deserialize_timestamp"
+    )]
     timestamp_ms: Option<i64>,
     #[serde(rename = "type", default)]
     kind: Option<String>,
@@ -122,7 +126,6 @@ impl TranslatorFactory for CodexTranslatorFactory {
             root_span_id: ids::span_id(session_id, "root"),
             external_parent_span_id: None,
             root_opened: false,
-            root_ended: false,
             session_source: None,
             permission_mode: None,
             root_cwd: None,
@@ -155,6 +158,13 @@ struct OpenTurn {
     last_child_end_ms: Option<i64>,
     llm_seq: u32,
     explicit_skill_names: Vec<String>,
+    input_source: Option<TurnInputSource>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum TurnInputSource {
+    Native,
+    Authoritative,
 }
 
 struct OpenLlm {
@@ -227,7 +237,6 @@ struct CodexTranslator {
     root_span_id: String,
     external_parent_span_id: Option<String>,
     root_opened: bool,
-    root_ended: bool,
     session_source: Option<String>,
     permission_mode: Option<String>,
     root_cwd: Option<String>,
@@ -769,6 +778,7 @@ impl CodexTranslator {
             last_child_end_ms: None,
             llm_seq: 0,
             explicit_skill_names: Vec::new(),
+            input_source: None,
         });
     }
 
@@ -777,12 +787,39 @@ impl CodexTranslator {
             .or_else(|| str_field(payload, "text"))
             .or_else(|| str_field(payload, "prompt"));
         let Some(text) = text else { return };
-        // Explicit skill mentions in the prompt (e.g. "$skill", "/skills name").
-        let names = explicit_skill_names(&text);
+        self.set_turn_input_text(scope, text, TurnInputSource::Authoritative, ops);
+    }
+
+    fn set_turn_input_text(
+        &mut self,
+        scope: &mut Scope,
+        text: String,
+        source: TurnInputSource,
+        ops: &mut Vec<SpanOp>,
+    ) {
         if let Some(turn) = scope.open_turns.last_mut() {
-            for n in names {
-                if !turn.explicit_skill_names.contains(&n) {
-                    turn.explicit_skill_names.push(n);
+            match source {
+                TurnInputSource::Authoritative => {
+                    turn.input_source = Some(TurnInputSource::Authoritative);
+                }
+                TurnInputSource::Native => {
+                    // A rollout can contain several user-role rows for one turn:
+                    // injected runtime context, the initiating prompt, and later
+                    // steering/context rows. In the absence of the authoritative
+                    // event_msg, retain the first non-injected native prompt.
+                    if turn.input_source.is_some() || is_injected_user_context(&text) {
+                        return;
+                    }
+                    turn.input_source = Some(TurnInputSource::Native);
+                }
+            }
+            // Explicit skill mentions in the selected prompt (e.g. `$skill`,
+            // `/skills name`) are user intent. Native injected context is
+            // filtered before reaching this point, so it cannot contribute
+            // attribution when the legacy authoritative event is absent.
+            for name in explicit_skill_names(&text) {
+                if !turn.explicit_skill_names.contains(&name) {
+                    turn.explicit_skill_names.push(name);
                 }
             }
             ops.push(SpanOp::Merge(SpanRow {
@@ -858,22 +895,10 @@ impl CodexTranslator {
                 llm.last_output_ms = llm.last_output_ms.max(ts);
             }
         } else if role == "user" {
-            let names = explicit_skill_names(&text);
-            if let Some(turn) = scope.open_turns.last_mut() {
-                for name in names {
-                    if !turn.explicit_skill_names.contains(&name) {
-                        turn.explicit_skill_names.push(name);
-                    }
-                }
-                if let Some(metadata) = explicit_skill_metadata(&turn.explicit_skill_names) {
-                    ops.push(SpanOp::Merge(SpanRow {
-                        span_id: turn.span_id.clone(),
-                        root_span_id: self.root_span_id.clone(),
-                        metadata: Some(metadata),
-                        ..Default::default()
-                    }));
-                }
-            }
+            // Newer rollouts carry the initiating prompt solely as a native
+            // response item, without the older `event_msg.user_message` row.
+            // The task span must remain readable independently of its LLM input.
+            self.set_turn_input_text(scope, text.clone(), TurnInputSource::Native, ops);
         }
         scope.message_history.push(msg);
     }
@@ -1264,10 +1289,9 @@ impl CodexTranslator {
     }
 
     fn end_main_root(&mut self, fallback_ts: i64, ops: &mut Vec<SpanOp>) {
-        if self.root_ended || !self.root_opened {
+        if !self.root_opened {
             return;
         }
-        self.root_ended = true;
         let end_ms = self
             .main_path
             .as_ref()
@@ -1278,6 +1302,7 @@ impl CodexTranslator {
             span_id: self.root_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
             end_ms: Some(end_ms),
+            late_merge_key: Some(format!("session:stop:{end_ms}")),
             ..Default::default()
         }));
     }
@@ -1359,6 +1384,26 @@ impl CodexTranslator {
             }));
         }
     }
+}
+
+fn is_injected_user_context(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "# AGENTS.md instructions",
+        "<apps_instructions>",
+        "<collaboration_mode>",
+        "<environment_context>",
+        "<permissions instructions>",
+        "<plugins_instructions>",
+        "<recommended_plugins>",
+        "<skill>",
+        "<skills_instructions>",
+        "<subagent_notification>",
+        "<system_instruction>",
+        "<turn_aborted>",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
 }
 
 fn effective_transcript_path(event: &Envelope) -> Option<String> {

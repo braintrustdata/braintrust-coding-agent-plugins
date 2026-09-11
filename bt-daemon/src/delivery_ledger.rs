@@ -268,6 +268,16 @@ mod tests {
         })
     }
 
+    fn late_terminal_merge(span_id: &str, key: &str, end_ms: i64) -> SpanOp {
+        SpanOp::Merge(SpanRow {
+            span_id: span_id.into(),
+            root_span_id: "root".into(),
+            end_ms: Some(end_ms),
+            late_merge_key: Some(key.into()),
+            ..Default::default()
+        })
+    }
+
     #[tokio::test]
     async fn a_destination_receives_a_terminal_span_only_once_across_sink_instances() {
         let temp = tempfile::tempdir().unwrap();
@@ -368,6 +378,53 @@ mod tests {
             third.emit(&[late_merge("span-1", "usage")]).await.unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_root_delivers_each_distinct_terminal_refresh_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = RecordingSink::default();
+        let mut first = LedgerSink::new(
+            Box::new(first),
+            temp.path(),
+            "codex",
+            "session-1",
+            Some(&config("project-a")),
+        )
+        .await;
+        assert_eq!(
+            first
+                .emit(&[late_terminal_merge("root", "session:stop:3", 3)])
+                .await
+                .unwrap(),
+            1
+        );
+        first.flush().await.unwrap();
+
+        let resumed = RecordingSink::default();
+        let mut resumed = LedgerSink::new(
+            Box::new(resumed),
+            temp.path(),
+            "codex",
+            "session-1",
+            Some(&config("project-a")),
+        )
+        .await;
+        assert_eq!(
+            resumed
+                .emit(&[late_terminal_merge("root", "session:stop:3", 3)])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            resumed
+                .emit(&[late_terminal_merge("root", "session:stop:5", 5)])
+                .await
+                .unwrap(),
+            1
+        );
+        resumed.flush().await.unwrap();
     }
 
     #[tokio::test]

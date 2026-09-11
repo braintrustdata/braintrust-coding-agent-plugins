@@ -27,8 +27,12 @@ fn write_transcript(path: &std::path::Path) {
                 "payload": { "type": "task_started", "turn_id": "t1" } }),
         json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "turn_context",
                 "payload": { "turn_id": "t1", "model": "gpt-5.5" } }),
-        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
-                "payload": { "type": "user_message", "message": "list the files" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+                "payload": { "type": "message", "role": "user",
+                             "content": [{ "type": "input_text", "text": "# AGENTS.md instructions for /test/project\nRead $review" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+                "payload": { "type": "message", "role": "user",
+                             "content": [{ "type": "input_text", "text": "list the files" }] } }),
         json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item",
                 "payload": { "type": "reasoning",
                              "summary": [{ "type": "summary_text", "text": "I'll run ls" }],
@@ -199,6 +203,13 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
     let turn = find(&rows, SpanType::Task, "turn: t1");
     assert_eq!(turn.parent_span_ids, vec![root.span_id.clone()]);
     assert_eq!(turn.input, Some(json!("list the files")));
+    assert!(
+        turn.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("loaded_skill_names"))
+            .is_none(),
+        "injected context must not be attributed as an explicitly requested skill"
+    );
     assert_eq!(turn.output, Some(json!("Here are the files.")));
     assert_eq!(
         turn.metadata.as_ref().unwrap()["model"],
@@ -214,6 +225,7 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
     let llm = find(&rows, SpanType::Llm, "gpt-5.5");
     assert_eq!(llm.parent_span_ids, vec![turn.span_id.clone()]);
     assert!(llm.end_ms.is_some(), "llm closed by token_count");
+    assert_eq!(llm.start_ms, Some(1_767_225_602_000));
     let m = llm.metrics.as_ref().unwrap();
     assert_eq!(m["prompt_tokens"], json!(100.0));
     assert_eq!(m["completion_tokens"], json!(20.0));
@@ -222,6 +234,10 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
         llm.output.as_ref().unwrap()[0]["summary"][0],
         json!({ "type": "summary_text", "text": "I'll run ls" })
     );
+
+    let tool = find(&rows, SpanType::Tool, "shell");
+    assert_eq!(tool.start_ms, Some(1_767_225_607_000));
+    assert_eq!(tool.end_ms, Some(1_767_225_609_000));
 
     // Tool span under the turn.
     let tool = find(&rows, SpanType::Tool, "shell");
@@ -248,6 +264,97 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
             .filter(|r| r.span_type == SpanType::Tool)
             .count(),
         1
+    );
+}
+
+#[test]
+fn codex_trailing_injected_user_row_does_not_replace_hook_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let records = [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
+                "payload": { "id": "session-1", "cwd": "/test/project" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+                "payload": { "type": "user_message", "message": "fix the timestamps" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+                "payload": { "type": "message", "role": "user",
+                             "content": [{ "type": "input_text", "text": "<skill>$review injected context</skill>" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "t1" } }),
+    ];
+    let mut file = std::fs::File::create(&transcript).unwrap();
+    for record in records {
+        writeln!(file, "{}", line(record)).unwrap();
+    }
+
+    let path = transcript.to_str().unwrap();
+    let reg = Registry::default_agents();
+    let mut translator = reg.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let rows = reduce(
+        translator
+            .handle(&envelope("s", "SessionStart", path, json!({})), &ctx)
+            .unwrap(),
+    );
+
+    let turn = find(&rows, SpanType::Task, "turn: t1");
+    assert_eq!(turn.input, Some(json!("fix the timestamps")));
+    assert!(turn
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("loaded_skill_names"))
+        .is_none());
+}
+
+#[test]
+fn codex_native_prompt_ignores_surrounding_injected_user_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let records = [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
+                "payload": { "id": "session-1", "cwd": "/test/project" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+                "payload": { "type": "message", "role": "user",
+                             "content": [{ "type": "input_text", "text": "<environment_context>injected before</environment_context>" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+                "payload": { "type": "message", "role": "user",
+                             "content": [{ "type": "input_text", "text": "$review fix the timestamps" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item",
+                "payload": { "type": "message", "role": "user",
+                             "content": [{ "type": "input_text", "text": "<skill>$review injected after</skill>" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "t1" } }),
+    ];
+    let mut file = std::fs::File::create(&transcript).unwrap();
+    for record in records {
+        writeln!(file, "{}", line(record)).unwrap();
+    }
+
+    let path = transcript.to_str().unwrap();
+    let reg = Registry::default_agents();
+    let mut translator = reg.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let rows = reduce(
+        translator
+            .handle(&envelope("s", "SessionStart", path, json!({})), &ctx)
+            .unwrap(),
+    );
+
+    let turn = find(&rows, SpanType::Task, "turn: t1");
+    assert_eq!(turn.input, Some(json!("$review fix the timestamps")));
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["loaded_skill_names"],
+        json!(["review"])
     );
 }
 
@@ -476,6 +583,63 @@ fn codex_stop_closes_turn_before_late_task_complete() {
     let turn = find(&rows, SpanType::Task, "turn: t1");
     assert_eq!(turn.end_ms, Some(0), "Stop hook closes the active turn");
     assert_eq!(turn.output, Some(json!("done")));
+}
+
+#[test]
+fn codex_later_stop_extends_session_root_through_resumed_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let path = transcript.to_str().unwrap();
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
+                "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "t1" } }),
+    ] {
+        append(&transcript, record);
+    }
+
+    let reg = Registry::default_agents();
+    let mut translator = reg.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let mut ops = translator
+        .handle(&envelope("s", "Stop", path, json!({})), &ctx)
+        .unwrap();
+
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t2" } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "t2" } }),
+    ] {
+        append(&transcript, record);
+    }
+    ops.extend(
+        translator
+            .handle(&envelope("s", "Stop", path, json!({})), &ctx)
+            .unwrap(),
+    );
+    ops.extend(translator.flush(&ctx).unwrap());
+
+    let root_refresh_keys = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Insert(row) | SpanOp::Merge(row) => row.late_merge_key.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        root_refresh_keys,
+        ["session:stop:1767225603000", "session:stop:1767225605000"]
+    );
+
+    let rows = reduce(ops);
+    let root = find(&rows, SpanType::Task, "codex: app");
+    assert_eq!(root.end_ms, Some(1_767_225_605_000));
 }
 
 // ---- compaction & subagent coverage --------------------------------------
