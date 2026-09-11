@@ -55,11 +55,11 @@ use anyhow::Context;
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use clap::{Args, ValueEnum};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use wire::{
     method, Envelope, ManagedRunFlushParams, SessionConfig, SessionRoute, StatusResult,
     PROTOCOL_VERSION,
@@ -67,6 +67,7 @@ use wire::{
 
 const MANAGED_RUN_ID_ENV: &str = "BT_TRACE_MANAGED_RUN_ID";
 const MANAGED_RUN_FLUSH_TIMEOUT_MS: u64 = 10_000;
+const MUSE_MSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -611,15 +612,7 @@ pub async fn run_import(
                 "Muse import does not support --attach yet; use a completed export-v1 session"
             )
         }
-        let session_ids = if args.all {
-            muse_msp_session_ids()?
-        } else {
-            args.session_ids.clone()
-        };
-        if session_ids.is_empty() {
-            anyhow::bail!("no durable Muse sessions found to import")
-        }
-        let exports = export_muse_sessions(&session_ids)?;
+        let exports = prepare_muse_exports(&args).await?;
         return import_muse_exports_with_ledger(
             &exports,
             opts,
@@ -644,13 +637,26 @@ pub async fn run_import(
     import_transcripts_with_ledger(&files, args.source, opts, config, Some(ledger_dir)).await
 }
 
-fn export_muse_sessions(session_ids: &[String]) -> anyhow::Result<tempfile::TempDir> {
+async fn prepare_muse_exports(args: &ImportArgs) -> anyhow::Result<tempfile::TempDir> {
+    let session_ids = if args.all {
+        muse_msp_session_ids().await?
+    } else {
+        args.session_ids.clone()
+    };
+    if session_ids.is_empty() {
+        anyhow::bail!("no durable Muse sessions found to import")
+    }
+    export_muse_sessions(&session_ids).await
+}
+
+async fn export_muse_sessions(session_ids: &[String]) -> anyhow::Result<tempfile::TempDir> {
     let directory = tempfile::Builder::new()
         .prefix("bt-muse-import-")
         .tempdir()?;
     let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
     for (index, session_id) in session_ids.iter().enumerate() {
-        let output = std::process::Command::new(&executable)
+        let output = tokio::process::Command::new(&executable)
+            .kill_on_drop(true)
             .args([
                 OsString::from("export"),
                 OsString::from("--session"),
@@ -659,6 +665,7 @@ fn export_muse_sessions(session_ids: &[String]) -> anyhow::Result<tempfile::Temp
             ])
             .arg(directory.path().join(format!("{index}.json")))
             .output()
+            .await
             .with_context(|| {
                 format!(
                     "run {} export for Muse session {session_id}",
@@ -678,10 +685,11 @@ fn export_muse_sessions(session_ids: &[String]) -> anyhow::Result<tempfile::Temp
 /// List durable Muse sessions through the read-only MSP surface. This never
 /// resumes a session, obtains a writer lease, or subscribes to its view; the
 /// export command remains the authoritative content reader.
-fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
+async fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
     const MAX_PAGES: usize = 1_000;
     let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
-    let mut child = ProcessCommand::new(&executable)
+    let mut child = tokio::process::Command::new(&executable)
+        .kill_on_drop(true)
         .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -695,7 +703,7 @@ fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
         })?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = BufReader::new(stdout).lines();
     let mut request_id = 1u64;
     muse_msp_request(
         &mut stdin,
@@ -703,10 +711,11 @@ fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
         request_id,
         "initialize",
         serde_json::json!({"clientInfo":{"name":"braintrust_muse_import","version":"1"}}),
-    )?;
+    )
+    .await?;
     // Muse follows the JSON-RPC/MSP initialization handshake: requests after
     // `initialize` are rejected until this notification has been flushed.
-    muse_msp_notify(&mut stdin, "initialized")?;
+    muse_msp_notify(&mut stdin, "initialized").await?;
     let mut cursor = None;
     let mut sessions = Vec::new();
     for _ in 0..MAX_PAGES {
@@ -717,7 +726,8 @@ fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
             request_id,
             "session/list",
             serde_json::json!({"cursor": cursor, "limit": 200}),
-        )?;
+        )
+        .await?;
         let page = result
             .get("sessions")
             .and_then(serde_json::Value::as_array)
@@ -739,7 +749,7 @@ fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
         }
     }
     drop(stdin);
-    let output = child.wait_with_output()?;
+    let output = child.wait_with_output().await?;
     if !output.status.success() {
         anyhow::bail!(
             "Muse MSP session listing failed: {}",
@@ -751,49 +761,56 @@ fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
     Ok(sessions)
 }
 
-fn muse_msp_notify(stdin: &mut impl Write, method: &str) -> anyhow::Result<()> {
-    serde_json::to_writer(
-        &mut *stdin,
-        &serde_json::json!({"jsonrpc":"2.0", "method":method}),
-    )?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
+async fn muse_msp_notify<W>(stdin: &mut W, method: &str) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut frame = serde_json::to_string(&serde_json::json!({"jsonrpc":"2.0", "method":method}))?;
+    frame.push('\n');
+    stdin.write_all(frame.as_bytes()).await?;
+    stdin.flush().await?;
     Ok(())
 }
 
-fn muse_msp_request(
-    stdin: &mut impl Write,
-    reader: &mut impl BufRead,
+async fn muse_msp_request<R, W>(
+    stdin: &mut W,
+    reader: &mut Lines<R>,
     id: u64,
     method: &str,
     params: serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    serde_json::to_writer(
-        &mut *stdin,
+) -> anyhow::Result<serde_json::Value>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut request = serde_json::to_string(
         &serde_json::json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
     )?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-    let mut line = String::new();
-    for _ in 0..10_000 {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            anyhow::bail!("Muse MSP closed before responding to {method}")
+    request.push('\n');
+    stdin.write_all(request.as_bytes()).await?;
+    stdin.flush().await?;
+    tokio::time::timeout(MUSE_MSP_REQUEST_TIMEOUT, async {
+        loop {
+            let line = reader
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Muse MSP closed before responding to {method}"))?;
+            let frame: serde_json::Value = serde_json::from_str(&line)
+                .with_context(|| format!("parse Muse MSP frame while waiting for {method}"))?;
+            if frame.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = frame.get("error") {
+                anyhow::bail!("Muse MSP {method} failed: {error}")
+            }
+            return frame
+                .get("result")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Muse MSP {method} response has no result"));
         }
-        let frame: serde_json::Value = serde_json::from_str(&line)
-            .with_context(|| format!("parse Muse MSP frame while waiting for {method}"))?;
-        if frame.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
-            continue;
-        }
-        if let Some(error) = frame.get("error") {
-            anyhow::bail!("Muse MSP {method} failed: {error}")
-        }
-        return frame
-            .get("result")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Muse MSP {method} response has no result"));
-    }
-    anyhow::bail!("Muse MSP sent too many frames before responding to {method}")
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Muse MSP timed out waiting for {method}"))?
 }
 
 async fn import_muse_exports_with_ledger(
@@ -1578,7 +1595,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
-    use std::io::Cursor;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     #[derive(Debug, Parser)]
     struct ImportCli {
@@ -1661,29 +1678,44 @@ mod tests {
         assert!(!should_flush_hook_event("turn_completed", true));
     }
 
-    #[test]
-    fn muse_msp_handshake_writes_notification_and_skips_notifications() {
-        let mut stdin = Vec::new();
-        muse_msp_notify(&mut stdin, "initialized").unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&stdin).unwrap(),
-            json!({"jsonrpc": "2.0", "method": "initialized"})
-        );
+    #[tokio::test]
+    async fn muse_msp_handshake_writes_notification_and_skips_notifications() {
+        let (client, server) = tokio::io::duplex(4_096);
+        let (client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, mut server_writer) = tokio::io::split(server);
+        let server = tokio::spawn(async move {
+            let mut incoming = BufReader::new(server_reader).lines();
+            let initialized = incoming.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&initialized).unwrap(),
+                json!({"jsonrpc": "2.0", "method": "initialized"})
+            );
+            let request = incoming.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"],
+                7
+            );
+            server_writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/changed\"}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"sessions\":[]}}\n")
+                .await
+                .unwrap();
+        });
 
-        let mut reader = BufReader::new(Cursor::new(
-            b"{\"jsonrpc\":\"2.0\",\"method\":\"session/changed\"}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"sessions\":[]}}\n",
-        ));
+        let mut reader = BufReader::new(client_reader).lines();
+        muse_msp_notify(&mut client_writer, "initialized")
+            .await
+            .unwrap();
         let result = muse_msp_request(
-            &mut stdin,
+            &mut client_writer,
             &mut reader,
             7,
             "session/list",
             json!({"cursor": null, "limit": 200}),
         )
+        .await
         .unwrap();
         assert_eq!(result, json!({"sessions": []}));
-        let frames = String::from_utf8(stdin).unwrap();
-        assert!(frames.contains("\"method\":\"session/list\""));
+        server.await.unwrap();
     }
 
     #[test]
