@@ -95,6 +95,7 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
     }
     match source {
         "codex" => home().join(".codex").join("braintrust.json"),
+        "muse" => muse_config_dir().join("braintrust.json"),
         "claude" | "claude-code" => claude_config_dir().join("braintrust.json"),
         "opencode" => std::env::var_os("XDG_CONFIG_HOME")
             .filter(|path| !path.is_empty())
@@ -110,6 +111,15 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
             .join("braintrust.json"),
         other => data_dir(None).join("agents").join(format!("{other}.json")),
     }
+}
+
+/// Muse Code's user configuration directory.
+pub(crate) fn muse_config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"))
+        .join("muse")
 }
 
 /// Claude Code's shared settings file. Braintrust never mutates this file;
