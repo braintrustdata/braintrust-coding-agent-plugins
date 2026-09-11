@@ -71,7 +71,7 @@ Cross-repository pushes use `GH_TOKEN` or ambient Git credentials.
 
 ## Releasing
 
-Run **Prepare plugin release** (`release.yml`) on `main` with a plugin and
+Run **Release Plugin** (`release.yml`) on `main` with a plugin and
 version. It opens or updates `release/<plugin>/v<version>` using Braintrust Bot,
 with the manifest changes and a monorepo-only
 `.github/release-versions/<plugin>` approval record. The record gives Antigravity
@@ -79,14 +79,17 @@ a reviewable diff without adding a native manifest version. Preparation never
 tags or deploys.
 
 A human approves and merges the PR under the existing branch protection rules.
-`release-merged.yml` then calls `_release.yml` with that PR's exact merge SHA,
-verifies the reviewed versions, creates `v<version>-<plugin>` and its GitHub
-Release, deploys the distribution, and creates its `v<version>` tag/release.
-It never pushes source changes to `main`. CI runs on release PRs; the current
-rules require one approval but do not require passing CI.
+That merge starts a new run of **Release Plugin** (`release.yml`), which calls
+`_release.yml` with the PR's exact merge SHA, verifies the reviewed versions,
+creates `v<version>-<plugin>` and its GitHub Release, deploys the distribution,
+and creates its `v<version>` tag/release. Preparation and publication are
+separate event-driven runs under one workflow entry, named `Prepare …` and
+`Publish …`; no runner waits for review. Closing a PR without merging skips
+publication. It never pushes source changes to `main`. CI runs on release PRs;
+the current rules require one approval but do not require passing CI.
 
-If publishing is interrupted, rerun the post-merge workflow rather than
-preparing the merged version again. An existing source tag must match the
+If publishing is interrupted, rerun the **publication run** in Release Plugin
+rather than manually preparing the merged version again. An existing source tag must match the
 approved merge SHA; an existing distribution tag still rejects publication.
 An unchanged Antigravity artifact may reuse its previous distribution commit
 under the new version tag.

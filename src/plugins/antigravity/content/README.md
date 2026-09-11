@@ -1,45 +1,43 @@
 # Braintrust tracing for Google Antigravity
 
-Capture your Google Antigravity sessions as Braintrust traces, including
-prompts, model responses, and tool activity.
+> **This repository is generated.** It is built from
+> [braintrustdata/braintrust-coding-agent-plugins](https://github.com/braintrustdata/braintrust-coding-agent-plugins).
+> Don't edit files here — make changes and file issues in that repository, and they
+> will be rebuilt into this one.
 
-## Set up tracing
+Trace Google Antigravity coding sessions in Braintrust.
 
-Use the Braintrust CLI to install the plugin and choose where traces are sent:
+## Quickstart
+
+Prerequisites:
+
+- The latest [Google Antigravity](https://antigravity.google/)
+- The latest [Braintrust CLI (`bt`)](https://www.braintrust.dev/docs/reference/cli/quickstart)
+
+Install the plugin and choose where traces are sent:
 
 ```bash
-bt trace enable antigravity
+bt login --profile myprofile
+bt trace --profile myprofile -p my-coding-agent-project enable antigravity
 ```
 
-You can disable it later with:
+This causes Google Antigravity sessions to report to your configured project.
+You can disable the plugin later with:
 
 ```bash
 bt trace disable antigravity
 ```
 
-The plugin requires the `bt` CLI and a Unix-compatible `sh`. You can also
-install it directly with:
+## What is captured
 
-```bash
-agy plugin install https://github.com/braintrustdata/braintrust-antigravity-plugin
-```
+Each traced session includes:
 
-However, `bt trace enable antigravity` is recommended because it also saves
-your Braintrust destination.
+- a root span for the Antigravity session;
+- a turn span for each user request and visible assistant response;
+- LLM spans with available model inputs, outputs, and token usage;
+- tool spans with observable inputs, outputs, duration, outcome, and errors;
+- useful session metadata such as the Antigravity version, model, workspace,
+  and native conversation ID.
 
-## Import an existing conversation
-
-Replay a previous Antigravity conversation by its conversation ID:
-
-```bash
-bt trace import antigravity <conversation-id>
-```
-
-To continue reporting a conversation while it is active, add `--attach`:
-
-```bash
-bt trace import antigravity <conversation-id> --attach
-```
-
-Managed `bt trace run antigravity` support and Windows support are not yet
-available.
+The plugin forwards events only to the local Braintrust daemon. It does not
+contain Braintrust credentials or send traces directly to Braintrust.

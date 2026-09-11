@@ -1,7 +1,15 @@
-# Prepare a reviewable release PR. Human merge authorizes release-merged.yml
-# to tag the approved commit and publish the production distribution.
+# Prepare a release PR on manual dispatch; publish its exact merge commit when
+# the PR is merged. Both stages appear under Release Plugin as separate runs.
 # For deploy-only sandbox runs, use test-release.yml.
-name: Prepare plugin release
+name: Release Plugin
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('Prepare {0} {1}', inputs.plugin, inputs.version)
+      || github.event.pull_request.merged
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && startsWith(github.event.pull_request.head.ref, 'release/')
+      && format('Publish {0} (PR #{1})', github.event.pull_request.head.ref, github.event.pull_request.number)
+      || format('No release (PR #{0} closed)', github.event.pull_request.number) }}
 
 on:
   workflow_dispatch:
@@ -15,16 +23,20 @@ on:
         required: true
         type: choice
         options: [antigravity, claude, codex, grok]
+  pull_request:
+    types: [closed]
+    branches: [main]
 
 permissions:
   contents: read
 
-concurrency:
-  group: prepare-release-${{ inputs.plugin }}
-  cancel-in-progress: false
-
 jobs:
   prepare:
+    name: Prepare release PR
+    if: github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: prepare-release-${{ inputs.plugin }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -80,7 +92,7 @@ jobs:
         run: |
           set -euo pipefail
           if cmp -s <(printf '%s\n' "$VERSION") ".github/release-versions/$PLUGIN"; then
-            echo "::error::Release version is already merged; rerun its post-merge release workflow."
+            echo "::error::Release version is already merged; rerun its publication run in Release Plugin."
             exit 1
           fi
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
@@ -142,3 +154,91 @@ jobs:
             exit 1
           fi
           printf 'Release pull request: %s\n' "$PR_URL" >> "$GITHUB_STEP_SUMMARY"
+          printf '\nPreparation is complete. Merging the PR starts a publication run under Release Plugin; closing it without merging does not publish.\n' >> "$GITHUB_STEP_SUMMARY"
+
+  resolve:
+    name: Resolve merged release
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      plugin: ${{ steps.vars.outputs.plugin }}
+      version: ${{ steps.vars.outputs.version }}
+      source_sha: ${{ steps.vars.outputs.source_sha }}
+      dist_repo: ${{ steps.vars.outputs.dist_repo }}
+    steps:
+      - name: Resolve merged release request
+        id: vars
+        env:
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SOURCE_REPO: ${{ github.repository }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          RELEASE_BRANCH: ${{ github.event.pull_request.head.ref }}
+          SOURCE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$PR_MERGED" != "true" ] || [ "$PR_HEAD_REPO" != "$SOURCE_REPO" ] || [ "$PR_BASE_REF" != "main" ]; then
+            echo "::error::Production releases require a merged same-repository PR targeting main."
+            exit 1
+          fi
+          if [[ ! "$RELEASE_BRANCH" =~ ^release/(antigravity|claude|codex|grok)/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Malformed release branch; expected release/<plugin>/vMAJOR.MINOR.PATCH."
+            exit 1
+          fi
+          plugin="${BASH_REMATCH[1]}"
+          version="${BASH_REMATCH[2]}"
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The merged release must have a full lowercase commit SHA."
+            exit 1
+          fi
+          case "$plugin" in
+            antigravity) dist_repo=braintrustdata/braintrust-antigravity-plugin ;;
+            claude) dist_repo=braintrustdata/braintrust-claude-plugin ;;
+            codex) dist_repo=braintrustdata/braintrust-codex-plugin ;;
+            grok) dist_repo=braintrustdata/braintrust-grok-plugin ;;
+          esac
+          {
+            printf 'plugin=%s\n' "$plugin"
+            printf 'version=%s\n' "$version"
+            printf 'source_sha=%s\n' "$SOURCE_SHA"
+            printf 'dist_repo=%s\n' "$dist_repo"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout approved merge commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ steps.vars.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Verify approved release marker
+        id: marker
+        env:
+          PLUGIN: ${{ steps.vars.outputs.plugin }}
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! cmp -s <(printf '%s\n' "$VERSION") ".github/release-versions/$PLUGIN"; then
+            echo "::error::The approved release marker must contain exactly the requested version and a newline."
+            exit 1
+          fi
+
+  release:
+    name: Publish approved release
+    permissions:
+      contents: write
+    needs: resolve
+    uses: ./.github/workflows/_release.yml
+    with:
+      plugin: ${{ needs.resolve.outputs.plugin }}
+      version: ${{ needs.resolve.outputs.version }}
+      source_sha: ${{ needs.resolve.outputs.source_sha }}
+      dist_repo: ${{ needs.resolve.outputs.dist_repo }}
+      record: true
+    secrets: inherit
