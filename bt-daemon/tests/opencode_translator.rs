@@ -121,6 +121,77 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
 }
 
 #[test]
+fn opencode_idle_updates_a_resumable_session_root() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = vec![
+        event(
+            "session.created",
+            1,
+            json!({"properties":{"info":{"id":"native"}}}),
+        ),
+        event(
+            "chat.message",
+            2,
+            json!({"input":{"sessionID":"native"},"output":{"parts":[{"type":"text","text":"first"}]}}),
+        ),
+        event(
+            "message.part.updated",
+            3,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"one","type":"text","text":"one"}}}),
+        ),
+        event(
+            "message.updated",
+            4,
+            json!({"properties":{"info":{"id":"one","sessionID":"native","role":"assistant","providerID":"openai","modelID":"gpt-5","time":{"created":2,"completed":4},"tokens":{}}}}),
+        ),
+        event(
+            "session.idle",
+            5,
+            json!({"properties":{"sessionID":"native"}}),
+        ),
+        event(
+            "chat.message",
+            10,
+            json!({"input":{"sessionID":"native"},"output":{"parts":[{"type":"text","text":"second"}]}}),
+        ),
+        event(
+            "message.part.updated",
+            11,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"two","type":"text","text":"two"}}}),
+        ),
+        event(
+            "message.updated",
+            12,
+            json!({"properties":{"info":{"id":"two","sessionID":"native","role":"assistant","providerID":"openai","modelID":"gpt-5","time":{"created":10,"completed":12},"tokens":{}}}}),
+        ),
+        event(
+            "session.idle",
+            13,
+            json!({"properties":{"sessionID":"native"}}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for event in events {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let root = rows.values().find(|row| row.name == "OpenCode").unwrap();
+    assert_eq!(root.metadata.as_ref().unwrap()["total_turns"], 2);
+    assert_eq!(root.end_ms, Some(13));
+    assert_eq!(
+        rows.values()
+            .filter(|row| row.name.starts_with("Turn "))
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn opencode_compaction_replaces_old_prefix_and_preserves_native_tail() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("opencode", "root-session");
