@@ -553,6 +553,67 @@ async fn imports_native_claude_transcript_with_multiple_turns_and_tools() {
 }
 
 #[tokio::test]
+async fn imports_claude_followups_as_sequential_turns_after_a_compact_summary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("claude.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"type":"user","timestamp":"2026-01-01T00:00:01Z","sessionId":"claude-followup","cwd":"/tmp/demo","message":{"content":"first request"}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:02Z","sessionId":"claude-followup","requestId":"first-response","message":{"id":"first-response","model":"claude-test","content":[{"type":"text","text":"first response"}],"usage":{"input_tokens":1,"output_tokens":1}}}),
+            json!({"type":"user","timestamp":"2026-01-01T00:00:03Z","sessionId":"claude-followup","isCompactSummary":true,"message":{"content":"internal summary"}}),
+            json!({"type":"user","timestamp":"2026-01-01T00:00:04Z","sessionId":"claude-followup","message":{"content":"follow up"}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:05Z","sessionId":"claude-followup","requestId":"second-response","message":{"id":"second-response","model":"claude-test","content":[{"type":"text","text":"second response"}],"usage":{"input_tokens":1,"output_tokens":1}}}),
+        ],
+    );
+    let subagents = tmp.path().join("claude/subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    write_jsonl(
+        &subagents.join("agent-orphan-followup.jsonl"),
+        &[
+            json!({"type":"user","isSidechain":true,"agentId":"orphan-followup","timestamp":"2026-01-01T00:00:04Z","sessionId":"claude-followup","message":{"content":"follow up"}}),
+            json!({"type":"assistant","isSidechain":true,"agentId":"orphan-followup","timestamp":"2026-01-01T00:00:04Z","sessionId":"claude-followup","message":{"content":[{"type":"text","text":"follow up"}]}}),
+        ],
+    );
+    write_jsonl(
+        &subagents.join("agent-orphan-summary.jsonl"),
+        &[
+            json!({"type":"user","isSidechain":true,"agentId":"orphan-summary","timestamp":"2026-01-01T00:00:05Z","sessionId":"claude-followup","message":{"content":"summarize the session"}}),
+            json!({"type":"assistant","isSidechain":true,"agentId":"orphan-summary","timestamp":"2026-01-01T00:00:05Z","sessionId":"claude-followup","message":{"content":[{"type":"text","text":"internal summary"}]}}),
+        ],
+    );
+
+    let output = tmp.path().join("spans");
+    import_transcript(
+        &transcript,
+        ImportSource::Claude,
+        options(&output),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let rows = rows(&output.join("claude-followup.ndjson"));
+    let task_inserts = rows
+        .iter()
+        .filter_map(|op| op.get("Insert"))
+        .filter(|row| row.get("span_type").and_then(Value::as_str) == Some("task"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        task_inserts.len(),
+        3,
+        "unlinked child transcripts must not become subagents"
+    );
+    assert!(task_inserts.iter().all(|row| !row["name"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("subagent:")));
+    assert!(task_inserts.iter().any(|row| row["name"] == "Turn 1"));
+    assert!(task_inserts.iter().any(|row| row["name"] == "Turn 2"));
+}
+
+#[tokio::test]
 async fn imports_non_monotonic_claude_records_into_their_native_turns() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("claude.jsonl");
