@@ -1,11 +1,11 @@
 use super::{
-    envelope, file_session_id, find_jsonl_files, read_jsonl_records, string_at, timestamp_bounds,
-    timestamp_ms, validate_session_id,
+    envelope, file_session_id, find_jsonl_files, read_complete_jsonl_records, read_jsonl_records,
+    string_at, timestamp_bounds, timestamp_ms, validate_session_id,
 };
 use crate::wire::Envelope;
 use anyhow::bail;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
@@ -279,7 +279,7 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
     paths.sort();
 
     let mut result_records = HashMap::<String, (usize, Option<String>)>::new();
-    let mut calls = HashMap::<String, (usize, Option<String>)>::new();
+    let mut calls = HashMap::<String, (usize, Option<String>, Option<String>)>::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(agent_id) = string_at(record, "/toolUseResult/agentId") {
             let call_id = record
@@ -306,56 +306,117 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
             let Some(call_id) = string_at(block, "/id") else {
                 continue;
             };
-            calls.insert(call_id, (index, string_at(block, "/input/subagent_type")));
+            calls.insert(
+                call_id,
+                (
+                    index,
+                    string_at(block, "/input/subagent_type"),
+                    string_at(block, "/input/prompt"),
+                ),
+            );
         }
     }
 
-    let fallback_index = records.len().saturating_sub(1);
-    paths
+    let completed_calls = result_records
+        .values()
+        .filter_map(|(_, call_id)| call_id.as_deref())
+        .collect::<HashSet<_>>();
+    let mut unmatched_calls = calls
+        .iter()
+        .filter(|(call_id, _)| !completed_calls.contains(call_id.as_str()))
+        .map(|(call_id, (index, agent_type, prompt))| {
+            (
+                call_id.clone(),
+                *index,
+                timestamp_ms(&records[*index]).unwrap_or_default(),
+                agent_type.clone(),
+                prompt.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    unmatched_calls.sort_by_key(|(_, index, _, _, _)| *index);
+
+    let mut children = Vec::new();
+    for path in paths {
+        let Some(agent_id) = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("agent-"))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let records = if result_records.contains_key(&agent_id) {
+            read_jsonl_records(&path)?
+        } else {
+            read_complete_jsonl_records(&path)?
+        };
+        let start_ms = timestamp_bounds(&records).0;
+        children.push((path, agent_id, records, start_ms));
+    }
+    children.sort_by(|left, right| left.3.cmp(&right.3).then_with(|| left.0.cmp(&right.0)));
+
+    let subagents = children
         .into_iter()
-        .filter_map(|subagent_path| {
-            let name = subagent_path.file_stem()?.to_str()?;
-            let agent_id = name.strip_prefix("agent-")?.to_owned();
-            let (record_index, call_id) = result_records
-                .get(&agent_id)
-                .cloned()
-                .unwrap_or((fallback_index, None));
+        .filter_map(|(subagent_path, agent_id, subagent_records, child_start)| {
+            // A completed tool result is the strongest parent/child link. If
+            // the session was interrupted first, Claude still leaves both the
+            // Agent call and a sidechain whose initial prompt matches that call.
+            // Files with neither anchor are auxiliary or stale and must not
+            // become synthetic `subagent: agent` outputs on the final turn.
+            let (record_index, call_id) = if let Some(link) = result_records.get(&agent_id) {
+                link.clone()
+            } else {
+                let child_prompt = subagent_records.iter().find_map(|record| {
+                    (record.get("isSidechain").and_then(Value::as_bool) == Some(true)
+                        && string_at(record, "/agentId").as_deref() == Some(&agent_id))
+                    .then(|| string_at(record, "/message/content"))
+                    .flatten()
+                })?;
+                let child_type = subagent_records
+                    .iter()
+                    .find_map(|record| string_at(record, "/attributionAgent"));
+                let call_index = unmatched_calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, call_start, agent_type, prompt))| {
+                        prompt.as_deref() == Some(child_prompt.as_str())
+                            && *call_start <= child_start
+                            && match (agent_type.as_deref(), child_type.as_deref()) {
+                                (Some(expected), Some(actual)) => expected == actual,
+                                _ => true,
+                            }
+                    })
+                    .min_by_key(|(_, (_, _, call_start, _, _))| child_start - *call_start)
+                    .map(|(index, _)| index)?;
+                let (call_id, index, _, _, _) = unmatched_calls.remove(call_index);
+                (index, Some(call_id))
+            };
             let (start_index, agent_type) = call_id
                 .as_ref()
                 .and_then(|call_id| calls.get(call_id))
-                .cloned()
+                .map(|(index, agent_type, _)| (*index, agent_type.clone()))
                 .unwrap_or((record_index, None));
-            Some((
-                subagent_path,
+            let (_, child_end) = timestamp_bounds(&subagent_records);
+            let start_ms = timestamp_ms(&records[start_index])
+                .unwrap_or(child_start)
+                .min(child_start);
+            let end_ms = timestamp_ms(&records[record_index])
+                .unwrap_or(child_end)
+                .max(child_end);
+            Some(Subagent {
                 agent_id,
+                agent_type,
+                path: subagent_path.to_string_lossy().into_owned(),
                 start_index,
                 record_index,
-                agent_type,
-            ))
+                start_ms,
+                end_ms,
+                last_assistant_message: last_assistant_text(&subagent_records),
+            })
         })
-        .map(
-            |(subagent_path, agent_id, start_index, record_index, agent_type)| {
-                let subagent_records = read_jsonl_records(&subagent_path)?;
-                let (child_start, child_end) = timestamp_bounds(&subagent_records);
-                let start_ms = timestamp_ms(&records[start_index])
-                    .unwrap_or(child_start)
-                    .min(child_start);
-                let end_ms = timestamp_ms(&records[record_index])
-                    .unwrap_or(child_end)
-                    .max(child_end);
-                Ok(Subagent {
-                    agent_id,
-                    agent_type,
-                    path: subagent_path.to_string_lossy().into_owned(),
-                    start_index,
-                    record_index,
-                    start_ms,
-                    end_ms,
-                    last_assistant_message: last_assistant_text(&subagent_records),
-                })
-            },
-        )
-        .collect()
+        .collect::<Vec<_>>();
+    Ok(subagents)
 }
 
 fn import_envelope(

@@ -428,6 +428,28 @@ fn read_jsonl_records(path: &Path) -> anyhow::Result<Vec<Value>> {
         .collect()
 }
 
+fn read_complete_jsonl_records(path: &Path) -> anyhow::Result<Vec<Value>> {
+    let contents =
+        std::fs::read(path).with_context(|| format!("read transcript {}", path.display()))?;
+    let lines = contents.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let mut records = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice(line) {
+            Ok(record) => records.push(record),
+            Err(_) if index + 1 == lines.len() => break,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("parse transcript {} line {}", path.display(), index + 1)
+                });
+            }
+        }
+    }
+    Ok(records)
+}
+
 fn envelope(
     source: &str,
     source_version: Option<String>,
@@ -679,6 +701,127 @@ mod tests {
         assert_eq!(
             Path::new(events[3].payload["agent_transcript_path"].as_str().unwrap()),
             subagent
+        );
+    }
+
+    #[test]
+    fn claude_import_rejects_partial_completed_subagent_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session-a.jsonl");
+        let subagent = temp.path().join("session-a/subagents/agent-child-a.jsonl");
+        std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
+        let records = [
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:01Z","message":{"content":"delegate"}}),
+            json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"call-a","name":"Agent","input":{"prompt":"review this change"}}]}}),
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:05Z","toolUseResult":{"agentId":"child-a"},"message":{"content":[{"type":"tool_result","tool_use_id":"call-a","content":"done"}]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &subagent,
+            format!(
+                "{}\n{{\"type\":",
+                json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:04Z","message":{"content":[{"type":"text","text":"reviewed"}]}})
+            ),
+        )
+        .unwrap();
+
+        let error = transcript_envelopes(&transcript, ImportSource::Claude).unwrap_err();
+        assert!(format!("{error:#}").contains("line 2"));
+    }
+
+    #[test]
+    fn claude_import_keeps_interrupted_subagent_with_matching_agent_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session-a.jsonl");
+        let subagent = temp.path().join("session-a/subagents/agent-child-a.jsonl");
+        std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
+        let records = [
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:01Z","message":{"content":"delegate"}}),
+            json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"call-a","name":"Agent","input":{"subagent_type":"reviewer","prompt":"review this change"}}]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &subagent,
+            format!(
+                "{}\n{{\"type\":",
+                json!({"type":"user","isSidechain":true,"agentId":"child-a","sessionId":"session-a","timestamp":"2026-01-01T00:00:03Z","message":{"content":"review this change"}})
+            ),
+        )
+        .unwrap();
+
+        let events = transcript_envelopes(&transcript, ImportSource::Claude).unwrap();
+        assert!(events.iter().any(|event| {
+            event.event == "SubagentStart"
+                && event.payload["agent_id"] == json!("child-a")
+                && event.payload["agent_type"] == json!("reviewer")
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "SubagentStop"
+                && event.payload["agent_transcript_path"]
+                    .as_str()
+                    .is_some_and(|path| Path::new(path) == subagent)
+        }));
+    }
+
+    #[test]
+    fn claude_import_matches_interrupted_subagents_by_native_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session-a.jsonl");
+        let child_dir = temp.path().join("session-a/subagents");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let records = [
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:01Z","message":{"content":"delegate"}}),
+            json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"call-early","name":"Agent","input":{"subagent_type":"reviewer","prompt":"same prompt"}}]}}),
+            json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:10Z","message":{"content":[{"type":"tool_use","id":"call-late","name":"Agent","input":{"subagent_type":"reviewer","prompt":"same prompt"}}]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        for (agent_id, timestamp) in [
+            ("z-early", "2026-01-01T00:00:03Z"),
+            ("a-late", "2026-01-01T00:00:11Z"),
+        ] {
+            std::fs::write(
+                child_dir.join(format!("agent-{agent_id}.jsonl")),
+                json!({"type":"user","isSidechain":true,"agentId":agent_id,"sessionId":"session-a","timestamp":timestamp,"message":{"content":"same prompt"}}).to_string(),
+            )
+            .unwrap();
+        }
+
+        let events = transcript_envelopes(&transcript, ImportSource::Claude).unwrap();
+        let starts = events
+            .iter()
+            .filter(|event| event.event == "SubagentStart")
+            .map(|event| (event.payload["agent_id"].as_str().unwrap(), event.ts_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            vec![
+                ("z-early", 1_767_225_602_000),
+                ("a-late", 1_767_225_610_000)
+            ]
         );
     }
 
