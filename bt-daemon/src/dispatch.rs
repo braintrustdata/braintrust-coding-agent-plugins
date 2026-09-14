@@ -162,14 +162,23 @@ impl Session {
         self.last_activity.lock().unwrap().elapsed()
     }
 
+    /// Insert a flush in actor order without waiting for backend delivery.
+    pub(crate) async fn enqueue_flush(&self) -> anyhow::Result<oneshot::Receiver<u64>> {
+        self.touch();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(SessionMsg::Flush(reply_tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("session actor is gone"))?;
+        Ok(reply_rx)
+    }
+
     /// Ask the actor to drain and flush its sink, bounded by `timeout`.
     /// Returns `(flushed, pending)`.
     pub async fn flush(&self, timeout: std::time::Duration) -> (bool, u64) {
-        self.touch();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self.tx.send(SessionMsg::Flush(reply_tx)).await.is_err() {
+        let Ok(reply_rx) = self.enqueue_flush().await else {
             return (false, self.counters.queued.load(Ordering::Relaxed));
-        }
+        };
         match tokio::time::timeout(timeout, reply_rx).await {
             Ok(Ok(pending)) => (pending == 0, pending),
             _ => (false, self.counters.queued.load(Ordering::Relaxed)),
@@ -846,6 +855,54 @@ pub(crate) fn is_tool_lifecycle_event(event: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn enqueue_flush_preserves_boundary_without_waiting_for_delivery() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let session = Session {
+            source: "pi".into(),
+            tx,
+            counters: Arc::new(Counters::default()),
+            last_error: Arc::new(Mutex::new(None)),
+            permalink: Arc::new(Mutex::new(None)),
+            last_activity: Mutex::new(Instant::now()),
+        };
+        let envelope = |event| {
+            serde_json::from_value::<Envelope>(serde_json::json!({
+                "source": "pi", "session_id": "ordered-turns", "event": event,
+                "ts_ms": 1, "payload": {"event": {}}
+            }))
+            .unwrap()
+        };
+        session.enqueue(envelope("agent_end"), 1).await.unwrap();
+        // No actor is reading yet: enqueue must complete independently of delivery.
+        let mut completion =
+            tokio::time::timeout(std::time::Duration::from_secs(1), session.enqueue_flush())
+                .await
+                .expect("enqueue waited for delivery")
+                .unwrap();
+        session
+            .enqueue(envelope("before_agent_start"), 2)
+            .await
+            .unwrap();
+        assert!(matches!(
+            completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            matches!(rx.recv().await, Some(SessionMsg::Event(env, 1)) if env.event == "agent_end")
+        );
+        let Some(SessionMsg::Flush(reply)) = rx.recv().await else {
+            panic!("next turn overtook the boundary flush");
+        };
+        assert!(
+            matches!(rx.recv().await, Some(SessionMsg::Event(env, 2)) if env.event == "before_agent_start")
+        );
+        reply.send(1).unwrap();
+        assert_eq!(completion.await.unwrap(), 1);
+        drop(rx);
+        assert!(session.enqueue_flush().await.is_err());
+    }
 
     #[tokio::test]
     async fn grok_hydration_mirrors_transcripts_and_system_prompt_at_one_boundary() {
