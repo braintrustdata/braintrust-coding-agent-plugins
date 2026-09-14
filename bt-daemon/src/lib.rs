@@ -349,8 +349,8 @@ pub(crate) fn should_flush_ingress_event(env: &wire::Envelope) -> bool {
         Some(wire::FlushMode::FlushOnTurnEnd)
     );
     should_flush_hook_event(&env.event, flush_on_turn_end)
-        || (env.source == "pi"
-            && match env.event.as_str() {
+        || match env.source.as_str() {
+            "pi" => match env.event.as_str() {
                 // Preserve Pi's explicit lifecycle flushes even in batched mode.
                 "session_shutdown" | "session_compact" | "session_tree" => true,
                 // OMP can end an attempt while keeping the same turn open for retry.
@@ -360,7 +360,13 @@ pub(crate) fn should_flush_ingress_event(env: &wire::Envelope) -> bool {
                             != Some(true)
                 }
                 _ => false,
-            })
+            },
+            "opencode" => matches!(
+                env.event.as_str(),
+                "session.idle" | "session.deleted" | "session.error" | "server.instance.disposed"
+            ),
+            _ => false,
+        }
 }
 
 /// Capture one hook event from `stdin` and forward it to the daemon.
@@ -1512,6 +1518,30 @@ mod tests {
             assert!(!should_flush_ingress_event(&env));
             env.source = "pi".into();
         }
+    }
+
+    #[test]
+    fn opencode_lifecycle_events_flush_from_ingress() {
+        let mut env: wire::Envelope = serde_json::from_value(serde_json::json!({
+            "source": "opencode", "session_id": "opencode-session", "event": "session.idle",
+            "ts_ms": 1, "payload": {},
+            "route": {"flush_mode": "fire_and_forget"}
+        }))
+        .unwrap();
+        for event in [
+            "session.idle",
+            "session.deleted",
+            "session.error",
+            "server.instance.disposed",
+        ] {
+            env.event = event.into();
+            assert!(should_flush_ingress_event(&env));
+        }
+        env.event = "session.compacted".into();
+        assert!(!should_flush_ingress_event(&env));
+        env.event = "session.idle".into();
+        env.source = "pi".into();
+        assert!(!should_flush_ingress_event(&env));
     }
 
     #[test]

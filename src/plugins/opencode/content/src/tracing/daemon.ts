@@ -55,15 +55,14 @@ export function createDaemonTracingHooks(
       },
       route: config.route,
     });
-    if (event === "session.idle" || event === "session.deleted" || event === "session.error") {
-      await daemon.flush(daemonSessionId);
-    }
   };
 
   return {
     event: async ({ event }: { event: Event }) => {
       if (event.type === "server.instance.disposed") {
-        await daemon.flush(daemonSessionId);
+        // Give the daemon a durable terminal event before disconnecting. It owns
+        // the potentially slow backend flush, so OpenCode shutdown is not blocked.
+        await forward(event.type, { properties: event.properties });
         await daemon.close();
         return;
       }
