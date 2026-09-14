@@ -1,40 +1,52 @@
 # @braintrust/trace-opencode
 
-Braintrust tracing plugin for [OpenCode](https://opencode.ai). The JavaScript
-adapter forwards native OpenCode events to the installed `bt` daemon, which
-constructs and delivers the trace.
-
-Version 1 requires a current `bt` CLI with the OpenCode daemon translator. If
-`bt` or the translator is unavailable, tracing fails open and OpenCode keeps
-running.
+Trace [OpenCode](https://opencode.ai) sessions in Braintrust. The plugin sends
+events to the local `bt` daemon, which builds and uploads traces. OpenCode keeps
+running if tracing fails.
 
 - **Session spans**: Root span for each OpenCode session with metadata (workspace, hostname, etc.)
 - **Turn spans**: Captures each user-assistant interaction
+- **LLM spans**: Records completed model messages with available inputs, outputs, and usage
 - **Tool spans**: Records individual tool executions with inputs and outputs
 
-## Quick Start
+## Quickstart
+
+Install OpenCode and the
+[Braintrust CLI](https://www.braintrust.dev/docs/reference/cli/quickstart), then run:
 
 ```bash
-bt auth login
-bt trace enable opencode
+bt login
+bt trace enable opencode --project my-coding-agent
 opencode
 ```
 
-For one invocation without changing OpenCode's global tracing configuration,
-use `bt trace run --project <PROJECT> opencode -- [OPENCODE_ARGS...]`.
+This registers the npm plugin and saves its configuration. Use `--profile` or
+`--org` to choose a profile or organization. Restart OpenCode if it is already open.
+
+For one invocation without changing global tracing configuration:
+
+```bash
+bt trace run --project my-coding-agent opencode -- run "summarize this repository"
+```
+
+Historical import and live attach are not supported for OpenCode.
+
+## Compatibility
+
+The package declares `@opencode-ai/plugin` and `@opencode-ai/sdk` peers at
+`>=1.2.25`. CI checks package installation at that minimum and at `latest`,
+and runs real-agent integration tests with the latest OpenCode CLI.
 
 ## Configuration
 
-You can configure the plugin using a config file. `braintrust.json` is the
-only source of persistent tracing configuration; routing and enablement are
-never read directly from the environment.
+Settings load from these files, with project settings overriding global settings:
 
-### Config File
+- Global: `$XDG_CONFIG_HOME/opencode/braintrust.json`, or
+  `~/.config/opencode/braintrust.json` if `XDG_CONFIG_HOME` is unset
+- Project: `.opencode/braintrust.json`
 
-Create a `braintrust.json` file in one of these locations:
-
-- `.opencode/braintrust.json` - Project-level config
-- `~/.config/opencode/braintrust.json` - Global config
+`bt trace run` overrides tracing settings for one invocation. Files are merged
+at the top level: a project `route` replaces the global `route`.
 
 ```json
 {
@@ -48,34 +60,28 @@ Create a `braintrust.json` file in one of these locations:
 }
 ```
 
-### Config Options
+### Settings
 
-| Config Key | Env Var | Type | Default | Description |
-|------------|---------|------|---------|-------------|
-| `trace_to_braintrust` | — | boolean | `false` | Enable/disable tracing |
-| `enable_tools` | `BRAINTRUST_OPENCODE_ENABLE_TOOLS` | boolean | `true` | Register Braintrust tools in OpenCode |
-| `profile` | — | string | current `bt` profile | Select the `bt` auth profile used by tracing and tools |
-| `project` | — | string | `"opencode"` | Project name for traces and project-scoped tools |
-| `debug` | `BRAINTRUST_DEBUG` | boolean | `false` | Enable debug logging |
-| `org_name` | — | string | profile default | Organization selected within the tracing profile and for tools |
-| `additional_metadata` | — | | | JSON object of additional metadata to attach to the root span. Standard metadata keys take precedence on conflict. |
+| Config key | Default | Purpose |
+|---|---|---|
+| `trace_to_braintrust` | `false` | Enable tracing |
+| `enable_tools` | `true` | Register Braintrust tools; override with `BRAINTRUST_OPENCODE_ENABLE_TOOLS` |
+| `route.auth.profile_id` | unset | Saved profile ID written by `bt` setup |
+| `route.auth.profile` | current `bt` profile | Select a profile by name |
+| `route.auth.org_name` | profile default | Select an organization |
+| `route.destination` | project logs in `opencode` | Select the trace destination |
+| `route.additional_metadata` | unset | Add root-span metadata |
+| `route.flush_mode` | `fire_and_forget` in the default route | Control delivery flushing |
+| `debug` | `false` | Enable debug logging; override with `BRAINTRUST_DEBUG` |
 
-`enable_tools` and `debug` control local plugin behavior and can still be set
-from the environment. Tracing routing and enablement (`trace_to_braintrust`,
-`profile`, `project`, `org_name`, `additional_metadata`) come only from
-`braintrust.json` and `bt trace run`.
+Older files can still use top-level `profile`, `org_name`, `project`, and
+`additional_metadata`. For new files, use `bt trace enable` or the nested
+`route` format above. Include a destination when supplying a route.
 
-### Precedence
+Only `enable_tools` and `debug` read environment variables directly. Tracing
+settings come from these files or `bt trace run`.
 
-Configuration is loaded with the following precedence (later overrides earlier):
-
-1. Default values
-2. `~/.config/opencode/braintrust.json` (global config)
-3. `.opencode/braintrust.json` (project config)
-4. `bt trace run` invocation settings (tracing only, per-invocation, highest
-   priority; never written back to the config files)
-
-## Disabling Braintrust Tools
+## Disable Braintrust tools
 
 Set `enable_tools` to `false` to trace OpenCode sessions without registering Braintrust-branded tools (`braintrust_query_logs`, `braintrust_list_projects`, `braintrust_log_data`, `braintrust_get_experiments`):
 
@@ -83,7 +89,9 @@ Set `enable_tools` to `false` to trace OpenCode sessions without registering Bra
 {
   "trace_to_braintrust": true,
   "enable_tools": false,
-  "project": "my-project"
+  "route": {
+    "destination": { "type": "project_logs", "project_name": "my-project" }
+  }
 }
 ```
 
@@ -93,9 +101,9 @@ Or use the environment variable:
 BRAINTRUST_OPENCODE_ENABLE_TOOLS=false opencode
 ```
 
-## Adding Dynamic Metadata
+## Add root metadata
 
-Set `additional_metadata` via the config file to attach custom key-value pairs to the root span. This is useful for tagging traces in CI or linking them back to a specific run.
+Set `route.additional_metadata` to add fields to the root span:
 
 For one invocation without changing the persistent configuration, use
 `bt trace run --additional-metadata '{"ci": true, "run_id": "abc-123"}' opencode -- run "do the thing"`,
@@ -106,36 +114,50 @@ You can also set it via the config file:
 
 ```json
 {
-  "additional_metadata": {
-    "team": "platform"
+  "route": {
+    "destination": { "type": "project_logs", "project_name": "my-project" },
+    "additional_metadata": { "team": "platform" }
   }
 }
 ```
 
-The value must be a JSON object. Any keys that conflict with standard root span metadata (`session_id`, `workspace`, `directory`, `hostname`, `username`, `os`) will be overridden by the standard values.
+The value must be a JSON object. Built-in session metadata wins if keys conflict.
 
-## Trace Structure
+## Trace structure
 
-Sessions are traced with the following hierarchy:
+The daemon reconstructs sessions, turns, model messages, and tool executions:
 
+```text
+Session (task)
+├── Turn 1 (task)
+│   ├── Model response (llm)
+│   ├── Tool execution (tool)
+│   └── Model response (llm)
+└── Turn 2 (task)
 ```
-Session (task span)
-├── metadata: session_id, workspace, hostname, username, os
-├── Turn 1 (task span)
-│   ├── input: "user message"
-│   ├── metadata: turn_number, agent, model
-│   ├── Tool 1 (tool span)
-│   │   ├── input: tool arguments
-│   │   └── output: tool result
-│   └── Tool 2 (tool span)
-├── Turn 2 (task span)
-│   └── ...
-└── metrics: total_turns, total_tool_calls
+
+Model usage and metadata are included when OpenCode provides them. Child
+sessions are attached to their parent's active turn when that relationship is
+available to the translator.
+
+## Manage tracing
+
+```bash
+bt trace doctor opencode
+bt trace status
+bt trace update opencode
+bt trace disable opencode
 ```
 
 ## Runtime architecture
 
-The package never calls the Braintrust API from JavaScript. Tracing forwards
-native events over local JSON-RPC to `bt-daemon`. The four optional data-access
-tools invoke non-interactive `bt` CLI commands. In both cases, `bt` owns profile
-selection, credential storage, refresh, backend resolution, and API transport.
+Tracing sends events to the local daemon over JSON-RPC. The four optional
+Braintrust tools call `bt` commands. Both use `bt` for credentials and API access.
+
+## Development
+
+From the monorepo root, run `make validate-opencode` to build, check, and test
+the package. See the
+[contribution guide](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/src/plugins/opencode/content/CONTRIBUTING.md)
+for development instructions. The npm package contains compiled entrypoints;
+source changes belong in the monorepo.

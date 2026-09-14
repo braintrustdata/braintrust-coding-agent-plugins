@@ -25,15 +25,15 @@ Use `--profile` or `--org` when needed. Restart Codex after setup so it loads
 the plugin. Codex will apply its normal hook-review flow; approve the stable
 Braintrust hook definition through `/hooks` when prompted.
 
-To verify the daemon path is available:
+To inspect tracing configuration and daemon status:
 
 ```bash
-bt trace hook --help
+bt trace doctor codex
 bt trace status
 ```
 
 Hook setup or forwarding never fails a Codex turn. If installation fails or the
-daemon cannot accept an event, the launcher reports a bounded diagnostic and
+daemon cannot accept an event, the launcher reports the failure and
 exits successfully.
 
 ## Additional root metadata
@@ -46,3 +46,17 @@ For one invocation without changing the persistent configuration, use
 `bt trace run --additional-metadata '{"ci":true,"run_id":"abc-123"}' codex`,
 or set `BRAINTRUST_ADDITIONAL_METADATA` before that command (`bt trace run`
 still accepts it; a launched `codex` session's live hooks do not).
+
+## Tags and diagnostics
+
+Use repeatable `--tag` flags for filterable root-span tags. Inspect the effective
+configuration with `doctor` and delivery state with `status`:
+
+```bash
+bt trace enable codex --tag coding-agent --tag development
+bt trace doctor codex
+bt trace status
+```
+
+See the [distribution guide](../../README.md) for installation, one-off runs,
+transcript import, updates, and disablement.

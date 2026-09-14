@@ -25,3 +25,17 @@ To add fields to each root trace span, pass a JSON object (as
 `bt trace run claude` for one invocation. The hook itself never reads that
 environment variable — only `bt trace enable`, `bt trace run`, and
 `bt trace import` do.
+
+## Tags and diagnostics
+
+Use repeatable `--tag` flags for filterable root-span tags. Inspect the effective
+configuration with `doctor` and delivery state with `status`:
+
+```bash
+bt trace enable claude --tag coding-agent --tag development
+bt trace doctor claude
+bt trace status
+```
+
+See the [distribution guide](../../README.md) for installation, one-off runs,
+transcript import, updates, and disablement.
