@@ -1,49 +1,49 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "PreToolUse": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "PostToolUse": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "PostToolUseFailure": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "PermissionDenied": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "StopFailure": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "StopCancelled": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "Notification": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "SubagentStart": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "SubagentStop": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "PreCompact": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "PostCompact": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 5 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ],
     "SessionEnd": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"", "timeout": 15 }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
     ]
   }
 }

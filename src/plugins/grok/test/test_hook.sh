@@ -141,15 +141,9 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 assert "SessionEnd" in hooks, "terminal hook must use exact SessionEnd spelling"
 assert "SessionStop" not in hooks, "non-native terminal spelling must not be registered"
 for event, groups in hooks.items():
-    expected_timeout = 15 if event == "SessionEnd" else 5
-    timeouts = {
-        hook["timeout"]
-        for group in groups
-        for hook in group["hooks"]
-    }
-    assert timeouts == {expected_timeout}, (
-        f"{event} timeout {sorted(timeouts)} != {expected_timeout}"
-    )
+    for group in groups:
+        for hook in group["hooks"]:
+            assert "timeout" not in hook, f"{event} must use Grok's default timeout"
 PY
 
 echo "test: grok hook adapter OK"
