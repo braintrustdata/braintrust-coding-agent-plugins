@@ -753,10 +753,16 @@ impl Daemon {
         result
     }
 
-    /// Flush every live delivery route for one source session. This is used
+    /// Queue a flush on every live delivery route before dispatching more ingress.
+    /// Only the completion wait runs in a separate task. This is used
     /// only by the daemon worker after a turn-ending event has already been
     /// durably captured and acknowledged to the hook client.
-    async fn flush_source_session(&self, source: &str, session_id: &str, timeout: Duration) {
+    async fn enqueue_source_session_flush(
+        &self,
+        source: &str,
+        session_id: &str,
+        timeout: Duration,
+    ) {
         let sessions: Vec<_> = self
             .sessions
             .lock()
@@ -766,15 +772,26 @@ impl Daemon {
             .map(|(_, session)| session.clone())
             .collect();
         for session in sessions {
-            let (flushed, pending) = session.flush(timeout).await;
-            if !flushed {
-                tracing::warn!(
-                    source,
-                    session_id,
-                    pending,
-                    "out-of-band turn-end flush did not complete"
-                );
-            }
+            let reply = match session.enqueue_flush().await {
+                Ok(reply) => reply,
+                Err(error) => {
+                    tracing::warn!(source, session_id, %error, "turn-end flush enqueue failed");
+                    continue;
+                }
+            };
+            let source = source.to_owned();
+            let session_id = session_id.to_owned();
+            tokio::spawn(async move {
+                // Later events may remain queued after this boundary has flushed.
+                // Their presence does not make this boundary's flush incomplete.
+                if !matches!(tokio::time::timeout(timeout, reply).await, Ok(Ok(_))) {
+                    tracing::warn!(
+                        source,
+                        session_id,
+                        "out-of-band turn-end flush did not complete"
+                    );
+                }
+            });
         }
     }
 
@@ -845,13 +862,7 @@ async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
         return;
     }
 
-    let schedule_flush = crate::should_flush_hook_event(
-        &event.env.event,
-        matches!(
-            event.env.route.as_ref().map(|route| route.flush_mode),
-            Some(crate::wire::FlushMode::FlushOnTurnEnd)
-        ),
-    );
+    let schedule_flush = crate::should_flush_ingress_event(&event.env);
     let flush_source = event.env.source.clone();
     let flush_session_id = event.env.session_id.clone();
     let journal_through = event.journal_through;
@@ -874,12 +885,9 @@ async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
         }
     }
     if schedule_flush {
-        let daemon = daemon.clone();
-        tokio::spawn(async move {
-            daemon
-                .flush_source_session(&flush_source, &flush_session_id, Duration::from_secs(10))
-                .await;
-        });
+        daemon
+            .enqueue_source_session_flush(&flush_source, &flush_session_id, Duration::from_secs(10))
+            .await;
     }
 }
 

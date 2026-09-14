@@ -88,7 +88,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     name: string,
     event: unknown,
     ctx?: ExtensionContext,
-    flush = false,
+    updateUi = false,
   ): Promise<void> => {
     const descriptor = ctx ? remember(ctx) : undefined;
     if (!sessionId) return;
@@ -108,10 +108,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
       },
       route: config.route,
     });
-    if (flush) {
-      await client.flush(sessionId);
-      if (ctx) await refreshUi(ctx);
-    }
+    if (updateUi && ctx) await refreshUi(ctx);
   };
 
   pi.on("session_start", async (event, ctx) => {
@@ -134,9 +131,10 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   pi.on("session_compact", async (event, ctx) => forward("session_compact", event, ctx, true));
   pi.on("session_before_tree", async (event, ctx) => forward("session_before_tree", event, ctx));
   pi.on("session_tree", async (event, ctx) => forward("session_tree", event, ctx, true));
-  pi.on("agent_end", async (event) => forward("agent_end", event, undefined, true));
+  // All delivery flushing belongs to the daemon, including session shutdown.
+  pi.on("agent_end", async (event) => forward("agent_end", event));
   pi.on("session_shutdown", async (event, ctx) => {
-    await forward("session_shutdown", event, ctx, true);
+    await forward("session_shutdown", event, ctx);
     if (ctx.hasUI) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
       ctx.ui.setWidget(WIDGET_KEY, undefined);
