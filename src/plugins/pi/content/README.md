@@ -2,22 +2,16 @@
 
 [![npm version](https://img.shields.io/npm/v/%40braintrust%2Fpi-extension)](https://www.npmjs.com/package/@braintrust/pi-extension)
 
-Braintrust extension for [pi](https://github.com/earendil-works/pi-coding-agent).
-
-Today this extension automatically traces pi sessions, turns, model calls, and tool executions to Braintrust.
-The extension forwards native pi events to the installed `bt` tracing daemon;
-all span construction, authentication, recovery, and Braintrust delivery happen
-inside the daemon.
-
-Version 1 requires a current `bt` CLI with the Pi daemon translator. If `bt` or
-the translator is unavailable, tracing fails open and Pi keeps running.
+Trace [Pi](https://github.com/earendil-works/pi-coding-agent) sessions in
+Braintrust. The extension sends events to the local `bt` daemon, which builds
+and uploads traces. Pi keeps running if tracing fails.
 
 ## What gets traced
 
-- **Session spans**: one root span per pi session that actually produces at least one turn
+- **Session spans**: one root span per Pi session with at least one turn
 - **Turn spans**: one span per user prompt / agent run
-- **LLM spans**: one span per model response inside a turn, including canonical token, cache, reasoning, estimated-cost, and time-to-first-token metrics
-- **Tool spans**: one span per tool execution, including tools activated through pi's dynamic/deferred tool-loading flow
+- **LLM spans**: one span per model response inside a turn, with token usage, cache usage, reasoning tokens, estimated cost, and time to first token
+- **Tool spans**: one span per tool execution, including dynamically loaded tools
 - **Compaction spans**: one span per session compaction, including trigger/retry metadata when available
 - **Branch summary spans**: one span per summarized `/tree` navigation branch
 
@@ -35,66 +29,49 @@ Session (task)
 └── Turn 2 (task)
 ```
 
-## Install
+## Quickstart
 
-### From npm
-
-```bash
-pi install npm:@braintrust/pi-extension
-```
-
-### From this repo
+Install Pi and the
+[Braintrust CLI](https://www.braintrust.dev/docs/reference/cli/quickstart), then run:
 
 ```bash
-pi install .
-```
-
-Or load it just for one run:
-
-```bash
-pi -e .
-```
-
-## Compatibility
-
-This package supports the **latest patch release from each of the last five stable pi minor versions**, currently excluding pi versions before `0.65.0`.
-
-Our GitHub Actions compatibility job automatically resolves and tests that compatibility window, so new pi releases are picked up without manually updating the matrix.
-
-## Quick start
-
-```bash
-bt auth login
-bt trace enable pi
+bt login
+bt trace enable pi --project my-coding-agent
 pi
 ```
 
-For one invocation without changing Pi's global tracing configuration, use
-`bt trace run --project <PROJECT> pi -- [PI_ARGS...]`. `bt trace run`'s flags
-(`--profile`, `--org`, `--project`, `--additional-metadata`) also accept the
-matching `BRAINTRUST_*` environment variable; a plain `pi` session's
-extension does not.
+This installs the extension and saves its configuration. Use `--profile` or
+`--org` to choose a profile or organization. Restart Pi if it is already open.
+The footer shows tracing status and a link to the trace when available.
 
-In interactive mode, the footer shows a `Braintrust` status indicator while tracing is active, and a widget below the editor shows a shortened clickable trace link when available.
+To install the npm extension separately, use
+`pi install npm:@braintrust/pi-extension`, then configure tracing with
+`bt trace enable pi`.
+
+For one invocation without changing global tracing configuration:
+
+```bash
+bt trace run --project my-coding-agent pi -- -p "summarize this repository"
+```
+
+The `bt trace run` routing and metadata flags also accept their matching
+`BRAINTRUST_*` environment variables; a plain `pi` session's extension does not.
+Historical import and live attach are not supported for Pi.
+
+## Compatibility
+
+CI installs the package against the latest patch from each of the last five
+stable Pi release lines. The compatibility job resolves these versions on each
+run, including releases from Pi's former npm package name when needed.
 
 ## Configuration
 
-You can configure the extension with JSON config files. `braintrust.json` is
-the only source of persistent tracing configuration; routing and enablement
-are never read directly from the environment.
+Settings load in this order, with later values taking precedence:
 
-Config precedence is:
-
-1. defaults
+1. Defaults
 2. `~/.pi/agent/braintrust.json`
-3. `.pi/braintrust.json`
-4. `bt trace run` invocation settings (tracing only, per-invocation, highest
-   priority; never written back to the config files)
-
-### Config file locations
-
-- Global: `~/.pi/agent/braintrust.json`
-- Project: `.pi/braintrust.json`
+3. `.pi/braintrust.json` in the project (or Pi's configured project config directory)
+4. `bt trace run` settings for that invocation
 
 Example:
 
@@ -109,33 +86,49 @@ Example:
 }
 ```
 
-## Supported settings
+### Settings
 
-| Config key | Env var | Default |
+| Config key | Default | Purpose |
 |---|---|---|
-| `trace_to_braintrust` | — | `false` |
-| `org_name` | — | unset |
-| `profile` | — | default `bt` profile |
-| `project` | — | `pi` |
-| `additional_metadata` | — | `{}` |
-| `show_ui` | `BRAINTRUST_SHOW_UI` | `true` |
-| `show_trace_link` | `BRAINTRUST_SHOW_TRACE_LINK` | `true` |
+| `trace_to_braintrust` | `false` | Enable tracing |
+| `route.auth.profile_id` | unset | Saved profile ID written by `bt` setup |
+| `route.auth.profile` | default `bt` profile | Select a profile by name |
+| `route.auth.org_name` | profile default | Select an organization |
+| `route.destination` | project logs in `pi` | Select the trace destination |
+| `route.additional_metadata` | unset | Add root-span metadata |
+| `route.flush_mode` | `flush_on_turn_end` in the default route | Control delivery flushing |
+| `show_ui` | `true` | Show the status indicator; override with `BRAINTRUST_SHOW_UI` |
+| `show_trace_link` | `true` | Show the trace link; override with `BRAINTRUST_SHOW_TRACE_LINK` |
 
-`show_ui` and `show_trace_link` control local display behavior only and can
-still be set from the environment. Tracing routing and enablement come only
-from `braintrust.json` and `bt trace run`.
+Older files can still use top-level `profile`, `org_name`, `project`, and
+`additional_metadata`. For new files, use `bt trace enable` or the nested
+`route` format above. Include a destination when supplying a route.
 
-## Notes
+Only the display settings read environment variables directly. Tracing settings
+come from these files or `bt trace run`. Credentials are managed by `bt`.
 
-- Project config overrides global config.
-- Project config follows pi's configured project config directory, which defaults to `.pi`.
-- The extension does not persist local span state; recovery and incomplete-operation cleanup are owned by the daemon journal.
-- Span construction and Braintrust delivery run in the installed `bt` tracing daemon.
-- The extension never reads or stores Braintrust credentials. Profile selection is
-  non-secret, optional, and resolved by the daemon through `bt` authentication.
-- Provider request tracing is allowlisted to effective model, thinking, output-limit, and tool-count settings; full provider payloads and thinking signatures are never logged.
-- If Braintrust is unavailable, pi should continue working normally.
+Provider request metadata is limited to model, thinking, output-limit, and
+tool-count settings. Full provider payloads and thinking signatures are omitted.
 
-## Contributing
+## Manage tracing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for development setup, validation, and repository conventions.
+```bash
+bt trace doctor pi
+bt trace status
+bt trace update pi
+bt trace disable pi
+```
+
+## Local development
+
+From the monorepo root, build the extension before loading it locally:
+
+```bash
+make build-pi
+pi -e ./dist/pi/dist/index.mjs
+```
+
+This loads the extension for one run; it still needs an enabled Braintrust
+configuration. Run `make validate-pi` for package checks. See the
+[contribution guide](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/src/plugins/pi/content/CONTRIBUTING.md)
+for source development instructions.

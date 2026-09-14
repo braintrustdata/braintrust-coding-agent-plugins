@@ -1,68 +1,67 @@
 # Agent integration test architecture
 
-The test infrastructure has three independent layers:
+Run these tests from the monorepo root. They launch real agents against mock
+model endpoints and mock Braintrust ingest by default.
 
-- `server` is a generic container that binds any Axum `Router` to an
-  ephemeral address and owns its lifecycle.
-- `inference` contains OpenAI Responses and Anthropic Messages protocol logic,
-  programmable scenarios, and captured inference requests. Each mock exports
-  an Axum router and can be hosted or embedded by any caller.
-- `ingest` contains the mock Braintrust API and captured trace rows. It also
-  exports an Axum router and has no dependency on the server container. Its
-  scenario builder matches named row shapes as an ordered subsequence,
-  independent of HTTP batching and unrelated SDK update rows.
+## Run the tests
 
-`agent_process` is the Braintrust-specific orchestration layer. It hosts the
-ingest router, starts the daemon, and provides the environment shared by agent
-processes.
+Install the agents you want to test. The harness finds `codex`, `claude`,
+`opencode`, and `pi` on `PATH`; `CODEX_BIN`, `CLAUDE_BIN`, `OPENCODE_BIN`, and
+`PI_BIN` override their executable paths.
 
-`agents` contains reusable adapters for real coding-agent CLIs. Each adapter
-owns only agent installation and isolated configuration state. The daemon
-world is passed to each run as its execution context, avoiding any lifetime or
-ownership coupling between the two layers. Adapters provide standard
-invocation flags, mock-inference routing, and process output. Runs remain
-configurable with additional arguments and environment variables so scenarios
-can add inputs such as attachment paths without duplicating CLI setup.
+OpenCode and Pi also require installed plugin packages. Set `OPENCODE_PLUGIN`
+and `PI_EXTENSION_PATH` to absolute paths to their installed `dist/index.mjs`
+files. Use packed npm artifacts with their peers installed, as shown in the
+[CI workflow](../../../.github/workflows/ci.yml).
 
-OpenCode and Pi integration runs set `OPENCODE_PLUGIN` and `PI_EXTENSION_PATH`
-to entrypoints from isolated installations of their ephemeral npm packages.
-This exercises the same peer-dependency resolution and published file
-allowlists as registry installs, rather than loading monorepo build trees
-directly.
+```bash
+cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked \
+  --test agent_integration -- --ignored --nocapture --test-threads=1
+```
 
-The integration test composes those pieces: it hosts an inference router,
-starts the daemon world, runs an agent, and evaluates the ingest scenario. This
-keeps both protocol mocks usable without coding agents, keeps the generic
-server unaware of either protocol, and lets new end-to-end scenarios focus on
-model behavior and expected trace shapes.
+These tests are ignored by a normal `cargo test` because they require agent
+executables. To run one agent, add a test-name filter before `--` (for example,
+`codex`). The ordinary Rust suite covers translators and daemon behavior
+without installing agents.
 
-The world controls inference and ingest independently:
+## Test layers
 
-- `BT_AGENT_INFERENCE_MODE=mock|live` selects deterministic mock inference or
-  the agent's normal provider.
-- `BT_AGENT_INGEST_MODE=mock|live` selects captured local ingest or the normal
-  Braintrust backend.
+- `server` binds an Axum router to an ephemeral address and manages its lifetime.
+- `inference` implements mock OpenAI Responses and Anthropic Messages endpoints.
+  Scenarios control responses and record incoming requests.
+- `ingest` implements a mock Braintrust API and records span rows. Scenarios
+  match ordered row shapes independently of HTTP batching.
+- `agent_process` starts the daemon and ingest server and supplies the shared
+  process environment.
+- `agents` configures and runs each CLI in an isolated workspace.
 
-Mock ingest launches the feature-gated standalone daemon with test
-credentials. Live ingest instead launches the profile-aware daemon embedded in
-`bt`, selected by:
+An integration test starts an inference mock and daemon, runs an agent, and
+checks the resulting trace. Agent arguments and environment variables can be
+customized per scenario.
 
-- `BT_AGENT_BT_BIN` — `bt` executable to test (defaults to `bt` on `PATH`);
-- `BT_AGENT_PROFILE` — optional saved OAuth or API-key profile;
-- `BT_AGENT_ORG` — optional organization constraint;
-- `BT_AGENT_PROJECT` — destination project name (defaults to `agent-e2e`).
+## Mock and live backends
 
-Only those non-secret selections are written to the harness route. The `bt`
-daemon host resolves credentials and refreshes OAuth leases internally.
+Inference and ingest are configured independently:
 
-This allows deterministic inference to drive real Braintrust ingest without
-paying for model inference. Every test uses ordinary assertions for stable
-process behavior and trace delivery regardless of mode. When ingest is mocked,
-the captured rows are also available for ordinary assertions over stable
-metadata. With live ingest, the daemon must report emitted spans and no sink
-errors.
+| Variable | Values | Default |
+|---|---|---|
+| `BT_AGENT_INFERENCE_MODE` | `mock`, `live` | `mock` |
+| `BT_AGENT_INGEST_MODE` | `mock`, `live` | `mock` |
 
-`IngestScenario` is exclusively for the additional deterministic expectations
-when both inference and ingest are mocked. Provider request sequences, exact
-model output, injected provider failures, and ordered trace shapes are layered
-on top of the always-run assertions.
+Mock ingest uses the standalone daemon with test credentials. Live ingest uses
+the daemon embedded in `bt`, with these settings:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `BT_AGENT_BT_BIN` | `bt` executable | `bt` on `PATH` |
+| `BT_AGENT_PROFILE` | Saved profile | `BRAINTRUST_PROFILE` |
+| `BT_AGENT_ORG` | Organization | `BRAINTRUST_ORG_NAME` |
+| `BT_AGENT_PROJECT` | Destination project | `agent-e2e` |
+
+The harness writes profile and destination selections to the route; `bt`
+resolves credentials and refreshes OAuth tokens.
+
+All modes check process success and trace delivery. Mock ingest also allows
+assertions on captured rows. `IngestScenario` adds exact output, failure, and
+ordering checks when both backends are mocked. See the
+[inference guide](inference/README.md) for examples of live-backend runs.

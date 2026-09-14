@@ -1,32 +1,26 @@
 # bt-daemon
 
-Shared Rust project for Braintrust coding-agent tracing plugins. A local,
-stateful daemon that plugin **hook shims** forward events to; it owns the
-event→trace state machine and sends spans to Braintrust out-of-band. See
-[`docs/protocol.md`](docs/protocol.md) for the wire contract.
-
-> **Placeholder name** — the real name is TBD. The subcommand framing
-> (`serve` / `hook` / `status` / `import` / `run`) should survive a rename.
+The Rust tracing daemon embedded in `bt`. Plugins send it native agent events;
+it builds spans, journals events for recovery, and uploads traces to Braintrust.
+See [the protocol](docs/protocol.md) for the wire contract.
 
 ## Layout
 
-One self-contained Cargo crate, liftable to its own repo by copying
-`bt-daemon/` verbatim:
+The daemon is one self-contained Cargo crate:
 
 - `src/wire` — the wire protocol module: envelope types + JSON-RPC framing.
 - `src/translate` and `src/sink` — agent state machines and Braintrust output.
-- `src/lib.rs` — the embeddable library: clap `Args` + async entry points
+- `src/lib.rs` — command arguments and async entry points, including
+  `run_serve`, `run_hook`, `run_status`, `run_import`, and `run_traced`.
 - `src/trace_command.rs`, `src/trace_runtime.rs`, and `src/setup.rs` — the
   complete mounted `bt trace` command schema, dispatch, daemon lifecycle, and
   agent-specific persistent setup behavior. Hosts supply only credential and
   destination-resolution services.
-  (`run_serve`, `run_hook`, `run_status`, `run_import`, `run_traced`). This is what `bt`
-  depends on.
 - `src/main.rs` — the standalone **`bt-daemon` binary**, compiled only with
   the `cli` feature for isolated testing/development. Env/flag static-token
   auth only; not an end-user artifact.
 
-## Dual consumption and authentication
+## Authentication
 
 Hooks send only a non-secret `SessionRoute`: an optional profile and
 organization selection plus the trace destination. The long-lived daemon asks
@@ -50,13 +44,14 @@ Each coding agent reads an independent non-credential `braintrust.json` file:
   `~/.config/opencode/braintrust.json`
 - Pi: `~/.pi/agent/braintrust.json`
 - Grok: `~/.grok/braintrust.json`
+- Antigravity: `~/.gemini/config/braintrust.json`
 
 `BT_DAEMON_CONFIG` can override the path for isolated tests and managed hosts.
 
 See [`config.json.example`](config.json.example). `trace_to_braintrust` controls
 enablement and `route` stores the selected profile, organization, typed
-destination, flush mode, and metadata. Omitting `route.auth.profile` selects
-the default `bt` profile. Credentials and backend URLs are never stored here;
+destination, flush mode, and metadata. Setup saves a stable `route.auth.profile_id`; older files can use
+`route.auth.profile`. If neither is set, `bt` resolves the default profile. Credentials and backend URLs are never stored here;
 production resolves and refreshes them through `bt`. `bt trace run` supplies a
 process-local settings overlay and never changes any of these files.
 
@@ -108,29 +103,31 @@ Use `bt trace disable <agent>` to remove the installed tracing plugin and its
 Braintrust settings. `bt trace setup <agent>` remains an alias for `bt trace
 enable <agent>` for backwards compatibility.
 
-## Build / test
+## Build and test
 
 ```bash
 cd bt-daemon
-cargo test                                      # library + pipeline tests
-cargo test --features cli                       # also compile/test the CLI
-cargo build --features cli --bin bt-daemon      # standalone test binary
+cargo test --locked                             # Library and pipeline tests
+cargo test --all-features --locked              # Include the standalone CLI
+cargo build --features cli --locked --bin bt-daemon
 ```
 
 CI runs the all-feature build, test suite, and Clippy on Linux, macOS, and
 Windows. The pipeline integration tests use Unix-domain sockets on Unix and
-real Windows named pipes on Windows.
+real Windows named pipes on Windows. Real-agent tests are separate from the
+default suite; see the [test harness guide](tests/support/README.md).
 
-## Try it (standalone, debug sink)
+## Local debugging
+
+From the monorepo root, in a Unix shell:
 
 ```bash
 export BT_DAEMON_SOCKET=/tmp/btd.sock BT_DAEMON_DATA_DIR=/tmp/btd
-cargo build --features cli --bin bt-daemon
-echo '{"session_id":"s1","hook_event_name":"SessionStart"}' | ./target/debug/bt-daemon hook --source debug
-echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./target/debug/bt-daemon hook --source debug
-./target/debug/bt-daemon status
-# journaled events:  $BT_DAEMON_DATA_DIR/journal/s1.ndjson
-# emitted span rows: $BT_DAEMON_DATA_DIR/spans/s1.ndjson
+cargo build --manifest-path bt-daemon/Cargo.toml --features cli --locked --bin bt-daemon
+echo '{"session_id":"s1","hook_event_name":"SessionStart"}' | ./bt-daemon/target/debug/bt-daemon hook --source debug
+echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./bt-daemon/target/debug/bt-daemon hook --source debug
+./bt-daemon/target/debug/bt-daemon status
+# Inspect journal/ and spans/ under $BT_DAEMON_DATA_DIR
 ```
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
@@ -143,8 +140,8 @@ create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
 
 Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
-Ctrl-C. `run <codex|claude> [ARGS...]` launches the selected agent with
-inherited stdio and injects live Braintrust hooks for that invocation, so it
+Ctrl-C. `run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent with
+inherited stdio and injects Braintrust hooks or an adapter for that invocation, so it
 does not depend on the tracing plugin being installed or enabled. Managed runs
 suppress inherited Braintrust plugin hooks to avoid logging the same session
 twice; the injected hooks still use the normal daemon translator and sink.
@@ -157,33 +154,32 @@ tracing for that invocation and override the persistent setup route without
 rewriting it, so ordinary agent sessions and concurrent managed runs may use
 different profiles, organizations, projects, experiments, or parent spans.
 
-## Status
+## Recovery and storage
 
-Phases 0–5 are implemented: protocol, daemon lifecycle, Braintrust sink,
-Codex, Claude, and Grok translators, `bt daemon` integration, and thin hook shims for
-all shipped plugins. Every coding-agent capture request returns after the raw
-event is flushed to its journal; authentication, correlation, translation, and
-reporting run on daemon-owned workers. Restart recovery replays the redacted
-journal with deterministic span ids, so resubmitted rows merge into the same
-spans instead of creating duplicates. Claude and Codex lifecycle entries
-reference a daemon-owned transcript mirror; Grok records independent bounded
-updates and events mirrors. Recovery therefore does not depend on mutable
-external paths or copy a full transcript into every event. Explicit
-turn/session-end flushes are bounded, and sessions can target project logs or
-an experiment.
+Capture requests return after the event is flushed to its journal. Daemon
+workers handle authentication, translation, and delivery. Restart recovery
+replays journaled events with deterministic span IDs, so repeated delivery
+updates the same spans.
 
-Memory is bounded end to end, while on-disk records stay complete: the daemon
-never holds a transcript or a whole journal in memory, mirroring and replay
-both stream, session queues apply backpressure, and sessions that go quiet are
-retired and rebuilt from their journal on the next event. Nothing on disk —
-journal, mirror, or conversation content — is capped or truncated; only
-in-memory caches are bounded, and each is re-derivable from disk.
+Claude and Codex events reference daemon-owned transcript mirrors. Grok uses
+separate updates and events mirrors. Replay does not depend on the original
+transcript staying at its old path.
 
-Windows named-pipe transport, detached spawning, lifecycle handover, and
-cross-platform pipeline tests are implemented. The remaining host follow-ups
-are OpenCode and pi, which are not present in this monorepo.
+The daemon streams journals and transcripts, applies queue backpressure, and
+retires idle sessions. Retired sessions are rebuilt from their journals when
+another event arrives. Journals and mirrors preserve conversation content;
+credentials are excluded from journaled routing data.
 
-- The Braintrust sink pins `braintrust-sdk-rust` commit `d33e806`, which adds
-  deterministic span ids, `span_origin`/`span_attributes` passthrough, and
-  per-session credential isolation. This follows the same exact-revision Git
-  dependency policy as `bt`.
+Recovery files are removed after seven days without modification. Cleanup runs
+at startup and hourly while the daemon is running. This retention period is
+currently fixed in `src/server.rs`.
+
+## Platform and integration coverage
+
+The daemon supports Linux, macOS, and Windows, using Unix sockets or Windows
+named pipes. Translators exist for Antigravity, Claude Code, Codex, Grok,
+OpenCode, and Pi. CI runs packaged Claude Code, Codex, OpenCode, and Pi against
+mock inference and mock Braintrust ingest on all three platforms.
+
+The Rust SDK is pinned to an exact Git revision in [Cargo.toml](Cargo.toml).
+Use `--locked` for reproducible builds.
