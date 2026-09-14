@@ -692,6 +692,8 @@ fn claude_recovered_tool_results_determine_outcome_without_boundary_errors() {
                 "role":"assistant",
                 "content":[
                     {"type":"tool_use","id":"success","name":"Bash","input":{"command":"pwd"}},
+                    {"type":"tool_use","id":"success-denial-text","name":"Bash","input":{"command":"cat audit.log"}},
+                    {"type":"tool_use","id":"success-cancellation-text","name":"Bash","input":{"command":"cat worker.log"}},
                     {"type":"tool_use","id":"task-stop","name":"TaskStop","input":{"task_id":"abc"}},
                     {"type":"tool_use","id":"denied","name":"Write","input":{"file_path":"secret"}},
                     {"type":"tool_use","id":"denied-permission","name":"Bash","input":{"command":"git commit"}},
@@ -706,6 +708,8 @@ fn claude_recovered_tool_results_determine_outcome_without_boundary_errors() {
             "timestamp":"2026-01-01T00:00:03Z",
             "message":{"role":"user","content":[
                 {"type":"tool_result","tool_use_id":"success","content":"/tmp","is_error":false},
+                {"type":"tool_result","tool_use_id":"success-denial-text","content":"audit log: permission request was denied yesterday","is_error":false},
+                {"type":"tool_result","tool_use_id":"success-cancellation-text","content":"worker log: operation was aborted and retried","is_error":false},
                 {"type":"tool_result","tool_use_id":"task-stop","content":"Successfully stopped task: abc","is_error":false},
                 {"type":"tool_result","tool_use_id":"denied","content":"The user doesn't want to proceed with this tool use. The tool use was rejected.","is_error":true},
                 {"type":"tool_result","tool_use_id":"denied-permission","content":"Permission to use Bash with command git commit has been denied.","is_error":true},
@@ -742,6 +746,16 @@ fn claude_recovered_tool_results_determine_outcome_without_boundary_errors() {
         .unwrap();
     for (call_id, tool_name, input) in [
         ("success", "Bash", json!({"command":"pwd"})),
+        (
+            "success-denial-text",
+            "Bash",
+            json!({"command":"cat audit.log"}),
+        ),
+        (
+            "success-cancellation-text",
+            "Bash",
+            json!({"command":"cat worker.log"}),
+        ),
         ("task-stop", "TaskStop", json!({"task_id":"abc"})),
         ("denied", "Write", json!({"file_path":"secret"})),
         ("denied-permission", "Bash", json!({"command":"git commit"})),
@@ -795,7 +809,12 @@ fn claude_recovered_tool_results_determine_outcome_without_boundary_errors() {
             })
             .unwrap()
     };
-    for call_id in ["success", "task-stop"] {
+    for call_id in [
+        "success",
+        "success-denial-text",
+        "success-cancellation-text",
+        "task-stop",
+    ] {
         let tool = by_call(call_id);
         assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
         assert_eq!(tool.error, None, "{call_id} should remain successful");

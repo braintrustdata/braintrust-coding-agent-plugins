@@ -1503,10 +1503,15 @@ fn transcript_tool_outcome(block: &Value, record: &Value) -> TranscriptToolOutco
         .flatten()
         .collect::<Vec<_>>();
 
-    if values.iter().any(|value| {
-        has_structured_outcome(value, &["denied", "deny", "rejected", "reject"])
-            || (has_outcome_phrase(value, &["permission to use"])
-                && has_outcome_phrase(value, &["has been denied"]))
+    let error_signalled = block.get("is_error").and_then(Value::as_bool) == Some(true)
+        || block.get("isError").and_then(Value::as_bool) == Some(true)
+        || values.iter().any(|value| has_structured_error(value));
+    let structured_denial = values
+        .iter()
+        .any(|value| has_structured_outcome(value, &["denied", "deny", "rejected", "reject"]));
+    let denial_text = values.iter().any(|value| {
+        (has_outcome_phrase(value, &["permission to use"])
+            && has_outcome_phrase(value, &["has been denied"]))
             || has_outcome_phrase(
                 value,
                 &[
@@ -1520,35 +1525,35 @@ fn transcript_tool_outcome(block: &Value, record: &Value) -> TranscriptToolOutco
                     "permission request was denied",
                 ],
             )
-    }) {
+    });
+    if structured_denial || (error_signalled && denial_text) {
         return TranscriptToolOutcome::Denied;
     }
-    if values.iter().any(|value| {
+
+    let structured_cancellation = values.iter().any(|value| {
         has_structured_outcome(value, &["cancelled", "canceled", "aborted", "interrupted"])
             || has_structured_cancellation(value)
-            || has_outcome_phrase(
-                value,
-                &[
-                    "request interrupted by user",
-                    "tool use was cancelled",
-                    "tool use was canceled",
-                    "operation was cancelled",
-                    "operation was canceled",
-                    "operation was aborted",
-                    "user cancelled",
-                    "user canceled",
-                ],
-            )
-    }) {
+    });
+    let cancellation_text = values.iter().any(|value| {
+        has_outcome_phrase(
+            value,
+            &[
+                "request interrupted by user",
+                "tool use was cancelled",
+                "tool use was canceled",
+                "operation was cancelled",
+                "operation was canceled",
+                "operation was aborted",
+                "user cancelled",
+                "user canceled",
+            ],
+        )
+    });
+    if structured_cancellation || (error_signalled && cancellation_text) {
         return TranscriptToolOutcome::Cancelled;
     }
 
-    let failed = block.get("is_error").and_then(Value::as_bool) == Some(true)
-        || block.get("isError").and_then(Value::as_bool) == Some(true)
-        || values
-            .iter()
-            .any(|value| has_structured_outcome(value, &["error", "failed", "failure"]));
-    if failed {
+    if error_signalled {
         let error = values
             .iter()
             .find_map(|value| nonempty_error_text(value))
@@ -1567,6 +1572,17 @@ fn has_structured_outcome(value: &Value, outcomes: &[&str]) -> bool {
         .into_iter()
         .filter_map(|key| object.get(key).and_then(Value::as_str))
         .any(|status| outcomes.contains(&status.trim().to_ascii_lowercase().as_str()))
+}
+
+fn has_structured_error(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.get("is_error").and_then(Value::as_bool) == Some(true)
+            || object.get("isError").and_then(Value::as_bool) == Some(true)
+            || object.get("error").is_some_and(|error| {
+                error.as_bool() == Some(true) || nonempty_error_text(error).is_some()
+            })
+            || has_structured_outcome(value, &["error", "failed", "failure"])
+    })
 }
 
 fn has_structured_cancellation(value: &Value) -> bool {
