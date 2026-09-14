@@ -1258,6 +1258,53 @@ async fn distinct_sessions_are_isolated() {
 }
 
 #[tokio::test]
+async fn pi_lifecycle_flushes_without_an_explicit_client_flush() {
+    let (socket, handle, flushes, _tmp) = start_tracking_daemon("test").await;
+    let host = dummy_host();
+    for event in [
+        "agent_end",
+        "session_compact",
+        "session_tree",
+        "session_shutdown",
+    ] {
+        let session_id = format!("pi-background-{event}");
+        for (index, name) in ["session_start", "before_agent_start", event]
+            .iter()
+            .enumerate()
+        {
+            let mut env = envelope(&session_id, name, index as i64 + 1);
+            env.source = "pi".into();
+            env.payload = serde_json::json!({"event": {"prompt": "hello"}});
+            // Session lifecycle flushing must also work when turn flushing is off.
+            if event == "agent_end" {
+                env.route.as_mut().unwrap().flush_mode = bt_daemon::wire::FlushMode::FlushOnTurnEnd;
+            }
+            forward_envelope(&env, &socket, &host, false).await.unwrap();
+        }
+        // forward_envelope has already closed its socket: delivery belongs to the daemon.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if flushes
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Pi {event} was not flushed by the daemon"));
+    }
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn hook_capture_stops_at_the_durable_journal_boundary() {
     let (socket, handle, tmp) = start_slow_daemon().await;
     let host = dummy_host();

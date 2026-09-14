@@ -5,6 +5,7 @@ const mockState = vi.hoisted(() => ({
   flushes: [] as string[],
   closed: 0,
   claim: true,
+  logGate: undefined as Promise<void> | undefined,
 }));
 
 vi.mock("./runtime/daemon-client.ts", () => ({
@@ -12,6 +13,7 @@ vi.mock("./runtime/daemon-client.ts", () => ({
   DaemonClient: class {
     async log(envelope: Record<string, unknown>): Promise<boolean> {
       mockState.logs.push(envelope);
+      await mockState.logGate;
       return true;
     }
     async flush(sessionId: string): Promise<boolean> {
@@ -63,6 +65,7 @@ describe("Pi daemon adapter", () => {
     mockState.flushes.length = 0;
     mockState.closed = 0;
     mockState.claim = true;
+    mockState.logGate = undefined;
   });
 
   it("does not register a duplicate managed adapter instance", async () => {
@@ -123,13 +126,35 @@ describe("Pi daemon adapter", () => {
 
     await handlers.get("session_start")?.({ reason: "new" }, ctx);
     await handlers.get("before_agent_start")?.({ prompt: "hello" }, ctx);
-    await handlers.get("agent_end")?.({ messages: [] });
+    let acknowledge!: () => void;
+    mockState.logGate = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    let turnEnded = false;
+    const turnEnd = handlers
+      .get("agent_end")?.({ messages: [] })
+      .then(() => {
+        turnEnded = true;
+      });
+    await Promise.resolve();
+    expect(turnEnded).toBe(false);
+    acknowledge();
+    await turnEnd;
+    mockState.logGate = undefined;
+    expect(mockState.flushes).toHaveLength(0);
+    await handlers.get("input")?.({ text: "next turn" });
+    expect(mockState.logs.at(-1)?.event).toBe("input");
+    await handlers.get("session_compact")?.({}, ctx);
+    await handlers.get("session_tree")?.({}, ctx);
     await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 
     expect(mockState.logs.map((log) => log.event)).toEqual([
       "session_start",
       "before_agent_start",
       "agent_end",
+      "input",
+      "session_compact",
+      "session_tree",
       "session_shutdown",
     ]);
     expect(
@@ -149,7 +174,7 @@ describe("Pi daemon adapter", () => {
       cwd: "/tmp/project",
       model: { provider: "openai", id: "gpt-5" },
     });
-    expect(mockState.flushes).toHaveLength(2);
+    expect(mockState.flushes).toHaveLength(0);
     expect(widgets).toContainEqual([
       "braintrust-trace-link",
       ["Braintrust trace", "https://www.braintrust.dev/trace/1"],

@@ -342,6 +342,27 @@ pub(crate) fn should_flush_hook_event(event: &str, flush_on_turn_end: bool) -> b
             ))
 }
 
+pub(crate) fn should_flush_ingress_event(env: &wire::Envelope) -> bool {
+    let native = env.payload.get("event").unwrap_or(&env.payload);
+    let flush_on_turn_end = matches!(
+        env.route.as_ref().map(|route| route.flush_mode),
+        Some(wire::FlushMode::FlushOnTurnEnd)
+    );
+    should_flush_hook_event(&env.event, flush_on_turn_end)
+        || (env.source == "pi"
+            && match env.event.as_str() {
+                // Preserve Pi's explicit lifecycle flushes even in batched mode.
+                "session_shutdown" | "session_compact" | "session_tree" => true,
+                // OMP can end an attempt while keeping the same turn open for retry.
+                "agent_end" => {
+                    flush_on_turn_end
+                        && native.get("willRetry").and_then(serde_json::Value::as_bool)
+                            != Some(true)
+                }
+                _ => false,
+            })
+}
+
 /// Capture one hook event from `stdin` and forward it to the daemon.
 ///
 /// `route` contains only non-secret profile and destination selection.
@@ -1449,6 +1470,48 @@ mod tests {
             assert!(should_flush_hook_event(event, true));
         }
         assert!(!should_flush_hook_event("turn_completed", true));
+    }
+
+    #[test]
+    fn pi_agent_end_flushes_only_completed_turns_when_enabled() {
+        let mut env: wire::Envelope = serde_json::from_value(serde_json::json!({
+            "source": "pi", "session_id": "pi-turn", "event": "agent_end",
+            "ts_ms": 1, "payload": {"event": {}},
+            "route": {"flush_mode": "flush_on_turn_end"}
+        }))
+        .unwrap();
+        for native in [
+            serde_json::json!({}),
+            serde_json::json!({"willRetry": false}),
+        ] {
+            env.payload = serde_json::json!({"event": native});
+            assert!(should_flush_ingress_event(&env));
+        }
+        for payload in [
+            serde_json::json!({"event": {"willRetry": true}}),
+            serde_json::json!({"willRetry": true}),
+        ] {
+            env.payload = payload;
+            assert!(!should_flush_ingress_event(&env));
+        }
+        env.payload = serde_json::json!({"event": {}});
+        env.source = "opencode".into();
+        assert!(!should_flush_ingress_event(&env));
+        env.source = "pi".into();
+        env.event = "message_end".into();
+        assert!(!should_flush_ingress_event(&env));
+        env.event = "agent_end".into();
+        env.route.as_mut().unwrap().flush_mode = wire::FlushMode::FireAndForget;
+        assert!(!should_flush_ingress_event(&env));
+        env.route = None;
+        assert!(!should_flush_ingress_event(&env));
+        for event in ["session_shutdown", "session_compact", "session_tree"] {
+            env.event = event.into();
+            assert!(should_flush_ingress_event(&env));
+            env.source = "opencode".into();
+            assert!(!should_flush_ingress_event(&env));
+            env.source = "pi".into();
+        }
     }
 
     #[test]
