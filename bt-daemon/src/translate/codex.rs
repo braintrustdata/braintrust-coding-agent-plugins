@@ -280,6 +280,7 @@ impl AgentTranslator for CodexTranslator {
                 if let Some(hook) = decode::<SessionStartHook>(payload) {
                     self.session_source = hook.source;
                     self.permission_mode = hook.permission_mode;
+                    self.update_open_main_root_source(&mut ops);
                 }
             }
             "SubagentStart" => {
@@ -428,6 +429,34 @@ impl CodexTranslator {
             path.to_string(),
             Scope::new(path, ScopeKind::Main, turn_parent),
         );
+    }
+
+    fn update_open_main_root_source(&self, ops: &mut Vec<SpanOp>) {
+        let Some(source) = &self.session_source else {
+            return;
+        };
+        if !self.root_opened {
+            return;
+        }
+        let model = self
+            .main_path
+            .as_ref()
+            .and_then(|path| self.scopes.get(path))
+            .and_then(|scope| scope.model.clone());
+        ops.push(SpanOp::Merge(SpanRow {
+            span_id: self.root_span_id.clone(),
+            root_span_id: self.root_span_id.clone(),
+            input: Some(json!({
+                "model": model,
+                "cwd": self.root_cwd,
+                "source": source,
+            })),
+            metadata: Some(json!({
+                "source": "codex",
+                "session_source": source,
+            })),
+            ..Default::default()
+        }));
     }
 
     fn record_compaction_trigger(&mut self, hook: CompactHook, ops: &mut Vec<SpanOp>) {
@@ -594,20 +623,26 @@ impl CodexTranslator {
                         let model_turn_id = context.turn_id;
                         scope.model = Some(m.clone());
                         if scope.root_created {
-                            let input = if scope.kind == ScopeKind::Main {
-                                json!({
-                                    "model": m,
-                                    "cwd": self.root_cwd,
-                                    "source": self.session_source,
-                                })
+                            let (input, metadata) = if scope.kind == ScopeKind::Main {
+                                (
+                                    json!({
+                                        "model": m,
+                                        "cwd": self.root_cwd,
+                                        "source": self.session_source,
+                                    }),
+                                    json!({
+                                        "model": m,
+                                        "source": "codex",
+                                    }),
+                                )
                             } else {
-                                json!({ "model": m })
+                                (json!({ "model": m }), json!({ "model": m }))
                             };
                             ops.push(SpanOp::Merge(SpanRow {
                                 span_id: scope.turn_parent_span_id.clone(),
                                 root_span_id: self.root_span_id.clone(),
                                 input: Some(input),
-                                metadata: Some(json!({ "model": m })),
+                                metadata: Some(metadata),
                                 ..Default::default()
                             }));
                         }
@@ -685,9 +720,8 @@ impl CodexTranslator {
                         );
                     }
                 }
-                // `source` identifies the agent consistently across all coding-agent
-                // integrations. Codex's SessionStart source (for example, startup or
-                // resume) describes how this session began, so keep it separately.
+                // `source` is the stable integration identity used to classify
+                // traces. The native SessionStart lifecycle source is separate.
                 md.insert("source".into(), json!("codex"));
                 if let Some(session_source) = &self.session_source {
                     md.insert("session_source".into(), json!(session_source));
