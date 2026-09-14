@@ -194,7 +194,7 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
         json!("gpt-5.5"),
         "model backfilled from turn_context"
     );
-    assert_eq!(md["source"], json!("codex"));
+    assert_eq!(md["source"], json!("startup"));
     assert_eq!(md["session_source"], json!("startup"));
     assert_eq!(md["permission_mode"], json!("auto"));
     assert_eq!(md["username"], json!(expected_username()));
@@ -265,6 +265,68 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
             .count(),
         1
     );
+}
+
+#[test]
+fn codex_root_metadata_source_matches_native_lifecycle_source() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    for source in ["startup", "resume", "compact"] {
+        let transcript = tmp.path().join(format!("{source}.jsonl"));
+        append(
+            &transcript,
+            json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
+                    "payload": { "id": "session-1", "cwd": "/x/app" } }),
+        );
+        append(
+            &transcript,
+            json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context",
+                    "payload": { "model": "gpt-5.5" } }),
+        );
+        let session_id = format!("lifecycle-{source}");
+        let registry = Registry::default_agents();
+        let mut translator = registry.create("codex", &session_id);
+        let ctx = SessionCtx {
+            session_id: session_id.clone(),
+            config: None,
+        };
+        let mut ops = translator
+            .handle(
+                &envelope(
+                    &session_id,
+                    "SessionStart",
+                    transcript.to_str().unwrap(),
+                    json!({ "source": "startup" }),
+                ),
+                &ctx,
+            )
+            .unwrap();
+
+        if source != "startup" {
+            // A resumed or compacted session can exit before writing another
+            // model-bearing turn_context record.
+            ops.extend(
+                translator
+                    .handle(
+                        &envelope(
+                            &session_id,
+                            "SessionStart",
+                            transcript.to_str().unwrap(),
+                            json!({ "source": source }),
+                        ),
+                        &ctx,
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let rows = reduce(ops);
+        let root = find(&rows, SpanType::Task, "codex: app");
+        assert_eq!(root.input.as_ref().unwrap()["source"], json!(source));
+        assert_eq!(root.input.as_ref().unwrap()["model"], json!("gpt-5.5"));
+        assert_eq!(root.input.as_ref().unwrap()["cwd"], json!("/x/app"));
+        assert_eq!(root.metadata.as_ref().unwrap()["source"], json!(source));
+    }
 }
 
 #[test]
