@@ -1305,6 +1305,60 @@ async fn pi_lifecycle_flushes_without_an_explicit_client_flush() {
 }
 
 #[tokio::test]
+async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
+    let (socket, handle, flushes, _tmp) = start_tracking_daemon("test").await;
+    let host = dummy_host();
+    for event in [
+        "session.idle",
+        "session.deleted",
+        "session.error",
+        "server.instance.disposed",
+    ] {
+        let session_id = format!("opencode-background-{event}");
+        let native_session_id = format!("native-{event}");
+        let mut start = envelope(&session_id, "session.created", 1);
+        start.source = "opencode".into();
+        start.payload = serde_json::json!({
+            "properties": {"info": {"id": native_session_id}}
+        });
+        forward_envelope(&start, &socket, &host, false)
+            .await
+            .unwrap();
+
+        let mut terminal = envelope(&session_id, event, 2);
+        terminal.source = "opencode".into();
+        terminal.payload = serde_json::json!({
+            "properties": {"sessionID": native_session_id}
+        });
+        forward_envelope(&terminal, &socket, &host, false)
+            .await
+            .unwrap();
+
+        // The forwarding client has disconnected; backend delivery belongs to
+        // the daemon and must continue independently.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if flushes
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("OpenCode {event} was not flushed by the daemon"));
+    }
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn hook_capture_stops_at_the_durable_journal_boundary() {
     let (socket, handle, tmp) = start_slow_daemon().await;
     let host = dummy_host();
