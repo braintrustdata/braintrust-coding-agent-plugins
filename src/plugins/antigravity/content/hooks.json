@@ -6,8 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"./bin/antigravity-hook.sh\" PostToolUse",
-            "timeout": 30
+            "command": "sh \"./bin/antigravity-hook.sh\" PostToolUse"
           }
         ]
       }
@@ -15,22 +14,19 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "sh \"./bin/antigravity-hook.sh\" PreInvocation",
-        "timeout": 30
+        "command": "sh \"./bin/antigravity-hook.sh\" PreInvocation"
       }
     ],
     "PostInvocation": [
       {
         "type": "command",
-        "command": "sh \"./bin/antigravity-hook.sh\" PostInvocation",
-        "timeout": 30
+        "command": "sh \"./bin/antigravity-hook.sh\" PostInvocation"
       }
     ],
     "Stop": [
       {
         "type": "command",
-        "command": "sh \"./bin/antigravity-hook.sh\" Stop",
-        "timeout": 30
+        "command": "sh \"./bin/antigravity-hook.sh\" Stop"
       }
     ]
   }

@@ -40,13 +40,11 @@ expected = {
 }
 assert set(hooks) == expected
 for event, groups in hooks.items():
-    expected_timeout = 15 if event == "SessionEnd" else 5
     for group in groups:
         for hook in group["hooks"]:
             assert hook == {
                 "type": "command",
                 "command": 'bash "${GROK_PLUGIN_ROOT}/hooks/forward.sh"',
-                "timeout": expected_timeout,
             }
 PY
 
