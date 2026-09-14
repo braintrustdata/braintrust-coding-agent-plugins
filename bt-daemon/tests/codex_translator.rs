@@ -194,7 +194,7 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
         json!("gpt-5.5"),
         "model backfilled from turn_context"
     );
-    assert_eq!(md["source"], json!("startup"));
+    assert_eq!(md["source"], json!("codex"));
     assert_eq!(md["session_source"], json!("startup"));
     assert_eq!(md["permission_mode"], json!("auto"));
     assert_eq!(md["username"], json!(expected_username()));
@@ -268,7 +268,7 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
 }
 
 #[test]
-fn codex_root_metadata_source_matches_native_lifecycle_source() {
+fn codex_root_preserves_canonical_source_across_lifecycle_events() {
     let tmp = tempfile::tempdir().unwrap();
 
     for source in ["startup", "resume", "compact"] {
@@ -325,7 +325,11 @@ fn codex_root_metadata_source_matches_native_lifecycle_source() {
         assert_eq!(root.input.as_ref().unwrap()["source"], json!(source));
         assert_eq!(root.input.as_ref().unwrap()["model"], json!("gpt-5.5"));
         assert_eq!(root.input.as_ref().unwrap()["cwd"], json!("/x/app"));
-        assert_eq!(root.metadata.as_ref().unwrap()["source"], json!(source));
+        assert_eq!(root.metadata.as_ref().unwrap()["source"], json!("codex"));
+        assert_eq!(
+            root.metadata.as_ref().unwrap()["session_source"],
+            json!(source)
+        );
     }
 }
 

@@ -446,7 +446,7 @@ async fn imports_native_codex_rollout_through_codex_translator() {
     assert!(rows.iter().any(|row| {
         row.pointer("/Insert/metadata/source")
             .and_then(Value::as_str)
-            == Some("import")
+            == Some("codex")
             && row
                 .pointer("/Insert/metadata/session_source")
                 .and_then(Value::as_str)
