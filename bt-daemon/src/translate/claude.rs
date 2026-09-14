@@ -156,6 +156,7 @@ struct Subagent {
 struct PendingTool {
     span_id: String,
     parent_id: String,
+    metadata: Value,
 }
 
 enum PendingHistory {
@@ -547,7 +548,10 @@ impl ClaudeTranslator {
         }
         let input = tool_input(&event.payload);
         let span_id = ids::span_id(&self.session_id, &format!("tool:{call_id}"));
-        let metadata = tool_metadata(event, &tool_name, &call_id, ToolApproval::Approved, &input);
+        // PreToolUse only proves that Claude proposed a call. Approval is
+        // recorded once a terminal hook or transcript result proves whether
+        // the call executed or was denied.
+        let metadata = tool_metadata(event, &tool_name, &call_id, None, &input);
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
@@ -556,11 +560,17 @@ impl ClaudeTranslator {
             span_type: SpanType::Tool,
             start_ms: Some(event.ts_ms),
             input: Some(input.clone()),
-            metadata: Some(metadata),
+            metadata: Some(metadata.clone()),
             ..Default::default()
         }));
-        self.pending_tools
-            .insert(call_id, PendingTool { span_id, parent_id });
+        self.pending_tools.insert(
+            call_id,
+            PendingTool {
+                span_id,
+                parent_id,
+                metadata,
+            },
+        );
     }
 
     fn finish_tool(
@@ -576,8 +586,10 @@ impl ClaudeTranslator {
         let call_id = self.call_id(event);
         let input = tool_input(&event.payload);
         let output = tool_output(&event.payload);
-        let error = forced_error.or_else(|| tool_error(&event.payload));
-        let metadata = tool_metadata(event, &tool_name, &call_id, approval, &input);
+        let error = (approval != ToolApproval::Denied)
+            .then(|| forced_error.or_else(|| tool_error(&event.payload)))
+            .flatten();
+        let metadata = tool_metadata(event, &tool_name, &call_id, Some(approval), &input);
         if let Some(pending) = self.pending_tools.remove(&call_id) {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: pending.span_id,
@@ -770,7 +782,20 @@ impl ClaudeTranslator {
             }
         }
         for tool in tools {
-            if self.emitted_tools.insert(tool.call_id.clone()) {
+            if self.emitted_tools.contains(&tool.call_id) {
+                continue;
+            }
+            // A tool_use row is not a terminal outcome. Leave a corresponding
+            // live hook span pending so the explicit boundary can cancel it.
+            if !tool.terminal && self.pending_tools.contains_key(&tool.call_id) {
+                continue;
+            }
+            self.emitted_tools.insert(tool.call_id.clone());
+            if let Some(pending) = self.pending_tools.remove(&tool.call_id) {
+                ops.push(SpanOp::Merge(
+                    tool.into_update(pending.span_id, self.root_span_id.clone()),
+                ));
+            } else {
                 let span_key = format!("tool:{}", tool.call_id);
                 ops.push(SpanOp::Insert(tool.into_row(
                     ids::span_id(&self.session_id, &span_key),
@@ -839,7 +864,7 @@ impl ClaudeTranslator {
         &mut self,
         parent_id: &str,
         end_ms: i64,
-        error: &str,
+        cancellation_reason: &str,
         ops: &mut Vec<SpanOp>,
     ) {
         let ids: Vec<String> = self
@@ -851,11 +876,14 @@ impl ClaudeTranslator {
         for id in ids {
             if let Some(tool) = self.pending_tools.remove(&id) {
                 self.emitted_tools.insert(id);
+                let mut metadata = tool.metadata.as_object().cloned().unwrap_or_default();
+                metadata.insert("cancelled".into(), json!(true));
+                metadata.insert("cancellation_reason".into(), json!(cancellation_reason));
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id: tool.span_id,
                     root_span_id: self.root_span_id.clone(),
                     end_ms: Some(end_ms),
-                    error: Some(error.to_string()),
+                    metadata: Some(Value::Object(metadata)),
                     ..Default::default()
                 }));
             }
@@ -1151,6 +1179,9 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
                                             .cloned()
                                             .unwrap_or_else(|| json!({})),
                                         output: None,
+                                        approval: None,
+                                        cancelled: false,
+                                        terminal: false,
                                         error: None,
                                         start_ms: parse_timestamp_ms(record).unwrap_or(0),
                                         end_ms: parse_timestamp_ms(record).unwrap_or(0),
@@ -1208,12 +1239,21 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
                         if let Some(tool) = tools.get_mut(&call_id) {
                             tool.output = Some(result);
                             tool.end_ms = parse_timestamp_ms(record).unwrap_or(tool.start_ms);
-                            if block
-                                .get("is_error")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                            {
-                                tool.error = Some("Tool execution failed".into());
+                            tool.terminal = true;
+                            match transcript_tool_outcome(block, record) {
+                                TranscriptToolOutcome::Succeeded => {
+                                    tool.approval = Some(ToolApproval::Approved);
+                                }
+                                TranscriptToolOutcome::Failed(error) => {
+                                    tool.approval = Some(ToolApproval::Approved);
+                                    tool.error = Some(error);
+                                }
+                                TranscriptToolOutcome::Denied => {
+                                    tool.approval = Some(ToolApproval::Denied);
+                                }
+                                TranscriptToolOutcome::Cancelled => {
+                                    tool.cancelled = true;
+                                }
                             }
                         }
                     }
@@ -1449,17 +1489,152 @@ impl LlmCall {
     }
 }
 
+enum TranscriptToolOutcome {
+    Succeeded,
+    Failed(String),
+    Denied,
+    Cancelled,
+}
+
+fn transcript_tool_outcome(block: &Value, record: &Value) -> TranscriptToolOutcome {
+    let native_result = record.get("toolUseResult");
+    let values = [block.get("content"), native_result]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let error_signalled = block.get("is_error").and_then(Value::as_bool) == Some(true)
+        || block.get("isError").and_then(Value::as_bool) == Some(true)
+        || values.iter().any(|value| has_structured_error(value));
+    let structured_denial = values
+        .iter()
+        .any(|value| has_structured_outcome(value, &["denied", "deny", "rejected", "reject"]));
+    let denial_text = values.iter().any(|value| {
+        (has_outcome_phrase(value, &["permission to use"])
+            && has_outcome_phrase(value, &["has been denied"]))
+            || has_outcome_phrase(
+                value,
+                &[
+                    "tool use was rejected",
+                    "tool use was denied",
+                    "user rejected",
+                    "user denied",
+                    "user doesn't want to proceed",
+                    "user does not want to proceed",
+                    "permission request was rejected",
+                    "permission request was denied",
+                ],
+            )
+    });
+    if structured_denial || (error_signalled && denial_text) {
+        return TranscriptToolOutcome::Denied;
+    }
+
+    let structured_cancellation = values.iter().any(|value| {
+        has_structured_outcome(value, &["cancelled", "canceled", "aborted", "interrupted"])
+            || has_structured_cancellation(value)
+    });
+    let cancellation_text = values.iter().any(|value| {
+        has_outcome_phrase(
+            value,
+            &[
+                "request interrupted by user",
+                "tool use was cancelled",
+                "tool use was canceled",
+                "operation was cancelled",
+                "operation was canceled",
+                "operation was aborted",
+                "user cancelled",
+                "user canceled",
+            ],
+        )
+    });
+    if structured_cancellation || (error_signalled && cancellation_text) {
+        return TranscriptToolOutcome::Cancelled;
+    }
+
+    if error_signalled {
+        let error = values
+            .iter()
+            .find_map(|value| nonempty_error_text(value))
+            .unwrap_or_else(|| "Tool execution failed".into());
+        TranscriptToolOutcome::Failed(error)
+    } else {
+        TranscriptToolOutcome::Succeeded
+    }
+}
+
+fn has_structured_outcome(value: &Value, outcomes: &[&str]) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    ["status", "outcome", "type"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(Value::as_str))
+        .any(|status| outcomes.contains(&status.trim().to_ascii_lowercase().as_str()))
+}
+
+fn has_structured_error(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.get("is_error").and_then(Value::as_bool) == Some(true)
+            || object.get("isError").and_then(Value::as_bool) == Some(true)
+            || object.get("error").is_some_and(|error| {
+                error.as_bool() == Some(true) || nonempty_error_text(error).is_some()
+            })
+            || has_structured_outcome(value, &["error", "failed", "failure"])
+    })
+}
+
+fn has_structured_cancellation(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        ["interrupted", "cancelled", "canceled", "aborted"]
+            .into_iter()
+            .any(|key| object.get(key).and_then(Value::as_bool) == Some(true))
+    })
+}
+
+fn has_outcome_phrase(value: &Value, phrases: &[&str]) -> bool {
+    match value {
+        Value::String(text) => {
+            let text = text.to_ascii_lowercase();
+            phrases.iter().any(|phrase| text.contains(phrase))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| has_outcome_phrase(value, phrases)),
+        Value::Object(object) => object
+            .values()
+            .any(|value| has_outcome_phrase(value, phrases)),
+        _ => false,
+    }
+}
+
 struct TranscriptTool {
     call_id: String,
     tool_name: String,
     input: Value,
     output: Option<Value>,
+    approval: Option<ToolApproval>,
+    cancelled: bool,
+    terminal: bool,
     error: Option<String>,
     start_ms: i64,
     end_ms: i64,
 }
 
 impl TranscriptTool {
+    fn metadata(&self) -> Value {
+        let mut metadata = Map::new();
+        metadata.insert("tool_name".into(), json!(self.tool_name));
+        add_tool_approval(&mut metadata, self.approval);
+        metadata.insert("tool_call_id".into(), json!(self.call_id));
+        metadata.insert("recovered_from_transcript".into(), json!(true));
+        if self.cancelled || !self.terminal {
+            metadata.insert("cancelled".into(), json!(true));
+        }
+        Value::Object(metadata)
+    }
+
     fn into_row(self, span_id: String, root_span_id: String, parent: String) -> SpanRow {
         SpanRow {
             span_id,
@@ -1469,17 +1644,22 @@ impl TranscriptTool {
             span_type: SpanType::Tool,
             start_ms: Some(self.start_ms),
             end_ms: Some(self.end_ms),
-            input: Some(self.input),
-            output: self.output,
-            metadata: Some({
-                let mut metadata = Map::new();
-                metadata.insert("tool_name".into(), json!(self.tool_name));
-                add_tool_approval(&mut metadata, Some(ToolApproval::Approved));
-                metadata.insert("tool_call_id".into(), json!(self.call_id));
-                metadata.insert("recovered_from_transcript".into(), json!(true));
-                Value::Object(metadata)
-            }),
-            error: self.error,
+            input: Some(self.input.clone()),
+            output: self.output.clone(),
+            metadata: Some(self.metadata()),
+            error: self.error.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn into_update(self, span_id: String, root_span_id: String) -> SpanRow {
+        SpanRow {
+            span_id,
+            root_span_id,
+            end_ms: Some(self.end_ms),
+            output: self.output.clone(),
+            metadata: Some(self.metadata()),
+            error: self.error.clone(),
             ..Default::default()
         }
     }
@@ -1624,12 +1804,12 @@ fn tool_metadata(
     event: &Envelope,
     tool_name: &str,
     call_id: &str,
-    approval: ToolApproval,
+    approval: Option<ToolApproval>,
     input: &Value,
 ) -> Value {
     let mut metadata = Map::new();
     metadata.insert("tool_name".into(), json!(tool_name));
-    add_tool_approval(&mut metadata, Some(approval));
+    add_tool_approval(&mut metadata, approval);
     metadata.insert("tool_call_id".into(), json!(call_id));
     for (target, direct, nested) in [
         ("permission_id", "permission_id", "/permission/id"),

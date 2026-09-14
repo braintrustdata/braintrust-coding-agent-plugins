@@ -532,7 +532,8 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
                         "tool_name":"Bash",
                         "tool_use_id":"a",
                         "tool_input":{"command":"no"},
-                        "permission":{"id":"p1","type":"tool","title":"Run command"}
+                        "permission":{"id":"p1","type":"tool","title":"Run command"},
+                        "error":"The user denied this tool request"
                     }),
                 ),
                 &ctx,
@@ -582,6 +583,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         denied.metadata.as_ref().unwrap()["permission_title"],
         json!("Run command")
     );
+    assert_eq!(denied.error, None, "permission denial is not tool failure");
     assert!(tools
         .iter()
         .any(|row| row.error.as_deref() == Some("missing")));
@@ -666,6 +668,247 @@ fn claude_successful_tool_outputs_do_not_populate_error() {
         row.metadata.as_ref().unwrap()["tool_name"] == json!("TaskStop")
             && row.output.as_ref().unwrap()["message"] == json!("Successfully stopped task: abc")
     }));
+}
+
+#[test]
+fn claude_recovered_tool_results_determine_outcome_without_boundary_errors() {
+    let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let transcript = tempfile::NamedTempFile::new().unwrap();
+    let transcript_path = transcript.path().to_str().unwrap();
+    let records = [
+        json!({
+            "type":"user",
+            "timestamp":"2026-01-01T00:00:01Z",
+            "message":{"role":"user","content":"run tools"}
+        }),
+        json!({
+            "type":"assistant",
+            "timestamp":"2026-01-01T00:00:02Z",
+            "message":{
+                "id":"request-1",
+                "model":"claude-test",
+                "role":"assistant",
+                "content":[
+                    {"type":"tool_use","id":"success","name":"Bash","input":{"command":"pwd"}},
+                    {"type":"tool_use","id":"success-denial-text","name":"Bash","input":{"command":"cat audit.log"}},
+                    {"type":"tool_use","id":"success-cancellation-text","name":"Bash","input":{"command":"cat worker.log"}},
+                    {"type":"tool_use","id":"task-stop","name":"TaskStop","input":{"task_id":"abc"}},
+                    {"type":"tool_use","id":"denied","name":"Write","input":{"file_path":"secret"}},
+                    {"type":"tool_use","id":"denied-permission","name":"Bash","input":{"command":"git commit"}},
+                    {"type":"tool_use","id":"failed","name":"Bash","input":{"command":"exit 7"}},
+                    {"type":"tool_use","id":"cancelled","name":"Bash","input":{"command":"sleep 10"}}
+                ],
+                "usage":{"input_tokens":1,"output_tokens":1}
+            }
+        }),
+        json!({
+            "type":"user",
+            "timestamp":"2026-01-01T00:00:03Z",
+            "message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"success","content":"/tmp","is_error":false},
+                {"type":"tool_result","tool_use_id":"success-denial-text","content":"audit log: permission request was denied yesterday","is_error":false},
+                {"type":"tool_result","tool_use_id":"success-cancellation-text","content":"worker log: operation was aborted and retried","is_error":false},
+                {"type":"tool_result","tool_use_id":"task-stop","content":"Successfully stopped task: abc","is_error":false},
+                {"type":"tool_result","tool_use_id":"denied","content":"The user doesn't want to proceed with this tool use. The tool use was rejected.","is_error":true},
+                {"type":"tool_result","tool_use_id":"denied-permission","content":"Permission to use Bash with command git commit has been denied.","is_error":true},
+                {"type":"tool_result","tool_use_id":"failed","content":"Exit code 7","is_error":true},
+                {"type":"tool_result","tool_use_id":"cancelled","content":"Request interrupted by user","is_error":true}
+            ]}
+        }),
+    ];
+    let contents = records
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(transcript.path(), &contents).unwrap();
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "recovered-outcomes");
+    let ctx = SessionCtx {
+        session_id: "recovered-outcomes".into(),
+        config: None,
+    };
+    let event = |name: &str, ts_ms: i64, payload: Value| {
+        claude_event("recovered-outcomes", name, ts_ms, payload)
+    };
+    let mut ops = translator
+        .handle(
+            &event(
+                "UserPromptSubmit",
+                base + 1_000,
+                json!({"session_id":"recovered-outcomes","prompt":"run tools"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    for (call_id, tool_name, input) in [
+        ("success", "Bash", json!({"command":"pwd"})),
+        (
+            "success-denial-text",
+            "Bash",
+            json!({"command":"cat audit.log"}),
+        ),
+        (
+            "success-cancellation-text",
+            "Bash",
+            json!({"command":"cat worker.log"}),
+        ),
+        ("task-stop", "TaskStop", json!({"task_id":"abc"})),
+        ("denied", "Write", json!({"file_path":"secret"})),
+        ("denied-permission", "Bash", json!({"command":"git commit"})),
+        ("failed", "Bash", json!({"command":"exit 7"})),
+        ("cancelled", "Bash", json!({"command":"sleep 10"})),
+    ] {
+        ops.extend(
+            translator
+                .handle(
+                    &event(
+                        "PreToolUse",
+                        base + 2_000,
+                        json!({
+                            "session_id":"recovered-outcomes",
+                            "tool_name":tool_name,
+                            "tool_use_id":call_id,
+                            "tool_input":input
+                        }),
+                    ),
+                    &ctx,
+                )
+                .unwrap(),
+        );
+    }
+    ops.extend(
+        translator
+            .handle(
+                &event(
+                    "Stop",
+                    base + 4_000,
+                    json!({
+                        "session_id":"recovered-outcomes",
+                        "transcript_path":transcript_path,
+                        "_bt_transcript_snapshot":{"path":transcript_path,"contents":contents}
+                    }),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+        ops.extend(batch);
+    }
+
+    let rows = reduce(ops);
+    let by_call = |call_id: &str| {
+        rows.values()
+            .find(|row| {
+                row.span_type == SpanType::Tool
+                    && row.metadata.as_ref().unwrap()["tool_call_id"] == call_id
+            })
+            .unwrap()
+    };
+    for call_id in [
+        "success",
+        "success-denial-text",
+        "success-cancellation-text",
+        "task-stop",
+    ] {
+        let tool = by_call(call_id);
+        assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
+        assert_eq!(tool.error, None, "{call_id} should remain successful");
+    }
+    for (call_id, marker) in [("denied", "rejected"), ("denied-permission", "denied")] {
+        let denied = by_call(call_id);
+        assert_eq!(denied.metadata.as_ref().unwrap()["tool_approval"], "denied");
+        assert_eq!(denied.error, None, "a denial is not an execution failure");
+        assert!(denied
+            .output
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains(marker));
+    }
+    let failed = by_call("failed");
+    assert_eq!(
+        failed.metadata.as_ref().unwrap()["tool_approval"],
+        "approved"
+    );
+    assert_eq!(failed.error.as_deref(), Some("Exit code 7"));
+    let cancelled = by_call("cancelled");
+    assert!(cancelled
+        .metadata
+        .as_ref()
+        .unwrap()
+        .get("tool_approval")
+        .is_none());
+    assert_eq!(cancelled.metadata.as_ref().unwrap()["cancelled"], true);
+    assert_eq!(
+        cancelled.error, None,
+        "cancellation is not an execution failure"
+    );
+}
+
+#[test]
+fn claude_unfinished_tools_are_cancelled_at_explicit_boundaries() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "boundary-cancellation");
+    let ctx = SessionCtx {
+        session_id: "boundary-cancellation".into(),
+        config: None,
+    };
+    let event = |name: &str, ts_ms: i64, payload: Value| {
+        claude_event("boundary-cancellation", name, ts_ms, payload)
+    };
+    let mut ops = Vec::new();
+    for envelope in [
+        event("UserPromptSubmit", 10, json!({"prompt":"go"})),
+        event(
+            "PreToolUse",
+            20,
+            json!({"tool_name":"Bash","tool_use_id":"turn","tool_input":{"command":"sleep 10"}}),
+        ),
+        event(
+            "SubagentStart",
+            30,
+            json!({"agent_id":"agent-1","agent_type":"worker"}),
+        ),
+        event(
+            "PreToolUse",
+            40,
+            json!({"agent_id":"agent-1","tool_name":"Bash","tool_use_id":"subagent","tool_input":{"command":"sleep 10"}}),
+        ),
+        event(
+            "SubagentStop",
+            50,
+            json!({"agent_id":"agent-1","agent_type":"worker"}),
+        ),
+        event("Stop", 60, json!({})),
+        event("UserPromptSubmit", 70, json!({"prompt":"again"})),
+        event(
+            "PreToolUse",
+            80,
+            json!({"tool_name":"Bash","tool_use_id":"session","tool_input":{"command":"sleep 10"}}),
+        ),
+        event("SessionEnd", 90, json!({})),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+
+    let rows = reduce(ops);
+    for call_id in ["turn", "subagent", "session"] {
+        let tool = rows
+            .values()
+            .find(|row| {
+                row.span_type == SpanType::Tool
+                    && row.metadata.as_ref().unwrap()["tool_call_id"] == call_id
+            })
+            .unwrap();
+        assert_eq!(tool.metadata.as_ref().unwrap()["cancelled"], true);
+        assert_eq!(tool.error, None, "{call_id} should be a cancellation");
+    }
 }
 
 #[test]
