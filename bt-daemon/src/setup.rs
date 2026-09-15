@@ -22,7 +22,6 @@ const OPENCODE_PACKAGE: &str = "@braintrust/trace-opencode";
 const PI_PACKAGE: &str = "@braintrust/pi-extension";
 const OPENCODE_PACKAGE_MANIFEST: &str =
     include_str!("../../src/plugins/opencode/content/package.json");
-const PI_PACKAGE_MANIFEST: &str = include_str!("../../src/plugins/pi/content/package.json");
 const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
 const LEGACY_CLAUDE_TRACING_ENV_KEYS: [&str; 2] = ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"];
 #[cfg(unix)]
@@ -53,11 +52,8 @@ fn opencode_plugin_spec() -> anyhow::Result<String> {
     npm_major_spec(OPENCODE_PACKAGE, OPENCODE_PACKAGE_MANIFEST)
 }
 
-pub(crate) fn pi_plugin_spec() -> anyhow::Result<String> {
-    Ok(format!(
-        "npm:{}",
-        npm_major_spec(PI_PACKAGE, PI_PACKAGE_MANIFEST)?
-    ))
+pub(crate) fn pi_plugin_spec() -> String {
+    format!("npm:{PI_PACKAGE}")
 }
 
 fn version_is_older(installed: &str, expected: &str) -> bool {
@@ -139,10 +135,10 @@ fn pi_update_required() -> bool {
         return false;
     }
     let installed = String::from_utf8_lossy(&output.stdout);
+    let expected = pi_plugin_spec();
     installed.lines().any(|line| {
         let plugin = line.trim();
-        plugin.starts_with("npm:@braintrust/pi-extension")
-            && Some(plugin) != pi_plugin_spec().ok().as_deref()
+        plugin.starts_with(&expected) && plugin != expected
     })
 }
 
@@ -673,17 +669,18 @@ fn disable_opencode() -> anyhow::Result<()> {
 }
 
 fn setup_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    let plugin = pi_plugin_spec()?;
+    let plugin = pi_plugin_spec();
     runner.run("pi", &["install", &plugin])
 }
 
 fn disable_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    let plugin = pi_plugin_spec()?;
+    let plugin = pi_plugin_spec();
     runner.run("pi", &["uninstall", &plugin])
 }
 
 fn update_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    runner.run("pi", &["update", PI_PACKAGE])
+    let plugin = pi_plugin_spec();
+    runner.run("pi", &["update", &plugin])
 }
 
 fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
@@ -1332,21 +1329,21 @@ mod tests {
     }
 
     #[test]
-    fn pi_installs_the_published_extension_range() {
+    fn pi_installs_the_latest_published_extension() {
         let mut runner = FakeRunner::new([]);
 
         setup_pi(&mut runner).unwrap();
 
-        assert!(runner.called(&format!("pi install {}", pi_plugin_spec().unwrap())));
+        assert!(runner.called("pi install npm:@braintrust/pi-extension"));
     }
 
     #[test]
-    fn pi_update_does_not_install_the_extension() {
+    fn pi_updates_the_npm_extension_without_installing_it() {
         let mut runner = FakeRunner::new([]);
 
         update_pi(&mut runner).unwrap();
 
-        assert!(runner.called("pi update @braintrust/pi-extension"));
+        assert!(runner.called("pi update npm:@braintrust/pi-extension"));
         assert!(!runner
             .calls
             .iter()
@@ -1671,7 +1668,7 @@ mod tests {
 
         let mut pi = FakeRunner::new([]);
         disable_pi(&mut pi).unwrap();
-        assert!(pi.called(&format!("pi uninstall {}", pi_plugin_spec().unwrap())));
+        assert!(pi.called("pi uninstall npm:@braintrust/pi-extension"));
     }
 
     #[test]
