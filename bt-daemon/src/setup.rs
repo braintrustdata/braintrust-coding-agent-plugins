@@ -24,6 +24,21 @@ const OPENCODE_PACKAGE_MANIFEST: &str =
     include_str!("../../src/plugins/opencode/content/package.json");
 const PI_PACKAGE_MANIFEST: &str = include_str!("../../src/plugins/pi/content/package.json");
 const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
+const MUSE_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreLLMCall",
+    "PostLLMCall",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+    "SessionEnd",
+];
 const LEGACY_CLAUDE_TRACING_ENV_KEYS: [&str; 2] = ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"];
 #[cfg(unix)]
 const ANTIGRAVITY_PLUGIN_SOURCE: &str =
@@ -686,6 +701,85 @@ fn update_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     runner.run("pi", &["update", PI_PACKAGE])
 }
 
+/// Install Braintrust's hook file through Muse's supported managed-hook
+/// pointer.  We never merge into `hooks`: that map belongs to the user and
+/// other tools.  A pre-existing non-Braintrust managed path is an explicit
+/// conflict rather than something setup may overwrite.
+fn muse_hook_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("braintrust-hooks.json")
+}
+
+fn muse_hook_config() -> Map<String, Value> {
+    let command = "bt trace hook --source muse --flush-on-turn-end || true";
+    let hooks = MUSE_HOOK_EVENTS
+        .iter()
+        .map(|event| {
+            (
+                (*event).to_string(),
+                serde_json::json!([{
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": command}],
+                }]),
+            )
+        })
+        .collect::<Map<_, _>>();
+    Map::from_iter([
+        ("schema_version".into(), Value::from(1)),
+        ("hooks".into(), Value::Object(hooks)),
+    ])
+}
+
+fn setup_muse_at(config_dir: &Path) -> anyhow::Result<()> {
+    let settings_path = config_dir.join("settings.json");
+    let hook_path = muse_hook_path(config_dir);
+    let mut settings = load_object(&settings_path)?;
+    let owned_path = hook_path.to_string_lossy();
+    if let Some(existing) = settings.get("managed_hooks_path").and_then(Value::as_str) {
+        if existing != owned_path {
+            bail!(
+                "Muse already uses managed_hooks_path {}; refusing to overwrite it",
+                existing
+            );
+        }
+    }
+    settings.entry("schema_version").or_insert(Value::from(1));
+    settings.insert(
+        "managed_hooks_path".into(),
+        Value::String(owned_path.into_owned()),
+    );
+    write_object_atomic(&hook_path, muse_hook_config())?;
+    write_object_atomic(&settings_path, settings)
+}
+
+fn disable_muse_at(config_dir: &Path) -> anyhow::Result<()> {
+    let settings_path = config_dir.join("settings.json");
+    let hook_path = muse_hook_path(config_dir);
+    let mut settings = load_object(&settings_path)?;
+    if settings.get("managed_hooks_path").and_then(Value::as_str)
+        == Some(hook_path.to_string_lossy().as_ref())
+    {
+        settings.remove("managed_hooks_path");
+        write_object_atomic(&settings_path, settings)?;
+    }
+    match std::fs::remove_file(&hook_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove Muse hook configuration: {}",
+                hook_path.display()
+            )
+        }),
+    }
+}
+
+fn setup_muse() -> anyhow::Result<()> {
+    setup_muse_at(&paths::muse_config_dir())
+}
+fn disable_muse() -> anyhow::Result<()> {
+    disable_muse_at(&paths::muse_config_dir())
+}
+
 fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
     if config_dir.file_name().and_then(|part| part.to_str()) != Some("config") {
         bail!(
@@ -882,6 +976,7 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => disable_opencode(),
         SetupAgent::Pi => disable_pi(&mut runner),
         SetupAgent::Grok => disable_grok(&mut runner),
+        SetupAgent::Muse => disable_muse(),
         SetupAgent::Antigravity => disable_antigravity(&mut runner),
     };
     let settings_path = paths::agent_settings_path(source, None);
@@ -904,6 +999,7 @@ pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => update_opencode()?,
         SetupAgent::Pi => update_pi(&mut runner)?,
         SetupAgent::Grok => update_grok(&mut runner)?,
+        SetupAgent::Muse => {}
         SetupAgent::Antigravity => update_antigravity(&mut runner)?,
     }
     Ok(TraceCommandOutput::update(source, display_name))
@@ -916,6 +1012,7 @@ fn agent_details(agent: SetupAgent) -> (&'static str, &'static str) {
         SetupAgent::OpenCode => ("opencode", "OpenCode"),
         SetupAgent::Pi => ("pi", "Pi"),
         SetupAgent::Grok => ("grok", "Grok"),
+        SetupAgent::Muse => ("muse", "Muse Code"),
         SetupAgent::Antigravity => ("antigravity", "Google Antigravity"),
     }
 }
@@ -945,6 +1042,10 @@ pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<Trace
         SetupAgent::Grok => {
             setup_grok(&mut runner)?;
             ("grok", "Grok")
+        }
+        SetupAgent::Muse => {
+            setup_muse()?;
+            ("muse", "Muse Code")
         }
         SetupAgent::Antigravity => {
             setup_antigravity(&mut runner)?;
@@ -1627,6 +1728,57 @@ mod tests {
             settings["route"]["tags"],
             serde_json::json!(["replacement"])
         );
+    }
+
+    #[test]
+    fn muse_setup_owns_only_its_managed_hook_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("muse");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"schema_version":1,"theme":"dark"}"#,
+        )
+        .unwrap();
+
+        setup_muse_at(&config_dir).unwrap();
+        setup_muse_at(&config_dir).unwrap();
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(config_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(
+            settings["managed_hooks_path"],
+            muse_hook_path(&config_dir).to_string_lossy().as_ref()
+        );
+        let hooks: Value =
+            serde_json::from_slice(&std::fs::read(muse_hook_path(&config_dir)).unwrap()).unwrap();
+        assert_eq!(hooks["schema_version"], 1);
+        assert!(hooks["hooks"]["PreLLMCall"].is_array());
+
+        disable_muse_at(&config_dir).unwrap();
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(config_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert!(settings.get("managed_hooks_path").is_none());
+        assert!(!muse_hook_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn muse_setup_refuses_another_managed_hook_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("muse");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"schema_version":1,"managed_hooks_path":"/other/hooks.json"}"#,
+        )
+        .unwrap();
+        assert!(setup_muse_at(&config_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to overwrite"));
     }
 
     #[test]
