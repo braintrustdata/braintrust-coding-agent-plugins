@@ -227,6 +227,104 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
 }
 
 #[test]
+fn pi_turn_and_root_carry_last_assistant_output() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let events = vec![
+        event("session_start", 1, json!({"reason":"new"})),
+        event("before_agent_start", 2, json!({"prompt":"do it"})),
+        event(
+            "context",
+            3,
+            json!({"messages":[{"role":"user","content":"do it"}]}),
+        ),
+        event(
+            "message_end",
+            4,
+            json!({"message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"text","text":"all done"}],"usage":{"input":3,"output":1,"totalTokens":4}}}),
+        ),
+        event("agent_end", 5, json!({"messages":[]})),
+        event("before_agent_start", 6, json!({"prompt":"again"})),
+        event(
+            "context",
+            7,
+            json!({"messages":[{"role":"user","content":"again"}]}),
+        ),
+        event(
+            "message_end",
+            8,
+            json!({"message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"text","text":"done again"}],"usage":{"input":3,"output":1,"totalTokens":4}}}),
+        ),
+        event("agent_end", 9, json!({"messages":[]})),
+        event("session_shutdown", 10, json!({"reason":"quit"})),
+    ];
+    let mut ops = Vec::new();
+    for event in events {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let turn_one = rows.values().find(|r| r.name == "Turn 1").unwrap();
+    assert_eq!(
+        turn_one.output,
+        Some(json!({"role":"assistant","content":"all done"})),
+        "a completed turn carries its last assistant message"
+    );
+    let turn_two = rows.values().find(|r| r.name == "Turn 2").unwrap();
+    assert_eq!(
+        turn_two.output,
+        Some(json!({"role":"assistant","content":"done again"}))
+    );
+    let root = rows.values().find(|r| r.name == "Pi").unwrap();
+    assert_eq!(
+        root.output,
+        Some(json!({"role":"assistant","content":"done again"})),
+        "the session outcome is the last completed turn's output"
+    );
+}
+
+#[test]
+fn pi_errored_message_is_not_a_turn_or_root_outcome() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let events = vec![
+        event("session_start", 1, json!({"reason":"new"})),
+        event("before_agent_start", 2, json!({"prompt":"do it"})),
+        event(
+            "context",
+            3,
+            json!({"messages":[{"role":"user","content":"do it"}]}),
+        ),
+        event(
+            "message_end",
+            4,
+            json!({"message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"text","text":""}],"stopReason":"error","errorMessage":"provider exploded","usage":{"input":3,"output":1,"totalTokens":4}}}),
+        ),
+        event("agent_end", 5, json!({"messages":[]})),
+        event("session_shutdown", 6, json!({"reason":"quit"})),
+    ];
+    let mut ops = Vec::new();
+    for event in events {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let turn = rows.values().find(|r| r.name == "Turn 1").unwrap();
+    assert_eq!(
+        turn.output, None,
+        "an errored message is not a completed outcome"
+    );
+    let root = rows.values().find(|r| r.name == "Pi").unwrap();
+    assert_eq!(root.output, None);
+}
+
+#[test]
 fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("pi", "pi-session");

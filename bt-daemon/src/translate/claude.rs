@@ -270,6 +270,7 @@ struct ClaudeTranslator {
     git: Arc<GitMetadataCache>,
     current_cwd: Option<String>,
     last_turn_cwd: Option<String>,
+    last_turn_output: Option<Value>,
     last_ts_ms: i64,
 }
 
@@ -302,6 +303,7 @@ impl ClaudeTranslator {
             git,
             current_cwd: None,
             last_turn_cwd: None,
+            last_turn_output: None,
             last_ts_ms: 0,
         }
     }
@@ -842,15 +844,19 @@ impl ClaudeTranslator {
             "Turn ended before tool completion",
             ops,
         );
+        let output = event
+            .payload
+            .get("last_assistant_message")
+            .cloned()
+            .or_else(|| event.payload.get("output").cloned());
+        if output.as_ref().is_some_and(|output| !output.is_null()) {
+            self.last_turn_output = output.clone();
+        }
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn_id.clone(),
             root_span_id: self.root_span_id.clone(),
             end_ms: Some(event.ts_ms),
-            output: event
-                .payload
-                .get("last_assistant_message")
-                .cloned()
-                .or_else(|| event.payload.get("output").cloned()),
+            output,
             error,
             ..Default::default()
         }));
@@ -920,6 +926,7 @@ impl ClaudeTranslator {
                 span_id: self.session_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
                 end_ms: Some(event.ts_ms),
+                output: self.last_turn_output.clone(),
                 ..Default::default()
             }));
         }
@@ -1064,6 +1071,7 @@ impl AgentTranslator for ClaudeTranslator {
                 span_id: self.session_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
                 end_ms: Some(end_ms),
+                output: self.last_turn_output.clone(),
                 ..Default::default()
             }));
         }

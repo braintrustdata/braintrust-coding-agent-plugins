@@ -35,6 +35,8 @@ impl TranslatorFactory for PiTranslatorFactory {
             external_parent: None,
             opened: false,
             turn: None,
+            turn_output: None,
+            last_turn_output: None,
             turn_seq: 0,
             llm_seq: 0,
             total_tools: 0,
@@ -309,6 +311,8 @@ struct PiTranslator {
     external_parent: Option<String>,
     opened: bool,
     turn: Option<(String, Value)>,
+    turn_output: Option<Value>,
+    last_turn_output: Option<Value>,
     turn_seq: u32,
     llm_seq: u32,
     total_tools: u32,
@@ -667,6 +671,11 @@ impl PiTranslator {
             .error_message
             .clone()
             .filter(|_| matches!(message.stop_reason.as_deref(), Some("error" | "aborted")));
+        // Turn and root outcomes come from the latest completed assistant
+        // message; errored or aborted messages are not outcomes.
+        if error.is_none() {
+            self.turn_output = Some(output.clone());
+        }
         let ttft = pending
             .first_token_ms
             .map(|first| (first - pending.start_ms) as f64 / 1000.0);
@@ -842,10 +851,15 @@ impl PiTranslator {
         let Some((id, _)) = turn else {
             return vec![];
         };
+        let output = self.turn_output.take();
+        if output.is_some() {
+            self.last_turn_output = output.clone();
+        }
         vec![SpanOp::Merge(SpanRow {
             span_id: id,
             root_span_id: self.effective_root_span_id.clone(),
             end_ms: Some(ts),
+            output,
             error,
             ..Default::default()
         })]
@@ -859,6 +873,7 @@ impl PiTranslator {
             span_id: self.root_span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
             end_ms: Some(ts),
+            output: self.last_turn_output.take(),
             metadata: Some(
                 json!({"total_turns":self.turn_seq,"total_tool_calls":self.total_tools}),
             ),

@@ -374,6 +374,170 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
 }
 
 #[test]
+fn claude_root_records_last_turn_output_on_session_end() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "outcome-session");
+    let ctx = SessionCtx {
+        session_id: "outcome-session".into(),
+        config: None,
+    };
+    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "outcome-session".into(),
+        event: name.into(),
+        ts_ms,
+        managed_run_id: None,
+        payload,
+        route: None,
+        config: None,
+        capture: None,
+    };
+
+    let mut ops = Vec::new();
+    for event in [
+        event(
+            "SessionStart",
+            1,
+            json!({"cwd":"/workspace/demo", "source":"startup", "model":"claude-test"}),
+        ),
+        event(
+            "UserPromptSubmit",
+            2,
+            json!({"cwd":"/workspace/demo", "prompt":"ship it"}),
+        ),
+        event(
+            "Stop",
+            3,
+            json!({"cwd":"/workspace/demo", "last_assistant_message":"Done. Shipped it."}),
+        ),
+        event("SessionEnd", 4, json!({"cwd":"/workspace/demo"})),
+    ] {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+
+    let rows = reduce(ops);
+    let turn = rows
+        .values()
+        .find(|row| row.name == "Turn 1")
+        .expect("turn span");
+    assert_eq!(turn.output, Some(json!("Done. Shipped it.")));
+    let root = rows
+        .values()
+        .find(|row| row.name == "Claude Code: demo")
+        .expect("root span");
+    assert_eq!(
+        root.output,
+        Some(json!("Done. Shipped it.")),
+        "the session outcome must land on the root span"
+    );
+}
+
+#[test]
+fn claude_root_records_last_turn_output_on_finalize() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "finalize-session");
+    let ctx = SessionCtx {
+        session_id: "finalize-session".into(),
+        config: None,
+    };
+    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "finalize-session".into(),
+        event: name.into(),
+        ts_ms,
+        managed_run_id: None,
+        payload,
+        route: None,
+        config: None,
+        capture: None,
+    };
+
+    let mut ops = Vec::new();
+    for event in [
+        event(
+            "SessionStart",
+            1,
+            json!({"cwd":"/workspace/demo", "source":"startup", "model":"claude-test"}),
+        ),
+        event(
+            "UserPromptSubmit",
+            2,
+            json!({"cwd":"/workspace/demo", "prompt":"ship it"}),
+        ),
+        event(
+            "Stop",
+            3,
+            json!({"cwd":"/workspace/demo", "last_assistant_message":"Done. Shipped it."}),
+        ),
+    ] {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    // No SessionEnd hook: the daemon finalizes the session after a teardown.
+    ops.extend(translator.finalize(&ctx).unwrap());
+
+    let rows = reduce(ops);
+    let root = rows
+        .values()
+        .find(|row| row.name == "Claude Code: demo")
+        .expect("root span");
+    assert_eq!(root.output, Some(json!("Done. Shipped it.")));
+}
+
+#[test]
+fn claude_root_output_stays_unset_without_a_completed_turn() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "no-turn-session");
+    let ctx = SessionCtx {
+        session_id: "no-turn-session".into(),
+        config: None,
+    };
+    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "no-turn-session".into(),
+        event: name.into(),
+        ts_ms,
+        managed_run_id: None,
+        payload,
+        route: None,
+        config: None,
+        capture: None,
+    };
+
+    let mut ops = Vec::new();
+    for event in [
+        event(
+            "SessionStart",
+            1,
+            json!({"cwd":"/workspace/demo", "source":"startup", "model":"claude-test"}),
+        ),
+        event(
+            "UserPromptSubmit",
+            2,
+            json!({"cwd":"/workspace/demo", "prompt":"interrupted"}),
+        ),
+        event("SessionEnd", 3, json!({"cwd":"/workspace/demo"})),
+    ] {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+
+    let rows = reduce(ops);
+    let root = rows
+        .values()
+        .find(|row| row.name == "Claude Code: demo")
+        .expect("root span");
+    assert_eq!(
+        root.output, None,
+        "a session with no completed turn has no outcome to record"
+    );
+}
+
+#[test]
 fn claude_subagent_routing_tolerates_malformed_optional_metadata() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", "subagent-session");

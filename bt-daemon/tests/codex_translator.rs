@@ -268,6 +268,45 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
 }
 
 #[test]
+fn codex_root_records_last_turn_output_on_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    write_transcript(&transcript);
+    let tpath = transcript.to_str().unwrap();
+
+    let reg = Registry::default_agents();
+    let mut tr = reg.create("codex", "sess-outcome");
+    let ctx = SessionCtx {
+        session_id: "sess-outcome".into(),
+        config: None,
+    };
+
+    let mut ops = Vec::new();
+    ops.extend(
+        tr.handle(
+            &envelope("sess-outcome", "SessionStart", tpath, json!({ "source": "startup" })),
+            &ctx,
+        )
+        .unwrap(),
+    );
+    ops.extend(
+        tr.handle(&envelope("sess-outcome", "Stop", tpath, json!({})), &ctx)
+            .unwrap(),
+    );
+    ops.extend(tr.flush(&ctx).unwrap());
+
+    let rows = reduce(ops);
+    let turn = find(&rows, SpanType::Task, "turn: t1");
+    assert_eq!(turn.output, Some(json!("Here are the files.")));
+    let root = find(&rows, SpanType::Task, "codex: myapp");
+    assert_eq!(
+        root.output,
+        Some(json!("Here are the files.")),
+        "the session outcome must land on the root span"
+    );
+}
+
+#[test]
 fn codex_root_preserves_canonical_source_across_lifecycle_events() {
     let tmp = tempfile::tempdir().unwrap();
 
