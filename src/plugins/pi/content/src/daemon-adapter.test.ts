@@ -6,6 +6,7 @@ const mockState = vi.hoisted(() => ({
   closed: 0,
   claim: true,
   logGate: undefined as Promise<void> | undefined,
+  statusGate: undefined as Promise<void> | undefined,
 }));
 
 vi.mock("./runtime/daemon-client.ts", () => ({
@@ -21,6 +22,7 @@ vi.mock("./runtime/daemon-client.ts", () => ({
       return true;
     }
     async status(sessionId: string): Promise<Record<string, unknown>> {
+      await mockState.statusGate;
       return {
         daemon_version: "test",
         uptime_ms: 1,
@@ -66,6 +68,7 @@ describe("Pi daemon adapter", () => {
     mockState.closed = 0;
     mockState.claim = true;
     mockState.logGate = undefined;
+    mockState.statusGate = undefined;
   });
 
   it("does not register a duplicate managed adapter instance", async () => {
@@ -78,6 +81,41 @@ describe("Pi daemon adapter", () => {
     const { default: extension } = await import("./index.ts");
     extension(pi as never);
     expect(handlers.size).toBe(0);
+  });
+
+  it("does not block session startup on daemon status", async () => {
+    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    const pi = {
+      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
+        handlers.set(name, handler),
+    };
+    const ctx = {
+      cwd: "/tmp/project",
+      hasUI: true,
+      ui: { setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: {
+        getSessionFile: () => "/tmp/session.jsonl",
+        getSessionId: () => "native-session",
+      },
+    };
+    const { default: extension } = await import("./index.ts");
+    extension(pi as never);
+
+    let releaseStatus!: () => void;
+    mockState.statusGate = new Promise<void>((resolve) => {
+      releaseStatus = resolve;
+    });
+    let started = false;
+    const startup = handlers
+      .get("session_start")?.({ reason: "new" }, ctx)
+      .then(() => {
+        started = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(started).toBe(true);
+    releaseStatus();
+    await startup;
   });
 
   it("forwards native events and keeps the trace-link UI", async () => {
@@ -126,6 +164,21 @@ describe("Pi daemon adapter", () => {
 
     await handlers.get("session_start")?.({ reason: "new" }, ctx);
     await handlers.get("before_agent_start")?.({ prompt: "hello" }, ctx);
+    await handlers.get("context")?.({ messages: [{ role: "user", content: "hello" }] }, ctx);
+    await handlers.get("message_update")?.({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_start" },
+    });
+    await handlers.get("message_update")?.({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "first" },
+      message: { role: "assistant", content: "first" },
+    });
+    await handlers.get("message_update")?.({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "second" },
+      message: { role: "assistant", content: "firstsecond" },
+    });
     let acknowledge!: () => void;
     mockState.logGate = new Promise<void>((resolve) => {
       acknowledge = resolve;
@@ -144,6 +197,11 @@ describe("Pi daemon adapter", () => {
     expect(mockState.flushes).toHaveLength(0);
     await handlers.get("input")?.({ text: "next turn" });
     expect(mockState.logs.at(-1)?.event).toBe("input");
+    await handlers.get("context")?.({ messages: [{ role: "user", content: "next" }] }, ctx);
+    await handlers.get("message_update")?.({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", delta: "first thought" },
+    });
     await handlers.get("session_compact")?.({}, ctx);
     await handlers.get("session_tree")?.({}, ctx);
     await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
@@ -151,8 +209,12 @@ describe("Pi daemon adapter", () => {
     expect(mockState.logs.map((log) => log.event)).toEqual([
       "session_start",
       "before_agent_start",
+      "context",
+      "message_update",
       "agent_end",
       "input",
+      "context",
+      "message_update",
       "session_compact",
       "session_tree",
       "session_shutdown",
@@ -174,6 +236,15 @@ describe("Pi daemon adapter", () => {
       cwd: "/tmp/project",
       model: { provider: "openai", id: "gpt-5" },
     });
+    const streamingUpdates = mockState.logs.filter((log) => log.event === "message_update");
+    expect(streamingUpdates).toHaveLength(2);
+    expect(
+      streamingUpdates.map(
+        (log) =>
+          (log.payload as { event: { assistantMessageEvent: { type: string } } }).event
+            .assistantMessageEvent.type,
+      ),
+    ).toEqual(["text_delta", "thinking_delta"]);
     expect(mockState.flushes).toHaveLength(0);
     expect(widgets).toContainEqual([
       "braintrust-trace-link",
@@ -181,6 +252,6 @@ describe("Pi daemon adapter", () => {
       { placement: "belowEditor" },
     ]);
     expect(statuses.length).toBeGreaterThan(0);
-    expect(mockState.closed).toBe(1);
+    expect(mockState.closed).toBe(2);
   });
 });

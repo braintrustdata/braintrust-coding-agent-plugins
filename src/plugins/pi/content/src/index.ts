@@ -8,6 +8,7 @@ import { EXTENSION_VERSION } from "./version.ts";
 
 const STATUS_KEY = "braintrust-tracing";
 const WIDGET_KEY = "braintrust-trace-link";
+const UI_STATUS_TIMEOUT_MS = 250;
 const PI_VERSION = loadPiPackageMetadata().version;
 
 function sessionKeyFor(
@@ -26,6 +27,23 @@ function nativePayload(value: unknown): unknown {
   } catch {
     return { serialization_error: "Pi event payload was not JSON serializable" };
   }
+}
+
+type JsonObject = Record<string, unknown>;
+
+function asObject(value: unknown): JsonObject | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonObject)
+    : undefined;
+}
+
+function streamingUpdateKind(value: unknown): string | undefined {
+  const event = asObject(value);
+  const update = asObject(event?.assistantMessageEvent);
+  if (typeof update?.type === "string") return update.type;
+  return typeof event?.type === "string" && event.type !== "message_update"
+    ? event.type
+    : undefined;
 }
 
 function sessionDescriptor(ctx: ExtensionContext): {
@@ -49,6 +67,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
 
   let sessionId: string | undefined;
   let lastContext: ExtensionContext | undefined;
+  let awaitingFirstToken = false;
   const client = new DaemonClient({
     source: "pi",
     pluginVersion: EXTENSION_VERSION,
@@ -57,6 +76,13 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
         lastContext.ui.setStatus(STATUS_KEY, `Braintrust tracing unavailable: ${message}`);
       }
     },
+  });
+  // status.get waits for the daemon's entire ingress queue to settle. Keep UI
+  // lookups off the event client so a busy daemon cannot block event capture.
+  const statusClient = new DaemonClient({
+    source: "pi",
+    pluginVersion: EXTENSION_VERSION,
+    requestTimeoutMs: UI_STATUS_TIMEOUT_MS,
   });
 
   const remember = (ctx: ExtensionContext): ReturnType<typeof sessionDescriptor> => {
@@ -68,7 +94,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
 
   const refreshUi = async (ctx: ExtensionContext): Promise<void> => {
     if (!ctx.hasUI || !config.showUi || !sessionId) return;
-    const status = await client.status(sessionId);
+    const status = await statusClient.status(sessionId);
     const daemonSession = status?.sessions.find((session) => session.session_id === sessionId);
     if (daemonSession?.last_error) {
       ctx.ui.setStatus(STATUS_KEY, `Braintrust: ${daemonSession.last_error}`);
@@ -108,21 +134,33 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
       },
       route: config.route,
     });
-    if (updateUi && ctx) await refreshUi(ctx);
+    if (updateUi && ctx) void refreshUi(ctx);
   };
 
   pi.on("session_start", async (event, ctx) => {
     await forward("session_start", event, ctx);
-    await refreshUi(ctx);
+    void refreshUi(ctx);
   });
   pi.on("input", async (event) => forward("input", event));
   pi.on("before_agent_start", async (event, ctx) => forward("before_agent_start", event, ctx));
-  pi.on("context", async (event, ctx) => forward("context", event, ctx));
+  pi.on("context", async (event, ctx) => {
+    awaitingFirstToken = true;
+    await forward("context", event, ctx);
+  });
   pi.on("before_provider_request", async (event) => forward("before_provider_request", event));
   pi.on("after_provider_response", async (event) => forward("after_provider_response", event));
-  pi.on("message_update", async (event) => forward("message_update", event));
+  pi.on("message_update", async (event) => {
+    if (!awaitingFirstToken) return;
+    const kind = streamingUpdateKind(event);
+    if (!kind || !["text_delta", "thinking_delta", "text", "thinking"].includes(kind)) return;
+    awaitingFirstToken = false;
+    await forward("message_update", event);
+  });
   pi.on("thinking_level_select", async (event) => forward("thinking_level_select", event));
-  pi.on("message_end", async (event) => forward("message_end", event));
+  pi.on("message_end", async (event) => {
+    awaitingFirstToken = false;
+    await forward("message_end", event);
+  });
   pi.on("tool_execution_start", async (event) => forward("tool_execution_start", event));
   pi.on("tool_execution_end", async (event, ctx) => forward("tool_execution_end", event, ctx));
   pi.on("session_before_compact", async (event, ctx) =>
@@ -140,6 +178,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
       ctx.ui.setWidget(WIDGET_KEY, undefined);
     }
     await client.close();
+    await statusClient.close();
     sessionId = undefined;
     lastContext = undefined;
   });
