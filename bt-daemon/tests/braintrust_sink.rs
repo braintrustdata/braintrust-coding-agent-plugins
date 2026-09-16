@@ -512,6 +512,10 @@ async fn braintrust_sink_delivers_spans_to_collector() {
         bodies.contains("0.9.0"),
         "plugin version missing from shared span origin"
     );
+    assert!(
+        bodies.contains("bt_daemon_version"),
+        "daemon version metadata missing from spans: {bodies}"
+    );
 
     // Project registration happened (org_name path, no login).
     assert!(

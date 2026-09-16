@@ -82,7 +82,12 @@ Params:
 ```json
 {
   "protocol_version": 1,
-  "client": { "source": "codex", "plugin_version": "1.2.3", "pid": 12345 }
+  "client": {
+    "source": "codex",
+    "daemon_version": "0.20.0",
+    "plugin_version": "1.2.3",
+    "pid": 12345
+  }
 }
 ```
 Result:
@@ -93,11 +98,11 @@ Result:
   "capabilities": { "sources": ["codex", "claude-code", "opencode", "pi", "debug"] }
 }
 ```
-If `protocol_version` is incompatible the daemon returns an application error;
-the client decides whether to drop events or (if the client is newer) trigger a
-version handover (`daemon.shutdown` → respawn).
+If `protocol_version` is incompatible the daemon returns an application error.
+Daemon versions move forward: an older client uses a newer compatible daemon,
+while a newer client drains and replaces an older daemon once.
 
-### `event.log` (request or notification)
+### `event.log` (request)
 
 The hot path. Params are the **Envelope** (see below). Request result:
 ```json
@@ -111,6 +116,11 @@ tool marker is translated is held in durable pending-correlation state and
 reconciled by the daemon. On restart, uncheckpointed journal entries are queued
 again automatically. Explicit status and flush requests act as daemon-worker
 barriers, but hook capture never does.
+
+During version handover, the draining daemon returns `{ "accepted": false }`.
+The client waits for the replacement daemon, initializes a new connection, and
+retries the same envelope. Capture adapters must use requests because a JSON-RPC
+notification has no acknowledgement and therefore cannot make this retry safe.
 
 ### `session.flush` (request)
 
@@ -173,9 +183,12 @@ widget.
 
 ### `daemon.shutdown` (request)
 
-Graceful: stop accepting new events, drain all session queues, flush sinks,
-release the local endpoint, exit. Result `{ "ok": true }` is sent before exit.
-Used for version handover and by tests.
+Graceful: reject new events, wait for captures already being journaled, drain all
+session queues, and flush sinks. Result `{ "ok": true }` is sent only after the
+drain completes; the daemon then releases the local endpoint and exits. Used
+for version handover and explicit stop commands. A client whose declared daemon
+version is older than the running daemon receives `{ "ok": false }` and cannot
+downgrade it.
 
 ## Envelope (`event.log` params)
 
@@ -208,6 +221,10 @@ Field notes:
 
 - **`source`** selects the daemon-side translator. `debug` is a built-in
   pass-through translator used by the prototype and tests.
+
+The Braintrust sink keeps the capture package version in
+`context.span_origin.version` and adds `metadata.bt_daemon_version` to every
+span so the daemon build that performed translation can be queried separately.
 - **`session_id`** identifies the source agent session. Combined with `route`
   it forms the queue + state key (see "Multiple routes per session" below).
   The shim extracts it from the payload (default JSON field `session_id`,
@@ -288,10 +305,12 @@ journal, logs, status, or RPC response. Envelopes journal only their non-secret
   event rebuilds it from the journal, and deterministic span ids merge the
   re-emitted rows. This matters because the idle exit above requires *every*
   session to be quiet, which for a continuously active user never happens.
-- **Version handover.** `initialize` compares versions. A newer client sends
-  `daemon.shutdown`, waits until the endpoint no longer accepts connections,
-  and spawns its own daemon. In-flight session state is rebuilt from the
-  journal.
+- **Version handover.** `initialize` compares versions. Older clients use a
+  newer compatible daemon. A newer client sends `daemon.shutdown`; the old
+  daemon quiesces and drains before acknowledging, then the client spawns its
+  daemon. In-flight session state is rebuilt from the journal. This makes
+  upgrades monotonic instead of allowing mixed-version clients to repeatedly
+  replace each other.
 
 ## Durability & idempotence
 

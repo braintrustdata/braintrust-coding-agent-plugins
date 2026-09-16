@@ -460,11 +460,12 @@ pub(crate) fn apply_tags(route: &mut SessionRoute, tags: &[String]) -> anyhow::R
     Ok(())
 }
 
-fn initialize_params(env: &Envelope) -> serde_json::Value {
+fn initialize_params(env: &Envelope, daemon_version: &str) -> serde_json::Value {
     serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
         "client": {
             "source": env.source,
+            "daemon_version": daemon_version,
             "plugin_version": env.plugin_version,
             "pid": std::process::id()
         }
@@ -480,36 +481,103 @@ pub async fn forward_envelope(
     host: &HostInfo,
     no_spawn: bool,
 ) -> anyhow::Result<()> {
-    let stream = client::ensure_daemon(socket, host, no_spawn).await?;
-    let mut conn = client::Conn::new(stream);
-    let initialized = conn
-        .request(method::INITIALIZE, initialize_params(env))
-        .await?;
-    let initialized: wire::InitializeResult = serde_json::from_value(initialized)?;
-    if initialized.daemon_version != host.version {
-        if no_spawn {
+    const MAX_HANDOVER_ATTEMPTS: usize = 3;
+    let mut handover_attempts = 0;
+    let mut capture_retry_deadline = None;
+
+    loop {
+        if capture_retry_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             anyhow::bail!(
-                "daemon version {} does not match client {} and --no-spawn is set",
-                initialized.daemon_version,
-                host.version
+                "replacement daemon did not accept the event at {}",
+                socket.display()
             );
         }
-        conn.request(method::DAEMON_SHUTDOWN, serde_json::json!({}))
-            .await?;
-        drop(conn);
-        for _ in 0..100 {
-            if client::connect(socket).await.is_err() {
-                break;
+
+        let stream = match client::connect(socket).await {
+            Ok(stream) => stream,
+            Err(_) if capture_retry_deadline.is_some() && no_spawn => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Err(_) => client::ensure_daemon(socket, host, no_spawn).await?,
+        };
+        let mut conn = client::Conn::new(stream);
+        let initialized = match conn
+            .request(method::INITIALIZE, initialize_params(env, &host.version))
+            .await
+        {
+            Ok(initialized) => initialized,
+            Err(_) if capture_retry_deadline.is_some() => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let initialized: wire::InitializeResult = serde_json::from_value(initialized)?;
+        if daemon_needs_upgrade(&initialized.daemon_version, &host.version) {
+            if no_spawn {
+                anyhow::bail!(
+                    "daemon version {} is older than client {} and --no-spawn is set",
+                    initialized.daemon_version,
+                    host.version
+                );
+            }
+            if handover_attempts == MAX_HANDOVER_ATTEMPTS {
+                anyhow::bail!(
+                    "daemon version {} is still older than client {} after {MAX_HANDOVER_ATTEMPTS} handover attempts",
+                    initialized.daemon_version,
+                    host.version
+                );
+            }
+            conn.request(method::DAEMON_SHUTDOWN, serde_json::json!({}))
+                .await?;
+            handover_attempts += 1;
+            drop(conn);
+            wait_for_daemon_exit(socket).await;
+            continue;
         }
-        let stream = client::ensure_daemon(socket, host, false).await?;
-        conn = client::Conn::new(stream);
-        conn.request(method::INITIALIZE, initialize_params(env))
-            .await?;
+        let result = match conn.request(method::EVENT_LOG, env).await {
+            Ok(result) => result,
+            Err(_) if capture_retry_deadline.is_some() => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let result: wire::EventLogResult = serde_json::from_value(result)?;
+        if result.accepted {
+            return Ok(());
+        }
+        capture_retry_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    conn.request(method::EVENT_LOG, env).await?;
-    Ok(())
+}
+
+async fn wait_for_daemon_exit(socket: &std::path::Path) {
+    for _ in 0..100 {
+        if client::connect(socket).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A shared daemon only moves forward. Released versions use semver; opaque
+/// development versions retain the old exact-match handover behavior.
+fn daemon_needs_upgrade(daemon_version: &str, client_version: &str) -> bool {
+    if daemon_version == client_version {
+        return false;
+    }
+    compare_daemon_versions(daemon_version, client_version).is_none_or(|ordering| ordering.is_lt())
+}
+
+pub(crate) fn compare_daemon_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    Some(
+        semver::Version::parse(left)
+            .ok()?
+            .cmp(&semver::Version::parse(right).ok()?),
+    )
 }
 
 /// Ask the daemon to flush a session, bounded by `timeout_ms`. A reliable
@@ -1451,8 +1519,9 @@ mod tests {
 
         // Both the initial connection and the post-restart retry use this
         // shared parameter builder.
-        let initialize = initialize_params(&env);
+        let initialize = initialize_params(&env, "1.0.13");
         assert_eq!(initialize["client"]["source"], "grok");
+        assert_eq!(initialize["client"]["daemon_version"], "1.0.13");
         assert_eq!(initialize["client"]["plugin_version"], "0.1.0");
         assert_ne!(initialize["client"]["plugin_version"], "1.0.13");
     }
