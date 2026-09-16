@@ -68,6 +68,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   let sessionId: string | undefined;
   let lastContext: ExtensionContext | undefined;
   let awaitingFirstToken = false;
+  let uiGeneration = 0;
   const client = new DaemonClient({
     source: "pi",
     pluginVersion: EXTENSION_VERSION,
@@ -88,14 +89,20 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   const remember = (ctx: ExtensionContext): ReturnType<typeof sessionDescriptor> => {
     lastContext = ctx;
     const descriptor = sessionDescriptor(ctx);
+    if (sessionId !== descriptor.sessionId) uiGeneration += 1;
     sessionId = descriptor.sessionId;
     return descriptor;
   };
 
   const refreshUi = async (ctx: ExtensionContext): Promise<void> => {
     if (!ctx.hasUI || !config.showUi || !sessionId) return;
-    const status = await statusClient.status(sessionId);
-    const daemonSession = status?.sessions.find((session) => session.session_id === sessionId);
+    const refreshGeneration = uiGeneration;
+    const refreshSessionId = sessionId;
+    const status = await statusClient.status(refreshSessionId);
+    if (uiGeneration !== refreshGeneration || sessionId !== refreshSessionId) return;
+    const daemonSession = status?.sessions.find(
+      (session) => session.session_id === refreshSessionId,
+    );
     if (daemonSession?.last_error) {
       ctx.ui.setStatus(STATUS_KEY, `Braintrust: ${daemonSession.last_error}`);
     } else {
@@ -173,13 +180,16 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   pi.on("agent_end", async (event) => forward("agent_end", event));
   pi.on("session_shutdown", async (event, ctx) => {
     await forward("session_shutdown", event, ctx);
+    // Invalidate fire-and-forget refreshes before clearing the UI so a status
+    // request that finishes during shutdown cannot restore stale state.
+    uiGeneration += 1;
+    sessionId = undefined;
+    lastContext = undefined;
     if (ctx.hasUI) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
       ctx.ui.setWidget(WIDGET_KEY, undefined);
     }
     await client.close();
     await statusClient.close();
-    sessionId = undefined;
-    lastContext = undefined;
   });
 }

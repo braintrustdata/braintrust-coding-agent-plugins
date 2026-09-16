@@ -118,6 +118,47 @@ describe("Pi daemon adapter", () => {
     await startup;
   });
 
+  it("does not restore UI from a pending status refresh after shutdown", async () => {
+    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    const statuses: unknown[] = [];
+    const widgets: unknown[] = [];
+    const pi = {
+      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
+        handlers.set(name, handler),
+    };
+    const ctx = {
+      cwd: "/tmp/project",
+      hasUI: true,
+      ui: {
+        setStatus: (...args: unknown[]) => statuses.push(args),
+        setWidget: (...args: unknown[]) => widgets.push(args),
+      },
+      sessionManager: {
+        getSessionFile: () => "/tmp/session.jsonl",
+        getSessionId: () => "native-session",
+      },
+    };
+    const { default: extension } = await import("./index.ts");
+    extension(pi as never);
+
+    let releaseStatus!: () => void;
+    mockState.statusGate = new Promise<void>((resolve) => {
+      releaseStatus = resolve;
+    });
+    await handlers.get("session_start")?.({ reason: "new" }, ctx);
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+
+    expect(statuses.at(-1)).toEqual(["braintrust-tracing", undefined]);
+    expect(widgets.at(-1)).toEqual(["braintrust-trace-link", undefined]);
+
+    releaseStatus();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(statuses).toEqual([["braintrust-tracing", undefined]]);
+    expect(widgets).toEqual([["braintrust-trace-link", undefined]]);
+  });
+
   it("forwards native events and keeps the trace-link UI", async () => {
     const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
     const statuses: unknown[] = [];
