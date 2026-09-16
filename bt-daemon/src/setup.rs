@@ -683,7 +683,8 @@ fn disable_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
 }
 
 fn update_pi(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    runner.run("pi", &["update", PI_PACKAGE])
+    let package = format!("npm:{PI_PACKAGE}");
+    runner.run("pi", &["update", &package])
 }
 
 fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
@@ -1341,12 +1342,12 @@ mod tests {
     }
 
     #[test]
-    fn pi_update_does_not_install_the_extension() {
+    fn pi_updates_the_npm_extension_without_installing_it() {
         let mut runner = FakeRunner::new([]);
 
         update_pi(&mut runner).unwrap();
 
-        assert!(runner.called("pi update @braintrust/pi-extension"));
+        assert!(runner.called("pi update npm:@braintrust/pi-extension"));
         assert!(!runner
             .calls
             .iter()
