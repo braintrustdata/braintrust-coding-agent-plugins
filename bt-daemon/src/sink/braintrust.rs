@@ -173,6 +173,7 @@ impl SinkFactory for BraintrustSinkFactory {
             default_api_url: self.default_api_url.clone(),
             default_app_url: self.default_app_url.clone(),
             version: plugin_version.unwrap_or(&self.version).to_string(),
+            daemon_version: self.version.clone(),
             source: source.to_string(),
             creds: None,
             urls: None,
@@ -205,6 +206,7 @@ struct BraintrustSink {
     default_api_url: Option<String>,
     default_app_url: Option<String>,
     version: String,
+    daemon_version: String,
     source: String,
     creds: Option<Creds>,
     /// Resolved `(api_url, app_url)` for this session, from its config.
@@ -300,7 +302,7 @@ impl BraintrustSink {
     fn update_open(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         self.ensure_handle(client, row)?;
         let handle = self.open.get(&row.span_id).expect("just inserted");
-        handle.log(build_log(row)?);
+        handle.log(build_log(row, &self.daemon_version)?);
         if let Some(end) = row.end_ms {
             handle.end_with_time(ms_to_secs(end));
             // SpanHandle retains the complete accumulated input/output. Once a
@@ -323,7 +325,7 @@ impl BraintrustSink {
                 creds.token.clone(),
                 creds.org_id.clone(),
                 &components,
-                build_log(row)?,
+                build_log(row, &self.daemon_version)?,
             )
             .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))
     }
@@ -558,7 +560,7 @@ fn ms_to_secs(ms: i64) -> f64 {
     ms as f64 / 1000.0
 }
 
-fn build_log(row: &SpanRow) -> anyhow::Result<SpanLog> {
+fn build_log(row: &SpanRow, daemon_version: &str) -> anyhow::Result<SpanLog> {
     // The span's display name is carried on the log event, not the builder.
     // An empty name means "unchanged" (many merge ops use `..Default::default()`
     // and don't rename the span) — omitting `.name()` avoids overwriting the
@@ -573,9 +575,19 @@ fn build_log(row: &SpanRow) -> anyhow::Result<SpanLog> {
     if let Some(output) = &row.output {
         lb = lb.output(output.clone());
     }
-    if let Some(Value::Object(md)) = &row.metadata {
-        lb = lb.metadata(md.clone());
-    }
+    let mut metadata = row
+        .metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    // The plugin version remains in span_origin for backwards compatibility;
+    // this records the daemon build that actually translated the event.
+    metadata.insert(
+        "bt_daemon_version".into(),
+        Value::String(daemon_version.to_string()),
+    );
+    lb = lb.metadata(metadata);
     let mut metrics = row
         .metrics
         .as_ref()

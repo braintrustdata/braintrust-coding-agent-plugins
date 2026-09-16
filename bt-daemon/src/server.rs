@@ -8,9 +8,10 @@ use crate::sink::SinkFactory;
 use crate::translate::Registry;
 use crate::transport::{self, Listener, ServerStream};
 use crate::wire::{
-    error_code, method, Capabilities, Envelope, EventLogResult, FlushParams, FlushResult,
-    InitializeParams, InitializeResult, ManagedRunFlushParams, Message, Request, Response,
-    RpcError, SessionStatus, ShutdownResult, StatusParams, StatusResult, PROTOCOL_VERSION,
+    error_code, method, Capabilities, ClientInfo, Envelope, EventLogResult, FlushParams,
+    FlushResult, InitializeParams, InitializeResult, ManagedRunFlushParams, Message, Request,
+    Response, RpcError, SessionStatus, ShutdownResult, StatusParams, StatusResult,
+    PROTOCOL_VERSION,
 };
 use crate::wire::{AuthSelection, BackendAuth, SessionRoute};
 use crate::{paths, ServeArgs};
@@ -190,6 +191,11 @@ pub struct Daemon {
     ingress_dispatched: Mutex<HashMap<DeliveryKey, u64>>,
     started: Instant,
     last_activity: Mutex<Instant>,
+    /// Prevents a shutdown drain from racing capture that has passed the
+    /// quiescing check but has not yet appended and queued its event.
+    capture_gate: tokio::sync::RwLock<()>,
+    quiescing: AtomicBool,
+    drained: tokio::sync::Mutex<bool>,
     shutting_down: AtomicBool,
     shutdown: Notify,
 }
@@ -222,6 +228,9 @@ impl Daemon {
             ingress_dispatched: Mutex::new(HashMap::new()),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
+            capture_gate: tokio::sync::RwLock::new(()),
+            quiescing: AtomicBool::new(false),
+            drained: tokio::sync::Mutex::new(false),
             shutting_down: AtomicBool::new(false),
             shutdown: Notify::new(),
         });
@@ -583,7 +592,11 @@ impl Daemon {
             .sum()
     }
 
-    async fn capture_event(&self, mut env: Envelope) -> Result<(), String> {
+    async fn capture_event(&self, mut env: Envelope) -> Result<bool, String> {
+        let _capture_guard = self.capture_gate.read().await;
+        if self.quiescing.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         env.source = self
             .translators
             .canonical_source(&env.source)
@@ -612,7 +625,7 @@ impl Daemon {
                 tracing::warn!("journaled event will be recovered after daemon restart");
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn ingress_barrier(&self) {
@@ -796,8 +809,13 @@ impl Daemon {
     }
 
     fn trigger_shutdown(&self) {
+        self.quiescing.store(true, Ordering::SeqCst);
         self.shutting_down.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
+    }
+
+    fn begin_quiesce(&self) {
+        self.quiescing.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1083,6 +1101,7 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
         if line.trim().is_empty() {
             continue;
         }
+        let mut shutdown_after_response = false;
         let response = match Message::from_line(&line) {
             Ok(Message::Request(req)) => {
                 let request_id = req.id.clone();
@@ -1093,6 +1112,14 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
                     "request received"
                 );
                 let response = handle_request(&daemon, req, &mut client).await;
+                shutdown_after_response = method == method::DAEMON_SHUTDOWN
+                    && response.error.is_none()
+                    && response
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("ok"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
                 if let Some(error) = &response.error {
                     tracing::warn!(
                         request_id = ?request_id,
@@ -1112,13 +1139,22 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
             }
             Ok(Message::Notification(note)) => {
                 tracing::info!(method = %note.method, "notification received");
-                // Hot-path notifications (in-process clients): process, no reply.
+                // Legacy best-effort notifications cannot participate in the
+                // acknowledged handover retry used by current clients.
                 if note.method == method::EVENT_LOG {
                     if let Some(params) = note.params {
                         match serde_json::from_value::<Envelope>(params) {
                             Ok(mut env) => {
                                 attach_process_capture(&mut env, client.as_ref());
-                                let _ = daemon.capture_event(env).await;
+                                match daemon.capture_event(env).await {
+                                    Ok(true) => {}
+                                    Ok(false) => tracing::warn!(
+                                        "event notification arrived while daemon was shutting down"
+                                    ),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "event notification was not captured")
+                                    }
+                                }
                             }
                             Err(error) => tracing::warn!(
                                 method = %note.method,
@@ -1143,8 +1179,15 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
         if let Some(resp) = response {
             let mut buf = Message::Response(resp).to_line()?;
             buf.push('\n');
-            write_half.write_all(buf.as_bytes()).await?;
-            write_half.flush().await?;
+            let write_result = async {
+                write_half.write_all(buf.as_bytes()).await?;
+                write_half.flush().await
+            }
+            .await;
+            if shutdown_after_response {
+                daemon.trigger_shutdown();
+            }
+            write_result?;
         }
     }
     Ok(())
@@ -1860,9 +1903,9 @@ async fn handle_request(
             let mut env = parse!(Envelope);
             attach_process_capture(&mut env, client.as_ref());
             match daemon.capture_event(env).await {
-                Ok(()) => Response::ok(
+                Ok(accepted) => Response::ok(
                     id,
-                    serde_json::to_value(EventLogResult { accepted: true }).unwrap(),
+                    serde_json::to_value(EventLogResult { accepted }).unwrap(),
                 ),
                 Err(error) => Response::err(id, RpcError::new(error_code::INTERNAL, error)),
             }
@@ -1923,12 +1966,17 @@ async fn handle_request(
             Response::ok(id, serde_json::to_value(daemon.status(p)).unwrap())
         }
         method::DAEMON_SHUTDOWN => {
-            let resp = Response::ok(
+            if !client_may_shutdown(client.as_ref(), &daemon.version) {
+                return Response::ok(
+                    id,
+                    serde_json::to_value(ShutdownResult { ok: false }).unwrap(),
+                );
+            }
+            drain_all(daemon).await;
+            Response::ok(
                 id,
                 serde_json::to_value(ShutdownResult { ok: true }).unwrap(),
-            );
-            daemon.trigger_shutdown();
-            resp
+            )
         }
         other => Response::err(
             id,
@@ -1938,6 +1986,17 @@ async fn handle_request(
             ),
         ),
     }
+}
+
+fn client_may_shutdown(client: Option<&ClientInfo>, daemon_version: &str) -> bool {
+    let Some(client) = client else {
+        return true; // Explicit stop commands do not initialize first.
+    };
+    let Some(client_version) = client.daemon_version.as_deref() else {
+        return false; // Legacy initialized hooks must not downgrade the daemon.
+    };
+    crate::compare_daemon_versions(client_version, daemon_version)
+        .is_none_or(|ordering| !ordering.is_lt())
 }
 
 impl Daemon {
@@ -2083,11 +2142,18 @@ fn spawn_idle_watchdog(daemon: Arc<Daemon>, idle_timeout: Duration) {
 }
 
 async fn drain_all(daemon: &Arc<Daemon>) {
+    let mut drained = daemon.drained.lock().await;
+    if *drained {
+        return;
+    }
+    daemon.begin_quiesce();
+    let _capture_guard = daemon.capture_gate.write().await;
     daemon.settle_ingress().await;
     let sessions: Vec<Arc<Session>> = daemon.sessions.lock().unwrap().values().cloned().collect();
     for s in sessions {
         s.shutdown().await;
     }
+    *drained = true;
 }
 
 /// Is a live daemon answering at the endpoint? Connect and expect any line
@@ -2117,4 +2183,36 @@ async fn probe_alive(endpoint: &std::path::Path) -> bool {
         tokio::time::timeout(Duration::from_secs(1), lines.next_line()).await,
         Ok(Ok(Some(_)))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_may_shutdown, ClientInfo};
+
+    fn initialized(version: Option<&str>) -> ClientInfo {
+        ClientInfo {
+            source: "codex".into(),
+            daemon_version: version.map(str::to_string),
+            plugin_version: None,
+            pid: None,
+        }
+    }
+
+    #[test]
+    fn legacy_initialized_clients_cannot_downgrade_the_daemon() {
+        assert!(client_may_shutdown(None, "0.20.0"));
+        assert!(!client_may_shutdown(Some(&initialized(None)), "0.20.0"));
+        assert!(!client_may_shutdown(
+            Some(&initialized(Some("0.19.3"))),
+            "0.20.0"
+        ));
+        assert!(client_may_shutdown(
+            Some(&initialized(Some("0.20.0"))),
+            "0.20.0"
+        ));
+        assert!(client_may_shutdown(
+            Some(&initialized(Some("0.21.0"))),
+            "0.20.0"
+        ));
+    }
 }

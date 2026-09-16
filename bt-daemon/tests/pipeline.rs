@@ -1530,18 +1530,93 @@ async fn no_spawn_errors_when_daemon_absent() {
 }
 
 #[tokio::test]
-async fn no_spawn_rejects_a_mismatched_daemon_version() {
-    let (_data_dir, socket, handle, _tmp) = start_daemon().await;
-    let host = HostInfo {
+async fn daemon_version_handover_only_moves_forward() {
+    let (older_socket, older_handle, _flushes, _tmp) = start_tracking_daemon("1.0.0").await;
+    let newer_host = HostInfo {
         serve_argv: vec![OsString::from("unused")],
-        version: "newer-client".into(),
+        version: "2.0.0".into(),
     };
-    let err = forward_envelope(&envelope("x", "y", 1), &socket, &host, true)
+    let error = forward_envelope(
+        &envelope("newer-client", "SessionStart", 1),
+        &older_socket,
+        &newer_host,
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("is older than client"));
+    shutdown(&older_socket).await;
+    older_handle.await.unwrap();
+
+    let (newer_socket, newer_handle, _flushes, _tmp) = start_tracking_daemon("2.0.0").await;
+    let older_host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "1.0.0".into(),
+    };
+    forward_envelope(
+        &envelope("older-client", "SessionStart", 1),
+        &newer_socket,
+        &older_host,
+        true,
+    )
+    .await
+    .unwrap();
+    shutdown(&newer_socket).await;
+    newer_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_drains_then_retries_late_capture_on_replacement() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (data_dir, socket, handle, _tmp) = start_gated_daemon(gate.clone(), emitted.clone()).await;
+
+    forward_envelope(
+        &envelope("drained-shutdown", "SessionStart", 1),
+        &socket,
+        &dummy_host(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let shutdown_socket = socket.clone();
+    let shutdown_task = tokio::spawn(async move { shutdown_daemon(&shutdown_socket).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !shutdown_task.is_finished(),
+        "shutdown returned before the sink drained"
+    );
+
+    let late_socket = socket.clone();
+    let late_event = tokio::spawn(async move {
+        forward_envelope(
+            &envelope("drained-shutdown", "PostToolUse", 2),
+            &late_socket,
+            &dummy_host(),
+            true,
+        )
         .await
-        .unwrap_err();
-    assert!(err.to_string().contains("does not match client"));
+    });
+
+    shutdown_task.abort();
+    let _ = shutdown_task.await;
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("daemon stayed alive after the shutdown client disconnected")
+        .unwrap();
+    let replacement = start_daemon_at(data_dir.clone(), socket.clone()).await;
+    late_event.await.unwrap().unwrap();
     shutdown(&socket).await;
-    handle.await.unwrap();
+    replacement.await.unwrap();
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "drained-shutdown"))
+            .unwrap();
+    assert!(
+        journal.contains(r#""n":2"#),
+        "replacement daemon did not journal the retried event: {journal}"
+    );
 }
 
 #[cfg(feature = "cli")]
