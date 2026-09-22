@@ -121,9 +121,11 @@ impl TranslatorFactory for CodexTranslatorFactory {
         "codex"
     }
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
+        let root_span_id = ids::span_id(session_id, "root");
         Box::new(CodexTranslator {
             session_id: session_id.to_string(),
-            root_span_id: ids::span_id(session_id, "root"),
+            root_span_id: root_span_id.clone(),
+            effective_root_span_id: root_span_id,
             external_parent_span_id: None,
             root_opened: false,
             session_source: None,
@@ -234,7 +236,10 @@ enum PendingWork {
 
 struct CodexTranslator {
     session_id: String,
+    /// The daemon-owned session row. Child spans always parent to this id.
     root_span_id: String,
+    /// The destination trace root, which may be supplied by an attached parent.
+    effective_root_span_id: String,
     external_parent_span_id: Option<String>,
     root_opened: bool,
     session_source: Option<String>,
@@ -263,7 +268,12 @@ impl AgentTranslator for CodexTranslator {
         let mut ops = Vec::new();
 
         if let Some(config) = &ctx.config {
-            self.external_parent_span_id = config.attached_span_ids().0;
+            let attached = config.attached_span_ids();
+            self.external_parent_span_id = attached.0;
+            self.effective_root_span_id = attached
+                .1
+                .or_else(|| self.external_parent_span_id.clone())
+                .unwrap_or_else(|| self.root_span_id.clone());
             self.project = config.project_name().map(ToOwned::to_owned);
             self.additional_metadata = config
                 .additional_metadata
@@ -445,7 +455,7 @@ impl CodexTranslator {
             .and_then(|scope| scope.model.clone());
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             input: Some(json!({
                 "model": model,
                 "cwd": self.root_cwd,
@@ -470,7 +480,7 @@ impl CodexTranslator {
             let span_id = ids::span_id(&self.session_id, &format!("turn:{turn_id}"));
             ops.push(SpanOp::Merge(SpanRow {
                 span_id,
-                root_span_id: self.root_span_id.clone(),
+                root_span_id: self.effective_root_span_id.clone(),
                 metadata: Some(json!({ "compaction": { "trigger": trigger } })),
                 ..Default::default()
             }));
@@ -640,7 +650,7 @@ impl CodexTranslator {
                             };
                             ops.push(SpanOp::Merge(SpanRow {
                                 span_id: scope.turn_parent_span_id.clone(),
-                                root_span_id: self.root_span_id.clone(),
+                                root_span_id: self.effective_root_span_id.clone(),
                                 input: Some(input),
                                 metadata: Some(metadata),
                                 ..Default::default()
@@ -651,7 +661,7 @@ impl CodexTranslator {
                         }) {
                             ops.push(SpanOp::Merge(SpanRow {
                                 span_id: turn.span_id.clone(),
-                                root_span_id: self.root_span_id.clone(),
+                                root_span_id: self.effective_root_span_id.clone(),
                                 metadata: Some(json!({ "model": m })),
                                 ..Default::default()
                             }));
@@ -742,7 +752,7 @@ impl CodexTranslator {
                 scope.root_created = true;
                 ops.push(SpanOp::Insert(SpanRow {
                     span_id: self.root_span_id.clone(),
-                    root_span_id: self.root_span_id.clone(),
+                    root_span_id: self.effective_root_span_id.clone(),
                     parent_span_ids: self.external_parent_span_id.clone().into_iter().collect(),
                     name,
                     span_type: SpanType::Task,
@@ -769,7 +779,7 @@ impl CodexTranslator {
                     .unwrap_or_else(|| self.root_span_id.clone());
                 ops.push(SpanOp::Insert(SpanRow {
                     span_id: scope.turn_parent_span_id.clone(),
-                    root_span_id: self.root_span_id.clone(),
+                    root_span_id: self.effective_root_span_id.clone(),
                     parent_span_ids: vec![parent],
                     name: format!("subagent: {agent_id}"),
                     span_type: SpanType::Task,
@@ -797,7 +807,7 @@ impl CodexTranslator {
         let span_id = ids::span_id(&self.session_id, &format!("turn:{turn_id}"));
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![scope.turn_parent_span_id.clone()],
             name: format!("turn: {turn_id}"),
             span_type: SpanType::Task,
@@ -858,7 +868,7 @@ impl CodexTranslator {
             }
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.span_id.clone(),
-                root_span_id: self.root_span_id.clone(),
+                root_span_id: self.effective_root_span_id.clone(),
                 input: Some(json!(text)),
                 metadata: explicit_skill_metadata(&turn.explicit_skill_names),
                 ..Default::default()
@@ -896,7 +906,7 @@ impl CodexTranslator {
         let turn_id = turn.turn_id.clone();
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![turn_span],
             name,
             span_type: SpanType::Llm,
@@ -1059,7 +1069,7 @@ impl CodexTranslator {
 
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![turn_span],
             name,
             span_type: SpanType::Tool,
@@ -1101,7 +1111,7 @@ impl CodexTranslator {
         let error = output.as_ref().and_then(classify_tool_output);
         ops.push(SpanOp::Merge(SpanRow {
             span_id,
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             end_ms: Some(ts),
             output,
             metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
@@ -1151,7 +1161,7 @@ impl CodexTranslator {
         };
         ops.push(SpanOp::Merge(SpanRow {
             span_id: llm.span_id,
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             end_ms: Some(end),
             output,
             metadata: usage_metadata,
@@ -1191,7 +1201,7 @@ impl CodexTranslator {
             };
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: llm.span_id,
-                root_span_id: self.root_span_id.clone(),
+                root_span_id: self.effective_root_span_id.clone(),
                 end_ms: Some(llm.last_output_ms),
                 output,
                 metadata: Some(json!({
@@ -1208,7 +1218,7 @@ impl CodexTranslator {
             .map(|s| json!(s));
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn.span_id,
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             end_ms: Some(ts),
             output,
             ..Default::default()
@@ -1232,7 +1242,7 @@ impl CodexTranslator {
             if let Some((span_id, _)) = scope.open_tools.remove(&call_id) {
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id,
-                    root_span_id: self.root_span_id.clone(),
+                    root_span_id: self.effective_root_span_id.clone(),
                     end_ms,
                     metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
                     error: Some(MISSING_TOOL_OUTPUT_ERROR.to_string()),
@@ -1273,7 +1283,7 @@ impl CodexTranslator {
         // Relabel the turn as a compaction span.
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn_span.clone(),
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             name: "compaction".to_string(),
             span_type: SpanType::Task,
             metadata: Some(json!({ "compaction": {
@@ -1296,7 +1306,7 @@ impl CodexTranslator {
             .unwrap_or_else(|| "compaction".to_string());
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![turn_span.clone()],
             name: name.clone(),
             span_type: SpanType::Llm,
@@ -1334,7 +1344,7 @@ impl CodexTranslator {
             .unwrap_or(fallback_ts);
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
-            root_span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
             end_ms: Some(end_ms),
             late_merge_key: Some(format!("session:stop:{end_ms}")),
             ..Default::default()
@@ -1364,7 +1374,7 @@ impl CodexTranslator {
             // End the subagent root span.
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: scope.turn_parent_span_id.clone(),
-                root_span_id: self.root_span_id.clone(),
+                root_span_id: self.effective_root_span_id.clone(),
                 end_ms: Some(end),
                 ..Default::default()
             }));
@@ -1385,7 +1395,7 @@ impl CodexTranslator {
             };
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: llm.span_id,
-                root_span_id: self.root_span_id.clone(),
+                root_span_id: self.effective_root_span_id.clone(),
                 end_ms: end_ms.or(Some(llm.last_output_ms)),
                 output,
                 metadata: Some(json!({
@@ -1402,7 +1412,7 @@ impl CodexTranslator {
         for (sid, error) in tools {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: sid,
-                root_span_id: self.root_span_id.clone(),
+                root_span_id: self.effective_root_span_id.clone(),
                 end_ms,
                 metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
                 error: Some(error),
@@ -1412,7 +1422,7 @@ impl CodexTranslator {
         for turn in scope.open_turns.drain(..) {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.span_id,
-                root_span_id: self.root_span_id.clone(),
+                root_span_id: self.effective_root_span_id.clone(),
                 end_ms,
                 ..Default::default()
             }));
