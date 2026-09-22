@@ -143,6 +143,7 @@ struct TurnCompletion {
 
 struct OpenLlm {
     span_id: String,
+    parent_span_id: String,
     prompt_id: Option<String>,
     stream_start_ms: Option<i64>,
     output: BoundedOutput,
@@ -153,11 +154,13 @@ struct OpenLlm {
 
 struct OpenTool {
     span_id: String,
+    parent_span_id: String,
     start_ms: i64,
 }
 
 struct CompletedTool {
     span_id: String,
+    parent_span_id: String,
     end_ms: i64,
     terminal_update_seen: bool,
 }
@@ -209,6 +212,7 @@ struct GrokTranslator {
     session_id: String,
     session_span_id: String,
     root_span_id: String,
+    session_parent_span_ids: Vec<String>,
     root_open: bool,
     root_closed: bool,
     root_generation: u32,
@@ -224,6 +228,7 @@ struct GrokTranslator {
     events: TranscriptCursor,
     system_prompt: Option<String>,
     first_llm_span_id: Option<String>,
+    first_llm_parent_span_id: Option<String>,
     first_llm_user_input: Option<Value>,
     pending: Option<PendingWork>,
     cwd: Option<String>,
@@ -238,6 +243,7 @@ impl GrokTranslator {
             session_id: session_id.to_string(),
             session_span_id: root.clone(),
             root_span_id: root,
+            session_parent_span_ids: Vec::new(),
             root_open: false,
             root_closed: false,
             root_generation: 0,
@@ -253,6 +259,7 @@ impl GrokTranslator {
             events: TranscriptCursor::default(),
             system_prompt: None,
             first_llm_span_id: None,
+            first_llm_parent_span_id: None,
             first_llm_user_input: None,
             pending: None,
             cwd: None,
@@ -271,6 +278,7 @@ impl GrokTranslator {
         self.emitted_turns.clear();
         self.emitted_chunks.clear();
         self.first_llm_span_id = None;
+        self.first_llm_parent_span_id = None;
         self.first_llm_user_input = None;
         self.last_ts_ms = 0;
     }
@@ -292,6 +300,7 @@ impl GrokTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: self.session_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: self.session_parent_span_ids.clone(),
                 end_ms: Some(ts_ms),
                 metadata: Some(json!({
                     "resumed": true,
@@ -308,6 +317,7 @@ impl GrokTranslator {
             .map(|config| config.attached_span_ids())
             .unwrap_or_default();
         self.root_span_id = attached.1.unwrap_or_else(|| self.session_span_id.clone());
+        self.session_parent_span_ids = attached.0.clone().into_iter().collect();
         self.root_open = true;
 
         let mut metadata = ctx
@@ -336,7 +346,7 @@ impl GrokTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: attached.0.into_iter().collect(),
+            parent_span_ids: self.session_parent_span_ids.clone(),
             name: "Grok".into(),
             span_type: SpanType::Task,
             start_ms: Some(ts_ms),
@@ -346,12 +356,15 @@ impl GrokTranslator {
     }
 
     fn sync_user_input(&mut self, ops: &mut Vec<SpanOp>) {
+        let session_span_id = self.session_span_id.clone();
         let Some(turn) = self.current_turn.as_mut() else {
             return;
         };
         if !turn.user_input_dirty {
             return;
         }
+        let turn_span_id = turn.span_id.clone();
+        let first_llm_parent = self.first_llm_parent_span_id.clone();
         let input = turn.user_input.message_content();
         let mut metadata = Map::new();
         turn.user_input
@@ -360,6 +373,7 @@ impl GrokTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn.span_id.clone(),
             root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![session_span_id],
             input: input.clone(),
             metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
             ..Default::default()
@@ -377,6 +391,9 @@ impl GrokTranslator {
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id,
                     root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: vec![first_llm_parent
+                        .clone()
+                        .unwrap_or_else(|| turn_span_id.clone())],
                     input: first_llm_input(
                         self.system_prompt.as_deref(),
                         self.first_llm_user_input.as_ref(),
@@ -528,7 +545,7 @@ impl GrokTranslator {
                     );
                     let turn = self.current_turn.as_ref().expect("turn checked above");
                     let sequence = turn.llm_span_ids.len() + 1;
-                    let turn_span_id = turn.span_id.clone();
+                    let llm_parent_span_id = turn.span_id.clone();
                     let turn_key = turn.key.clone();
                     let model = turn.model.clone().unwrap_or_else(|| "Grok".into());
                     let identity_prompt = prompt_id.as_deref().unwrap_or("unknown");
@@ -544,6 +561,7 @@ impl GrokTranslator {
                     let is_first_llm = self.first_llm_span_id.is_none();
                     let input = if is_first_llm {
                         self.first_llm_span_id = Some(span_id.clone());
+                        self.first_llm_parent_span_id = Some(llm_parent_span_id.clone());
                         first_llm_input(
                             self.system_prompt.as_deref(),
                             self.first_llm_user_input.as_ref(),
@@ -574,7 +592,7 @@ impl GrokTranslator {
                     ops.push(SpanOp::Insert(SpanRow {
                         span_id: span_id.clone(),
                         root_span_id: self.root_span_id.clone(),
-                        parent_span_ids: vec![turn_span_id],
+                        parent_span_ids: vec![llm_parent_span_id.clone()],
                         name: format!("{model} call {sequence}"),
                         span_type: SpanType::Llm,
                         start_ms: Some(boundary_ms),
@@ -589,6 +607,7 @@ impl GrokTranslator {
                         .push(span_id.clone());
                     self.open_llm = Some(OpenLlm {
                         span_id,
+                        parent_span_id: llm_parent_span_id,
                         prompt_id: prompt_id.clone(),
                         stream_start_ms,
                         output: BoundedOutput::default(),
@@ -628,7 +647,7 @@ impl GrokTranslator {
             }
             "tool_call" => {
                 self.close_llm(ts_ms, "tool_call", Some("llm:tool_call".into()), ops);
-                let Some(turn_span_id) =
+                let Some(tool_parent_span_id) =
                     self.current_turn.as_ref().map(|turn| turn.span_id.clone())
                 else {
                     return;
@@ -654,7 +673,7 @@ impl GrokTranslator {
                 ops.push(SpanOp::Insert(SpanRow {
                     span_id: span_id.clone(),
                     root_span_id: self.root_span_id.clone(),
-                    parent_span_ids: vec![turn_span_id],
+                    parent_span_ids: vec![tool_parent_span_id.clone()],
                     name,
                     span_type: SpanType::Tool,
                     start_ms: Some(ts_ms),
@@ -666,6 +685,7 @@ impl GrokTranslator {
                     call_key,
                     OpenTool {
                         span_id,
+                        parent_span_id: tool_parent_span_id,
                         start_ms: ts_ms,
                     },
                 );
@@ -690,6 +710,7 @@ impl GrokTranslator {
                     (
                         OpenTool {
                             span_id: completed.span_id,
+                            parent_span_id: completed.parent_span_id,
                             start_ms: completed.end_ms,
                         },
                         true,
@@ -699,10 +720,11 @@ impl GrokTranslator {
                         return;
                     };
                     let span_id = ids::span_id(&self.session_id, &format!("tool:{call_id}"));
+                    let parent_span_id = turn.span_id.clone();
                     ops.push(SpanOp::Insert(SpanRow {
                         span_id: span_id.clone(),
                         root_span_id: self.root_span_id.clone(),
-                        parent_span_ids: vec![turn.span_id.clone()],
+                        parent_span_ids: vec![parent_span_id.clone()],
                         name: update
                             .get("title")
                             .and_then(Value::as_str)
@@ -720,6 +742,7 @@ impl GrokTranslator {
                     (
                         OpenTool {
                             span_id,
+                            parent_span_id,
                             start_ms: ts_ms,
                         },
                         false,
@@ -730,6 +753,7 @@ impl GrokTranslator {
                     call_key.clone(),
                     CompletedTool {
                         span_id: tool.span_id.clone(),
+                        parent_span_id: tool.parent_span_id.clone(),
                         end_ms,
                         terminal_update_seen: true,
                     },
@@ -753,6 +777,7 @@ impl GrokTranslator {
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id: tool.span_id,
                     root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: vec![tool.parent_span_id],
                     end_ms: Some(end_ms),
                     output: update
                         .get("rawOutput")
@@ -779,6 +804,7 @@ impl GrokTranslator {
                     ops.push(SpanOp::Merge(SpanRow {
                         span_id: llm_span_id.clone(),
                         root_span_id: self.root_span_id.clone(),
+                        parent_span_ids: vec![turn.span_id.clone()],
                         metrics: Some(metrics.clone()),
                         metadata: Some(json!({
                             "usage_scope": "turn",
@@ -853,6 +879,7 @@ impl GrokTranslator {
             key,
             CompletedTool {
                 span_id: completed.span_id,
+                parent_span_id: completed.parent_span_id.clone(),
                 end_ms,
                 terminal_update_seen: completed.terminal_update_seen,
             },
@@ -873,6 +900,7 @@ impl GrokTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id,
             root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![completed.parent_span_id],
             end_ms: Some(end_ms),
             metadata: Some(Value::Object(metadata)),
             error: failed.then(|| format!("Grok tool outcome: {}", outcome.unwrap_or("error"))),
@@ -916,6 +944,7 @@ impl GrokTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: llm.span_id,
             root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![llm.parent_span_id],
             end_ms: Some(end_ms.max(llm.last_ms).max(llm.start_ms)),
             output: Some(Value::Array(vec![output])),
             metadata: Some(Value::Object(metadata)),
@@ -939,6 +968,7 @@ impl GrokTranslator {
             call_id.clone(),
             CompletedTool {
                 span_id: tool.span_id.clone(),
+                parent_span_id: tool.parent_span_id.clone(),
                 end_ms,
                 terminal_update_seen: false,
             },
@@ -946,6 +976,7 @@ impl GrokTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: tool.span_id,
             root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![tool.parent_span_id],
             end_ms: Some(end_ms),
             metadata: Some(json!({
                 "incomplete": true,
@@ -963,6 +994,7 @@ impl GrokTranslator {
                 call_id.clone(),
                 CompletedTool {
                     span_id: tool.span_id.clone(),
+                    parent_span_id: tool.parent_span_id.clone(),
                     end_ms,
                     terminal_update_seen: false,
                 },
@@ -970,6 +1002,7 @@ impl GrokTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: tool.span_id,
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: vec![tool.parent_span_id],
                 end_ms: Some(end_ms),
                 metadata: Some(json!({"incomplete": true, "close_reason": reason})),
                 ..Default::default()
@@ -1005,6 +1038,7 @@ impl GrokTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn.span_id,
             root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![self.session_span_id.clone()],
             end_ms: Some(end_ms),
             output: Some(turn.assistant_output.into_value()),
             metadata: Some(Value::Object(metadata)),
@@ -1072,6 +1106,7 @@ impl GrokTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id,
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: self.first_llm_parent_span_id.clone().into_iter().collect(),
                 input: Some(input),
                 metadata: Some(Value::Object(metadata)),
                 ..Default::default()
@@ -1180,6 +1215,7 @@ impl GrokTranslator {
                     ops.push(SpanOp::Merge(SpanRow {
                         span_id: self.session_span_id.clone(),
                         root_span_id: self.root_span_id.clone(),
+                        parent_span_ids: self.session_parent_span_ids.clone(),
                         end_ms: Some(terminal_ms),
                         late_merge_key: Some(format!("session:terminal:{}", self.root_generation)),
                         ..Default::default()
@@ -1238,6 +1274,7 @@ impl AgentTranslator for GrokTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: self.session_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
+                parent_span_ids: self.session_parent_span_ids.clone(),
                 end_ms: Some(self.last_ts_ms),
                 late_merge_key: Some(format!("session:finalize:{}", self.root_generation)),
                 ..Default::default()

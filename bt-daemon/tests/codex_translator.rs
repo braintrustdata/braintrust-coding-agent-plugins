@@ -2,10 +2,14 @@
 //! hook triggers into a session → turn → {llm, tool} span tree. Mirrors the
 //! happy-path shape of the TS `event-processor` tests.
 
+#[path = "support/span_identity.rs"]
+mod span_identity;
+
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, FlushMode, SessionConfig, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
+use span_identity::assert_merges_preserve_insert_identity;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -180,6 +184,7 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
     );
     ops.extend(tr.flush(&ctx).unwrap());
 
+    assert_merges_preserve_insert_identity(&ops);
     let rows = reduce(ops);
 
     // Root (session).
@@ -423,6 +428,54 @@ fn codex_native_prompt_ignores_surrounding_injected_user_rows() {
         turn.metadata.as_ref().unwrap()["loaded_skill_names"],
         json!(["review"])
     );
+}
+
+#[test]
+fn attached_codex_root_merge_preserves_external_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    write_transcript(&transcript);
+    let path = transcript.to_str().unwrap();
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    let ctx = SessionCtx {
+        session_id: "attached-session".into(),
+        config: Some(SessionConfig {
+            auth: BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: Some(TraceDestination::ParentSpan { components }),
+            flush_mode: FlushMode::FireAndForget,
+            additional_metadata: None,
+            tags: Vec::new(),
+        }),
+    };
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "attached-session");
+    let mut ops = translator
+        .handle(
+            &envelope("attached-session", "SessionStart", path, json!({})),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(
+        translator
+            .handle(&envelope("attached-session", "Stop", path, json!({})), &ctx)
+            .unwrap(),
+    );
+    ops.extend(translator.flush(&ctx).unwrap());
+    assert_merges_preserve_insert_identity(&ops);
+    let rows = reduce(ops);
+    let root = rows
+        .values()
+        .find(|row| row.name.starts_with("codex:"))
+        .unwrap();
+    assert_eq!(root.parent_span_ids, ["external-parent"]);
 }
 
 #[test]
@@ -824,6 +877,7 @@ fn late_task_complete_is_correlated_by_turn_id() {
             .unwrap(),
     );
 
+    assert_merges_preserve_insert_identity(&ops);
     let rows = reduce(ops);
     let t1 = find(&rows, SpanType::Task, "turn: t1");
     let t2 = find(&rows, SpanType::Task, "turn: t2");
@@ -1216,6 +1270,7 @@ fn codex_compaction_relabels_turn_and_adds_compaction_llm() {
         )
         .unwrap(),
     );
+    assert_merges_preserve_insert_identity(&ops);
     let rows = reduce(ops);
 
     let compaction = find(&rows, SpanType::Task, "compaction");
@@ -1481,6 +1536,7 @@ fn codex_subagent_with_malformed_optional_type_nests_under_spawning_turn() {
         .unwrap(),
     );
 
+    assert_merges_preserve_insert_identity(&ops);
     let rows = reduce(ops);
 
     let root = find(&rows, SpanType::Task, "codex: app");
@@ -1579,4 +1635,89 @@ fn codex_rollout_routing_ignores_future_fields() {
     let tool = find(&rows, SpanType::Tool, "shell");
     assert_eq!(tool.input, Some(json!("{\"command\":\"pwd\"}")));
     assert_eq!(tool.output, Some(json!("/work/app")));
+}
+
+/// `end_main_root` closes the root handle on every main-scope Stop, so a later
+/// `SessionStart` (resume/compact) re-merges the root through the sink's
+/// stateless path. That merge must still carry the attached parent.
+#[test]
+fn codex_root_source_merge_after_stop_keeps_external_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    write_transcript(&transcript);
+    let path = transcript.to_str().unwrap();
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    let ctx = SessionCtx {
+        session_id: "attached-session".into(),
+        config: Some(SessionConfig {
+            auth: BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: Some(TraceDestination::ParentSpan { components }),
+            flush_mode: FlushMode::FireAndForget,
+            additional_metadata: None,
+            tags: Vec::new(),
+        }),
+    };
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "attached-session");
+    let mut ops = translator
+        .handle(
+            &envelope("attached-session", "SessionStart", path, json!({})),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(
+        translator
+            .handle(&envelope("attached-session", "Stop", path, json!({})), &ctx)
+            .unwrap(),
+    );
+    // Resume in the same live session: the root handle is already closed.
+    ops.extend(
+        translator
+            .handle(
+                &envelope(
+                    "attached-session",
+                    "SessionStart",
+                    path,
+                    json!({ "source": "resume" }),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    ops.extend(translator.flush(&ctx).unwrap());
+
+    let root_span_id = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name.starts_with("codex:") => Some(row.span_id.clone()),
+            _ => None,
+        })
+        .expect("root insert");
+    let source_merge = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Merge(row) if row.span_id == root_span_id => Some(row),
+            _ => None,
+        })
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .and_then(|m| m.get("session_source"))
+                .is_some()
+        })
+        .expect("post-Stop root source merge");
+    assert_eq!(
+        source_merge.parent_span_ids,
+        ["external-parent"],
+        "post-Stop root merge dropped the external parent"
+    );
+    assert_merges_preserve_insert_identity(&ops);
 }
