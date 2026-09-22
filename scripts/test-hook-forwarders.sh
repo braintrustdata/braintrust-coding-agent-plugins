@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Exercise the packaged hook shims with a fake bt CLI. This proves that raw
-# stdin and the canonical source identity reach `bt trace hook`, and that
-# installer or forwarding failures never fail an agent hook.
+# Exercise direct hook execution with a fake bt CLI. This proves that raw stdin
+# and the canonical source identity reach `bt trace hook` without a shell shim.
 
 set -euo pipefail
 
@@ -23,7 +22,8 @@ PAYLOAD='{"session_id":"shim-test","hook_event_name":"SessionStart","message":"u
 exercise() {
   local name="$1"
   local source="$2"
-  shift 2
+  local swallows_failure="$3"
+  shift 3
   local args_file="$TEST_DIR/$name.args"
   local stdin_file="$TEST_DIR/$name.stdin"
 
@@ -36,22 +36,26 @@ exercise() {
   [[ "$(cat "$args_file")" == "trace hook --source $source" ]]
   [[ "$(cat "$stdin_file")" == "$PAYLOAD" ]]
 
-  # The shim must swallow a daemon-client failure after forwarding the payload.
-  printf '%s' "$PAYLOAD" | env \
-    PATH="$TEST_DIR:$PATH" \
-    BT_CAPTURE_ARGS="$args_file" \
-    BT_CAPTURE_STDIN="$stdin_file" \
-    BT_STUB_STATUS=23 \
-    "$@"
+  if [[ "$swallows_failure" == true ]]; then
+    # The shell shim must swallow a daemon-client failure after forwarding the
+    # payload. Claude's direct exec-form hook leaves command exit handling to
+    # Claude Code, so it deliberately has no wrapper to test here.
+    printf '%s' "$PAYLOAD" | env \
+      PATH="$TEST_DIR:$PATH" \
+      BT_CAPTURE_ARGS="$args_file" \
+      BT_CAPTURE_STDIN="$stdin_file" \
+      BT_STUB_STATUS=23 \
+      "$@"
+  fi
 }
 
-exercise claude claude-code \
-  bash "$DIST_DIR/claude/plugins/trace-claude-code/hooks/forward.sh"
-exercise codex codex \
+exercise claude claude-code false \
+  bt trace hook --source claude-code
+exercise codex codex true \
   bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
 
-# Exercise first-use bootstrap without touching the developer's installation.
-# The fake curl materializes a fake bt binary and emits a no-op installer body.
+# Codex retains its shell shim and first-use bootstrap. Claude's package uses
+# Claude Code's exec-form hook configuration, so it intentionally has neither.
 BOOTSTRAP_DIR="$TEST_DIR/bootstrap"
 mkdir "$BOOTSTRAP_DIR"
 cat > "$BOOTSTRAP_DIR/curl" <<'EOF'
@@ -93,17 +97,13 @@ bootstrap() {
   [[ "$(cat "$stdin_file")" == "$PAYLOAD" ]]
 }
 
-bootstrap claude claude-code \
-  bash "$DIST_DIR/claude/plugins/trace-claude-code/hooks/forward.sh"
 bootstrap codex codex \
   bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
 
-# No bt binary is also fail-open. Use an empty path so the test does not depend
-# on whether the host running the suite has bt or curl installed.
+# No bt binary is also fail-open for the Codex shell shim. Use an empty path so
+# the test does not depend on whether the host running the suite has bt or curl.
 EMPTY_PATH="$TEST_DIR/empty-path"
 mkdir "$EMPTY_PATH"
-printf '%s' "$PAYLOAD" | PATH="$EMPTY_PATH" XDG_BIN_HOME="$EMPTY_PATH" CARGO_HOME="$EMPTY_PATH" /bin/bash \
-  "$DIST_DIR/claude/plugins/trace-claude-code/hooks/forward.sh"
 printf '%s' "$PAYLOAD" | PATH="$EMPTY_PATH" XDG_BIN_HOME="$EMPTY_PATH" CARGO_HOME="$EMPTY_PATH" /bin/bash \
   "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
 
