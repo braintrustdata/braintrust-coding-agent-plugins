@@ -111,6 +111,10 @@ pub struct EnableArgs {
         value_delimiter = ','
     )]
     pub tags: Vec<String>,
+    /// JavaScript span transform to persist for this agent. Repeat to compose
+    /// transforms in order.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub plugin: Vec<PathBuf>,
 }
 
 /// Backwards-compatible API name for hosts that mounted the former setup command.
@@ -358,6 +362,52 @@ mod tests {
                     .command,
                 TraceCommand::Update(_)
             ));
+        }
+    }
+
+    #[test]
+    fn public_commands_preserve_repeated_plugin_order() {
+        for args in [
+            vec![
+                "bt",
+                "setup",
+                "codex",
+                "--plugin",
+                "first.mjs",
+                "--plugin",
+                "second.mjs",
+            ],
+            vec![
+                "bt",
+                "run",
+                "--plugin",
+                "first.mjs",
+                "--plugin",
+                "second.mjs",
+                "codex",
+            ],
+            vec![
+                "bt",
+                "import",
+                "codex",
+                "session",
+                "--plugin",
+                "first.mjs",
+                "--plugin",
+                "second.mjs",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(args).unwrap();
+            let plugins = match parsed.trace.command {
+                TraceCommand::Setup(args) => args.plugin,
+                TraceCommand::Run(args) => args.plugin,
+                TraceCommand::Import(args) => args.plugin,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                plugins,
+                [PathBuf::from("first.mjs"), PathBuf::from("second.mjs")]
+            );
         }
     }
 }
