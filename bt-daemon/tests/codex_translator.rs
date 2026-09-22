@@ -2,7 +2,8 @@
 //! hook triggers into a session → turn → {llm, tool} span tree. Mirrors the
 //! happy-path shape of the TS `event-processor` tests.
 
-use bt_daemon::wire::{BackendAuth, Envelope, FlushMode, SessionConfig};
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use bt_daemon::wire::{BackendAuth, Envelope, FlushMode, SessionConfig, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -740,6 +741,32 @@ fn configured_ctx(session_id: &str, additional_metadata: Value) -> SessionCtx {
             tags: vec!["ci".into(), "docs".into()],
         }),
     }
+}
+
+#[test]
+fn codex_attached_root_uses_the_external_trace_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("attached.jsonl");
+    write_transcript(&transcript);
+    let path = transcript.to_str().unwrap();
+
+    let mut translator = Registry::default_agents().create("codex", "attached");
+    let mut ctx = configured_ctx("attached", json!({}));
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    ctx.config.as_mut().unwrap().destination = Some(TraceDestination::ParentSpan { components });
+
+    let rows = reduce(
+        translator
+            .handle(&envelope("attached", "SessionStart", path, json!({})), &ctx)
+            .unwrap(),
+    );
+    let root = find(&rows, SpanType::Task, "codex: myapp");
+    assert_ne!(root.span_id, root.root_span_id);
+    assert_eq!(root.root_span_id, "external-root");
+    assert_eq!(root.parent_span_ids, vec!["external-parent"]);
+    assert!(rows.values().all(|row| row.root_span_id == "external-root"));
 }
 
 #[test]
