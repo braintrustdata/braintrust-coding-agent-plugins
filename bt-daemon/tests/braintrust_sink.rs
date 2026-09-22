@@ -238,6 +238,149 @@ async fn merge_with_empty_name_does_not_clobber_the_original_name() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provisional_lifecycle_root_is_not_exported_without_work() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("empty", "codex", None).unwrap();
+    sink.configure(&session_config(&base));
+
+    let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
+    root.metadata = Some(json!({"_bt_defer_root": true}));
+    let closing = row("root", "root", &[], "", SpanType::Task, 1, Some(2));
+    assert_eq!(
+        sink.emit(&[SpanOp::Insert(root), SpanOp::Merge(closing)])
+            .await
+            .unwrap(),
+        0
+    );
+    sink.flush().await.unwrap();
+
+    assert!(logs3_bodies(&server).await.is_empty());
+    assert!(
+        sink.has_pending_delivery(),
+        "an ordinary flush must retain the root for a later replay or work row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provisional_root_survives_a_nonterminal_flush_until_work_arrives() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("flush", "codex", None).unwrap();
+    sink.configure(&session_config(&base));
+
+    let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
+    root.metadata = Some(json!({"_bt_defer_root": true}));
+    assert_eq!(sink.emit(&[SpanOp::Insert(root)]).await.unwrap(), 0);
+    sink.flush().await.unwrap();
+
+    let turn = row(
+        "turn",
+        "root",
+        &["root"],
+        "Turn 1",
+        SpanType::Task,
+        2,
+        Some(3),
+    );
+    assert_eq!(sink.emit(&[SpanOp::Insert(turn)]).await.unwrap(), 2);
+    sink.flush().await.unwrap();
+
+    let bodies = logs3_bodies(&server).await;
+    assert!(bodies.contains("codex"));
+    assert!(bodies.contains("Turn 1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_releases_only_its_direct_provisional_root() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("multi-root", "opencode", None).unwrap();
+    sink.configure(&session_config(&base));
+
+    let mut root_a = row("root-a", "root-a", &[], "root A", SpanType::Task, 1, None);
+    root_a.metadata = Some(json!({"_bt_defer_root": true}));
+    let mut root_b = row("root-b", "root-b", &[], "root B", SpanType::Task, 1, None);
+    root_b.metadata = Some(json!({"_bt_defer_root": true}));
+    assert_eq!(
+        sink.emit(&[SpanOp::Insert(root_a), SpanOp::Insert(root_b)])
+            .await
+            .unwrap(),
+        0
+    );
+
+    let work_b = row(
+        "work-b",
+        "root-b",
+        &["root-b"],
+        "work B",
+        SpanType::Task,
+        2,
+        Some(3),
+    );
+    assert_eq!(sink.emit(&[SpanOp::Insert(work_b)]).await.unwrap(), 2);
+    sink.flush().await.unwrap();
+
+    let bodies = logs3_bodies(&server).await;
+    assert!(bodies.contains("root B"));
+    assert!(bodies.contains("work B"));
+    assert!(!bodies.contains("root A"));
+    assert!(sink.has_pending_delivery(), "root A should remain deferred");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provisional_root_is_exported_before_its_first_work_row() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("work", "codex", None).unwrap();
+    sink.configure(&session_config(&base));
+
+    let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
+    root.metadata = Some(json!({"_bt_defer_root": true, "source": "codex"}));
+    let turn = row(
+        "turn",
+        "root",
+        &["root"],
+        "Turn 1",
+        SpanType::Task,
+        2,
+        Some(3),
+    );
+    assert_eq!(
+        sink.emit(&[SpanOp::Insert(root), SpanOp::Insert(turn)])
+            .await
+            .unwrap(),
+        2
+    );
+    sink.flush().await.unwrap();
+
+    let bodies = logs3_bodies(&server).await;
+    assert!(bodies.contains("codex"));
+    assert!(bodies.contains("Turn 1"));
+    assert!(!bodies.contains("_bt_defer_root"));
+}
+
 /// Completed handles must be releasable without changing the update contract:
 /// an update that arrives after terminal insertion is emitted as a stateless
 /// merge against the same deterministic span id.

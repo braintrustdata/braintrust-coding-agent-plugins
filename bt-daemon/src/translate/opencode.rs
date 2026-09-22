@@ -626,6 +626,7 @@ impl OpenCodeTranslator {
             .unwrap_or_default();
         metadata.insert("session_id".into(), Value::String(native_id.to_string()));
         metadata.insert("source".into(), Value::String("opencode".into()));
+        metadata.insert("_bt_defer_root".into(), Value::Bool(true));
         metadata.insert("username".into(), Value::String(local_username()));
         if let Some(parent) = parent_id {
             metadata.insert("parent_session_id".into(), Value::String(parent.into()));

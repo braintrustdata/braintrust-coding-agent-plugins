@@ -180,8 +180,13 @@ impl Sink for LedgerSink {
             return Ok(0);
         }
         let emitted = self.inner.emit(&filtered).await?;
-        if let Some(ledger) = &mut self.ledger {
-            ledger.record_emitted(&filtered);
+        // A deferred lifecycle root has not reached the backend yet. Do not
+        // record it as delivered: a subsequent cold-worker replay needs to
+        // retain the root until descendant work makes it exportable.
+        if emitted > 0 {
+            if let Some(ledger) = &mut self.ledger {
+                ledger.record_emitted(&filtered);
+            }
         }
         Ok(emitted)
     }
@@ -192,6 +197,10 @@ impl Sink for LedgerSink {
             ledger.commit().await?;
         }
         Ok(())
+    }
+
+    fn has_pending_delivery(&self) -> bool {
+        self.inner.has_pending_delivery()
     }
 
     fn permalink(&self) -> Option<String> {

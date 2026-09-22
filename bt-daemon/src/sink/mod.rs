@@ -30,6 +30,13 @@ pub trait Sink: Send {
     /// Deliver everything buffered (bounded by the caller's flush timeout).
     async fn flush(&mut self) -> anyhow::Result<()>;
 
+    /// Whether the sink is holding translated rows that have intentionally
+    /// not been delivered yet. Callers must not checkpoint past them because
+    /// a cold worker needs to rebuild and eventually deliver that state.
+    fn has_pending_delivery(&self) -> bool {
+        false
+    }
+
     /// A user-facing trace permalink, once known.
     fn permalink(&self) -> Option<String> {
         None

@@ -179,6 +179,7 @@ impl SinkFactory for BraintrustSinkFactory {
             urls: None,
             client: None,
             open: HashMap::new(),
+            pending_roots: HashMap::new(),
         }))
     }
 }
@@ -216,6 +217,9 @@ struct BraintrustSink {
     /// Live span handles keyed by deterministic span id, so a later op (e.g.
     /// setting `end`) merges onto the same row the SDK already knows.
     open: HashMap<String, SpanHandle<BraintrustClient>>,
+    /// Roots marked by translators as provisional, keyed by their local span
+    /// id. Each is exported only once direct descendant work arrives.
+    pending_roots: HashMap<String, Vec<SpanOp>>,
 }
 
 impl BraintrustSink {
@@ -356,6 +360,20 @@ impl BraintrustSink {
             propagated_event: destination.propagated_event,
         }
     }
+
+    async fn emit_op(&mut self, op: &SpanOp) -> anyhow::Result<()> {
+        let client = self.ensure_client().await?;
+        match op {
+            SpanOp::Insert(row) => self.update_open(&client.client, row)?,
+            SpanOp::Merge(row) if self.open.contains_key(&row.span_id) => {
+                self.update_open(&client.client, row)?
+            }
+            SpanOp::Merge(row) => self.merge_closed(&client.client, row)?,
+        }
+        client
+            .account_and_flush(serialized_len(op).unwrap_or(0))
+            .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -409,20 +427,30 @@ impl Sink for BraintrustSink {
     }
 
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
-        let client = self.ensure_client().await?;
         let mut n = 0u64;
         for op in ops {
-            match op {
-                SpanOp::Insert(row) => self.update_open(&client.client, row)?,
-                SpanOp::Merge(row) if self.open.contains_key(&row.span_id) => {
-                    self.update_open(&client.client, row)?
-                }
-                SpanOp::Merge(row) => self.merge_closed(&client.client, row)?,
+            let op_id = op_span_id(op);
+            if let Some(pending) = self.pending_roots.get_mut(op_id) {
+                pending.push(op.clone());
+                continue;
             }
+            if let Some(root_id) = direct_pending_parent(op, &self.pending_roots) {
+                let pending = self
+                    .pending_roots
+                    .remove(&root_id)
+                    .expect("pending root checked");
+                for pending_op in pending {
+                    self.emit_op(&pending_op).await?;
+                    n += 1;
+                }
+            }
+            if is_provisional_root(op) {
+                self.pending_roots
+                    .insert(op_id.to_string(), vec![op.clone()]);
+                continue;
+            }
+            self.emit_op(op).await?;
             n += 1;
-            client
-                .account_and_flush(serialized_len(op).unwrap_or(0))
-                .await?;
         }
         Ok(n)
     }
@@ -433,6 +461,45 @@ impl Sink for BraintrustSink {
             None => Ok(()),
         }
     }
+
+    fn has_pending_delivery(&self) -> bool {
+        !self.pending_roots.is_empty()
+    }
+}
+
+fn span_id(op: &SpanOp) -> Option<&str> {
+    match op {
+        SpanOp::Insert(row) | SpanOp::Merge(row) => Some(&row.span_id),
+    }
+}
+
+fn op_span_id(op: &SpanOp) -> &str {
+    span_id(op).expect("span operation always has an id")
+}
+
+fn direct_pending_parent(
+    op: &SpanOp,
+    pending_roots: &HashMap<String, Vec<SpanOp>>,
+) -> Option<String> {
+    let row = match op {
+        SpanOp::Insert(row) | SpanOp::Merge(row) => row,
+    };
+    row.parent_span_ids
+        .iter()
+        .find(|parent| pending_roots.contains_key(*parent))
+        .cloned()
+}
+
+fn is_provisional_root(op: &SpanOp) -> bool {
+    let SpanOp::Insert(row) = op else {
+        return false;
+    };
+    row.metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("_bt_defer_root"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn full_span(
@@ -581,6 +648,7 @@ fn build_log(row: &SpanRow, daemon_version: &str) -> anyhow::Result<SpanLog> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    metadata.remove("_bt_defer_root");
     // The plugin version remains in span_origin for backwards compatibility;
     // this records the daemon build that actually translated the event.
     metadata.insert(

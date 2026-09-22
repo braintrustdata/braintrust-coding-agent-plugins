@@ -799,7 +799,7 @@ impl SessionActor {
             return false;
         }
         self.refresh_permalink(sink.as_ref());
-        true
+        !sink.has_pending_delivery()
     }
 
     async fn record_delivery_checkpoint(
