@@ -779,3 +779,84 @@ fn opencode_accepts_flattened_tool_hook_payloads() {
     assert_eq!(tool.output.as_ref().unwrap(), "contents");
     assert_eq!(tool.end_ms, Some(4));
 }
+
+/// `session.idle` fires after every turn and merges the root summary while the
+/// session stays resumable. That merge must keep the attached parent — the
+/// sibling close-root arm already does.
+#[test]
+fn opencode_idle_root_merge_keeps_external_parent() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: Some(
+            SessionRoute {
+                destination: Some(TraceDestination::ParentSpan { components }),
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
+    };
+    let mut ops = translator
+        .handle(
+            &event(
+                "session.created",
+                1,
+                json!({"properties":{"info":{"id":"native"}}}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(
+        translator
+            .handle(
+                &event("chat.message", 2, json!({"input":{"sessionID":"native"}})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    // Idle, not deleted: the session stays resumable for the next turn.
+    ops.extend(
+        translator
+            .handle(
+                &event(
+                    "session.idle",
+                    3,
+                    json!({"properties":{"sessionID":"native"}}),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+
+    let root_span_id = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "OpenCode" => Some(row.span_id.clone()),
+            _ => None,
+        })
+        .expect("root insert");
+    let idle_merge = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Merge(row) if row.span_id == root_span_id => Some(row),
+            _ => None,
+        })
+        .next_back()
+        .expect("idle root merge");
+    assert_eq!(
+        idle_merge.parent_span_ids,
+        ["external-parent"],
+        "idle root merge dropped the external parent"
+    );
+    assert_merges_preserve_insert_identity(&ops);
+}

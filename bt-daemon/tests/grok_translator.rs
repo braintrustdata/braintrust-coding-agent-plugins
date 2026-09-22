@@ -1,6 +1,11 @@
-use bt_daemon::wire::Envelope;
+#[path = "support/span_identity.rs"]
+mod span_identity;
+
+use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{AgentTranslator, Registry, SessionCtx, SpanOp, SpanType};
 use serde_json::json;
+use span_identity::{assert_merges_preserve_insert_identity, IdentityLedger};
 use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> PathBuf {
@@ -64,9 +69,30 @@ fn point_at(event: &mut Envelope, updates: &Path, events: &Path) {
         json!(std::fs::metadata(events).unwrap().len());
 }
 
+thread_local! {
+    /// One ledger per test (each `#[test]` runs on its own thread), so a merge
+    /// emitted by a later hook is still checked against the batch that inserted
+    /// the span.
+    static LEDGER: std::cell::RefCell<IdentityLedger> =
+        std::cell::RefCell::new(IdentityLedger::default());
+}
+
+fn check_identity(ops: &[SpanOp]) {
+    LEDGER.with(|ledger| ledger.borrow_mut().check(ops));
+}
+
+/// Handle one event and assert every merge it emits still carries the parent
+/// identity its insert used.
+fn handle(translator: &mut dyn AgentTranslator, event: &Envelope) -> Vec<SpanOp> {
+    let ops = translator.handle(event, &ctx()).unwrap();
+    check_identity(&ops);
+    ops
+}
+
 fn drain(translator: &mut dyn AgentTranslator) -> Vec<SpanOp> {
     let mut ops = Vec::new();
     while let Some(batch) = translator.drain_pending(&ctx()).unwrap() {
+        check_identity(&batch);
         ops.extend(batch);
     }
     ops
@@ -271,7 +297,7 @@ fn grok_enriches_emitted_spans_from_the_captured_working_directory() {
     event.payload["cwd"] = json!(repo);
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let ops = translator.handle(&event, &ctx()).unwrap();
+    let ops = handle(&mut *translator, &event);
 
     let inserts: Vec<_> = ops
         .iter()
@@ -351,7 +377,7 @@ fn grok_single_call_usage_and_missing_tool_start_are_recovered() {
 
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let ops = translator.handle(&event, &ctx()).unwrap();
+    let ops = handle(&mut *translator, &event);
     let llm = ops
         .iter()
         .find_map(|op| match op {
@@ -379,7 +405,7 @@ fn grok_edge_fixture_preserves_turns_skips_malformed_records_and_marks_mismatche
     point_at(&mut event, &updates, &events);
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let ops = translator.handle(&event, &ctx()).unwrap();
+    let ops = handle(&mut *translator, &event);
 
     let turns: Vec<_> = ops
         .iter()
@@ -478,7 +504,7 @@ fn grok_partial_records_are_retried_and_complete_malformed_lines_do_not_stall() 
 
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let first = translator.handle(&first_event, &ctx()).unwrap();
+    let first = handle(&mut *translator, &first_event);
     assert!(!first
         .iter()
         .any(|op| matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Llm)));
@@ -490,7 +516,7 @@ fn grok_partial_records_are_retried_and_complete_malformed_lines_do_not_stall() 
     std::fs::write(&updates_path, completed).unwrap();
     let mut second_event = envelope(0, 0);
     point_at(&mut second_event, &updates_path, &events_path);
-    let second = translator.handle(&second_event, &ctx()).unwrap();
+    let second = handle(&mut *translator, &second_event);
     assert!(second
         .iter()
         .any(|op| matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Llm)));
@@ -515,7 +541,7 @@ fn grok_processes_a_complete_terminal_record_without_a_trailing_newline() {
 
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let ops = translator.handle(&event, &ctx()).unwrap();
+    let ops = handle(&mut *translator, &event);
 
     assert!(ops.iter().any(|op| {
         matches!(op, SpanOp::Merge(row)
@@ -546,7 +572,7 @@ fn grok_events_failure_does_not_block_updates_and_recovers_enrichment() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
 
-    let primary = translator.handle(&event, &ctx()).unwrap();
+    let primary = handle(&mut *translator, &event);
     assert_eq!(
         primary
             .iter()
@@ -562,7 +588,7 @@ fn grok_events_failure_does_not_block_updates_and_recovers_enrichment() {
     }));
 
     std::fs::write(&events_path, event_body).unwrap();
-    let enrichment = translator.handle(&event, &ctx()).unwrap();
+    let enrichment = handle(&mut *translator, &event);
     assert!(!enrichment.iter().any(|op| matches!(op, SpanOp::Insert(_))));
     let enriched_tools: Vec<_> = enrichment
         .iter()
@@ -578,7 +604,7 @@ fn grok_events_failure_does_not_block_updates_and_recovers_enrichment() {
         })
         .collect();
     assert_eq!(enriched_tools.len(), 1);
-    assert!(translator.handle(&event, &ctx()).unwrap().is_empty());
+    assert!(handle(&mut *translator, &event).is_empty());
 }
 
 #[test]
@@ -599,7 +625,7 @@ fn grok_buffers_tool_events_until_the_matching_update_arrives() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
 
-    let first = translator.handle(&first_event, &ctx()).unwrap();
+    let first = handle(&mut *translator, &first_event);
     assert!(!first.iter().any(|op| {
         matches!(op, SpanOp::Merge(row)
             if row.metadata.as_ref().is_some_and(|metadata| metadata.get("outcome").is_some()))
@@ -612,7 +638,7 @@ fn grok_buffers_tool_events_until_the_matching_update_arrives() {
     .unwrap();
     let mut second_event = envelope(0, 0);
     point_at(&mut second_event, &updates_path, &events_path);
-    let second = translator.handle(&second_event, &ctx()).unwrap();
+    let second = handle(&mut *translator, &second_event);
     assert!(second.iter().any(|op| {
         matches!(op, SpanOp::Merge(row)
             if row.output == Some(json!("done"))
@@ -644,7 +670,7 @@ fn grok_drains_every_captured_event_batch_before_finishing_the_hook() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
 
-    let mut ops = translator.handle(&envelope, &ctx()).unwrap();
+    let mut ops = handle(&mut *translator, &envelope);
     ops.extend(drain(translator.as_mut()));
 
     assert_eq!(
@@ -681,7 +707,7 @@ fn grok_updates_failure_keeps_primary_state_retryable() {
     assert!(translator.handle(&event, &ctx()).is_err());
 
     std::fs::write(&updates_path, update_body).unwrap();
-    let ops = translator.handle(&event, &ctx()).unwrap();
+    let ops = handle(&mut *translator, &event);
     assert_eq!(
         ops.iter()
             .filter(|op| matches!(op, SpanOp::Insert(row) if row.name == "Turn 1"))
@@ -711,7 +737,7 @@ fn grok_resets_semantic_state_when_the_transcript_is_replaced() {
     point_at(&mut first_event, &updates_path, &events_path);
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    translator.handle(&first_event, &ctx()).unwrap();
+    handle(&mut *translator, &first_event);
 
     let replacement = concat!(
         "{\"params\":{\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"text\":\"new\"}},\"_meta\":{\"promptIndex\":0,\"agentTimestampMs\":2000}}}\n",
@@ -720,7 +746,7 @@ fn grok_resets_semantic_state_when_the_transcript_is_replaced() {
     std::fs::write(&updates_path, replacement).unwrap();
     let mut replacement_event = envelope(0, 0);
     point_at(&mut replacement_event, &updates_path, &events_path);
-    let ops = translator.handle(&replacement_event, &ctx()).unwrap();
+    let ops = handle(&mut *translator, &replacement_event);
 
     assert!(ops.iter().any(|op| {
         matches!(op, SpanOp::Insert(row)
@@ -757,7 +783,7 @@ fn grok_supports_native_and_documented_terminal_events() {
         let mut translator = registry.create("grok", "grok-session");
         let mut event = base.clone();
         event.event = event_name.into();
-        let ops = translator.handle(&event, &ctx()).unwrap();
+        let ops = handle(&mut *translator, &event);
         let root_id = ops
             .iter()
             .find_map(|op| match op {
@@ -779,7 +805,7 @@ fn grok_supports_native_and_documented_terminal_events() {
         let mut translator = registry.create("grok", "grok-session");
         let mut event = base.clone();
         event.event = event_name.into();
-        let ops = translator.handle(&event, &ctx()).unwrap();
+        let ops = handle(&mut *translator, &event);
         let turn_id = ops
             .iter()
             .find_map(|op| match op {
@@ -823,7 +849,7 @@ fn grok_resume_extends_and_recloses_the_existing_session_root() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
 
-    let first = translator.handle(&first_end, &ctx()).unwrap();
+    let first = handle(&mut *translator, &first_end);
     let root_id = first
         .iter()
         .find_map(|op| match op {
@@ -845,7 +871,7 @@ fn grok_resume_extends_and_recloses_the_existing_session_root() {
     let mut resumed = envelope(0, 0);
     resumed.ts_ms = 3_100;
     point_at(&mut resumed, &updates_path, &events_path);
-    let second = translator.handle(&resumed, &ctx()).unwrap();
+    let second = handle(&mut *translator, &resumed);
     assert!(second.iter().any(|op| {
         matches!(op, SpanOp::Merge(row)
             if row.span_id == root_id
@@ -856,7 +882,7 @@ fn grok_resume_extends_and_recloses_the_existing_session_root() {
     let mut second_end = resumed;
     second_end.event = "session_end".into();
     second_end.ts_ms = 3_200;
-    let third = translator.handle(&second_end, &ctx()).unwrap();
+    let third = handle(&mut *translator, &second_end);
     assert!(third.iter().any(|op| {
         matches!(op, SpanOp::Merge(row)
             if row.span_id == root_id
@@ -881,7 +907,7 @@ fn grok_catch_up_and_open_state_bounds_drain_without_losing_later_records() {
     point_at(&mut event, &updates_path, &events_path);
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let mut ops = translator.handle(&event, &ctx()).unwrap();
+    let mut ops = handle(&mut *translator, &event);
     ops.extend(drain(translator.as_mut()));
     assert_eq!(
         ops.iter()
@@ -910,7 +936,7 @@ fn grok_finalize_closes_open_spans() {
     point_at(&mut event, &updates_path, &events_path);
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let handled = translator.handle(&event, &ctx()).unwrap();
+    let handled = handle(&mut *translator, &event);
     let root_id = handled
         .iter()
         .find_map(|op| match op {
@@ -976,7 +1002,7 @@ fn grok_assembles_user_and_identical_assistant_chunks() {
     point_at(&mut event, &updates_path, &events_path);
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let ops = translator.handle(&event, &ctx()).unwrap();
+    let ops = handle(&mut *translator, &event);
     let turn_id = ops
         .iter()
         .find_map(|op| match op {
@@ -1033,7 +1059,7 @@ fn grok_late_update_completes_an_evicted_tool_without_reinserting_it() {
     point_at(&mut event, &updates_path, &events_path);
     let registry = Registry::default_agents();
     let mut translator = registry.create("grok", "grok-session");
-    let mut ops = translator.handle(&event, &ctx()).unwrap();
+    let mut ops = handle(&mut *translator, &event);
     ops.extend(drain(translator.as_mut()));
     let tool_id = ops
         .iter()
@@ -1062,4 +1088,84 @@ fn grok_late_update_completes_an_evicted_tool_without_reinserting_it() {
             && row.late_merge_key.as_deref() == Some("tool:terminal_update")
             && row.metadata.as_ref().is_some_and(|metadata| metadata["incomplete"] == false))
     }));
+}
+
+/// An attached Grok session parents its root at the caller's span. Every
+/// session-row merge — resume, terminal, finalize — must repeat that parent,
+/// because each carries a `late_merge_key` and so is expected to land after
+/// the terminal row, with no open handle to borrow identity from.
+#[test]
+fn grok_attached_session_merges_keep_the_external_parent() {
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    let attached = SessionCtx {
+        session_id: "grok-session".into(),
+        config: Some(
+            SessionRoute {
+                destination: Some(TraceDestination::ParentSpan { components }),
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let updates_path = temp.path().join("updates.jsonl");
+    let events_path = temp.path().join("events.jsonl");
+    std::fs::write(&events_path, "").unwrap();
+    std::fs::write(
+        &updates_path,
+        concat!(
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"text\":\"go\"}},\"_meta\":{\"promptIndex\":0,\"agentTimestampMs\":1000}}}\n",
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"turn_completed\",\"usage\":{\"modelCalls\":0}},\"_meta\":{\"agentTimestampMs\":1100}}}\n"
+        ),
+    )
+    .unwrap();
+    let mut end = envelope(0, 0);
+    end.event = "SessionEnd".into();
+    end.ts_ms = 1_200;
+    point_at(&mut end, &updates_path, &events_path);
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("grok", "grok-session");
+    let mut ops = translator.handle(&end, &attached).unwrap();
+    ops.extend(translator.finalize(&attached).unwrap());
+
+    let root = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "Grok" => Some(row.clone()),
+            _ => None,
+        })
+        .expect("root insert");
+    assert_eq!(root.root_span_id, "external-root");
+    assert_eq!(root.parent_span_ids, ["external-parent"]);
+
+    let session_merges: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Merge(row) if row.span_id == root.span_id => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !session_merges.is_empty(),
+        "expected at least one session-row merge"
+    );
+    for merge in session_merges {
+        assert_eq!(
+            merge.parent_span_ids,
+            ["external-parent"],
+            "session merge {:?} dropped the external parent",
+            merge.late_merge_key
+        );
+    }
+    assert_merges_preserve_insert_identity(&ops);
 }

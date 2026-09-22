@@ -470,6 +470,7 @@ impl CodexTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
+            parent_span_ids: self.external_parent_span_id.clone().into_iter().collect(),
             input: Some(json!({
                 "model": model,
                 "cwd": self.root_cwd,

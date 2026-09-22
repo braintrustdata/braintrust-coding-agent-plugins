@@ -1298,6 +1298,7 @@ impl OpenCodeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: s.root_span_id.clone(),
                 root_span_id: s.effective_root_span_id.clone(),
+                parent_span_ids: s.parent_span_ids.clone(),
                 end_ms: Some(ts),
                 metadata: Some(
                     json!({"total_turns":s.turn_number,"total_tool_calls":s.tool_call_count}),
