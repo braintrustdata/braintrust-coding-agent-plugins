@@ -733,6 +733,7 @@ impl CodexTranslator {
                 // `source` is the stable integration identity used to classify
                 // traces. The native SessionStart lifecycle source is separate.
                 md.insert("source".into(), json!("codex"));
+                md.insert("_bt_defer_root".into(), json!(true));
                 if let Some(session_source) = &self.session_source {
                     md.insert("session_source".into(), json!(session_source));
                 }

@@ -129,6 +129,7 @@ impl AntigravityTranslator {
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("conversation_id".into(), json!(ctx.session_id));
         metadata.insert("source".into(), json!("antigravity"));
+        metadata.insert("_bt_defer_root".into(), json!(true));
         metadata.insert("username".into(), json!(local_username()));
         if let Some(model) = string_field(&event.payload, "modelName") {
             metadata.insert("model".into(), json!(model));

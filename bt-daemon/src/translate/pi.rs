@@ -512,6 +512,7 @@ impl PiTranslator {
             .unwrap_or_default();
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("source".into(), json!("pi"));
+        metadata.insert("_bt_defer_root".into(), json!(true));
         metadata.insert("username".into(), json!(local_username()));
         metadata.insert("pi_version".into(), json!(envelope.source_version));
         metadata.insert(
