@@ -433,6 +433,11 @@ pub(crate) fn envelopes(path: &Path) -> Result<Vec<Envelope>> {
     envelopes_for_session(path, &session.session_id)
 }
 
+pub(crate) fn session_id(path: &Path) -> Result<String> {
+    let header = read_header(path)?;
+    Ok(single_session(&header, path)?.session_id.clone())
+}
+
 pub(crate) fn envelopes_for_session(path: &Path, expected_id: &str) -> Result<Vec<Envelope>> {
     let mut events = Vec::new();
     for_each_envelope_for_session(path, expected_id, |event| {
