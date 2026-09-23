@@ -1,49 +1,49 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "PreToolUse": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "PostToolUse": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "PostToolUseFailure": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "PermissionDenied": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "StopFailure": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "StopCancelled": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "Notification": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "SubagentStart": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "SubagentStop": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "PreCompact": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "PostCompact": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ],
     "SessionEnd": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bash \"${GROK_PLUGIN_ROOT}/hooks/forward.sh\"" }] }
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "bt", "args": ["trace", "hook", "--source", "grok", "--session-id-field", "sessionId", "--event-field", "hookEventName", "--transcript-path-field", "transcriptPath"] }] }
     ]
   }
 }

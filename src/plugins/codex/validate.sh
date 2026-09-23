@@ -32,7 +32,6 @@ check_json "$MARKETPLACE"
 required=(
   "plugins/trace-codex/.codex-plugin/plugin.json"
   "plugins/trace-codex/hooks/hooks.json"
-  "plugins/trace-codex/bin/codex-hook.sh"
 )
 for rel in "${required[@]}"; do
   [[ -f "$TARGET_DIR/$rel" ]] || fail "missing $rel"
@@ -74,24 +73,12 @@ for definitions in hooks.values():
     for definition in definitions:
         for hook in definition["hooks"]:
             assert hook["type"] == "command"
-            assert hook["command"] == 'bash "${PLUGIN_ROOT}/bin/codex-hook.sh"'
-            assert hook["commandWindows"] == 'bash "${PLUGIN_ROOT}\\bin\\codex-hook.sh"'
-PY
-
-grep -Fq 'trace hook --source codex' \
-  "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.sh" \
-  || fail "Codex Unix forwarder does not invoke bt trace hook with source codex"
-python3 - "$TARGET_DIR/plugins/trace-codex/bin/codex-hook.sh" <<'PY' \
-  || fail "Codex forwarder does not install bt before forwarding"
-import sys
-
-text = open(sys.argv[1]).read()
-assert text.index("command -v bt") < text.index("curl -fsSL")
-assert text.index("curl -fsSL") < text.index("trace hook --source codex")
+            assert hook["command"] == "bt trace hook --source codex"
+            assert hook["commandWindows"] == "bt trace hook --source codex"
 PY
 if find "$TARGET_DIR/plugins/trace-codex" -type f \( \
   -name 'package.json' -o -name 'pnpm-lock.yaml' -o -name 'tsconfig.json' -o \
-  -name 'codex-hook-*' \) -print -quit | grep -q .; then
+  -name 'codex-hook-*' -o -name 'codex-hook.sh' \) -print -quit | grep -q .; then
   fail "Codex tracing plugin still contains a legacy tracing runtime"
 fi
 

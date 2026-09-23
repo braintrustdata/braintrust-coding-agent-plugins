@@ -7,11 +7,11 @@ tracing daemon through:
 bt trace hook --source codex
 ```
 
-The plugin is intentionally a thin, fail-open adapter. Its launcher installs
-the `bt` CLI with the official installer when it is not already available, then
-forwards the event. The `bt` CLI owns authentication, configuration, event
-journaling, trace construction, and delivery to Braintrust. No credentials are
-stored in the plugin.
+The plugin invokes the installed `bt` CLI directly for each hook. Install `bt`
+before enabling the plugin; it owns authentication, configuration, event
+journaling, trace construction, and delivery to Braintrust. It discovers the
+installed plugin and Codex versions dynamically. No credentials are stored in
+the plugin.
 
 ## Setup
 
@@ -32,9 +32,8 @@ bt trace doctor codex
 bt trace status
 ```
 
-Hook setup or forwarding never fails a Codex turn. If installation fails or the
-daemon cannot accept an event, the launcher reports the failure and
-exits successfully.
+Hook setup or forwarding never fails a Codex turn. If the CLI is unavailable or
+the daemon cannot accept an event, Codex reports the hook failure and continues.
 
 ## Additional root metadata
 

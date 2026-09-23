@@ -24,7 +24,6 @@ const OPENCODE_PACKAGE_MANIFEST: &str =
     include_str!("../../src/plugins/opencode/content/package.json");
 const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
 const LEGACY_CLAUDE_TRACING_ENV_KEYS: [&str; 2] = ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"];
-#[cfg(unix)]
 const ANTIGRAVITY_PLUGIN_SOURCE: &str =
     "https://github.com/braintrustdata/braintrust-antigravity-plugin";
 
@@ -144,7 +143,6 @@ fn pi_update_required() -> bool {
 
 trait CommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value>;
-    #[cfg(unix)]
     fn json_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<Value>;
     fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<()>;
     fn run_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<()>;
@@ -168,7 +166,6 @@ impl CommandRunner for SystemCommandRunner {
             .with_context(|| format!("`{program} {}` returned invalid JSON", args.join(" ")))
     }
 
-    #[cfg(unix)]
     fn json_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<Value> {
         let output = ProcessCommand::new(program)
             .args(args)
@@ -722,7 +719,6 @@ fn remove_legacy_antigravity_registration(config_dir: &Path) -> anyhow::Result<(
     Ok(())
 }
 
-#[cfg(unix)]
 fn setup_antigravity_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
     runner.run_in_home(
         "agy",
@@ -736,11 +732,6 @@ fn setup_antigravity_at(runner: &mut impl CommandRunner, config_dir: &Path) -> a
     )?;
 
     remove_legacy_antigravity_registration(config_dir)
-}
-
-#[cfg(not(unix))]
-fn setup_antigravity_at(_: &mut impl CommandRunner, _: &Path) -> anyhow::Result<()> {
-    bail!("Google Antigravity tracing setup currently requires a Unix-compatible `sh`")
 }
 
 fn setup_antigravity(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
@@ -764,7 +755,6 @@ fn disable_antigravity(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     disable_antigravity_at(runner, &paths::antigravity_config_dir())
 }
 
-#[cfg(unix)]
 fn update_antigravity_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
     let home = antigravity_home(config_dir)?;
     let plugins = runner.json_in_home("agy", &["plugin", "list"], home)?;
@@ -788,14 +778,8 @@ fn update_antigravity_at(runner: &mut impl CommandRunner, config_dir: &Path) -> 
     )
 }
 
-#[cfg(unix)]
 fn update_antigravity(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
     update_antigravity_at(runner, &paths::antigravity_config_dir())
-}
-
-#[cfg(not(unix))]
-fn update_antigravity(_: &mut impl CommandRunner) -> anyhow::Result<()> {
-    bail!("Google Antigravity tracing updates currently require a Unix-compatible `sh`")
 }
 
 fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()> {
@@ -1002,7 +986,6 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("missing fake JSON response"))
         }
 
-        #[cfg(unix)]
         fn json_in_home(
             &mut self,
             program: &str,
@@ -1030,16 +1013,13 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     struct MissingAgyRunner;
 
-    #[cfg(unix)]
     impl CommandRunner for MissingAgyRunner {
         fn json(&mut self, _: &str, _: &[&str]) -> anyhow::Result<Value> {
             unreachable!()
         }
 
-        #[cfg(unix)]
         fn json_in_home(&mut self, _: &str, _: &[&str], _: &Path) -> anyhow::Result<Value> {
             unreachable!()
         }
@@ -1393,7 +1373,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn antigravity_installs_published_plugin_and_removes_legacy_registration() {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".gemini/config");
@@ -1420,7 +1399,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn antigravity_update_checks_and_updates_the_same_overridden_home() {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".gemini/config");
@@ -1445,7 +1423,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn antigravity_setup_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".gemini/config");
@@ -1480,7 +1457,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn antigravity_setup_relies_on_native_plugin_hooks() {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".gemini/config");
@@ -1494,7 +1470,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn antigravity_setup_reports_a_missing_cli_without_changing_hooks() {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".gemini/config");

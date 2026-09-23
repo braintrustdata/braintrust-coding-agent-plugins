@@ -44,8 +44,10 @@ Each traced session includes:
 - session metadata such as Grok and plugin versions, working directory,
   workspace, and native session ID.
 
-The plugin sends events to the local `bt` daemon, which handles credentials
-and uploads traces.
+The plugin invokes the installed `bt` CLI directly for each event. `bt` owns
+credentials, daemon startup, and trace delivery. It records the installed
+plugin and Grok versions dynamically; no release-specific hook edits are
+needed.
 
 ## Caveats
 

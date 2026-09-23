@@ -7,10 +7,10 @@ bt trace hook --source claude-code
 ```
 
 Use `bt trace enable claude --project <project>` to install and configure it.
-The hook first installs the `bt` CLI with the official installer when it is not
-already available, then forwards the event. The plugin is credential-free and
-fail-open; the `bt` CLI and shared daemon own authentication, event journaling,
-trace construction, and delivery.
+Claude Code directly executes the configured `bt` CLI for each hook; it does
+not launch a shell or an intermediate forwarding script. The plugin is
+credential-free; the `bt` CLI and shared daemon own authentication, event
+journaling, trace construction, and delivery.
 
 ## Supported surfaces
 

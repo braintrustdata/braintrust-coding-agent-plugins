@@ -32,7 +32,6 @@ check_json "$MARKETPLACE"
 required=(
   "plugins/trace-claude-code/.claude-plugin/plugin.json"
   "plugins/trace-claude-code/hooks/hooks.json"
-  "plugins/trace-claude-code/hooks/forward.sh"
 )
 for rel in "${required[@]}"; do
   [[ -f "$TARGET_DIR/$rel" ]] || fail "missing $rel"
@@ -59,7 +58,7 @@ if find "$TARGET_DIR" -name '.mcp.json' -print -quit | grep -q .; then
 fi
 
 python3 - "$TARGET_DIR/plugins/trace-claude-code/hooks/hooks.json" <<'PY' \
-  || fail "Claude hooks do not all use the blocking daemon forwarder"
+  || fail "Claude hooks do not all directly execute the bt daemon client"
 import json
 import sys
 
@@ -76,20 +75,9 @@ for definitions in hooks.values():
     for definition in definitions:
         for hook in definition["hooks"]:
             assert hook["type"] == "command"
-            assert hook["command"] == 'bash "${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh"'
+            assert hook["command"] == "bt trace hook --source claude-code"
+            assert "args" not in hook
             assert hook["async"] is False
-PY
-
-grep -Fq 'trace hook --source claude-code' \
-  "$TARGET_DIR/plugins/trace-claude-code/hooks/forward.sh" \
-  || fail "Claude forwarder does not invoke bt trace hook with source claude-code"
-python3 - "$TARGET_DIR/plugins/trace-claude-code/hooks/forward.sh" <<'PY' \
-  || fail "Claude forwarder does not install bt before forwarding"
-import sys
-
-text = open(sys.argv[1]).read()
-assert text.index("command -v bt") < text.index("curl -fsSL")
-assert text.index("curl -fsSL") < text.index("trace hook --source claude-code")
 PY
 
 if find "$TARGET_DIR/plugins/trace-claude-code" -type f \( \
