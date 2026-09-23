@@ -2426,7 +2426,7 @@ async fn start_grok_debug_daemon_at(
     handle
 }
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", unix))]
 fn grok_package_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../src/plugins/grok/content")
@@ -2451,7 +2451,7 @@ fn prefix_through_lines(bytes: &[u8], line_count: usize) -> usize {
         .expect("fixture must contain the requested line boundary")
 }
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", unix))]
 fn assert_packaged_grok_hook_mapping() {
     let hooks: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(grok_package_path("hooks/hooks.json")).unwrap(),
