@@ -342,7 +342,13 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
         event(
             "SessionStart",
             1,
-            json!({"cwd":"/workspace/demo", "source":"resume", "model":"claude-test"}),
+            json!({
+                "cwd":"/workspace/demo",
+                "source":"resume",
+                "model":"claude-test",
+                "permission_mode":"plan",
+                "system_prompt":"You are a precise coding assistant."
+            }),
         ),
         event(
             "Notification",
@@ -380,6 +386,11 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
     let metadata = root.metadata.as_ref().unwrap();
     assert_eq!(metadata["session_source"], "resume");
     assert_eq!(metadata["model"], "claude-test");
+    assert_eq!(metadata["permission_mode"], "plan");
+    assert_eq!(
+        metadata["system_prompt"],
+        "You are a precise coding assistant."
+    );
 }
 
 #[test]

@@ -33,6 +33,10 @@ struct HookContext {
     source: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    permission_mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    system_prompt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -269,6 +273,8 @@ struct ClaudeTranslator {
     claude_version_logged: bool,
     session_source: Option<String>,
     session_model: Option<String>,
+    permission_mode: Option<String>,
+    system_prompt: Option<String>,
     git: Arc<GitMetadataCache>,
     current_cwd: Option<String>,
     last_turn_cwd: Option<String>,
@@ -302,6 +308,8 @@ impl ClaudeTranslator {
             claude_version_logged: false,
             session_source: None,
             session_model: None,
+            permission_mode: None,
+            system_prompt: None,
             git,
             current_cwd: None,
             last_turn_cwd: None,
@@ -361,6 +369,20 @@ impl ClaudeTranslator {
         if let Some(model) = hook.model.clone().or_else(|| self.session_model.clone()) {
             metadata.insert("model".into(), json!(model));
         }
+        if let Some(permission_mode) = hook
+            .permission_mode
+            .clone()
+            .or_else(|| self.permission_mode.clone())
+        {
+            metadata.insert("permission_mode".into(), json!(permission_mode));
+        }
+        if let Some(system_prompt) = hook
+            .system_prompt
+            .clone()
+            .or_else(|| self.system_prompt.clone())
+        {
+            metadata.insert("system_prompt".into(), json!(system_prompt));
+        }
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
@@ -396,6 +418,12 @@ impl ClaudeTranslator {
         }
         if let Some(model) = &hook.model {
             self.session_model = Some(model.clone());
+        }
+        if let Some(permission_mode) = &hook.permission_mode {
+            self.permission_mode = Some(permission_mode.clone());
+        }
+        if let Some(system_prompt) = &hook.system_prompt {
+            self.system_prompt = Some(system_prompt.clone());
         }
     }
 
