@@ -74,7 +74,7 @@ for definitions in hooks.values():
         for hook in definition["hooks"]:
             assert hook["type"] == "command"
             assert hook["command"] == "bt trace hook --source codex"
-            assert hook["commandWindows"] == "bt.exe trace hook --source codex"
+            assert hook["commandWindows"] == "bt trace hook --source codex"
 PY
 if find "$TARGET_DIR/plugins/trace-codex" -type f \( \
   -name 'package.json' -o -name 'pnpm-lock.yaml' -o -name 'tsconfig.json' -o \

@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -30,7 +30,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -42,7 +42,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -54,7 +54,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -66,7 +66,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -78,7 +78,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -90,7 +90,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -102,7 +102,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -114,7 +114,7 @@
           {
             "type": "command",
             "command": "bt trace hook --source codex",
-            "commandWindows": "bt.exe trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
