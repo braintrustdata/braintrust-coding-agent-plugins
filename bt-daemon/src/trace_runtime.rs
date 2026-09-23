@@ -543,6 +543,9 @@ async fn doctor_output_at(
     if let Some(warning) = crate::setup::update_warning(source) {
         warnings.push(warning);
     }
+    if args.agent == DoctorAgent::Muse {
+        warnings.extend(crate::setup::muse_doctor_warnings(&paths::muse_config_dir()));
+    }
 
     let (route, route_source) = match settings.route {
         Some(route) => (Some(route), "settings_file".to_string()),
