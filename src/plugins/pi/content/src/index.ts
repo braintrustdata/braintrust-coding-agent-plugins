@@ -51,7 +51,6 @@ function sessionDescriptor(ctx: ExtensionContext): {
   sessionId: string;
   sessionFile?: string;
   nativeSessionId?: string;
-  legacyContinuation?: LegacyContinuation;
 } {
   const sessionFile = ctx.sessionManager.getSessionFile();
   const nativeSessionId = ctx.sessionManager.getSessionId();
@@ -59,7 +58,6 @@ function sessionDescriptor(ctx: ExtensionContext): {
     sessionId: sessionKeyFor(sessionFile, nativeSessionId, ctx.cwd),
     sessionFile,
     nativeSessionId,
-    legacyContinuation: legacyContinuationFor(sessionFile),
   };
 }
 
@@ -70,6 +68,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
 
   let sessionId: string | undefined;
   let legacyContinuation: LegacyContinuation | undefined;
+  let legacyContinuationSessionId: string | undefined;
   let lastContext: ExtensionContext | undefined;
   let awaitingFirstToken = false;
   let uiGeneration = 0;
@@ -90,12 +89,17 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     requestTimeoutMs: UI_STATUS_TIMEOUT_MS,
   });
 
-  const remember = (ctx: ExtensionContext): ReturnType<typeof sessionDescriptor> => {
+  const remember = async (ctx: ExtensionContext): Promise<ReturnType<typeof sessionDescriptor>> => {
     lastContext = ctx;
     const descriptor = sessionDescriptor(ctx);
     if (sessionId !== descriptor.sessionId) uiGeneration += 1;
     sessionId = descriptor.sessionId;
-    legacyContinuation = descriptor.legacyContinuation;
+    if (legacyContinuationSessionId !== descriptor.sessionId) {
+      // The legacy file is immutable migration input. Read it asynchronously
+      // once per Pi session before forwarding its first event.
+      legacyContinuation = await legacyContinuationFor(descriptor.sessionFile);
+      legacyContinuationSessionId = descriptor.sessionId;
+    }
     return descriptor;
   };
 
@@ -128,7 +132,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     ctx?: ExtensionContext,
     updateUi = false,
   ): Promise<void> => {
-    const descriptor = ctx ? remember(ctx) : undefined;
+    const descriptor = ctx ? await remember(ctx) : undefined;
     if (!sessionId) return;
     await client.log({
       source: "pi",
@@ -141,7 +145,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
         extension_version: EXTENSION_VERSION,
         session_file: descriptor?.sessionFile,
         native_session_id: descriptor?.nativeSessionId,
-        legacy_resume: descriptor?.legacyContinuation ?? legacyContinuation,
+        legacy_resume: legacyContinuation,
         cwd: ctx?.cwd,
         model: nativePayload(ctx?.model),
       },
@@ -191,6 +195,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     uiGeneration += 1;
     sessionId = undefined;
     legacyContinuation = undefined;
+    legacyContinuationSessionId = undefined;
     lastContext = undefined;
     if (ctx.hasUI) {
       ctx.ui.setStatus(STATUS_KEY, undefined);

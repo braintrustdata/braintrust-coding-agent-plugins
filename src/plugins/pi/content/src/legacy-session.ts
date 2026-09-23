@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -15,18 +15,16 @@ export interface LegacyContinuation {
  * This is deliberately a compatibility boundary: invalid or unavailable state
  * must leave a new daemon session untouched.
  */
-export function legacyContinuationFor(
+export async function legacyContinuationFor(
   sessionFile: string | undefined,
-): LegacyContinuation | undefined {
+): Promise<LegacyContinuation | undefined> {
   if (!sessionFile) return undefined;
   const stateDir =
     process.env.BRAINTRUST_STATE_DIR ??
     join(homedir(), ".pi", "agent", "state", "braintrust-pi-extension");
   const stateFile = join(stateDir, "sessions.json");
-  if (!existsSync(stateFile)) return undefined;
-
   try {
-    const parsed: unknown = JSON.parse(readFileSync(stateFile, "utf8"));
+    const parsed: unknown = JSON.parse(await readFile(stateFile, "utf8"));
     const sessions = objectValue(parsed)?.sessions;
     // Version 0.9.0 stored the key with an absolute session-file path.
     const session = objectValue(objectValue(sessions)?.[`file:${resolve(sessionFile)}`]);

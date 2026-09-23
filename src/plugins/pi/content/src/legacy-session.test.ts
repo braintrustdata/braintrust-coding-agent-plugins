@@ -36,17 +36,19 @@ describe("legacy Pi session state", () => {
 
     // @braintrust/pi-extension 0.9.0 persisted this exact sessions.json
     // shape, including camelCase fields and an absolute file session key.
-    expect(legacyContinuationFor("/tmp/live.jsonl")).toEqual({
+    await expect(legacyContinuationFor("/tmp/live.jsonl")).resolves.toEqual({
       span: "legacy-root",
       trace: "legacy-trace",
       parent: "upstream",
       turns: 3,
       tools: 7,
     });
-    expect(legacyContinuationFor(relative(process.cwd(), "/tmp/live.jsonl"))).toMatchObject({
+    await expect(
+      legacyContinuationFor(relative(process.cwd(), "/tmp/live.jsonl")),
+    ).resolves.toMatchObject({
       span: "legacy-root",
     });
-    expect(legacyContinuationFor("/tmp/other.jsonl")).toBeUndefined();
+    await expect(legacyContinuationFor("/tmp/other.jsonl")).resolves.toBeUndefined();
   });
 
   it("fails open when legacy state is malformed or incomplete", async () => {
@@ -54,6 +56,6 @@ describe("legacy Pi session state", () => {
     stateDirs.push(stateDir);
     process.env.BRAINTRUST_STATE_DIR = stateDir;
     await writeFile(join(stateDir, "sessions.json"), "not json");
-    expect(legacyContinuationFor("/tmp/live.jsonl")).toBeUndefined();
+    await expect(legacyContinuationFor("/tmp/live.jsonl")).resolves.toBeUndefined();
   });
 });
