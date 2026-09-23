@@ -46,6 +46,20 @@ failures never fail a Claude Code turn.
 This marketplace does not install or configure the Braintrust MCP server. Use
 your agent's native connector or MCP configuration when you want MCP access.
 
+## Data handling
+
+Tracing forwards Claude Code's native hook payloads and reads the session
+transcript to construct traces. This can include user prompts, tool inputs and
+outputs, model requests and responses, and session metadata. Each turn records
+the effective Claude permission mode. Root-span metadata includes, when Claude
+provides it, the complete client system prompt.
+
+System prompts and the other captured content can contain confidential
+instructions, file contents, or secrets. The plugin does not redact these
+values locally. Configure the applicable Braintrust content-redaction controls
+before enabling tracing, and do not trace content that must not be sent to
+Braintrust. Redaction cannot remove data that has already been delivered.
+
 ## Additional root metadata
 
 For a persistent route, pass a JSON object to `bt trace enable claude

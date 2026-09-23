@@ -342,7 +342,13 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
         event(
             "SessionStart",
             1,
-            json!({"cwd":"/workspace/demo", "source":"resume", "model":"claude-test"}),
+            json!({
+                "cwd":"/workspace/demo",
+                "source":"resume",
+                "model":"claude-test",
+                "permission_mode":"plan",
+                "system_prompt":"You are a precise coding assistant."
+            }),
         ),
         event(
             "Notification",
@@ -380,6 +386,75 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
     let metadata = root.metadata.as_ref().unwrap();
     assert_eq!(metadata["session_source"], "resume");
     assert_eq!(metadata["model"], "claude-test");
+    assert!(metadata.get("permission_mode").is_none());
+    assert_eq!(
+        metadata["system_prompt"],
+        "You are a precise coding assistant."
+    );
+}
+
+#[test]
+fn claude_turns_capture_the_effective_permission_mode() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "permission-session");
+    let ctx = SessionCtx {
+        session_id: "permission-session".into(),
+        config: None,
+    };
+    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
+        source: "claude-code".into(),
+        source_version: None,
+        plugin_version: None,
+        session_id: "permission-session".into(),
+        event: name.into(),
+        ts_ms,
+        managed_run_id: None,
+        payload,
+        route: None,
+        config: None,
+        capture: None,
+    };
+
+    let mut ops = Vec::new();
+    for event in [
+        event(
+            "SessionStart",
+            1,
+            json!({"cwd":"/workspace/demo", "permission_mode":"plan"}),
+        ),
+        event(
+            "UserPromptSubmit",
+            2,
+            json!({"cwd":"/workspace/demo", "prompt":"plan this", "permission_mode":"plan"}),
+        ),
+        event(
+            "Stop",
+            3,
+            json!({"cwd":"/workspace/demo", "permission_mode":"plan"}),
+        ),
+        event(
+            "UserPromptSubmit",
+            4,
+            json!({"cwd":"/workspace/demo", "prompt":"implement it", "permission_mode":"acceptEdits"}),
+        ),
+        event(
+            "SessionEnd",
+            5,
+            json!({"cwd":"/workspace/demo", "permission_mode":"acceptEdits"}),
+        ),
+    ] {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let turn_metadata = |name: &str| {
+        rows.values()
+            .find(|row| row.name == name)
+            .and_then(|row| row.metadata.as_ref())
+            .and_then(|metadata| metadata.get("permission_mode"))
+            .cloned()
+    };
+    assert_eq!(turn_metadata("Turn 1"), Some(json!("plan")));
+    assert_eq!(turn_metadata("Turn 2"), Some(json!("acceptEdits")));
 }
 
 #[test]
