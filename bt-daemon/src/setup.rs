@@ -5,6 +5,7 @@ use crate::trace_command::{EnableArgs, SetupAgent};
 use crate::wire::SessionRoute;
 use crate::TraceCommandOutput;
 use anyhow::{bail, Context};
+use fs2::FileExt;
 use serde_json::{Map, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -704,7 +705,8 @@ fn muse_hook_path(config_dir: &Path) -> PathBuf {
 }
 
 fn muse_hook_config() -> Map<String, Value> {
-    let command = "bt trace hook --source muse --flush-on-turn-end || true";
+    // Muse treats command-hook failures as non-fatal to the agent turn.
+    let command = "bt trace hook --source muse --flush-on-turn-end";
     let hooks = MUSE_HOOK_EVENTS
         .iter()
         .map(|event| {
@@ -723,55 +725,218 @@ fn muse_hook_config() -> Map<String, Value> {
     ])
 }
 
-fn setup_muse_at(config_dir: &Path) -> anyhow::Result<()> {
-    let settings_path = config_dir.join("settings.json");
-    let hook_path = muse_hook_path(config_dir);
-    let mut settings = load_object(&settings_path)?;
-    let owned_path = hook_path.to_string_lossy();
-    if let Some(existing) = settings.get("managed_hooks_path").and_then(Value::as_str) {
-        if existing != owned_path {
-            bail!(
-                "Muse already uses managed_hooks_path {}; refusing to overwrite it",
-                existing
-            );
+fn legacy_muse_hook_config() -> Map<String, Value> {
+    let mut config = muse_hook_config();
+    if let Some(hooks) = config.get_mut("hooks").and_then(Value::as_object_mut) {
+        for entries in hooks.values_mut() {
+            if let Some(command) = entries
+                .get_mut(0)
+                .and_then(|entry| entry.get_mut("hooks"))
+                .and_then(|hooks| hooks.get_mut(0))
+                .and_then(|hook| hook.get_mut("command"))
+            {
+                *command =
+                    Value::String("bt trace hook --source muse --flush-on-turn-end || true".into());
+            }
         }
     }
-    settings.entry("schema_version").or_insert(Value::from(1));
-    settings.insert(
-        "managed_hooks_path".into(),
-        Value::String(owned_path.into_owned()),
-    );
-    write_object_atomic(&hook_path, muse_hook_config())?;
-    write_object_atomic(&settings_path, settings)
+    config
+}
+
+fn muse_version(output: &[u8]) -> anyhow::Result<semver::Version> {
+    let text = std::str::from_utf8(output).context("Muse version is not UTF-8")?;
+    text.split_whitespace()
+        .find_map(|word| semver::Version::parse(word).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Muse Code returned an unrecognized version: {}",
+                text.trim()
+            )
+        })
+}
+
+/// Muse serializes changes to settings.json with this native lock file. Hold
+/// it across the read, hook update, and settings update so we cannot discard a
+/// concurrent change made by Muse itself.
+fn with_muse_settings_lock<T>(
+    config_dir: &Path,
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("create Muse config directory {}", config_dir.display()))?;
+    let lock_path = config_dir.join(".settings.json.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open Muse settings lock {}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("lock Muse settings {}", lock_path.display()))?;
+    let result = action();
+    FileExt::unlock(&lock)?;
+    result
+}
+
+fn muse_hook_is_owned(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::read(path) {
+        Ok(raw) => {
+            let value: Value = serde_json::from_slice(&raw)
+                .with_context(|| format!("invalid Muse hook configuration: {}", path.display()))?;
+            Ok(value == Value::Object(muse_hook_config())
+                || value == Value::Object(legacy_muse_hook_config()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("read Muse hook configuration: {}", path.display()))
+        }
+    }
+}
+
+fn check_muse_hook_ownership(path: &Path) -> anyhow::Result<()> {
+    if path.exists() && !muse_hook_is_owned(path)? {
+        bail!("Muse hook file {} differs from Braintrust's generated hooks; refusing to overwrite or remove it", path.display());
+    }
+    Ok(())
+}
+
+fn setup_muse_at(config_dir: &Path) -> anyhow::Result<()> {
+    with_muse_settings_lock(config_dir, || {
+        let settings_path = config_dir.join("settings.json");
+        let hook_path = muse_hook_path(config_dir);
+        let mut settings = load_object(&settings_path)?;
+        let owned_path = hook_path.to_string_lossy();
+        if let Some(existing) = settings.get("managed_hooks_path") {
+            if existing.as_str() != Some(owned_path.as_ref()) {
+                bail!(
+                    "Muse already uses managed_hooks_path {}; refusing to overwrite it",
+                    existing
+                );
+            }
+        }
+        check_muse_hook_ownership(&hook_path)?;
+        settings.entry("schema_version").or_insert(Value::from(1));
+        settings.insert(
+            "managed_hooks_path".into(),
+            Value::String(owned_path.into_owned()),
+        );
+        write_object_atomic_unlocked(&hook_path, muse_hook_config())?;
+        write_object_atomic_unlocked(&settings_path, settings)
+    })
 }
 
 fn disable_muse_at(config_dir: &Path) -> anyhow::Result<()> {
-    let settings_path = config_dir.join("settings.json");
-    let hook_path = muse_hook_path(config_dir);
-    let mut settings = load_object(&settings_path)?;
-    if settings.get("managed_hooks_path").and_then(Value::as_str)
-        == Some(hook_path.to_string_lossy().as_ref())
+    with_muse_settings_lock(config_dir, || {
+        let settings_path = config_dir.join("settings.json");
+        let hook_path = muse_hook_path(config_dir);
+        let mut settings = load_object(&settings_path)?;
+        check_muse_hook_ownership(&hook_path)?;
+        if settings.get("managed_hooks_path").and_then(Value::as_str)
+            == Some(hook_path.to_string_lossy().as_ref())
+        {
+            settings.remove("managed_hooks_path");
+            write_object_atomic_unlocked(&settings_path, settings)?;
+        }
+        match std::fs::remove_file(&hook_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to remove Muse hook configuration: {}",
+                    hook_path.display()
+                )
+            }),
+        }
+    })
+}
+
+fn update_muse_at(config_dir: &Path) -> anyhow::Result<()> {
+    with_muse_settings_lock(config_dir, || {
+        let settings = load_object(&config_dir.join("settings.json"))?;
+        let hook_path = muse_hook_path(config_dir);
+        if settings.get("managed_hooks_path").and_then(Value::as_str)
+            != Some(hook_path.to_string_lossy().as_ref())
+        {
+            bail!("Muse tracing hooks are not installed; run `bt trace enable muse`");
+        }
+        if !hook_path.exists() {
+            bail!("Muse tracing hook file is missing; run `bt trace enable muse`");
+        }
+        check_muse_hook_ownership(&hook_path)?;
+        write_object_atomic_unlocked(&hook_path, muse_hook_config())
+    })
+}
+
+pub(crate) fn muse_doctor_warnings(config_dir: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    match ProcessCommand::new("muse").arg("--version").output() {
+        Ok(output) if output.status.success() => match muse_version(&output.stdout) {
+            Ok(version) if version < semver::Version::new(1, 1, 1) => warnings
+                .push("Muse Code 1.1.1 or newer is required for verified command hooks".into()),
+            Ok(_) => {}
+            Err(error) => warnings.push(error.to_string()),
+        },
+        _ => warnings.push(
+            "Muse Code executable is unavailable; install Muse Code before enabling tracing".into(),
+        ),
+    }
+    if !ProcessCommand::new("bt")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
     {
-        settings.remove("managed_hooks_path");
-        write_object_atomic(&settings_path, settings)?;
+        warnings.push(
+            "Braintrust `bt` executable is unavailable on PATH; Muse command hooks cannot forward events".into(),
+        );
     }
-    match std::fs::remove_file(&hook_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed to remove Muse hook configuration: {}",
-                hook_path.display()
-            )
-        }),
+    let settings = match load_object(&config_dir.join("settings.json")) {
+        Ok(settings) => settings,
+        Err(error) => {
+            warnings.push(format!("Muse settings could not be read: {error}"));
+            return warnings;
+        }
+    };
+    let hook_path = muse_hook_path(config_dir);
+    if settings.get("managed_hooks_path").and_then(Value::as_str)
+        != Some(hook_path.to_string_lossy().as_ref())
+    {
+        warnings.push("Muse managed_hooks_path does not point to Braintrust's hook file; run `bt trace enable muse`".into());
     }
+    match std::fs::read(&hook_path) {
+        Ok(raw) => match serde_json::from_slice::<Value>(&raw) {
+            Ok(hooks) if hooks == Value::Object(muse_hook_config()) => {}
+            Ok(hooks) if hooks == Value::Object(legacy_muse_hook_config()) => warnings.push(
+                "Muse Braintrust hooks use an older command; run `bt trace update muse`".into(),
+            ),
+            Ok(_) => warnings.push("Muse Braintrust hook file differs from expected event definitions; restore it or run `bt trace enable muse`".into()),
+            Err(error) => warnings.push(format!("Muse Braintrust hook file is invalid JSON: {error}")),
+        },
+        Err(error) => warnings.push(format!("Muse Braintrust hook file could not be read: {error}")),
+    }
+    warnings
 }
 
 fn setup_muse() -> anyhow::Result<()> {
+    let output = ProcessCommand::new("muse")
+        .arg("--version")
+        .output()
+        .context("Muse Code is not installed; install Muse Code before enabling tracing")?;
+    if !output.status.success() {
+        bail!("Muse Code could not report its version; install Muse Code before enabling tracing");
+    }
+    let installed = muse_version(&output.stdout)?;
+    if installed < semver::Version::new(1, 1, 1) {
+        bail!("Muse Code 1.1.1 or newer is required for verified command hooks");
+    }
     setup_muse_at(&paths::muse_config_dir())
 }
 fn disable_muse() -> anyhow::Result<()> {
     disable_muse_at(&paths::muse_config_dir())
+}
+
+fn update_muse() -> anyhow::Result<()> {
+    update_muse_at(&paths::muse_config_dir())
 }
 
 fn antigravity_home(config_dir: &Path) -> anyhow::Result<&Path> {
@@ -987,7 +1152,7 @@ pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => update_opencode()?,
         SetupAgent::Pi => update_pi(&mut runner)?,
         SetupAgent::Grok => update_grok(&mut runner)?,
-        SetupAgent::Muse => {}
+        SetupAgent::Muse => update_muse()?,
         SetupAgent::Antigravity => update_antigravity(&mut runner)?,
     }
     Ok(TraceCommandOutput::update(source, display_name))
@@ -1734,6 +1899,11 @@ mod tests {
             serde_json::from_slice(&std::fs::read(muse_hook_path(&config_dir)).unwrap()).unwrap();
         assert_eq!(hooks["schema_version"], 1);
         assert!(hooks["hooks"]["PreLLMCall"].is_array());
+        assert_eq!(
+            hooks["hooks"]["PreLLMCall"][0]["hooks"][0]["command"],
+            "bt trace hook --source muse --flush-on-turn-end"
+        );
+        assert!(config_dir.join(".settings.json.lock").exists());
 
         disable_muse_at(&config_dir).unwrap();
         let settings: Value =
@@ -1758,6 +1928,61 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("refusing to overwrite"));
+    }
+
+    #[test]
+    fn muse_setup_and_disable_preserve_foreign_hook_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("muse");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let hook_path = muse_hook_path(&config_dir);
+        let custom = r#"{"schema_version":1,"hooks":{"Stop":[]}}"#;
+        std::fs::write(&hook_path, custom).unwrap();
+
+        assert!(setup_muse_at(&config_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to overwrite"));
+        assert!(disable_muse_at(&config_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to overwrite"));
+        assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), custom);
+    }
+
+    #[test]
+    fn muse_update_requires_an_owned_install_and_upgrades_legacy_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("muse");
+        assert!(update_muse_at(&config_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("not installed"));
+
+        setup_muse_at(&config_dir).unwrap();
+        let hook_path = muse_hook_path(&config_dir);
+        write_object_atomic(&hook_path, legacy_muse_hook_config()).unwrap();
+        assert!(muse_doctor_warnings(&config_dir)
+            .iter()
+            .any(|warning| warning.contains("older command")));
+        update_muse_at(&config_dir).unwrap();
+        let installed = load_object(&hook_path).unwrap();
+        assert_eq!(installed, muse_hook_config());
+
+        std::fs::write(&hook_path, r#"{"hooks":{}}"#).unwrap();
+        assert!(update_muse_at(&config_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to overwrite"));
+    }
+
+    #[test]
+    fn muse_version_requires_a_parseable_native_version() {
+        assert_eq!(
+            muse_version(b"Muse Code 1.1.1 (1.1.1-R2514.1)\n").unwrap(),
+            semver::Version::new(1, 1, 1)
+        );
+        assert!(muse_version(b"unexpected output").is_err());
     }
 
     #[test]
