@@ -2426,7 +2426,7 @@ async fn start_grok_debug_daemon_at(
     handle
 }
 
-#[cfg(all(feature = "cli", unix))]
+#[cfg(feature = "cli")]
 fn grok_package_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../src/plugins/grok/content")
