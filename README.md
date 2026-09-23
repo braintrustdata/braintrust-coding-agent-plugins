@@ -41,8 +41,7 @@ bt trace import claude SESSION_ID
 bt trace import claude SESSION_ID --attach
 ```
 
-See the agent guides for limitations. Antigravity setup requires a
-Unix-compatible shell.
+See the agent guides for limitations.
 
 ## Manage tracing
 

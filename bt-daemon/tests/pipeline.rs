@@ -2451,82 +2451,33 @@ fn prefix_through_lines(bytes: &[u8], line_count: usize) -> usize {
         .expect("fixture must contain the requested line boundary")
 }
 
-#[cfg(all(feature = "cli", unix))]
-async fn assert_packaged_grok_hook_mapping(
-    temp: &Path,
-    plugin_version: &str,
-    payload: &serde_json::Value,
-) {
-    use std::os::unix::fs::PermissionsExt;
-    use tokio::io::AsyncWriteExt;
-
-    let fake_bt = temp.join("record-bt.sh");
-    let args_file = temp.join("packaged-args.txt");
-    let stdin_file = temp.join("packaged-stdin.json");
-    std::fs::write(
-        &fake_bt,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BT_ARGS_FILE\"\ncat > \"$BT_STDIN_FILE\"\n",
+#[cfg(feature = "cli")]
+fn assert_packaged_grok_hook_mapping() {
+    let hooks: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(grok_package_path("hooks/hooks.json")).unwrap(),
     )
     .unwrap();
-    std::fs::set_permissions(&fake_bt, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    let mut child = tokio::process::Command::new("bash")
-        .arg(grok_package_path("hooks/forward.sh"))
-        .env("BT_BIN", &fake_bt)
-        .env("BT_ARGS_FILE", &args_file)
-        .env("BT_STDIN_FILE", &stdin_file)
-        .env("GROK_VERSION", "1.0.13")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let encoded = serde_json::to_vec(payload).unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&encoded)
-        .await
-        .unwrap();
-    let output = child.wait_with_output().await.unwrap();
-    assert!(
-        output.status.success(),
-        "packaged Grok hook failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let args: Vec<_> = std::fs::read_to_string(args_file)
-        .unwrap()
-        .lines()
-        .map(str::to_string)
-        .collect();
-    assert_eq!(
-        args,
-        [
-            "trace",
-            "hook",
-            "--source",
-            "grok",
-            "--plugin-version",
-            plugin_version,
-            "--session-id-field",
-            "sessionId",
-            "--event-field",
-            "hookEventName",
-            "--transcript-path-field",
-            "transcriptPath",
-            "--source-version",
-            "1.0.13",
-        ]
-    );
-    let forwarded: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(stdin_file).unwrap()).unwrap();
-    assert_eq!(
-        &forwarded, payload,
-        "the adapter must forward stdin unchanged"
-    );
+    let expected_args = serde_json::json!([
+        "trace",
+        "hook",
+        "--source",
+        "grok",
+        "--session-id-field",
+        "sessionId",
+        "--event-field",
+        "hookEventName",
+        "--transcript-path-field",
+        "transcriptPath",
+    ]);
+    for groups in hooks["hooks"].as_object().unwrap().values() {
+        for group in groups.as_array().unwrap() {
+            for hook in group["hooks"].as_array().unwrap() {
+                assert_eq!(hook["type"], "command");
+                assert_eq!(hook["command"], "bt");
+                assert_eq!(hook["args"], expected_args);
+            }
+        }
+    }
 }
 
 #[cfg(all(feature = "cli", unix))]
@@ -2689,7 +2640,7 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
         "cwd": "/repo/primary",
         "workspaceRoot": "/repo"
     });
-    assert_packaged_grok_hook_mapping(temp.path(), plugin_version, &primary_stop).await;
+    assert_packaged_grok_hook_mapping();
 
     let flushes = Arc::new(Mutex::new(HashMap::new()));
     let created = Arc::new(Mutex::new(Vec::new()));

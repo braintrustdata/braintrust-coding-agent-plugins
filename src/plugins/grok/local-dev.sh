@@ -280,12 +280,8 @@ chmod +x "$BT_WRAPPER"
 
 installed_hooks="$installed_path/hooks/hooks.json"
 dist_hooks="$DIST_DIR/hooks/hooks.json"
-installed_forward="$installed_path/hooks/forward.sh"
-dist_forward="$DIST_DIR/hooks/forward.sh"
 original_hooks="$DEV_DIR/hooks.json.original"
 original_dist_hooks="$DEV_DIR/dist-hooks.json.original"
-original_forward="$DEV_DIR/forward.sh.original"
-original_dist_forward="$DEV_DIR/dist-forward.sh.original"
 
 # Grok's local-source refresh can leave an interrupted development run's
 # temporary env injection in the installed copy. Reset it from the freshly
@@ -293,13 +289,8 @@ original_dist_forward="$DEV_DIR/dist-forward.sh.original"
 if [[ "$installed_hooks" != "$dist_hooks" ]]; then
   cp "$dist_hooks" "$installed_hooks"
 fi
-if [[ "$installed_forward" != "$dist_forward" ]]; then
-  cp "$dist_forward" "$installed_forward"
-fi
 cp "$installed_hooks" "$original_hooks"
 cp "$dist_hooks" "$original_dist_hooks"
-cp "$installed_forward" "$original_forward"
-cp "$dist_forward" "$original_dist_forward"
 
 restore_hooks() {
   if [[ -f "$original_hooks" && -n "$installed_hooks" ]]; then
@@ -307,12 +298,6 @@ restore_hooks() {
   fi
   if [[ -f "$original_dist_hooks" ]]; then
     cp "$original_dist_hooks" "$dist_hooks" 2>/dev/null || true
-  fi
-  if [[ -f "$original_forward" ]]; then
-    cp "$original_forward" "$installed_forward" 2>/dev/null || true
-  fi
-  if [[ -f "$original_dist_forward" ]]; then
-    cp "$original_dist_forward" "$dist_forward" 2>/dev/null || true
   fi
 }
 
@@ -329,43 +314,21 @@ trap cleanup EXIT INT TERM
 # Grok's hook runner intentionally does not pass arbitrary parent-process
 # environment variables through. Add the isolated local route explicitly to
 # this installed copy, then restore the original file when the session exits.
-python3 - "$installed_hooks" "$dist_hooks" "$BT_WRAPPER" "$DAEMON_BIN" "$SOCKET" "$CONFIG" <<'PY'
+python3 - "$installed_hooks" "$dist_hooks" "$BT_WRAPPER" <<'PY'
 import json
 import sys
 
-installed_path, dist_path, bt_bin, daemon_bin, socket, config = sys.argv[1:]
-local_env = {
-    "BT_BIN": bt_bin,
-    "BT_DAEMON_BIN": daemon_bin,
-    "BT_DAEMON_SOCKET": socket,
-    "BT_DAEMON_CONFIG": config,
-}
+installed_path, dist_path, bt_bin = sys.argv[1:]
 for path in (installed_path, dist_path):
     with open(path) as f:
         document = json.load(f)
     for groups in document["hooks"].values():
         for group in groups:
             for handler in group["hooks"]:
-                handler["env"] = {**handler.get("env", {}), **local_env}
+                handler["command"] = bt_bin
     with open(path, "w") as f:
         json.dump(document, f, indent=2)
         f.write("\n")
-PY
-
-# Pin the adapter itself to the local wrapper. This remains effective even when
-# Grok strips parent-process variables, and patching both copies survives its
-# local-source refresh during /reload-plugins.
-python3 - "$installed_forward" "$dist_forward" "$BT_WRAPPER" "$DEV_DIR/grok-adapter.stderr" <<'PY'
-import shlex
-import sys
-
-for path in sys.argv[1:3]:
-    with open(path) as f:
-        lines = f.readlines()
-    lines.insert(1, f"exec 2>>{shlex.quote(sys.argv[4])}\n")
-    lines.insert(1, f"export BT_BIN={shlex.quote(sys.argv[3])}\n")
-    with open(path, "w") as f:
-        f.writelines(lines)
 PY
 
 if [[ "$SKIP_PLUGIN_RELOAD" == true ]]; then
@@ -373,22 +336,18 @@ if [[ "$SKIP_PLUGIN_RELOAD" == true ]]; then
   # For a clean demo, install this artifact's hooks into the isolated run home,
   # where Grok discovers them as trusted global hooks without a slash command.
   direct_hooks_dir="$GROK_HOME_DIR/hooks"
-  direct_forward="$direct_hooks_dir/forward.sh"
   mkdir -p "$direct_hooks_dir"
-  cp "$dist_forward" "$direct_forward"
-  chmod +x "$direct_forward"
-  python3 - "$dist_hooks" "$direct_hooks_dir/braintrust.json" "$direct_forward" <<'PY'
+  python3 - "$dist_hooks" "$direct_hooks_dir/braintrust.json" "$BT_WRAPPER" <<'PY'
 import json
-import shlex
 import sys
 
-source, destination, forward = sys.argv[1:]
+source, destination, bt_bin = sys.argv[1:]
 with open(source) as f:
     document = json.load(f)
 for groups in document["hooks"].values():
     for group in groups:
         for handler in group["hooks"]:
-            handler["command"] = f"bash {shlex.quote(forward)}"
+            handler["command"] = bt_bin
 with open(destination, "w") as f:
     json.dump(document, f, indent=2)
     f.write("\n")
@@ -427,11 +386,11 @@ done
 PROBE_SESSION="grok-local-dev-probe"
 PROBE_JOURNAL=""
 printf '%s' "{\"hookEventName\":\"local_dev_probe\",\"sessionId\":\"$PROBE_SESSION\"}" | \
-  BT_BIN="$BT_WRAPPER" \
-  BT_DAEMON_BIN="$DAEMON_BIN" \
-  BT_DAEMON_SOCKET="$SOCKET" \
-  BT_DAEMON_CONFIG="$CONFIG" \
-  "$DIST_DIR/hooks/forward.sh"
+  "$BT_WRAPPER" trace hook \
+    --source grok \
+    --session-id-field sessionId \
+    --event-field hookEventName \
+    --transcript-path-field transcriptPath
 for _ in {1..100}; do
   PROBE_JOURNAL="$(find_probe_journal "$DATA_DIR/journal" "$PROBE_SESSION" || true)"
   [[ -n "$PROBE_JOURNAL" ]] && break

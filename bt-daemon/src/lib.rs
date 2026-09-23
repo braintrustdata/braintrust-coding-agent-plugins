@@ -387,7 +387,7 @@ pub(crate) fn should_flush_ingress_event(env: &wire::Envelope) -> bool {
 /// must never fail the agent's turn should treat any `Err` as non-fatal and
 /// exit 0.
 pub async fn run_hook(
-    args: HookArgs,
+    mut args: HookArgs,
     mut route: SessionRoute,
     host: HostInfo,
 ) -> anyhow::Result<()> {
@@ -402,6 +402,8 @@ pub async fn run_hook(
         return Ok(());
     }
     let mut payload = read_stdin_json()?;
+
+    resolve_dynamic_hook_versions(&mut args, &payload);
 
     if let Some(field) = &args.transcript_path_field {
         add_transcript_observation(&mut payload, field);
@@ -428,6 +430,69 @@ pub async fn run_hook(
     forward_envelope(&env, &socket, &host, args.no_spawn).await?;
 
     Ok(())
+}
+
+fn resolve_dynamic_hook_versions(args: &mut HookArgs, payload: &serde_json::Value) {
+    if args.source_version.is_none() {
+        args.source_version = source_version_from_env(&args.source)
+            .or_else(|| source_version_from_payload(&args.source, payload));
+    }
+    if args.plugin_version.is_none() {
+        args.plugin_version = plugin_version_from_plugin_root(&args.source);
+    }
+}
+
+fn source_version_from_env(source: &str) -> Option<String> {
+    let key = match source {
+        "claude-code" => "CLAUDE_CODE_VERSION",
+        "codex" => "CODEX_VERSION",
+        "grok" => "GROK_VERSION",
+        "antigravity" => "AGY_VERSION",
+        _ => return None,
+    };
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn source_version_from_payload(source: &str, payload: &serde_json::Value) -> Option<String> {
+    let fields: &[&str] = match source {
+        "codex" => &["cli_version", "version"],
+        "claude-code" | "grok" | "antigravity" => &["version", "cli_version"],
+        _ => &[],
+    };
+    fields
+        .iter()
+        .find_map(|field| json_str_field(payload, field))
+}
+
+fn plugin_version_from_plugin_root(source: &str) -> Option<String> {
+    let root = match source {
+        "claude-code" => std::env::var_os("CLAUDE_PLUGIN_ROOT"),
+        "codex" => std::env::var_os("PLUGIN_ROOT"),
+        "grok" => std::env::var_os("GROK_PLUGIN_ROOT"),
+        // Antigravity runs plugin hooks with the plugin root as cwd.
+        "antigravity" => std::env::current_dir()
+            .ok()
+            .map(|path| path.into_os_string()),
+        _ => None,
+    }?;
+    let manifest = match source {
+        "claude-code" => ".claude-plugin/plugin.json",
+        "codex" => ".codex-plugin/plugin.json",
+        "grok" => ".grok-plugin/plugin.json",
+        "antigravity" => "plugin.json",
+        _ => return None,
+    };
+    plugin_version_from_manifest(&PathBuf::from(root).join(manifest))
+}
+
+fn plugin_version_from_manifest(path: &std::path::Path) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).ok()?)
+        .ok()?
+        .get("version")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Apply one invocation-local JSON metadata override to a non-secret route.
@@ -1656,6 +1721,23 @@ mod tests {
         assert_eq!(initialize["client"]["daemon_version"], "1.0.13");
         assert_eq!(initialize["client"]["plugin_version"], "0.1.0");
         assert_ne!(initialize["client"]["plugin_version"], "1.0.13");
+    }
+
+    #[test]
+    fn hook_versions_are_discovered_without_hook_configuration_literals() {
+        let payload = serde_json::json!({"cli_version": "2.3.4"});
+        assert_eq!(
+            source_version_from_payload("codex", &payload).as_deref(),
+            Some("2.3.4")
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("plugin.json");
+        std::fs::write(&manifest, br#"{"version":"5.6.7"}"#).unwrap();
+        assert_eq!(
+            plugin_version_from_manifest(&manifest).as_deref(),
+            Some("5.6.7")
+        );
     }
 
     #[test]

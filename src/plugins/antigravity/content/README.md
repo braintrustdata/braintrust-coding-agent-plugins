@@ -12,7 +12,6 @@ Trace Google Antigravity coding sessions in Braintrust.
 Prerequisites:
 
 - [Google Antigravity](https://antigravity.google/)
-- A Unix-compatible `sh` (persistent setup is not supported on Windows)
 - The [Braintrust CLI (`bt`)](https://www.braintrust.dev/docs/reference/cli/quickstart)
 
 Install the plugin and choose where traces are sent:
@@ -24,7 +23,8 @@ bt trace enable antigravity --project my-coding-agent
 
 Setup installs the hooks and saves non-secret routing settings in
 `~/.gemini/config/braintrust.json`. Use `--profile` or `--org` to select a
-Braintrust profile or organization. Restart Antigravity after setup.
+Braintrust profile or organization. Restart Antigravity after setup. The plugin
+invokes the installed `bt` CLI directly on macOS, Linux, and Windows.
 
 ## What is captured
 

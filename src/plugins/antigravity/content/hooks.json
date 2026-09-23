@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"./bin/antigravity-hook.sh\" PostToolUse"
+            "command": "bt trace hook --source antigravity --session-id-field conversationId --event PostToolUse --transcript-path-field transcriptPath --flush-on-turn-end"
           }
         ]
       }
@@ -14,19 +14,19 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "sh \"./bin/antigravity-hook.sh\" PreInvocation"
+        "command": "bt trace hook --source antigravity --session-id-field conversationId --event PreInvocation --transcript-path-field transcriptPath --flush-on-turn-end"
       }
     ],
     "PostInvocation": [
       {
         "type": "command",
-        "command": "sh \"./bin/antigravity-hook.sh\" PostInvocation"
+        "command": "bt trace hook --source antigravity --session-id-field conversationId --event PostInvocation --transcript-path-field transcriptPath --flush-on-turn-end"
       }
     ],
     "Stop": [
       {
         "type": "command",
-        "command": "sh \"./bin/antigravity-hook.sh\" Stop"
+        "command": "bt trace hook --source antigravity --session-id-field conversationId --event Stop --transcript-path-field transcriptPath --flush-on-turn-end"
       }
     ]
   }

@@ -8,7 +8,7 @@ fail() { echo "validate: $*" >&2; exit 1; }
 [[ -x "$SRC_DIR/local-dev.sh" ]] || fail "local-dev.sh is not executable"
 bash -n "$SRC_DIR/local-dev.sh" || fail "local-dev.sh has invalid shell syntax"
 
-for file in .grok-plugin/plugin.json hooks/hooks.json hooks/forward.sh README.md LICENSE; do
+for file in .grok-plugin/plugin.json hooks/hooks.json README.md LICENSE; do
   [[ -f "$TARGET_DIR/$file" ]] || fail "missing $file"
 done
 
@@ -23,8 +23,6 @@ assert "END OF TERMS AND CONDITIONS" in text
 assert "placeholder" not in text.lower()
 assert "todo" not in text.lower()
 PY
-[[ -x "$TARGET_DIR/hooks/forward.sh" ]] || fail "hook adapter is not executable"
-
 python3 - "$TARGET_DIR/hooks/hooks.json" <<'PY' || fail "invalid Grok hooks"
 import json
 import sys
@@ -44,7 +42,12 @@ for event, groups in hooks.items():
         for hook in group["hooks"]:
             assert hook == {
                 "type": "command",
-                "command": 'bash "${GROK_PLUGIN_ROOT}/hooks/forward.sh"',
+                "command": "bt",
+                "args": [
+                    "trace", "hook", "--source", "grok",
+                    "--session-id-field", "sessionId", "--event-field", "hookEventName",
+                    "--transcript-path-field", "transcriptPath",
+                ],
             }
 PY
 
@@ -55,9 +58,6 @@ else
     || fail "invalid plugin manifest"
 fi
 
-TEST_LOG="$(mktemp -d)/grok-hook-data"
-trap 'rm -rf "$(dirname "$TEST_LOG")"' EXIT
-"$SRC_DIR/test/test_hook.sh" "$TARGET_DIR/hooks/forward.sh" "$TEST_LOG"
 "$SRC_DIR/test/test_local_dev.sh"
 
 echo "validate: grok dist OK ($TARGET_DIR)"

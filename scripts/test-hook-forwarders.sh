@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Exercise direct hook execution with a fake bt CLI. This proves that raw stdin
-# and the canonical source identity reach `bt trace hook` without a shell shim.
+# and each canonical source identity reach `bt trace hook` without a shell shim.
 
 set -euo pipefail
 
@@ -17,13 +17,12 @@ exit "${BT_STUB_STATUS:-0}"
 EOF
 chmod +x "$TEST_DIR/bt"
 
-PAYLOAD='{"session_id":"shim-test","hook_event_name":"SessionStart","message":"unchanged"}'
+PAYLOAD='{"session_id":"direct-test","hook_event_name":"SessionStart","message":"unchanged"}'
 
 exercise() {
   local name="$1"
-  local source="$2"
-  local swallows_failure="$3"
-  shift 3
+  local expected_args="$2"
+  shift 2
   local args_file="$TEST_DIR/$name.args"
   local stdin_file="$TEST_DIR/$name.stdin"
 
@@ -33,78 +32,45 @@ exercise() {
     BT_CAPTURE_STDIN="$stdin_file" \
     "$@"
 
-  [[ "$(cat "$args_file")" == "trace hook --source $source" ]]
+  [[ "$(cat "$args_file")" == "$expected_args" ]]
   [[ "$(cat "$stdin_file")" == "$PAYLOAD" ]]
-
-  if [[ "$swallows_failure" == true ]]; then
-    # The shell shim must swallow a daemon-client failure after forwarding the
-    # payload. Claude's direct exec-form hook leaves command exit handling to
-    # Claude Code, so it deliberately has no wrapper to test here.
-    printf '%s' "$PAYLOAD" | env \
-      PATH="$TEST_DIR:$PATH" \
-      BT_CAPTURE_ARGS="$args_file" \
-      BT_CAPTURE_STDIN="$stdin_file" \
-      BT_STUB_STATUS=23 \
-      "$@"
-  fi
 }
 
-exercise claude claude-code false \
+exercise claude 'trace hook --source claude-code' \
   bt trace hook --source claude-code
-exercise codex codex true \
-  bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
+exercise codex 'trace hook --source codex' \
+  bt trace hook --source codex
+exercise grok 'trace hook --source grok --session-id-field sessionId --event-field hookEventName --transcript-path-field transcriptPath' \
+  bt trace hook --source grok --session-id-field sessionId --event-field hookEventName --transcript-path-field transcriptPath
+exercise antigravity 'trace hook --source antigravity --session-id-field conversationId --event Stop --transcript-path-field transcriptPath --flush-on-turn-end' \
+  bt trace hook --source antigravity --session-id-field conversationId --event Stop --transcript-path-field transcriptPath --flush-on-turn-end
 
-# Codex retains its shell shim and first-use bootstrap. Claude's package uses
-# Claude Code's exec-form hook configuration, so it intentionally has neither.
-BOOTSTRAP_DIR="$TEST_DIR/bootstrap"
-mkdir "$BOOTSTRAP_DIR"
-cat > "$BOOTSTRAP_DIR/curl" <<'EOF'
-#!/bin/bash
-printf '%s\n' "$*" > "$BT_INSTALL_CAPTURE"
-cp "$BT_INSTALLABLE" "$BT_INSTALL_DEST"
-chmod +x "$BT_INSTALL_DEST"
-printf '%s\n' '#!/bin/bash' 'exit 0'
-EOF
-cat > "$TEST_DIR/installable-bt" <<'EOF'
-#!/bin/bash
-printf '%s\n' "$*" > "$BT_CAPTURE_ARGS"
-cat > "$BT_CAPTURE_STDIN"
-EOF
-chmod +x "$BOOTSTRAP_DIR/curl" "$TEST_DIR/installable-bt"
+python3 - "$DIST_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
 
-bootstrap() {
-  local name="$1"
-  local source="$2"
-  shift 2
-  local args_file="$TEST_DIR/$name.bootstrap.args"
-  local stdin_file="$TEST_DIR/$name.bootstrap.stdin"
-  local install_file="$TEST_DIR/$name.install.args"
+dist = Path(sys.argv[1])
 
-  rm -f "$BOOTSTRAP_DIR/bt"
-  printf '%s' "$PAYLOAD" | env \
-    PATH="$BOOTSTRAP_DIR:/usr/bin:/bin" \
-    BT_CAPTURE_ARGS="$args_file" \
-    BT_CAPTURE_STDIN="$stdin_file" \
-    BT_INSTALL_CAPTURE="$install_file" \
-    BT_INSTALLABLE="$TEST_DIR/installable-bt" \
-    BT_INSTALL_DEST="$BOOTSTRAP_DIR/bt" \
-    XDG_BIN_HOME="$BOOTSTRAP_DIR" \
-    CARGO_HOME="$BOOTSTRAP_DIR/cargo" \
-    "$@"
+codex = json.loads((dist / "codex/plugins/trace-codex/hooks/hooks.json").read_text())["hooks"]
+for groups in codex.values():
+    for group in groups:
+        for hook in group["hooks"]:
+            assert hook["command"] == "bt trace hook --source codex"
+            assert hook["commandWindows"] == "bt.exe trace hook --source codex"
 
-  [[ "$(cat "$install_file")" == "-fsSL https://bt.dev/cli/install.sh" ]]
-  [[ "$(cat "$args_file")" == "trace hook --source $source" ]]
-  [[ "$(cat "$stdin_file")" == "$PAYLOAD" ]]
-}
+grok = json.loads((dist / "grok/hooks/hooks.json").read_text())["hooks"]
+for groups in grok.values():
+    for group in groups:
+        for hook in group["hooks"]:
+            assert hook["command"] == "bt"
+            assert hook["args"][:4] == ["trace", "hook", "--source", "grok"]
 
-bootstrap codex codex \
-  bash "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
-
-# No bt binary is also fail-open for the Codex shell shim. Use an empty path so
-# the test does not depend on whether the host running the suite has bt or curl.
-EMPTY_PATH="$TEST_DIR/empty-path"
-mkdir "$EMPTY_PATH"
-printf '%s' "$PAYLOAD" | PATH="$EMPTY_PATH" XDG_BIN_HOME="$EMPTY_PATH" CARGO_HOME="$EMPTY_PATH" /bin/bash \
-  "$DIST_DIR/codex/plugins/trace-codex/bin/codex-hook.sh"
+antigravity = json.loads((dist / "antigravity/hooks.json").read_text())["braintrust-antigravity-tracing"]
+for groups in antigravity.values():
+    for group in groups:
+        for hook in group.get("hooks", [group]):
+            assert hook["command"].startswith("bt trace hook --source antigravity ")
+PY
 
 echo "test: hook forwarders OK"

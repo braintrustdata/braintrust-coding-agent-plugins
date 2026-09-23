@@ -2,9 +2,8 @@
 """Set a release version on every distributed version surface for an agent.
 
 Versioning is per-plugin: every plugin under an agent carries its own
-.<agent>-plugin/plugin.json with a `version` field. Grok's hook adapter also
-embeds the plugin version forwarded to the daemon, so its manifest and adapter
-constant are stamped together. The marketplace manifest is NOT touched.
+.<agent>-plugin/plugin.json with a `version` field. The marketplace manifest is
+NOT touched.
 
 Only version values are rewritten, so surrounding files keep their formatting.
 
@@ -23,10 +22,6 @@ MANIFEST_GLOBS = {
 }
 
 VERSION_RE = re.compile(r'("version"\s*:\s*")[^"]*(")')
-GROK_ADAPTER = "src/plugins/grok/content/hooks/forward.sh"
-GROK_PLUGIN_VERSION_RE = re.compile(r'^(PLUGIN_VERSION=")[^"]*(")$', re.MULTILINE)
-
-
 def main() -> None:
     if len(sys.argv) != 3:
         sys.exit("usage: set-plugin-version.py <agent> <version>")
@@ -40,8 +35,6 @@ def main() -> None:
         sys.exit(f"no plugin manifests found for '{agent}' ({pattern})")
 
     surfaces = [(path, VERSION_RE, "version") for path in manifests]
-    if agent == "grok":
-        surfaces.append((GROK_ADAPTER, GROK_PLUGIN_VERSION_RE, "PLUGIN_VERSION"))
 
     changes = []
     for path, version_re, label in surfaces:
