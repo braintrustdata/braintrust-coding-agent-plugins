@@ -32,7 +32,7 @@ async fn importing_muse_export_uses_the_production_translator() {
             {"recorded_at": 1_001_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"model_input_trace_recorded", "request_record_id":"request-1", "bounded":{"request_digest":"sha256:test"}}}}},
             {"recorded_at": 1_002_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"model_completed", "usage":{"input_tokens":3, "output_tokens":2}}}}},
             {"recorded_at": 1_003_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"assistant_message_committed", "text":"traced"}}}},
-            {"recorded_at": 1_004_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"terminal"}}}}
+            {"recorded_at": 1_004_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"terminal","terminal":"completed"}}}}
         ]
     })).unwrap()).unwrap();
     let output = tmp.path().join("spans");
@@ -43,12 +43,44 @@ async fn importing_muse_export_uses_the_production_translator() {
     assert_eq!(inserted(&output_rows, "llm"), 1);
     assert!(output_rows
         .iter()
-        .any(|row| { row.pointer("/Insert/output").and_then(Value::as_str) == Some("traced") }));
+        .any(|row| { row.pointer("/Merge/output").and_then(Value::as_str) == Some("traced") }));
     assert!(output_rows.iter().any(|row| {
-        row.pointer("/Insert/metrics/input_tokens")
+        row.pointer("/Merge/metrics/prompt_tokens")
             .and_then(Value::as_i64)
             == Some(3)
     }));
+}
+
+#[tokio::test]
+async fn importing_sparse_failed_muse_export_preserves_model_and_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let export = tmp.path().join("muse-sparse-export.json");
+    std::fs::write(&export, serde_json::to_vec(&json!({
+        "export_schema_version": 1,
+        "exporter_version": {"semver":"1.1.1"},
+        "sessions": [{"session_id":"muse-sparse", "session_end":{"exit_reason":"error"}}],
+        "events": [
+            {"recorded_at": 1_000_000, "envelope":{"payload":{"kind":"run", "run_id":"run-1", "event":{"kind":"assistant_message_committed", "text":"partial"}}}},
+            {"recorded_at": 1_001_000, "envelope":{"payload":{"kind":"run", "run_id":"run-1", "event":{"kind":"resource_usage_sampled", "usage":{"input_tokens":3, "output_tokens":2}}}}},
+            {"recorded_at": 1_002_000, "envelope":{"payload":{"kind":"run", "run_id":"run-1", "event":{"kind":"terminal", "terminal":"failed", "reason":"provider failed"}}}},
+            {"recorded_at": 1_009_000, "envelope":{"payload":{"kind":"session_end"}}}
+        ]
+    })).unwrap()).unwrap();
+    let output = tmp.path().join("spans");
+    import_transcript(&export, ImportSource::Muse, options(&output), None, false)
+        .await
+        .unwrap();
+    let output_rows = rows(&output.join("muse-sparse.ndjson"));
+    assert_eq!(inserted(&output_rows, "llm"), 1);
+    assert!(output_rows.iter().any(|row| {
+        row.pointer("/Merge/metrics/prompt_tokens")
+            .and_then(Value::as_u64)
+            == Some(3)
+            && row.pointer("/Merge/error").and_then(Value::as_str) == Some("provider failed")
+    }));
+    assert!(output_rows
+        .iter()
+        .any(|row| { row.pointer("/Merge/end_ms").and_then(Value::as_i64) == Some(1009) }));
 }
 
 #[tokio::test]
