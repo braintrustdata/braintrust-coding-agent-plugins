@@ -50,9 +50,9 @@ your agent's native connector or MCP configuration when you want MCP access.
 
 Tracing forwards Claude Code's native hook payloads and reads the session
 transcript to construct traces. This can include user prompts, tool inputs and
-outputs, model requests and responses, and session metadata. Root-span metadata
-includes the Claude permission mode and, when Claude provides it, the complete
-client system prompt.
+outputs, model requests and responses, and session metadata. Each turn records
+the effective Claude permission mode. Root-span metadata includes, when Claude
+provides it, the complete client system prompt.
 
 System prompts and the other captured content can contain confidential
 instructions, file contents, or secrets. The plugin does not redact these

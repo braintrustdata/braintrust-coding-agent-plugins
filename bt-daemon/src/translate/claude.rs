@@ -369,13 +369,6 @@ impl ClaudeTranslator {
         if let Some(model) = hook.model.clone().or_else(|| self.session_model.clone()) {
             metadata.insert("model".into(), json!(model));
         }
-        if let Some(permission_mode) = hook
-            .permission_mode
-            .clone()
-            .or_else(|| self.permission_mode.clone())
-        {
-            metadata.insert("permission_mode".into(), json!(permission_mode));
-        }
         if let Some(system_prompt) = hook
             .system_prompt
             .clone()
@@ -461,8 +454,13 @@ impl ClaudeTranslator {
         }
         self.turn_count += 1;
         let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_count));
-        let skill_metadata = explicit_skill_metadata(&self.pending_skills);
+        let mut metadata = explicit_skill_metadata(&self.pending_skills)
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
         self.pending_skills.clear();
+        if let Some(permission_mode) = &self.permission_mode {
+            metadata.insert("permission_mode".into(), json!(permission_mode));
+        }
         ops.push(SpanOp::Insert(SpanRow {
             span_id: id.clone(),
             root_span_id: self.root_span_id.clone(),
@@ -471,7 +469,7 @@ impl ClaudeTranslator {
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
             input: event.payload.get("prompt").cloned(),
-            metadata: skill_metadata,
+            metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
             ..Default::default()
         }));
         self.turn = Some(Turn {
