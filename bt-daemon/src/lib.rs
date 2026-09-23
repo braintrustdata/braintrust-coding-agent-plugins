@@ -49,7 +49,9 @@ pub use trace_command::{
     DisableArgs, DoctorAgent, DoctorArgs, EnableArgs, SetupAgent, SetupArgs, StopArgs, TraceArgs,
     TraceCommand, UpdateArgs,
 };
-pub use trace_runtime::{run_trace, RouteRequirements, TraceHostContext, TraceHostServices};
+pub use trace_runtime::{
+    run_trace, HostRouteSelection, RouteRequirements, TraceHostContext, TraceHostServices,
+};
 pub use translate::{
     AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
