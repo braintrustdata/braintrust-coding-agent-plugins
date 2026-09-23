@@ -1,13 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 export interface LegacyContinuation {
-  root_span_id: string;
-  trace_root_span_id: string;
-  parent_span_id?: string;
-  total_turns: number;
-  total_tool_calls: number;
+  span: string;
+  trace: string;
+  parent?: string;
+  turns: number;
+  tools: number;
 }
 
 /**
@@ -28,7 +28,8 @@ export function legacyContinuationFor(
   try {
     const parsed: unknown = JSON.parse(readFileSync(stateFile, "utf8"));
     const sessions = objectValue(parsed)?.sessions;
-    const session = objectValue(objectValue(sessions)?.[`file:${sessionFile}`]);
+    // Version 0.9.0 stored the key with an absolute session-file path.
+    const session = objectValue(objectValue(sessions)?.[`file:${resolve(sessionFile)}`]);
     const rootSpanId = stringValue(session?.rootSpanId);
     if (!rootSpanId) return undefined;
     const traceRootSpanId = stringValue(session?.traceRootSpanId) ?? rootSpanId;
@@ -36,13 +37,11 @@ export function legacyContinuationFor(
     const totalToolCalls = countValue(session?.totalToolCalls);
     if (totalTurns === undefined || totalToolCalls === undefined) return undefined;
     return {
-      root_span_id: rootSpanId,
-      trace_root_span_id: traceRootSpanId,
-      ...(stringValue(session?.parentSpanId)
-        ? { parent_span_id: stringValue(session?.parentSpanId) }
-        : {}),
-      total_turns: totalTurns,
-      total_tool_calls: totalToolCalls,
+      span: rootSpanId,
+      trace: traceRootSpanId,
+      ...(stringValue(session?.parentSpanId) ? { parent: stringValue(session?.parentSpanId) } : {}),
+      turns: totalTurns,
+      tools: totalToolCalls,
     };
   } catch {
     return undefined;

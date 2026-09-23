@@ -304,10 +304,10 @@ describe("Pi daemon adapter", () => {
 
   it("forwards legacy continuation state with the first daemon event", async () => {
     mockState.legacyContinuation = {
-      root_span_id: "legacy-root",
-      trace_root_span_id: "legacy-trace",
-      total_turns: 3,
-      total_tool_calls: 7,
+      span: "legacy-root",
+      trace: "legacy-trace",
+      turns: 3,
+      tools: 7,
     };
     const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
     const pi = {
@@ -329,7 +329,7 @@ describe("Pi daemon adapter", () => {
     await handlers.get("session_start")?.({ reason: "resume" }, ctx);
 
     expect(mockState.logs[0]?.payload).toMatchObject({
-      legacy_continuation: mockState.legacyContinuation,
+      legacy_resume: mockState.legacyContinuation,
     });
   });
 });

@@ -303,12 +303,12 @@ fn pi_adopts_a_legacy_root_and_continues_its_turn_sequence() {
         config: None,
     };
     let mut start = event("session_start", 1, json!({"reason":"resume"}));
-    start.payload["legacy_continuation"] = json!({
-        "root_span_id":"legacy-root",
-        "trace_root_span_id":"legacy-trace-root",
-        "parent_span_id":"upstream-parent",
-        "total_turns":3,
-        "total_tool_calls":7,
+    start.payload["legacy_resume"] = json!({
+        "span":"legacy-root",
+        "trace":"legacy-trace-root",
+        "parent":"upstream-parent",
+        "turns":3,
+        "tools":7,
     });
 
     let mut ops = translator.handle(&start, &ctx).unwrap();

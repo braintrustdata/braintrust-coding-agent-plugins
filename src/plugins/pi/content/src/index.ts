@@ -141,7 +141,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
         extension_version: EXTENSION_VERSION,
         session_file: descriptor?.sessionFile,
         native_session_id: descriptor?.nativeSessionId,
-        legacy_continuation: descriptor?.legacyContinuation ?? legacyContinuation,
+        legacy_resume: descriptor?.legacyContinuation ?? legacyContinuation,
         cwd: ctx?.cwd,
         model: nativePayload(ctx?.model),
       },

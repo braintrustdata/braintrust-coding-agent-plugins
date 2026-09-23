@@ -886,24 +886,24 @@ struct LegacyContinuation {
 }
 
 fn legacy_continuation(payload: &Value) -> Option<LegacyContinuation> {
-    let value = payload.get("legacy_continuation")?;
-    let root_span_id = value.get("root_span_id")?.as_str()?.to_owned();
+    let value = payload.get("legacy_resume")?;
+    let root_span_id = value.get("span")?.as_str()?.to_owned();
     if root_span_id.is_empty() {
         return None;
     }
     let trace_root_span_id = value
-        .get("trace_root_span_id")
+        .get("trace")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .unwrap_or(&root_span_id)
         .to_owned();
-    let total_turns = u32::try_from(value.get("total_turns")?.as_u64()?).ok()?;
-    let total_tool_calls = u32::try_from(value.get("total_tool_calls")?.as_u64()?).ok()?;
+    let total_turns = u32::try_from(value.get("turns")?.as_u64()?).ok()?;
+    let total_tool_calls = u32::try_from(value.get("tools")?.as_u64()?).ok()?;
     Some(LegacyContinuation {
         root_span_id,
         trace_root_span_id,
         parent_span_id: value
-            .get("parent_span_id")
+            .get("parent")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_owned),

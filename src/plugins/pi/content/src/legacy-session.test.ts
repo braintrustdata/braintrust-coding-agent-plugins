@@ -1,6 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { legacyContinuationFor } from "./legacy-session.ts";
 
@@ -14,7 +14,7 @@ afterEach(async () => {
 });
 
 describe("legacy Pi session state", () => {
-  it("returns only valid continuation state for the matching session file", async () => {
+  it("reads the published 0.9.0 legacy state shape for the matching session", async () => {
     const stateDir = await mkdtemp(join(tmpdir(), "braintrust-pi-state-"));
     stateDirs.push(stateDir);
     process.env.BRAINTRUST_STATE_DIR = stateDir;
@@ -34,12 +34,17 @@ describe("legacy Pi session state", () => {
       }),
     );
 
+    // @braintrust/pi-extension 0.9.0 persisted this exact sessions.json
+    // shape, including camelCase fields and an absolute file session key.
     expect(legacyContinuationFor("/tmp/live.jsonl")).toEqual({
-      root_span_id: "legacy-root",
-      trace_root_span_id: "legacy-trace",
-      parent_span_id: "upstream",
-      total_turns: 3,
-      total_tool_calls: 7,
+      span: "legacy-root",
+      trace: "legacy-trace",
+      parent: "upstream",
+      turns: 3,
+      tools: 7,
+    });
+    expect(legacyContinuationFor(relative(process.cwd(), "/tmp/live.jsonl"))).toMatchObject({
+      span: "legacy-root",
     });
     expect(legacyContinuationFor("/tmp/other.jsonl")).toBeUndefined();
   });
