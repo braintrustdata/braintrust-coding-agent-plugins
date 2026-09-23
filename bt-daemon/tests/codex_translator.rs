@@ -792,6 +792,7 @@ fn configured_ctx(session_id: &str, additional_metadata: Value) -> SessionCtx {
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: Some(additional_metadata),
             tags: vec!["ci".into(), "docs".into()],
+            span_plugins: Vec::new(),
         }),
     }
 }

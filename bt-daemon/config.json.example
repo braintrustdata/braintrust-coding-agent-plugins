@@ -14,6 +14,9 @@
     "additional_metadata": {
       "team": "platform",
       "environment": "development"
-    }
+    },
+    "span_plugins": [
+      "/absolute/path/to/redact.mjs"
+    ]
   }
 }

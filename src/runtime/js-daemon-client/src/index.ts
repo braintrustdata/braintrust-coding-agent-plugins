@@ -17,6 +17,7 @@ export interface DaemonSessionRoute {
   destination: unknown
   flush_mode?: "fire_and_forget" | "flush_on_turn_end"
   additional_metadata?: Record<string, unknown>
+  span_plugins?: string[]
 }
 
 export interface DaemonTraceSettings {

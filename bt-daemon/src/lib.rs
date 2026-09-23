@@ -19,11 +19,13 @@ mod delivery_ledger;
 mod dispatch;
 mod ids;
 mod journal;
+mod plugin_diagnostics;
 pub(crate) mod process;
 mod server;
 mod settings;
 mod setup;
 mod sink;
+mod span_processor;
 mod trace_command;
 mod trace_runtime;
 mod transcript_import;
@@ -39,6 +41,7 @@ pub use command_output::{
 };
 #[doc(hidden)]
 pub use journal::source_journal_path;
+pub use plugin_diagnostics::PluginDiagnostic;
 pub use server::{AuthLease, AuthProvider, AuthResolveReason, ServeOptions};
 pub use setup::{run_disable, run_enable, run_setup, run_update};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
@@ -223,6 +226,10 @@ pub struct ImportArgs {
     /// Tag applied to each imported root span. May be repeated or comma-separated.
     #[arg(long = "tag", env = "BRAINTRUST_TAGS", value_delimiter = ',')]
     pub tags: Vec<String>,
+    /// JavaScript span transform for this import. Repeat to compose an isolated
+    /// transform chain; persistent setup plugins are not included.
+    #[arg(long, value_name = "PATH")]
+    pub plugin: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -272,6 +279,10 @@ pub struct RunArgs {
     /// Tag applied to each root span for this invocation. May be repeated or comma-separated.
     #[arg(long = "tag", env = "BRAINTRUST_TAGS", value_delimiter = ',')]
     pub tags: Vec<String>,
+    /// JavaScript span transform for this invocation. Repeat to compose an
+    /// isolated transform chain; persistent setup plugins are not included.
+    #[arg(long, value_name = "PATH")]
+    pub plugin: Vec<PathBuf>,
     /// Arguments forwarded verbatim to the coding agent.
     #[arg(allow_hyphen_values = true)]
     pub agent_args: Vec<OsString>,
@@ -693,6 +704,7 @@ pub async fn run_import(
     mut config: Option<SessionConfig>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     validate_import_selection(&args)?;
+    apply_import_span_plugins(&mut config, &args.plugin)?;
     let destination = import_parent_components(&args)?
         .map(|components| wire::TraceDestination::ParentSpan { components })
         .or_else(|| args.destination.clone());
@@ -711,6 +723,32 @@ pub async fn run_import(
         .await;
     }
     import_transcripts_with_ledger(&files, args.source, opts, config, Some(ledger_dir)).await
+}
+
+fn apply_import_span_plugins(
+    config: &mut Option<SessionConfig>,
+    plugins: &[PathBuf],
+) -> anyhow::Result<()> {
+    let plugins = resolve_span_plugin_paths(plugins)?;
+    if let Some(config) = config.as_mut() {
+        config.span_plugins = plugins;
+    } else if !plugins.is_empty() {
+        *config = Some(SessionConfig {
+            auth: wire::BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: None,
+            flush_mode: wire::FlushMode::FireAndForget,
+            additional_metadata: None,
+            tags: Vec::new(),
+            span_plugins: plugins,
+        });
+    }
+    Ok(())
 }
 
 fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
@@ -806,8 +844,9 @@ fn import_parent_components(args: &ImportArgs) -> anyhow::Result<Option<SpanComp
 pub async fn run_traced(
     args: RunArgs,
     hook_command: RunHookCommand,
-    route: SessionRoute,
+    mut route: SessionRoute,
 ) -> anyhow::Result<std::process::ExitStatus> {
+    apply_run_span_plugins(&mut route, &args.plugin)?;
     if route.destination.is_none() {
         anyhow::bail!(
             "managed run requires a trace destination; select a project, object destination, or parent span"
@@ -911,8 +950,13 @@ pub async fn run_traced(
         ),
         Err(error) => tracing::warn!(managed_run_id, %error, "managed run trace flush failed"),
     }
-    if isolated_runtime.is_some() {
+    if let Some(runtime) = &isolated_runtime {
         let _ = shutdown_daemon(&socket).await;
+        if let Err(error) =
+            crate::plugin_diagnostics::merge(runtime.temp_dir.path(), &paths::data_dir(None))
+        {
+            tracing::warn!(managed_run_id, %error, "failed to preserve managed-run plugin diagnostics");
+        }
     }
     status
 }
@@ -933,6 +977,24 @@ impl ManagedRunRuntime {
         ));
         Ok(Self { temp_dir, socket })
     }
+}
+
+fn apply_run_span_plugins(route: &mut SessionRoute, plugins: &[PathBuf]) -> anyhow::Result<()> {
+    route.span_plugins = resolve_span_plugin_paths(plugins)?;
+    Ok(())
+}
+
+pub(crate) fn resolve_span_plugin_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let paths: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            path.canonicalize().map_err(|error| {
+                anyhow::anyhow!("could not resolve span plugin {}: {error}", path.display())
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    crate::span_processor::validate(&paths)?;
+    Ok(paths)
 }
 
 fn managed_run_args(
@@ -1210,6 +1272,7 @@ struct ImportLive {
     span_ids: std::collections::HashSet<String>,
     root_span_id: Option<String>,
     destination: Option<wire::TraceDestination>,
+    diagnostics_dir: Option<PathBuf>,
 }
 
 struct ImportProcessor {
@@ -1275,6 +1338,7 @@ impl ImportProcessor {
                                 .config
                                 .as_ref()
                                 .and_then(|config| config.destination.clone()),
+                            diagnostics_dir: self.ledger_dir.clone(),
                         },
                     );
                     self.sessions.get_mut(&sid).unwrap()
@@ -1316,8 +1380,76 @@ impl ImportProcessor {
                         live.root_span_id = Some(row.root_span_id.clone());
                     }
                 }
-                live.sink.emit(chunk).await?;
-                live.pending_ops += chunk.len();
+                let plugins = live
+                    .ctx
+                    .config
+                    .as_ref()
+                    .map(|config| config.span_plugins.as_slice())
+                    .unwrap_or_default();
+                let mut transformed = Vec::with_capacity(chunk.len());
+                for op in chunk {
+                    match crate::span_processor::process(
+                        plugins,
+                        op,
+                        &live.source,
+                        &live.ctx.session_id,
+                    ) {
+                        Ok(result) => {
+                            if let Some(failure) = result.failure {
+                                if failure.newly_seen {
+                                    if let Some(data_dir) = &live.diagnostics_dir {
+                                        if let Err(error) = crate::plugin_diagnostics::record(
+                                            data_dir,
+                                            &live.source,
+                                            &failure.path,
+                                            &failure.message,
+                                        ) {
+                                            tracing::warn!(
+                                                session_id = %live.ctx.session_id,
+                                                "failed to persist span plugin diagnostic: {error}"
+                                            );
+                                        }
+                                    }
+                                    tracing::warn!(
+                                        session_id = %live.ctx.session_id,
+                                        plugin = %failure.path.display(),
+                                        error = %failure.message,
+                                        "span plugin failed during import; span operations are being discarded"
+                                    );
+                                }
+                            }
+                            if let Some(op) = result.op {
+                                transformed.push(op);
+                            }
+                        }
+                        Err(error) => {
+                            if let (Some(data_dir), Some(plugin)) =
+                                (&live.diagnostics_dir, plugins.first())
+                            {
+                                if let Err(diagnostic_error) = crate::plugin_diagnostics::record(
+                                    data_dir,
+                                    &live.source,
+                                    plugin,
+                                    &error.to_string(),
+                                ) {
+                                    tracing::warn!(
+                                        session_id = %live.ctx.session_id,
+                                        "failed to persist span plugin diagnostic: {diagnostic_error}"
+                                    );
+                                }
+                            }
+                            tracing::warn!(
+                                session_id = %live.ctx.session_id,
+                                %error,
+                                "span plugin processor failed during import; span operation discarded"
+                            );
+                        }
+                    }
+                }
+                if !transformed.is_empty() {
+                    live.sink.emit(&transformed).await?;
+                }
+                live.pending_ops += transformed.len();
                 if live.pending_ops >= FLUSH_OPS {
                     live.sink.flush().await?;
                     live.pending_ops = 0;
@@ -1614,6 +1746,22 @@ mod tests {
     }
 
     #[test]
+    fn span_plugin_paths_are_canonicalized_before_use() {
+        let dir = tempfile::Builder::new()
+            .prefix("span-plugin-path-")
+            .tempdir_in(".")
+            .unwrap();
+        let plugin = dir.path().join("plugin.mjs");
+        std::fs::write(&plugin, "export default span => span").unwrap();
+        let relative = PathBuf::from(dir.path().file_name().unwrap()).join("plugin.mjs");
+
+        let resolved = resolve_span_plugin_paths(&[relative]).unwrap();
+
+        assert_eq!(resolved, [plugin.canonicalize().unwrap()]);
+        assert!(resolved[0].is_absolute());
+    }
+
+    #[test]
     fn additional_metadata_overrides_a_route_only_with_a_json_object() {
         let mut route = SessionRoute {
             additional_metadata: Some(serde_json::json!({"saved": true})),
@@ -1644,6 +1792,53 @@ mod tests {
 
         let error = apply_tags(&mut route, &[" ".into()]).unwrap_err();
         assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn managed_run_plugins_replace_inherited_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("run.mjs");
+        std::fs::write(&plugin, "export default span => span").unwrap();
+        let mut route = SessionRoute {
+            span_plugins: vec![PathBuf::from("persisted.mjs")],
+            ..SessionRoute::default()
+        };
+
+        apply_run_span_plugins(&mut route, &[]).unwrap();
+        assert!(route.span_plugins.is_empty());
+
+        apply_run_span_plugins(&mut route, std::slice::from_ref(&plugin)).unwrap();
+        assert_eq!(route.span_plugins, [plugin.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn import_plugins_replace_inherited_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("import.mjs");
+        std::fs::write(&plugin, "export default span => span").unwrap();
+        let mut config = Some(SessionConfig {
+            auth: wire::BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: None,
+            flush_mode: wire::FlushMode::FireAndForget,
+            additional_metadata: None,
+            tags: Vec::new(),
+            span_plugins: vec![PathBuf::from("persisted.mjs")],
+        });
+
+        apply_import_span_plugins(&mut config, &[]).unwrap();
+        assert!(config.as_ref().unwrap().span_plugins.is_empty());
+
+        apply_import_span_plugins(&mut config, std::slice::from_ref(&plugin)).unwrap();
+        assert_eq!(
+            config.unwrap().span_plugins,
+            [plugin.canonicalize().unwrap()]
+        );
     }
 
     #[test]
@@ -1748,6 +1943,7 @@ mod tests {
             attach: true,
             additional_metadata: None,
             tags: Vec::new(),
+            plugin: Vec::new(),
         };
         assert!(validate_import_selection(&args)
             .unwrap_err()
@@ -1829,6 +2025,7 @@ mod tests {
             flush_mode: wire::FlushMode::FireAndForget,
             additional_metadata: None,
             tags: Vec::new(),
+            span_plugins: Vec::new(),
         }
     }
 
@@ -1921,6 +2118,7 @@ mod tests {
                 source: RunSource::Codex,
                 additional_metadata: None,
                 tags: Vec::new(),
+                plugin: Vec::new(),
                 agent_args: Vec::new(),
             },
             test_run_hook_command(),
@@ -1939,6 +2137,7 @@ mod tests {
                 source: RunSource::Codex,
                 additional_metadata: None,
                 tags: Vec::new(),
+                plugin: Vec::new(),
                 agent_args: vec![OsString::from("--dangerously-bypass-hook-trust")],
             },
             test_run_hook_command(),
