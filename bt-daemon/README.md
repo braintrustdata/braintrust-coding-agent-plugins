@@ -254,7 +254,12 @@ transcript are not invented.
 Muse imports invoke its documented local `muse export --session` interface and
 read export schema version 1. `import muse --all` enumerates durable session
 IDs through Muse's read-only MSP `session/list` interface, then exports each
-completed session. `--attach` is not available yet because it needs a durable
+completed session. Exports are parsed incrementally, one session at a time.
+Muse Code 1.1.1 setup captures the six verified lifecycle and model hooks:
+`SessionStart`, `UserPromptSubmit`, `PreLLMCall`, `PostLLMCall`, `Stop`, and
+`SessionEnd`. Tool, permission, subagent, and compaction details are not
+available from those hooks and are not inferred by the live translator.
+`--attach` is not available yet because it needs a durable
 MSP subscription and cursor-following implementation. Muse also has no safe
 invocation-local configuration overlay, so `run muse` is deliberately
 unavailable; use persistent `enable muse` setup.
