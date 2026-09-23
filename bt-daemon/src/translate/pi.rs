@@ -34,6 +34,7 @@ impl TranslatorFactory for PiTranslatorFactory {
             effective_root_span_id: String::new(),
             external_parent: None,
             opened: false,
+            legacy_root_adopted: false,
             turn: None,
             turn_seq: 0,
             llm_seq: 0,
@@ -308,6 +309,10 @@ struct PiTranslator {
     effective_root_span_id: String,
     external_parent: Option<String>,
     opened: bool,
+    // A legacy state file remains available after migration, so its counters
+    // are initialization input only. Later reopen/replay events must retain
+    // the daemon's accumulated counters and deterministic turn sequence.
+    legacy_root_adopted: bool,
     turn: Option<(String, Value)>,
     turn_seq: u32,
     llm_seq: u32,
@@ -493,12 +498,16 @@ impl PiTranslator {
             return Vec::new();
         }
         self.opened = true;
+        if self.legacy_root_adopted {
+            return Vec::new();
+        }
         if let Some(legacy) = legacy_continuation(&envelope.payload) {
             self.root_span_id = legacy.root_span_id;
             self.effective_root_span_id = legacy.trace_root_span_id;
             self.external_parent = legacy.parent_span_id;
             self.turn_seq = legacy.total_turns;
             self.total_tools = legacy.total_tool_calls;
+            self.legacy_root_adopted = true;
             // The legacy extension already created this root. Re-emitting an
             // insert could replace its metadata and attachment, so only emit
             // descendants and terminal aggregate merges from this point on.
