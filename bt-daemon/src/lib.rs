@@ -1097,52 +1097,60 @@ async fn import_muse_sessions_with_ledger(
             .tempdir()?;
         let export = directory.path().join("session.json");
         export_muse_session(session_id, &export).await?;
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<Envelope>>(4);
-        let export_for_parser = export.clone();
-        let expected_id = session_id.clone();
-        let parser = tokio::task::spawn_blocking(move || {
-            let mut batch = Vec::with_capacity(128);
-            transcript_import::muse::for_each_envelope_for_session(
-                &export_for_parser,
-                &expected_id,
-                |entry| {
-                    batch.push(entry);
-                    if batch.len() == 128 {
-                        sender
-                            .blocking_send(std::mem::take(&mut batch))
-                            .map_err(|_| {
-                                anyhow::anyhow!("Muse import stopped while parsing {expected_id}")
-                            })?;
-                    }
-                    Ok(())
-                },
-            )?;
-            if !batch.is_empty() {
-                sender.blocking_send(batch).map_err(|_| {
-                    anyhow::anyhow!("Muse import stopped while parsing {expected_id}")
-                })?;
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        let mut processing_error = None;
-        while let Some(batch) = receiver.recv().await {
-            if let Err(error) = processor.process(batch).await {
-                processing_error = Some(error);
-                break;
-            }
-        }
-        drop(receiver);
-        let parse_result = parser.await.context("Muse export parser task failed")?;
-        if let Some(error) = processing_error {
-            return Err(error);
-        }
-        parse_result?;
+        process_muse_export(&mut processor, &export, session_id).await?;
         if let Some(summary) = processor.finish_session(session_id).await? {
             summaries.push(summary);
         }
     }
     summaries.extend(processor.finish().await?);
     Ok(summaries)
+}
+
+async fn process_muse_export(
+    processor: &mut ImportProcessor,
+    export: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<Envelope>>(4);
+    let export_for_parser = export.to_path_buf();
+    let expected_id = session_id.to_owned();
+    let parser = tokio::task::spawn_blocking(move || {
+        let mut batch = Vec::with_capacity(128);
+        transcript_import::muse::for_each_envelope_for_session(
+            &export_for_parser,
+            &expected_id,
+            |entry| {
+                batch.push(entry);
+                if batch.len() == 128 {
+                    sender
+                        .blocking_send(std::mem::take(&mut batch))
+                        .map_err(|_| {
+                            anyhow::anyhow!("Muse import stopped while parsing {expected_id}")
+                        })?;
+                }
+                Ok(())
+            },
+        )?;
+        if !batch.is_empty() {
+            sender
+                .blocking_send(batch)
+                .map_err(|_| anyhow::anyhow!("Muse import stopped while parsing {expected_id}"))?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    let mut processing_error = None;
+    while let Some(batch) = receiver.recv().await {
+        if let Err(error) = processor.process(batch).await {
+            processing_error = Some(error);
+            break;
+        }
+    }
+    drop(receiver);
+    let parse_result = parser.await.context("Muse export parser task failed")?;
+    if let Some(error) = processing_error {
+        return Err(error);
+    }
+    parse_result
 }
 
 fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
@@ -1590,6 +1598,20 @@ async fn import_transcript_with_ledger(
     attach: bool,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
+    if source == ImportSource::Muse {
+        if attach {
+            anyhow::bail!("Muse import does not support --attach yet")
+        }
+        let session_id = transcript_import::muse::session_id(file)?;
+        let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+        process_muse_export(&mut processor, file, &session_id).await?;
+        let mut summaries = Vec::new();
+        if let Some(summary) = processor.finish_session(&session_id).await? {
+            summaries.push(summary);
+        }
+        summaries.extend(processor.finish().await?);
+        return Ok(summaries);
+    }
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
     let mut processor = ImportProcessor::new(opts, config, ledger_dir);
     let shutdown = tokio::signal::ctrl_c();
