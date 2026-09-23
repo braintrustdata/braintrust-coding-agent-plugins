@@ -453,6 +453,7 @@ fn attached_codex_root_merge_preserves_external_parent() {
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: None,
             tags: Vec::new(),
+            span_plugins: Vec::new(),
         }),
     };
     let registry = Registry::default_agents();
@@ -1664,6 +1665,7 @@ fn codex_root_source_merge_after_stop_keeps_external_parent() {
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: None,
             tags: Vec::new(),
+            span_plugins: Vec::new(),
         }),
     };
     let registry = Registry::default_agents();
