@@ -59,12 +59,15 @@ pub use translate::{
 use anyhow::Context;
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use clap::{Args, ValueEnum};
+use serde::Deserialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+};
 use wire::{
     method, Envelope, ManagedRunFlushParams, SessionConfig, SessionRoute, StatusResult,
     PROTOCOL_VERSION,
@@ -73,6 +76,9 @@ use wire::{
 const MANAGED_RUN_ID_ENV: &str = "BT_TRACE_MANAGED_RUN_ID";
 const MANAGED_RUN_FLUSH_TIMEOUT_MS: u64 = 10_000;
 const MUSE_MSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MUSE_MSP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MUSE_MSP_MAX_PAGES: usize = 1_000;
+const MUSE_MSP_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -786,9 +792,16 @@ pub async fn run_import(
                 "Muse import does not support --attach yet; use a completed export-v1 session"
             )
         }
-        let exports = prepare_muse_exports(&args).await?;
-        return import_muse_exports_with_ledger(
-            &exports,
+        let session_ids = if args.all {
+            muse_msp_session_ids().await?
+        } else {
+            args.session_ids.clone()
+        };
+        if session_ids.is_empty() {
+            anyhow::bail!("no durable Muse sessions found to import")
+        }
+        return import_muse_sessions_with_ledger(
+            &session_ids,
             opts,
             config,
             Some(paths::data_dir(None)),
@@ -837,56 +850,44 @@ fn apply_import_span_plugins(
     Ok(())
 }
 
-async fn prepare_muse_exports(args: &ImportArgs) -> anyhow::Result<tempfile::TempDir> {
-    let session_ids = if args.all {
-        muse_msp_session_ids().await?
-    } else {
-        args.session_ids.clone()
-    };
-    if session_ids.is_empty() {
-        anyhow::bail!("no durable Muse sessions found to import")
-    }
-    export_muse_sessions(&session_ids).await
-}
-
-async fn export_muse_sessions(session_ids: &[String]) -> anyhow::Result<tempfile::TempDir> {
-    let directory = tempfile::Builder::new()
-        .prefix("bt-muse-import-")
-        .tempdir()?;
+async fn export_muse_session(session_id: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    transcript_import::validate_session_id(session_id)?;
     let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
-    for (index, session_id) in session_ids.iter().enumerate() {
-        let output = tokio::process::Command::new(&executable)
-            .kill_on_drop(true)
-            .args([
-                OsString::from("export"),
-                OsString::from("--session"),
-                OsString::from(session_id),
-                OsString::from("--out"),
-            ])
-            .arg(directory.path().join(format!("{index}.json")))
-            .output()
-            .await
-            .with_context(|| {
-                format!(
-                    "run {} export for Muse session {session_id}",
-                    executable.to_string_lossy()
-                )
-            })?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "Muse export for session {session_id} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+    let mut child = tokio::process::Command::new(&executable)
+        .kill_on_drop(true)
+        .args(["export", "--session", session_id, "--out"])
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "run {} export for Muse session {session_id}",
+                executable.to_string_lossy()
+            )
+        })?;
+    let stderr = child.stderr.take().expect("piped stderr");
+    let diagnostics = tokio::spawn(muse_drain_stderr(stderr));
+    let status = tokio::time::timeout(Duration::from_secs(300), child.wait())
+        .await
+        .with_context(|| format!("Muse export for session {session_id} timed out"))?
+        .with_context(|| format!("wait for Muse export of session {session_id}"))?;
+    let stderr = diagnostics
+        .await
+        .context("collect Muse export diagnostics")??;
+    if !status.success() {
+        anyhow::bail!(
+            "Muse export for session {session_id} failed: {}",
+            stderr.trim()
+        );
     }
-    Ok(directory)
+    Ok(())
 }
 
 /// List durable Muse sessions through the read-only MSP surface. This never
 /// resumes a session, obtains a writer lease, or subscribes to its view; the
 /// export command remains the authoritative content reader.
 async fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
-    const MAX_PAGES: usize = 1_000;
     let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
     let mut child = tokio::process::Command::new(&executable)
         .kill_on_drop(true)
@@ -903,62 +904,118 @@ async fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
         })?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let diagnostics = tokio::spawn(muse_drain_stderr(stderr));
     let mut reader = BufReader::new(stdout).lines();
-    let mut request_id = 1u64;
-    muse_msp_request(
-        &mut stdin,
-        &mut reader,
-        request_id,
-        "initialize",
-        serde_json::json!({"clientInfo":{"name":"braintrust_muse_import","version":"1"}}),
-    )
-    .await?;
-    // Muse follows the JSON-RPC/MSP initialization handshake: requests after
-    // `initialize` are rejected until this notification has been flushed.
-    muse_msp_notify(&mut stdin, "initialized").await?;
-    let mut cursor = None;
-    let mut sessions = Vec::new();
-    for _ in 0..MAX_PAGES {
-        request_id += 1;
-        let result = muse_msp_request(
+    let listing = async {
+        let mut request_id = 1u64;
+        muse_msp_request(
             &mut stdin,
             &mut reader,
             request_id,
-            "session/list",
-            serde_json::json!({"cursor": cursor, "limit": 200}),
+            "initialize",
+            serde_json::json!({"clientInfo":{"name":"braintrust_muse_import","version":"1"}}),
         )
         .await?;
-        let page = result
-            .get("sessions")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("Muse session/list response has no sessions array"))?;
-        sessions.extend(page.iter().filter_map(|session| {
-            session
-                .get("sessionId")
-                .or_else(|| session.get("session_id"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|id| transcript_import::validate_session_id(id).is_ok())
-                .map(str::to_owned)
-        }));
-        cursor = result
-            .get("nextCursor")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        if cursor.is_none() {
-            break;
+        // Muse requires the initialized notification before other requests.
+        muse_msp_notify(&mut stdin, "initialized").await?;
+        let mut cursor = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut sessions = Vec::new();
+        for page_index in 0..MUSE_MSP_MAX_PAGES {
+            request_id += 1;
+            let result = muse_msp_request(
+                &mut stdin,
+                &mut reader,
+                request_id,
+                "session/list",
+                serde_json::json!({"cursor": cursor, "limit": 200}),
+            )
+            .await?;
+            match muse_msp_append_page(result, page_index + 1, &mut sessions, &mut seen_cursors)? {
+                None => {
+                    sessions.sort();
+                    sessions.dedup();
+                    return Ok(sessions);
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        anyhow::bail!("Muse session/list exceeded {MUSE_MSP_MAX_PAGES} pages")
+    }
+    .await;
+    drop(stdin);
+    drop(reader);
+    let status = match tokio::time::timeout(MUSE_MSP_SHUTDOWN_TIMEOUT, child.wait()).await {
+        Ok(status) => status.context("wait for Muse MSP host")?,
+        Err(_) => {
+            child
+                .start_kill()
+                .context("stop unresponsive Muse MSP host")?;
+            child
+                .wait()
+                .await
+                .context("reap unresponsive Muse MSP host")?;
+            anyhow::bail!("Muse MSP host did not exit after stdin closed")
+        }
+    };
+    let stderr = diagnostics
+        .await
+        .context("collect Muse MSP diagnostics")??;
+    let sessions = listing?;
+    if !status.success() {
+        anyhow::bail!("Muse MSP session listing failed: {}", stderr.trim());
+    }
+    Ok(sessions)
+}
+
+#[derive(Deserialize)]
+struct MuseMspSessionPage {
+    sessions: Vec<MuseMspSessionEntry>,
+    #[serde(rename = "nextCursor")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MuseMspSessionEntry {
+    #[serde(rename = "sessionId", alias = "session_id")]
+    session_id: String,
+}
+
+fn muse_msp_append_page(
+    result: serde_json::Value,
+    page_index: usize,
+    sessions: &mut Vec<String>,
+    seen_cursors: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<Option<String>> {
+    let page: MuseMspSessionPage = serde_json::from_value(result)
+        .with_context(|| format!("decode Muse session/list page {page_index}"))?;
+    for session in page.sessions {
+        transcript_import::validate_session_id(&session.session_id).with_context(|| {
+            format!("invalid Muse session id on session/list page {page_index}")
+        })?;
+        sessions.push(session.session_id);
+    }
+    if let Some(cursor) = &page.next_cursor {
+        if !seen_cursors.insert(cursor.clone()) {
+            anyhow::bail!("Muse session/list repeated cursor on page {page_index}")
         }
     }
-    drop(stdin);
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "Muse MSP session listing failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    Ok(page.next_cursor)
+}
+
+async fn muse_drain_stderr(mut stderr: tokio::process::ChildStderr) -> anyhow::Result<String> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = stderr.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MUSE_MSP_DIAGNOSTIC_BYTES.saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..count.min(remaining)]);
     }
-    sessions.sort();
-    sessions.dedup();
-    Ok(sessions)
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 async fn muse_msp_notify<W>(stdin: &mut W, method: &str) -> anyhow::Result<()>
@@ -967,9 +1024,13 @@ where
 {
     let mut frame = serde_json::to_string(&serde_json::json!({"jsonrpc":"2.0", "method":method}))?;
     frame.push('\n');
-    stdin.write_all(frame.as_bytes()).await?;
-    stdin.flush().await?;
-    Ok(())
+    tokio::time::timeout(MUSE_MSP_REQUEST_TIMEOUT, async {
+        stdin.write_all(frame.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Muse MSP timed out sending {method}"))?
 }
 
 async fn muse_msp_request<R, W>(
@@ -987,9 +1048,9 @@ where
         &serde_json::json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
     )?;
     request.push('\n');
-    stdin.write_all(request.as_bytes()).await?;
-    stdin.flush().await?;
     tokio::time::timeout(MUSE_MSP_REQUEST_TIMEOUT, async {
+        stdin.write_all(request.as_bytes()).await?;
+        stdin.flush().await?;
         loop {
             let line = reader
                 .next_line()
@@ -997,8 +1058,17 @@ where
                 .ok_or_else(|| anyhow::anyhow!("Muse MSP closed before responding to {method}"))?;
             let frame: serde_json::Value = serde_json::from_str(&line)
                 .with_context(|| format!("parse Muse MSP frame while waiting for {method}"))?;
-            if frame.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+            if frame.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+                anyhow::bail!(
+                    "Muse MSP sent a frame without JSON-RPC 2.0 while waiting for {method}"
+                )
+            }
+            let Some(response_id) = frame.get("id") else {
+                // Notifications can be interleaved with responses.
                 continue;
+            };
+            if response_id.as_u64() != Some(id) {
+                anyhow::bail!("Muse MSP returned an unexpected response id for {method}")
             }
             if let Some(error) = frame.get("error") {
                 anyhow::bail!("Muse MSP {method} failed: {error}")
@@ -1013,31 +1083,62 @@ where
     .map_err(|_| anyhow::anyhow!("Muse MSP timed out waiting for {method}"))?
 }
 
-async fn import_muse_exports_with_ledger(
-    directory: &tempfile::TempDir,
+async fn import_muse_sessions_with_ledger(
+    session_ids: &[String],
     opts: ServeOptions,
     config: Option<SessionConfig>,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     let mut processor = ImportProcessor::new(opts, config, ledger_dir);
-    let mut exports = std::fs::read_dir(directory.path())
-        .with_context(|| format!("read Muse exports {}", directory.path().display()))?
-        .flatten()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    exports.sort();
     let mut summaries = Vec::new();
-    for export in exports {
-        let entries = transcript_import::muse::envelopes(&export)?;
-        let session_ids = entries
-            .iter()
-            .map(|entry| entry.session_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        processor.process(entries).await?;
-        for session_id in session_ids {
-            if let Some(summary) = processor.finish_session(&session_id).await? {
-                summaries.push(summary);
+    for session_id in session_ids {
+        let directory = tempfile::Builder::new()
+            .prefix("bt-muse-import-")
+            .tempdir()?;
+        let export = directory.path().join("session.json");
+        export_muse_session(session_id, &export).await?;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<Envelope>>(4);
+        let export_for_parser = export.clone();
+        let expected_id = session_id.clone();
+        let parser = tokio::task::spawn_blocking(move || {
+            let mut batch = Vec::with_capacity(128);
+            transcript_import::muse::for_each_envelope_for_session(
+                &export_for_parser,
+                &expected_id,
+                |entry| {
+                    batch.push(entry);
+                    if batch.len() == 128 {
+                        sender
+                            .blocking_send(std::mem::take(&mut batch))
+                            .map_err(|_| {
+                                anyhow::anyhow!("Muse import stopped while parsing {expected_id}")
+                            })?;
+                    }
+                    Ok(())
+                },
+            )?;
+            if !batch.is_empty() {
+                sender.blocking_send(batch).map_err(|_| {
+                    anyhow::anyhow!("Muse import stopped while parsing {expected_id}")
+                })?;
             }
+            Ok::<(), anyhow::Error>(())
+        });
+        let mut processing_error = None;
+        while let Some(batch) = receiver.recv().await {
+            if let Err(error) = processor.process(batch).await {
+                processing_error = Some(error);
+                break;
+            }
+        }
+        drop(receiver);
+        let parse_result = parser.await.context("Muse export parser task failed")?;
+        if let Some(error) = processing_error {
+            return Err(error);
+        }
+        parse_result?;
+        if let Some(summary) = processor.finish_session(session_id).await? {
+            summaries.push(summary);
         }
     }
     summaries.extend(processor.finish().await?);
@@ -2110,6 +2211,86 @@ mod tests {
         .unwrap();
         assert_eq!(result, json!({"sessions": []}));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn muse_msp_pages_reject_partial_or_cyclic_session_lists() {
+        let mut sessions = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        assert_eq!(
+            muse_msp_append_page(
+                json!({"sessions":[{"sessionId":"session-a"}],"nextCursor":"next"}),
+                1,
+                &mut sessions,
+                &mut cursors,
+            )
+            .unwrap(),
+            Some("next".to_owned())
+        );
+        assert_eq!(sessions, ["session-a"]);
+        assert!(muse_msp_append_page(
+            json!({"sessions":[],"nextCursor":"next"}),
+            2,
+            &mut sessions,
+            &mut cursors,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("repeated cursor"));
+        assert!(muse_msp_append_page(
+            json!({"sessions":[{"status":"notLoaded"}]}),
+            2,
+            &mut sessions,
+            &mut cursors,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("decode Muse session/list page 2"));
+    }
+
+    #[tokio::test]
+    async fn muse_msp_request_accepts_notifications_but_rejects_wrong_response_ids() {
+        async fn exchange(response: &str) -> anyhow::Result<serde_json::Value> {
+            let (client, server) = tokio::io::duplex(4096);
+            let (client_read, mut client_write) = tokio::io::split(client);
+            let (server_read, mut server_write) = tokio::io::split(server);
+            let response = response.to_owned();
+            let server = tokio::spawn(async move {
+                let request = BufReader::new(server_read)
+                    .lines()
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"],
+                    7
+                );
+                server_write.write_all(response.as_bytes()).await.unwrap();
+            });
+            let result = muse_msp_request(
+                &mut client_write,
+                &mut BufReader::new(client_read).lines(),
+                7,
+                "session/list",
+                json!({}),
+            )
+            .await;
+            server.await.unwrap();
+            result
+        }
+
+        let result = exchange(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"progress\"}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"sessions\":[]}}\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, json!({"sessions": []}));
+        assert!(exchange("{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{}}\n")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected response id"));
     }
 
     #[test]
