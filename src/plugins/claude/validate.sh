@@ -75,8 +75,8 @@ for definitions in hooks.values():
     for definition in definitions:
         for hook in definition["hooks"]:
             assert hook["type"] == "command"
-            assert hook["command"] == "bt"
-            assert hook["args"] == ["trace", "hook", "--source", "claude-code"]
+            assert hook["command"] == "bt trace hook --source claude-code"
+            assert "args" not in hook
             assert hook["async"] is False
 PY
 

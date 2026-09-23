@@ -143,7 +143,6 @@ fn pi_update_required() -> bool {
 
 trait CommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value>;
-    #[cfg(unix)]
     fn json_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<Value>;
     fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<()>;
     fn run_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<()>;
@@ -167,7 +166,6 @@ impl CommandRunner for SystemCommandRunner {
             .with_context(|| format!("`{program} {}` returned invalid JSON", args.join(" ")))
     }
 
-    #[cfg(unix)]
     fn json_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<Value> {
         let output = ProcessCommand::new(program)
             .args(args)
@@ -988,7 +986,6 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("missing fake JSON response"))
         }
 
-        #[cfg(unix)]
         fn json_in_home(
             &mut self,
             program: &str,
@@ -1016,16 +1013,13 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     struct MissingAgyRunner;
 
-    #[cfg(unix)]
     impl CommandRunner for MissingAgyRunner {
         fn json(&mut self, _: &str, _: &[&str]) -> anyhow::Result<Value> {
             unreachable!()
         }
 
-        #[cfg(unix)]
         fn json_in_home(&mut self, _: &str, _: &[&str], _: &Path) -> anyhow::Result<Value> {
             unreachable!()
         }

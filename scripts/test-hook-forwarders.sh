@@ -59,6 +59,13 @@ for groups in codex.values():
             assert hook["command"] == "bt trace hook --source codex"
             assert hook["commandWindows"] == "bt.exe trace hook --source codex"
 
+claude = json.loads((dist / "claude/plugins/trace-claude-code/hooks/hooks.json").read_text())["hooks"]
+for groups in claude.values():
+    for group in groups:
+        for hook in group["hooks"]:
+            assert hook["command"] == "bt trace hook --source claude-code"
+            assert "args" not in hook
+
 grok = json.loads((dist / "grok/hooks/hooks.json").read_text())["hooks"]
 for groups in grok.values():
     for group in groups:
