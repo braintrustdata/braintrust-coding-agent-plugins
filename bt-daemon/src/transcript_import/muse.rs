@@ -92,7 +92,7 @@ struct Reader<'a, F> {
     runs: HashMap<String, RunState>,
     first_ts: Option<i64>,
     last_ts: Option<i64>,
-    session_end_ts: Option<i64>,
+    current_session_ended: bool,
     activity_count: usize,
 }
 
@@ -249,9 +249,10 @@ where
         let ts = micros / 1_000;
         self.ensure_start(ts)?;
         if payload.kind.as_deref() == Some("session_end") {
-            self.session_end_ts = Some(ts);
+            self.current_session_ended = true;
             return Ok(());
         }
+        self.current_session_ended = false;
         let event = payload
             .event
             .as_ref()
@@ -398,9 +399,9 @@ where
             );
         }
         let end_ts = self
-            .session_end_ts
-            .or(self.last_ts)
+            .last_ts
             .ok_or_else(|| anyhow!("Muse export {} has no timestamps", self.path.display()))?;
+        let current_session_ended = self.current_session_ended;
         for run_id in self.runs.keys().cloned().collect::<Vec<_>>() {
             self.finish_model(&run_id, end_ts, Some("Run ended without a terminal event"))?;
             let run = self.runs.remove(&run_id).expect("run exists");
@@ -420,8 +421,14 @@ where
         self.emit("SessionEnd", end_ts, json!({
             "session_id": self.session_id,
             "hook_event_name": "SessionEnd",
-            "reason": self.session.session_end.as_ref().and_then(|end| end.exit_reason.as_deref()),
-            "error": self.terminated_abnormally.then_some("Session terminated abnormally"),
+            "reason": current_session_ended.then(|| self.session.session_end.as_ref().and_then(|end| end.exit_reason.as_deref())).flatten(),
+            "error": if !current_session_ended {
+                Some("Session has no terminal end after its latest activity")
+            } else if self.terminated_abnormally {
+                Some("Session terminated abnormally")
+            } else {
+                None
+            },
             "source": "muse_export_v1",
         }))
     }
@@ -482,7 +489,7 @@ where
         runs: HashMap::new(),
         first_ts: None,
         last_ts: None,
-        session_end_ts: None,
+        current_session_ended: false,
         activity_count: 0,
     };
     let mut de = serde_json::Deserializer::from_reader(BufReader::new(
@@ -687,5 +694,28 @@ mod tests {
             .contains("expected session-2"));
         let error = envelopes(&path).unwrap_err();
         assert!(format!("{error:#}").contains("event 1: Muse started record has no run_id"));
+    }
+
+    #[test]
+    fn resumed_active_export_does_not_reuse_an_old_session_end() {
+        let (_temp, path) = write_export(json!({
+            "export_schema_version": 1,
+            "sessions": [{"session_id":"session-1", "session_end":{"exit_reason":"clean"}}],
+            "events": [
+                {"recorded_at": 1_000_000, "envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"first"}}}},
+                {"recorded_at": 1_001_000, "envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}},
+                {"recorded_at": 1_002_000, "envelope":{"payload":{"kind":"session_end"}}},
+                {"recorded_at": 1_003_000, "envelope":{"payload":{"kind":"run","run_id":"run-2","event":{"kind":"started","prompt":"second"}}}}
+            ]
+        }));
+        let events = envelopes(&path).unwrap();
+        let end = events.last().unwrap();
+        assert_eq!(end.event, "SessionEnd");
+        assert_eq!(end.ts_ms, 1003);
+        assert_eq!(end.payload["reason"], Value::Null);
+        assert_eq!(
+            end.payload["error"],
+            "Session has no terminal end after its latest activity"
+        );
     }
 }
