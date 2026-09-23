@@ -259,10 +259,15 @@ Muse Code 1.1.1 setup captures the six verified lifecycle and model hooks:
 `SessionStart`, `UserPromptSubmit`, `PreLLMCall`, `PostLLMCall`, `Stop`, and
 `SessionEnd`. Tool, permission, subagent, and compaction details are not
 available from those hooks and are not inferred by the live translator.
-`--attach` is not available yet because it needs a durable
-MSP subscription and cursor-following implementation. Muse also has no safe
-invocation-local configuration overlay, so `run muse` is deliberately
-unavailable; use persistent `enable muse` setup.
+`--attach` is not available yet. MSP offers cursor-paged `view/page`, but its
+view events omit the model request/response records needed by this translator;
+`view/subscribe` also requires a session loaded on the same host. Repeated
+full exports can see an active session but do not provide an incremental tail.
+`run muse` is also deliberately unavailable: the observed process-local
+managed-hook override replaces an existing managed hook file, and Muse's hook
+environment drops the invocation route and duplicate-suppression variables.
+Use persistent `enable muse` setup until those behaviors can be preserved
+without changing unrelated hooks or tracing destinations.
 
 Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
 Ctrl-C. `run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent with
