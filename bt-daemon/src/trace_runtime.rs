@@ -6,7 +6,7 @@
 //! the coding-agent integrations.
 
 use crate::trace_command::{DoctorAgent, DoctorArgs, TraceCommand};
-use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute};
+use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
     apply_additional_metadata, apply_tags, braintrust_serve_options, paths, run_disable,
     run_enable, run_hook, run_import, run_serve, run_status, run_traced, shutdown_daemon,
@@ -35,6 +35,30 @@ pub struct RouteRequirements {
     pub persistent_auth: bool,
 }
 
+/// The selections the embedding CLI owns. The CLI selects a Braintrust profile,
+/// organization, and default project; trace-specific destinations and settings
+/// are assembled by this crate.
+#[derive(Debug, Clone, Default)]
+pub struct HostRouteSelection {
+    pub auth: AuthSelection,
+    pub project_name: Option<String>,
+}
+
+impl HostRouteSelection {
+    fn into_session_route(self) -> SessionRoute {
+        SessionRoute {
+            auth: self.auth,
+            destination: self
+                .project_name
+                .map(|project_name| TraceDestination::ProjectLogs {
+                    project_id: None,
+                    project_name: Some(project_name),
+                }),
+            ..SessionRoute::default()
+        }
+    }
+}
+
 fn auth_source_label(selection: &AuthSelection) -> &'static str {
     match selection.effective_source() {
         AuthSource::SavedProfile => "saved_profile",
@@ -49,10 +73,14 @@ fn auth_source_label(selection: &AuthSelection) -> &'static str {
 /// not dispatch or interpret coding-agent commands.
 #[async_trait]
 pub trait TraceHostServices: Send + Sync {
-    /// Resolve the non-secret route selected by the host. Commands such as
-    /// setup and managed run require a destination and allow interactive auth
-    /// resolution; hooks may use the current selection without prompting.
-    async fn resolve_route(&self, requirements: RouteRequirements) -> anyhow::Result<SessionRoute>;
+    /// Resolve only the host-owned auth and default project selections.
+    /// Setup and managed run require a project and may prompt for auth;
+    /// hooks use the current selection without prompting. The trace runtime
+    /// owns every other route setting.
+    async fn resolve_route(
+        &self,
+        requirements: RouteRequirements,
+    ) -> anyhow::Result<HostRouteSelection>;
 
     /// Resolve a Braintrust credential lease without exposing credentials to
     /// plugins, settings files, journals, or command arguments.
@@ -209,11 +237,22 @@ fn require_resolved_org(route: &SessionRoute, lease: &AuthLease) -> anyhow::Resu
     Ok(org_name.to_string())
 }
 
+async fn resolve_host_route(
+    host: &TraceHostContext,
+    requirements: RouteRequirements,
+) -> anyhow::Result<SessionRoute> {
+    Ok(host
+        .services
+        .resolve_route(requirements)
+        .await?
+        .into_session_route())
+}
+
 async fn resolve_command_route(
     host: &TraceHostContext,
     requirements: RouteRequirements,
 ) -> anyhow::Result<SessionRoute> {
-    let mut route = host.services.resolve_route(requirements).await?;
+    let mut route = resolve_host_route(host, requirements).await?;
     let lease = host
         .services
         .resolve_auth(&route.auth, AuthResolveReason::Initial)
@@ -261,11 +300,7 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
 
     let (route, route_source) = match settings.route {
         Some(route) => (Some(route), "settings_file".to_string()),
-        None => match host
-            .services
-            .resolve_route(RouteRequirements::default())
-            .await
-        {
+        None => match resolve_host_route(host, RouteRequirements::default()).await {
             Ok(route) => (Some(route), "command_context".to_string()),
             Err(error) => {
                 warnings.push(format!("route could not be resolved: {error}"));
@@ -371,10 +406,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         TraceCommand::Hook(hook_args) => {
             // A persistent hook must never fail the coding agent's turn.
             let result = async {
-                let route = host
-                    .services
-                    .resolve_route(RouteRequirements::default())
-                    .await?;
+                let route = resolve_host_route(&host, RouteRequirements::default()).await?;
                 run_hook(hook_args, route, host_info(&host)).await
             }
             .await;
@@ -404,14 +436,15 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             print_output(TraceCommandOutput::stop(true, true), host.output_format)
         }
         TraceCommand::Import(import_args) => {
-            let mut route = host
-                .services
-                .resolve_route(RouteRequirements {
+            let mut route = resolve_host_route(
+                &host,
+                RouteRequirements {
                     destination_required: !import_args.has_destination_override(),
                     interactive_auth: true,
                     persistent_auth: false,
-                })
-                .await?;
+                },
+            )
+            .await?;
             apply_additional_metadata(&mut route, import_args.additional_metadata.as_deref())?;
             apply_tags(&mut route, &import_args.tags)?;
             let config = session_config(&host, &route).await?;
@@ -490,7 +523,7 @@ mod tests {
 
     #[async_trait]
     impl TraceHostServices for PanicHost {
-        async fn resolve_route(&self, _: RouteRequirements) -> anyhow::Result<SessionRoute> {
+        async fn resolve_route(&self, _: RouteRequirements) -> anyhow::Result<HostRouteSelection> {
             panic!("host service should not be called")
         }
 
@@ -538,17 +571,14 @@ mod tests {
         async fn resolve_route(
             &self,
             requirements: RouteRequirements,
-        ) -> anyhow::Result<SessionRoute> {
+        ) -> anyhow::Result<HostRouteSelection> {
             self.route_requests.lock().unwrap().push(requirements);
             if let Some(error) = self.route_error {
                 anyhow::bail!(error);
             }
-            Ok(SessionRoute {
-                destination: Some(TraceDestination::ProjectLogs {
-                    project_id: None,
-                    project_name: Some("test-project".into()),
-                }),
-                ..SessionRoute::default()
+            Ok(HostRouteSelection {
+                project_name: Some("test-project".into()),
+                ..HostRouteSelection::default()
             })
         }
 
@@ -597,6 +627,33 @@ mod tests {
         interactive_auth: true,
         persistent_auth: false,
     };
+
+    #[test]
+    fn host_selection_only_sets_auth_and_default_project() {
+        let route = HostRouteSelection {
+            auth: AuthSelection {
+                source: AuthSource::SavedProfile,
+                profile_id: Some("00000000-0000-4000-8000-000000000001".into()),
+                profile: Some("test-profile".into()),
+                org_name: Some("test-org".into()),
+            },
+            project_name: Some("test-project".into()),
+        }
+        .into_session_route();
+
+        assert_eq!(route.auth.profile.as_deref(), Some("test-profile"));
+        assert_eq!(
+            route
+                .destination
+                .as_ref()
+                .and_then(TraceDestination::project_name),
+            Some("test-project")
+        );
+        assert_eq!(route.flush_mode, crate::wire::FlushMode::FireAndForget);
+        assert!(route.additional_metadata.is_none());
+        assert!(route.tags.is_empty());
+        assert!(route.span_plugins.is_empty());
+    }
 
     #[tokio::test]
     async fn setup_and_run_require_a_host_resolved_destination() {
