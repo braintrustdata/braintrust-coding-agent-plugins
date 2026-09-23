@@ -27,6 +27,14 @@ const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
 const MUSE_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
+    "PreLLMCall",
+    "PostLLMCall",
+    "Stop",
+    "SessionEnd",
+];
+const LEGACY_MUSE_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
     "PreToolUse",
     "PermissionRequest",
     "PostToolUse",
@@ -706,8 +714,14 @@ fn muse_hook_path(config_dir: &Path) -> PathBuf {
 
 fn muse_hook_config() -> Map<String, Value> {
     // Muse treats command-hook failures as non-fatal to the agent turn.
-    let command = "bt trace hook --source muse --flush-on-turn-end";
-    let hooks = MUSE_HOOK_EVENTS
+    muse_hook_config_for(
+        MUSE_HOOK_EVENTS,
+        "bt trace hook --source muse --flush-on-turn-end",
+    )
+}
+
+fn muse_hook_config_for(events: &[&str], command: &str) -> Map<String, Value> {
+    let hooks = events
         .iter()
         .map(|event| {
             (
@@ -726,21 +740,10 @@ fn muse_hook_config() -> Map<String, Value> {
 }
 
 fn legacy_muse_hook_config() -> Map<String, Value> {
-    let mut config = muse_hook_config();
-    if let Some(hooks) = config.get_mut("hooks").and_then(Value::as_object_mut) {
-        for entries in hooks.values_mut() {
-            if let Some(command) = entries
-                .get_mut(0)
-                .and_then(|entry| entry.get_mut("hooks"))
-                .and_then(|hooks| hooks.get_mut(0))
-                .and_then(|hook| hook.get_mut("command"))
-            {
-                *command =
-                    Value::String("bt trace hook --source muse --flush-on-turn-end || true".into());
-            }
-        }
-    }
-    config
+    muse_hook_config_for(
+        LEGACY_MUSE_HOOK_EVENTS,
+        "bt trace hook --source muse --flush-on-turn-end || true",
+    )
 }
 
 fn muse_version(output: &[u8]) -> anyhow::Result<semver::Version> {
@@ -1899,6 +1902,8 @@ mod tests {
             serde_json::from_slice(&std::fs::read(muse_hook_path(&config_dir)).unwrap()).unwrap();
         assert_eq!(hooks["schema_version"], 1);
         assert!(hooks["hooks"]["PreLLMCall"].is_array());
+        assert_eq!(hooks["hooks"].as_object().unwrap().len(), 6);
+        assert!(hooks["hooks"].get("PreToolUse").is_none());
         assert_eq!(
             hooks["hooks"]["PreLLMCall"][0]["hooks"][0]["command"],
             "bt trace hook --source muse --flush-on-turn-end"
