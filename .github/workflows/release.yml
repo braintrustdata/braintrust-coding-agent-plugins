@@ -72,7 +72,7 @@ jobs:
             case "$PLUGIN" in
               claude) printf '%s\n' 'src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json' ;;
               codex) printf '%s\n' 'src/plugins/codex/content/plugins/*/.codex-plugin/plugin.json' ;;
-              grok) printf '%s\n' 'src/plugins/grok/content/.grok-plugin/plugin.json' 'src/plugins/grok/content/hooks/forward.sh' ;;
+              grok) printf '%s\n' 'src/plugins/grok/content/.grok-plugin/plugin.json' 'src/plugins/grok/content/hooks/hooks.json' ;;
             esac
             printf 'EOF\n'
           } >> "$GITHUB_OUTPUT"
