@@ -493,6 +493,17 @@ impl PiTranslator {
             return Vec::new();
         }
         self.opened = true;
+        if let Some(legacy) = legacy_continuation(&envelope.payload) {
+            self.root_span_id = legacy.root_span_id;
+            self.effective_root_span_id = legacy.trace_root_span_id;
+            self.external_parent = legacy.parent_span_id;
+            self.turn_seq = legacy.total_turns;
+            self.total_tools = legacy.total_tool_calls;
+            // The legacy extension already created this root. Re-emitting an
+            // insert could replace its metadata and attachment, so only emit
+            // descendants and terminal aggregate merges from this point on.
+            return Vec::new();
+        }
         let attached = ctx
             .config
             .as_ref()
@@ -864,6 +875,41 @@ impl PiTranslator {
             ..Default::default()
         })
     }
+}
+
+struct LegacyContinuation {
+    root_span_id: String,
+    trace_root_span_id: String,
+    parent_span_id: Option<String>,
+    total_turns: u32,
+    total_tool_calls: u32,
+}
+
+fn legacy_continuation(payload: &Value) -> Option<LegacyContinuation> {
+    let value = payload.get("legacy_continuation")?;
+    let root_span_id = value.get("root_span_id")?.as_str()?.to_owned();
+    if root_span_id.is_empty() {
+        return None;
+    }
+    let trace_root_span_id = value
+        .get("trace_root_span_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(&root_span_id)
+        .to_owned();
+    let total_turns = u32::try_from(value.get("total_turns")?.as_u64()?).ok()?;
+    let total_tool_calls = u32::try_from(value.get("total_tool_calls")?.as_u64()?).ok()?;
+    Some(LegacyContinuation {
+        root_span_id,
+        trace_root_span_id,
+        parent_span_id: value
+            .get("parent_span_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        total_turns,
+        total_tool_calls,
+    })
 }
 
 fn compaction_message(event: &SessionCompact) -> Option<Value> {

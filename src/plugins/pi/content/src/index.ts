@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
+import { legacyContinuationFor, type LegacyContinuation } from "./legacy-session.ts";
 import { loadPiPackageMetadata } from "./pi-package.ts";
 import { claimManagedTracingInstance, DaemonClient } from "./runtime/daemon-client.ts";
 import { EXTENSION_VERSION } from "./version.ts";
@@ -50,6 +51,7 @@ function sessionDescriptor(ctx: ExtensionContext): {
   sessionId: string;
   sessionFile?: string;
   nativeSessionId?: string;
+  legacyContinuation?: LegacyContinuation;
 } {
   const sessionFile = ctx.sessionManager.getSessionFile();
   const nativeSessionId = ctx.sessionManager.getSessionId();
@@ -57,6 +59,7 @@ function sessionDescriptor(ctx: ExtensionContext): {
     sessionId: sessionKeyFor(sessionFile, nativeSessionId, ctx.cwd),
     sessionFile,
     nativeSessionId,
+    legacyContinuation: legacyContinuationFor(sessionFile),
   };
 }
 
@@ -66,6 +69,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   if (!claimManagedTracingInstance("pi")) return;
 
   let sessionId: string | undefined;
+  let legacyContinuation: LegacyContinuation | undefined;
   let lastContext: ExtensionContext | undefined;
   let awaitingFirstToken = false;
   let uiGeneration = 0;
@@ -91,6 +95,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     const descriptor = sessionDescriptor(ctx);
     if (sessionId !== descriptor.sessionId) uiGeneration += 1;
     sessionId = descriptor.sessionId;
+    legacyContinuation = descriptor.legacyContinuation;
     return descriptor;
   };
 
@@ -136,6 +141,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
         extension_version: EXTENSION_VERSION,
         session_file: descriptor?.sessionFile,
         native_session_id: descriptor?.nativeSessionId,
+        legacy_continuation: descriptor?.legacyContinuation ?? legacyContinuation,
         cwd: ctx?.cwd,
         model: nativePayload(ctx?.model),
       },
@@ -184,6 +190,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     // request that finishes during shutdown cannot restore stale state.
     uiGeneration += 1;
     sessionId = undefined;
+    legacyContinuation = undefined;
     lastContext = undefined;
     if (ctx.hasUI) {
       ctx.ui.setStatus(STATUS_KEY, undefined);

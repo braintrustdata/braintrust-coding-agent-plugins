@@ -295,6 +295,76 @@ fn pi_additional_metadata_reaches_roots_without_overriding_session_fields() {
 }
 
 #[test]
+fn pi_adopts_a_legacy_root_and_continues_its_turn_sequence() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "daemon-session");
+    let ctx = SessionCtx {
+        session_id: "daemon-session".into(),
+        config: None,
+    };
+    let mut start = event("session_start", 1, json!({"reason":"resume"}));
+    start.payload["legacy_continuation"] = json!({
+        "root_span_id":"legacy-root",
+        "trace_root_span_id":"legacy-trace-root",
+        "parent_span_id":"upstream-parent",
+        "total_turns":3,
+        "total_tool_calls":7,
+    });
+
+    let mut ops = translator.handle(&start, &ctx).unwrap();
+    assert!(
+        ops.is_empty(),
+        "the existing legacy root must not be reinserted"
+    );
+    ops.extend(
+        translator
+            .handle(
+                &event("before_agent_start", 2, json!({"prompt":"continue"})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    ops.extend(
+        translator
+            .handle(&event("agent_end", 3, json!({"messages":[]})), &ctx)
+            .unwrap(),
+    );
+    ops.extend(
+        translator
+            .handle(
+                &event("session_shutdown", 4, json!({"reason":"quit"})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+
+    let turn = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "Turn 4" => Some(row),
+            _ => None,
+        })
+        .expect("first daemon turn continues the legacy sequence");
+    assert_eq!(turn.root_span_id, "legacy-trace-root");
+    assert_eq!(turn.parent_span_ids, ["legacy-root"]);
+    assert!(ops
+        .iter()
+        .all(|op| !matches!(op, SpanOp::Insert(row) if row.name == "Pi")));
+
+    let root = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Merge(row) if row.span_id == "legacy-root" => Some(row),
+            _ => None,
+        })
+        .expect("shutdown updates the adopted root");
+    assert_eq!(root.root_span_id, "legacy-trace-root");
+    assert_eq!(root.parent_span_ids, ["upstream-parent"]);
+    assert_eq!(root.metadata.as_ref().unwrap()["total_turns"], 4);
+    assert_eq!(root.metadata.as_ref().unwrap()["total_tool_calls"], 7);
+}
+
+#[test]
 fn pi_checkpoint_preserves_the_open_session_and_turn() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("pi", "pi-session");
