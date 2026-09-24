@@ -268,6 +268,8 @@ export each poll, so polling cost grows with long sessions. MSP offers
 cursor-paged `view/page`, but its view events omit the model request/response
 records needed by this translator; `view/subscribe` also requires a session
 loaded on the same host.
+One-shot imports of active Muse sessions also leave spans open, allowing a
+later import to add the native completion to the same deterministic trace.
 `run muse` uses a process-local managed-hook override in the verified Muse Code
 1.1.1 release. It retains compatible unrelated managed hooks, replaces Braintrust's saved
 managed hooks only for that invocation, and leaves ordinary Muse sessions and

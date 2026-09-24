@@ -32,7 +32,8 @@ async fn importing_muse_export_uses_the_production_translator() {
             {"recorded_at": 1_001_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"model_input_trace_recorded", "request_record_id":"request-1", "bounded":{"request_digest":"sha256:test"}}}}},
             {"recorded_at": 1_002_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"model_completed", "usage":{"input_tokens":3, "output_tokens":2}}}}},
             {"recorded_at": 1_003_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"assistant_message_committed", "text":"traced"}}}},
-            {"recorded_at": 1_004_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"terminal","terminal":"completed"}}}}
+            {"recorded_at": 1_004_000, "envelope": {"payload": {"kind":"run", "run_id":"run-1", "event":{"kind":"terminal","terminal":"completed"}}}},
+            {"recorded_at": 1_005_000, "envelope": {"payload": {"kind":"session_end"}}}
         ]
     })).unwrap()).unwrap();
     let output = tmp.path().join("spans");
