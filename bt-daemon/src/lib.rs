@@ -832,9 +832,13 @@ pub async fn run_import(
     apply_import_destination(&mut config, destination)?;
     if args.source == ImportSource::Muse {
         if args.attach {
-            anyhow::bail!(
-                "Muse import does not support --attach yet; use a completed export-v1 session"
+            return attach_muse_session(
+                &args.session_ids[0],
+                opts,
+                config,
+                Some(paths::data_dir(None)),
             )
+            .await;
         }
         let session_ids = if args.all {
             muse_msp_session_ids().await?
@@ -1155,15 +1159,36 @@ async fn process_muse_export(
     export: &std::path::Path,
     session_id: &str,
 ) -> anyhow::Result<()> {
+    process_muse_snapshot(processor, export, session_id, false, 0)
+        .await
+        .map(|_| ())
+}
+
+/// The file is fully parsed on every poll. Only envelopes beyond the previous
+/// snapshot are sent to the long-lived translator and sink, so open model and
+/// turn state is retained without replaying old starts into it.
+async fn process_muse_snapshot(
+    processor: &mut ImportProcessor,
+    export: &std::path::Path,
+    session_id: &str,
+    attach_snapshot: bool,
+    skip_envelopes: usize,
+) -> anyhow::Result<(usize, bool)> {
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<Envelope>>(4);
     let export_for_parser = export.to_path_buf();
     let expected_id = session_id.to_owned();
     let parser = tokio::task::spawn_blocking(move || {
         let mut batch = Vec::with_capacity(128);
-        transcript_import::muse::for_each_envelope_for_session(
+        let mut envelope_count = 0usize;
+        let ended = transcript_import::muse::for_each_snapshot_envelope_for_session(
             &export_for_parser,
             &expected_id,
+            attach_snapshot,
             |entry| {
+                envelope_count += 1;
+                if envelope_count <= skip_envelopes {
+                    return Ok(());
+                }
                 batch.push(entry);
                 if batch.len() == 128 {
                     sender
@@ -1175,12 +1200,17 @@ async fn process_muse_export(
                 Ok(())
             },
         )?;
+        if envelope_count < skip_envelopes {
+            anyhow::bail!(
+                "Muse export for {expected_id} shrank from {skip_envelopes} to {envelope_count} trace events"
+            );
+        }
         if !batch.is_empty() {
             sender
                 .blocking_send(batch)
                 .map_err(|_| anyhow::anyhow!("Muse import stopped while parsing {expected_id}"))?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<(usize, bool), anyhow::Error>((envelope_count, ended))
     });
     let mut processing_error = None;
     while let Some(batch) = receiver.recv().await {
@@ -1195,6 +1225,62 @@ async fn process_muse_export(
         return Err(error);
     }
     parse_result
+}
+
+async fn attach_muse_session(
+    session_id: &str,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    ledger_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
+    transcript_import::validate_session_id(session_id)?;
+    let directory = tempfile::Builder::new()
+        .prefix("bt-muse-attach-")
+        .tempdir()?;
+    let export = directory.path().join("session.json");
+    attach_muse_export(&export, session_id, true, opts, config, ledger_dir).await
+}
+
+async fn attach_muse_export(
+    export: &std::path::Path,
+    session_id: &str,
+    reexport: bool,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    ledger_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+    let mut emitted = 0usize;
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        if reexport {
+            export_muse_session(session_id, export).await?;
+        }
+        let (count, ended) =
+            process_muse_snapshot(&mut processor, export, session_id, true, emitted).await?;
+        if count != emitted {
+            processor.flush_open().await?;
+        }
+        emitted = count;
+        if ended {
+            return processor.finish().await;
+        }
+        tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+    // Capture one final complete snapshot before interrupting any still-open
+    // spans, matching the finalization behavior of other attach sources.
+    if reexport {
+        export_muse_session(session_id, export).await?;
+    }
+    process_muse_snapshot(&mut processor, export, session_id, true, emitted).await?;
+    processor.finish().await
 }
 
 fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
@@ -1746,10 +1832,10 @@ async fn import_transcript_with_ledger(
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     if source == ImportSource::Muse {
-        if attach {
-            anyhow::bail!("Muse import does not support --attach yet")
-        }
         let session_id = transcript_import::muse::session_id(file)?;
+        if attach {
+            return attach_muse_export(file, &session_id, false, opts, config, ledger_dir).await;
+        }
         let mut processor = ImportProcessor::new(opts, config, ledger_dir);
         process_muse_export(&mut processor, file, &session_id).await?;
         let mut summaries = Vec::new();
@@ -2035,6 +2121,14 @@ impl ImportProcessor {
         Ok(summaries)
     }
 
+    async fn flush_open(&mut self) -> anyhow::Result<()> {
+        for live in self.sessions.values_mut() {
+            live.sink.flush().await?;
+            live.pending_ops = 0;
+        }
+        Ok(())
+    }
+
     async fn finish_session(&mut self, session_id: &str) -> anyhow::Result<Option<ImportSummary>> {
         let Some(mut live) = self.sessions.remove(session_id) else {
             return Ok(None);
@@ -2177,6 +2271,94 @@ mod tests {
     struct HookCli {
         #[command(flatten)]
         args: HookArgs,
+    }
+
+    #[tokio::test]
+    async fn muse_attach_snapshots_reuse_one_trace_and_keep_open_spans() {
+        let temp = tempfile::tempdir().unwrap();
+        let export = temp.path().join("export.json");
+        let output = temp.path().join("spans");
+        let mut processor = ImportProcessor::new(
+            ServeOptions {
+                version: "test".into(),
+                translators: Arc::new(Registry::default_agents()),
+                sink_factory: Arc::new(DebugSinkFactory {
+                    dir: output.clone(),
+                }),
+                auth_provider: None,
+            },
+            None,
+            None,
+        );
+        let mut events = vec![
+            json!({"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}}),
+            json!({"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_input_trace_recorded","request_record_id":"request-1"}}}}),
+        ];
+        let write = |events: &[serde_json::Value]| {
+            std::fs::write(
+                &export,
+                serde_json::to_vec(&json!({
+                    "export_schema_version":1,
+                    "sessions":[{"session_id":"muse-attach"}],
+                    "events":events,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write(&events);
+        let (count, ended) = process_muse_snapshot(&mut processor, &export, "muse-attach", true, 0)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        assert!(!ended);
+        processor.flush_open().await.unwrap();
+        let (same_count, ended) =
+            process_muse_snapshot(&mut processor, &export, "muse-attach", true, count)
+                .await
+                .unwrap();
+        assert_eq!(same_count, count);
+        assert!(!ended);
+        events.extend([
+            json!({"recorded_at":1_002_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_completed","usage":{"input_tokens":2}}}}}),
+            json!({"recorded_at":1_003_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"assistant_message_committed","text":"done"}}}}),
+            json!({"recorded_at":1_004_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}}),
+            json!({"recorded_at":1_005_000,"envelope":{"payload":{"kind":"session_end"}}}),
+        ]);
+        write(&events);
+        let (_, ended) = process_muse_snapshot(&mut processor, &export, "muse-attach", true, count)
+            .await
+            .unwrap();
+        assert!(ended);
+        processor.finish().await.unwrap();
+        let rows = std::fs::read_to_string(output.join("muse-attach.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for identity in ["root", "turn:run-1", "llm:request-1"] {
+            let id = ids::span_id(&ids::session_namespace("muse", "muse-attach"), identity);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row
+                        .pointer("/Insert/span_id")
+                        .and_then(|value| value.as_str())
+                        == Some(id.as_str()))
+                    .count(),
+                1,
+                "duplicate insert for {identity}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row
+                        .pointer("/Merge/span_id")
+                        .and_then(|value| value.as_str())
+                        == Some(id.as_str()))
+                    .count(),
+                1,
+                "missing or duplicate completion for {identity}"
+            );
+        }
     }
 
     #[test]
@@ -2808,6 +2990,44 @@ mod tests {
             imported_terminal_span_ids(&second_output.join("spans/ledger-import.ndjson")),
             first_terminals
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_muse_import_does_not_emit_a_second_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let export = temp.path().join("muse-export.json");
+        std::fs::write(
+            &export,
+            serde_json::to_vec(&json!({
+                "export_schema_version":1,
+                "sessions":[{"session_id":"muse-ledger"}],
+                "events":[
+                    {"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}},
+                    {"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}},
+                    {"recorded_at":1_002_000,"envelope":{"payload":{"kind":"session_end"}}}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let import = || {
+            import_transcript_with_ledger(
+                &export,
+                ImportSource::Muse,
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                false,
+                Some(ledger.clone()),
+            )
+        };
+        import().await.unwrap();
+        let rows = output.join("spans/muse-ledger.ndjson");
+        let first = std::fs::read_to_string(&rows).unwrap();
+        assert!(first.contains("Muse Code"));
+        import().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&rows).unwrap(), first);
     }
 
     fn test_run_hook_command() -> RunHookCommand {

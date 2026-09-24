@@ -391,8 +391,11 @@ where
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn finish(mut self, attach_snapshot: bool) -> Result<bool> {
         if self.activity_count == 0 {
+            if attach_snapshot {
+                return Ok(self.current_session_ended);
+            }
             bail!(
                 "Muse export {} has no traceable run events",
                 self.path.display()
@@ -402,6 +405,9 @@ where
             .last_ts
             .ok_or_else(|| anyhow!("Muse export {} has no timestamps", self.path.display()))?;
         let current_session_ended = self.current_session_ended;
+        if attach_snapshot && !current_session_ended {
+            return Ok(false);
+        }
         for run_id in self.runs.keys().cloned().collect::<Vec<_>>() {
             self.finish_model(&run_id, end_ts, Some("Run ended without a terminal event"))?;
             let run = self.runs.remove(&run_id).expect("run exists");
@@ -430,7 +436,8 @@ where
                 None
             },
             "source": "muse_export_v1",
-        }))
+        }))?;
+        Ok(current_session_ended)
     }
 }
 
@@ -459,6 +466,20 @@ pub(crate) fn for_each_envelope_for_session<F>(
     expected_id: &str,
     emit: F,
 ) -> Result<()>
+where
+    F: FnMut(Envelope) -> Result<()>,
+{
+    for_each_snapshot_envelope_for_session(path, expected_id, false, emit).map(|_| ())
+}
+
+/// Parse a complete export without manufacturing terminal events for an
+/// active attach snapshot. Returns whether Muse actually ended the session.
+pub(crate) fn for_each_snapshot_envelope_for_session<F>(
+    path: &Path,
+    expected_id: &str,
+    attach_snapshot: bool,
+    emit: F,
+) -> Result<bool>
 where
     F: FnMut(Envelope) -> Result<()>,
 {
@@ -500,7 +521,7 @@ where
         .with_context(|| format!("parse Muse export {}", path.display()))?;
     de.end()
         .with_context(|| format!("parse Muse export {}", path.display()))?;
-    reader.finish()
+    reader.finish(attach_snapshot)
 }
 
 fn read_header(path: &Path) -> Result<Header> {
@@ -717,5 +738,42 @@ mod tests {
             end.payload["error"],
             "Session has no terminal end after its latest activity"
         );
+    }
+
+    #[test]
+    fn active_snapshot_does_not_invent_terminal_events() {
+        let (_temp, path) = write_export(json!({
+            "export_schema_version": 1,
+            "sessions": [{"session_id":"session-1"}],
+            "events": [
+                {"recorded_at": 1_000_000, "envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}},
+                {"recorded_at": 1_001_000, "envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_input_trace_recorded","request_record_id":"request-1"}}}}
+            ]
+        }));
+        let mut events = Vec::new();
+        let ended = for_each_snapshot_envelope_for_session(&path, "session-1", true, |event| {
+            events.push(event.event);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!ended);
+        assert_eq!(events, ["SessionStart", "UserPromptSubmit", "PreLLMCall"]);
+    }
+
+    #[test]
+    fn empty_active_snapshot_waits_for_first_run() {
+        let (_temp, path) = write_export(json!({
+            "export_schema_version": 1,
+            "sessions": [{"session_id":"session-1"}],
+            "events": []
+        }));
+        let mut events = Vec::new();
+        let ended = for_each_snapshot_envelope_for_session(&path, "session-1", true, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!ended);
+        assert!(events.is_empty());
     }
 }
