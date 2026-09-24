@@ -52,6 +52,80 @@ async fn importing_muse_export_uses_the_production_translator() {
 }
 
 #[tokio::test]
+async fn attaching_muse_export_waits_for_native_end_without_reinserting_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let export = tmp.path().join("muse-export.json");
+    let output = tmp.path().join("spans");
+    let started = json!({"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}});
+    let write_export = |events: Vec<Value>| {
+        std::fs::write(
+            &export,
+            serde_json::to_vec(&json!({
+                "export_schema_version":1,
+                "sessions":[{"session_id":"muse-follow"}],
+                "events":events,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    write_export(vec![started.clone()]);
+    let export_for_attach = export.clone();
+    let output_for_attach = output.clone();
+    let attach = tokio::spawn(async move {
+        import_transcript(
+            &export_for_attach,
+            ImportSource::Muse,
+            options(&output_for_attach),
+            None,
+            true,
+        )
+        .await
+    });
+    let rows_path = output.join("muse-follow.ndjson");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if std::fs::read_to_string(&rows_path)
+                .is_ok_and(|contents| contents.contains("Muse Code"))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!attach.is_finished());
+    write_export(vec![
+        started,
+        json!({"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}}),
+        json!({"recorded_at":1_002_000,"envelope":{"payload":{"kind":"session_end"}}}),
+    ]);
+    let summaries = tokio::time::timeout(std::time::Duration::from_secs(4), attach)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].finalized);
+    let output_rows = rows(&rows_path);
+    assert_eq!(
+        output_rows
+            .iter()
+            .filter(|row| row.pointer("/Insert/name").and_then(Value::as_str) == Some("Muse Code"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        output_rows
+            .iter()
+            .filter(|row| row.pointer("/Merge/end_ms").and_then(Value::as_i64) == Some(1002))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn importing_sparse_failed_muse_export_preserves_model_and_error() {
     let tmp = tempfile::tempdir().unwrap();
     let export = tmp.path().join("muse-sparse-export.json");

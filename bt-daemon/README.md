@@ -259,10 +259,15 @@ Muse Code 1.1.1 setup captures the six verified lifecycle and model hooks:
 `SessionStart`, `UserPromptSubmit`, `PreLLMCall`, `PostLLMCall`, `Stop`, and
 `SessionEnd`. Tool, permission, subagent, and compaction details are not
 available from those hooks and are not inferred by the live translator.
-`--attach` is not available yet. MSP offers cursor-paged `view/page`, but its
-view events omit the model request/response records needed by this translator;
-`view/subscribe` also requires a session loaded on the same host. Repeated
-full exports can see an active session but do not provide an incremental tail.
+`import muse <session-id> --attach` follows an active session by polling full
+exports. Each snapshot is parsed with the same reader and translator as
+historical import; only new envelopes are delivered, and an active snapshot
+does not invent `Stop` or `SessionEnd` events. The attach exits after a native
+session end, or finalizes open spans on interruption. This reads the full
+export each poll, so polling cost grows with long sessions. MSP offers
+cursor-paged `view/page`, but its view events omit the model request/response
+records needed by this translator; `view/subscribe` also requires a session
+loaded on the same host.
 `run muse` uses a process-local managed-hook override in the verified Muse Code
 1.1.1 release. It retains compatible unrelated managed hooks, replaces Braintrust's saved
 managed hooks only for that invocation, and leaves ordinary Muse sessions and
