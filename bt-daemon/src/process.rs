@@ -17,7 +17,7 @@ const MAX_PROCESS_CHAIN_DEPTH: usize = 64;
 /// than failing event capture.
 pub(crate) fn capture_process_context(pid: u32) -> CaptureContext {
     let mut system = System::new();
-    let process_chain = build_process_chain(pid, |pid| {
+    let (process_chain, truncated) = build_process_chain(pid, |pid| {
         let sysinfo_pid = Pid::from_u32(pid);
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[sysinfo_pid]),
@@ -33,7 +33,10 @@ pub(crate) fn capture_process_context(pid: u32) -> CaptureContext {
             parent_pid: process.parent().map(Pid::as_u32),
         })
     });
-    CaptureContext { process_chain }
+    CaptureContext {
+        process_chain,
+        truncated,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -45,9 +48,9 @@ struct ProcessSnapshot {
 fn build_process_chain(
     start_pid: u32,
     mut inspect: impl FnMut(u32) -> Option<ProcessSnapshot>,
-) -> Vec<ProcessIdentity> {
+) -> (Vec<ProcessIdentity>, bool) {
     if start_pid == 0 {
-        return Vec::new();
+        return (Vec::new(), true);
     }
 
     let mut chain = Vec::new();
@@ -56,16 +59,16 @@ fn build_process_chain(
 
     while chain.len() < MAX_PROCESS_CHAIN_DEPTH && seen.insert(current) {
         let Some(snapshot) = inspect(current) else {
-            break;
+            return (chain, true);
         };
         chain.push(snapshot.identity);
         let Some(parent) = snapshot.parent_pid.filter(|parent| *parent != 0) else {
-            break;
+            return (chain, false);
         };
         current = parent;
     }
 
-    chain
+    (chain, true)
 }
 
 #[cfg(test)]
@@ -93,7 +96,8 @@ mod tests {
             (10, snapshot(10, None)),
         ]);
 
-        let chain = build_process_chain(30, |pid| processes.get(&pid).cloned());
+        let (chain, truncated) = build_process_chain(30, |pid| processes.get(&pid).cloned());
+        assert!(!truncated);
 
         assert_eq!(
             chain
@@ -108,7 +112,8 @@ mod tests {
     fn returns_available_prefix_when_an_ancestor_disappears() {
         let processes = HashMap::from([(30, snapshot(30, Some(20)))]);
 
-        let chain = build_process_chain(30, |pid| processes.get(&pid).cloned());
+        let (chain, truncated) = build_process_chain(30, |pid| processes.get(&pid).cloned());
+        assert!(truncated);
 
         assert_eq!(
             chain
@@ -122,7 +127,8 @@ mod tests {
     #[test]
     fn stops_at_cycles_and_depth_limit() {
         let cycle = HashMap::from([(30, snapshot(30, Some(20))), (20, snapshot(20, Some(30)))]);
-        let chain = build_process_chain(30, |pid| cycle.get(&pid).cloned());
+        let (chain, truncated) = build_process_chain(30, |pid| cycle.get(&pid).cloned());
+        assert!(truncated);
         assert_eq!(
             chain
                 .iter()
@@ -131,7 +137,8 @@ mod tests {
             vec![30, 20]
         );
 
-        let chain = build_process_chain(1, |pid| snapshot(pid, Some(pid + 1)).into());
+        let (chain, truncated) = build_process_chain(1, |pid| snapshot(pid, Some(pid + 1)).into());
+        assert!(truncated);
         assert_eq!(chain.len(), MAX_PROCESS_CHAIN_DEPTH);
     }
 

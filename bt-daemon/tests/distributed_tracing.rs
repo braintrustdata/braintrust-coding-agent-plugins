@@ -2164,7 +2164,7 @@ async fn sibling_agents_under_one_shell_remain_separate_with_active_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn truncated_first_parent_hook_capture_recovers_on_later_events() {
+async fn truncated_first_parent_and_child_captures_recover_on_later_events() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {
         serve_argv: vec![OsString::from("unused")],
@@ -2188,6 +2188,7 @@ async fn truncated_first_parent_hook_capture_recovers_on_later_events() {
         .unwrap()
         .process_chain
         .truncate(1);
+    parent_events[0].capture.as_mut().unwrap().truncated = true;
     forward_all(&mut parent_events, &socket, &host).await;
     forward(
         fixtures.open_tool(
@@ -2210,6 +2211,13 @@ async fn truncated_first_parent_hook_capture_recovers_on_later_events() {
         "delegate",
         1_701_700_000_020,
     );
+    child_events[0]
+        .capture
+        .as_mut()
+        .unwrap()
+        .process_chain
+        .truncate(1);
+    child_events[0].capture.as_mut().unwrap().truncated = true;
     forward_all(&mut child_events, &socket, &host).await;
     forward(
         fixtures.close_session(

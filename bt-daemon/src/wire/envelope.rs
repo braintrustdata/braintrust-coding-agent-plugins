@@ -27,6 +27,9 @@ pub struct ProcessIdentity {
 pub struct CaptureContext {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_chain: Vec<ProcessIdentity>,
+    /// The process walk stopped before reaching the operating-system root.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// One captured hook event, forwarded from a shim to the daemon.
@@ -366,6 +369,7 @@ mod tests {
                     pid: 42,
                     start_time_secs: 1_753_639_500,
                 }],
+                truncated: false,
             }),
             payload: serde_json::json!({ "session_id": "sess-1", "tool_name": "shell" }),
             route: Some(SessionRoute {

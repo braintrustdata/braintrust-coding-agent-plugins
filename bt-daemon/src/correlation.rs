@@ -75,46 +75,58 @@ impl CorrelationRegistry {
         let mut state = self.state.lock().unwrap();
         state.live_sessions.insert(key.to_string());
         let Some(capture) = capture else { return };
-        if state.session_processes.contains_key(key) {
-            return;
-        }
         let processes: Vec<_> = capture
             .process_chain
             .iter()
             .skip(usize::from(uses_command_hook(source)))
             .cloned()
             .collect();
+        let known = state.session_processes.get(key).cloned();
         let agent = if !uses_command_hook(source) {
             processes
                 .first()
                 .filter(|process| process.start_time_secs != 0)
                 .cloned()
-        } else if let Some(previous) = state.unconfirmed_processes.get(key) {
+        } else if let Some(previous) = state
+            .unconfirmed_processes
+            .insert(key.to_string(), processes.clone())
+        {
             // A command hook gets a fresh CLI process for each event. The first
             // process shared by successive hooks is the closest stable process
             // owned by this session, even when the launcher adds extra shells.
-            processes
-                .iter()
-                .find(|process| previous.contains(process))
-                .filter(|process| process.start_time_secs != 0)
-                .cloned()
+            let crossed_known_boundary = known.as_ref().is_some_and(|known| {
+                let previous_known = previous.iter().any(|process| known.contains(process));
+                let current_known = processes.iter().any(|process| known.contains(process));
+                previous_known != current_known
+            });
+            (!crossed_known_boundary)
+                .then(|| {
+                    processes
+                        .iter()
+                        .find(|process| previous.contains(process))
+                        .filter(|process| process.start_time_secs != 0)
+                        .cloned()
+                })
+                .flatten()
         } else {
-            state
-                .unconfirmed_processes
-                .insert(key.to_string(), processes);
             return;
         };
-        let Some(agent) = agent else {
-            if uses_command_hook(source) {
-                // Process inspection may stop before the agent. Compare the
-                // next hook against this newer capture instead.
-                state
-                    .unconfirmed_processes
-                    .insert(key.to_string(), processes);
+        let Some(agent) = agent else { return };
+        if known.as_ref().is_some_and(|known| known.contains(&agent)) {
+            return;
+        }
+        // A native session may resume in a different agent process. Keep the
+        // nearest current process while leaving its parentage decision intact.
+        if let Some(previous) = state.session_processes.remove(key) {
+            for process in previous {
+                if let Some(sessions) = state.process_sessions.get_mut(&process) {
+                    sessions.remove(key);
+                    if sessions.is_empty() {
+                        state.process_sessions.remove(&process);
+                    }
+                }
             }
-            return;
-        };
-        state.unconfirmed_processes.remove(key);
+        }
         state
             .session_processes
             .entry(key.to_string())
@@ -601,6 +613,7 @@ mod tests {
                 process(12),
                 parent_agent.clone(),
             ],
+            truncated: false,
         };
         let latest = CaptureContext {
             process_chain: vec![
@@ -611,6 +624,7 @@ mod tests {
                 process(12),
                 parent_agent.clone(),
             ],
+            truncated: false,
         };
         for source in ["antigravity", "claude-code", "codex", "grok"] {
             assert!(uses_command_hook(source), "{source} uses a CLI hook");
@@ -642,6 +656,7 @@ mod tests {
                     process(12),
                     parent_agent.clone(),
                 ],
+                truncated: false,
             };
             assert_eq!(
                 session_agent_process(source, &in_process, None),
@@ -671,11 +686,13 @@ mod tests {
                     } else {
                         vec![parent_agent.clone()]
                     },
+                    truncated: false,
                 };
                 registry.observe_session("parent", parent_source, Some(&parent_first));
                 if uses_command_hook(parent_source) {
                     let parent_next = CaptureContext {
                         process_chain: vec![process(31), parent_agent.clone()],
+                        truncated: false,
                     };
                     registry.observe_session("parent", parent_source, Some(&parent_next));
                 }
@@ -707,6 +724,7 @@ mod tests {
                     } else {
                         ancestry.clone()
                     },
+                    truncated: false,
                 };
                 let child_next = CaptureContext {
                     process_chain: if uses_command_hook(child_source) {
@@ -714,6 +732,7 @@ mod tests {
                     } else {
                         child_first.process_chain.clone()
                     },
+                    truncated: false,
                 };
                 let child_agent =
                     session_agent_process(child_source, &child_first, Some(&child_next));
@@ -736,6 +755,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn resumed_session_replaces_its_agent_process_without_indexing_shared_shell() {
+        let registry = CorrelationRegistry::default();
+        let old_agent = process(100);
+        let new_agent = process(200);
+        let shell = process(300);
+        let capture = |hook, agent: &ProcessIdentity| CaptureContext {
+            process_chain: vec![process(hook), agent.clone(), shell.clone()],
+            truncated: false,
+        };
+        registry.observe_session("resumed", "claude-code", Some(&capture(1, &old_agent)));
+        registry.observe_session("resumed", "claude-code", Some(&capture(2, &old_agent)));
+        assert!(registry
+            .state
+            .lock()
+            .unwrap()
+            .process_sessions
+            .contains_key(&old_agent));
+
+        // The first new hook shares only the shell with the old process. It
+        // cannot establish a new agent identity until another new hook agrees.
+        registry.observe_session("resumed", "claude-code", Some(&capture(3, &new_agent)));
+        assert!(!registry
+            .state
+            .lock()
+            .unwrap()
+            .process_sessions
+            .contains_key(&shell));
+        registry.observe_session("resumed", "claude-code", Some(&capture(4, &new_agent)));
+        let state = registry.state.lock().unwrap();
+        assert_eq!(
+            state.session_processes["resumed"],
+            HashSet::from([new_agent.clone()])
+        );
+        assert!(!state.process_sessions.contains_key(&old_agent));
+        assert!(!state.process_sessions.contains_key(&shell));
+        assert!(state.process_sessions[&new_agent].contains("resumed"));
     }
 
     #[test]

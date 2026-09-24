@@ -1209,7 +1209,7 @@ fn attach_process_capture(env: &mut Envelope, client: Option<&crate::wire::Clien
         return;
     };
     let capture = crate::process::capture_process_context(pid);
-    if !capture.process_chain.is_empty() {
+    if !capture.process_chain.is_empty() || capture.truncated {
         env.capture = Some(capture);
     }
 }
@@ -1309,15 +1309,20 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
             replay_through,
             journal_through,
         });
-        let first = state.events.first().unwrap();
-        let capture = first.env.capture.as_ref();
         if state.awaiting_agent {
-            let latest = state
+            let mut captures = state
                 .events
-                .last()
-                .and_then(|event| event.env.capture.as_ref());
-            state.agent_process = capture.and_then(|capture| {
-                crate::correlation::session_agent_process(&first.env.source, capture, latest)
+                .iter()
+                .rev()
+                .filter_map(|event| event.env.capture.as_ref());
+            let latest = captures.next();
+            let previous = captures.next();
+            state.agent_process = previous.and_then(|previous| {
+                crate::correlation::session_agent_process(
+                    &state.events[0].env.source,
+                    previous,
+                    latest,
+                )
             });
             if state.agent_process.is_none() {
                 if state.events.len() >= 3 {
@@ -1351,6 +1356,16 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
             }
             state.awaiting_agent = false;
         }
+        let capture = state
+            .events
+            .iter()
+            .rev()
+            .filter_map(|event| event.env.capture.as_ref())
+            .find(|capture| {
+                state.agent_process.as_ref().is_none_or(|agent| {
+                    capture.process_chain.iter().any(|process| process == agent)
+                })
+            });
         let evidence = Value::Array(state.evidence.clone());
         let resolution = if state.candidate_span_ids.is_empty() {
             daemon
@@ -1421,7 +1436,11 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                 .correlation
                 .resolve(None, env.capture.as_ref(), child_agent.as_ref(), &evidence);
         if crate::correlation::uses_command_hook(&env.source)
-            && !matches!(resolution, crate::correlation::Resolution::Standalone)
+            && (env
+                .capture
+                .as_ref()
+                .is_some_and(|capture| capture.truncated)
+                || !matches!(resolution, crate::correlation::Resolution::Standalone))
         {
             let state = PendingSession {
                 awaiting_agent: true,
