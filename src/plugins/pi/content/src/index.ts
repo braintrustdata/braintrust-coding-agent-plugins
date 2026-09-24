@@ -86,7 +86,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     requestTimeoutMs: UI_STATUS_TIMEOUT_MS,
   });
 
-  const remember = (ctx: ExtensionContext): ReturnType<typeof sessionDescriptor> => {
+  const updateSession = (ctx: ExtensionContext): ReturnType<typeof sessionDescriptor> => {
     lastContext = ctx;
     const descriptor = sessionDescriptor(ctx);
     if (sessionId !== descriptor.sessionId) uiGeneration += 1;
@@ -123,7 +123,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     ctx?: ExtensionContext,
     updateUi = false,
   ): Promise<void> => {
-    const descriptor = ctx ? remember(ctx) : undefined;
+    const descriptor = ctx ? updateSession(ctx) : undefined;
     if (!sessionId) return;
     await client.log({
       source: "pi",

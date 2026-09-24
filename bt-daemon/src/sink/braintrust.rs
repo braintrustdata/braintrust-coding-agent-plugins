@@ -630,21 +630,21 @@ fn ms_to_secs(ms: i64) -> f64 {
 }
 
 fn build_log(row: &SpanRow, daemon_version: &str, origin: SpanOrigin) -> anyhow::Result<SpanLog> {
+    // Repeat the plugin origin so stateless merges cannot use SDK defaults.
+    let mut builder = SpanLog::builder().span_origin(origin);
+
     // The span's display name is carried on the log event, not the builder.
     // An empty name means "unchanged" (many merge ops use `..Default::default()`
     // and don't rename the span) — omitting `.name()` avoids overwriting the
     // already-set name with an empty string on merge.
-    // Stateless merges have no handle from which to inherit the plugin origin.
-    // Repeat it on every log so late updates cannot replace it with SDK defaults.
-    let mut lb = SpanLog::builder().span_origin(origin);
     if !row.name.is_empty() {
-        lb = lb.name(row.name.clone());
+        builder = builder.name(row.name.clone());
     }
     if let Some(input) = &row.input {
-        lb = lb.input(input.clone());
+        builder = builder.input(input.clone());
     }
     if let Some(output) = &row.output {
-        lb = lb.output(output.clone());
+        builder = builder.output(output.clone());
     }
     let mut metadata = row
         .metadata
@@ -659,7 +659,7 @@ fn build_log(row: &SpanRow, daemon_version: &str, origin: SpanOrigin) -> anyhow:
         "bt_daemon_version".into(),
         Value::String(daemon_version.to_string()),
     );
-    lb = lb.metadata(metadata);
+    builder = builder.metadata(metadata);
     let mut metrics = row
         .metrics
         .as_ref()
@@ -677,17 +677,17 @@ fn build_log(row: &SpanRow, daemon_version: &str, origin: SpanOrigin) -> anyhow:
         metrics.insert("end".into(), ms_to_secs(end));
     }
     if !metrics.is_empty() {
-        lb = lb.metrics(metrics);
+        builder = builder.metrics(metrics);
     }
     if let Some(err) = &row.error {
-        lb = lb.error(Value::String(err.clone()));
+        builder = builder.error(Value::String(err.clone()));
     }
     if let Some(tags) = &row.tags {
         if !tags.is_empty() {
-            lb = lb.tags(tags.clone());
+            builder = builder.tags(tags.clone());
         }
     }
-    lb.build()
+    builder.build()
         .map_err(|e| anyhow::anyhow!("span log build failed: {e}"))
 }
 

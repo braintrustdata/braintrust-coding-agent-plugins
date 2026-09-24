@@ -460,9 +460,9 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
             .unwrap();
         recovered.flush().await.unwrap();
 
-        let rows = logs3_rows(&server).await;
-        let rows: Vec<_> = rows
-            .iter()
+        let rows: Vec<_> = logs3_rows(&server)
+            .await
+            .into_iter()
             .filter(|row| row["span_id"] == span_id)
             .collect();
         assert!(rows
