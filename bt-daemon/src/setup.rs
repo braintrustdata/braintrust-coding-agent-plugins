@@ -739,6 +739,110 @@ fn muse_hook_config_for(events: &[&str], command: &str) -> Map<String, Value> {
     ])
 }
 
+/// Build an invocation-local managed file without changing Muse's settings.
+/// Preserve handlers administered by someone else, but never run two Muse
+/// Braintrust forwarders with different destinations in the same session.
+pub(crate) fn muse_managed_hook_config(config_dir: &Path, command: &str) -> anyhow::Result<Value> {
+    let settings = load_object(&config_dir.join("settings.json"))?;
+    if settings
+        .get("hooks")
+        .is_some_and(muse_contains_braintrust_hook)
+    {
+        bail!("Muse user hooks already include Braintrust tracing; remove that duplicate before `bt trace run muse`");
+    }
+    let existing = match settings.get("managed_hooks_path").and_then(Value::as_str) {
+        Some(path) => {
+            let path = Path::new(path);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                config_dir.join(path)
+            };
+            if !path.exists() || muse_hook_is_owned(&path)? {
+                Map::from_iter([("schema_version".into(), Value::from(1))])
+            } else {
+                let raw = std::fs::read(&path)
+                    .with_context(|| format!("read Muse managed hooks {}", path.display()))?;
+                let value: Value = serde_json::from_slice(&raw)?;
+                if muse_contains_braintrust_hook(&value) {
+                    bail!("Muse managed hooks already include an unrecognized Braintrust forwarder; cannot safely replace it");
+                }
+                if muse_has_strict_handler_fields(&value) {
+                    bail!("Muse managed hooks use the strict handler schema; cannot safely merge invocation hooks");
+                }
+                value
+                    .as_object()
+                    .cloned()
+                    .context("Muse managed hooks must be a JSON object")?
+            }
+        }
+        None => Map::from_iter([("schema_version".into(), Value::from(1))]),
+    };
+    let mut result = existing;
+    let mut hooks = result
+        .remove("hooks")
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    let hooks = hooks
+        .as_object_mut()
+        .context("Muse managed hooks must be an object")?;
+    let generated = muse_hook_config_for(MUSE_HOOK_EVENTS, command);
+    for (event, handlers) in generated["hooks"].as_object().unwrap() {
+        let existing = hooks
+            .entry(event.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        existing
+            .as_array_mut()
+            .with_context(|| format!("Muse managed hook event {event} must be an array"))?
+            .extend(handlers.as_array().unwrap().iter().cloned());
+    }
+    result.insert("hooks".into(), hooks.clone().into());
+    Ok(Value::Object(result))
+}
+
+pub(crate) fn check_muse_project_hooks(start: &Path) -> anyhow::Result<()> {
+    for dir in start.ancestors() {
+        let path = dir.join(".muse").join("hooks.json");
+        if !path.exists() {
+            continue;
+        }
+        let hooks: Value = serde_json::from_slice(&std::fs::read(&path)?)
+            .with_context(|| format!("read Muse project hooks {}", path.display()))?;
+        if muse_contains_braintrust_hook(&hooks) {
+            bail!("Muse project hooks {} already include Braintrust tracing; cannot safely run a managed trace", path.display());
+        }
+        break;
+    }
+    Ok(())
+}
+
+fn muse_contains_braintrust_hook(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            (key == "command"
+                && value.as_str().is_some_and(|command| {
+                    command.contains("--source")
+                        && command.contains("muse")
+                        && command.contains("hook")
+                }))
+                || muse_contains_braintrust_hook(value)
+        }),
+        Value::Array(items) => items.iter().any(muse_contains_braintrust_hook),
+        _ => false,
+    }
+}
+
+fn muse_has_strict_handler_fields(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key("name")
+                || object.contains_key("timeout_ms")
+                || object.values().any(muse_has_strict_handler_fields)
+        }
+        Value::Array(items) => items.iter().any(muse_has_strict_handler_fields),
+        _ => false,
+    }
+}
+
 fn legacy_muse_hook_config() -> Map<String, Value> {
     muse_hook_config_for(
         LEGACY_MUSE_HOOK_EVENTS,
@@ -746,7 +850,7 @@ fn legacy_muse_hook_config() -> Map<String, Value> {
     )
 }
 
-fn muse_version(output: &[u8]) -> anyhow::Result<semver::Version> {
+pub(crate) fn muse_version(output: &[u8]) -> anyhow::Result<semver::Version> {
     let text = std::str::from_utf8(output).context("Muse version is not UTF-8")?;
     text.split_whitespace()
         .find_map(|word| semver::Version::parse(word).ok())
@@ -1917,6 +2021,93 @@ mod tests {
         assert_eq!(settings["theme"], "dark");
         assert!(settings.get("managed_hooks_path").is_none());
         assert!(!muse_hook_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn muse_managed_run_replaces_only_owned_braintrust_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("muse");
+        setup_muse_at(&config_dir).unwrap();
+        let saved = std::fs::read(muse_hook_path(&config_dir)).unwrap();
+        let generated =
+            muse_managed_hook_config(&config_dir, "'bt' 'hook' '--source' 'muse'").unwrap();
+        assert_eq!(
+            generated["hooks"].as_object().unwrap().len(),
+            MUSE_HOOK_EVENTS.len()
+        );
+        assert_eq!(
+            generated["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "'bt' 'hook' '--source' 'muse'"
+        );
+        assert_eq!(std::fs::read(muse_hook_path(&config_dir)).unwrap(), saved);
+    }
+
+    #[test]
+    fn muse_managed_run_keeps_foreign_handlers_and_rejects_duplicate_user_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("muse");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"schema_version":1,"managed_hooks_path":"other.json"}"#,
+        )
+        .unwrap();
+        let original = r#"{"schema_version":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#;
+        std::fs::write(config_dir.join("other.json"), original).unwrap();
+        let generated = muse_managed_hook_config(&config_dir, "bt hook --source muse").unwrap();
+        assert_eq!(generated["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        assert_eq!(generated["hooks"]["Stop"][0]["hooks"][0]["command"], "true");
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("other.json")).unwrap(),
+            original
+        );
+
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"schema_version":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"bt trace hook --source muse"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(
+            muse_managed_hook_config(&config_dir, "bt hook --source muse")
+                .unwrap_err()
+                .to_string()
+                .contains("user hooks already include Braintrust")
+        );
+
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"schema_version":1,"managed_hooks_path":"other.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("other.json"),
+            r#"{"schema_version":1,"hooks":{"Stop":[{"hooks":[{"type":"command","name":"foreign","timeout_ms":1000,"command":"true"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(
+            muse_managed_hook_config(&config_dir, "bt hook --source muse")
+                .unwrap_err()
+                .to_string()
+                .contains("strict handler schema")
+        );
+    }
+
+    #[test]
+    fn muse_managed_run_rejects_duplicate_project_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(project.join(".muse")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            project.join(".muse/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'bt' 'trace' 'hook' '--source' 'muse'"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(check_muse_project_hooks(&nested)
+            .unwrap_err()
+            .to_string()
+            .contains("project hooks"));
     }
 
     #[test]

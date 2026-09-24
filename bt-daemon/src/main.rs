@@ -307,7 +307,7 @@ async fn main() {
                 program: exe,
                 args: vec![OsString::from("hook")],
             };
-            match run_traced(args, hook_command, route.into_route()).await {
+            match run_traced(args, hook_command, route.into_route(), host_info()).await {
                 Ok(status) if status.success() => {}
                 Ok(status) => std::process::exit(status.code().unwrap_or(1)),
                 Err(error) => {

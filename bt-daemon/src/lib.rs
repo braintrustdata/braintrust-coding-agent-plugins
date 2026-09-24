@@ -152,6 +152,9 @@ pub struct HookArgs {
     /// not carry this flag and are suppressed for the managed child.
     #[arg(long, hide = true)]
     pub managed_run_hook: bool,
+    /// Private invocation context for Muse's environment-sanitized hooks.
+    #[arg(long, hide = true)]
+    pub managed_context: Option<PathBuf>,
 }
 
 /// Arguments for `status`.
@@ -313,6 +316,7 @@ pub struct RunHookCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RunSource {
     Codex,
+    Muse,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
     #[value(name = "opencode", alias = "open-code")]
@@ -347,6 +351,13 @@ fn build_hook_envelope(
         route: Some(route),
         config: None,
     }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct MuseManagedContext {
+    route: SessionRoute,
+    managed_run_id: String,
+    socket: PathBuf,
 }
 
 pub(crate) fn should_flush_hook_event(event: &str, flush_on_turn_end: bool) -> bool {
@@ -403,14 +414,33 @@ pub async fn run_hook(
     mut route: SessionRoute,
     host: HostInfo,
 ) -> anyhow::Result<()> {
+    let managed_context = args
+        .managed_context
+        .as_ref()
+        .map(|path| -> anyhow::Result<MuseManagedContext> {
+            if args.source != "muse" || !args.managed_run_hook {
+                anyhow::bail!("managed context is only valid for an injected Muse hook");
+            }
+            let context: MuseManagedContext = serde_json::from_slice(&std::fs::read(path)?)?;
+            if context.managed_run_id.is_empty() || context.route.destination.is_none() {
+                anyhow::bail!("Muse managed hook context is incomplete");
+            }
+            Ok(context)
+        })
+        .transpose()?;
     // A managed run injects its own hook definitions. Suppress an inherited
     // Braintrust plugin hook for the same child, but allow the injected hook
     // process, which carries the second marker.
     if std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook {
         return Ok(());
     }
-    let settings = settings::AgentSettings::load(&args.source);
-    if !settings.tracing_enabled() {
+    let settings = managed_context
+        .is_none()
+        .then(|| settings::AgentSettings::load(&args.source));
+    if settings
+        .as_ref()
+        .is_some_and(|settings| !settings.tracing_enabled())
+    {
         return Ok(());
     }
     let mut payload = read_stdin_json()?;
@@ -429,17 +459,31 @@ pub async fn run_hook(
         .or_else(|| json_str_field(&payload, &args.event_field))
         .unwrap_or_default();
 
-    if let Some(configured_route) = settings.route {
+    if let Some(context) = &managed_context {
+        route = context.route.clone();
+    } else if let Some(configured_route) = settings.and_then(|settings| settings.route) {
         route = configured_route;
     }
     if args.flush_on_turn_end {
         route.flush_mode = wire::FlushMode::FlushOnTurnEnd;
     }
     apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
-    let env = build_hook_envelope(&args, route, payload, session_id, event);
+    let mut env = build_hook_envelope(&args, route, payload, session_id, event);
+    if let Some(context) = &managed_context {
+        env.managed_run_id = Some(context.managed_run_id.clone());
+    }
 
-    let socket = paths::socket_path(args.socket.as_deref());
-    forward_envelope(&env, &socket, &host, args.no_spawn).await?;
+    let socket = managed_context
+        .as_ref()
+        .map(|context| context.socket.clone())
+        .unwrap_or_else(|| paths::socket_path(args.socket.as_deref()));
+    forward_envelope(
+        &env,
+        &socket,
+        &host,
+        args.no_spawn || managed_context.is_some(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1247,6 +1291,7 @@ pub async fn run_traced(
     args: RunArgs,
     hook_command: RunHookCommand,
     mut route: SessionRoute,
+    host: HostInfo,
 ) -> anyhow::Result<std::process::ExitStatus> {
     apply_run_span_plugins(&mut route, &args.plugin)?;
     if route.destination.is_none() {
@@ -1267,23 +1312,57 @@ pub async fn run_traced(
     }
     let (executable_env, default_executable) = match args.source {
         RunSource::Codex => ("CODEX_BIN", "codex"),
+        RunSource::Muse => ("MUSE_BIN", "muse"),
         RunSource::Claude => ("CLAUDE_BIN", "claude"),
         RunSource::OpenCode => ("OPENCODE_BIN", "opencode"),
         RunSource::Pi => ("PI_BIN", "pi"),
     };
     let executable =
         std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
+    if args.source == RunSource::Muse {
+        setup::check_muse_project_hooks(&std::env::current_dir()?)?;
+        for (index, arg) in args.agent_args.iter().enumerate() {
+            let Some(arg) = arg.to_str() else { continue };
+            let workspace = if arg == "--workspace" {
+                args.agent_args.get(index + 1).map(PathBuf::from)
+            } else {
+                arg.strip_prefix("--workspace=").map(PathBuf::from)
+            };
+            if let Some(workspace) = workspace {
+                setup::check_muse_project_hooks(&workspace)?;
+            }
+        }
+        let output = tokio::process::Command::new(&executable)
+            .arg("--version")
+            .output()
+            .await
+            .context("check Muse Code version for managed hooks")?;
+        if !output.status.success()
+            || setup::muse_version(&output.stdout)? != semver::Version::new(1, 1, 1)
+        {
+            anyhow::bail!("Muse managed runs require the verified Muse Code 1.1.1 hook override");
+        }
+    }
     let injected_args = managed_run_args(args.source, &hook_command)?;
     let managed_run_id = uuid::Uuid::new_v4().to_string();
     // A caller-supplied socket is already an explicit daemon boundary (for
     // example an integration harness or a deliberately isolated runtime).
     // Only create our own boundary when environment auth would otherwise use
     // the ambient shared daemon.
-    let isolate_daemon = route.auth.effective_source() == wire::AuthSource::Environment
+    let isolate_daemon = (args.source == RunSource::Muse
+        || route.auth.effective_source() == wire::AuthSource::Environment)
         && std::env::var_os(paths::SOCKET_ENV).is_none();
     let isolated_runtime = isolate_daemon
         .then(|| ManagedRunRuntime::new(&managed_run_id))
         .transpose()?;
+    let muse_context_dir = (args.source == RunSource::Muse && isolated_runtime.is_none())
+        .then(|| {
+            tempfile::Builder::new()
+                .prefix("bt-trace-run-muse-")
+                .tempdir()
+        })
+        .transpose()?;
+    let muse_route = (args.source == RunSource::Muse).then(|| route.clone());
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut command = tokio::process::Command::new(&executable);
     command
@@ -1292,6 +1371,40 @@ pub async fn run_traced(
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
+    if args.source == RunSource::Muse {
+        let context_dir = isolated_runtime
+            .as_ref()
+            .map(|runtime| runtime.temp_dir.path())
+            .or_else(|| muse_context_dir.as_ref().map(|dir| dir.path()))
+            .expect("Muse has an invocation directory");
+        let context = MuseManagedContext {
+            route: muse_route.expect("Muse route is available"),
+            managed_run_id: managed_run_id.clone(),
+            socket: isolated_runtime
+                .as_ref()
+                .map(|runtime| runtime.socket.clone())
+                .unwrap_or_else(|| paths::socket_path(None)),
+        };
+        let context_path = context_dir.join("muse-context.json");
+        std::fs::write(&context_path, serde_json::to_vec(&context)?)?;
+        let mut hook = hook_command.clone();
+        hook.args.extend([
+            OsString::from("--source"),
+            OsString::from("muse"),
+            OsString::from("--managed-run-hook"),
+            OsString::from("--flush-on-turn-end"),
+            OsString::from("--managed-context"),
+            context_path.into_os_string(),
+        ]);
+        let command_string = shell_command(&hook, cfg!(windows))?;
+        let hooks = setup::muse_managed_hook_config(&paths::muse_config_dir(), &command_string)?;
+        let hooks_path = context_dir.join("muse-hooks.json");
+        std::fs::write(&hooks_path, serde_json::to_vec(&hooks)?)?;
+        command.env("TBH_MANAGED_HOOKS_PATH", hooks_path);
+        if let Some(runtime) = &isolated_runtime {
+            start_muse_managed_daemon(&host, runtime).await?;
+        }
+    }
     if let Some(runtime) = &isolated_runtime {
         command
             .env(paths::SOCKET_ENV, &runtime.socket)
@@ -1303,9 +1416,20 @@ pub async fn run_traced(
             opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?,
         );
     }
-    let mut child = command.spawn().map_err(|error| {
-        anyhow::anyhow!("failed to launch {}: {error}", executable.to_string_lossy())
-    })?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if args.source == RunSource::Muse {
+                if let Some(runtime) = &isolated_runtime {
+                    let _ = shutdown_daemon(&runtime.socket).await;
+                }
+            }
+            return Err(anyhow::anyhow!(
+                "failed to launch {}: {error}",
+                executable.to_string_lossy()
+            ));
+        }
+    };
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
 
@@ -1381,6 +1505,18 @@ impl ManagedRunRuntime {
     }
 }
 
+async fn start_muse_managed_daemon(
+    host: &HostInfo,
+    runtime: &ManagedRunRuntime,
+) -> anyhow::Result<()> {
+    let stream =
+        client::ensure_daemon_in(&runtime.socket, host, false, Some(runtime.temp_dir.path()))
+            .await
+            .context("start isolated daemon for Muse managed run")?;
+    drop(stream);
+    Ok(())
+}
+
 fn apply_run_span_plugins(route: &mut SessionRoute, plugins: &[PathBuf]) -> anyhow::Result<()> {
     route.span_plugins = resolve_span_plugin_paths(plugins)?;
     Ok(())
@@ -1405,6 +1541,7 @@ fn managed_run_args(
 ) -> anyhow::Result<Vec<OsString>> {
     let source_name = match source {
         RunSource::Codex => "codex",
+        RunSource::Muse => "muse",
         RunSource::Claude => "claude",
         RunSource::OpenCode => "opencode",
         RunSource::Pi => "pi",
@@ -1423,7 +1560,7 @@ fn managed_run_args(
                 _ => unreachable!(),
             }
         }
-        RunSource::OpenCode => Ok(Vec::new()),
+        RunSource::Muse | RunSource::OpenCode => Ok(Vec::new()),
         RunSource::Pi => {
             let extension = match std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC") {
                 Some(extension) => extension,
@@ -1467,15 +1604,25 @@ fn managed_hook_shell_command(
     argv.push(OsString::from("--source"));
     argv.push(OsString::from(source));
     argv.push(OsString::from("--managed-run-hook"));
+    shell_argv(&argv, windows)
+}
+
+fn shell_command(command: &RunHookCommand, windows: bool) -> anyhow::Result<String> {
+    let mut argv = vec![command.program.clone()];
+    argv.extend(command.args.iter().cloned());
+    shell_argv(&argv, windows)
+}
+
+fn shell_argv(argv: &[OsString], windows: bool) -> anyhow::Result<String> {
     let mut rendered = Vec::with_capacity(argv.len());
     for arg in argv {
         let arg = arg
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("managed hook command contains non-Unicode argv"))?;
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("managed hook command contains non-Unicode argv"))?;
         rendered.push(if windows {
-            quote_windows_command_arg(&arg)
+            quote_windows_command_arg(arg)
         } else {
-            quote_unix_shell_arg(&arg)
+            quote_unix_shell_arg(arg)
         });
     }
     Ok(rendered.join(" "))
@@ -2682,6 +2829,10 @@ mod tests {
             },
             test_run_hook_command(),
             SessionRoute::default(),
+            HostInfo {
+                serve_argv: Vec::new(),
+                version: "test".into(),
+            },
         )
         .await
         .unwrap_err();
@@ -2706,6 +2857,10 @@ mod tests {
                     project_name: None,
                 }),
                 ..SessionRoute::default()
+            },
+            HostInfo {
+                serve_argv: Vec::new(),
+                version: "test".into(),
             },
         )
         .await
@@ -2803,5 +2958,34 @@ mod tests {
         let windows = managed_hook_shell_command(&hook, "claude", true).unwrap();
         assert!(windows
             .contains("\"/opt/Braintrust CLI/bt\" \"agents\" \"hook\" \"--source\" \"claude\""));
+    }
+
+    #[tokio::test]
+    async fn muse_managed_hook_rejects_missing_context_before_reading_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = HookCli::try_parse_from([
+            "test",
+            "--source",
+            "muse",
+            "--managed-run-hook",
+            "--managed-context",
+            temp.path().join("missing.json").to_str().unwrap(),
+        ])
+        .unwrap()
+        .args;
+        let error = run_hook(
+            args,
+            SessionRoute::default(),
+            HostInfo {
+                serve_argv: Vec::new(),
+                version: "test".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

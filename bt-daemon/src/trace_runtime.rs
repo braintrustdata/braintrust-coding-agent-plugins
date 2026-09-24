@@ -409,7 +409,11 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         TraceCommand::Hook(hook_args) => {
             // A persistent hook must never fail the coding agent's turn.
             let result = async {
-                let route = resolve_host_route(&host, RouteRequirements::default()).await?;
+                let route = if hook_args.managed_context.is_some() {
+                    SessionRoute::default()
+                } else {
+                    resolve_host_route(&host, RouteRequirements::default()).await?
+                };
                 run_hook(hook_args, route, host_info(&host)).await
             }
             .await;
@@ -467,7 +471,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             apply_additional_metadata(&mut route, run_args.additional_metadata.as_deref())?;
             apply_tags(&mut route, &run_args.tags)?;
             let hook_command = child_command(&host.command, "hook");
-            let status = run_traced(run_args, hook_command, route).await?;
+            let status = run_traced(run_args, hook_command, route, host_info(&host)).await?;
             if status.success() {
                 Ok(())
             } else {
@@ -810,6 +814,7 @@ mod tests {
             flush_timeout_ms: 10_000,
             additional_metadata: None,
             managed_run_hook: false,
+            managed_context: None,
         };
         run_trace(
             TraceArgs {

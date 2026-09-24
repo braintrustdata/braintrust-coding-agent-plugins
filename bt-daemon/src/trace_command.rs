@@ -401,6 +401,18 @@ mod tests {
     }
 
     #[test]
+    fn run_accepts_muse() {
+        let parsed = Cli::try_parse_from(["bt", "run", "muse", "exec", "hello"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Run(RunArgs {
+                source: crate::RunSource::Muse,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn public_commands_preserve_repeated_plugin_order() {
         for args in [
             vec![

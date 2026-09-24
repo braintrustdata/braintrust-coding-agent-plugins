@@ -263,14 +263,20 @@ available from those hooks and are not inferred by the live translator.
 view events omit the model request/response records needed by this translator;
 `view/subscribe` also requires a session loaded on the same host. Repeated
 full exports can see an active session but do not provide an incremental tail.
-`run muse` is also deliberately unavailable: the observed process-local
-managed-hook override replaces an existing managed hook file, and Muse's hook
-environment drops the invocation route and duplicate-suppression variables.
-Use persistent `enable muse` setup until those behaviors can be preserved
-without changing unrelated hooks or tracing destinations.
+`run muse` uses a process-local managed-hook override in the verified Muse Code
+1.1.1 release. It retains compatible unrelated managed hooks, replaces Braintrust's saved
+managed hooks only for that invocation, and leaves ordinary Muse sessions and
+settings unchanged. The injected hook reads a private invocation context file
+because Muse clears its hook environment. A dedicated daemon is started before
+Muse so environment-based Braintrust authentication never depends on that
+cleared environment. Known duplicate Braintrust user or project hooks stop the
+managed run with a diagnostic. A foreign managed file using Muse's strict
+handler schema is also rejected rather than silently losing hooks. Muse plugins that independently trace the same
+session should be disabled before using `run muse`; new Muse versions must be
+verified before the undocumented hook-path override is enabled for them.
 
 Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
-Ctrl-C. `run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent with
+Ctrl-C. `run <codex|muse|claude|opencode|pi> [ARGS...]` launches the selected agent with
 inherited stdio and injects Braintrust hooks or an adapter for that invocation, so it
 does not depend on the tracing plugin being installed or enabled. Managed runs
 suppress inherited Braintrust plugin hooks to avoid logging the same session
