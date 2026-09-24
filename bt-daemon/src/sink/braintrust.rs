@@ -270,6 +270,13 @@ impl BraintrustSink {
         Ok(client)
     }
 
+    fn span_origin(&self) -> SpanOrigin {
+        SpanOrigin::new()
+            .name(format!("braintrust.plugin.{}", self.source))
+            .version(self.version.clone())
+            .instrumentation("braintrust-plugin")
+    }
+
     fn ensure_handle(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         if self.open.contains_key(&row.span_id) {
             return Ok(());
@@ -287,12 +294,7 @@ impl BraintrustSink {
             .span_id(row.span_id.clone())
             .row_id(row.span_id.clone())
             .parent_info(parent)
-            .span_origin(
-                SpanOrigin::new()
-                    .name(format!("braintrust.plugin.{}", self.source))
-                    .version(self.version.clone())
-                    .instrumentation("braintrust-plugin"),
-            );
+            .span_origin(self.span_origin());
         if let Some(org_name) = &creds.org_name {
             builder = builder.org_name(org_name.clone());
         }
@@ -306,7 +308,7 @@ impl BraintrustSink {
     fn update_open(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         self.ensure_handle(client, row)?;
         let handle = self.open.get(&row.span_id).expect("just inserted");
-        handle.log(build_log(row, &self.daemon_version)?);
+        handle.log(build_log(row, &self.daemon_version, self.span_origin())?);
         if let Some(end) = row.end_ms {
             handle.end_with_time(ms_to_secs(end));
             // SpanHandle retains the complete accumulated input/output. Once a
@@ -329,7 +331,7 @@ impl BraintrustSink {
                 creds.token.clone(),
                 creds.org_id.clone(),
                 &components,
-                build_log(row, &self.daemon_version)?,
+                build_log(row, &self.daemon_version, self.span_origin())?,
             )
             .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))
     }
@@ -627,20 +629,22 @@ fn ms_to_secs(ms: i64) -> f64 {
     ms as f64 / 1000.0
 }
 
-fn build_log(row: &SpanRow, daemon_version: &str) -> anyhow::Result<SpanLog> {
+fn build_log(row: &SpanRow, daemon_version: &str, origin: SpanOrigin) -> anyhow::Result<SpanLog> {
+    // Repeat the plugin origin so stateless merges cannot use SDK defaults.
+    let mut builder = SpanLog::builder().span_origin(origin);
+
     // The span's display name is carried on the log event, not the builder.
     // An empty name means "unchanged" (many merge ops use `..Default::default()`
     // and don't rename the span) — omitting `.name()` avoids overwriting the
     // already-set name with an empty string on merge.
-    let mut lb = SpanLog::builder();
     if !row.name.is_empty() {
-        lb = lb.name(row.name.clone());
+        builder = builder.name(row.name.clone());
     }
     if let Some(input) = &row.input {
-        lb = lb.input(input.clone());
+        builder = builder.input(input.clone());
     }
     if let Some(output) = &row.output {
-        lb = lb.output(output.clone());
+        builder = builder.output(output.clone());
     }
     let mut metadata = row
         .metadata
@@ -655,7 +659,7 @@ fn build_log(row: &SpanRow, daemon_version: &str) -> anyhow::Result<SpanLog> {
         "bt_daemon_version".into(),
         Value::String(daemon_version.to_string()),
     );
-    lb = lb.metadata(metadata);
+    builder = builder.metadata(metadata);
     let mut metrics = row
         .metrics
         .as_ref()
@@ -673,17 +677,18 @@ fn build_log(row: &SpanRow, daemon_version: &str) -> anyhow::Result<SpanLog> {
         metrics.insert("end".into(), ms_to_secs(end));
     }
     if !metrics.is_empty() {
-        lb = lb.metrics(metrics);
+        builder = builder.metrics(metrics);
     }
     if let Some(err) = &row.error {
-        lb = lb.error(Value::String(err.clone()));
+        builder = builder.error(Value::String(err.clone()));
     }
     if let Some(tags) = &row.tags {
         if !tags.is_empty() {
-            lb = lb.tags(tags.clone());
+            builder = builder.tags(tags.clone());
         }
     }
-    lb.build()
+    builder
+        .build()
         .map_err(|e| anyhow::anyhow!("span log build failed: {e}"))
 }
 
