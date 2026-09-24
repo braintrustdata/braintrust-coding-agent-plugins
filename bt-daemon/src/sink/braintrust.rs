@@ -687,7 +687,8 @@ fn build_log(row: &SpanRow, daemon_version: &str, origin: SpanOrigin) -> anyhow:
             builder = builder.tags(tags.clone());
         }
     }
-    builder.build()
+    builder
+        .build()
         .map_err(|e| anyhow::anyhow!("span log build failed: {e}"))
 }
 

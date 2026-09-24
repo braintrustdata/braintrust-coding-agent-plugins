@@ -5,6 +5,8 @@ const mockState = vi.hoisted(() => ({
   flushes: [] as string[],
   closed: 0,
   claim: true,
+  legacyContinuation: undefined as Record<string, unknown> | undefined,
+  legacyContinuationFor: vi.fn(),
   logGate: undefined as Promise<void> | undefined,
   statusGate: undefined as Promise<void> | undefined,
 }));
@@ -61,12 +63,21 @@ vi.mock("./config.ts", () => ({
   }),
 }));
 
+vi.mock("./legacy-session.ts", () => ({
+  legacyContinuationFor: (...args: unknown[]) => {
+    mockState.legacyContinuationFor(...args);
+    return mockState.legacyContinuation;
+  },
+}));
+
 describe("Pi daemon adapter", () => {
   beforeEach(() => {
     mockState.logs.length = 0;
     mockState.flushes.length = 0;
     mockState.closed = 0;
     mockState.claim = true;
+    mockState.legacyContinuation = undefined;
+    mockState.legacyContinuationFor.mockClear();
     mockState.logGate = undefined;
     mockState.statusGate = undefined;
   });
@@ -294,5 +305,62 @@ describe("Pi daemon adapter", () => {
     ]);
     expect(statuses.length).toBeGreaterThan(0);
     expect(mockState.closed).toBe(2);
+  });
+
+  it("forwards legacy continuation state with the first daemon event", async () => {
+    mockState.legacyContinuation = {
+      span: "legacy-root",
+      trace: "legacy-trace",
+      turns: 3,
+      tools: 7,
+    };
+    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    const pi = {
+      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
+        handlers.set(name, handler),
+    };
+    const ctx = {
+      cwd: "/tmp/project",
+      hasUI: false,
+      ui: { setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: {
+        getSessionFile: () => "/tmp/session.jsonl",
+        getSessionId: () => "native-session",
+      },
+    };
+    const { default: extension } = await import("./index.ts");
+    extension(pi as never);
+
+    await handlers.get("session_start")?.({ reason: "resume" }, ctx);
+
+    expect(mockState.logs[0]?.payload).toMatchObject({
+      legacy_resume: mockState.legacyContinuation,
+    });
+  });
+
+  it("reads legacy continuation state once per Pi session", async () => {
+    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    const pi = {
+      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
+        handlers.set(name, handler),
+    };
+    const ctx = {
+      cwd: "/tmp/project",
+      hasUI: false,
+      ui: { setStatus: vi.fn(), setWidget: vi.fn() },
+      sessionManager: {
+        getSessionFile: () => "/tmp/session.jsonl",
+        getSessionId: () => "native-session",
+      },
+    };
+    const { default: extension } = await import("./index.ts");
+    extension(pi as never);
+
+    await handlers.get("session_start")?.({}, ctx);
+    await handlers.get("context")?.({}, ctx);
+    await handlers.get("tool_execution_end")?.({}, ctx);
+
+    expect(mockState.legacyContinuationFor).toHaveBeenCalledTimes(1);
+    expect(mockState.legacyContinuationFor).toHaveBeenCalledWith("/tmp/session.jsonl");
   });
 });

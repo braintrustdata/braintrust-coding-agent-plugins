@@ -56,7 +56,11 @@ bt trace run --project my-coding-agent pi -- -p "summarize this repository"
 
 The `bt trace run` routing and metadata flags also accept their matching
 `BRAINTRUST_*` environment variables; a plain `pi` session's extension does not.
-Historical import and live attach are not supported for Pi.
+Historical import and live attach are not supported for Pi. Upgrading an active
+session from the pre-daemon extension is supported: when its local legacy state
+file is still present, the daemon continues the existing Braintrust root and
+turn sequence. If that state was removed or is invalid, tracing safely starts a
+new daemon session instead.
 
 ## Compatibility
 
