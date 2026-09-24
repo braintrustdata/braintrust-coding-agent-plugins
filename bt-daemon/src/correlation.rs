@@ -2,7 +2,7 @@
 //!
 //! Agent translators remain source-specific, but their emitted tool rows are a
 //! common contract. This registry observes those rows, indexes the active tools
-//! by the process ancestry that produced their session, and resolves a child's
+//! by the coding agent process that owns their session, and resolves a child's
 //! requested route to the exact spawning tool span.
 
 use crate::translate::{SpanOp, SpanRow, SpanType};
@@ -35,6 +35,7 @@ pub(crate) struct CorrelationRegistry {
 struct State {
     process_sessions: HashMap<ProcessIdentity, HashSet<String>>,
     session_processes: HashMap<String, HashSet<ProcessIdentity>>,
+    unconfirmed_processes: HashMap<String, Vec<ProcessIdentity>>,
     active_tools: HashMap<String, HashMap<String, ActiveTool>>,
     live_sessions: HashSet<String>,
 }
@@ -65,26 +66,56 @@ struct ActiveToolSnapshot {
 }
 
 impl CorrelationRegistry {
-    pub(crate) fn observe_session(&self, key: &str, capture: Option<&CaptureContext>) {
+    pub(crate) fn observe_session(
+        &self,
+        key: &str,
+        source: &str,
+        capture: Option<&CaptureContext>,
+    ) {
         let mut state = self.state.lock().unwrap();
         state.live_sessions.insert(key.to_string());
         let Some(capture) = capture else { return };
-        for process in capture
+        if state.session_processes.contains_key(key) {
+            return;
+        }
+        let processes: Vec<_> = capture
             .process_chain
             .iter()
-            .filter(|process| process.start_time_secs != 0)
-        {
+            .skip(usize::from(uses_command_hook(source)))
+            .cloned()
+            .collect();
+        let agent = if !uses_command_hook(source) {
+            processes
+                .first()
+                .filter(|process| process.start_time_secs != 0)
+                .cloned()
+        } else if let Some(first) = state.unconfirmed_processes.get(key) {
+            // A command hook gets a fresh CLI process for each event. The first
+            // process shared by two hooks is the closest stable process owned
+            // by this session, even when the launcher adds extra shells.
+            processes
+                .iter()
+                .find(|process| first.contains(process))
+                .filter(|process| process.start_time_secs != 0)
+                .cloned()
+        } else {
             state
-                .session_processes
-                .entry(key.to_string())
-                .or_default()
-                .insert(process.clone());
-            state
-                .process_sessions
-                .entry(process.clone())
-                .or_default()
-                .insert(key.to_string());
-        }
+                .unconfirmed_processes
+                .insert(key.to_string(), processes);
+            return;
+        };
+        let Some(agent) = agent else { return };
+        state.unconfirmed_processes.remove(key);
+        state
+            .session_processes
+            .entry(key.to_string())
+            .or_default()
+            .insert(agent.clone());
+        state
+            .process_sessions
+            .entry(agent)
+            .or_default()
+            .insert(key.to_string());
     }
 
     pub(crate) fn active_parent_snapshot(&self, key: &str) -> Option<ActiveParentSnapshot> {
@@ -103,7 +134,7 @@ impl CorrelationRegistry {
             return None;
         }
         Some(ActiveParentSnapshot {
-            version: 1,
+            version: 2,
             dirty: false,
             correlation_key: key.to_string(),
             processes: state
@@ -128,9 +159,9 @@ impl CorrelationRegistry {
             .into_iter()
             .filter(|tool| tool.components.span_id.is_some())
             .collect();
-        if snapshot.version != 1
+        if snapshot.version != 2
             || snapshot.dirty
-            || snapshot.processes.is_empty()
+            || snapshot.processes.len() != 1
             || restored_tools.is_empty()
         {
             return false;
@@ -228,21 +259,19 @@ impl CorrelationRegistry {
 
     pub(crate) fn resolve(
         &self,
-        child_source: &str,
         child_session_key: Option<&str>,
         capture: Option<&CaptureContext>,
+        child_agent: Option<&ProcessIdentity>,
         evidence: &Value,
     ) -> Resolution {
         let Some(capture) = capture else {
             return Resolution::Standalone;
         };
+        let Some(processes) = ancestors(capture, child_agent) else {
+            return Resolution::Standalone;
+        };
         let state = self.state.lock().unwrap();
-        for process in capture
-            .process_chain
-            .iter()
-            .skip(minimum_ancestor_depth(child_source))
-            .filter(|process| process.start_time_secs != 0)
-        {
+        for process in processes.filter(|process| process.start_time_secs != 0) {
             let Some(sessions) = state.process_sessions.get(process) else {
                 continue;
             };
@@ -256,7 +285,7 @@ impl CorrelationRegistry {
                 }
             }
             if candidates.is_empty() {
-                continue;
+                return Resolution::Standalone;
             }
             if candidates.len() == 1 {
                 return Resolution::Parent(Box::new(to_link(candidates.pop().unwrap())));
@@ -291,23 +320,24 @@ impl CorrelationRegistry {
 
     pub(crate) fn resolve_pending(
         &self,
-        child_source: &str,
         capture: Option<&CaptureContext>,
+        child_agent: Option<&ProcessIdentity>,
         evidence: &Value,
         candidate_span_ids: &[String],
     ) -> Resolution {
         let Some(capture) = capture else {
             return Resolution::Standalone;
         };
+        let Some(child_agent) = child_agent else {
+            return Resolution::Standalone;
+        };
+        let Some(processes) = ancestors(capture, Some(child_agent)) else {
+            return Resolution::Standalone;
+        };
         let wanted: HashSet<&str> = candidate_span_ids.iter().map(String::as_str).collect();
         let evidence = fingerprints(evidence);
         let state = self.state.lock().unwrap();
-        for process in capture
-            .process_chain
-            .iter()
-            .skip(minimum_ancestor_depth(child_source))
-            .filter(|process| process.start_time_secs != 0)
-        {
+        for process in processes.filter(|process| process.start_time_secs != 0) {
             let Some(sessions) = state.process_sessions.get(process) else {
                 continue;
             };
@@ -329,6 +359,11 @@ impl CorrelationRegistry {
                     }
                 }
             }
+            if found == 0 {
+                // A nearer agent owns this process. Older candidates cannot
+                // be reached by stepping over that agent.
+                return Resolution::Standalone;
+            }
             scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             if let Some((best_score, best)) = scored.first().cloned() {
                 let tied = scored
@@ -349,6 +384,7 @@ impl CorrelationRegistry {
     pub(crate) fn remove_session(&self, key: &str) {
         let mut state = self.state.lock().unwrap();
         state.live_sessions.remove(key);
+        state.unconfirmed_processes.remove(key);
         state.active_tools.remove(key);
         if let Some(processes) = state.session_processes.remove(key) {
             for process in processes {
@@ -382,15 +418,54 @@ impl CorrelationRegistry {
     }
 }
 
-fn minimum_ancestor_depth(source: &str) -> usize {
-    // Claude and Codex connect from a short-lived `bt trace hook` process, so
-    // index 1 is still the current agent process. Pi and OpenCode connect
-    // in-process, making index 0 current. A real child must be beyond those
-    // current-session processes in either capture shape.
-    match source {
-        "claude-code" | "codex" => 2,
-        _ => 1,
+pub(crate) fn uses_command_hook(source: &str) -> bool {
+    // Only the connecting CLI process is known to be outside the agent. The
+    // number of shell or launcher processes between it and the agent varies.
+    matches!(source, "claude-code" | "codex")
+}
+
+pub(crate) fn session_agent_process(
+    source: &str,
+    first: &CaptureContext,
+    latest: Option<&CaptureContext>,
+) -> Option<ProcessIdentity> {
+    if !uses_command_hook(source) {
+        return first
+            .process_chain
+            .first()
+            .filter(|process| process.start_time_secs != 0)
+            .cloned();
     }
+    let latest = latest?;
+    latest
+        .process_chain
+        .iter()
+        .skip(1)
+        .find(|process| {
+            first
+                .process_chain
+                .iter()
+                .skip(1)
+                .any(|prior| prior == *process)
+        })
+        .filter(|process| process.start_time_secs != 0)
+        .cloned()
+}
+
+fn ancestors<'a>(
+    capture: &'a CaptureContext,
+    child_agent: Option<&ProcessIdentity>,
+) -> Option<impl Iterator<Item = &'a ProcessIdentity>> {
+    let start = if let Some(child_agent) = child_agent {
+        capture
+            .process_chain
+            .iter()
+            .position(|process| process == child_agent)?
+            + 1
+    } else {
+        0
+    };
+    Some(capture.process_chain.iter().skip(start))
 }
 
 fn to_link(tool: ActiveTool) -> ParentLink {
