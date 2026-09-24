@@ -59,10 +59,15 @@ pub use translate::{
 use anyhow::Context;
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use clap::{Args, ValueEnum};
+use serde::Deserialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+};
 use wire::{
     method, Envelope, ManagedRunFlushParams, SessionConfig, SessionRoute, StatusResult,
     PROTOCOL_VERSION,
@@ -70,6 +75,10 @@ use wire::{
 
 const MANAGED_RUN_ID_ENV: &str = "BT_TRACE_MANAGED_RUN_ID";
 const MANAGED_RUN_FLUSH_TIMEOUT_MS: u64 = 10_000;
+const MUSE_MSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MUSE_MSP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MUSE_MSP_MAX_PAGES: usize = 1_000;
+const MUSE_MSP_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -143,6 +152,9 @@ pub struct HookArgs {
     /// not carry this flag and are suppressed for the managed child.
     #[arg(long, hide = true)]
     pub managed_run_hook: bool,
+    /// Private invocation context for Muse's environment-sanitized hooks.
+    #[arg(long, hide = true)]
+    pub managed_context: Option<PathBuf>,
 }
 
 /// Arguments for `status`.
@@ -237,6 +249,7 @@ pub struct ImportArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ImportSource {
     Codex,
+    Muse,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
     #[value(name = "antigravity", alias = "agy")]
@@ -303,6 +316,7 @@ pub struct RunHookCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RunSource {
     Codex,
+    Muse,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
     #[value(name = "opencode", alias = "open-code")]
@@ -337,6 +351,13 @@ fn build_hook_envelope(
         route: Some(route),
         config: None,
     }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct MuseManagedContext {
+    route: SessionRoute,
+    managed_run_id: String,
+    socket: PathBuf,
 }
 
 pub(crate) fn should_flush_hook_event(event: &str, flush_on_turn_end: bool) -> bool {
@@ -393,14 +414,33 @@ pub async fn run_hook(
     mut route: SessionRoute,
     host: HostInfo,
 ) -> anyhow::Result<()> {
+    let managed_context = args
+        .managed_context
+        .as_ref()
+        .map(|path| -> anyhow::Result<MuseManagedContext> {
+            if args.source != "muse" || !args.managed_run_hook {
+                anyhow::bail!("managed context is only valid for an injected Muse hook");
+            }
+            let context: MuseManagedContext = serde_json::from_slice(&std::fs::read(path)?)?;
+            if context.managed_run_id.is_empty() || context.route.destination.is_none() {
+                anyhow::bail!("Muse managed hook context is incomplete");
+            }
+            Ok(context)
+        })
+        .transpose()?;
     // A managed run injects its own hook definitions. Suppress an inherited
     // Braintrust plugin hook for the same child, but allow the injected hook
     // process, which carries the second marker.
     if std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook {
         return Ok(());
     }
-    let settings = settings::AgentSettings::load(&args.source);
-    if !settings.tracing_enabled() {
+    let settings = managed_context
+        .is_none()
+        .then(|| settings::AgentSettings::load(&args.source));
+    if settings
+        .as_ref()
+        .is_some_and(|settings| !settings.tracing_enabled())
+    {
         return Ok(());
     }
     let mut payload = read_stdin_json()?;
@@ -419,17 +459,31 @@ pub async fn run_hook(
         .or_else(|| json_str_field(&payload, &args.event_field))
         .unwrap_or_default();
 
-    if let Some(configured_route) = settings.route {
+    if let Some(context) = &managed_context {
+        route = context.route.clone();
+    } else if let Some(configured_route) = settings.and_then(|settings| settings.route) {
         route = configured_route;
     }
     if args.flush_on_turn_end {
         route.flush_mode = wire::FlushMode::FlushOnTurnEnd;
     }
     apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
-    let env = build_hook_envelope(&args, route, payload, session_id, event);
+    let mut env = build_hook_envelope(&args, route, payload, session_id, event);
+    if let Some(context) = &managed_context {
+        env.managed_run_id = Some(context.managed_run_id.clone());
+    }
 
-    let socket = paths::socket_path(args.socket.as_deref());
-    forward_envelope(&env, &socket, &host, args.no_spawn).await?;
+    let socket = managed_context
+        .as_ref()
+        .map(|context| context.socket.clone())
+        .unwrap_or_else(|| paths::socket_path(args.socket.as_deref()));
+    forward_envelope(
+        &env,
+        &socket,
+        &host,
+        args.no_spawn || managed_context.is_some(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -776,6 +830,32 @@ pub async fn run_import(
         .map(|components| wire::TraceDestination::ParentSpan { components })
         .or_else(|| args.destination.clone());
     apply_import_destination(&mut config, destination)?;
+    if args.source == ImportSource::Muse {
+        if args.attach {
+            return attach_muse_session(
+                &args.session_ids[0],
+                opts,
+                config,
+                Some(paths::data_dir(None)),
+            )
+            .await;
+        }
+        let session_ids = if args.all {
+            muse_msp_session_ids().await?
+        } else {
+            args.session_ids.clone()
+        };
+        if session_ids.is_empty() {
+            anyhow::bail!("no durable Muse sessions found to import")
+        }
+        return import_muse_sessions_with_ledger(
+            &session_ids,
+            opts,
+            config,
+            Some(paths::data_dir(None)),
+        )
+        .await;
+    }
     let files = transcript_import::resolve_transcripts(&args.session_ids, args.all, args.source)?;
     let ledger_dir = paths::data_dir(None);
     if args.attach {
@@ -816,6 +896,396 @@ fn apply_import_span_plugins(
         });
     }
     Ok(())
+}
+
+async fn export_muse_session(session_id: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    transcript_import::validate_session_id(session_id)?;
+    let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
+    let mut child = tokio::process::Command::new(&executable)
+        .kill_on_drop(true)
+        .args(["export", "--session", session_id, "--out"])
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "run {} export for Muse session {session_id}",
+                executable.to_string_lossy()
+            )
+        })?;
+    let stderr = child.stderr.take().expect("piped stderr");
+    let diagnostics = tokio::spawn(muse_drain_stderr(stderr));
+    let status = tokio::time::timeout(Duration::from_secs(300), child.wait())
+        .await
+        .with_context(|| format!("Muse export for session {session_id} timed out"))?
+        .with_context(|| format!("wait for Muse export of session {session_id}"))?;
+    let stderr = diagnostics
+        .await
+        .context("collect Muse export diagnostics")??;
+    if !status.success() {
+        anyhow::bail!(
+            "Muse export for session {session_id} failed: {}",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// List durable Muse sessions through the read-only MSP surface. This never
+/// resumes a session, obtains a writer lease, or subscribes to its view; the
+/// export command remains the authoritative content reader.
+async fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
+    let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
+    let mut child = tokio::process::Command::new(&executable)
+        .kill_on_drop(true)
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "run {} serve to list Muse sessions",
+                executable.to_string_lossy()
+            )
+        })?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let diagnostics = tokio::spawn(muse_drain_stderr(stderr));
+    let mut reader = BufReader::new(stdout).lines();
+    let listing = async {
+        let mut request_id = 1u64;
+        muse_msp_request(
+            &mut stdin,
+            &mut reader,
+            request_id,
+            "initialize",
+            serde_json::json!({"clientInfo":{"name":"braintrust_muse_import","version":"1"}}),
+        )
+        .await?;
+        // Muse requires the initialized notification before other requests.
+        muse_msp_notify(&mut stdin, "initialized").await?;
+        let mut cursor = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut sessions = Vec::new();
+        for page_index in 0..MUSE_MSP_MAX_PAGES {
+            request_id += 1;
+            let result = muse_msp_request(
+                &mut stdin,
+                &mut reader,
+                request_id,
+                "session/list",
+                serde_json::json!({"cursor": cursor, "limit": 200}),
+            )
+            .await?;
+            match muse_msp_append_page(result, page_index + 1, &mut sessions, &mut seen_cursors)? {
+                None => {
+                    sessions.sort();
+                    sessions.dedup();
+                    return Ok(sessions);
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        anyhow::bail!("Muse session/list exceeded {MUSE_MSP_MAX_PAGES} pages")
+    }
+    .await;
+    drop(stdin);
+    drop(reader);
+    let status = match tokio::time::timeout(MUSE_MSP_SHUTDOWN_TIMEOUT, child.wait()).await {
+        Ok(status) => status.context("wait for Muse MSP host")?,
+        Err(_) => {
+            child
+                .start_kill()
+                .context("stop unresponsive Muse MSP host")?;
+            child
+                .wait()
+                .await
+                .context("reap unresponsive Muse MSP host")?;
+            anyhow::bail!("Muse MSP host did not exit after stdin closed")
+        }
+    };
+    let stderr = diagnostics
+        .await
+        .context("collect Muse MSP diagnostics")??;
+    let sessions = listing?;
+    if !status.success() {
+        anyhow::bail!("Muse MSP session listing failed: {}", stderr.trim());
+    }
+    Ok(sessions)
+}
+
+#[derive(Deserialize)]
+struct MuseMspSessionPage {
+    sessions: Vec<MuseMspSessionEntry>,
+    #[serde(rename = "nextCursor")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MuseMspSessionEntry {
+    #[serde(rename = "sessionId", alias = "session_id")]
+    session_id: String,
+}
+
+fn muse_msp_append_page(
+    result: serde_json::Value,
+    page_index: usize,
+    sessions: &mut Vec<String>,
+    seen_cursors: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<Option<String>> {
+    let page: MuseMspSessionPage = serde_json::from_value(result)
+        .with_context(|| format!("decode Muse session/list page {page_index}"))?;
+    for session in page.sessions {
+        transcript_import::validate_session_id(&session.session_id).with_context(|| {
+            format!("invalid Muse session id on session/list page {page_index}")
+        })?;
+        sessions.push(session.session_id);
+    }
+    if let Some(cursor) = &page.next_cursor {
+        if !seen_cursors.insert(cursor.clone()) {
+            anyhow::bail!("Muse session/list repeated cursor on page {page_index}")
+        }
+    }
+    Ok(page.next_cursor)
+}
+
+async fn muse_drain_stderr(mut stderr: tokio::process::ChildStderr) -> anyhow::Result<String> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = stderr.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MUSE_MSP_DIAGNOSTIC_BYTES.saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..count.min(remaining)]);
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+async fn muse_msp_notify<W>(stdin: &mut W, method: &str) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut frame = serde_json::to_string(&serde_json::json!({"jsonrpc":"2.0", "method":method}))?;
+    frame.push('\n');
+    tokio::time::timeout(MUSE_MSP_REQUEST_TIMEOUT, async {
+        stdin.write_all(frame.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Muse MSP timed out sending {method}"))?
+}
+
+async fn muse_msp_request<R, W>(
+    stdin: &mut W,
+    reader: &mut Lines<R>,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<serde_json::Value>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut request = serde_json::to_string(
+        &serde_json::json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
+    )?;
+    request.push('\n');
+    tokio::time::timeout(MUSE_MSP_REQUEST_TIMEOUT, async {
+        stdin.write_all(request.as_bytes()).await?;
+        stdin.flush().await?;
+        loop {
+            let line = reader
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Muse MSP closed before responding to {method}"))?;
+            let frame: serde_json::Value = serde_json::from_str(&line)
+                .with_context(|| format!("parse Muse MSP frame while waiting for {method}"))?;
+            if frame.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+                anyhow::bail!(
+                    "Muse MSP sent a frame without JSON-RPC 2.0 while waiting for {method}"
+                )
+            }
+            let Some(response_id) = frame.get("id") else {
+                // Notifications can be interleaved with responses.
+                continue;
+            };
+            if response_id.as_u64() != Some(id) {
+                anyhow::bail!("Muse MSP returned an unexpected response id for {method}")
+            }
+            if let Some(error) = frame.get("error") {
+                anyhow::bail!("Muse MSP {method} failed: {error}")
+            }
+            return frame
+                .get("result")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Muse MSP {method} response has no result"));
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Muse MSP timed out waiting for {method}"))?
+}
+
+async fn import_muse_sessions_with_ledger(
+    session_ids: &[String],
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    ledger_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+    let mut summaries = Vec::new();
+    for session_id in session_ids {
+        let directory = tempfile::Builder::new()
+            .prefix("bt-muse-import-")
+            .tempdir()?;
+        let export = directory.path().join("session.json");
+        export_muse_session(session_id, &export).await?;
+        let ended = process_muse_export(&mut processor, &export, session_id).await?;
+        let summary = if ended {
+            processor.finish_session(session_id).await?
+        } else {
+            processor.detach_session(session_id).await?
+        };
+        if let Some(summary) = summary {
+            summaries.push(summary);
+        }
+    }
+    summaries.extend(processor.finish().await?);
+    Ok(summaries)
+}
+
+async fn process_muse_export(
+    processor: &mut ImportProcessor,
+    export: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    process_muse_snapshot(processor, export, session_id, true, 0)
+        .await
+        .map(|(_, ended)| ended)
+}
+
+/// The file is fully parsed on every poll. Only envelopes beyond the previous
+/// snapshot are sent to the long-lived translator and sink, so open model and
+/// turn state is retained without replaying old starts into it.
+async fn process_muse_snapshot(
+    processor: &mut ImportProcessor,
+    export: &std::path::Path,
+    session_id: &str,
+    attach_snapshot: bool,
+    skip_envelopes: usize,
+) -> anyhow::Result<(usize, bool)> {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<Envelope>>(4);
+    let export_for_parser = export.to_path_buf();
+    let expected_id = session_id.to_owned();
+    let parser = tokio::task::spawn_blocking(move || {
+        let mut batch = Vec::with_capacity(128);
+        let mut envelope_count = 0usize;
+        let ended = transcript_import::muse::for_each_snapshot_envelope_for_session(
+            &export_for_parser,
+            &expected_id,
+            attach_snapshot,
+            |entry| {
+                envelope_count += 1;
+                if envelope_count <= skip_envelopes {
+                    return Ok(());
+                }
+                batch.push(entry);
+                if batch.len() == 128 {
+                    sender
+                        .blocking_send(std::mem::take(&mut batch))
+                        .map_err(|_| {
+                            anyhow::anyhow!("Muse import stopped while parsing {expected_id}")
+                        })?;
+                }
+                Ok(())
+            },
+        )?;
+        if envelope_count < skip_envelopes {
+            anyhow::bail!(
+                "Muse export for {expected_id} shrank from {skip_envelopes} to {envelope_count} trace events"
+            );
+        }
+        if !batch.is_empty() {
+            sender
+                .blocking_send(batch)
+                .map_err(|_| anyhow::anyhow!("Muse import stopped while parsing {expected_id}"))?;
+        }
+        Ok::<(usize, bool), anyhow::Error>((envelope_count, ended))
+    });
+    let mut processing_error = None;
+    while let Some(batch) = receiver.recv().await {
+        if let Err(error) = processor.process(batch).await {
+            processing_error = Some(error);
+            break;
+        }
+    }
+    drop(receiver);
+    let parse_result = parser.await.context("Muse export parser task failed")?;
+    if let Some(error) = processing_error {
+        return Err(error);
+    }
+    parse_result
+}
+
+async fn attach_muse_session(
+    session_id: &str,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    ledger_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
+    transcript_import::validate_session_id(session_id)?;
+    let directory = tempfile::Builder::new()
+        .prefix("bt-muse-attach-")
+        .tempdir()?;
+    let export = directory.path().join("session.json");
+    attach_muse_export(&export, session_id, true, opts, config, ledger_dir).await
+}
+
+async fn attach_muse_export(
+    export: &std::path::Path,
+    session_id: &str,
+    reexport: bool,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    ledger_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+    let mut emitted = 0usize;
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        if reexport {
+            export_muse_session(session_id, export).await?;
+        }
+        let (count, ended) =
+            process_muse_snapshot(&mut processor, export, session_id, true, emitted).await?;
+        if count != emitted {
+            processor.flush_open().await?;
+        }
+        emitted = count;
+        if ended {
+            return processor.finish().await;
+        }
+        tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+    // Capture one final complete snapshot before interrupting any still-open
+    // spans, matching the finalization behavior of other attach sources.
+    if reexport {
+        export_muse_session(session_id, export).await?;
+    }
+    process_muse_snapshot(&mut processor, export, session_id, true, emitted).await?;
+    processor.finish().await
 }
 
 fn validate_import_selection(args: &ImportArgs) -> anyhow::Result<()> {
@@ -912,6 +1382,7 @@ pub async fn run_traced(
     args: RunArgs,
     hook_command: RunHookCommand,
     mut route: SessionRoute,
+    host: HostInfo,
 ) -> anyhow::Result<std::process::ExitStatus> {
     apply_run_span_plugins(&mut route, &args.plugin)?;
     if route.destination.is_none() {
@@ -932,23 +1403,57 @@ pub async fn run_traced(
     }
     let (executable_env, default_executable) = match args.source {
         RunSource::Codex => ("CODEX_BIN", "codex"),
+        RunSource::Muse => ("MUSE_BIN", "muse"),
         RunSource::Claude => ("CLAUDE_BIN", "claude"),
         RunSource::OpenCode => ("OPENCODE_BIN", "opencode"),
         RunSource::Pi => ("PI_BIN", "pi"),
     };
     let executable =
         std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
+    if args.source == RunSource::Muse {
+        setup::check_muse_project_hooks(&std::env::current_dir()?)?;
+        for (index, arg) in args.agent_args.iter().enumerate() {
+            let Some(arg) = arg.to_str() else { continue };
+            let workspace = if arg == "--workspace" {
+                args.agent_args.get(index + 1).map(PathBuf::from)
+            } else {
+                arg.strip_prefix("--workspace=").map(PathBuf::from)
+            };
+            if let Some(workspace) = workspace {
+                setup::check_muse_project_hooks(&workspace)?;
+            }
+        }
+        let output = tokio::process::Command::new(&executable)
+            .arg("--version")
+            .output()
+            .await
+            .context("check Muse Code version for managed hooks")?;
+        if !output.status.success()
+            || setup::muse_version(&output.stdout)? != semver::Version::new(1, 1, 1)
+        {
+            anyhow::bail!("Muse managed runs require the verified Muse Code 1.1.1 hook override");
+        }
+    }
     let injected_args = managed_run_args(args.source, &hook_command)?;
     let managed_run_id = uuid::Uuid::new_v4().to_string();
     // A caller-supplied socket is already an explicit daemon boundary (for
     // example an integration harness or a deliberately isolated runtime).
     // Only create our own boundary when environment auth would otherwise use
     // the ambient shared daemon.
-    let isolate_daemon = route.auth.effective_source() == wire::AuthSource::Environment
+    let isolate_daemon = (args.source == RunSource::Muse
+        || route.auth.effective_source() == wire::AuthSource::Environment)
         && std::env::var_os(paths::SOCKET_ENV).is_none();
     let isolated_runtime = isolate_daemon
         .then(|| ManagedRunRuntime::new(&managed_run_id))
         .transpose()?;
+    let muse_context_dir = (args.source == RunSource::Muse && isolated_runtime.is_none())
+        .then(|| {
+            tempfile::Builder::new()
+                .prefix("bt-trace-run-muse-")
+                .tempdir()
+        })
+        .transpose()?;
+    let muse_route = (args.source == RunSource::Muse).then(|| route.clone());
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut command = tokio::process::Command::new(&executable);
     command
@@ -957,6 +1462,40 @@ pub async fn run_traced(
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
+    if args.source == RunSource::Muse {
+        let context_dir = isolated_runtime
+            .as_ref()
+            .map(|runtime| runtime.temp_dir.path())
+            .or_else(|| muse_context_dir.as_ref().map(|dir| dir.path()))
+            .expect("Muse has an invocation directory");
+        let context = MuseManagedContext {
+            route: muse_route.expect("Muse route is available"),
+            managed_run_id: managed_run_id.clone(),
+            socket: isolated_runtime
+                .as_ref()
+                .map(|runtime| runtime.socket.clone())
+                .unwrap_or_else(|| paths::socket_path(None)),
+        };
+        let context_path = context_dir.join("muse-context.json");
+        std::fs::write(&context_path, serde_json::to_vec(&context)?)?;
+        let mut hook = hook_command.clone();
+        hook.args.extend([
+            OsString::from("--source"),
+            OsString::from("muse"),
+            OsString::from("--managed-run-hook"),
+            OsString::from("--flush-on-turn-end"),
+            OsString::from("--managed-context"),
+            context_path.into_os_string(),
+        ]);
+        let command_string = shell_command(&hook, cfg!(windows))?;
+        let hooks = setup::muse_managed_hook_config(&paths::muse_config_dir(), &command_string)?;
+        let hooks_path = context_dir.join("muse-hooks.json");
+        std::fs::write(&hooks_path, serde_json::to_vec(&hooks)?)?;
+        command.env("TBH_MANAGED_HOOKS_PATH", hooks_path);
+        if let Some(runtime) = &isolated_runtime {
+            start_muse_managed_daemon(&host, runtime).await?;
+        }
+    }
     if let Some(runtime) = &isolated_runtime {
         command
             .env(paths::SOCKET_ENV, &runtime.socket)
@@ -968,9 +1507,20 @@ pub async fn run_traced(
             opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?,
         );
     }
-    let mut child = command.spawn().map_err(|error| {
-        anyhow::anyhow!("failed to launch {}: {error}", executable.to_string_lossy())
-    })?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if args.source == RunSource::Muse {
+                if let Some(runtime) = &isolated_runtime {
+                    let _ = shutdown_daemon(&runtime.socket).await;
+                }
+            }
+            return Err(anyhow::anyhow!(
+                "failed to launch {}: {error}",
+                executable.to_string_lossy()
+            ));
+        }
+    };
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
 
@@ -1046,6 +1596,18 @@ impl ManagedRunRuntime {
     }
 }
 
+async fn start_muse_managed_daemon(
+    host: &HostInfo,
+    runtime: &ManagedRunRuntime,
+) -> anyhow::Result<()> {
+    let stream =
+        client::ensure_daemon_in(&runtime.socket, host, false, Some(runtime.temp_dir.path()))
+            .await
+            .context("start isolated daemon for Muse managed run")?;
+    drop(stream);
+    Ok(())
+}
+
 fn apply_run_span_plugins(route: &mut SessionRoute, plugins: &[PathBuf]) -> anyhow::Result<()> {
     route.span_plugins = resolve_span_plugin_paths(plugins)?;
     Ok(())
@@ -1070,6 +1632,7 @@ fn managed_run_args(
 ) -> anyhow::Result<Vec<OsString>> {
     let source_name = match source {
         RunSource::Codex => "codex",
+        RunSource::Muse => "muse",
         RunSource::Claude => "claude",
         RunSource::OpenCode => "opencode",
         RunSource::Pi => "pi",
@@ -1088,7 +1651,7 @@ fn managed_run_args(
                 _ => unreachable!(),
             }
         }
-        RunSource::OpenCode => Ok(Vec::new()),
+        RunSource::Muse | RunSource::OpenCode => Ok(Vec::new()),
         RunSource::Pi => {
             let extension = match std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC") {
                 Some(extension) => extension,
@@ -1132,15 +1695,25 @@ fn managed_hook_shell_command(
     argv.push(OsString::from("--source"));
     argv.push(OsString::from(source));
     argv.push(OsString::from("--managed-run-hook"));
+    shell_argv(&argv, windows)
+}
+
+fn shell_command(command: &RunHookCommand, windows: bool) -> anyhow::Result<String> {
+    let mut argv = vec![command.program.clone()];
+    argv.extend(command.args.iter().cloned());
+    shell_argv(&argv, windows)
+}
+
+fn shell_argv(argv: &[OsString], windows: bool) -> anyhow::Result<String> {
     let mut rendered = Vec::with_capacity(argv.len());
     for arg in argv {
         let arg = arg
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("managed hook command contains non-Unicode argv"))?;
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("managed hook command contains non-Unicode argv"))?;
         rendered.push(if windows {
-            quote_windows_command_arg(&arg)
+            quote_windows_command_arg(arg)
         } else {
-            quote_unix_shell_arg(&arg)
+            quote_unix_shell_arg(arg)
         });
     }
     Ok(rendered.join(" "))
@@ -1263,6 +1836,25 @@ async fn import_transcript_with_ledger(
     attach: bool,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
+    if source == ImportSource::Muse {
+        let session_id = transcript_import::muse::session_id(file)?;
+        if attach {
+            return attach_muse_export(file, &session_id, false, opts, config, ledger_dir).await;
+        }
+        let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+        let ended = process_muse_export(&mut processor, file, &session_id).await?;
+        let mut summaries = Vec::new();
+        let summary = if ended {
+            processor.finish_session(&session_id).await?
+        } else {
+            processor.detach_session(&session_id).await?
+        };
+        if let Some(summary) = summary {
+            summaries.push(summary);
+        }
+        summaries.extend(processor.finish().await?);
+        return Ok(summaries);
+    }
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
     let mut processor = ImportProcessor::new(opts, config, ledger_dir);
     let shutdown = tokio::signal::ctrl_c();
@@ -1533,10 +2125,18 @@ impl ImportProcessor {
             let ops = live.translator.flush(&live.ctx)?;
             Self::emit_translator_batches(&mut live, ops).await?;
             live.sink.flush().await?;
-            summaries.push(Self::summary(sid, live));
+            summaries.push(Self::summary(sid, live, true));
         }
         summaries.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         Ok(summaries)
+    }
+
+    async fn flush_open(&mut self) -> anyhow::Result<()> {
+        for live in self.sessions.values_mut() {
+            live.sink.flush().await?;
+            live.pending_ops = 0;
+        }
+        Ok(())
     }
 
     async fn finish_session(&mut self, session_id: &str) -> anyhow::Result<Option<ImportSummary>> {
@@ -1546,16 +2146,27 @@ impl ImportProcessor {
         let ops = live.translator.flush(&live.ctx)?;
         Self::emit_translator_batches(&mut live, ops).await?;
         live.sink.flush().await?;
-        Ok(Some(Self::summary(session_id.to_string(), live)))
+        Ok(Some(Self::summary(session_id.to_string(), live, true)))
     }
 
-    fn summary(session_id: String, live: ImportLive) -> ImportSummary {
+    /// A one-shot snapshot of an active session must not mark its spans
+    /// complete in the destination ledger. A later import can then extend the
+    /// same deterministic rows when Muse records the real terminal events.
+    async fn detach_session(&mut self, session_id: &str) -> anyhow::Result<Option<ImportSummary>> {
+        let Some(mut live) = self.sessions.remove(session_id) else {
+            return Ok(None);
+        };
+        live.sink.flush().await?;
+        Ok(Some(Self::summary(session_id.to_string(), live, false)))
+    }
+
+    fn summary(session_id: String, live: ImportLive, finalized: bool) -> ImportSummary {
         ImportSummary {
             session_id,
             destination: live.destination,
             root_span_id: live.root_span_id,
             span_count: live.span_ids.len(),
-            finalized: true,
+            finalized,
         }
     }
 }
@@ -1663,6 +2274,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     #[derive(Debug, Parser)]
     struct ImportCli {
@@ -1680,6 +2292,94 @@ mod tests {
     struct HookCli {
         #[command(flatten)]
         args: HookArgs,
+    }
+
+    #[tokio::test]
+    async fn muse_attach_snapshots_reuse_one_trace_and_keep_open_spans() {
+        let temp = tempfile::tempdir().unwrap();
+        let export = temp.path().join("export.json");
+        let output = temp.path().join("spans");
+        let mut processor = ImportProcessor::new(
+            ServeOptions {
+                version: "test".into(),
+                translators: Arc::new(Registry::default_agents()),
+                sink_factory: Arc::new(DebugSinkFactory {
+                    dir: output.clone(),
+                }),
+                auth_provider: None,
+            },
+            None,
+            None,
+        );
+        let mut events = vec![
+            json!({"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}}),
+            json!({"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_input_trace_recorded","request_record_id":"request-1"}}}}),
+        ];
+        let write = |events: &[serde_json::Value]| {
+            std::fs::write(
+                &export,
+                serde_json::to_vec(&json!({
+                    "export_schema_version":1,
+                    "sessions":[{"session_id":"muse-attach"}],
+                    "events":events,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write(&events);
+        let (count, ended) = process_muse_snapshot(&mut processor, &export, "muse-attach", true, 0)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        assert!(!ended);
+        processor.flush_open().await.unwrap();
+        let (same_count, ended) =
+            process_muse_snapshot(&mut processor, &export, "muse-attach", true, count)
+                .await
+                .unwrap();
+        assert_eq!(same_count, count);
+        assert!(!ended);
+        events.extend([
+            json!({"recorded_at":1_002_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_completed","usage":{"input_tokens":2}}}}}),
+            json!({"recorded_at":1_003_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"assistant_message_committed","text":"done"}}}}),
+            json!({"recorded_at":1_004_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}}),
+            json!({"recorded_at":1_005_000,"envelope":{"payload":{"kind":"session_end"}}}),
+        ]);
+        write(&events);
+        let (_, ended) = process_muse_snapshot(&mut processor, &export, "muse-attach", true, count)
+            .await
+            .unwrap();
+        assert!(ended);
+        processor.finish().await.unwrap();
+        let rows = std::fs::read_to_string(output.join("muse-attach.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for identity in ["root", "turn:run-1", "llm:request-1"] {
+            let id = ids::span_id(&ids::session_namespace("muse", "muse-attach"), identity);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row
+                        .pointer("/Insert/span_id")
+                        .and_then(|value| value.as_str())
+                        == Some(id.as_str()))
+                    .count(),
+                1,
+                "duplicate insert for {identity}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row
+                        .pointer("/Merge/span_id")
+                        .and_then(|value| value.as_str())
+                        == Some(id.as_str()))
+                    .count(),
+                1,
+                "missing or duplicate completion for {identity}"
+            );
+        }
     }
 
     #[test]
@@ -1845,6 +2545,126 @@ mod tests {
         assert!(resolved[0].is_absolute());
     }
 
+    #[tokio::test]
+    async fn muse_msp_handshake_writes_notification_and_skips_notifications() {
+        let (client, server) = tokio::io::duplex(4_096);
+        let (client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, mut server_writer) = tokio::io::split(server);
+        let server = tokio::spawn(async move {
+            let mut incoming = BufReader::new(server_reader).lines();
+            let initialized = incoming.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&initialized).unwrap(),
+                json!({"jsonrpc": "2.0", "method": "initialized"})
+            );
+            let request = incoming.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"],
+                7
+            );
+            server_writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/changed\"}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"sessions\":[]}}\n")
+                .await
+                .unwrap();
+        });
+
+        let mut reader = BufReader::new(client_reader).lines();
+        muse_msp_notify(&mut client_writer, "initialized")
+            .await
+            .unwrap();
+        let result = muse_msp_request(
+            &mut client_writer,
+            &mut reader,
+            7,
+            "session/list",
+            json!({"cursor": null, "limit": 200}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, json!({"sessions": []}));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn muse_msp_pages_reject_partial_or_cyclic_session_lists() {
+        let mut sessions = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        assert_eq!(
+            muse_msp_append_page(
+                json!({"sessions":[{"sessionId":"session-a"}],"nextCursor":"next"}),
+                1,
+                &mut sessions,
+                &mut cursors,
+            )
+            .unwrap(),
+            Some("next".to_owned())
+        );
+        assert_eq!(sessions, ["session-a"]);
+        assert!(muse_msp_append_page(
+            json!({"sessions":[],"nextCursor":"next"}),
+            2,
+            &mut sessions,
+            &mut cursors,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("repeated cursor"));
+        assert!(muse_msp_append_page(
+            json!({"sessions":[{"status":"notLoaded"}]}),
+            2,
+            &mut sessions,
+            &mut cursors,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("decode Muse session/list page 2"));
+    }
+
+    #[tokio::test]
+    async fn muse_msp_request_accepts_notifications_but_rejects_wrong_response_ids() {
+        async fn exchange(response: &str) -> anyhow::Result<serde_json::Value> {
+            let (client, server) = tokio::io::duplex(4096);
+            let (client_read, mut client_write) = tokio::io::split(client);
+            let (server_read, mut server_write) = tokio::io::split(server);
+            let response = response.to_owned();
+            let server = tokio::spawn(async move {
+                let request = BufReader::new(server_read)
+                    .lines()
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"],
+                    7
+                );
+                server_write.write_all(response.as_bytes()).await.unwrap();
+            });
+            let result = muse_msp_request(
+                &mut client_write,
+                &mut BufReader::new(client_read).lines(),
+                7,
+                "session/list",
+                json!({}),
+            )
+            .await;
+            server.await.unwrap();
+            result
+        }
+
+        let result = exchange(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"progress\"}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"sessions\":[]}}\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, json!({"sessions": []}));
+        assert!(exchange("{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{}}\n")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected response id"));
+    }
+
     #[test]
     fn additional_metadata_overrides_a_route_only_with_a_json_object() {
         let mut route = SessionRoute {
@@ -1946,6 +2766,11 @@ mod tests {
             .args;
         assert!(all.session_ids.is_empty());
         assert!(all.all);
+
+        let muse = ImportCli::try_parse_from(["test", "muse", "session-a"])
+            .unwrap()
+            .args;
+        assert_eq!(muse.source, ImportSource::Muse);
 
         assert!(ImportCli::try_parse_from(["test", "codex"]).is_err());
         assert!(ImportCli::try_parse_from(["test", "codex", "session-a", "--all"]).is_err());
@@ -2188,6 +3013,122 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repeated_muse_import_does_not_emit_a_second_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let export = temp.path().join("muse-export.json");
+        std::fs::write(
+            &export,
+            serde_json::to_vec(&json!({
+                "export_schema_version":1,
+                "sessions":[{"session_id":"muse-ledger"}],
+                "events":[
+                    {"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}},
+                    {"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}},
+                    {"recorded_at":1_002_000,"envelope":{"payload":{"kind":"session_end"}}}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let import = || {
+            import_transcript_with_ledger(
+                &export,
+                ImportSource::Muse,
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                false,
+                Some(ledger.clone()),
+            )
+        };
+        import().await.unwrap();
+        let rows = output.join("spans/muse-ledger.ndjson");
+        let first = std::fs::read_to_string(&rows).unwrap();
+        assert!(first.contains("Muse Code"));
+        import().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&rows).unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn later_muse_import_completes_an_active_snapshot_on_the_same_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let export = temp.path().join("muse-export.json");
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let started = json!({"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}});
+        let write = |events: Vec<serde_json::Value>| {
+            std::fs::write(
+                &export,
+                serde_json::to_vec(&json!({
+                    "export_schema_version":1,
+                    "sessions":[{"session_id":"muse-active-import"}],
+                    "events":events,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let import = || {
+            import_transcript_with_ledger(
+                &export,
+                ImportSource::Muse,
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                false,
+                Some(ledger.clone()),
+            )
+        };
+        write(vec![started.clone()]);
+        let summaries = import().await.unwrap();
+        assert!(!summaries[0].finalized);
+        let rows_path = output.join("spans/muse-active-import.ndjson");
+        let first = std::fs::read_to_string(&rows_path).unwrap();
+        assert!(!first.contains("\"Merge\""));
+
+        write(vec![
+            started,
+            json!({"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}}),
+            json!({"recorded_at":1_002_000,"envelope":{"payload":{"kind":"session_end"}}}),
+        ]);
+        let summaries = import().await.unwrap();
+        assert!(summaries[0].finalized);
+        let rows = std::fs::read_to_string(&rows_path).unwrap();
+        let parsed = rows
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let root_id = ids::span_id(
+            &ids::session_namespace("muse", "muse-active-import"),
+            "root",
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|row| row
+                    .pointer("/Insert/span_id")
+                    .and_then(|value| value.as_str())
+                    == Some(root_id.as_str()))
+                .count(),
+            2
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|row| row
+                    .pointer("/Merge/span_id")
+                    .and_then(|value| value.as_str())
+                    == Some(root_id.as_str()))
+                .count(),
+            1
+        );
+        assert!(rows.contains("\"end_ms\":1002"));
+        let completed = rows.clone();
+        import().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&rows_path).unwrap(), completed);
+    }
+
     fn test_run_hook_command() -> RunHookCommand {
         RunHookCommand {
             program: OsString::from("/opt/Braintrust CLI/bt"),
@@ -2207,6 +3148,10 @@ mod tests {
             },
             test_run_hook_command(),
             SessionRoute::default(),
+            HostInfo {
+                serve_argv: Vec::new(),
+                version: "test".into(),
+            },
         )
         .await
         .unwrap_err();
@@ -2231,6 +3176,10 @@ mod tests {
                     project_name: None,
                 }),
                 ..SessionRoute::default()
+            },
+            HostInfo {
+                serve_argv: Vec::new(),
+                version: "test".into(),
             },
         )
         .await
@@ -2328,5 +3277,34 @@ mod tests {
         let windows = managed_hook_shell_command(&hook, "claude", true).unwrap();
         assert!(windows
             .contains("\"/opt/Braintrust CLI/bt\" \"agents\" \"hook\" \"--source\" \"claude\""));
+    }
+
+    #[tokio::test]
+    async fn muse_managed_hook_rejects_missing_context_before_reading_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = HookCli::try_parse_from([
+            "test",
+            "--source",
+            "muse",
+            "--managed-run-hook",
+            "--managed-context",
+            temp.path().join("missing.json").to_str().unwrap(),
+        ])
+        .unwrap()
+        .args;
+        let error = run_hook(
+            args,
+            SessionRoute::default(),
+            HostInfo {
+                serve_argv: Vec::new(),
+                version: "test".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

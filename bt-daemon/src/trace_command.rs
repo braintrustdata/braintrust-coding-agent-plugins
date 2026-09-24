@@ -63,6 +63,7 @@ pub struct DoctorArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DoctorAgent {
     Codex,
+    Muse,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
     #[value(name = "opencode", alias = "open-code")]
@@ -76,6 +77,7 @@ impl DoctorAgent {
     pub(crate) fn source(self) -> &'static str {
         match self {
             Self::Codex => "codex",
+            Self::Muse => "muse",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
@@ -87,6 +89,7 @@ impl DoctorAgent {
     pub(crate) fn display_name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
+            Self::Muse => "Muse Code",
             Self::Claude => "Claude Code",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
@@ -136,6 +139,8 @@ pub struct UpdateArgs {
 pub enum SetupAgent {
     /// Install the published Codex tracing plugin.
     Codex,
+    /// Configure Muse Code tracing hooks.
+    Muse,
     /// Install the published Claude Code tracing plugin.
     Claude,
     /// Configure the published OpenCode tracing plugin.
@@ -274,6 +279,7 @@ mod tests {
     fn doctor_accepts_every_supported_agent_alias() {
         for (agent, expected, source, display_name) in [
             ("codex", DoctorAgent::Codex, "codex", "Codex"),
+            ("muse", DoctorAgent::Muse, "muse", "Muse Code"),
             ("claude-code", DoctorAgent::Claude, "claude", "Claude Code"),
             ("open-code", DoctorAgent::OpenCode, "opencode", "OpenCode"),
             ("pi", DoctorAgent::Pi, "pi", "Pi"),
@@ -320,6 +326,27 @@ mod tests {
     }
 
     #[test]
+    fn muse_uses_shared_enable_and_disable_commands() {
+        for command in ["enable", "setup"] {
+            let parsed = Cli::try_parse_from(["bt", command, "muse"]).unwrap();
+            assert!(matches!(
+                parsed.trace.command,
+                TraceCommand::Setup(SetupArgs {
+                    agent: SetupAgent::Muse,
+                    ..
+                })
+            ));
+        }
+        let parsed = Cli::try_parse_from(["bt", "disable", "muse"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Disable(DisableArgs {
+                agent: SetupAgent::Muse
+            })
+        ));
+    }
+
+    #[test]
     fn grok_uses_shared_enable_disable_and_doctor_commands() {
         for command in ["enable", "setup"] {
             let parsed = Cli::try_parse_from(["bt", command, "grok"]).unwrap();
@@ -354,7 +381,15 @@ mod tests {
 
     #[test]
     fn update_accepts_every_setup_agent() {
-        for agent in ["codex", "claude", "opencode", "pi", "grok", "antigravity"] {
+        for agent in [
+            "codex",
+            "claude",
+            "opencode",
+            "pi",
+            "grok",
+            "muse",
+            "antigravity",
+        ] {
             assert!(matches!(
                 Cli::try_parse_from(["bt", "update", agent])
                     .unwrap()
@@ -363,6 +398,18 @@ mod tests {
                 TraceCommand::Update(_)
             ));
         }
+    }
+
+    #[test]
+    fn run_accepts_muse() {
+        let parsed = Cli::try_parse_from(["bt", "run", "muse", "exec", "hello"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Run(RunArgs {
+                source: crate::RunSource::Muse,
+                ..
+            })
+        ));
     }
 
     #[test]

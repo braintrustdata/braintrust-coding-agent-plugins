@@ -39,6 +39,8 @@ hook processes or JavaScript plugins.
 Each coding agent reads an independent non-credential `braintrust.json` file:
 
 - Codex: `~/.codex/braintrust.json`
+- Muse Code: `$XDG_CONFIG_HOME/muse/braintrust.json`, falling back to
+  `~/.config/muse/braintrust.json`
 - Claude Code: `~/.claude/braintrust.json`
 - OpenCode: `$XDG_CONFIG_HOME/opencode/braintrust.json`, falling back to
   `~/.config/opencode/braintrust.json`
@@ -242,15 +244,46 @@ echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./bt-daemon/target
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
 
-`import <codex|claude|antigravity> <session-id>` has a different purpose from restart
+`import <codex|claude|antigravity|muse> <session-id>` has a different purpose from restart
 recovery. It locates the native transcript in the selected agent's standard
 session store, synthesizes the lifecycle triggers that can be recovered from
 that transcript, and sends them through the normal translator and sink to
 create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
 
+Muse imports invoke its documented local `muse export --session` interface and
+read export schema version 1. `import muse --all` enumerates durable session
+IDs through Muse's read-only MSP `session/list` interface, then exports each
+completed session. Exports are parsed incrementally, one session at a time.
+Muse Code 1.1.1 setup captures the six verified lifecycle and model hooks:
+`SessionStart`, `UserPromptSubmit`, `PreLLMCall`, `PostLLMCall`, `Stop`, and
+`SessionEnd`. Tool, permission, subagent, and compaction details are not
+available from those hooks and are not inferred by the live translator.
+`import muse <session-id> --attach` follows an active session by polling full
+exports. Each snapshot is parsed with the same reader and translator as
+historical import; only new envelopes are delivered, and an active snapshot
+does not invent `Stop` or `SessionEnd` events. The attach exits after a native
+session end, or finalizes open spans on interruption. This reads the full
+export each poll, so polling cost grows with long sessions. MSP offers
+cursor-paged `view/page`, but its view events omit the model request/response
+records needed by this translator; `view/subscribe` also requires a session
+loaded on the same host.
+One-shot imports of active Muse sessions also leave spans open, allowing a
+later import to add the native completion to the same deterministic trace.
+`run muse` uses a process-local managed-hook override in the verified Muse Code
+1.1.1 release. It retains compatible unrelated managed hooks, replaces Braintrust's saved
+managed hooks only for that invocation, and leaves ordinary Muse sessions and
+settings unchanged. The injected hook reads a private invocation context file
+because Muse clears its hook environment. A dedicated daemon is started before
+Muse so environment-based Braintrust authentication never depends on that
+cleared environment. Known duplicate Braintrust user or project hooks stop the
+managed run with a diagnostic. A foreign managed file using Muse's strict
+handler schema is also rejected rather than silently losing hooks. Muse plugins that independently trace the same
+session should be disabled before using `run muse`; new Muse versions must be
+verified before the undocumented hook-path override is enabled for them.
+
 Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
-Ctrl-C. `run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent with
+Ctrl-C. `run <codex|muse|claude|opencode|pi> [ARGS...]` launches the selected agent with
 inherited stdio and injects Braintrust hooks or an adapter for that invocation, so it
 does not depend on the tracing plugin being installed or enabled. Managed runs
 suppress inherited Braintrust plugin hooks to avoid logging the same session

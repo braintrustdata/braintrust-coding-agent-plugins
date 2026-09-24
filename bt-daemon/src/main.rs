@@ -110,7 +110,7 @@ enum Command {
     },
     /// Print daemon/session status.
     Status(StatusArgs),
-    /// Import a past Codex or Claude Code session by its resume id.
+    /// Import a past coding-agent session by its resume id.
     Import(ImportArgs),
     /// Launch a coding agent with live tracing hooks for this invocation.
     Run {
@@ -307,7 +307,7 @@ async fn main() {
                 program: exe,
                 args: vec![OsString::from("hook")],
             };
-            match run_traced(args, hook_command, route.into_route()).await {
+            match run_traced(args, hook_command, route.into_route(), host_info()).await {
                 Ok(status) if status.success() => {}
                 Ok(status) => std::process::exit(status.code().unwrap_or(1)),
                 Err(error) => {
