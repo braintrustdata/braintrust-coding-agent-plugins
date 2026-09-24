@@ -410,49 +410,81 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
         app_url: Some(base.clone()),
         version: "test".into(),
     });
-    let mut sink = factory.create("sess-late", "codex", None).unwrap();
-    sink.configure(&session_config(&base));
+    // The same cached SDK client serves every source. Provenance must stay
+    // session-specific, including when the plugin version falls back to bt's.
+    for (source, plugin_version) in [
+        ("codex", Some("1.2.3")),
+        ("claude", Some("2.3.4")),
+        ("grok", Some("3.4.5")),
+        ("opencode", Some("4.5.6")),
+        ("pi", Some("5.6.7")),
+        ("antigravity", None),
+    ] {
+        let session_id = format!("sess-late-{source}");
+        let span_id = format!("finished-{source}");
+        let mut sink = factory.create(&session_id, source, plugin_version).unwrap();
+        sink.configure(&session_config(&base));
 
-    sink.emit(&[SpanOp::Insert(row(
-        "finished",
-        "trace-root",
-        &["turn-parent"],
-        "original name",
-        SpanType::Tool,
-        1,
-        Some(2),
-    ))])
-    .await
-    .unwrap();
-    sink.flush().await.unwrap();
-    let mut late = SpanRow {
-        span_id: "finished".into(),
-        root_span_id: "trace-root".into(),
-        parent_span_ids: vec!["turn-parent".into()],
-        output: Some(json!({"status":"late"})),
-        ..Default::default()
-    };
-    late.name.clear();
-    sink.emit(&[SpanOp::Merge(late)]).await.unwrap();
-    sink.flush().await.unwrap();
+        sink.emit(&[SpanOp::Insert(row(
+            &span_id,
+            "trace-root",
+            &["turn-parent"],
+            "original name",
+            SpanType::Tool,
+            1,
+            Some(2),
+        ))])
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        let late = SpanRow {
+            span_id: span_id.clone(),
+            root_span_id: "trace-root".into(),
+            parent_span_ids: vec!["turn-parent".into()],
+            output: Some(json!({"status":"late"})),
+            ..Default::default()
+        };
+        sink.emit(&[SpanOp::Merge(late.clone())]).await.unwrap();
+        sink.flush().await.unwrap();
 
-    let bodies = logs3_bodies(&server).await;
-    assert!(
-        bodies.contains("original name"),
-        "initial row absent: {bodies}"
-    );
-    let rows = logs3_rows(&server).await;
-    let late = rows
-        .iter()
-        .find(|row| row.pointer("/output/status") == Some(&json!("late")))
-        .unwrap_or_else(|| panic!("late merge absent: {bodies}"));
-    assert_eq!(late["_is_merge"], true);
-    assert_eq!(late["root_span_id"], "trace-root");
-    assert_eq!(
-        late["span_parents"],
-        json!(["turn-parent"]),
-        "stateless merge did not repeat the child parent identity: {bodies}"
-    );
+        // Recovery also starts without an open handle for an existing span.
+        drop(sink);
+        let mut recovered = factory.create(&session_id, source, plugin_version).unwrap();
+        recovered.configure(&session_config(&base));
+        recovered
+            .emit(&[SpanOp::Merge(SpanRow {
+                output: Some(json!({"status":"recovered"})),
+                ..late
+            })])
+            .await
+            .unwrap();
+        recovered.flush().await.unwrap();
+
+        let rows = logs3_rows(&server).await;
+        let rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row["span_id"] == span_id)
+            .collect();
+        assert!(rows
+            .iter()
+            .any(|row| row.pointer("/span_attributes/name") == Some(&json!("original name"))));
+        for status in ["late", "recovered"] {
+            let update = rows
+                .iter()
+                .find(|row| row.pointer("/output/status") == Some(&json!(status)))
+                .unwrap_or_else(|| panic!("{source}: {status} merge absent: {rows:?}"));
+            assert_eq!(update["_is_merge"], true);
+            assert_eq!(update["root_span_id"], "trace-root");
+            assert_eq!(update["span_parents"], json!(["turn-parent"]));
+        }
+        for row in rows {
+            let origin = &row["context"]["span_origin"];
+            assert_eq!(origin["name"], format!("braintrust.plugin.{source}"));
+            assert_eq!(origin["version"], plugin_version.unwrap_or("test"));
+            assert_eq!(origin["instrumentation"]["name"], "braintrust-plugin");
+            assert_eq!(row["metadata"]["bt_daemon_version"], "test");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
