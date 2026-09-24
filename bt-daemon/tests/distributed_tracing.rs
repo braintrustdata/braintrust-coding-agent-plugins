@@ -2164,6 +2164,78 @@ async fn sibling_agents_under_one_shell_remain_separate_with_active_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncated_first_parent_hook_capture_recovers_on_later_events() {
+    let (socket, daemon, recording, _tmp) = start_daemon().await;
+    let host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "test".into(),
+    };
+    let mut fixtures = DistributedFixtures::new();
+    let parent = ProcessTree::root(28_000);
+    let child = ProcessTree::child(28_002, 28_001, &parent);
+
+    let mut parent_events = fixtures.start_turn(
+        AgentKind::Claude,
+        "partial-parent",
+        &parent,
+        "delegate",
+        1_701_700_000_000,
+    );
+    // Process inspection saw only the short-lived hook process at startup.
+    parent_events[0]
+        .capture
+        .as_mut()
+        .unwrap()
+        .process_chain
+        .truncate(1);
+    forward_all(&mut parent_events, &socket, &host).await;
+    forward(
+        fixtures.open_tool(
+            AgentKind::Claude,
+            "partial-parent",
+            &parent,
+            "partial-parent-tool",
+            "delegate",
+            1_701_700_000_010,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+
+    let mut child_events = fixtures.start_turn(
+        AgentKind::Claude,
+        "partial-child",
+        &child,
+        "delegate",
+        1_701_700_000_020,
+    );
+    forward_all(&mut child_events, &socket, &host).await;
+    forward(
+        fixtures.close_session(
+            AgentKind::Claude,
+            "partial-child",
+            &child,
+            "done",
+            1_701_700_000_030,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("partial-child", &socket).await;
+    assert_pair_linked(
+        recording.as_ref(),
+        "partial-parent",
+        "partial-child",
+        "recovered capture",
+    );
+
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn child_does_not_skip_an_idle_agent_to_reach_a_grandparent_tool() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {

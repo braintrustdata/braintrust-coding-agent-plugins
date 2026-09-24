@@ -89,13 +89,13 @@ impl CorrelationRegistry {
                 .first()
                 .filter(|process| process.start_time_secs != 0)
                 .cloned()
-        } else if let Some(first) = state.unconfirmed_processes.get(key) {
+        } else if let Some(previous) = state.unconfirmed_processes.get(key) {
             // A command hook gets a fresh CLI process for each event. The first
-            // process shared by two hooks is the closest stable process owned
-            // by this session, even when the launcher adds extra shells.
+            // process shared by successive hooks is the closest stable process
+            // owned by this session, even when the launcher adds extra shells.
             processes
                 .iter()
-                .find(|process| first.contains(process))
+                .find(|process| previous.contains(process))
                 .filter(|process| process.start_time_secs != 0)
                 .cloned()
         } else {
@@ -104,7 +104,16 @@ impl CorrelationRegistry {
                 .insert(key.to_string(), processes);
             return;
         };
-        let Some(agent) = agent else { return };
+        let Some(agent) = agent else {
+            if uses_command_hook(source) {
+                // Process inspection may stop before the agent. Compare the
+                // next hook against this newer capture instead.
+                state
+                    .unconfirmed_processes
+                    .insert(key.to_string(), processes);
+            }
+            return;
+        };
         state.unconfirmed_processes.remove(key);
         state
             .session_processes
@@ -426,11 +435,11 @@ pub(crate) fn uses_command_hook(source: &str) -> bool {
 
 pub(crate) fn session_agent_process(
     source: &str,
-    first: &CaptureContext,
+    previous: &CaptureContext,
     latest: Option<&CaptureContext>,
 ) -> Option<ProcessIdentity> {
     if !uses_command_hook(source) {
-        return first
+        return previous
             .process_chain
             .first()
             .filter(|process| process.start_time_secs != 0)
@@ -442,7 +451,7 @@ pub(crate) fn session_agent_process(
         .iter()
         .skip(1)
         .find(|process| {
-            first
+            previous
                 .process_chain
                 .iter()
                 .skip(1)
