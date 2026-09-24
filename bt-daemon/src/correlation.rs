@@ -430,7 +430,7 @@ impl CorrelationRegistry {
 pub(crate) fn uses_command_hook(source: &str) -> bool {
     // Only the connecting CLI process is known to be outside the agent. The
     // number of shell or launcher processes between it and the agent varies.
-    matches!(source, "claude-code" | "codex")
+    matches!(source, "antigravity" | "claude-code" | "codex" | "grok")
 }
 
 pub(crate) fn session_agent_process(
@@ -580,6 +580,163 @@ fn hash(value: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process(pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            start_time_secs: u64::from(pid),
+        }
+    }
+
+    #[test]
+    fn every_command_hook_agent_is_identified_before_scanning_all_ancestors() {
+        let agent = process(10);
+        let parent_agent = process(20);
+        let first = CaptureContext {
+            process_chain: vec![
+                process(1),
+                process(2),
+                agent.clone(),
+                process(11),
+                process(12),
+                parent_agent.clone(),
+            ],
+        };
+        let latest = CaptureContext {
+            process_chain: vec![
+                process(3),
+                process(4),
+                agent.clone(),
+                process(11),
+                process(12),
+                parent_agent.clone(),
+            ],
+        };
+        for source in ["antigravity", "claude-code", "codex", "grok"] {
+            assert!(uses_command_hook(source), "{source} uses a CLI hook");
+            assert_eq!(
+                session_agent_process(source, &first, Some(&latest)),
+                Some(agent.clone())
+            );
+            let registry = CorrelationRegistry::default();
+            registry.observe_session(source, source, Some(&first));
+            registry.observe_session(source, source, Some(&latest));
+            let state = registry.state.lock().unwrap();
+            assert_eq!(
+                state.session_processes[source],
+                HashSet::from([agent.clone()])
+            );
+            assert!(!state.process_sessions.contains_key(&parent_agent));
+            let ancestors: Vec<_> = ancestors(&latest, Some(&agent)).unwrap().cloned().collect();
+            assert_eq!(
+                ancestors,
+                vec![process(11), process(12), parent_agent.clone()]
+            );
+        }
+        for source in ["pi", "opencode"] {
+            assert!(!uses_command_hook(source));
+            let in_process = CaptureContext {
+                process_chain: vec![
+                    agent.clone(),
+                    process(11),
+                    process(12),
+                    parent_agent.clone(),
+                ],
+            };
+            assert_eq!(
+                session_agent_process(source, &in_process, None),
+                Some(agent.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn every_agent_source_can_parent_every_other_source_through_wrappers() {
+        let sources = [
+            "antigravity",
+            "claude-code",
+            "codex",
+            "grok",
+            "pi",
+            "opencode",
+        ];
+        let parent_agent = process(20);
+        let child_agent = process(10);
+        for parent_source in sources {
+            for child_source in sources {
+                let registry = CorrelationRegistry::default();
+                let parent_first = CaptureContext {
+                    process_chain: if uses_command_hook(parent_source) {
+                        vec![process(30), parent_agent.clone()]
+                    } else {
+                        vec![parent_agent.clone()]
+                    },
+                };
+                registry.observe_session("parent", parent_source, Some(&parent_first));
+                if uses_command_hook(parent_source) {
+                    let parent_next = CaptureContext {
+                        process_chain: vec![process(31), parent_agent.clone()],
+                    };
+                    registry.observe_session("parent", parent_source, Some(&parent_next));
+                }
+                let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+                components.span_id = Some("tool".into());
+                registry.state.lock().unwrap().active_tools.insert(
+                    "parent".into(),
+                    HashMap::from([(
+                        "tool".into(),
+                        ActiveTool {
+                            components,
+                            route: SessionRoute::default(),
+                            fingerprints: HashSet::new(),
+                            active: true,
+                        },
+                    )]),
+                );
+
+                let ancestry = vec![
+                    child_agent.clone(),
+                    process(11),
+                    process(12),
+                    process(13),
+                    parent_agent.clone(),
+                ];
+                let child_first = CaptureContext {
+                    process_chain: if uses_command_hook(child_source) {
+                        [vec![process(40), process(41)], ancestry.clone()].concat()
+                    } else {
+                        ancestry.clone()
+                    },
+                };
+                let child_next = CaptureContext {
+                    process_chain: if uses_command_hook(child_source) {
+                        [vec![process(42), process(43)], ancestry].concat()
+                    } else {
+                        child_first.process_chain.clone()
+                    },
+                };
+                let child_agent =
+                    session_agent_process(child_source, &child_first, Some(&child_next));
+                assert_eq!(
+                    child_agent,
+                    Some(process(10)),
+                    "{parent_source} -> {child_source}"
+                );
+                assert!(
+                    matches!(
+                        registry.resolve(
+                            None,
+                            Some(&child_next),
+                            child_agent.as_ref(),
+                            &Value::Null
+                        ),
+                        Resolution::Parent(_)
+                    ),
+                    "{parent_source} -> {child_source} failed through wrapper processes"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fingerprints_match_prompt_subsets_without_parsing_shell() {
