@@ -43,6 +43,7 @@ impl AgentKind {
 pub struct ProcessTree {
     pub agent: ProcessIdentity,
     pub ancestors: Vec<ProcessIdentity>,
+    pub ancestor_labels: Vec<Vec<String>>,
 }
 
 impl ProcessTree {
@@ -50,6 +51,7 @@ impl ProcessTree {
         Self {
             agent: process(pid),
             ancestors: Vec::new(),
+            ancestor_labels: Vec::new(),
         }
     }
 
@@ -59,7 +61,13 @@ impl ProcessTree {
         Self {
             agent: process(pid),
             ancestors,
+            ancestor_labels: [vec![vec!["bash".into()]], parent.ancestor_labels.clone()].concat(),
         }
+    }
+
+    pub fn with_branch_label(mut self, label: &str) -> Self {
+        self.ancestor_labels[0].push(label.into());
+        self
     }
 
     fn capture(&self, kind: AgentKind, hook_pid: u32) -> CaptureContext {
@@ -69,7 +77,17 @@ impl ProcessTree {
         }
         process_chain.push(self.agent.clone());
         process_chain.extend(self.ancestors.iter().cloned());
-        CaptureContext { process_chain }
+        let mut process_labels = Vec::new();
+        if kind.uses_command_hook() {
+            process_labels.push(vec!["bt".into()]);
+        }
+        process_labels.push(vec![kind.label().into()]);
+        process_labels.extend(self.ancestor_labels.iter().cloned());
+        CaptureContext {
+            process_chain,
+            process_labels,
+            truncated: false,
+        }
     }
 }
 

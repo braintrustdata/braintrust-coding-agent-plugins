@@ -21,12 +21,20 @@ pub struct ProcessIdentity {
 /// Process evidence captured at the hook or in-process adapter boundary.
 ///
 /// `process_chain` is ordered from the process that connected to the daemon
-/// toward the operating-system root. It intentionally excludes command lines,
-/// environment variables, and working directories.
+/// toward the operating-system root. It intentionally excludes full command
+/// lines, environment variables, and working directories.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureContext {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_chain: Vec<ProcessIdentity>,
+    /// Executable and script basenames, aligned with `process_chain`. These
+    /// are captured while the processes are alive for ambiguous tool matching.
+    /// Full command lines and argument values are never retained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub process_labels: Vec<Vec<String>>,
+    /// The process walk stopped before reaching the operating-system root.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// One captured hook event, forwarded from a shim to the daemon.
@@ -366,6 +374,8 @@ mod tests {
                     pid: 42,
                     start_time_secs: 1_753_639_500,
                 }],
+                process_labels: Vec::new(),
+                truncated: false,
             }),
             payload: serde_json::json!({ "session_id": "sess-1", "tool_name": "shell" }),
             route: Some(SessionRoute {

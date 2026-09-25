@@ -286,6 +286,9 @@ struct DeliveryCheckpointRecord {
 }
 
 #[derive(Debug)]
+// Keep event records inline on the journal read path; the added capture
+// completeness bit makes this enum just exceed Clippy's size threshold.
+#[allow(clippy::large_enum_variant)]
 pub enum JournalRecord {
     Event(RedactedEnvelope),
     DeliveryCheckpoint { route: SessionRoute, through: u64 },

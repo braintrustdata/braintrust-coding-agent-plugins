@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 /// Injected dependencies for `serve`, so `bt` / tests can supply a sink
@@ -80,11 +80,15 @@ struct PendingSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     linked_route: Option<SessionRoute>,
     #[serde(default)]
+    standalone: bool,
+    #[serde(default)]
+    awaiting_agent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_process: Option<crate::wire::ProcessIdentity>,
+    #[serde(default)]
     events: Vec<PendingEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     candidate_span_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    evidence: Vec<Value>,
 }
 
 #[derive(Clone, Serialize)]
@@ -182,6 +186,7 @@ pub struct Daemon {
     sessions: Mutex<HashMap<DeliveryKey, Arc<Session>>>,
     correlation: Arc<crate::correlation::CorrelationRegistry>,
     automatic_links: Mutex<HashMap<String, SessionRoute>>,
+    standalone_links: Mutex<HashSet<String>>,
     pending_sessions: Mutex<HashMap<String, PendingSession>>,
     pending_reconcile_lock: tokio::sync::Mutex<()>,
     correlation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -219,6 +224,7 @@ impl Daemon {
             sessions: Mutex::new(HashMap::new()),
             correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
             automatic_links: Mutex::new(HashMap::new()),
+            standalone_links: Mutex::new(HashSet::new()),
             pending_sessions: Mutex::new(HashMap::new()),
             pending_reconcile_lock: tokio::sync::Mutex::new(()),
             correlation_locks: Mutex::new(HashMap::new()),
@@ -886,7 +892,7 @@ async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
     let journal_through = event.journal_through;
     // A child may arrive immediately after a parent's tool hook. Catch prior
     // session actors up before resolving a new session, entirely in the daemon.
-    if is_session_start(&event.env.event) {
+    if is_session_start(&event.env.source, &event.env.event) {
         daemon.settle_session_actors().await;
     }
     match accept_event(daemon, event).await {
@@ -1145,7 +1151,7 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
                     if let Some(params) = note.params {
                         match serde_json::from_value::<Envelope>(params) {
                             Ok(mut env) => {
-                                attach_process_capture(&mut env, client.as_ref());
+                                attach_process_capture(&daemon, &mut env, client.as_ref());
                                 match daemon.capture_event(env).await {
                                     Ok(true) => {}
                                     Ok(false) => tracing::warn!(
@@ -1193,15 +1199,26 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
     Ok(())
 }
 
-fn attach_process_capture(env: &mut Envelope, client: Option<&crate::wire::ClientInfo>) {
+fn attach_process_capture(
+    daemon: &Daemon,
+    env: &mut Envelope,
+    client: Option<&crate::wire::ClientInfo>,
+) {
     if env.capture.is_some() {
+        return;
+    }
+    if !is_session_start(&env.source, &env.event)
+        && !daemon
+            .correlation
+            .needs_process_capture(&env.source, &env.session_id)
+    {
         return;
     }
     let Some(pid) = client.and_then(|client| client.pid) else {
         return;
     };
     let capture = crate::process::capture_process_context(pid);
-    if !capture.process_chain.is_empty() {
+    if !capture.process_chain.is_empty() || capture.truncated {
         env.capture = Some(capture);
     }
 }
@@ -1215,6 +1232,23 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
     let requested_link_key = automatic_link_key(&env);
     let correlation_lock = daemon.correlation_lock(&requested_link_key);
     let _correlation_guard = correlation_lock.lock().await;
+    if daemon
+        .standalone_links
+        .lock()
+        .unwrap()
+        .contains(&requested_link_key)
+    {
+        drop(_correlation_guard);
+        return accept_resolved_and_retry_pending(
+            daemon,
+            PendingEvent {
+                env,
+                replay_through,
+                journal_through,
+            },
+        )
+        .await;
+    }
     let mut state = daemon
         .pending_sessions
         .lock()
@@ -1229,9 +1263,7 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                 .cloned()
                 .map(|route| PendingSession {
                     linked_route: Some(route),
-                    events: Vec::new(),
-                    candidate_span_ids: Vec::new(),
-                    evidence: Vec::new(),
+                    ..Default::default()
                 })
         });
     if state.is_none() {
@@ -1239,6 +1271,23 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
     }
 
     if let Some(mut state) = state {
+        if state.standalone {
+            daemon
+                .standalone_links
+                .lock()
+                .unwrap()
+                .insert(requested_link_key);
+            drop(_correlation_guard);
+            return accept_resolved_and_retry_pending(
+                daemon,
+                PendingEvent {
+                    env,
+                    replay_through,
+                    journal_through,
+                },
+            )
+            .await;
+        }
         if let Some(route) = state.linked_route.clone() {
             for mut pending in std::mem::take(&mut state.events) {
                 pending.env.route = Some(route.clone());
@@ -1263,27 +1312,82 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
             .await;
         }
 
-        let capture = env.capture.as_ref().or_else(|| {
-            state
-                .events
-                .first()
-                .and_then(|event| event.env.capture.as_ref())
+        state.events.push(PendingEvent {
+            env,
+            replay_through,
+            journal_through,
         });
-        state.evidence.push(correlation_evidence(&env).await);
-        let evidence = Value::Array(state.evidence.clone());
-        match daemon.correlation.resolve_pending(
-            &env.source,
-            capture,
-            &evidence,
-            &state.candidate_span_ids,
-        ) {
+        if state.awaiting_agent {
+            let mut captures = state
+                .events
+                .iter()
+                .rev()
+                .filter_map(|event| event.env.capture.as_ref());
+            let latest = captures.next();
+            let previous = captures.next();
+            state.agent_process = previous.and_then(|previous| {
+                crate::correlation::session_agent_process(
+                    &state.events[0].env.source,
+                    previous,
+                    latest,
+                )
+            });
+            if state.agent_process.is_none() {
+                if state.events.len() >= 3 {
+                    let events = std::mem::take(&mut state.events);
+                    write_correlation_state(
+                        &daemon.data_dir,
+                        &requested_link_key,
+                        &PendingSession {
+                            standalone: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    daemon
+                        .standalone_links
+                        .lock()
+                        .unwrap()
+                        .insert(requested_link_key);
+                    for event in events {
+                        accept_resolved_event(daemon, event).await?;
+                    }
+                    return Ok(());
+                }
+                write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
+                daemon
+                    .pending_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(requested_link_key, state);
+                return Ok(());
+            }
+            state.awaiting_agent = false;
+        }
+        let capture = state
+            .events
+            .iter()
+            .rev()
+            .filter_map(|event| event.env.capture.as_ref())
+            .find(|capture| {
+                state.agent_process.as_ref().is_none_or(|agent| {
+                    capture.process_chain.iter().any(|process| process == agent)
+                })
+            });
+        let resolution = if state.candidate_span_ids.is_empty() {
+            daemon
+                .correlation
+                .resolve(None, capture, state.agent_process.as_ref())
+        } else {
+            daemon.correlation.resolve_pending(
+                capture,
+                state.agent_process.as_ref(),
+                &state.candidate_span_ids,
+            )
+        };
+        match resolution {
             crate::correlation::Resolution::Parent(parent) => {
                 state.linked_route = Some(parent.route.clone());
-                state.events.push(PendingEvent {
-                    env,
-                    replay_through,
-                    journal_through,
-                });
                 write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
                 for mut event in std::mem::take(&mut state.events) {
                     event.env.route = Some(parent.route.clone());
@@ -1297,13 +1401,8 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                     .insert(requested_link_key, parent.route);
                 return Ok(());
             }
-            crate::correlation::Resolution::Ambiguous(_)
-            | crate::correlation::Resolution::Standalone => {
-                state.events.push(PendingEvent {
-                    env,
-                    replay_through,
-                    journal_through,
-                });
+            crate::correlation::Resolution::Ambiguous(candidate_span_ids) => {
+                state.candidate_span_ids = candidate_span_ids;
                 write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
                 daemon
                     .pending_sessions
@@ -1313,21 +1412,69 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                 daemon.correlation_changed.notify_one();
                 return Ok(());
             }
+            crate::correlation::Resolution::Standalone => {
+                let events = std::mem::take(&mut state.events);
+                let standalone = PendingSession {
+                    standalone: true,
+                    ..Default::default()
+                };
+                write_correlation_state(&daemon.data_dir, &requested_link_key, &standalone).await?;
+                daemon
+                    .standalone_links
+                    .lock()
+                    .unwrap()
+                    .insert(requested_link_key);
+                for event in events {
+                    accept_resolved_event(daemon, event).await?;
+                }
+                return Ok(());
+            }
         }
     }
 
-    if is_session_start(&env.event) {
-        let evidence = correlation_evidence(&env).await;
-        match daemon
-            .correlation
-            .resolve(&env.source, None, env.capture.as_ref(), &evidence)
+    if is_session_start(&env.source, &env.event) {
+        let child_agent = env.capture.as_ref().and_then(|capture| {
+            crate::correlation::session_agent_process(&env.source, capture, None)
+        });
+        let resolution =
+            daemon
+                .correlation
+                .resolve(None, env.capture.as_ref(), child_agent.as_ref());
+        if crate::correlation::uses_command_hook(&env.source)
+            && (env
+                .capture
+                .as_ref()
+                // An incomplete walk cannot conceal a registered parent
+                // when this is the first agent known to the daemon. On
+                // Windows, inaccessible system ancestors commonly truncate
+                // otherwise complete captures.
+                .is_some_and(|capture| {
+                    capture.truncated && daemon.correlation.has_registered_agent_process()
+                })
+                || !matches!(resolution, crate::correlation::Resolution::Standalone))
         {
+            let state = PendingSession {
+                awaiting_agent: true,
+                events: vec![PendingEvent {
+                    env,
+                    replay_through,
+                    journal_through,
+                }],
+                ..Default::default()
+            };
+            write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
+            daemon
+                .pending_sessions
+                .lock()
+                .unwrap()
+                .insert(requested_link_key, state);
+            return Ok(());
+        }
+        match resolution {
             crate::correlation::Resolution::Parent(parent) => {
                 let state = PendingSession {
                     linked_route: Some(parent.route.clone()),
-                    events: Vec::new(),
-                    candidate_span_ids: Vec::new(),
-                    evidence: Vec::new(),
+                    ..Default::default()
                 };
                 write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
                 daemon
@@ -1338,16 +1485,15 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                 env.route = Some(parent.route);
             }
             crate::correlation::Resolution::Ambiguous(candidate_span_ids) => {
-                let evidence = correlation_evidence(&env).await;
                 let state = PendingSession {
-                    linked_route: None,
+                    agent_process: child_agent,
                     events: vec![PendingEvent {
                         env,
                         replay_through,
                         journal_through,
                     }],
                     candidate_span_ids,
-                    evidence: vec![evidence],
+                    ..Default::default()
                 };
                 write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
                 daemon
@@ -1358,7 +1504,22 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                 daemon.correlation_changed.notify_one();
                 return Ok(());
             }
-            crate::correlation::Resolution::Standalone => {}
+            crate::correlation::Resolution::Standalone => {
+                write_correlation_state(
+                    &daemon.data_dir,
+                    &requested_link_key,
+                    &PendingSession {
+                        standalone: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                daemon
+                    .standalone_links
+                    .lock()
+                    .unwrap()
+                    .insert(requested_link_key);
+            }
         }
     }
 
@@ -1397,7 +1558,7 @@ async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
         let Some(mut state) = daemon.pending_sessions.lock().unwrap().remove(&key) else {
             continue;
         };
-        if state.linked_route.is_some() || state.events.is_empty() {
+        if state.linked_route.is_some() || state.awaiting_agent || state.events.is_empty() {
             daemon.pending_sessions.lock().unwrap().insert(key, state);
             continue;
         }
@@ -1405,15 +1566,9 @@ async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
             .events
             .iter()
             .find_map(|event| event.env.capture.as_ref());
-        let evidence = Value::Array(state.evidence.clone());
         match daemon.correlation.resolve_pending(
-            state
-                .events
-                .first()
-                .map(|event| event.env.source.as_str())
-                .unwrap_or(""),
             capture,
-            &evidence,
+            state.agent_process.as_ref(),
             &state.candidate_span_ids,
         ) {
             crate::correlation::Resolution::Parent(parent) => {
@@ -1434,70 +1589,23 @@ async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
                 daemon.pending_sessions.lock().unwrap().insert(key, state);
             }
             crate::correlation::Resolution::Standalone => {
+                write_correlation_state(
+                    &daemon.data_dir,
+                    &key,
+                    &PendingSession {
+                        standalone: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                daemon.standalone_links.lock().unwrap().insert(key.clone());
                 for event in std::mem::take(&mut state.events) {
                     accept_resolved_event(daemon, event).await?;
                 }
-                remove_correlation_state(&daemon.data_dir, &key).await;
             }
         }
     }
     Ok(())
-}
-
-/// Build opaque matching evidence without teaching the daemon agent or shell
-/// syntax. Codex hook payloads reference a JSONL rollout rather than carrying
-/// the prompt/output directly, so include a bounded tail of those native JSON
-/// values when available. Other agents are fully represented by their payload.
-async fn correlation_evidence(env: &Envelope) -> Value {
-    const MAX_TRANSCRIPT_EVIDENCE_BYTES: u64 = 256 * 1024;
-
-    let mut evidence = vec![env.payload.clone()];
-    if env.source != "codex" {
-        return Value::Array(evidence);
-    }
-    let mirror = env.payload.get("_bt_transcript_mirror");
-    let path = mirror
-        .and_then(|value| value.get("mirror"))
-        .and_then(Value::as_str)
-        .or_else(|| env.payload.get("transcript_path").and_then(Value::as_str));
-    let Some(path) = path else {
-        return Value::Array(evidence);
-    };
-    let Ok(mut file) = tokio::fs::File::open(path).await else {
-        return Value::Array(evidence);
-    };
-    let Ok(metadata) = file.metadata().await else {
-        return Value::Array(evidence);
-    };
-    let through = mirror
-        .and_then(|value| value.get("through"))
-        .and_then(Value::as_u64)
-        .unwrap_or(metadata.len())
-        .min(metadata.len());
-    let start = through.saturating_sub(MAX_TRANSCRIPT_EVIDENCE_BYTES);
-    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-        return Value::Array(evidence);
-    }
-    let mut bytes = Vec::with_capacity((through - start) as usize);
-    if file
-        .take(through - start)
-        .read_to_end(&mut bytes)
-        .await
-        .is_err()
-    {
-        return Value::Array(evidence);
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let text = if start == 0 {
-        text.as_ref()
-    } else {
-        text.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
-    };
-    evidence.extend(
-        text.lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
-    );
-    Value::Array(evidence)
 }
 
 fn correlation_state_path(data_dir: &std::path::Path, key: &str) -> PathBuf {
@@ -1538,10 +1646,6 @@ async fn write_correlation_state(
         })?;
     }
     Ok(())
-}
-
-async fn remove_correlation_state(data_dir: &std::path::Path, key: &str) {
-    let _ = tokio::fs::remove_file(correlation_state_path(data_dir, key)).await;
 }
 
 fn active_parent_snapshot_path(data_dir: &std::path::Path, key: &str) -> PathBuf {
@@ -1793,7 +1897,7 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Res
             .map_err(|error| format!("session init failed: {error}"))?;
         daemon
             .correlation
-            .observe_session(&delivery_key.correlation_key(), env.capture.as_ref());
+            .observe_session(&delivery_key.correlation_key(), &env.source, env.capture.as_ref());
         session
             .enqueue(env, journal_through)
             .await
@@ -1816,8 +1920,12 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Res
     result.map(|_| ())
 }
 
-fn is_session_start(event: &str) -> bool {
+fn is_session_start(source: &str, event: &str) -> bool {
     matches!(event, "SessionStart" | "session_start" | "session.created")
+        // Antigravity has no dedicated session-start or resume hook. Its
+        // PreInvocation is the earliest hook in each invocation and is the
+        // only opportunity to refresh a resumed conversation's process.
+        || (source == "antigravity" && event == "PreInvocation")
 }
 
 fn automatic_link_key(env: &Envelope) -> String {
@@ -1901,7 +2009,7 @@ async fn handle_request(
         }
         method::EVENT_LOG => {
             let mut env = parse!(Envelope);
-            attach_process_capture(&mut env, client.as_ref());
+            attach_process_capture(daemon, &mut env, client.as_ref());
             match daemon.capture_event(env).await {
                 Ok(accepted) => Response::ok(
                     id,
@@ -2187,7 +2295,16 @@ async fn probe_alive(endpoint: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_may_shutdown, ClientInfo};
+    use super::{client_may_shutdown, is_session_start, ClientInfo};
+
+    #[test]
+    fn antigravity_invocation_refreshes_a_resumed_conversations_process() {
+        assert!(is_session_start("antigravity", "PreInvocation"));
+        assert!(!is_session_start("claude-code", "PreInvocation"));
+        assert!(is_session_start("claude-code", "SessionStart"));
+        assert!(is_session_start("pi", "session_start"));
+        assert!(is_session_start("opencode", "session.created"));
+    }
 
     fn initialized(version: Option<&str>) -> ClientInfo {
         ClientInfo {

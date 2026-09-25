@@ -459,7 +459,7 @@ async fn mixed_recursive_hierarchy_survives_a_restart_at_every_spawn_boundary() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_tools_are_disambiguated_by_prompt_fingerprints() {
+async fn concurrent_tools_are_disambiguated_by_process_script_name() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {
         serve_argv: vec![OsString::from("unused")],
@@ -467,11 +467,12 @@ async fn concurrent_tools_are_disambiguated_by_prompt_fingerprints() {
     };
     let mut fixtures = DistributedFixtures::new();
     let parent_tree = ProcessTree::root(9_000);
-    let child_tree = ProcessTree::child(9_002, 9_001, &parent_tree);
+    let child_tree =
+        ProcessTree::child(9_002, 9_001, &parent_tree).with_branch_label("beta-task.sh");
     let parent_session = "concurrent-parent";
     let child_session = "concurrent-child";
     let first_prompt = "inspect the unrelated alpha candidate carefully";
-    let selected_prompt = "inspect the selected beta candidate carefully";
+    let selected_prompt = "bash beta-task.sh to inspect the selected beta candidate carefully";
 
     forward_all(
         &mut fixtures.start_turn(
@@ -512,8 +513,8 @@ async fn concurrent_tools_are_disambiguated_by_prompt_fingerprints() {
     )
     .await;
 
-    // SessionStart alone is ambiguous and is held. UserPromptSubmit supplies
-    // the opaque-content fingerprints that select call-beta.
+    // The script name on the process branch selects call-beta even while both
+    // tools are open. The child's prompt is not used as launch evidence.
     forward_all(
         &mut fixtures.start_turn(
             AgentKind::Pi,
@@ -756,7 +757,7 @@ async fn mixed_agents_link_recursively_through_every_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn indistinguishable_concurrent_tools_fail_safe_without_a_parent() {
+async fn indistinguishable_concurrent_tools_attach_to_the_known_session() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {
         serve_argv: vec![OsString::from("unused")],
@@ -836,21 +837,7 @@ async fn indistinguishable_concurrent_tools_fail_safe_without_a_parent() {
     }
     flush("ambiguous-child", &socket).await;
 
-    let child = recording.session("ambiguous-child");
-    assert!(
-        child.configs.lock().unwrap().iter().all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )),
-        "an ambiguous child must never be attached by guessing"
-    );
-    let child_root = session_root(
-        &inserted_rows(&child),
-        "ambiguous-child",
-        "ambiguous standalone",
-    )
-    .clone();
-    assert!(child_root.parent_span_ids.is_empty());
+    assert_attached_to_session(recording.as_ref(), "ambiguous-parent", "ambiguous-child");
 
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
@@ -940,7 +927,7 @@ async fn resolved_child_link_survives_daemon_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ambiguous_child_evidence_survives_daemon_restart() {
+async fn session_fallback_survives_daemon_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
@@ -995,6 +982,7 @@ async fn ambiguous_child_evidence_survives_daemon_restart() {
     );
     forward(child_start.remove(0), &socket, &host).await;
     flush("pending-child", &socket).await;
+    assert_attached_to_session(first_recording.as_ref(), "pending-parent", "pending-child");
     assert!(tokio::fs::read_dir(data_dir.join("correlation"))
         .await
         .unwrap()
@@ -1007,8 +995,8 @@ async fn ambiguous_child_evidence_survives_daemon_restart() {
 
     let second_recording = Arc::new(RecordingSinkFactory::default());
     let second_daemon = spawn_daemon(socket.clone(), data_dir, second_recording.clone()).await;
-    // No parent event is sent after restart. Both candidates and their hashed
-    // evidence must come from the compact active-parent snapshot.
+    // No parent event is sent after restart. The decided session attachment
+    // must be reused even though the old tools are no longer in this process.
     forward(child_start.remove(0), &socket, &host).await;
     forward(
         fixtures.close_session(
@@ -1023,26 +1011,6 @@ async fn ambiguous_child_evidence_survives_daemon_restart() {
     )
     .await;
     flush("pending-child", &socket).await;
-
-    let parent = first_recording.session("pending-parent");
-    let beta = inserted_rows(&parent)
-        .into_iter()
-        .find(|row| {
-            row.span_type == SpanType::Tool
-                && row
-                    .input
-                    .as_ref()
-                    .is_some_and(|input| input.to_string().contains(selected))
-        })
-        .expect("replayed beta tool");
-    let child = second_recording.session("pending-child");
-    let child_root = session_root(
-        &inserted_rows(&child),
-        "pending-child",
-        "durable pending child",
-    )
-    .clone();
-    assert_eq!(child_root.parent_span_ids, vec![beta.span_id]);
 
     shutdown_daemon(&socket).await.unwrap();
     second_daemon.await.unwrap();
@@ -1139,11 +1107,15 @@ async fn completed_tools_are_not_resurrected_after_restart() {
         )
         .await;
         flush(&child_session, &socket).await;
-        let child = recording.session(&child_session);
-        assert!(child.configs.lock().unwrap().iter().all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )));
+        if reused_pid {
+            let child = recording.session(&child_session);
+            assert!(child.configs.lock().unwrap().iter().all(|config| !matches!(
+                config.destination,
+                Some(TraceDestination::ParentSpan { .. })
+            )));
+        } else {
+            assert_attached_to_session(recording.as_ref(), "closed-restart-parent", &child_session);
+        }
     }
 
     shutdown_daemon(&socket).await.unwrap();
@@ -1431,11 +1403,7 @@ async fn completed_tools_are_not_candidates_for_later_children() {
         )
         .await;
         flush(&child_session, &socket).await;
-        let child = recording.session(&child_session);
-        assert!(child.configs.lock().unwrap().iter().all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )));
+        assert_attached_to_session(recording.as_ref(), &parent_session, &child_session);
     }
 
     shutdown_daemon(&socket).await.unwrap();
@@ -1443,7 +1411,7 @@ async fn completed_tools_are_not_candidates_for_later_children() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn child_output_can_disambiguate_when_inputs_do_not_overlap() {
+async fn child_output_does_not_guess_a_tool_when_process_text_is_ambiguous() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {
         serve_argv: vec![OsString::from("unused")],
@@ -1538,25 +1506,7 @@ async fn child_output_can_disambiguate_when_inputs_do_not_overlap() {
     .await;
     flush("output-child", &socket).await;
 
-    let parent = recording.session("output-parent");
-    let beta = inserted_rows(&parent)
-        .into_iter()
-        .find(|row| {
-            row.span_type == SpanType::Tool
-                && row
-                    .input
-                    .as_ref()
-                    .is_some_and(|input| input.to_string().contains("opaque-beta"))
-        })
-        .expect("beta tool");
-    let child = recording.session("output-child");
-    let child_root = session_root(
-        &inserted_rows(&child),
-        "output-child",
-        "output fingerprint child",
-    )
-    .clone();
-    assert_eq!(child_root.parent_span_ids, vec![beta.span_id]);
+    assert_attached_to_session(recording.as_ref(), "output-parent", "output-child");
 
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
@@ -1578,10 +1528,8 @@ async fn concurrent_agent_sessions_in_one_process_choose_their_own_tools() {
         let parent_session = format!("multiplex-parent-{}", parent_kind.label());
         let child_session = format!("multiplex-child-{}", child_kind.label());
         let call_id = format!("multiplex-call-{index}");
-        let prompt = format!(
-            "unique multiplexed prompt number {index} for {}",
-            parent_kind.label()
-        );
+        let script = format!("multiplex-{index}.sh");
+        let prompt = format!("bash {script} for {}", parent_kind.label());
         let ts = 1_700_900_000_000 + index as i64 * 100;
         forward_all(
             &mut fixtures.start_turn(
@@ -1612,7 +1560,8 @@ async fn concurrent_agent_sessions_in_one_process_choose_their_own_tools() {
             18_100 + index as u32 * 2,
             18_101 + index as u32 * 2,
             &shared_parent_tree,
-        );
+        )
+        .with_branch_label(&script);
         let events = fixtures.start_turn(child_kind, &child_session, &child_tree, &prompt, ts + 20);
         cases.push((
             parent_kind,
@@ -1963,11 +1912,7 @@ async fn concurrent_ambiguous_children_do_not_deadlock_or_cross_link() {
     }
     for (_, session, _) in &child_cases {
         flush(session, &socket).await;
-        let child = recording.session(session);
-        assert!(child.configs.lock().unwrap().iter().all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )));
+        assert_attached_to_session(recording.as_ref(), "deadlock-parent", session);
     }
 
     shutdown_daemon(&socket).await.unwrap();
@@ -2054,6 +1999,444 @@ async fn one_tool_can_fan_out_to_concurrent_children_of_every_agent() {
     daemon.await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sibling_agents_under_one_shell_remain_separate_with_active_tools() {
+    let (socket, daemon, recording, _tmp) = start_daemon().await;
+    let host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "test".into(),
+    };
+    let mut fixtures = DistributedFixtures::new();
+    let shared_shell = ProcessTree::root(23_000);
+    let first = ProcessTree {
+        agent: bt_daemon::wire::ProcessIdentity {
+            pid: 23_001,
+            start_time_secs: 1_700_023_001,
+        },
+        ancestors: vec![shared_shell.agent.clone()],
+        ancestor_labels: vec![vec!["bash".into()]],
+    };
+    let second = ProcessTree {
+        agent: bt_daemon::wire::ProcessIdentity {
+            pid: 23_002,
+            start_time_secs: 1_700_023_002,
+        },
+        ancestors: first.ancestors.clone(),
+        ancestor_labels: first.ancestor_labels.clone(),
+    };
+
+    // Each Claude hook has its own Bash launcher between `bt` and Claude.
+    let mut first_events = fixtures.start_turn(
+        AgentKind::Claude,
+        "sibling-first",
+        &first,
+        "first prompt",
+        1_701_400_000_000,
+    );
+    add_distinct_launchers(&mut first_events, 24_000);
+    forward_all(&mut first_events, &socket, &host).await;
+    let mut open = fixtures.open_tool(
+        AgentKind::Claude,
+        "sibling-first",
+        &first,
+        "sibling-tool",
+        "run another agent",
+        1_701_400_000_010,
+    );
+    add_distinct_launchers(std::slice::from_mut(&mut open), 24_010);
+    forward(open, &socket, &host).await;
+
+    let mut second_events = fixtures.start_turn(
+        AgentKind::Claude,
+        "sibling-second",
+        &second,
+        "independent prompt",
+        1_701_400_000_020,
+    );
+    add_distinct_launchers(&mut second_events, 24_020);
+    forward_all(&mut second_events, &socket, &host).await;
+    flush("sibling-second", &socket).await;
+    let sibling = recording.session("sibling-second");
+    let rows = inserted_rows(&sibling);
+    assert!(session_root(&rows, "sibling-second", "sibling")
+        .parent_span_ids
+        .is_empty());
+    assert!(sibling
+        .configs
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|config| !matches!(
+            config.destination,
+            Some(TraceDestination::ParentSpan { .. })
+        )));
+
+    // Two active tools used to leave a second sibling waiting for a parent
+    // choice, so it would have no emitted root until both tools closed.
+    let mut second_tool = fixtures.open_tool(
+        AgentKind::Claude,
+        "sibling-first",
+        &first,
+        "sibling-tool-two",
+        "another operation",
+        1_701_400_000_030,
+    );
+    add_distinct_launchers(std::slice::from_mut(&mut second_tool), 24_030);
+    forward(second_tool, &socket, &host).await;
+    let third = ProcessTree {
+        agent: bt_daemon::wire::ProcessIdentity {
+            pid: 23_003,
+            start_time_secs: 1_700_023_003,
+        },
+        ancestors: first.ancestors.clone(),
+        ancestor_labels: first.ancestor_labels.clone(),
+    };
+    let mut third_events = fixtures.start_turn(
+        AgentKind::Claude,
+        "sibling-third",
+        &third,
+        "another independent prompt",
+        1_701_400_000_040,
+    );
+    add_distinct_launchers(&mut third_events, 24_040);
+    forward_all(&mut third_events, &socket, &host).await;
+    flush("sibling-third", &socket).await;
+    let sibling = recording.session("sibling-third");
+    let rows = inserted_rows(&sibling);
+    assert!(session_root(&rows, "sibling-third", "third sibling")
+        .parent_span_ids
+        .is_empty());
+
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncated_first_parent_and_child_captures_recover_on_later_events() {
+    let (socket, daemon, recording, _tmp) = start_daemon().await;
+    let host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "test".into(),
+    };
+    let mut fixtures = DistributedFixtures::new();
+    let parent = ProcessTree::root(28_000);
+    let child = ProcessTree::child(28_002, 28_001, &parent);
+
+    let mut parent_events = fixtures.start_turn(
+        AgentKind::Claude,
+        "partial-parent",
+        &parent,
+        "delegate",
+        1_701_700_000_000,
+    );
+    // Process inspection saw only the short-lived hook process at startup.
+    parent_events[0]
+        .capture
+        .as_mut()
+        .unwrap()
+        .process_chain
+        .truncate(1);
+    parent_events[0].capture.as_mut().unwrap().truncated = true;
+    forward_all(&mut parent_events, &socket, &host).await;
+    forward(
+        fixtures.open_tool(
+            AgentKind::Claude,
+            "partial-parent",
+            &parent,
+            "partial-parent-tool",
+            "delegate",
+            1_701_700_000_010,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+
+    let mut child_events = fixtures.start_turn(
+        AgentKind::Claude,
+        "partial-child",
+        &child,
+        "delegate",
+        1_701_700_000_020,
+    );
+    child_events[0]
+        .capture
+        .as_mut()
+        .unwrap()
+        .process_chain
+        .truncate(1);
+    child_events[0].capture.as_mut().unwrap().truncated = true;
+    forward_all(&mut child_events, &socket, &host).await;
+    forward(
+        fixtures.close_session(
+            AgentKind::Claude,
+            "partial-child",
+            &child,
+            "done",
+            1_701_700_000_030,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("partial-child", &socket).await;
+    assert_pair_linked(
+        recording.as_ref(),
+        "partial-parent",
+        "partial-child",
+        "recovered capture",
+    );
+
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_does_not_skip_an_idle_agent_to_reach_a_grandparent_tool() {
+    let (socket, daemon, recording, _tmp) = start_daemon().await;
+    let host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "test".into(),
+    };
+    let mut fixtures = DistributedFixtures::new();
+    let grandparent = ProcessTree::root(25_000);
+    let parent = ProcessTree {
+        agent: test_process(25_002),
+        ancestors: vec![
+            test_process(25_001),
+            test_process(25_005),
+            test_process(25_006),
+            grandparent.agent.clone(),
+        ],
+        ancestor_labels: vec![vec!["bash".into()]; 4],
+    };
+    let child = ProcessTree::child(25_004, 25_003, &parent);
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::Claude,
+            "direct-grandparent",
+            &grandparent,
+            "go",
+            1_701_500_000_000,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    forward(
+        fixtures.open_tool(
+            AgentKind::Claude,
+            "direct-grandparent",
+            &grandparent,
+            "grandparent-tool",
+            "delegate",
+            1_701_500_000_010,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    let mut parent_events = fixtures.start_turn(
+        AgentKind::Claude,
+        "direct-parent",
+        &parent,
+        "delegate",
+        1_701_500_000_020,
+    );
+    add_distinct_launchers(&mut parent_events, 26_000);
+    forward_all(&mut parent_events, &socket, &host).await;
+    flush("direct-grandparent", &socket).await;
+    flush("direct-parent", &socket).await;
+    assert_pair_linked(
+        recording.as_ref(),
+        "direct-grandparent",
+        "direct-parent",
+        "direct parent",
+    );
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::Claude,
+            "direct-child",
+            &child,
+            "separate work",
+            1_701_500_000_030,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("direct-child", &socket).await;
+    // The nearer agent owns the child, even without an open tool. Its session
+    // span is the fallback; the grandparent tool must never be selected.
+    assert_attached_to_session(recording.as_ref(), "direct-parent", "direct-child");
+
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opencode_resume_refreshes_the_process_for_later_child_agents() {
+    let (socket, daemon, recording, _tmp) = start_daemon().await;
+    let host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "test".into(),
+    };
+    let mut fixtures = DistributedFixtures::new();
+    let previous = ProcessTree::root(34_000);
+    let resumed = ProcessTree::root(35_000);
+    let child = ProcessTree::child(35_002, 35_001, &resumed);
+
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::OpenCode,
+            "resumed-opencode",
+            &previous,
+            "before resume",
+            1_701_000_000_000,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("resumed-opencode", &socket).await;
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::OpenCode,
+            "resumed-opencode",
+            &resumed,
+            "after resume",
+            1_701_000_000_100,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    forward(
+        fixtures.open_tool(
+            AgentKind::OpenCode,
+            "resumed-opencode",
+            &resumed,
+            "spawn-child",
+            "work in child",
+            1_701_000_000_110,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("resumed-opencode", &socket).await;
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::Pi,
+            "post-resume-child",
+            &child,
+            "work in child",
+            1_701_000_000_120,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("post-resume-child", &socket).await;
+    assert_pair_linked(
+        recording.as_ref(),
+        "resumed-opencode",
+        "post-resume-child",
+        "OpenCode resumed in a new process",
+    );
+
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standalone_parentage_is_not_reconsidered_on_later_session_start() {
+    let (socket, daemon, recording, _tmp) = start_daemon().await;
+    let host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "test".into(),
+    };
+    let mut fixtures = DistributedFixtures::new();
+    let parent = ProcessTree::root(27_000);
+    let child = ProcessTree::child(27_002, 27_001, &parent);
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::Claude,
+            "late-tool-parent",
+            &parent,
+            "initial work",
+            1_701_600_000_000,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::Claude,
+            "late-tool-child",
+            &child,
+            "already started",
+            1_701_600_000_010,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    forward(
+        fixtures.open_tool(
+            AgentKind::Claude,
+            "late-tool-parent",
+            &parent,
+            "late-tool",
+            "tool started after child",
+            1_701_600_000_020,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::Claude,
+            "late-tool-child",
+            &child,
+            "same session resumed",
+            1_701_600_000_030,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("late-tool-child", &socket).await;
+    // A later tool must not move a child already attached to its session.
+    assert_attached_to_session(recording.as_ref(), "late-tool-parent", "late-tool-child");
+
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+}
+
+fn add_distinct_launchers(events: &mut [Envelope], first_pid: u32) {
+    for (index, event) in events.iter_mut().enumerate() {
+        for layer in 0..3 {
+            let pid = first_pid + index as u32 * 3 + layer;
+            event
+                .capture
+                .as_mut()
+                .unwrap()
+                .process_chain
+                .insert(1, test_process(pid));
+        }
+    }
+}
+
+fn test_process(pid: u32) -> bt_daemon::wire::ProcessIdentity {
+    bt_daemon::wire::ProcessIdentity {
+        pid,
+        start_time_secs: 1_700_000_000 + u64::from(pid),
+    }
+}
+
 fn assert_pair_linked(
     recording: &RecordingSinkFactory,
     parent_session: &str,
@@ -2096,6 +2479,24 @@ fn assert_pair_linked(
         Some(parent_root.root_span_id.as_str()),
         "{label}: sink attachment chose a different trace root"
     );
+}
+
+fn assert_attached_to_session(
+    recording: &RecordingSinkFactory,
+    parent_session: &str,
+    child_session: &str,
+) {
+    let parent = recording.session(parent_session);
+    let child = recording.session(child_session);
+    let parent_rows = inserted_rows(&parent);
+    let parent_root = session_root(&parent_rows, parent_session, "parent session");
+    let child_rows = inserted_rows(&child);
+    let child_root = session_root(&child_rows, child_session, "child session");
+    assert_eq!(
+        child_root.parent_span_ids,
+        vec![parent_root.span_id.clone()]
+    );
+    assert_eq!(child_root.root_span_id, parent_root.root_span_id);
 }
 
 fn inserted_rows(record: &RecordedSession) -> Vec<SpanRow> {
