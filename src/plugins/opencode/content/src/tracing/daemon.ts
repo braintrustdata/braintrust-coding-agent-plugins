@@ -26,35 +26,121 @@ const FORWARDED_NATIVE_EVENTS = new Set([
   "permission.replied",
 ]);
 
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function nonemptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function nativeSessionId(event: string, payload: Record<string, unknown>): string | undefined {
+  const properties = record(payload.properties);
+  const input = record(payload.input);
+  const info = record(properties.info);
+  const part = record(properties.part);
+  const permission = record(properties.permission);
+  const request = record(properties.request);
+  const tool = record(permission.tool);
+  return (
+    nonemptyString(input.sessionID) ??
+    nonemptyString(payload.sessionID) ??
+    nonemptyString(properties.sessionID) ??
+    nonemptyString(info.sessionID) ??
+    nonemptyString(part.sessionID) ??
+    nonemptyString(permission.sessionID) ??
+    nonemptyString(request.sessionID) ??
+    nonemptyString(tool.sessionID) ??
+    (event === "session.created" ? nonemptyString(info.id) : undefined)
+  );
+}
+
+function permissionId(payload: Record<string, unknown>): string | undefined {
+  const properties = record(payload.properties);
+  return (
+    nonemptyString(properties.requestID) ??
+    nonemptyString(properties.permissionID) ??
+    nonemptyString(record(properties.permission).id) ??
+    nonemptyString(record(properties.info).id) ??
+    nonemptyString(properties.id)
+  );
+}
+
 export function createDaemonTracingHooks(
   input: PluginInput,
   config: TracingRouteConfig,
   log: Logger,
 ): Partial<Hooks> {
-  // One transport stream per plugin instance. Native OpenCode session IDs and
-  // parent relationships stay untouched in each payload for the daemon to
-  // interpret.
-  const daemonSessionId = randomUUID();
+  // A native top-level session keeps the same daemon identity across OpenCode
+  // process runs. Subagent events use their top-level parent's stream so the
+  // translator can preserve the native session graph inside one trace.
+  const fallbackSessionId = randomUUID();
+  const roots = new Map<string, string>();
+  const permissionRoots = new Map<string, string>();
+  const started = new Set<string>();
+  const queues = new Map<string, Promise<void>>();
   const daemon = new DaemonClient({
     source: "opencode",
     pluginVersion: PLUGIN_VERSION,
     warn: (message) => log("Braintrust tracing unavailable", { message }),
   });
 
-  const forward = async (event: string, payload: unknown) => {
-    await daemon.log({
+  const forward = async (event: string, payload: unknown, sessionId?: string) => {
+    const nativePayload = record(payload);
+    const nativeId = nativeSessionId(event, nativePayload);
+    if (event === "session.created" && nativeId) {
+      const info = record(record(nativePayload.properties).info);
+      const parentId = nonemptyString(info.parentID);
+      roots.set(nativeId, parentId ? (roots.get(parentId) ?? parentId) : nativeId);
+    }
+    const requestId = event.startsWith("permission.") ? permissionId(nativePayload) : undefined;
+    const daemonSessionId =
+      sessionId ??
+      (nativeId
+        ? (roots.get(nativeId) ?? nativeId)
+        : ((requestId && permissionRoots.get(requestId)) ?? fallbackSessionId));
+    if (event === "permission.asked" && requestId) {
+      permissionRoots.set(requestId, daemonSessionId);
+    }
+    const envelope = (name: string) => ({
       source: "opencode",
       source_version: process.env.OPENCODE_VERSION,
       session_id: daemonSessionId,
-      event,
+      event: name,
       ts_ms: Date.now(),
       payload: {
-        ...(payload as Record<string, unknown>),
+        ...nativePayload,
         directory: input.directory,
         worktree: input.worktree,
       },
       route: config.route,
     });
+    // OpenCode may resume an existing native session without emitting another
+    // session.created. A synthetic lifecycle boundary on the first event of
+    // this process refreshes the registry's process mapping. The translator
+    // ignores this event; the native payload remains unmodified.
+    const first = !started.has(daemonSessionId);
+    started.add(daemonSessionId);
+    const previous = queues.get(daemonSessionId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => {})
+      .then(async () => {
+        if (first && event !== "session.created" && event !== "server.instance.disposed") {
+          await daemon.log(envelope("session_start"));
+        }
+        await daemon.log(envelope(event));
+      });
+    queues.set(daemonSessionId, next);
+    try {
+      await next;
+    } finally {
+      if (queues.get(daemonSessionId) === next) queues.delete(daemonSessionId);
+    }
+    if (event === "permission.replied" && requestId) {
+      permissionRoots.delete(requestId);
+    }
   };
 
   return {
@@ -62,7 +148,11 @@ export function createDaemonTracingHooks(
       if (event.type === "server.instance.disposed") {
         // Give the daemon a durable terminal event before disconnecting. It owns
         // the potentially slow backend flush, so OpenCode shutdown is not blocked.
-        await forward(event.type, { properties: event.properties });
+        await Promise.all(
+          [...started].map((sessionId) =>
+            forward(event.type, { properties: event.properties }, sessionId),
+          ),
+        );
         await daemon.close();
         return;
       }

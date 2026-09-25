@@ -2275,6 +2275,81 @@ async fn child_does_not_skip_an_idle_agent_to_reach_a_grandparent_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opencode_resume_refreshes_the_process_for_later_child_agents() {
+    let (socket, daemon, recording, _tmp) = start_daemon().await;
+    let host = HostInfo {
+        serve_argv: vec![OsString::from("unused")],
+        version: "test".into(),
+    };
+    let mut fixtures = DistributedFixtures::new();
+    let previous = ProcessTree::root(34_000);
+    let resumed = ProcessTree::root(35_000);
+    let child = ProcessTree::child(35_002, 35_001, &resumed);
+
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::OpenCode,
+            "resumed-opencode",
+            &previous,
+            "before resume",
+            1_701_000_000_000,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("resumed-opencode", &socket).await;
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::OpenCode,
+            "resumed-opencode",
+            &resumed,
+            "after resume",
+            1_701_000_000_100,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    forward(
+        fixtures.open_tool(
+            AgentKind::OpenCode,
+            "resumed-opencode",
+            &resumed,
+            "spawn-child",
+            "work in child",
+            1_701_000_000_110,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("resumed-opencode", &socket).await;
+    forward_all(
+        &mut fixtures.start_turn(
+            AgentKind::Pi,
+            "post-resume-child",
+            &child,
+            "work in child",
+            1_701_000_000_120,
+        ),
+        &socket,
+        &host,
+    )
+    .await;
+    flush("post-resume-child", &socket).await;
+    assert_pair_linked(
+        recording.as_ref(),
+        "resumed-opencode",
+        "post-resume-child",
+        "OpenCode resumed in a new process",
+    );
+
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn standalone_parentage_is_not_reconsidered_on_later_session_start() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {

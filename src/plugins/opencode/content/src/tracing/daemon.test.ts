@@ -80,6 +80,7 @@ describe("OpenCode daemon adapter", () => {
     });
 
     expect(mockState.logs.map((log) => log.event)).toEqual([
+      "session_start",
       "session.idle",
       "session.deleted",
       "session.error",
@@ -88,5 +89,61 @@ describe("OpenCode daemon adapter", () => {
     expect(mockState.logs.every((log) => log.source === "opencode")).toBe(true);
     expect(mockState.flushes).toHaveLength(0);
     expect(mockState.closed).toBe(1);
+  });
+
+  it("keeps native session identity across process runs and groups subagents with their parent", async () => {
+    const input = { directory: "/tmp/project", worktree: "/tmp/project" } as PluginInput;
+    const config = {
+      projectName: "agents",
+      route: { destination: { type: "project_logs", project_name: "agents" } },
+    } as Parameters<typeof createDaemonTracingHooks>[1];
+    const first = createDaemonTracingHooks(input, config, () => {});
+    const firstEvent = first.event as (input: { event: Event }) => Promise<void>;
+    await firstEvent({
+      event: { type: "session.created", properties: { info: { id: "parent" } } } as Event,
+    });
+    await firstEvent({
+      event: {
+        type: "session.created",
+        properties: { info: { id: "child", parentID: "parent" } },
+      } as Event,
+    });
+    await (first["tool.execute.before"] as (input: unknown, output: unknown) => Promise<void>)(
+      { sessionID: "child", callID: "tool" },
+      {},
+    );
+    await firstEvent({
+      event: {
+        type: "permission.asked",
+        properties: { requestID: "approval", sessionID: "child" },
+      } as unknown as Event,
+    });
+    await firstEvent({
+      event: {
+        type: "permission.replied",
+        properties: { requestID: "approval" },
+      } as unknown as Event,
+    });
+    await firstEvent({
+      event: { type: "session.created", properties: { info: { id: "other" } } } as Event,
+    });
+    expect(mockState.logs.map((log) => log.session_id)).toEqual([
+      "parent",
+      "parent",
+      "parent",
+      "parent",
+      "parent",
+      "other",
+    ]);
+
+    const resumed = createDaemonTracingHooks(input, config, () => {});
+    await (resumed["chat.message"] as (input: unknown, output: unknown) => Promise<void>)(
+      { sessionID: "parent" },
+      { parts: [{ type: "text", text: "continue" }] },
+    );
+    expect(mockState.logs.slice(-2).map((log) => [log.event, log.session_id])).toEqual([
+      ["session_start", "parent"],
+      ["chat.message", "parent"],
+    ]);
   });
 });

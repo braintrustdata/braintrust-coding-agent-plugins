@@ -892,7 +892,7 @@ async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
     let journal_through = event.journal_through;
     // A child may arrive immediately after a parent's tool hook. Catch prior
     // session actors up before resolving a new session, entirely in the daemon.
-    if is_session_start(&event.env.event) {
+    if is_session_start(&event.env.source, &event.env.event) {
         daemon.settle_session_actors().await;
     }
     match accept_event(daemon, event).await {
@@ -1207,7 +1207,7 @@ fn attach_process_capture(
     if env.capture.is_some() {
         return;
     }
-    if !is_session_start(&env.event)
+    if !is_session_start(&env.source, &env.event)
         && !daemon
             .correlation
             .needs_process_capture(&env.source, &env.session_id)
@@ -1432,7 +1432,7 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
         }
     }
 
-    if is_session_start(&env.event) {
+    if is_session_start(&env.source, &env.event) {
         let child_agent = env.capture.as_ref().and_then(|capture| {
             crate::correlation::session_agent_process(&env.source, capture, None)
         });
@@ -1920,8 +1920,12 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Res
     result.map(|_| ())
 }
 
-fn is_session_start(event: &str) -> bool {
+fn is_session_start(source: &str, event: &str) -> bool {
     matches!(event, "SessionStart" | "session_start" | "session.created")
+        // Antigravity has no dedicated session-start or resume hook. Its
+        // PreInvocation is the earliest hook in each invocation and is the
+        // only opportunity to refresh a resumed conversation's process.
+        || (source == "antigravity" && event == "PreInvocation")
 }
 
 fn automatic_link_key(env: &Envelope) -> String {
@@ -2291,7 +2295,16 @@ async fn probe_alive(endpoint: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_may_shutdown, ClientInfo};
+    use super::{client_may_shutdown, is_session_start, ClientInfo};
+
+    #[test]
+    fn antigravity_invocation_refreshes_a_resumed_conversations_process() {
+        assert!(is_session_start("antigravity", "PreInvocation"));
+        assert!(!is_session_start("claude-code", "PreInvocation"));
+        assert!(is_session_start("claude-code", "SessionStart"));
+        assert!(is_session_start("pi", "session_start"));
+        assert!(is_session_start("opencode", "session.created"));
+    }
 
     fn initialized(version: Option<&str>) -> ClientInfo {
         ClientInfo {
