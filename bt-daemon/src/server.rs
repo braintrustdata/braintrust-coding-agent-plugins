@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 /// Injected dependencies for `serve`, so `bt` / tests can supply a sink
@@ -89,8 +89,6 @@ struct PendingSession {
     events: Vec<PendingEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     candidate_span_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    evidence: Vec<Value>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1153,7 +1151,7 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
                     if let Some(params) = note.params {
                         match serde_json::from_value::<Envelope>(params) {
                             Ok(mut env) => {
-                                attach_process_capture(&mut env, client.as_ref());
+                                attach_process_capture(&daemon, &mut env, client.as_ref());
                                 match daemon.capture_event(env).await {
                                     Ok(true) => {}
                                     Ok(false) => tracing::warn!(
@@ -1201,8 +1199,19 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: ServerStream) -> anyhow::
     Ok(())
 }
 
-fn attach_process_capture(env: &mut Envelope, client: Option<&crate::wire::ClientInfo>) {
+fn attach_process_capture(
+    daemon: &Daemon,
+    env: &mut Envelope,
+    client: Option<&crate::wire::ClientInfo>,
+) {
     if env.capture.is_some() {
+        return;
+    }
+    if !is_session_start(&env.event)
+        && !daemon
+            .correlation
+            .needs_process_capture(&env.source, &env.session_id)
+    {
         return;
     }
     let Some(pid) = client.and_then(|client| client.pid) else {
@@ -1303,7 +1312,6 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
             .await;
         }
 
-        state.evidence.push(correlation_evidence(&env).await);
         state.events.push(PendingEvent {
             env,
             replay_through,
@@ -1366,16 +1374,14 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                     capture.process_chain.iter().any(|process| process == agent)
                 })
             });
-        let evidence = Value::Array(state.evidence.clone());
         let resolution = if state.candidate_span_ids.is_empty() {
             daemon
                 .correlation
-                .resolve(None, capture, state.agent_process.as_ref(), &evidence)
+                .resolve(None, capture, state.agent_process.as_ref())
         } else {
             daemon.correlation.resolve_pending(
                 capture,
                 state.agent_process.as_ref(),
-                &evidence,
                 &state.candidate_span_ids,
             )
         };
@@ -1427,19 +1433,24 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
     }
 
     if is_session_start(&env.event) {
-        let evidence = correlation_evidence(&env).await;
         let child_agent = env.capture.as_ref().and_then(|capture| {
             crate::correlation::session_agent_process(&env.source, capture, None)
         });
         let resolution =
             daemon
                 .correlation
-                .resolve(None, env.capture.as_ref(), child_agent.as_ref(), &evidence);
+                .resolve(None, env.capture.as_ref(), child_agent.as_ref());
         if crate::correlation::uses_command_hook(&env.source)
             && (env
                 .capture
                 .as_ref()
-                .is_some_and(|capture| capture.truncated)
+                // An incomplete walk cannot conceal a registered parent
+                // when this is the first agent known to the daemon. On
+                // Windows, inaccessible system ancestors commonly truncate
+                // otherwise complete captures.
+                .is_some_and(|capture| {
+                    capture.truncated && daemon.correlation.has_registered_agent_process()
+                })
                 || !matches!(resolution, crate::correlation::Resolution::Standalone))
         {
             let state = PendingSession {
@@ -1449,7 +1460,6 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                     replay_through,
                     journal_through,
                 }],
-                evidence: vec![evidence],
                 ..Default::default()
             };
             write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
@@ -1475,7 +1485,6 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                 env.route = Some(parent.route);
             }
             crate::correlation::Resolution::Ambiguous(candidate_span_ids) => {
-                let evidence = correlation_evidence(&env).await;
                 let state = PendingSession {
                     agent_process: child_agent,
                     events: vec![PendingEvent {
@@ -1484,7 +1493,6 @@ async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), S
                         journal_through,
                     }],
                     candidate_span_ids,
-                    evidence: vec![evidence],
                     ..Default::default()
                 };
                 write_correlation_state(&daemon.data_dir, &requested_link_key, &state).await?;
@@ -1558,11 +1566,9 @@ async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
             .events
             .iter()
             .find_map(|event| event.env.capture.as_ref());
-        let evidence = Value::Array(state.evidence.clone());
         match daemon.correlation.resolve_pending(
             capture,
             state.agent_process.as_ref(),
-            &evidence,
             &state.candidate_span_ids,
         ) {
             crate::correlation::Resolution::Parent(parent) => {
@@ -1600,62 +1606,6 @@ async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Build opaque matching evidence without teaching the daemon agent or shell
-/// syntax. Codex hook payloads reference a JSONL rollout rather than carrying
-/// the prompt/output directly, so include a bounded tail of those native JSON
-/// values when available. Other agents are fully represented by their payload.
-async fn correlation_evidence(env: &Envelope) -> Value {
-    const MAX_TRANSCRIPT_EVIDENCE_BYTES: u64 = 256 * 1024;
-
-    let mut evidence = vec![env.payload.clone()];
-    if env.source != "codex" {
-        return Value::Array(evidence);
-    }
-    let mirror = env.payload.get("_bt_transcript_mirror");
-    let path = mirror
-        .and_then(|value| value.get("mirror"))
-        .and_then(Value::as_str)
-        .or_else(|| env.payload.get("transcript_path").and_then(Value::as_str));
-    let Some(path) = path else {
-        return Value::Array(evidence);
-    };
-    let Ok(mut file) = tokio::fs::File::open(path).await else {
-        return Value::Array(evidence);
-    };
-    let Ok(metadata) = file.metadata().await else {
-        return Value::Array(evidence);
-    };
-    let through = mirror
-        .and_then(|value| value.get("through"))
-        .and_then(Value::as_u64)
-        .unwrap_or(metadata.len())
-        .min(metadata.len());
-    let start = through.saturating_sub(MAX_TRANSCRIPT_EVIDENCE_BYTES);
-    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-        return Value::Array(evidence);
-    }
-    let mut bytes = Vec::with_capacity((through - start) as usize);
-    if file
-        .take(through - start)
-        .read_to_end(&mut bytes)
-        .await
-        .is_err()
-    {
-        return Value::Array(evidence);
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let text = if start == 0 {
-        text.as_ref()
-    } else {
-        text.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
-    };
-    evidence.extend(
-        text.lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
-    );
-    Value::Array(evidence)
 }
 
 fn correlation_state_path(data_dir: &std::path::Path, key: &str) -> PathBuf {
@@ -2055,7 +2005,7 @@ async fn handle_request(
         }
         method::EVENT_LOG => {
             let mut env = parse!(Envelope);
-            attach_process_capture(&mut env, client.as_ref());
+            attach_process_capture(daemon, &mut env, client.as_ref());
             match daemon.capture_event(env).await {
                 Ok(accepted) => Response::ok(
                     id,

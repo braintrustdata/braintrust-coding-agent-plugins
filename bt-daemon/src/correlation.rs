@@ -1,9 +1,14 @@
-//! Daemon-wide local correlation between active tool calls and child sessions.
+//! Daemon-wide registry of coding-agent sessions, their processes, and spans.
 //!
-//! Agent translators remain source-specific, but their emitted tool rows are a
-//! common contract. This registry observes those rows, indexes the active tools
-//! by the coding agent process that owns their session, and resolves a child's
-//! requested route to the exact spawning tool span.
+//! Agent translators remain source-specific, but they emit ordinary session
+//! and tool spans into this common registry. A child's nearest registered
+//! coding-agent ancestor is the only possible parent process; a sibling agent
+//! under the same shell cannot be mistaken for its parent. One open tool under
+//! that process is sufficient to attach directly. Concurrent tools require a
+//! unique executable/script-name match on the branch between the two agents.
+//! When tools remain ambiguous but all belong to one session, the child is
+//! attached to that session span. Across multiple possible sessions, it stays
+//! standalone. The registry never guesses from process timing or child text.
 
 use crate::translate::{SpanOp, SpanRow, SpanType};
 use crate::wire::{CaptureContext, ProcessIdentity, SessionConfig, SessionRoute, TraceDestination};
@@ -37,6 +42,7 @@ struct State {
     session_processes: HashMap<String, HashSet<ProcessIdentity>>,
     unconfirmed_processes: HashMap<String, Vec<ProcessIdentity>>,
     active_tools: HashMap<String, HashMap<String, ActiveTool>>,
+    session_spans: HashMap<String, ActiveTool>,
     live_sessions: HashSet<String>,
 }
 
@@ -44,7 +50,9 @@ struct State {
 struct ActiveTool {
     components: SpanComponents,
     route: SessionRoute,
-    fingerprints: HashSet<[u8; 32]>,
+    /// Hashes of executable/script basenames in the tool input. These are
+    /// compared only to the captured process path when tools are concurrent.
+    command_terms: HashSet<[u8; 32]>,
     active: bool,
 }
 
@@ -55,6 +63,8 @@ pub(crate) struct ActiveParentSnapshot {
     dirty: bool,
     correlation_key: String,
     processes: Vec<ProcessIdentity>,
+    #[serde(default)]
+    session_span: Option<ActiveToolSnapshot>,
     tools: Vec<ActiveToolSnapshot>,
 }
 
@@ -62,10 +72,31 @@ pub(crate) struct ActiveParentSnapshot {
 struct ActiveToolSnapshot {
     components: SpanComponents,
     route: SessionRoute,
-    fingerprints: Vec<[u8; 32]>,
+    #[serde(default)]
+    command_terms: Vec<[u8; 32]>,
 }
 
 impl CorrelationRegistry {
+    pub(crate) fn has_registered_agent_process(&self) -> bool {
+        !self.state.lock().unwrap().process_sessions.is_empty()
+    }
+
+    pub(crate) fn needs_process_capture(&self, source: &str, session_id: &str) -> bool {
+        let prefix = format!("{source}\u{1f}{session_id}\u{1f}");
+        let state = self.state.lock().unwrap();
+        // Command hooks may need a second request to distinguish the agent
+        // from their one-shot `bt` process. Once its mapping is established,
+        // later hooks need no process walk until another SessionStart/resume.
+        state
+            .unconfirmed_processes
+            .keys()
+            .any(|key| key.starts_with(&prefix))
+            || !state
+                .session_processes
+                .keys()
+                .any(|key| key.starts_with(&prefix))
+    }
+
     pub(crate) fn observe_session(
         &self,
         key: &str,
@@ -112,6 +143,7 @@ impl CorrelationRegistry {
             return;
         };
         let Some(agent) = agent else { return };
+        state.unconfirmed_processes.remove(key);
         if known.as_ref().is_some_and(|known| known.contains(&agent)) {
             return;
         }
@@ -141,21 +173,32 @@ impl CorrelationRegistry {
 
     pub(crate) fn active_parent_snapshot(&self, key: &str) -> Option<ActiveParentSnapshot> {
         let state = self.state.lock().unwrap();
-        let tools = state.active_tools.get(key)?;
-        let tools: Vec<_> = tools
-            .values()
+        let tools: Vec<_> = state
+            .active_tools
+            .get(key)
+            .into_iter()
+            .flat_map(|tools| tools.values())
             .filter(|tool| tool.active)
             .map(|tool| ActiveToolSnapshot {
                 components: tool.components.clone(),
                 route: tool.route.clone(),
-                fingerprints: tool.fingerprints.iter().copied().collect(),
+                command_terms: tool.command_terms.iter().copied().collect(),
             })
             .collect();
-        if tools.is_empty() {
+        let session_span = state
+            .session_spans
+            .get(key)
+            .filter(|span| span.active)
+            .map(|span| ActiveToolSnapshot {
+                components: span.components.clone(),
+                route: span.route.clone(),
+                command_terms: Vec::new(),
+            });
+        if tools.is_empty() && session_span.is_none() {
             return None;
         }
         Some(ActiveParentSnapshot {
-            version: 2,
+            version: 3,
             dirty: false,
             correlation_key: key.to_string(),
             processes: state
@@ -163,6 +206,7 @@ impl CorrelationRegistry {
                 .get(key)
                 .map(|processes| processes.iter().cloned().collect())
                 .unwrap_or_default(),
+            session_span,
             tools,
         })
     }
@@ -180,10 +224,10 @@ impl CorrelationRegistry {
             .into_iter()
             .filter(|tool| tool.components.span_id.is_some())
             .collect();
-        if snapshot.version != 2
+        if !matches!(snapshot.version, 2 | 3)
             || snapshot.dirty
             || snapshot.processes.len() != 1
-            || restored_tools.is_empty()
+            || (restored_tools.is_empty() && snapshot.session_span.is_none())
         {
             return false;
         }
@@ -208,7 +252,7 @@ impl CorrelationRegistry {
         if !state.session_processes.contains_key(&key) {
             return false;
         }
-        let tools = state.active_tools.entry(key).or_default();
+        let tools = state.active_tools.entry(key.clone()).or_default();
         for snapshot in restored_tools {
             let span_id = snapshot.components.span_id.clone().unwrap();
             tools.insert(
@@ -216,12 +260,24 @@ impl CorrelationRegistry {
                 ActiveTool {
                     components: snapshot.components,
                     route: snapshot.route,
-                    fingerprints: snapshot.fingerprints.into_iter().collect(),
+                    command_terms: snapshot.command_terms.into_iter().collect(),
                     active: true,
                 },
             );
         }
-        !tools.is_empty()
+        let has_tools = !tools.is_empty();
+        if let Some(span) = snapshot.session_span {
+            state.session_spans.insert(
+                key.clone(),
+                ActiveTool {
+                    components: span.components,
+                    route: span.route,
+                    command_terms: HashSet::new(),
+                    active: true,
+                },
+            );
+        }
+        state.session_spans.contains_key(&key) || has_tools
     }
 
     pub(crate) fn observe_ops(
@@ -240,12 +296,43 @@ impl CorrelationRegistry {
             if row.span_id.is_empty() {
                 continue;
             }
+            if let Some(span) = state.session_spans.get_mut(key) {
+                if row.span_id == span.components.span_id.as_deref().unwrap_or_default() {
+                    // Terminal root merges close the session as a possible
+                    // parent. A later root update on resume can reopen it.
+                    let active = row.end_ms.is_none();
+                    if span.active != active {
+                        span.active = active;
+                        changed = true;
+                    }
+                }
+            }
+            // The first top-level task belongs to the session itself. Its
+            // parent is either empty or the external span that already owns
+            // this session. A later turn/task has the session span as parent.
+            // Retain this span so ambiguous tools can still attach a child to
+            // the *right session* without inventing a tool relationship.
+            let external_parent = config.attached_span_ids().0;
+            let is_session_span = row.span_type == SpanType::Task
+                && row.parent_span_ids == external_parent.into_iter().collect::<Vec<_>>();
+            if matches!(op, SpanOp::Insert(_))
+                && is_session_span
+                && !state.session_spans.contains_key(key)
+            {
+                state.session_spans.insert(
+                    key.to_string(),
+                    ActiveTool {
+                        components: span_components(config, row),
+                        route: route.clone(),
+                        command_terms: HashSet::new(),
+                        active: true,
+                    },
+                );
+                changed = true;
+            }
             if row.end_ms.is_some() {
                 if let Some(tools) = state.active_tools.get_mut(key) {
                     if let Some(tool) = tools.get_mut(&row.span_id) {
-                        if let Some(output) = &row.output {
-                            tool.fingerprints.extend(fingerprints(output));
-                        }
                         tool.active = false;
                         changed = true;
                     }
@@ -259,7 +346,7 @@ impl CorrelationRegistry {
                 continue;
             }
             let components = span_components(config, row);
-            let fingerprints = row.input.as_ref().map(fingerprints).unwrap_or_default();
+            let command_terms = row.input.as_ref().map(command_terms).unwrap_or_default();
             state
                 .active_tools
                 .entry(key.to_string())
@@ -269,7 +356,7 @@ impl CorrelationRegistry {
                     ActiveTool {
                         components,
                         route: route.clone(),
-                        fingerprints,
+                        command_terms,
                         active: true,
                     },
                 );
@@ -283,7 +370,25 @@ impl CorrelationRegistry {
         child_session_key: Option<&str>,
         capture: Option<&CaptureContext>,
         child_agent: Option<&ProcessIdentity>,
-        evidence: &Value,
+    ) -> Resolution {
+        self.resolve_internal(child_session_key, capture, child_agent, None)
+    }
+
+    pub(crate) fn resolve_pending(
+        &self,
+        capture: Option<&CaptureContext>,
+        child_agent: Option<&ProcessIdentity>,
+        candidate_span_ids: &[String],
+    ) -> Resolution {
+        self.resolve_internal(None, capture, child_agent, Some(candidate_span_ids))
+    }
+
+    fn resolve_internal(
+        &self,
+        child_session_key: Option<&str>,
+        capture: Option<&CaptureContext>,
+        child_agent: Option<&ProcessIdentity>,
+        candidate_span_ids: Option<&[String]>,
     ) -> Resolution {
         let Some(capture) = capture else {
             return Resolution::Standalone;
@@ -291,113 +396,96 @@ impl CorrelationRegistry {
         let Some(processes) = ancestors(capture, child_agent) else {
             return Resolution::Standalone;
         };
+        let wanted: Option<HashSet<&str>> =
+            candidate_span_ids.map(|ids| ids.iter().map(String::as_str).collect());
         let state = self.state.lock().unwrap();
         for process in processes.filter(|process| process.start_time_secs != 0) {
             let Some(sessions) = state.process_sessions.get(process) else {
                 continue;
             };
-            let mut candidates = Vec::new();
+            let mut candidates: Vec<(&str, &ActiveTool)> = Vec::new();
             for session in sessions {
                 if child_session_key.is_some_and(|child| child == session) {
                     continue;
                 }
                 if let Some(tools) = state.active_tools.get(session) {
-                    candidates.extend(tools.values().filter(|tool| tool.active).cloned());
-                }
-            }
-            if candidates.is_empty() {
-                return Resolution::Standalone;
-            }
-            if candidates.len() == 1 {
-                return Resolution::Parent(Box::new(to_link(candidates.pop().unwrap())));
-            }
-
-            let candidate_span_ids = candidates
-                .iter()
-                .filter_map(|candidate| candidate.components.span_id.clone())
-                .collect();
-            let evidence = fingerprints(evidence);
-            let mut scored: Vec<(usize, ActiveTool)> = candidates
-                .into_iter()
-                .map(|candidate| {
-                    let score = candidate.fingerprints.intersection(&evidence).count();
-                    (score, candidate)
-                })
-                .filter(|(score, _)| *score > 0)
-                .collect();
-            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-            if let Some((best_score, best)) = scored.first().cloned() {
-                let tied = scored
-                    .get(1)
-                    .is_some_and(|(second, _)| *second == best_score);
-                if !tied {
-                    return Resolution::Parent(Box::new(to_link(best)));
-                }
-            }
-            return Resolution::Ambiguous(candidate_span_ids);
-        }
-        Resolution::Standalone
-    }
-
-    pub(crate) fn resolve_pending(
-        &self,
-        capture: Option<&CaptureContext>,
-        child_agent: Option<&ProcessIdentity>,
-        evidence: &Value,
-        candidate_span_ids: &[String],
-    ) -> Resolution {
-        let Some(capture) = capture else {
-            return Resolution::Standalone;
-        };
-        let Some(child_agent) = child_agent else {
-            return Resolution::Standalone;
-        };
-        let Some(processes) = ancestors(capture, Some(child_agent)) else {
-            return Resolution::Standalone;
-        };
-        let wanted: HashSet<&str> = candidate_span_ids.iter().map(String::as_str).collect();
-        let evidence = fingerprints(evidence);
-        let state = self.state.lock().unwrap();
-        for process in processes.filter(|process| process.start_time_secs != 0) {
-            let Some(sessions) = state.process_sessions.get(process) else {
-                continue;
-            };
-            let mut scored = Vec::new();
-            let mut found = 0usize;
-            let mut any_active = false;
-            for session in sessions {
-                let Some(tools) = state.active_tools.get(session) else {
-                    continue;
-                };
-                for (span_id, tool) in tools {
-                    if wanted.contains(span_id.as_str()) {
-                        found += 1;
-                        any_active |= tool.active;
-                        let score = tool.fingerprints.intersection(&evidence).count();
-                        if score > 0 {
-                            scored.push((score, tool.clone()));
+                    for (span_id, tool) in tools {
+                        if wanted
+                            .as_ref()
+                            .is_some_and(|ids| !ids.contains(span_id.as_str()))
+                        {
+                            continue;
+                        }
+                        if tool.active || wanted.is_some() {
+                            candidates.push((session, tool));
                         }
                     }
                 }
             }
-            if found == 0 {
-                // A nearer agent owns this process. Older candidates cannot
-                // be reached by stepping over that agent.
-                return Resolution::Standalone;
+            if candidates.len() == 1 {
+                return Resolution::Parent(Box::new(to_link(candidates[0].1.clone())));
             }
-            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-            if let Some((best_score, best)) = scored.first().cloned() {
-                let tied = scored
-                    .get(1)
-                    .is_some_and(|(second, _)| *second == best_score);
-                if !tied {
-                    return Resolution::Parent(Box::new(to_link(best)));
+
+            if candidates.len() > 1 {
+                // Start times distinguish reused PIDs, not simultaneous calls.
+                // Only names from the branch between the two agent processes
+                // can distinguish concurrent tool calls. Generic shells and
+                // the child agent executable itself are excluded.
+                let terms = branch_terms(capture, child_agent, process);
+                let mut scored: Vec<_> = candidates
+                    .iter()
+                    .map(|(_, tool)| tool.command_terms.intersection(&terms).count())
+                    .enumerate()
+                    .collect();
+                scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+                if let Some(&(index, best)) = scored.first() {
+                    if best > 0 && scored.get(1).is_none_or(|(_, next)| *next < best) {
+                        return Resolution::Parent(Box::new(to_link(candidates[index].1.clone())));
+                    }
                 }
             }
-            if found == wanted.len() && !any_active {
-                return Resolution::Standalone;
+
+            if child_agent.is_none() && candidates.len() > 1 {
+                // A command hook initially exposes only its own CLI process.
+                // Wait for a second hook to identify the stable child agent;
+                // only then can we inspect the branch below this parent.
+                return Resolution::Ambiguous(
+                    candidates
+                        .iter()
+                        .filter_map(|(_, tool)| tool.components.span_id.clone())
+                        .collect(),
+                );
             }
-            return Resolution::Ambiguous(candidate_span_ids.to_vec());
+
+            // Tool attribution may be ambiguous while session attribution is
+            // certain. Attach to that session's span, preserving the trace
+            // tree without claiming a particular tool launched the child.
+            let candidate_sessions: HashSet<&str> = if candidates.is_empty() && wanted.is_none() {
+                sessions
+                    .iter()
+                    .filter(|session| child_session_key != Some(session.as_str()))
+                    .map(String::as_str)
+                    .collect()
+            } else {
+                candidates.iter().map(|(session, _)| *session).collect()
+            };
+            if candidate_sessions.len() == 1 {
+                if let Some(span) = state
+                    .session_spans
+                    .get(*candidate_sessions.iter().next().unwrap())
+                    .filter(|span| span.active)
+                {
+                    return Resolution::Parent(Box::new(to_link(span.clone())));
+                }
+            }
+
+            // A nearer registered agent is a hard boundary. Even if its
+            // sessions are ambiguous, never search beyond it for an older
+            // agent process that happens to have an open tool.
+            // No later tool result can prove which concurrent launch owned
+            // this child. Once the process branch has been captured, keeping
+            // the child pending would only delay an unavoidable decision.
+            return Resolution::Standalone;
         }
         Resolution::Standalone
     }
@@ -407,6 +495,7 @@ impl CorrelationRegistry {
         state.live_sessions.remove(key);
         state.unconfirmed_processes.remove(key);
         state.active_tools.remove(key);
+        state.session_spans.remove(key);
         if let Some(processes) = state.session_processes.remove(key) {
             for process in processes {
                 if let Some(sessions) = state.process_sessions.get_mut(&process) {
@@ -489,6 +578,31 @@ fn ancestors<'a>(
     Some(capture.process_chain.iter().skip(start))
 }
 
+fn branch_terms(
+    capture: &CaptureContext,
+    child_agent: Option<&ProcessIdentity>,
+    parent_agent: &ProcessIdentity,
+) -> HashSet<[u8; 32]> {
+    let Some(child_agent) = child_agent else {
+        return HashSet::new();
+    };
+    let Some(start) = capture.process_chain.iter().position(|p| p == child_agent) else {
+        return HashSet::new();
+    };
+    let Some(end) = capture.process_chain.iter().position(|p| p == parent_agent) else {
+        return HashSet::new();
+    };
+    capture
+        .process_labels
+        .get(start + 1..end)
+        .unwrap_or_default()
+        .iter()
+        .flatten()
+        .filter_map(|label| normalized_command_name(label))
+        .map(|name| hash(name.as_bytes()))
+        .collect()
+}
+
 fn to_link(tool: ActiveTool) -> ParentLink {
     let mut route = tool.route;
     route.destination = Some(TraceDestination::ParentSpan {
@@ -545,23 +659,49 @@ fn span_components(config: &SessionConfig, row: &SpanRow) -> SpanComponents {
     }
 }
 
-fn fingerprints(value: &Value) -> HashSet<[u8; 32]> {
+fn command_terms(value: &Value) -> HashSet<[u8; 32]> {
     let mut strings = Vec::new();
     collect_strings(value, &mut strings);
-    let mut result = HashSet::new();
-    for value in strings {
-        let normalized = normalize(&value);
-        if normalized.len() >= 8 {
-            result.insert(hash(normalized.as_bytes()));
-        }
-        let tokens: Vec<&str> = normalized.split_whitespace().collect();
-        for width in 3..=tokens.len().min(8) {
-            for window in tokens.windows(width) {
-                result.insert(hash(window.join(" ").as_bytes()));
-            }
-        }
+    strings
+        .into_iter()
+        .flat_map(|text| {
+            text.split(|ch: char| ch.is_whitespace() || "'\";|&()<>".contains(ch))
+                .filter_map(normalized_command_name)
+                .map(|name| hash(name.as_bytes()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn normalized_command_name(text: &str) -> Option<String> {
+    // Compare whole executable/script names, never arbitrary substrings:
+    // `app` must not match `other-app`. Normalize both Unix and Windows paths
+    // regardless of the host running a fixture or replay.
+    let name = text
+        .rsplit(['/', '\\'])
+        .next()?
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '.' && ch != '_' && ch != '-');
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    if name.len() < 4
+        || matches!(
+            name,
+            "bash"
+                | "zsh"
+                | "fish"
+                | "cmd"
+                | "pwsh"
+                | "python"
+                | "node"
+                | "claude"
+                | "codex"
+                | "grok"
+                | "opencode"
+        )
+    {
+        return None;
     }
-    result
+    Some(name.to_owned())
 }
 
 fn collect_strings(value: &Value, strings: &mut Vec<String>) {
@@ -577,14 +717,6 @@ fn collect_strings(value: &Value, strings: &mut Vec<String>) {
     }
 }
 
-fn normalize(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
 fn hash(value: &[u8]) -> [u8; 32] {
     Sha256::digest(value).into()
 }
@@ -592,6 +724,160 @@ fn hash(value: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_span(id: &str, text: &str) -> ActiveTool {
+        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+        components.span_id = Some(id.into());
+        components.root_span_id = Some("trace-root".into());
+        ActiveTool {
+            components,
+            route: SessionRoute::default(),
+            command_terms: command_terms(&Value::String(text.into())),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn concurrent_tools_use_process_text_then_fall_back_to_session_span() {
+        let registry = CorrelationRegistry::default();
+        let parent = process(20);
+        let child = process(10);
+        let wrapper = process(15);
+        {
+            let mut state = registry.state.lock().unwrap();
+            state
+                .process_sessions
+                .insert(parent.clone(), HashSet::from(["one".into()]));
+            state
+                .session_spans
+                .insert("one".into(), test_span("session", ""));
+            state.active_tools.insert(
+                "one".into(),
+                HashMap::from([
+                    ("a".into(), test_span("a", "bash something.sh")),
+                    ("b".into(), test_span("b", "./my-app")),
+                ]),
+            );
+        }
+        let mut capture = CaptureContext {
+            process_chain: vec![child.clone(), wrapper, parent],
+            process_labels: vec![
+                vec!["codex".into()],
+                vec!["bash".into(), "something.sh".into()],
+                vec!["claude".into()],
+            ],
+            truncated: false,
+        };
+        let parent_id =
+            |capture: &CaptureContext| match registry.resolve(None, Some(capture), Some(&child)) {
+                Resolution::Parent(link) => match link.route.destination {
+                    Some(TraceDestination::ParentSpan { components }) => {
+                        components.span_id.unwrap()
+                    }
+                    _ => panic!("missing span destination"),
+                },
+                _ => panic!("expected parent"),
+            };
+        assert_eq!(parent_id(&capture), "a");
+        capture.process_labels[1] = vec!["my-app".into()];
+        assert_eq!(parent_id(&capture), "b");
+        capture.process_labels[1] = vec!["bash".into()];
+        assert_eq!(parent_id(&capture), "session");
+    }
+
+    #[test]
+    fn shared_process_requires_one_session_when_text_cannot_distinguish_calls() {
+        let registry = CorrelationRegistry::default();
+        let parent = process(20);
+        let child = process(10);
+        let wrapper = process(15);
+        {
+            let mut state = registry.state.lock().unwrap();
+            state
+                .process_sessions
+                .insert(parent.clone(), HashSet::from(["one".into(), "two".into()]));
+            for (session, id) in [("one", "a"), ("two", "b")] {
+                state
+                    .session_spans
+                    .insert(session.into(), test_span(session, ""));
+                state.active_tools.insert(
+                    session.into(),
+                    HashMap::from([(id.into(), test_span(id, &format!("./{session}.sh")))]),
+                );
+            }
+        }
+        let mut capture = CaptureContext {
+            process_chain: vec![child.clone(), wrapper, parent],
+            process_labels: vec![
+                vec!["codex".into()],
+                vec!["bash".into()],
+                vec!["claude".into()],
+            ],
+            truncated: false,
+        };
+        assert!(matches!(
+            registry.resolve(None, Some(&capture), Some(&child)),
+            Resolution::Standalone
+        ));
+        capture.process_labels[1].push("two.sh".into());
+        assert!(matches!(
+            registry.resolve(None, Some(&capture), Some(&child)),
+            Resolution::Parent(_)
+        ));
+    }
+
+    #[test]
+    fn completed_session_is_not_a_fallback_parent() {
+        let registry = CorrelationRegistry::default();
+        let parent = process(20);
+        let child = process(10);
+        {
+            let mut state = registry.state.lock().unwrap();
+            state
+                .process_sessions
+                .insert(parent.clone(), HashSet::from(["one".into()]));
+            state
+                .session_spans
+                .insert("one".into(), test_span("session", ""));
+        }
+        let capture = CaptureContext {
+            process_chain: vec![child.clone(), parent],
+            process_labels: Vec::new(),
+            truncated: false,
+        };
+        let config = SessionConfig {
+            auth: crate::wire::BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            },
+            destination: None,
+            flush_mode: crate::wire::FlushMode::default(),
+            additional_metadata: None,
+            tags: Vec::new(),
+            span_plugins: Vec::new(),
+        };
+        assert!(matches!(
+            registry.resolve(None, Some(&capture), Some(&child)),
+            Resolution::Parent(_)
+        ));
+        registry.observe_ops(
+            "one",
+            &SessionRoute::default(),
+            &config,
+            &[SpanOp::Merge(SpanRow {
+                span_id: "session".into(),
+                end_ms: Some(1),
+                ..Default::default()
+            })],
+        );
+        assert!(matches!(
+            registry.resolve(None, Some(&capture), Some(&child)),
+            Resolution::Standalone
+        ));
+    }
 
     fn process(pid: u32) -> ProcessIdentity {
         ProcessIdentity {
@@ -613,6 +899,7 @@ mod tests {
                 process(12),
                 parent_agent.clone(),
             ],
+            process_labels: Vec::new(),
             truncated: false,
         };
         let latest = CaptureContext {
@@ -624,6 +911,7 @@ mod tests {
                 process(12),
                 parent_agent.clone(),
             ],
+            process_labels: Vec::new(),
             truncated: false,
         };
         for source in ["antigravity", "claude-code", "codex", "grok"] {
@@ -656,6 +944,7 @@ mod tests {
                     process(12),
                     parent_agent.clone(),
                 ],
+                process_labels: Vec::new(),
                 truncated: false,
             };
             assert_eq!(
@@ -686,12 +975,14 @@ mod tests {
                     } else {
                         vec![parent_agent.clone()]
                     },
+                    process_labels: Vec::new(),
                     truncated: false,
                 };
                 registry.observe_session("parent", parent_source, Some(&parent_first));
                 if uses_command_hook(parent_source) {
                     let parent_next = CaptureContext {
                         process_chain: vec![process(31), parent_agent.clone()],
+                        process_labels: Vec::new(),
                         truncated: false,
                     };
                     registry.observe_session("parent", parent_source, Some(&parent_next));
@@ -705,7 +996,7 @@ mod tests {
                         ActiveTool {
                             components,
                             route: SessionRoute::default(),
-                            fingerprints: HashSet::new(),
+                            command_terms: HashSet::new(),
                             active: true,
                         },
                     )]),
@@ -724,6 +1015,7 @@ mod tests {
                     } else {
                         ancestry.clone()
                     },
+                    process_labels: Vec::new(),
                     truncated: false,
                 };
                 let child_next = CaptureContext {
@@ -732,6 +1024,7 @@ mod tests {
                     } else {
                         child_first.process_chain.clone()
                     },
+                    process_labels: Vec::new(),
                     truncated: false,
                 };
                 let child_agent =
@@ -743,12 +1036,7 @@ mod tests {
                 );
                 assert!(
                     matches!(
-                        registry.resolve(
-                            None,
-                            Some(&child_next),
-                            child_agent.as_ref(),
-                            &Value::Null
-                        ),
+                        registry.resolve(None, Some(&child_next), child_agent.as_ref(),),
                         Resolution::Parent(_)
                     ),
                     "{parent_source} -> {child_source} failed through wrapper processes"
@@ -765,6 +1053,7 @@ mod tests {
         let shell = process(300);
         let capture = |hook, agent: &ProcessIdentity| CaptureContext {
             process_chain: vec![process(hook), agent.clone(), shell.clone()],
+            process_labels: Vec::new(),
             truncated: false,
         };
         registry.observe_session("resumed", "claude-code", Some(&capture(1, &old_agent)));
@@ -794,16 +1083,5 @@ mod tests {
         assert!(!state.process_sessions.contains_key(&old_agent));
         assert!(!state.process_sessions.contains_key(&shell));
         assert!(state.process_sessions[&new_agent].contains("resumed"));
-    }
-
-    #[test]
-    fn fingerprints_match_prompt_subsets_without_parsing_shell() {
-        let parent = fingerprints(&serde_json::json!({
-            "command": "agent --prompt 'inspect the distributed tracing linkage carefully please'"
-        }));
-        let child = fingerprints(&serde_json::json!({
-            "prompt": "inspect the distributed tracing linkage carefully please"
-        }));
-        assert!(parent.intersection(&child).count() > 0);
     }
 }

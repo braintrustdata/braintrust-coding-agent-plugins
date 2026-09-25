@@ -459,7 +459,7 @@ async fn mixed_recursive_hierarchy_survives_a_restart_at_every_spawn_boundary() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_tools_are_disambiguated_by_prompt_fingerprints() {
+async fn concurrent_tools_are_disambiguated_by_process_script_name() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {
         serve_argv: vec![OsString::from("unused")],
@@ -467,11 +467,12 @@ async fn concurrent_tools_are_disambiguated_by_prompt_fingerprints() {
     };
     let mut fixtures = DistributedFixtures::new();
     let parent_tree = ProcessTree::root(9_000);
-    let child_tree = ProcessTree::child(9_002, 9_001, &parent_tree);
+    let child_tree =
+        ProcessTree::child(9_002, 9_001, &parent_tree).with_branch_label("beta-task.sh");
     let parent_session = "concurrent-parent";
     let child_session = "concurrent-child";
     let first_prompt = "inspect the unrelated alpha candidate carefully";
-    let selected_prompt = "inspect the selected beta candidate carefully";
+    let selected_prompt = "bash beta-task.sh to inspect the selected beta candidate carefully";
 
     forward_all(
         &mut fixtures.start_turn(
@@ -512,8 +513,8 @@ async fn concurrent_tools_are_disambiguated_by_prompt_fingerprints() {
     )
     .await;
 
-    // SessionStart alone is ambiguous and is held. UserPromptSubmit supplies
-    // the opaque-content fingerprints that select call-beta.
+    // The script name on the process branch selects call-beta even while both
+    // tools are open. The child's prompt is not used as launch evidence.
     forward_all(
         &mut fixtures.start_turn(
             AgentKind::Pi,
@@ -756,7 +757,7 @@ async fn mixed_agents_link_recursively_through_every_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn indistinguishable_concurrent_tools_fail_safe_without_a_parent() {
+async fn indistinguishable_concurrent_tools_attach_to_the_known_session() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {
         serve_argv: vec![OsString::from("unused")],
@@ -836,21 +837,7 @@ async fn indistinguishable_concurrent_tools_fail_safe_without_a_parent() {
     }
     flush("ambiguous-child", &socket).await;
 
-    let child = recording.session("ambiguous-child");
-    assert!(
-        child.configs.lock().unwrap().iter().all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )),
-        "an ambiguous child must never be attached by guessing"
-    );
-    let child_root = session_root(
-        &inserted_rows(&child),
-        "ambiguous-child",
-        "ambiguous standalone",
-    )
-    .clone();
-    assert!(child_root.parent_span_ids.is_empty());
+    assert_attached_to_session(recording.as_ref(), "ambiguous-parent", "ambiguous-child");
 
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
@@ -940,7 +927,7 @@ async fn resolved_child_link_survives_daemon_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ambiguous_child_evidence_survives_daemon_restart() {
+async fn session_fallback_survives_daemon_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
@@ -995,6 +982,7 @@ async fn ambiguous_child_evidence_survives_daemon_restart() {
     );
     forward(child_start.remove(0), &socket, &host).await;
     flush("pending-child", &socket).await;
+    assert_attached_to_session(first_recording.as_ref(), "pending-parent", "pending-child");
     assert!(tokio::fs::read_dir(data_dir.join("correlation"))
         .await
         .unwrap()
@@ -1007,8 +995,8 @@ async fn ambiguous_child_evidence_survives_daemon_restart() {
 
     let second_recording = Arc::new(RecordingSinkFactory::default());
     let second_daemon = spawn_daemon(socket.clone(), data_dir, second_recording.clone()).await;
-    // No parent event is sent after restart. Both candidates and their hashed
-    // evidence must come from the compact active-parent snapshot.
+    // No parent event is sent after restart. The decided session attachment
+    // must be reused even though the old tools are no longer in this process.
     forward(child_start.remove(0), &socket, &host).await;
     forward(
         fixtures.close_session(
@@ -1023,26 +1011,6 @@ async fn ambiguous_child_evidence_survives_daemon_restart() {
     )
     .await;
     flush("pending-child", &socket).await;
-
-    let parent = first_recording.session("pending-parent");
-    let beta = inserted_rows(&parent)
-        .into_iter()
-        .find(|row| {
-            row.span_type == SpanType::Tool
-                && row
-                    .input
-                    .as_ref()
-                    .is_some_and(|input| input.to_string().contains(selected))
-        })
-        .expect("replayed beta tool");
-    let child = second_recording.session("pending-child");
-    let child_root = session_root(
-        &inserted_rows(&child),
-        "pending-child",
-        "durable pending child",
-    )
-    .clone();
-    assert_eq!(child_root.parent_span_ids, vec![beta.span_id]);
 
     shutdown_daemon(&socket).await.unwrap();
     second_daemon.await.unwrap();
@@ -1139,11 +1107,15 @@ async fn completed_tools_are_not_resurrected_after_restart() {
         )
         .await;
         flush(&child_session, &socket).await;
-        let child = recording.session(&child_session);
-        assert!(child.configs.lock().unwrap().iter().all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )));
+        if reused_pid {
+            let child = recording.session(&child_session);
+            assert!(child.configs.lock().unwrap().iter().all(|config| !matches!(
+                config.destination,
+                Some(TraceDestination::ParentSpan { .. })
+            )));
+        } else {
+            assert_attached_to_session(recording.as_ref(), "closed-restart-parent", &child_session);
+        }
     }
 
     shutdown_daemon(&socket).await.unwrap();
@@ -1431,11 +1403,7 @@ async fn completed_tools_are_not_candidates_for_later_children() {
         )
         .await;
         flush(&child_session, &socket).await;
-        let child = recording.session(&child_session);
-        assert!(child.configs.lock().unwrap().iter().all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )));
+        assert_attached_to_session(recording.as_ref(), &parent_session, &child_session);
     }
 
     shutdown_daemon(&socket).await.unwrap();
@@ -1443,7 +1411,7 @@ async fn completed_tools_are_not_candidates_for_later_children() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn child_output_can_disambiguate_when_inputs_do_not_overlap() {
+async fn child_output_does_not_guess_a_tool_when_process_text_is_ambiguous() {
     let (socket, daemon, recording, _tmp) = start_daemon().await;
     let host = HostInfo {
         serve_argv: vec![OsString::from("unused")],
@@ -1538,25 +1506,7 @@ async fn child_output_can_disambiguate_when_inputs_do_not_overlap() {
     .await;
     flush("output-child", &socket).await;
 
-    let parent = recording.session("output-parent");
-    let beta = inserted_rows(&parent)
-        .into_iter()
-        .find(|row| {
-            row.span_type == SpanType::Tool
-                && row
-                    .input
-                    .as_ref()
-                    .is_some_and(|input| input.to_string().contains("opaque-beta"))
-        })
-        .expect("beta tool");
-    let child = recording.session("output-child");
-    let child_root = session_root(
-        &inserted_rows(&child),
-        "output-child",
-        "output fingerprint child",
-    )
-    .clone();
-    assert_eq!(child_root.parent_span_ids, vec![beta.span_id]);
+    assert_attached_to_session(recording.as_ref(), "output-parent", "output-child");
 
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
@@ -1578,10 +1528,8 @@ async fn concurrent_agent_sessions_in_one_process_choose_their_own_tools() {
         let parent_session = format!("multiplex-parent-{}", parent_kind.label());
         let child_session = format!("multiplex-child-{}", child_kind.label());
         let call_id = format!("multiplex-call-{index}");
-        let prompt = format!(
-            "unique multiplexed prompt number {index} for {}",
-            parent_kind.label()
-        );
+        let script = format!("multiplex-{index}.sh");
+        let prompt = format!("bash {script} for {}", parent_kind.label());
         let ts = 1_700_900_000_000 + index as i64 * 100;
         forward_all(
             &mut fixtures.start_turn(
@@ -1612,7 +1560,8 @@ async fn concurrent_agent_sessions_in_one_process_choose_their_own_tools() {
             18_100 + index as u32 * 2,
             18_101 + index as u32 * 2,
             &shared_parent_tree,
-        );
+        )
+        .with_branch_label(&script);
         let events = fixtures.start_turn(child_kind, &child_session, &child_tree, &prompt, ts + 20);
         cases.push((
             parent_kind,
@@ -1963,11 +1912,7 @@ async fn concurrent_ambiguous_children_do_not_deadlock_or_cross_link() {
     }
     for (_, session, _) in &child_cases {
         flush(session, &socket).await;
-        let child = recording.session(session);
-        assert!(child.configs.lock().unwrap().iter().all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )));
+        assert_attached_to_session(recording.as_ref(), "deadlock-parent", session);
     }
 
     shutdown_daemon(&socket).await.unwrap();
@@ -2069,6 +2014,7 @@ async fn sibling_agents_under_one_shell_remain_separate_with_active_tools() {
             start_time_secs: 1_700_023_001,
         },
         ancestors: vec![shared_shell.agent.clone()],
+        ancestor_labels: vec![vec!["bash".into()]],
     };
     let second = ProcessTree {
         agent: bt_daemon::wire::ProcessIdentity {
@@ -2076,6 +2022,7 @@ async fn sibling_agents_under_one_shell_remain_separate_with_active_tools() {
             start_time_secs: 1_700_023_002,
         },
         ancestors: first.ancestors.clone(),
+        ancestor_labels: first.ancestor_labels.clone(),
     };
 
     // Each Claude hook has its own Bash launcher between `bt` and Claude.
@@ -2142,6 +2089,7 @@ async fn sibling_agents_under_one_shell_remain_separate_with_active_tools() {
             start_time_secs: 1_700_023_003,
         },
         ancestors: first.ancestors.clone(),
+        ancestor_labels: first.ancestor_labels.clone(),
     };
     let mut third_events = fixtures.start_turn(
         AgentKind::Claude,
@@ -2260,6 +2208,7 @@ async fn child_does_not_skip_an_idle_agent_to_reach_a_grandparent_tool() {
             test_process(25_006),
             grandparent.agent.clone(),
         ],
+        ancestor_labels: vec![vec!["bash".into()]; 4],
     };
     let child = ProcessTree::child(25_004, 25_003, &parent);
     forward_all(
@@ -2317,20 +2266,9 @@ async fn child_does_not_skip_an_idle_agent_to_reach_a_grandparent_tool() {
     )
     .await;
     flush("direct-child", &socket).await;
-    let child_record = recording.session("direct-child");
-    let rows = inserted_rows(&child_record);
-    assert!(session_root(&rows, "direct-child", "direct child")
-        .parent_span_ids
-        .is_empty());
-    assert!(child_record
-        .configs
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )));
+    // The nearer agent owns the child, even without an open tool. Its session
+    // span is the fallback; the grandparent tool must never be selected.
+    assert_attached_to_session(recording.as_ref(), "direct-parent", "direct-child");
 
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
@@ -2396,20 +2334,8 @@ async fn standalone_parentage_is_not_reconsidered_on_later_session_start() {
     )
     .await;
     flush("late-tool-child", &socket).await;
-    let record = recording.session("late-tool-child");
-    let rows = inserted_rows(&record);
-    assert!(session_root(&rows, "late-tool-child", "late tool")
-        .parent_span_ids
-        .is_empty());
-    assert!(record
-        .configs
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|config| !matches!(
-            config.destination,
-            Some(TraceDestination::ParentSpan { .. })
-        )));
+    // A later tool must not move a child already attached to its session.
+    assert_attached_to_session(recording.as_ref(), "late-tool-parent", "late-tool-child");
 
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
@@ -2478,6 +2404,24 @@ fn assert_pair_linked(
         Some(parent_root.root_span_id.as_str()),
         "{label}: sink attachment chose a different trace root"
     );
+}
+
+fn assert_attached_to_session(
+    recording: &RecordingSinkFactory,
+    parent_session: &str,
+    child_session: &str,
+) {
+    let parent = recording.session(parent_session);
+    let child = recording.session(child_session);
+    let parent_rows = inserted_rows(&parent);
+    let parent_root = session_root(&parent_rows, parent_session, "parent session");
+    let child_rows = inserted_rows(&child);
+    let child_root = session_root(&child_rows, child_session, "child session");
+    assert_eq!(
+        child_root.parent_span_ids,
+        vec![parent_root.span_id.clone()]
+    );
+    assert_eq!(child_root.root_span_id, parent_root.root_span_id);
 }
 
 fn inserted_rows(record: &RecordedSession) -> Vec<SpanRow> {
