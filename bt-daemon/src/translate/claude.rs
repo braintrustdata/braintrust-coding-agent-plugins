@@ -2062,6 +2062,7 @@ fn tool_failure_text(payload: &Value) -> Option<String> {
         payload.pointer("/tool_response/stderr"),
         payload.pointer("/tool_response/message"),
         payload.pointer("/tool_response/output"),
+        payload.pointer("/tool_response/content"),
     ]
     .into_iter()
     .flatten()

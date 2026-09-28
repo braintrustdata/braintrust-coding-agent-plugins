@@ -1184,6 +1184,49 @@ fn codex_successful_structured_tool_outputs_do_not_populate_error() {
 }
 
 #[test]
+fn codex_mcp_error_results_keep_the_content_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
+                "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+                "payload": { "type": "function_call", "call_id": "c1", "name": "mcp_tool",
+                             "arguments": "{}", "metadata": { "turn_id": "t1" } } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+                "payload": { "type": "function_call_output", "call_id": "c1",
+                             "output": { "isError": true, "content": [
+                                 { "type": "text", "text": "Could not resolve to an issue or pull request with the number of 355." }
+                             ] } } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "t1",
+                             "last_agent_message": "done" } }),
+    ] {
+        append(&transcript, record);
+    }
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let rows = reduce(
+        translator
+            .handle(
+                &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        find(&rows, SpanType::Tool, "mcp_tool").error.as_deref(),
+        Some("Could not resolve to an issue or pull request with the number of 355.")
+    );
+}
+
+#[test]
 fn missing_tool_output_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout.jsonl");

@@ -801,7 +801,7 @@ impl PiTranslator {
                 }),
                 Some(ToolApproval::Approved),
             )),
-            error: failed.then(|| format_error(event.result.as_ref())),
+            error: failed.then(|| format_error(&tracked.name, event.result.as_ref())),
             ..Default::default()
         };
         vec![if pending.is_some() {
@@ -1046,6 +1046,31 @@ fn explicit_skills(input: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .collect()
 }
-fn format_error(v: Option<&Value>) -> String {
-    error_text(v, "Tool execution failed")
+fn format_error(tool: &str, v: Option<&Value>) -> String {
+    bash_status(tool, v).unwrap_or_else(|| error_text(v, "Tool execution failed"))
+}
+/// Pi's bash tool appends its terminal status after the captured command
+/// output, so the status line identifies the failure better than the first line.
+fn bash_status(tool: &str, v: Option<&Value>) -> Option<String> {
+    if tool != "bash" {
+        return None;
+    }
+    let text = v?
+        .pointer("/content")?
+        .as_array()?
+        .iter()
+        .find_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+        })?;
+    let status = text.lines().map(str::trim).rfind(|line| !line.is_empty())?;
+    [
+        "Command exited with code ",
+        "Command timed out after ",
+        "Command aborted",
+    ]
+    .iter()
+    .any(|prefix| status.starts_with(prefix))
+    .then(|| status.to_string())
 }

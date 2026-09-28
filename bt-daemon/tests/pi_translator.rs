@@ -584,3 +584,97 @@ fn pi_ignores_malformed_typed_events_without_failing_the_session() {
         .iter()
         .any(|op| matches!(op, SpanOp::Merge(row) if row.end_ms == Some(3))));
 }
+
+#[test]
+fn pi_tool_errors_keep_the_native_failure_cause() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    // Pi reports every thrown tool error as `{content:[{type:"text",text}],details:{}}`,
+    // and bash appends its terminal status after the captured command output.
+    let failures = [
+        (
+            "bash",
+            "(no output)\n\nCommand exited with code 1",
+            "Command exited with code 1",
+        ),
+        (
+            "bash",
+            "Compiling...\nstill running\n\nCommand timed out after 20 seconds",
+            "Command timed out after 20 seconds",
+        ),
+        (
+            "bash",
+            "partial\n\nCommand aborted",
+            "Command aborted",
+        ),
+        (
+            "edit",
+            "Found 2 occurrences of the text in src/lib.rs. Each oldText must be unique. Please provide more context to make it unique.",
+            "Found 2 occurrences of the text in src/lib.rs. Each oldText must be unique. Please provide more context to make it unique.",
+        ),
+        (
+            "read",
+            "ENOENT: no such file or directory, access '/repo/AGENTS.md'",
+            "ENOENT: no such file or directory, access '/repo/AGENTS.md'",
+        ),
+    ];
+    let mut ops = translator
+        .handle(
+            &event("before_agent_start", 1, json!({"prompt":"go"})),
+            &ctx,
+        )
+        .unwrap();
+    for (index, (tool, text, _)) in failures.iter().enumerate() {
+        let call = format!("call-{index}");
+        let ts = 10 + index as i64 * 2;
+        ops.extend(
+            translator
+                .handle(
+                    &event(
+                        "tool_execution_start",
+                        ts,
+                        json!({"toolCallId":call,"toolName":tool,"args":{}}),
+                    ),
+                    &ctx,
+                )
+                .unwrap(),
+        );
+        ops.extend(
+            translator
+                .handle(
+                    &event(
+                        "tool_execution_end",
+                        ts + 1,
+                        json!({
+                            "toolCallId":call,
+                            "toolName":tool,
+                            "result":{"content":[{"type":"text","text":text}],"details":{}},
+                            "isError":true
+                        }),
+                    ),
+                    &ctx,
+                )
+                .unwrap(),
+        );
+    }
+    let rows = reduce(ops);
+    for (index, (tool, text, expected)) in failures.iter().enumerate() {
+        let row = rows
+            .values()
+            .find(|row| {
+                row.span_type == SpanType::Tool
+                    && row.metadata.as_ref().unwrap()["tool_call_id"]
+                        == json!(format!("call-{index}"))
+            })
+            .unwrap();
+        assert_eq!(row.error.as_deref(), Some(*expected), "{tool}: {text}");
+        assert_eq!(
+            row.output.as_ref().unwrap()["content"][0]["text"],
+            json!(text)
+        );
+    }
+}
