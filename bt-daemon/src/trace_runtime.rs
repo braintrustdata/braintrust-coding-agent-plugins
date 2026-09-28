@@ -418,11 +418,12 @@ async fn diagnose_daemon_auth(socket: &Path, selection: &AuthSelection) -> AuthD
 /// through the same host path the daemon uses, which separates divergent
 /// credential views from failures both processes share.
 fn daemon_warnings(
-    display_name: &str,
+    agent: DoctorAgent,
     auth: &AuthDiagnostic,
     daemon: &DaemonDiagnostic,
     resolves_locally: bool,
 ) -> Vec<String> {
+    let (source, display_name) = (agent.source(), agent.display_name());
     if daemon.status == DaemonStatus::Unreachable {
         return vec![format!(
             "the tracing daemon did not answer: {}",
@@ -458,7 +459,7 @@ fn daemon_warnings(
         }
         Some(daemon_auth) if daemon_auth.status == "unsupported" => {
             warnings.push(format!(
-                "the running tracing daemon{} cannot report its authentication; run `bt trace stop` so the next event starts the current version",
+                "the tracing daemon is still running an older bt{} that can't report whether its login works; it restarts on this bt version the next time {display_name} sends a trace event, so use {display_name} once, then rerun `bt trace doctor {source}`",
                 daemon.version_suffix()
             ));
         }
@@ -569,7 +570,7 @@ async fn doctor_output_at(
         _ => false,
     };
     warnings.extend(daemon_warnings(
-        args.agent.display_name(),
+        args.agent,
         &auth,
         &daemon,
         resolves_locally,
@@ -1313,9 +1314,9 @@ mod tests {
         // are the only evidence.
         let older = running_daemon("0.21.0", diagnostic("unsupported", None));
         assert_eq!(
-            daemon_warnings("Codex", &shell, &older, true),
+            daemon_warnings(DoctorAgent::Codex, &shell, &older, true),
             [
-                "the running tracing daemon (0.21.0) cannot report its authentication; run `bt trace stop` so the next event starts the current version".to_string(),
+                "the tracing daemon is still running an older bt (0.21.0) that can't report whether its login works; it restarts on this bt version the next time Codex sends a trace event, so use Codex once, then rerun `bt trace doctor codex`".to_string(),
                 format!("the running tracing daemon reported a Codex session error: {session_error}"),
             ]
         );
@@ -1327,7 +1328,7 @@ mod tests {
             diagnostic("error", Some("failed to call login endpoint")),
         );
         assert_eq!(
-            daemon_warnings("Codex", &shell, &offline, false),
+            daemon_warnings(DoctorAgent::Codex, &shell, &offline, false),
             ["the running tracing daemon cannot authenticate, so it rejects Codex events: failed to call login endpoint"]
         );
     }
