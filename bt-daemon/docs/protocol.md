@@ -181,6 +181,26 @@ reporting to two destinations appears twice, each entry carrying its own
 `route`, counters, and permalink. Powers a `status` CLI and pi's trace-link
 widget.
 
+### `auth.diagnose` (request)
+
+Resolve a route's auth selection through the daemon's own `AuthProvider`,
+exactly as event delivery would, and report the outcome without the
+credential. Used by `doctor`, whose process can see a different credential
+store or environment than the daemon.
+
+Params: `{ "auth": { "profile_id": "…", "profile": "work", "org_name": "acme" } }`.
+Result:
+```json
+{
+  "ready": true,
+  "selection": { "source": "saved_profile", "profile_id": "…", "profile": "work", "org_name": "acme" },
+  "org_name": "acme",
+  "expires_at_ms": 1753639552123
+}
+```
+On failure, `ready` is `false` and `error` explains why. Daemons that predate
+this method answer with `-32601` (method not found).
+
 ### `daemon.shutdown` (request)
 
 Graceful: reject new events, wait for captures already being journaled, drain all

@@ -34,6 +34,13 @@ hook processes or JavaScript plugins.
 2. **Standalone binary** (testing): the provider uses `BRAINTRUST_API_KEY` and
    related environment variables.
 
+The daemon resolves credentials in its own process. A hook may start it under
+a different credential store or environment than the user's shell, for example
+when a packaged Windows desktop app virtualizes `%APPDATA%`. `bt trace doctor`
+therefore reports the local view and asks the running daemon to resolve the
+same route through `auth.diagnose`. It also shows the latest session errors the
+daemon recorded, and warns when the two views disagree.
+
 ## Per-agent plugin settings
 
 Each coding agent reads an independent non-credential `braintrust.json` file:

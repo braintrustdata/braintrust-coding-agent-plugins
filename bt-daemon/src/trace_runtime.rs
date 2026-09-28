@@ -11,12 +11,14 @@ use crate::{
     apply_additional_metadata, apply_tags, braintrust_serve_options, paths, run_disable,
     run_enable, run_hook, run_import, run_serve, run_status, run_traced, shutdown_daemon,
     AuthDiagnostic, AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig,
-    DoctorCommandOutput, HostInfo, OutputFormat, Registry, RunHookCommand, ServeOptions,
-    StatusArgs, TraceArgs, TraceCommandOutput,
+    DaemonDiagnostic, DoctorCommandOutput, HostInfo, OutputFormat, Registry, RunHookCommand,
+    ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// What a command still needs the host to resolve before tracing can start.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -274,7 +276,237 @@ fn plugin_activation_warning(agent: DoctorAgent, enabled: bool) -> Option<&'stat
     )
 }
 
+/// Bounds each daemon round-trip made by `doctor`.
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Resolving auth may refresh OAuth and look up the organization's data plane.
+const DAEMON_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn is_same_agent(doctor_source: &str, source: &str) -> bool {
+    let canonical = |source| match source {
+        "claude" => "claude-code",
+        "open-code" => "opencode",
+        other => other,
+    };
+    canonical(doctor_source) == canonical(source)
+}
+
+fn unreachable_daemon(version: Option<String>, error: String) -> DaemonDiagnostic {
+    DaemonDiagnostic {
+        status: "unreachable".into(),
+        version,
+        error: Some(error),
+        ..DaemonDiagnostic::not_running()
+    }
+}
+
+/// Ask the running daemon, not this process, whether it can authenticate the
+/// route and what it last failed on. Hooks may start the daemon under a
+/// different credential store or environment than the doctor's shell.
+async fn diagnose_daemon(
+    socket: &Path,
+    source: &str,
+    selection: Option<&AuthSelection>,
+) -> DaemonDiagnostic {
+    let Ok(stream) = crate::client::connect(socket).await else {
+        return DaemonDiagnostic::not_running();
+    };
+    let mut conn = crate::client::Conn::new(stream);
+    let initialize = conn.request(
+        crate::wire::method::INITIALIZE,
+        serde_json::json!({
+            "protocol_version": crate::wire::PROTOCOL_VERSION,
+            "client": { "source": "doctor" }
+        }),
+    );
+    let version = match tokio::time::timeout(DAEMON_PROBE_TIMEOUT, initialize).await {
+        Ok(Ok(value)) => serde_json::from_value::<crate::wire::InitializeResult>(value)
+            .ok()
+            .map(|result| result.daemon_version),
+        Ok(Err(error)) => return unreachable_daemon(None, error.to_string()),
+        Err(_) => return unreachable_daemon(None, "daemon did not answer initialize".into()),
+    };
+    let mut diagnostic = DaemonDiagnostic {
+        status: "running".into(),
+        version,
+        ..DaemonDiagnostic::not_running()
+    };
+
+    // Status first: a slow auth probe would otherwise delay it on this
+    // connection.
+    let status = conn.request(
+        crate::wire::method::STATUS_GET,
+        crate::wire::StatusParams::default(),
+    );
+    match tokio::time::timeout(DAEMON_PROBE_TIMEOUT, status).await {
+        Ok(Ok(value)) => match serde_json::from_value::<crate::wire::StatusResult>(value) {
+            Ok(status) => {
+                for session in status.sessions {
+                    if !is_same_agent(source, &session.source) {
+                        continue;
+                    }
+                    if let Some(error) = session.last_error {
+                        if !diagnostic.session_errors.contains(&error) {
+                            diagnostic.session_errors.push(error);
+                        }
+                    }
+                }
+            }
+            Err(error) => diagnostic.error = Some(format!("status is unreadable: {error}")),
+        },
+        Ok(Err(error)) => diagnostic.error = Some(format!("status unavailable: {error}")),
+        Err(_) => diagnostic.error = Some("status did not answer in time".into()),
+    }
+
+    if let Some(selection) = selection {
+        diagnostic.auth = Some(diagnose_daemon_auth(&mut conn, selection).await);
+    }
+    diagnostic
+}
+
+async fn diagnose_daemon_auth(
+    conn: &mut crate::client::Conn,
+    selection: &AuthSelection,
+) -> AuthDiagnostic {
+    // The route already shows what was requested; report only what the
+    // daemon actually resolved.
+    let unconfirmed = |status: &str, error: Option<String>| AuthDiagnostic {
+        status: status.into(),
+        source: auth_source_label(selection).into(),
+        kind: None,
+        profile: None,
+        org_name: None,
+        expires_at_ms: None,
+        error,
+    };
+    let request = conn.request(
+        crate::wire::method::AUTH_DIAGNOSE,
+        crate::wire::AuthDiagnoseParams {
+            auth: selection.clone(),
+        },
+    );
+    let value = match tokio::time::timeout(DAEMON_AUTH_TIMEOUT, request).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            let unsupported = error
+                .downcast_ref::<crate::client::RpcCallError>()
+                .is_some_and(|error| error.code == crate::wire::error_code::METHOD_NOT_FOUND);
+            return if unsupported {
+                unconfirmed("unsupported", None)
+            } else {
+                unconfirmed("unknown", Some(error.to_string()))
+            };
+        }
+        Err(_) => {
+            return unconfirmed(
+                "unknown",
+                Some("daemon did not finish resolving auth in time".into()),
+            )
+        }
+    };
+    let result = match serde_json::from_value::<crate::wire::AuthDiagnoseResult>(value) {
+        Ok(result) => result,
+        Err(error) => return unconfirmed("unknown", Some(error.to_string())),
+    };
+    if !result.ready {
+        return unconfirmed("error", result.error);
+    }
+    let resolved = result.selection.unwrap_or_else(|| selection.clone());
+    AuthDiagnostic {
+        status: "ready".into(),
+        source: auth_source_label(&resolved).into(),
+        kind: None,
+        profile: resolved.profile,
+        org_name: result.org_name.or(resolved.org_name),
+        expires_at_ms: result.expires_at_ms,
+        error: None,
+    }
+}
+
+/// Explain where the daemon's view of delivery differs from this process's.
+/// `resolves_locally` records whether this process resolves the same route
+/// through the same host path the daemon uses, which separates divergent
+/// credential views from failures both processes share.
+fn daemon_warnings(
+    display_name: &str,
+    auth: &AuthDiagnostic,
+    daemon: &DaemonDiagnostic,
+    resolves_locally: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if daemon.status == "unreachable" {
+        warnings.push(format!(
+            "the tracing daemon did not answer: {}",
+            daemon.error.as_deref().unwrap_or("unknown error")
+        ));
+        return warnings;
+    }
+    let daemon_auth_failed = match &daemon.auth {
+        Some(daemon_auth) if daemon_auth.status == "error" => {
+            warnings.push(format!(
+                "the running tracing daemon cannot authenticate, so it rejects {display_name} events: {}",
+                daemon_auth.error.as_deref().unwrap_or("unknown error")
+            ));
+            if resolves_locally {
+                warnings.push(
+                    "this shell can authenticate but the running daemon cannot, so they see different Braintrust credentials (for example, a packaged Windows desktop app gives the daemon a virtualized credential store); run `bt login` from the coding agent's own terminal, or `bt trace stop` to restart a daemon started with a stale environment".into(),
+                );
+            }
+            true
+        }
+        Some(daemon_auth) if daemon_auth.status == "ready" && auth.status == "ready" => {
+            for (label, shell, daemon) in [
+                ("profile", &auth.profile, &daemon_auth.profile),
+                ("organization", &auth.org_name, &daemon_auth.org_name),
+            ] {
+                if let (Some(shell), Some(daemon)) = (shell, daemon) {
+                    if shell != daemon {
+                        warnings.push(format!(
+                            "this shell resolved {label} {shell:?} but the running daemon resolved {daemon:?}; events are delivered with the daemon's credentials"
+                        ));
+                    }
+                }
+            }
+            false
+        }
+        Some(daemon_auth) if daemon_auth.status == "unsupported" => {
+            warnings.push(format!(
+                "the running tracing daemon{} cannot report its authentication; run `bt trace stop` so the next event starts the current version",
+                daemon
+                    .version
+                    .as_deref()
+                    .map(|version| format!(" ({version})"))
+                    .unwrap_or_default()
+            ));
+            false
+        }
+        Some(daemon_auth) if daemon_auth.status == "unknown" => {
+            warnings.push(format!(
+                "could not confirm the running daemon's authentication: {}",
+                daemon_auth.error.as_deref().unwrap_or("unknown error")
+            ));
+            false
+        }
+        _ => false,
+    };
+    if !daemon_auth_failed {
+        for error in &daemon.session_errors {
+            warnings.push(format!(
+                "the running tracing daemon reported a {display_name} session error: {error}"
+            ));
+        }
+    }
+    warnings
+}
+
 async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorCommandOutput {
+    doctor_output_at(host, args, &paths::socket_path(None)).await
+}
+
+async fn doctor_output_at(
+    host: &TraceHostContext,
+    args: DoctorArgs,
+    socket: &Path,
+) -> DoctorCommandOutput {
     let source = args.agent.source();
     let settings_path = paths::agent_settings_path(source, None);
     let settings_present = settings_path.exists();
@@ -340,15 +572,31 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
     if let Some(error) = &auth.error {
         warnings.push(format!("authentication is unusable: {error}"));
     }
+    let daemon = diagnose_daemon(socket, source, route.as_ref().map(|route| &route.auth)).await;
+    let daemon_auth_failed = daemon
+        .auth
+        .as_ref()
+        .is_some_and(|daemon_auth| daemon_auth.status == "error");
+    let resolves_locally = match &route {
+        Some(route) if daemon_auth_failed => host
+            .services
+            .resolve_auth(&route.auth, AuthResolveReason::Initial)
+            .await
+            .is_ok(),
+        _ => false,
+    };
+    warnings.extend(daemon_warnings(
+        args.agent.display_name(),
+        &auth,
+        &daemon,
+        resolves_locally,
+    ));
 
     let plugin_diagnostics = match crate::plugin_diagnostics::read(&paths::data_dir(None)) {
         Ok(diagnostics) => {
             let mut diagnostics: Vec<_> = diagnostics
                 .into_iter()
-                .filter(|diagnostic| {
-                    diagnostic.source == source
-                        || (source == "claude" && diagnostic.source == "claude-code")
-                })
+                .filter(|diagnostic| is_same_agent(source, &diagnostic.source))
                 .collect();
             diagnostics.sort_by_key(|diagnostic| std::cmp::Reverse(diagnostic.last_seen_ms));
             diagnostics
@@ -368,6 +616,7 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
         route_source,
         route,
         auth,
+        daemon,
         warnings,
         plugin_diagnostics,
     }
@@ -819,6 +1068,341 @@ mod tests {
         assert_eq!(
             *services.route_requests.lock().unwrap(),
             [RouteRequirements::default()]
+        );
+    }
+
+    /// The daemon's credential view: a packaged app's virtualized store holds
+    /// a different profile than the one the user's shell logged into.
+    struct DivergedDaemonAuth;
+
+    #[async_trait]
+    impl AuthProvider for DivergedDaemonAuth {
+        async fn resolve(
+            &self,
+            _: &AuthSelection,
+            _: AuthResolveReason,
+        ) -> anyhow::Result<AuthLease> {
+            anyhow::bail!(
+                "saved profile ID 'daemon-only' no longer exists; run `bt trace enable` to select a profile"
+            )
+        }
+    }
+
+    fn test_endpoint(dir: &Path) -> PathBuf {
+        #[cfg(unix)]
+        {
+            dir.join("d.sock")
+        }
+        #[cfg(windows)]
+        {
+            let _ = dir;
+            PathBuf::from(format!(
+                r"\\.\pipe\bt-daemon-doctor-test-{}",
+                uuid::Uuid::new_v4()
+            ))
+        }
+    }
+
+    async fn start_daemon_with_auth(
+        dir: &Path,
+        auth_provider: Arc<dyn AuthProvider>,
+    ) -> (PathBuf, tokio::task::JoinHandle<()>) {
+        let socket = test_endpoint(dir);
+        let data_dir = dir.join("data");
+        let args = crate::ServeArgs {
+            socket: Some(socket.clone()),
+            data_dir: Some(data_dir.clone()),
+            idle_timeout_secs: 0,
+            session_idle_timeout_secs: 0,
+        };
+        let options = ServeOptions {
+            version: "test".into(),
+            translators: Arc::new(Registry::default_agents()),
+            sink_factory: Arc::new(crate::DebugSinkFactory {
+                dir: data_dir.join("spans"),
+            }),
+            auth_provider: Some(auth_provider),
+        };
+        let handle = tokio::spawn(async move {
+            let _ = run_serve(args, options).await;
+        });
+        for _ in 0..200 {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await;
+            if matches!(status, Ok(Some(_))) {
+                return (socket, handle);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("daemon never answered at {}", socket.display());
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_a_daemon_that_cannot_authenticate_the_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let (socket, daemon) =
+            start_daemon_with_auth(temp.path(), Arc::new(DivergedDaemonAuth)).await;
+        let host = test_host(Arc::new(RecordingHost::new(None, None)));
+        forward_event(
+            &socket,
+            "codex",
+            "rejected-session",
+            SessionRoute::default(),
+        )
+        .await;
+
+        let output = doctor_output_at(
+            &host,
+            DoctorArgs {
+                agent: DoctorAgent::Codex,
+            },
+            &socket,
+        )
+        .await;
+
+        // The shell's credential store is healthy, so its own check passes...
+        assert_eq!(output.auth.status, "ready");
+        let daemon_auth = output.daemon.auth.as_ref().unwrap();
+        assert_eq!(daemon_auth.status, "error");
+        assert!(
+            output.daemon.session_errors[0].contains("could not resolve Braintrust auth for codex"),
+            "{:#?}",
+            output.daemon.session_errors
+        );
+        assert!(output
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("see different Braintrust credentials")));
+        // ...but the daemon that actually delivers events cannot authenticate.
+        assert!(
+            output.warnings.iter().any(|warning| {
+                warning.contains("daemon cannot authenticate")
+                    && warning.contains("'daemon-only' no longer exists")
+            }),
+            "doctor must surface the daemon's auth failure: {:#?}",
+            output.warnings
+        );
+
+        crate::shutdown_daemon(&socket).await.unwrap();
+        daemon.await.unwrap();
+    }
+
+    async fn forward_event(socket: &Path, source: &str, session_id: &str, route: SessionRoute) {
+        let env = crate::wire::Envelope {
+            source: source.into(),
+            source_version: None,
+            plugin_version: None,
+            session_id: session_id.into(),
+            event: "SessionStart".into(),
+            ts_ms: 1,
+            managed_run_id: None,
+            payload: serde_json::json!({ "session_id": session_id, "hook_event_name": "SessionStart" }),
+            route: Some(SessionRoute {
+                destination: Some(TraceDestination::ProjectLogs {
+                    project_id: None,
+                    project_name: Some("test-project".into()),
+                }),
+                ..route
+            }),
+            config: None,
+            capture: None,
+        };
+        let host = HostInfo {
+            serve_argv: vec![OsString::from("unused")],
+            version: "test".into(),
+        };
+        crate::forward_envelope(&env, socket, &host, true)
+            .await
+            .unwrap();
+    }
+
+    /// Resolves a working credential, but for another profile and org than
+    /// the shell's.
+    struct OtherProfileDaemonAuth;
+
+    #[async_trait]
+    impl AuthProvider for OtherProfileDaemonAuth {
+        async fn resolve(
+            &self,
+            _: &AuthSelection,
+            _: AuthResolveReason,
+        ) -> anyhow::Result<AuthLease> {
+            Ok(AuthLease {
+                selection: AuthSelection {
+                    source: AuthSource::SavedProfile,
+                    profile_id: None,
+                    profile: Some("stale".into()),
+                    org_name: Some("other-org".into()),
+                },
+                auth: BackendAuth {
+                    token: "daemon-secret".into(),
+                    api_url: None,
+                    app_url: None,
+                    org_name: Some("other-org".into()),
+                    org_id: None,
+                },
+                expires_at_ms: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_a_daemon_that_resolves_other_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let (socket, daemon) =
+            start_daemon_with_auth(temp.path(), Arc::new(OtherProfileDaemonAuth)).await;
+        let host = test_host(Arc::new(RecordingHost::new(None, None)));
+
+        let output = doctor_output_at(
+            &host,
+            DoctorArgs {
+                agent: DoctorAgent::Claude,
+            },
+            &socket,
+        )
+        .await;
+
+        let daemon_auth = output.daemon.auth.as_ref().unwrap();
+        assert_eq!(daemon_auth.status, "ready");
+        assert_eq!(daemon_auth.profile.as_deref(), Some("stale"));
+        assert!(output.warnings.iter().any(|warning| warning.contains(
+            r#"this shell resolved profile "test" but the running daemon resolved "stale""#
+        )));
+        assert!(output.warnings.iter().any(|warning| warning.contains(
+            r#"this shell resolved organization "test-org" but the running daemon resolved "other-org""#
+        )));
+        let rendered = TraceCommandOutput::doctor(output)
+            .render(OutputFormat::Json)
+            .unwrap();
+        assert!(!rendered.contains("daemon-secret"));
+
+        crate::shutdown_daemon(&socket).await.unwrap();
+        daemon.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_records_an_organization_mismatch_for_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let (socket, daemon) =
+            start_daemon_with_auth(temp.path(), Arc::new(OtherProfileDaemonAuth)).await;
+        let route = SessionRoute {
+            auth: AuthSelection {
+                org_name: Some("test-org".into()),
+                ..AuthSelection::default()
+            },
+            ..SessionRoute::default()
+        };
+        forward_event(&socket, "claude-code", "wrong-org", route).await;
+
+        let status = run_status(StatusArgs {
+            socket: Some(socket.clone()),
+            session_id: Some("wrong-org".into()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let error = status.sessions[0].last_error.as_deref().unwrap();
+        assert!(error.contains(r#"expected "test-org""#), "{error}");
+
+        let output = doctor_output_at(
+            &test_host(Arc::new(RecordingHost::new(None, None))),
+            DoctorArgs {
+                agent: DoctorAgent::Claude,
+            },
+            &socket,
+        )
+        .await;
+        assert_eq!(output.daemon.session_errors, [error]);
+
+        crate::shutdown_daemon(&socket).await.unwrap();
+        daemon.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doctor_without_a_running_daemon_reports_only_the_local_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = doctor_output_at(
+            &test_host(Arc::new(RecordingHost::new(None, None))),
+            DoctorArgs {
+                agent: DoctorAgent::Codex,
+            },
+            &test_endpoint(temp.path()),
+        )
+        .await;
+        assert_eq!(output.daemon.status, "not_running");
+        assert!(output.daemon.auth.is_none());
+        assert!(!output
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("daemon")));
+    }
+
+    #[tokio::test]
+    async fn older_daemons_report_unknown_methods_as_typed_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let (socket, daemon) =
+            start_daemon_with_auth(temp.path(), Arc::new(DivergedDaemonAuth)).await;
+        let mut conn = crate::client::Conn::new(crate::client::connect(&socket).await.unwrap());
+        let error = conn
+            .request("auth.future", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        let error = error.downcast_ref::<crate::client::RpcCallError>().unwrap();
+        assert_eq!(error.code, crate::wire::error_code::METHOD_NOT_FOUND);
+        drop(conn);
+
+        crate::shutdown_daemon(&socket).await.unwrap();
+        daemon.await.unwrap();
+    }
+
+    fn diagnostic(status: &str, error: Option<&str>) -> AuthDiagnostic {
+        AuthDiagnostic {
+            status: status.into(),
+            source: "saved_profile".into(),
+            kind: None,
+            profile: Some("test".into()),
+            org_name: Some("test-org".into()),
+            expires_at_ms: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn doctor_asks_an_older_daemon_to_restart() {
+        let daemon = DaemonDiagnostic {
+            status: "running".into(),
+            version: Some("0.21.0".into()),
+            auth: Some(diagnostic("unsupported", None)),
+            session_errors: vec!["could not resolve Braintrust auth for codex".into()],
+            error: None,
+        };
+        let warnings = daemon_warnings("Codex", &diagnostic("ready", None), &daemon, true);
+        assert_eq!(
+            warnings,
+            [
+                "the running tracing daemon (0.21.0) cannot report its authentication; run `bt trace stop` so the next event starts the current version",
+                "the running tracing daemon reported a Codex session error: could not resolve Braintrust auth for codex",
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_does_not_blame_credential_divergence_when_both_processes_fail() {
+        let daemon = DaemonDiagnostic {
+            status: "running".into(),
+            version: Some("test".into()),
+            auth: Some(diagnostic("error", Some("failed to call login endpoint"))),
+            session_errors: vec!["could not resolve Braintrust auth for codex".into()],
+            error: None,
+        };
+        // Offline checks can pass while both processes fail to reach Braintrust.
+        let warnings = daemon_warnings("Codex", &diagnostic("ready", None), &daemon, false);
+        assert_eq!(
+            warnings,
+            ["the running tracing daemon cannot authenticate, so it rejects Codex events: failed to call login endpoint"]
         );
     }
 

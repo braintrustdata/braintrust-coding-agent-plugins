@@ -36,8 +36,8 @@ mod transport;
 pub mod wire;
 pub use client::HostInfo;
 pub use command_output::{
-    AuthDiagnostic, DoctorCommandOutput, ImportSummary, OutputFormat, SetupCommandOutput,
-    StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
+    AuthDiagnostic, DaemonDiagnostic, DoctorCommandOutput, ImportSummary, OutputFormat,
+    SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
 };
 #[doc(hidden)]
 pub use journal::source_journal_path;

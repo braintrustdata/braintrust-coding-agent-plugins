@@ -14,9 +14,9 @@ pub use envelope::{
     RedactedEnvelope, SessionConfig, SessionRoute, TraceDestination,
 };
 pub use methods::{
-    method, Capabilities, ClientInfo, EventLogResult, FlushParams, FlushResult, InitializeParams,
-    InitializeResult, ManagedRunFlushParams, SessionStatus, ShutdownResult, StatusParams,
-    StatusResult,
+    method, AuthDiagnoseParams, AuthDiagnoseResult, Capabilities, ClientInfo, EventLogResult,
+    FlushParams, FlushResult, InitializeParams, InitializeResult, ManagedRunFlushParams,
+    SessionStatus, ShutdownResult, StatusParams, StatusResult,
 };
 pub use rpc::{error_code, Message, Request, RequestId, Response, RpcError};
 

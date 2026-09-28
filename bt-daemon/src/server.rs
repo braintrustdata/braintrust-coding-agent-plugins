@@ -8,10 +8,10 @@ use crate::sink::SinkFactory;
 use crate::translate::Registry;
 use crate::transport::{self, Listener, ServerStream};
 use crate::wire::{
-    error_code, method, Capabilities, ClientInfo, Envelope, EventLogResult, FlushParams,
-    FlushResult, InitializeParams, InitializeResult, ManagedRunFlushParams, Message, Request,
-    Response, RpcError, SessionStatus, ShutdownResult, StatusParams, StatusResult,
-    PROTOCOL_VERSION,
+    error_code, method, AuthDiagnoseParams, AuthDiagnoseResult, Capabilities, ClientInfo, Envelope,
+    EventLogResult, FlushParams, FlushResult, InitializeParams, InitializeResult,
+    ManagedRunFlushParams, Message, Request, Response, RpcError, SessionStatus, ShutdownResult,
+    StatusParams, StatusResult, PROTOCOL_VERSION,
 };
 use crate::wire::{AuthSelection, BackendAuth, SessionRoute};
 use crate::{paths, ServeArgs};
@@ -301,15 +301,12 @@ impl Daemon {
                 );
             }
         }
-        if let Some(expected_org) = requested_route.auth.org_name.as_deref() {
-            if lease.auth.org_name.as_deref() != Some(expected_org) {
-                anyhow::bail!(
-                    "profile {:?} resolved organization {:?}, expected {:?}",
-                    lease.selection,
-                    lease.auth.org_name,
-                    expected_org
-                );
-            }
+        if let Err(error) = require_selected_org(&requested_route.auth, &lease) {
+            self.auth_errors
+                .lock()
+                .unwrap()
+                .insert(key.clone(), (env.source.clone(), error.to_string()));
+            return Err(error);
         }
 
         let mut route = requested_route;
@@ -341,6 +338,40 @@ impl Daemon {
             .insert(canonical_key.clone(), SessionAuthState { route, lease });
         self.auth_errors.lock().unwrap().remove(&canonical_key);
         Ok(canonical_key)
+    }
+
+    /// Resolve a route's credentials exactly as event delivery would, so
+    /// diagnostics see this process's credential store and environment rather
+    /// than the caller's.
+    async fn diagnose_auth(&self, selection: AuthSelection) -> AuthDiagnoseResult {
+        let result = async {
+            let provider = self
+                .auth_provider
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("daemon host has no Braintrust auth provider"))?;
+            let lease = provider
+                .resolve(&selection, AuthResolveReason::Initial)
+                .await?;
+            require_selected_org(&selection, &lease)?;
+            Ok::<_, anyhow::Error>(lease)
+        }
+        .await;
+        match result {
+            Ok(lease) => AuthDiagnoseResult {
+                ready: true,
+                selection: Some(lease.selection),
+                org_name: lease.auth.org_name,
+                expires_at_ms: lease.expires_at_ms,
+                error: None,
+            },
+            Err(error) => AuthDiagnoseResult {
+                ready: false,
+                selection: None,
+                org_name: None,
+                expires_at_ms: None,
+                error: Some(error.to_string()),
+            },
+        }
     }
 
     async fn refresh_session_before_flush(&self, key: &DeliveryKey) -> anyhow::Result<()> {
@@ -1965,6 +1996,13 @@ async fn handle_request(
             daemon.settle_ingress().await;
             Response::ok(id, serde_json::to_value(daemon.status(p)).unwrap())
         }
+        method::AUTH_DIAGNOSE => {
+            let p = parse!(AuthDiagnoseParams);
+            Response::ok(
+                id,
+                serde_json::to_value(daemon.diagnose_auth(p.auth).await).unwrap(),
+            )
+        }
         method::DAEMON_SHUTDOWN => {
             if !client_may_shutdown(client.as_ref(), &daemon.version) {
                 return Response::ok(
@@ -1986,6 +2024,20 @@ async fn handle_request(
             ),
         ),
     }
+}
+
+fn require_selected_org(selection: &AuthSelection, lease: &AuthLease) -> anyhow::Result<()> {
+    if let Some(expected_org) = selection.org_name.as_deref() {
+        if lease.auth.org_name.as_deref() != Some(expected_org) {
+            anyhow::bail!(
+                "profile {:?} resolved organization {:?}, expected {:?}",
+                lease.selection,
+                lease.auth.org_name,
+                expected_org
+            );
+        }
+    }
+    Ok(())
 }
 
 fn client_may_shutdown(client: Option<&ClientInfo>, daemon_version: &str) -> bool {

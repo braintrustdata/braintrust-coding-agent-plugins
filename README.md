@@ -52,7 +52,8 @@ bt trace update claude
 bt trace disable claude
 ```
 
-`doctor` shows which configuration is in use. `status` reports trace delivery.
+`doctor` shows which configuration is in use and whether the running tracing
+daemon can authenticate it. `status` reports trace delivery.
 `update` keeps your settings; `disable` removes the plugin and its settings.
 
 ## Development

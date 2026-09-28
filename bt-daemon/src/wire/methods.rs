@@ -9,6 +9,7 @@ pub mod method {
     pub const SESSION_FLUSH: &str = "session.flush";
     pub const MANAGED_RUN_FLUSH: &str = "managed_run.flush";
     pub const STATUS_GET: &str = "status.get";
+    pub const AUTH_DIAGNOSE: &str = "auth.diagnose";
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
 }
 
@@ -102,6 +103,28 @@ pub struct SessionStatus {
     pub permalink: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthDiagnoseParams {
+    #[serde(default)]
+    pub auth: crate::wire::AuthSelection,
+}
+
+/// The daemon's own resolution of a route's credentials. Never carries the
+/// credential itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthDiagnoseResult {
+    pub ready: bool,
+    /// The canonical selection the daemon resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crate::wire::AuthSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

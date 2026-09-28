@@ -101,6 +101,36 @@ pub struct AuthDiagnostic {
     pub error: Option<String>,
 }
 
+/// What the running daemon, rather than the doctor's own process, sees. The
+/// two can read different credential stores or environments.
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonDiagnostic {
+    /// `running`, `not_running`, or `unreachable`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The daemon's own resolution of the route's credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthDiagnostic>,
+    /// Distinct latest errors the daemon recorded for this agent's sessions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub session_errors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl DaemonDiagnostic {
+    pub fn not_running() -> Self {
+        Self {
+            status: "not_running".into(),
+            version: None,
+            auth: None,
+            session_errors: Vec::new(),
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorCommandOutput {
     pub source: String,
@@ -112,6 +142,7 @@ pub struct DoctorCommandOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<SessionRoute>,
     pub auth: AuthDiagnostic,
+    pub daemon: DaemonDiagnostic,
     pub warnings: Vec<String>,
     pub plugin_diagnostics: Vec<crate::PluginDiagnostic>,
 }
@@ -220,6 +251,32 @@ impl TraceCommandOutput {
                 }
                 if let Some(error) = &doctor.auth.error {
                     rendered.push_str(&format!("\nAuth error: {error}"));
+                }
+                let daemon = &doctor.daemon;
+                match (daemon.status.as_str(), &daemon.version) {
+                    ("running", Some(version)) => {
+                        rendered.push_str(&format!("\nDaemon: running ({version})"))
+                    }
+                    ("not_running", _) => rendered.push_str("\nDaemon: not running"),
+                    (status, _) => rendered.push_str(&format!("\nDaemon: {status}")),
+                }
+                if let Some(error) = &daemon.error {
+                    rendered.push_str(&format!("\nDaemon error: {error}"));
+                }
+                if let Some(auth) = &daemon.auth {
+                    rendered.push_str(&format!("\nDaemon auth: {} ({})", auth.status, auth.source));
+                    if let Some(profile) = &auth.profile {
+                        rendered.push_str(&format!("\nDaemon profile: {profile}"));
+                    }
+                    if let Some(org_name) = &auth.org_name {
+                        rendered.push_str(&format!("\nDaemon organization: {org_name}"));
+                    }
+                    if let Some(error) = &auth.error {
+                        rendered.push_str(&format!("\nDaemon auth error: {error}"));
+                    }
+                }
+                for error in &daemon.session_errors {
+                    rendered.push_str(&format!("\nDaemon session error: {error}"));
                 }
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
@@ -443,6 +500,7 @@ mod tests {
                 expires_at_ms: Some(123),
                 error: None,
             },
+            daemon: DaemonDiagnostic::not_running(),
             warnings: Vec::new(),
             plugin_diagnostics: vec![crate::PluginDiagnostic {
                 source: "codex".into(),

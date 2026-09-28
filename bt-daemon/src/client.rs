@@ -19,6 +19,27 @@ pub struct HostInfo {
     pub version: String,
 }
 
+/// A JSON-RPC error response from the daemon, kept typed so callers can tell
+/// an older daemon's unknown method apart from a failed call.
+#[derive(Debug)]
+pub struct RpcCallError {
+    pub method: String,
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rpc error {} on {}: {}",
+            self.code, self.method, self.message
+        )
+    }
+}
+
+impl std::error::Error for RpcCallError {}
+
 /// A framed JSON-RPC connection with request/response correlation.
 pub struct Conn {
     reader: Lines<BufReader<ReadHalf<ClientStream>>>,
@@ -64,7 +85,12 @@ impl Conn {
                     continue;
                 }
                 if let Some(err) = error {
-                    anyhow::bail!("rpc error {} on {method}: {}", err.code, err.message);
+                    return Err(RpcCallError {
+                        method: method.to_string(),
+                        code: err.code,
+                        message: err.message,
+                    }
+                    .into());
                 }
                 return Ok(result.unwrap_or(serde_json::Value::Null));
             }
