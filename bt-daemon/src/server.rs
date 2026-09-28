@@ -2031,7 +2031,7 @@ async fn handle_request(
 
 /// Resolve a route's lease the way event delivery does, including the
 /// organization the route requires.
-async fn resolve_route_auth(
+pub(crate) async fn resolve_route_auth(
     provider: &dyn AuthProvider,
     selection: &AuthSelection,
     reason: AuthResolveReason,

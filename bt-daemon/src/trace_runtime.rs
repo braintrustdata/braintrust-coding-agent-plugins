@@ -559,14 +559,23 @@ async fn doctor_output_at(
     if let Some(error) = &auth.error {
         warnings.push(format!("authentication is unusable: {error}"));
     }
-    // Only a full local resolution separates divergent credential views from
-    // failures both processes share; skip it when the local check failed.
+    // Resolving the route here exactly as the daemon does, org included, is
+    // what separates divergent credential views from failures both processes
+    // share. Skip it when the local check already failed.
     let resolves_locally = match &route {
-        Some(route) if daemon.auth_failed() && auth.status == "ready" => host
-            .services
-            .resolve_auth(&route.auth, AuthResolveReason::Initial)
+        Some(route) if daemon.auth_failed() && auth.status == "ready" => {
+            let local = HostAuthProvider {
+                services: host.services.clone(),
+            };
+            crate::server::resolve_route_auth(
+                &local,
+                &route.auth,
+                AuthResolveReason::Initial,
+                route.auth.org_name.as_deref(),
+            )
             .await
-            .is_ok(),
+            .is_ok()
+        }
         _ => false,
     };
     warnings.extend(daemon_warnings(
@@ -775,6 +784,8 @@ mod tests {
         auth_error: Option<&'static str>,
         resolved_org: Option<&'static str>,
         profile_id: Option<&'static str>,
+        /// The organization the resolved route requires.
+        route_org: Option<&'static str>,
     }
 
     impl RecordingHost {
@@ -785,6 +796,7 @@ mod tests {
                 auth_error,
                 resolved_org: Some("test-org"),
                 profile_id: None,
+                route_org: None,
             }
         }
 
@@ -795,6 +807,7 @@ mod tests {
                 auth_error: None,
                 resolved_org: None,
                 profile_id: None,
+                route_org: None,
             }
         }
     }
@@ -810,8 +823,11 @@ mod tests {
                 anyhow::bail!(error);
             }
             Ok(HostRouteSelection {
+                auth: AuthSelection {
+                    org_name: self.route_org.map(str::to_string),
+                    ..AuthSelection::default()
+                },
                 project_name: Some("test-project".into()),
-                ..HostRouteSelection::default()
             })
         }
 
@@ -1125,7 +1141,17 @@ mod tests {
 
         /// Run doctor from a shell whose own credentials resolve.
         async fn doctor(&self, agent: DoctorAgent) -> DoctorCommandOutput {
-            let host = test_host(Arc::new(RecordingHost::new(None, None)));
+            self.doctor_from(RecordingHost::new(None, None), agent)
+                .await
+        }
+
+        /// Run doctor from a shell with the given credential view.
+        async fn doctor_from(
+            &self,
+            shell: RecordingHost,
+            agent: DoctorAgent,
+        ) -> DoctorCommandOutput {
+            let host = test_host(Arc::new(shell));
             doctor_output_at(&host, DoctorArgs { agent }, &self.socket).await
         }
 
@@ -1263,6 +1289,31 @@ mod tests {
             .render(OutputFormat::Json)
             .unwrap();
         assert!(!rendered.contains("daemon-secret"));
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn doctor_does_not_blame_a_credential_split_when_both_resolve_the_wrong_org() {
+        // Both processes resolve the profile, but neither to the org the
+        // route requires, so their credential views agree.
+        let daemon = TestDaemon::start(Arc::new(OtherProfileDaemonAuth)).await;
+        let shell = RecordingHost {
+            route_org: Some("required-org"),
+            ..RecordingHost::new(None, None)
+        };
+
+        let output = daemon.doctor_from(shell, DoctorAgent::Codex).await;
+
+        assert_eq!(output.daemon.auth.as_ref().unwrap().status, "error");
+        assert!(
+            !output
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("see different Braintrust credentials")),
+            "{:#?}",
+            output.warnings
+        );
 
         daemon.stop().await;
     }
