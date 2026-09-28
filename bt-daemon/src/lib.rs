@@ -673,8 +673,7 @@ pub async fn flush_session(
         session_id: session_id.to_string(),
         timeout_ms,
     };
-    let value = conn.request(method::SESSION_FLUSH, params).await?;
-    Ok(serde_json::from_value(value)?)
+    conn.call(method::SESSION_FLUSH, params).await
 }
 
 /// Flush every daemon session accepted from one managed child process tree.
@@ -714,8 +713,7 @@ async fn flush_managed_run_in(
         managed_run_id: managed_run_id.to_string(),
         timeout_ms,
     };
-    let value = conn.request(method::MANAGED_RUN_FLUSH, params).await?;
-    Ok(serde_json::from_value(value)?)
+    conn.call(method::MANAGED_RUN_FLUSH, params).await
 }
 
 /// Query daemon status. `Ok(None)` means no daemon is running.
@@ -730,8 +728,7 @@ pub async fn run_status(args: StatusArgs) -> anyhow::Result<Option<StatusResult>
     let params = wire::StatusParams {
         session_id: args.session_id.clone(),
     };
-    let value = conn.request(method::STATUS_GET, params).await?;
-    Ok(Some(serde_json::from_value(value)?))
+    Ok(Some(conn.call(method::STATUS_GET, params).await?))
 }
 
 /// Request a graceful daemon shutdown. Primarily useful for lifecycle

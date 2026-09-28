@@ -85,6 +85,22 @@ fn ready_auth_diagnostic(
     }
 }
 
+fn unconfirmed_auth_diagnostic(
+    status: &str,
+    source: &str,
+    error: Option<String>,
+) -> AuthDiagnostic {
+    AuthDiagnostic {
+        status: status.into(),
+        source: source.into(),
+        kind: None,
+        profile: None,
+        org_name: None,
+        expires_at_ms: None,
+        error,
+    }
+}
+
 /// Host-owned services used by the integration runtime.
 ///
 /// Implementations resolve Braintrust profiles and destination choices but do
@@ -120,13 +136,13 @@ pub trait TraceHostServices: Send + Sync {
                 ready_auth_diagnostic(lease.selection, lease.auth.org_name, lease.expires_at_ms)
             }
             Err(error) => AuthDiagnostic {
-                status: "error".into(),
-                source: auth_source_label(selection).into(),
-                kind: None,
                 profile: selection.profile.clone(),
                 org_name: selection.org_name.clone(),
-                expires_at_ms: None,
-                error: Some(error.to_string()),
+                ..unconfirmed_auth_diagnostic(
+                    "error",
+                    auth_source_label(selection),
+                    Some(error.to_string()),
+                )
             },
         }
     }
@@ -286,7 +302,7 @@ fn plugin_activation_warning(agent: DoctorAgent, enabled: bool) -> Option<&'stat
     )
 }
 
-/// Bounds each daemon round-trip made by `doctor`.
+/// Bounds `doctor`'s status query to the running daemon.
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Resolving auth may refresh OAuth and look up the organization's data plane.
 const DAEMON_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -304,80 +320,68 @@ async fn diagnose_daemon(
     source: &str,
     selection: Option<&AuthSelection>,
 ) -> DaemonDiagnostic {
-    let Ok(stream) = crate::client::connect(socket).await else {
-        return DaemonDiagnostic::default();
+    let status = tokio::time::timeout(
+        DAEMON_PROBE_TIMEOUT,
+        run_status(StatusArgs {
+            socket: Some(socket.to_path_buf()),
+            session_id: None,
+        }),
+    );
+    let auth = async {
+        match selection {
+            Some(selection) => Some(diagnose_daemon_auth(socket, selection).await),
+            None => None,
+        }
     };
-    let mut conn = crate::client::Conn::new(stream);
-    let initialized = tokio::time::timeout(DAEMON_PROBE_TIMEOUT, conn.initialize("doctor")).await;
-    let version = match initialized {
-        Ok(Ok(result)) => Some(result.daemon_version),
-        Ok(Err(error)) => return unreachable_daemon(error.to_string()),
-        Err(_) => return unreachable_daemon("daemon did not answer initialize".into()),
-    };
-    let mut diagnostic = DaemonDiagnostic {
-        status: DaemonStatus::Running,
-        version,
-        ..DaemonDiagnostic::default()
-    };
-
-    // Status first: a slow auth probe would otherwise delay it on this
-    // connection.
-    let status = async {
-        let value = conn
-            .request(
-                crate::wire::method::STATUS_GET,
-                crate::wire::StatusParams::default(),
-            )
-            .await?;
-        Ok::<_, anyhow::Error>(serde_json::from_value::<crate::wire::StatusResult>(value)?)
-    };
-    match tokio::time::timeout(DAEMON_PROBE_TIMEOUT, status).await {
-        Ok(Ok(status)) => {
+    let (status, auth) = tokio::join!(status, auth);
+    let mut diagnostic = match status {
+        Ok(Ok(None)) => return DaemonDiagnostic::default(),
+        Ok(Err(error)) => {
+            return DaemonDiagnostic {
+                status: DaemonStatus::Unreachable,
+                error: Some(error.to_string()),
+                ..DaemonDiagnostic::default()
+            }
+        }
+        Ok(Ok(Some(status))) => {
+            let mut session_errors = Vec::new();
             let errors = status
                 .sessions
                 .into_iter()
                 .filter(|session| is_same_agent(source, &session.source))
                 .filter_map(|session| session.last_error);
             for error in errors {
-                if !diagnostic.session_errors.contains(&error) {
-                    diagnostic.session_errors.push(error);
+                if !session_errors.contains(&error) {
+                    session_errors.push(error);
                 }
             }
+            DaemonDiagnostic {
+                version: Some(status.daemon_version),
+                session_errors,
+                ..DaemonDiagnostic::default()
+            }
         }
-        Ok(Err(error)) => diagnostic.error = Some(format!("status unavailable: {error}")),
-        Err(_) => diagnostic.error = Some("status did not answer in time".into()),
-    }
-
-    if let Some(selection) = selection {
-        diagnostic.auth = Some(diagnose_daemon_auth(&mut conn, selection).await);
-    }
+        Err(_) => DaemonDiagnostic {
+            error: Some("status did not answer in time".into()),
+            ..DaemonDiagnostic::default()
+        },
+    };
+    diagnostic.status = DaemonStatus::Running;
+    diagnostic.auth = auth;
     diagnostic
 }
 
-fn unreachable_daemon(error: String) -> DaemonDiagnostic {
-    DaemonDiagnostic {
-        status: DaemonStatus::Unreachable,
-        error: Some(error),
-        ..DaemonDiagnostic::default()
-    }
-}
-
-async fn diagnose_daemon_auth(
-    conn: &mut crate::client::Conn,
-    selection: &AuthSelection,
-) -> AuthDiagnostic {
+async fn diagnose_daemon_auth(socket: &Path, selection: &AuthSelection) -> AuthDiagnostic {
     let request = async {
-        let value = conn
-            .request(
-                crate::wire::method::AUTH_DIAGNOSE,
-                crate::wire::AuthDiagnoseParams {
-                    auth: selection.clone(),
-                },
-            )
-            .await?;
-        Ok::<_, anyhow::Error>(serde_json::from_value::<crate::wire::AuthDiagnoseResult>(
-            value,
-        )?)
+        let mut conn = crate::client::Conn::new(crate::client::connect(socket).await?);
+        conn.initialize("doctor").await?;
+        conn.call::<crate::wire::AuthDiagnoseResult>(
+            crate::wire::method::AUTH_DIAGNOSE,
+            crate::wire::AuthDiagnoseParams {
+                auth: selection.clone(),
+            },
+        )
+        .await
     };
     let result = tokio::time::timeout(DAEMON_AUTH_TIMEOUT, request)
         .await
@@ -388,25 +392,19 @@ async fn diagnose_daemon_auth(
         });
     // The route already shows what was requested; report only what the
     // daemon actually resolved.
-    let unconfirmed = |status: &str, error: Option<String>| AuthDiagnostic {
-        status: status.into(),
-        source: auth_source_label(selection).into(),
-        kind: None,
-        profile: None,
-        org_name: None,
-        expires_at_ms: None,
-        error,
-    };
+    let source = auth_source_label(selection);
     match result {
         Err(error)
             if error
                 .downcast_ref::<crate::client::RpcCallError>()
                 .is_some_and(|error| error.code == crate::wire::error_code::METHOD_NOT_FOUND) =>
         {
-            unconfirmed("unsupported", None)
+            unconfirmed_auth_diagnostic("unsupported", source, None)
         }
-        Err(error) => unconfirmed("unknown", Some(error.to_string())),
-        Ok(result) if result.error.is_some() => unconfirmed("error", result.error),
+        Err(error) => unconfirmed_auth_diagnostic("unknown", source, Some(error.to_string())),
+        Ok(result) if result.error.is_some() => {
+            unconfirmed_auth_diagnostic("error", source, result.error)
+        }
         Ok(result) => ready_auth_diagnostic(
             result.selection.unwrap_or_else(|| selection.clone()),
             result.org_name,
@@ -425,14 +423,13 @@ fn daemon_warnings(
     daemon: &DaemonDiagnostic,
     resolves_locally: bool,
 ) -> Vec<String> {
-    let mut warnings = Vec::new();
     if daemon.status == DaemonStatus::Unreachable {
-        warnings.push(format!(
+        return vec![format!(
             "the tracing daemon did not answer: {}",
             daemon.error.as_deref().unwrap_or("unknown error")
-        ));
-        return warnings;
+        )];
     }
+    let mut warnings = Vec::new();
     match &daemon.auth {
         Some(daemon_auth) if daemon_auth.status == "error" => {
             warnings.push(format!(
@@ -462,11 +459,7 @@ fn daemon_warnings(
         Some(daemon_auth) if daemon_auth.status == "unsupported" => {
             warnings.push(format!(
                 "the running tracing daemon{} cannot report its authentication; run `bt trace stop` so the next event starts the current version",
-                daemon
-                    .version
-                    .as_deref()
-                    .map(|version| format!(" ({version})"))
-                    .unwrap_or_default()
+                daemon.version_suffix()
             ));
         }
         Some(daemon_auth) if daemon_auth.status == "unknown" => {
@@ -551,15 +544,11 @@ async fn doctor_output_at(
     let local_auth = async {
         match &route {
             Some(route) => host.services.diagnose_auth(&route.auth).await,
-            None => AuthDiagnostic {
-                status: "unresolved".into(),
-                source: "unresolved".into(),
-                kind: None,
-                profile: None,
-                org_name: None,
-                expires_at_ms: None,
-                error: Some("route is unresolved".into()),
-            },
+            None => unconfirmed_auth_diagnostic(
+                "unresolved",
+                "unresolved",
+                Some("route is unresolved".into()),
+            ),
         }
     };
     let (auth, daemon) = tokio::join!(

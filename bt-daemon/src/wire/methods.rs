@@ -113,7 +113,7 @@ pub struct AuthDiagnoseParams {
 
 /// The daemon's own resolution of a route's credentials. Never carries the
 /// credential itself. Resolution succeeded when `error` is absent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthDiagnoseResult {
     /// The canonical selection the daemon resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]

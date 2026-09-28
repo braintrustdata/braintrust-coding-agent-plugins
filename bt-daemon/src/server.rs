@@ -282,7 +282,14 @@ impl Daemon {
             }
         };
 
-        let lease = provider.resolve(&selection, reason).await.map_err(|error| {
+        let lease = resolve_route_auth(
+            provider.as_ref(),
+            &selection,
+            reason,
+            requested_route.auth.org_name.as_deref(),
+        )
+        .await
+        .map_err(|error| {
             let message = format!(
                 "could not resolve Braintrust auth for {}: {error}; run `bt login` or select a profile explicitly",
                 env.source
@@ -297,10 +304,6 @@ impl Daemon {
                     lease.selection
                 );
             }
-        }
-        if let Err(error) = require_selected_org(&requested_route.auth, &lease) {
-            self.record_auth_error(&key, &env.source, error.to_string());
-            return Err(error);
         }
 
         let mut route = requested_route;
@@ -346,18 +349,20 @@ impl Daemon {
     /// diagnostics see this process's credential store and environment rather
     /// than the caller's.
     async fn diagnose_auth(&self, selection: AuthSelection) -> AuthDiagnoseResult {
-        let result = async {
-            let provider = self
-                .auth_provider
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("daemon host has no Braintrust auth provider"))?;
-            let lease = provider
-                .resolve(&selection, AuthResolveReason::Initial)
-                .await?;
-            require_selected_org(&selection, &lease)?;
-            Ok::<_, anyhow::Error>(lease)
-        }
-        .await;
+        let result = match &self.auth_provider {
+            Some(provider) => {
+                resolve_route_auth(
+                    provider.as_ref(),
+                    &selection,
+                    AuthResolveReason::Initial,
+                    selection.org_name.as_deref(),
+                )
+                .await
+            }
+            None => Err(anyhow::anyhow!(
+                "daemon host has no Braintrust auth provider"
+            )),
+        };
         match result {
             Ok(lease) => AuthDiagnoseResult {
                 selection: Some(lease.selection),
@@ -366,10 +371,8 @@ impl Daemon {
                 error: None,
             },
             Err(error) => AuthDiagnoseResult {
-                selection: None,
-                org_name: None,
-                expires_at_ms: None,
                 error: Some(error.to_string()),
+                ..AuthDiagnoseResult::default()
             },
         }
     }
@@ -2026,8 +2029,16 @@ async fn handle_request(
     }
 }
 
-fn require_selected_org(selection: &AuthSelection, lease: &AuthLease) -> anyhow::Result<()> {
-    if let Some(expected_org) = selection.org_name.as_deref() {
+/// Resolve a route's lease the way event delivery does, including the
+/// organization the route requires.
+async fn resolve_route_auth(
+    provider: &dyn AuthProvider,
+    selection: &AuthSelection,
+    reason: AuthResolveReason,
+    required_org: Option<&str>,
+) -> anyhow::Result<AuthLease> {
+    let lease = provider.resolve(selection, reason).await?;
+    if let Some(expected_org) = required_org {
         if lease.auth.org_name.as_deref() != Some(expected_org) {
             anyhow::bail!(
                 "profile {:?} resolved organization {:?}, expected {:?}",
@@ -2037,7 +2048,7 @@ fn require_selected_org(selection: &AuthSelection, lease: &AuthLease) -> anyhow:
             );
         }
     }
-    Ok(())
+    Ok(lease)
 }
 
 fn client_may_shutdown(client: Option<&ClientInfo>, daemon_version: &str) -> bool {

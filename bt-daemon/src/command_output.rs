@@ -128,6 +128,14 @@ pub struct DaemonDiagnostic {
 }
 
 impl DaemonDiagnostic {
+    /// ` (<version>)` when the daemon reported one.
+    pub fn version_suffix(&self) -> String {
+        self.version
+            .as_deref()
+            .map(|version| format!(" ({version})"))
+            .unwrap_or_default()
+    }
+
     /// The daemon answered and could not authenticate the route.
     pub fn auth_failed(&self) -> bool {
         self.auth
@@ -238,48 +246,27 @@ impl TraceCommandOutput {
                     .transpose()?
                     .unwrap_or_else(|| "(unresolved)".into());
                 let mut rendered = format!(
-                    "Braintrust tracing doctor: {}\nEnabled: {}\nSettings: {}{}\nRoute source: {}\nRoute: {}\nAuth: {} ({})",
+                    "Braintrust tracing doctor: {}\nEnabled: {}\nSettings: {}{}\nRoute source: {}\nRoute: {}",
                     doctor.display_name,
                     doctor.enabled,
                     doctor.settings_path.display(),
                     if doctor.settings_present { "" } else { " (missing)" },
                     doctor.route_source,
                     route,
-                    doctor.auth.status,
-                    doctor.auth.source,
                 );
-                if let Some(profile) = &doctor.auth.profile {
-                    rendered.push_str(&format!("\nProfile: {profile}"));
-                }
-                if let Some(org_name) = &doctor.auth.org_name {
-                    rendered.push_str(&format!("\nOrganization: {org_name}"));
-                }
-                if let Some(error) = &doctor.auth.error {
-                    rendered.push_str(&format!("\nAuth error: {error}"));
-                }
+                push_auth_lines(&mut rendered, "", &doctor.auth);
                 let daemon = &doctor.daemon;
-                match (daemon.status, &daemon.version) {
-                    (DaemonStatus::Running, Some(version)) => {
-                        rendered.push_str(&format!("\nDaemon: running ({version})"))
-                    }
-                    (DaemonStatus::Running, None) => rendered.push_str("\nDaemon: running"),
-                    (DaemonStatus::NotRunning, _) => rendered.push_str("\nDaemon: not running"),
-                    (DaemonStatus::Unreachable, _) => rendered.push_str("\nDaemon: unreachable"),
-                }
+                let status = match daemon.status {
+                    DaemonStatus::Running => "running",
+                    DaemonStatus::NotRunning => "not running",
+                    DaemonStatus::Unreachable => "unreachable",
+                };
+                rendered.push_str(&format!("\nDaemon: {status}{}", daemon.version_suffix()));
                 if let Some(error) = &daemon.error {
                     rendered.push_str(&format!("\nDaemon error: {error}"));
                 }
                 if let Some(auth) = &daemon.auth {
-                    rendered.push_str(&format!("\nDaemon auth: {} ({})", auth.status, auth.source));
-                    if let Some(profile) = &auth.profile {
-                        rendered.push_str(&format!("\nDaemon profile: {profile}"));
-                    }
-                    if let Some(org_name) = &auth.org_name {
-                        rendered.push_str(&format!("\nDaemon organization: {org_name}"));
-                    }
-                    if let Some(error) = &auth.error {
-                        rendered.push_str(&format!("\nDaemon auth error: {error}"));
-                    }
+                    push_auth_lines(&mut rendered, "Daemon ", auth);
                 }
                 for error in &daemon.session_errors {
                     rendered.push_str(&format!("\nDaemon session error: {error}"));
@@ -336,6 +323,32 @@ impl TraceCommandOutput {
                 })
                 .collect::<Vec<_>>()
                 .join("\n")),
+        }
+    }
+}
+
+/// Render one auth view; `prefix` distinguishes the daemon's from the local.
+fn push_auth_lines(rendered: &mut String, prefix: &str, auth: &AuthDiagnostic) {
+    let label = |name: &str| {
+        if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}{}", name.to_lowercase())
+        }
+    };
+    rendered.push_str(&format!(
+        "\n{}: {} ({})",
+        label("Auth"),
+        auth.status,
+        auth.source
+    ));
+    for (name, value) in [
+        ("Profile", &auth.profile),
+        ("Organization", &auth.org_name),
+        ("Auth error", &auth.error),
+    ] {
+        if let Some(value) = value {
+            rendered.push_str(&format!("\n{}: {value}", label(name)));
         }
     }
 }

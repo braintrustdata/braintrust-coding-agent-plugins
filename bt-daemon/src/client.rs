@@ -99,18 +99,25 @@ impl Conn {
         }
     }
 
+    /// Send a request and decode its result.
+    pub async fn call<R: serde::de::DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: impl serde::Serialize,
+    ) -> anyhow::Result<R> {
+        Ok(serde_json::from_value(self.request(method, params).await?)?)
+    }
+
     /// Perform the `initialize` handshake as a named, non-hook client.
     pub async fn initialize(&mut self, source: &str) -> anyhow::Result<InitializeResult> {
-        let value = self
-            .request(
-                method::INITIALIZE,
-                serde_json::json!({
-                    "protocol_version": PROTOCOL_VERSION,
-                    "client": { "source": source }
-                }),
-            )
-            .await?;
-        Ok(serde_json::from_value(value)?)
+        self.call(
+            method::INITIALIZE,
+            serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "client": { "source": source }
+            }),
+        )
+        .await
     }
 
     async fn write(&mut self, msg: &Message) -> anyhow::Result<()> {
