@@ -506,7 +506,21 @@ mod tests {
                 expires_at_ms: Some(123),
                 error: None,
             },
-            daemon: DaemonDiagnostic::default(),
+            daemon: DaemonDiagnostic {
+                status: DaemonStatus::Running,
+                version: Some("1.2.3".into()),
+                auth: Some(AuthDiagnostic {
+                    status: "error".into(),
+                    source: "saved_profile".into(),
+                    kind: None,
+                    profile: None,
+                    org_name: None,
+                    expires_at_ms: None,
+                    error: Some("saved profile ID 'p' no longer exists".into()),
+                }),
+                session_errors: vec!["could not resolve Braintrust auth for codex".into()],
+                error: None,
+            },
             warnings: Vec::new(),
             plugin_diagnostics: vec![crate::PluginDiagnostic {
                 source: "codex".into(),
@@ -522,6 +536,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["command"], "doctor");
         assert_eq!(value["auth"]["source"], "saved_profile");
+        assert_eq!(value["daemon"]["status"], "running");
+        assert_eq!(value["daemon"]["auth"]["status"], "error");
+        assert_eq!(
+            value["daemon"]["session_errors"][0],
+            "could not resolve Braintrust auth for codex"
+        );
         assert!(!rendered.contains("token"));
         assert!(!rendered.contains("api_key"));
         assert_eq!(

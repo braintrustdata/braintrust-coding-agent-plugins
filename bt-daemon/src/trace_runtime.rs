@@ -937,17 +937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_routes_persist_the_resolved_profile_and_organization() {
-        let services = Arc::new(RecordingHost::new(None, None));
-        let route = resolve_command_route(&test_host(services), COMMAND_REQUIREMENTS)
-            .await
-            .unwrap();
-        assert_eq!(route.auth.profile.as_deref(), Some("test"));
-        assert_eq!(route.auth.org_name.as_deref(), Some("test-org"));
-    }
-
-    #[tokio::test]
-    async fn command_routes_prefer_the_resolved_stable_profile_id() {
+    async fn command_routes_persist_the_resolved_identity_and_require_an_organization() {
         let services = Arc::new(RecordingHost {
             profile_id: Some("00000000-0000-4000-8000-000000000001"),
             ..RecordingHost::new(None, None)
@@ -959,6 +949,14 @@ mod tests {
             route.auth.profile_id.as_deref(),
             Some("00000000-0000-4000-8000-000000000001")
         );
+        assert_eq!(route.auth.profile.as_deref(), Some("test"));
+        assert_eq!(route.auth.org_name.as_deref(), Some("test-org"));
+
+        let services = Arc::new(RecordingHost::without_org());
+        let error = resolve_command_route(&test_host(services), COMMAND_REQUIREMENTS)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("organization choice required"));
     }
 
     #[tokio::test]
@@ -973,15 +971,6 @@ mod tests {
             config.additional_metadata,
             Some(serde_json::json!({"import": true}))
         );
-    }
-
-    #[tokio::test]
-    async fn command_routes_reject_an_unresolved_organization() {
-        let services = Arc::new(RecordingHost::without_org());
-        let error = resolve_command_route(&test_host(services), COMMAND_REQUIREMENTS)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("organization choice required"));
     }
 
     #[tokio::test]
