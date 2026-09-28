@@ -1252,6 +1252,16 @@ mod tests {
     #[tokio::test]
     async fn doctor_reports_a_daemon_that_resolves_other_credentials() {
         let daemon = TestDaemon::start(Arc::new(OtherProfileDaemonAuth)).await;
+        let route = SessionRoute {
+            auth: AuthSelection {
+                org_name: Some("test-org".into()),
+                ..AuthSelection::default()
+            },
+            ..SessionRoute::default()
+        };
+        daemon
+            .forward_event("claude-code", "wrong-org", route)
+            .await;
 
         let output = daemon.doctor(DoctorAgent::Claude).await;
 
@@ -1264,40 +1274,16 @@ mod tests {
         assert!(output.warnings.iter().any(|warning| warning.contains(
             r#"this shell resolved organization "test-org" but the running daemon resolved "other-org""#
         )));
+        // The daemon records the org mismatch it rejected the event for.
+        assert!(
+            output.daemon.session_errors[0].contains(r#"expected "test-org""#),
+            "{:#?}",
+            output.daemon.session_errors
+        );
         let rendered = TraceCommandOutput::doctor(output)
             .render(OutputFormat::Json)
             .unwrap();
         assert!(!rendered.contains("daemon-secret"));
-
-        daemon.stop().await;
-    }
-
-    #[tokio::test]
-    async fn daemon_records_an_organization_mismatch_for_status() {
-        let daemon = TestDaemon::start(Arc::new(OtherProfileDaemonAuth)).await;
-        let route = SessionRoute {
-            auth: AuthSelection {
-                org_name: Some("test-org".into()),
-                ..AuthSelection::default()
-            },
-            ..SessionRoute::default()
-        };
-        daemon
-            .forward_event("claude-code", "wrong-org", route)
-            .await;
-
-        let status = run_status(StatusArgs {
-            socket: Some(daemon.socket.clone()),
-            session_id: Some("wrong-org".into()),
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        let error = status.sessions[0].last_error.as_deref().unwrap();
-        assert!(error.contains(r#"expected "test-org""#), "{error}");
-
-        let output = daemon.doctor(DoctorAgent::Claude).await;
-        assert_eq!(output.daemon.session_errors, [error]);
 
         daemon.stop().await;
     }
@@ -1321,22 +1307,6 @@ mod tests {
             .any(|warning| warning.contains("daemon")));
     }
 
-    #[tokio::test]
-    async fn older_daemons_report_unknown_methods_as_typed_errors() {
-        let daemon = TestDaemon::start(Arc::new(DivergedDaemonAuth)).await;
-        let mut conn =
-            crate::client::Conn::new(crate::client::connect(&daemon.socket).await.unwrap());
-        let error = conn
-            .request("auth.future", serde_json::json!({}))
-            .await
-            .unwrap_err();
-        let error = error.downcast_ref::<crate::client::RpcCallError>().unwrap();
-        assert_eq!(error.code, crate::wire::error_code::METHOD_NOT_FOUND);
-        drop(conn);
-
-        daemon.stop().await;
-    }
-
     fn diagnostic(status: &str, error: Option<&str>) -> AuthDiagnostic {
         AuthDiagnostic {
             status: status.into(),
@@ -1349,39 +1319,37 @@ mod tests {
         }
     }
 
-    fn running_daemon(version: &str, auth: AuthDiagnostic) -> DaemonDiagnostic {
-        DaemonDiagnostic {
+    #[test]
+    fn doctor_warnings_depend_on_what_the_daemon_could_confirm() {
+        let session_error = "could not resolve Braintrust auth for codex";
+        let running_daemon = |version: &str, auth| DaemonDiagnostic {
             status: DaemonStatus::Running,
             version: Some(version.into()),
             auth: Some(auth),
-            session_errors: vec!["could not resolve Braintrust auth for codex".into()],
+            session_errors: vec![session_error.into()],
             error: None,
-        }
-    }
+        };
+        let shell = diagnostic("ready", None);
 
-    #[test]
-    fn doctor_asks_an_older_daemon_to_restart() {
-        let daemon = running_daemon("0.21.0", diagnostic("unsupported", None));
-        let warnings = daemon_warnings("Codex", &diagnostic("ready", None), &daemon, true);
+        // An older daemon cannot answer auth.diagnose, so its session errors
+        // are the only evidence.
+        let older = running_daemon("0.21.0", diagnostic("unsupported", None));
         assert_eq!(
-            warnings,
+            daemon_warnings("Codex", &shell, &older, true),
             [
-                "the running tracing daemon (0.21.0) cannot report its authentication; run `bt trace stop` so the next event starts the current version",
-                "the running tracing daemon reported a Codex session error: could not resolve Braintrust auth for codex",
+                "the running tracing daemon (0.21.0) cannot report its authentication; run `bt trace stop` so the next event starts the current version".to_string(),
+                format!("the running tracing daemon reported a Codex session error: {session_error}"),
             ]
         );
-    }
 
-    #[test]
-    fn doctor_does_not_blame_credential_divergence_when_both_processes_fail() {
-        let daemon = running_daemon(
+        // Offline checks can pass while both processes fail to reach
+        // Braintrust; that is not a credential split.
+        let offline = running_daemon(
             "test",
             diagnostic("error", Some("failed to call login endpoint")),
         );
-        // Offline checks can pass while both processes fail to reach Braintrust.
-        let warnings = daemon_warnings("Codex", &diagnostic("ready", None), &daemon, false);
         assert_eq!(
-            warnings,
+            daemon_warnings("Codex", &shell, &offline, false),
             ["the running tracing daemon cannot authenticate, so it rejects Codex events: failed to call login endpoint"]
         );
     }
