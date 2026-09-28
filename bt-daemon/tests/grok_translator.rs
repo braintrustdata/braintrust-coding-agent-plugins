@@ -1172,70 +1172,93 @@ fn grok_attached_session_merges_keep_the_external_parent() {
 
 #[test]
 fn grok_failed_tools_keep_the_native_failure_cause() {
-    // Terminal updates as serialized by grok-build's `acp_tool_update` and
-    // tool-call error paths: readable text lives in ACP `content`, while
+    // Terminal update fields as serialized by grok-build's `acp_tool_update`
+    // and tool-call error paths: readable text lives in ACP `content`, while
     // `rawOutput` is Grok's tagged `ToolOutput` enum.
+    let text = |text: &str| json!([{"type":"content","content":{"type":"text","text":text}}]);
+    let bash = |timed_out: bool, signal: Option<&str>| {
+        json!({
+            "type":"Bash","output":b"compiling".to_vec(),"exit_code":-1,"command":"sleep 99",
+            "signal":signal,"timed_out":timed_out,"current_dir":"/repo"
+        })
+    };
     let cases = [
         (
             "read_missing",
-            r#"{"sessionUpdate":"tool_call_update","toolCallId":"read_missing","status":"failed","content":[{"type":"content","content":{"type":"text","text":"File not found: /repo/missing.txt"}}],"rawOutput":{"type":"ReadFile","FileNotFound":"File not found: /repo/missing.txt"}}"#,
+            json!({
+                "content": text("File not found: /repo/missing.txt"),
+                "rawOutput": {"type":"ReadFile","FileNotFound":"File not found: /repo/missing.txt"}
+            }),
             "File not found: /repo/missing.txt",
         ),
         (
             "list_missing",
-            r#"{"sessionUpdate":"tool_call_update","toolCallId":"list_missing","status":"failed","rawOutput":{"type":"ListDir","NotFound":"Directory not found: /repo/nope"}}"#,
+            json!({"rawOutput": {"type":"ListDir","NotFound":"Directory not found: /repo/nope"}}),
             "Directory not found: /repo/nope",
         ),
         (
             "mcp_error",
-            r#"{"sessionUpdate":"tool_call_update","toolCallId":"mcp_error","status":"failed","rawOutput":{"type":"MCP","tool_name":"issue_read","server_name":"github","output":{"Error":"Could not resolve issue 355"},"is_error":true}}"#,
+            json!({"rawOutput": {
+                "type":"MCP","tool_name":"issue_read","server_name":"github",
+                "output":{"Error":"Could not resolve issue 355"},"is_error":true
+            }}),
             "Could not resolve issue 355",
         ),
         (
             "bash_timeout",
-            r#"{"sessionUpdate":"tool_call_update","toolCallId":"bash_timeout","status":"failed","content":[{"type":"content","content":{"type":"text","text":"compiling\nstill going"}}],"rawOutput":{"type":"Bash","output_for_prompt":"","exit_code":-1,"command":"sleep 99","truncated":false,"signal":null,"timed_out":true,"description":null,"current_dir":"/repo","output_file":"/tmp/out.txt","total_bytes":0,"output":[99,111,109,112,105,108,105,110,103]}}"#,
+            json!({"content": text("compiling\nstill going"), "rawOutput": bash(true, None)}),
             "Command timed out",
         ),
         (
             "bash_signal",
-            r#"{"sessionUpdate":"tool_call_update","toolCallId":"bash_signal","status":"failed","content":[{"type":"content","content":{"type":"text","text":"compiling\nstill going"}}],"rawOutput":{"type":"Bash","output_for_prompt":"","exit_code":-1,"command":"sleep 99","truncated":false,"signal":"SIGKILL","timed_out":false,"description":null,"current_dir":"/repo","output_file":"/tmp/out.txt","total_bytes":0,"output":[99,111,109,112,105,108,105,110,103]}}"#,
+            json!({"content": text("compiling\nstill going"), "rawOutput": bash(false, Some("SIGKILL"))}),
             "Command terminated by signal SIGKILL",
         ),
         (
             "exec_failed",
-            r#"{"sessionUpdate":"tool_call_update","toolCallId":"exec_failed","status":"failed","content":[{"type":"content","content":{"type":"text","text":"Tool `grep` failed: regex parse error: unclosed group"}}],"rawOutput":{"error":"tool_execution_failed","message":"regex parse error: unclosed group"}}"#,
+            json!({
+                "content": text("Tool `grep` failed: regex parse error: unclosed group"),
+                "rawOutput": {"error":"tool_execution_failed","message":"regex parse error: unclosed group"}
+            }),
             "Tool `grep` failed: regex parse error: unclosed group",
         ),
-        (
-            "silent",
-            r#"{"sessionUpdate":"tool_call_update","toolCallId":"silent","status":"failed"}"#,
-            "Grok tool failed",
-        ),
+        ("silent", json!({}), "Grok tool failed"),
     ];
+    let mut updates = vec![json!({"params":{
+        "update":{"sessionUpdate":"user_message_chunk","content":{"text":"go"}},
+        "_meta":{"promptIndex":0,"agentTimestampMs":1000}
+    }})];
+    let mut events = Vec::new();
+    for (index, (call, fields, _)) in cases.iter().enumerate() {
+        let ts = 1_100 + index as i64 * 20;
+        let mut update =
+            json!({"sessionUpdate":"tool_call_update","toolCallId":call,"status":"failed"});
+        update
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        updates.push(json!({"params":{
+            "update":{"sessionUpdate":"tool_call","toolCallId":call,"title":call},
+            "_meta":{"agentTimestampMs":ts}
+        }}));
+        updates.push(json!({"params":{"update":update,"_meta":{"agentTimestampMs":ts + 10}}}));
+        // The later hook outcome must not replace the update's native message.
+        events.push(json!({
+            "ts":format!("1970-01-01T00:00:01.{:03}Z", ts % 1_000 + 10),
+            "type":"tool_completed","tool_call_id":call,"duration_ms":10,"outcome":"error"
+        }));
+    }
+    let jsonl = |records: Vec<serde_json::Value>| {
+        records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>()
+    };
     let temp = tempfile::tempdir().unwrap();
     let updates_path = temp.path().join("updates.jsonl");
     let events_path = temp.path().join("events.jsonl");
-    let mut updates = String::from(
-        "{\"params\":{\"update\":{\"sessionUpdate\":\"user_message_chunk\",\"content\":{\"text\":\"go\"}},\"_meta\":{\"promptIndex\":0,\"agentTimestampMs\":1000}}}\n",
-    );
-    let mut events = String::new();
-    for (index, (call, update, _)) in cases.iter().enumerate() {
-        let ts = 1_100 + index as i64 * 20;
-        updates.push_str(&format!(
-            "{{\"params\":{{\"update\":{{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"{call}\",\"title\":\"{call}\"}},\"_meta\":{{\"agentTimestampMs\":{ts}}}}}}}\n"
-        ));
-        updates.push_str(&format!(
-            "{{\"params\":{{\"update\":{update},\"_meta\":{{\"agentTimestampMs\":{}}}}}}}\n",
-            ts + 10
-        ));
-        // The later hook outcome must not replace the update's native message.
-        events.push_str(&format!(
-            "{{\"ts\":\"1970-01-01T00:00:01.{:03}Z\",\"type\":\"tool_completed\",\"tool_call_id\":\"{call}\",\"duration_ms\":10,\"outcome\":\"error\"}}\n",
-            ts % 1_000 + 10
-        ));
-    }
-    std::fs::write(&updates_path, updates).unwrap();
-    std::fs::write(&events_path, events).unwrap();
+    std::fs::write(&updates_path, jsonl(updates)).unwrap();
+    std::fs::write(&events_path, jsonl(events)).unwrap();
     let mut event = envelope(0, 0);
     point_at(&mut event, &updates_path, &events_path);
     let registry = Registry::default_agents();
@@ -1243,30 +1266,28 @@ fn grok_failed_tools_keep_the_native_failure_cause() {
     let mut ops = handle(&mut *translator, &event);
     ops.extend(drain(&mut *translator));
 
-    // Merges apply in order, so the last error written to a span is what lands.
-    let mut span_by_call = std::collections::HashMap::new();
-    let mut errors = std::collections::HashMap::new();
-    for op in &ops {
-        let row = match op {
+    let rows: Vec<_> = ops
+        .iter()
+        .map(|op| match op {
             SpanOp::Insert(row) | SpanOp::Merge(row) => row,
-        };
-        if let Some(call) = row
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("tool_call_id"))
-            .and_then(|call| call.as_str())
-        {
-            span_by_call.insert(call.to_string(), row.span_id.clone());
-        }
-        if let Some(error) = &row.error {
-            errors.insert(row.span_id.clone(), error.clone());
-        }
-    }
+        })
+        .collect();
     for (call, _, expected) in cases {
-        assert_eq!(
-            errors.get(&span_by_call[call]).map(String::as_str),
-            Some(expected),
-            "{call}"
-        );
+        let span_id = &rows
+            .iter()
+            .find(|row| {
+                row.metadata
+                    .as_ref()
+                    .is_some_and(|m| m["tool_call_id"] == call)
+            })
+            .unwrap()
+            .span_id;
+        // Merges apply in order, so the last error written to a span is what lands.
+        let error = rows
+            .iter()
+            .rev()
+            .find(|row| &row.span_id == span_id && row.error.is_some())
+            .and_then(|row| row.error.as_deref());
+        assert_eq!(error, Some(expected), "{call}");
     }
 }

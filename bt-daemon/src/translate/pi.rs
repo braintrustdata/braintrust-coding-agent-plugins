@@ -1056,14 +1056,11 @@ fn bash_status(tool: &str, v: Option<&Value>) -> Option<String> {
         return None;
     }
     let text = v?
-        .pointer("/content")?
+        .get("content")?
         .as_array()?
         .iter()
-        .find_map(|block| {
-            (block.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| block.get("text").and_then(Value::as_str))
-                .flatten()
-        })?;
+        .filter(|block| block["type"] == "text")
+        .find_map(|block| block["text"].as_str())?;
     let status = text.lines().map(str::trim).rfind(|line| !line.is_empty())?;
     [
         "Command exited with code ",

@@ -59,7 +59,7 @@ pub fn nonempty_error_text(value: &Value) -> Option<String> {
             .find(|line| !line.is_empty())
             .map(str::to_string);
     }
-    // Pi and MCP tool results carry their message in `content` text blocks.
+    // MCP and ACP tool results carry their message in `content` text blocks.
     if let Some(values) = value.as_array() {
         return values.iter().find_map(nonempty_error_text);
     }

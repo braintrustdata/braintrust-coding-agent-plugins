@@ -778,20 +778,19 @@ impl GrokTranslator {
                     metadata.insert("incomplete".into(), json!(false));
                     metadata.insert("close_reason".into(), json!("tool_call_update"));
                 }
-                let output = update
-                    .get("rawOutput")
-                    .or_else(|| update.get("content"))
-                    .cloned();
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id: tool.span_id,
                     root_span_id: self.root_span_id.clone(),
                     parent_span_ids: vec![tool.parent_span_id],
                     end_ms: Some(end_ms),
+                    output: update
+                        .get("rawOutput")
+                        .or_else(|| update.get("content"))
+                        .cloned(),
                     error: failed.then(|| {
                         tool_failure_text(update)
                             .unwrap_or_else(|| format!("Grok tool {}", status.unwrap_or("failed")))
                     }),
-                    output,
                     metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
                     late_merge_key: allow_late_merge.then(|| "tool:terminal_update".to_string()),
                     ..Default::default()
@@ -1585,11 +1584,11 @@ fn usage_metrics(usage: &Value) -> Value {
 /// serialized `ToolOutput` enum, which only carries text in a variant payload.
 fn tool_failure_text(update: &Value) -> Option<String> {
     let raw = update.get("rawOutput");
-    if let Some(raw) = raw.filter(|raw| raw.get("type").and_then(Value::as_str) == Some("Bash")) {
-        if raw.get("timed_out").and_then(Value::as_bool) == Some(true) {
+    if let Some(raw) = raw.filter(|raw| raw["type"] == "Bash") {
+        if raw["timed_out"] == true {
             return Some("Command timed out".into());
         }
-        if let Some(signal) = raw.get("signal").and_then(Value::as_str) {
+        if let Some(signal) = raw["signal"].as_str() {
             return Some(format!("Command terminated by signal {signal}"));
         }
     }
@@ -1597,28 +1596,18 @@ fn tool_failure_text(update: &Value) -> Option<String> {
         return Some(text);
     }
     let raw = raw?;
-    if let Some(text) = raw.as_str() {
-        return nonempty_error_text(&Value::String(text.into()));
-    }
-    let object = raw.as_object()?;
-    if let Some(message) = object.get("message").and_then(nonempty_error_text) {
-        return Some(message);
-    }
-    // `{"type":"ReadFile","FileNotFound":"..."}` or `{"type":"MCP","output":{"Error":"..."}}`.
-    let variant = object
-        .iter()
-        .filter(|(key, _)| key.as_str() != "type")
-        .find_map(|(key, value)| {
-            key.starts_with(|c: char| c.is_ascii_uppercase())
-                .then(|| nonempty_error_text(value))
-                .flatten()
-        });
-    variant
-        .or_else(|| {
-            object
-                .get("output")
-                .and_then(|output| output.get("Error"))
-                .and_then(nonempty_error_text)
+    // Variant payloads such as `{"type":"ReadFile","FileNotFound":"..."}` or,
+    // for MCP, `{"type":"MCP","output":{"Error":"..."}}`.
+    let variant = |value: &Value| {
+        value.as_object()?.iter().find_map(|(key, value)| {
+            if key.starts_with(|c: char| c.is_ascii_uppercase()) {
+                nonempty_error_text(value)
+            } else {
+                None
+            }
         })
+    };
+    variant(raw)
+        .or_else(|| variant(&raw["output"]))
         .or_else(|| nonempty_error_text(raw))
 }
