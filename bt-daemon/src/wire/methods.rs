@@ -112,10 +112,9 @@ pub struct AuthDiagnoseParams {
 }
 
 /// The daemon's own resolution of a route's credentials. Never carries the
-/// credential itself.
+/// credential itself. Resolution succeeded when `error` is absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthDiagnoseResult {
-    pub ready: bool,
     /// The canonical selection the daemon resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<crate::wire::AuthSelection>,

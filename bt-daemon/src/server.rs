@@ -287,10 +287,7 @@ impl Daemon {
                 "could not resolve Braintrust auth for {}: {error}; run `bt login` or select a profile explicitly",
                 env.source
             );
-            self.auth_errors.lock().unwrap().insert(
-                key.clone(),
-                (env.source.clone(), message.clone()),
-            );
+            self.record_auth_error(&key, &env.source, message.clone());
             anyhow::anyhow!(message)
         })?;
         if let Some(expected) = expected_selection {
@@ -302,10 +299,7 @@ impl Daemon {
             }
         }
         if let Err(error) = require_selected_org(&requested_route.auth, &lease) {
-            self.auth_errors
-                .lock()
-                .unwrap()
-                .insert(key.clone(), (env.source.clone(), error.to_string()));
+            self.record_auth_error(&key, &env.source, error.to_string());
             return Err(error);
         }
 
@@ -340,6 +334,14 @@ impl Daemon {
         Ok(canonical_key)
     }
 
+    /// Keep a route's auth failure visible to `status.get` until it succeeds.
+    fn record_auth_error(&self, key: &DeliveryKey, source: &str, message: String) {
+        self.auth_errors
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (source.to_string(), message));
+    }
+
     /// Resolve a route's credentials exactly as event delivery would, so
     /// diagnostics see this process's credential store and environment rather
     /// than the caller's.
@@ -358,14 +360,12 @@ impl Daemon {
         .await;
         match result {
             Ok(lease) => AuthDiagnoseResult {
-                ready: true,
                 selection: Some(lease.selection),
                 org_name: lease.auth.org_name,
                 expires_at_ms: lease.expires_at_ms,
                 error: None,
             },
             Err(error) => AuthDiagnoseResult {
-                ready: false,
                 selection: None,
                 org_name: None,
                 expires_at_ms: None,

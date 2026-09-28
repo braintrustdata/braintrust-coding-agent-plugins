@@ -101,12 +101,20 @@ pub struct AuthDiagnostic {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonStatus {
+    Running,
+    #[default]
+    NotRunning,
+    Unreachable,
+}
+
 /// What the running daemon, rather than the doctor's own process, sees. The
 /// two can read different credential stores or environments.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DaemonDiagnostic {
-    /// `running`, `not_running`, or `unreachable`.
-    pub status: String,
+    pub status: DaemonStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// The daemon's own resolution of the route's credentials.
@@ -120,14 +128,11 @@ pub struct DaemonDiagnostic {
 }
 
 impl DaemonDiagnostic {
-    pub fn not_running() -> Self {
-        Self {
-            status: "not_running".into(),
-            version: None,
-            auth: None,
-            session_errors: Vec::new(),
-            error: None,
-        }
+    /// The daemon answered and could not authenticate the route.
+    pub fn auth_failed(&self) -> bool {
+        self.auth
+            .as_ref()
+            .is_some_and(|auth| auth.status == "error")
     }
 }
 
@@ -253,12 +258,13 @@ impl TraceCommandOutput {
                     rendered.push_str(&format!("\nAuth error: {error}"));
                 }
                 let daemon = &doctor.daemon;
-                match (daemon.status.as_str(), &daemon.version) {
-                    ("running", Some(version)) => {
+                match (daemon.status, &daemon.version) {
+                    (DaemonStatus::Running, Some(version)) => {
                         rendered.push_str(&format!("\nDaemon: running ({version})"))
                     }
-                    ("not_running", _) => rendered.push_str("\nDaemon: not running"),
-                    (status, _) => rendered.push_str(&format!("\nDaemon: {status}")),
+                    (DaemonStatus::Running, None) => rendered.push_str("\nDaemon: running"),
+                    (DaemonStatus::NotRunning, _) => rendered.push_str("\nDaemon: not running"),
+                    (DaemonStatus::Unreachable, _) => rendered.push_str("\nDaemon: unreachable"),
                 }
                 if let Some(error) = &daemon.error {
                     rendered.push_str(&format!("\nDaemon error: {error}"));
@@ -500,7 +506,7 @@ mod tests {
                 expires_at_ms: Some(123),
                 error: None,
             },
-            daemon: DaemonDiagnostic::not_running(),
+            daemon: DaemonDiagnostic::default(),
             warnings: Vec::new(),
             plugin_diagnostics: vec![crate::PluginDiagnostic {
                 source: "codex".into(),

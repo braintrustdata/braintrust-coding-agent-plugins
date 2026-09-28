@@ -36,8 +36,8 @@ mod transport;
 pub mod wire;
 pub use client::HostInfo;
 pub use command_output::{
-    AuthDiagnostic, DaemonDiagnostic, DoctorCommandOutput, ImportSummary, OutputFormat,
-    SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
+    AuthDiagnostic, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, ImportSummary,
+    OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
 };
 #[doc(hidden)]
 pub use journal::source_journal_path;
@@ -668,11 +668,7 @@ pub async fn flush_session(
 ) -> anyhow::Result<wire::FlushResult> {
     let stream = client::connect(socket).await?;
     let mut conn = client::Conn::new(stream);
-    conn.request(
-        method::INITIALIZE,
-        serde_json::json!({ "protocol_version": PROTOCOL_VERSION, "client": { "source": "flush" } }),
-    )
-    .await?;
+    conn.initialize("flush").await?;
     let params = wire::FlushParams {
         session_id: session_id.to_string(),
         timeout_ms,
@@ -713,14 +709,7 @@ async fn flush_managed_run_in(
         }
     };
     let mut conn = client::Conn::new(stream);
-    conn.request(
-        method::INITIALIZE,
-        serde_json::json!({
-            "protocol_version": PROTOCOL_VERSION,
-            "client": { "source": "managed-run-flush" }
-        }),
-    )
-    .await?;
+    conn.initialize("managed-run-flush").await?;
     let params = ManagedRunFlushParams {
         managed_run_id: managed_run_id.to_string(),
         timeout_ms,
@@ -737,14 +726,7 @@ pub async fn run_status(args: StatusArgs) -> anyhow::Result<Option<StatusResult>
         Err(_) => return Ok(None),
     };
     let mut conn = client::Conn::new(stream);
-    conn.request(
-        method::INITIALIZE,
-        serde_json::json!({
-            "protocol_version": PROTOCOL_VERSION,
-            "client": { "source": "status" }
-        }),
-    )
-    .await?;
+    conn.initialize("status").await?;
     let params = wire::StatusParams {
         session_id: args.session_id.clone(),
     };

@@ -11,8 +11,8 @@ use crate::{
     apply_additional_metadata, apply_tags, braintrust_serve_options, paths, run_disable,
     run_enable, run_hook, run_import, run_serve, run_status, run_traced, shutdown_daemon,
     AuthDiagnostic, AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig,
-    DaemonDiagnostic, DoctorCommandOutput, HostInfo, OutputFormat, Registry, RunHookCommand,
-    ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
+    DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, HostInfo, OutputFormat, Registry,
+    RunHookCommand, ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -69,6 +69,22 @@ fn auth_source_label(selection: &AuthSelection) -> &'static str {
     }
 }
 
+fn ready_auth_diagnostic(
+    selection: AuthSelection,
+    org_name: Option<String>,
+    expires_at_ms: Option<i64>,
+) -> AuthDiagnostic {
+    AuthDiagnostic {
+        status: "ready".into(),
+        source: auth_source_label(&selection).into(),
+        kind: None,
+        profile: selection.profile,
+        org_name,
+        expires_at_ms,
+        error: None,
+    }
+}
+
 /// Host-owned services used by the integration runtime.
 ///
 /// Implementations resolve Braintrust profiles and destination choices but do
@@ -100,15 +116,9 @@ pub trait TraceHostServices: Send + Sync {
             .resolve_auth(selection, AuthResolveReason::Initial)
             .await
         {
-            Ok(lease) => AuthDiagnostic {
-                status: "ready".into(),
-                source: auth_source_label(&lease.selection).into(),
-                kind: None,
-                profile: lease.selection.profile,
-                org_name: lease.auth.org_name,
-                expires_at_ms: lease.expires_at_ms,
-                error: None,
-            },
+            Ok(lease) => {
+                ready_auth_diagnostic(lease.selection, lease.auth.org_name, lease.expires_at_ms)
+            }
             Err(error) => AuthDiagnostic {
                 status: "error".into(),
                 source: auth_source_label(selection).into(),
@@ -282,21 +292,8 @@ const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn is_same_agent(doctor_source: &str, source: &str) -> bool {
-    let canonical = |source| match source {
-        "claude" => "claude-code",
-        "open-code" => "opencode",
-        other => other,
-    };
-    canonical(doctor_source) == canonical(source)
-}
-
-fn unreachable_daemon(version: Option<String>, error: String) -> DaemonDiagnostic {
-    DaemonDiagnostic {
-        status: "unreachable".into(),
-        version,
-        error: Some(error),
-        ..DaemonDiagnostic::not_running()
-    }
+    crate::translate::canonical_source_name(doctor_source)
+        == crate::translate::canonical_source_name(source)
 }
 
 /// Ask the running daemon, not this process, whether it can authenticate the
@@ -308,51 +305,45 @@ async fn diagnose_daemon(
     selection: Option<&AuthSelection>,
 ) -> DaemonDiagnostic {
     let Ok(stream) = crate::client::connect(socket).await else {
-        return DaemonDiagnostic::not_running();
+        return DaemonDiagnostic::default();
     };
     let mut conn = crate::client::Conn::new(stream);
-    let initialize = conn.request(
-        crate::wire::method::INITIALIZE,
-        serde_json::json!({
-            "protocol_version": crate::wire::PROTOCOL_VERSION,
-            "client": { "source": "doctor" }
-        }),
-    );
-    let version = match tokio::time::timeout(DAEMON_PROBE_TIMEOUT, initialize).await {
-        Ok(Ok(value)) => serde_json::from_value::<crate::wire::InitializeResult>(value)
-            .ok()
-            .map(|result| result.daemon_version),
-        Ok(Err(error)) => return unreachable_daemon(None, error.to_string()),
-        Err(_) => return unreachable_daemon(None, "daemon did not answer initialize".into()),
+    let initialized = tokio::time::timeout(DAEMON_PROBE_TIMEOUT, conn.initialize("doctor")).await;
+    let version = match initialized {
+        Ok(Ok(result)) => Some(result.daemon_version),
+        Ok(Err(error)) => return unreachable_daemon(error.to_string()),
+        Err(_) => return unreachable_daemon("daemon did not answer initialize".into()),
     };
     let mut diagnostic = DaemonDiagnostic {
-        status: "running".into(),
+        status: DaemonStatus::Running,
         version,
-        ..DaemonDiagnostic::not_running()
+        ..DaemonDiagnostic::default()
     };
 
     // Status first: a slow auth probe would otherwise delay it on this
     // connection.
-    let status = conn.request(
-        crate::wire::method::STATUS_GET,
-        crate::wire::StatusParams::default(),
-    );
+    let status = async {
+        let value = conn
+            .request(
+                crate::wire::method::STATUS_GET,
+                crate::wire::StatusParams::default(),
+            )
+            .await?;
+        Ok::<_, anyhow::Error>(serde_json::from_value::<crate::wire::StatusResult>(value)?)
+    };
     match tokio::time::timeout(DAEMON_PROBE_TIMEOUT, status).await {
-        Ok(Ok(value)) => match serde_json::from_value::<crate::wire::StatusResult>(value) {
-            Ok(status) => {
-                for session in status.sessions {
-                    if !is_same_agent(source, &session.source) {
-                        continue;
-                    }
-                    if let Some(error) = session.last_error {
-                        if !diagnostic.session_errors.contains(&error) {
-                            diagnostic.session_errors.push(error);
-                        }
-                    }
+        Ok(Ok(status)) => {
+            let errors = status
+                .sessions
+                .into_iter()
+                .filter(|session| is_same_agent(source, &session.source))
+                .filter_map(|session| session.last_error);
+            for error in errors {
+                if !diagnostic.session_errors.contains(&error) {
+                    diagnostic.session_errors.push(error);
                 }
             }
-            Err(error) => diagnostic.error = Some(format!("status is unreadable: {error}")),
-        },
+        }
         Ok(Err(error)) => diagnostic.error = Some(format!("status unavailable: {error}")),
         Err(_) => diagnostic.error = Some("status did not answer in time".into()),
     }
@@ -363,10 +354,38 @@ async fn diagnose_daemon(
     diagnostic
 }
 
+fn unreachable_daemon(error: String) -> DaemonDiagnostic {
+    DaemonDiagnostic {
+        status: DaemonStatus::Unreachable,
+        error: Some(error),
+        ..DaemonDiagnostic::default()
+    }
+}
+
 async fn diagnose_daemon_auth(
     conn: &mut crate::client::Conn,
     selection: &AuthSelection,
 ) -> AuthDiagnostic {
+    let request = async {
+        let value = conn
+            .request(
+                crate::wire::method::AUTH_DIAGNOSE,
+                crate::wire::AuthDiagnoseParams {
+                    auth: selection.clone(),
+                },
+            )
+            .await?;
+        Ok::<_, anyhow::Error>(serde_json::from_value::<crate::wire::AuthDiagnoseResult>(
+            value,
+        )?)
+    };
+    let result = tokio::time::timeout(DAEMON_AUTH_TIMEOUT, request)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "daemon did not finish resolving auth in time"
+            ))
+        });
     // The route already shows what was requested; report only what the
     // daemon actually resolved.
     let unconfirmed = |status: &str, error: Option<String>| AuthDiagnostic {
@@ -378,47 +397,21 @@ async fn diagnose_daemon_auth(
         expires_at_ms: None,
         error,
     };
-    let request = conn.request(
-        crate::wire::method::AUTH_DIAGNOSE,
-        crate::wire::AuthDiagnoseParams {
-            auth: selection.clone(),
-        },
-    );
-    let value = match tokio::time::timeout(DAEMON_AUTH_TIMEOUT, request).await {
-        Ok(Ok(value)) => value,
-        Ok(Err(error)) => {
-            let unsupported = error
+    match result {
+        Err(error)
+            if error
                 .downcast_ref::<crate::client::RpcCallError>()
-                .is_some_and(|error| error.code == crate::wire::error_code::METHOD_NOT_FOUND);
-            return if unsupported {
-                unconfirmed("unsupported", None)
-            } else {
-                unconfirmed("unknown", Some(error.to_string()))
-            };
+                .is_some_and(|error| error.code == crate::wire::error_code::METHOD_NOT_FOUND) =>
+        {
+            unconfirmed("unsupported", None)
         }
-        Err(_) => {
-            return unconfirmed(
-                "unknown",
-                Some("daemon did not finish resolving auth in time".into()),
-            )
-        }
-    };
-    let result = match serde_json::from_value::<crate::wire::AuthDiagnoseResult>(value) {
-        Ok(result) => result,
-        Err(error) => return unconfirmed("unknown", Some(error.to_string())),
-    };
-    if !result.ready {
-        return unconfirmed("error", result.error);
-    }
-    let resolved = result.selection.unwrap_or_else(|| selection.clone());
-    AuthDiagnostic {
-        status: "ready".into(),
-        source: auth_source_label(&resolved).into(),
-        kind: None,
-        profile: resolved.profile,
-        org_name: result.org_name.or(resolved.org_name),
-        expires_at_ms: result.expires_at_ms,
-        error: None,
+        Err(error) => unconfirmed("unknown", Some(error.to_string())),
+        Ok(result) if result.error.is_some() => unconfirmed("error", result.error),
+        Ok(result) => ready_auth_diagnostic(
+            result.selection.unwrap_or_else(|| selection.clone()),
+            result.org_name,
+            result.expires_at_ms,
+        ),
     }
 }
 
@@ -433,14 +426,14 @@ fn daemon_warnings(
     resolves_locally: bool,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    if daemon.status == "unreachable" {
+    if daemon.status == DaemonStatus::Unreachable {
         warnings.push(format!(
             "the tracing daemon did not answer: {}",
             daemon.error.as_deref().unwrap_or("unknown error")
         ));
         return warnings;
     }
-    let daemon_auth_failed = match &daemon.auth {
+    match &daemon.auth {
         Some(daemon_auth) if daemon_auth.status == "error" => {
             warnings.push(format!(
                 "the running tracing daemon cannot authenticate, so it rejects {display_name} events: {}",
@@ -451,7 +444,6 @@ fn daemon_warnings(
                     "this shell can authenticate but the running daemon cannot, so they see different Braintrust credentials (for example, a packaged Windows desktop app gives the daemon a virtualized credential store); run `bt login` from the coding agent's own terminal, or `bt trace stop` to restart a daemon started with a stale environment".into(),
                 );
             }
-            true
         }
         Some(daemon_auth) if daemon_auth.status == "ready" && auth.status == "ready" => {
             for (label, shell, daemon) in [
@@ -466,7 +458,6 @@ fn daemon_warnings(
                     }
                 }
             }
-            false
         }
         Some(daemon_auth) if daemon_auth.status == "unsupported" => {
             warnings.push(format!(
@@ -477,18 +468,16 @@ fn daemon_warnings(
                     .map(|version| format!(" ({version})"))
                     .unwrap_or_default()
             ));
-            false
         }
         Some(daemon_auth) if daemon_auth.status == "unknown" => {
             warnings.push(format!(
                 "could not confirm the running daemon's authentication: {}",
                 daemon_auth.error.as_deref().unwrap_or("unknown error")
             ));
-            false
         }
-        _ => false,
-    };
-    if !daemon_auth_failed {
+        _ => {}
+    }
+    if !daemon.auth_failed() {
         for error in &daemon.session_errors {
             warnings.push(format!(
                 "the running tracing daemon reported a {display_name} session error: {error}"
@@ -557,28 +546,33 @@ async fn doctor_output_at(
         );
     }
 
-    let auth = match &route {
-        Some(route) => host.services.diagnose_auth(&route.auth).await,
-        None => AuthDiagnostic {
-            status: "unresolved".into(),
-            source: "unresolved".into(),
-            kind: None,
-            profile: None,
-            org_name: None,
-            expires_at_ms: None,
-            error: Some("route is unresolved".into()),
-        },
+    // The local and daemon checks are independent and may each reach the
+    // network, so run them together.
+    let local_auth = async {
+        match &route {
+            Some(route) => host.services.diagnose_auth(&route.auth).await,
+            None => AuthDiagnostic {
+                status: "unresolved".into(),
+                source: "unresolved".into(),
+                kind: None,
+                profile: None,
+                org_name: None,
+                expires_at_ms: None,
+                error: Some("route is unresolved".into()),
+            },
+        }
     };
+    let (auth, daemon) = tokio::join!(
+        local_auth,
+        diagnose_daemon(socket, source, route.as_ref().map(|route| &route.auth))
+    );
     if let Some(error) = &auth.error {
         warnings.push(format!("authentication is unusable: {error}"));
     }
-    let daemon = diagnose_daemon(socket, source, route.as_ref().map(|route| &route.auth)).await;
-    let daemon_auth_failed = daemon
-        .auth
-        .as_ref()
-        .is_some_and(|daemon_auth| daemon_auth.status == "error");
+    // Only a full local resolution separates divergent credential views from
+    // failures both processes share; skip it when the local check failed.
     let resolves_locally = match &route {
-        Some(route) if daemon_auth_failed => host
+        Some(route) if daemon.auth_failed() && auth.status == "ready" => host
             .services
             .resolve_auth(&route.auth, AuthResolveReason::Initial)
             .await
@@ -1103,80 +1097,112 @@ mod tests {
         }
     }
 
-    async fn start_daemon_with_auth(
-        dir: &Path,
-        auth_provider: Arc<dyn AuthProvider>,
-    ) -> (PathBuf, tokio::task::JoinHandle<()>) {
-        let socket = test_endpoint(dir);
-        let data_dir = dir.join("data");
-        let args = crate::ServeArgs {
-            socket: Some(socket.clone()),
-            data_dir: Some(data_dir.clone()),
-            idle_timeout_secs: 0,
-            session_idle_timeout_secs: 0,
-        };
-        let options = ServeOptions {
-            version: "test".into(),
-            translators: Arc::new(Registry::default_agents()),
-            sink_factory: Arc::new(crate::DebugSinkFactory {
-                dir: data_dir.join("spans"),
-            }),
-            auth_provider: Some(auth_provider),
-        };
-        let handle = tokio::spawn(async move {
-            let _ = run_serve(args, options).await;
-        });
-        for _ in 0..200 {
-            let status = run_status(StatusArgs {
+    /// An in-process daemon whose credential view is `auth_provider`.
+    struct TestDaemon {
+        socket: PathBuf,
+        handle: tokio::task::JoinHandle<()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TestDaemon {
+        async fn start(auth_provider: Arc<dyn AuthProvider>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = test_endpoint(dir.path());
+            let data_dir = dir.path().join("data");
+            let args = crate::ServeArgs {
                 socket: Some(socket.clone()),
-                session_id: None,
-            })
-            .await;
-            if matches!(status, Ok(Some(_))) {
-                return (socket, handle);
+                data_dir: Some(data_dir.clone()),
+                idle_timeout_secs: 0,
+                session_idle_timeout_secs: 0,
+            };
+            let options = ServeOptions {
+                version: "test".into(),
+                translators: Arc::new(Registry::default_agents()),
+                sink_factory: Arc::new(crate::DebugSinkFactory {
+                    dir: data_dir.join("spans"),
+                }),
+                auth_provider: Some(auth_provider),
+            };
+            let handle = tokio::spawn(async move {
+                let _ = run_serve(args, options).await;
+            });
+            for _ in 0..200 {
+                let status = run_status(StatusArgs {
+                    socket: Some(socket.clone()),
+                    session_id: None,
+                })
+                .await;
+                if matches!(status, Ok(Some(_))) {
+                    return Self {
+                        socket,
+                        handle,
+                        _dir: dir,
+                    };
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            panic!("daemon never answered at {}", socket.display());
         }
-        panic!("daemon never answered at {}", socket.display());
+
+        /// Run doctor from a shell whose own credentials resolve.
+        async fn doctor(&self, agent: DoctorAgent) -> DoctorCommandOutput {
+            let host = test_host(Arc::new(RecordingHost::new(None, None)));
+            doctor_output_at(&host, DoctorArgs { agent }, &self.socket).await
+        }
+
+        async fn forward_event(&self, source: &str, session_id: &str, route: SessionRoute) {
+            let env = crate::wire::Envelope {
+                source: source.into(),
+                source_version: None,
+                plugin_version: None,
+                session_id: session_id.into(),
+                event: "SessionStart".into(),
+                ts_ms: 1,
+                managed_run_id: None,
+                payload: serde_json::json!({ "session_id": session_id, "hook_event_name": "SessionStart" }),
+                route: Some(SessionRoute {
+                    destination: Some(TraceDestination::ProjectLogs {
+                        project_id: None,
+                        project_name: Some("test-project".into()),
+                    }),
+                    ..route
+                }),
+                config: None,
+                capture: None,
+            };
+            let host = HostInfo {
+                serve_argv: vec![OsString::from("unused")],
+                version: "test".into(),
+            };
+            crate::forward_envelope(&env, &self.socket, &host, true)
+                .await
+                .unwrap();
+        }
+
+        async fn stop(self) {
+            crate::shutdown_daemon(&self.socket).await.unwrap();
+            self.handle.await.unwrap();
+        }
     }
 
     #[tokio::test]
     async fn doctor_reports_a_daemon_that_cannot_authenticate_the_route() {
-        let temp = tempfile::tempdir().unwrap();
-        let (socket, daemon) =
-            start_daemon_with_auth(temp.path(), Arc::new(DivergedDaemonAuth)).await;
-        let host = test_host(Arc::new(RecordingHost::new(None, None)));
-        forward_event(
-            &socket,
-            "codex",
-            "rejected-session",
-            SessionRoute::default(),
-        )
-        .await;
+        let daemon = TestDaemon::start(Arc::new(DivergedDaemonAuth)).await;
+        daemon
+            .forward_event("codex", "rejected-session", SessionRoute::default())
+            .await;
 
-        let output = doctor_output_at(
-            &host,
-            DoctorArgs {
-                agent: DoctorAgent::Codex,
-            },
-            &socket,
-        )
-        .await;
+        let output = daemon.doctor(DoctorAgent::Codex).await;
 
         // The shell's credential store is healthy, so its own check passes...
         assert_eq!(output.auth.status, "ready");
-        let daemon_auth = output.daemon.auth.as_ref().unwrap();
-        assert_eq!(daemon_auth.status, "error");
+        // ...but the daemon that actually delivers events cannot authenticate.
+        assert_eq!(output.daemon.auth.as_ref().unwrap().status, "error");
         assert!(
             output.daemon.session_errors[0].contains("could not resolve Braintrust auth for codex"),
             "{:#?}",
             output.daemon.session_errors
         );
-        assert!(output
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("see different Braintrust credentials")));
-        // ...but the daemon that actually delivers events cannot authenticate.
         assert!(
             output.warnings.iter().any(|warning| {
                 warning.contains("daemon cannot authenticate")
@@ -1185,38 +1211,12 @@ mod tests {
             "doctor must surface the daemon's auth failure: {:#?}",
             output.warnings
         );
+        assert!(output
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("see different Braintrust credentials")));
 
-        crate::shutdown_daemon(&socket).await.unwrap();
-        daemon.await.unwrap();
-    }
-
-    async fn forward_event(socket: &Path, source: &str, session_id: &str, route: SessionRoute) {
-        let env = crate::wire::Envelope {
-            source: source.into(),
-            source_version: None,
-            plugin_version: None,
-            session_id: session_id.into(),
-            event: "SessionStart".into(),
-            ts_ms: 1,
-            managed_run_id: None,
-            payload: serde_json::json!({ "session_id": session_id, "hook_event_name": "SessionStart" }),
-            route: Some(SessionRoute {
-                destination: Some(TraceDestination::ProjectLogs {
-                    project_id: None,
-                    project_name: Some("test-project".into()),
-                }),
-                ..route
-            }),
-            config: None,
-            capture: None,
-        };
-        let host = HostInfo {
-            serve_argv: vec![OsString::from("unused")],
-            version: "test".into(),
-        };
-        crate::forward_envelope(&env, socket, &host, true)
-            .await
-            .unwrap();
+        daemon.stop().await;
     }
 
     /// Resolves a working credential, but for another profile and org than
@@ -1251,19 +1251,9 @@ mod tests {
 
     #[tokio::test]
     async fn doctor_reports_a_daemon_that_resolves_other_credentials() {
-        let temp = tempfile::tempdir().unwrap();
-        let (socket, daemon) =
-            start_daemon_with_auth(temp.path(), Arc::new(OtherProfileDaemonAuth)).await;
-        let host = test_host(Arc::new(RecordingHost::new(None, None)));
+        let daemon = TestDaemon::start(Arc::new(OtherProfileDaemonAuth)).await;
 
-        let output = doctor_output_at(
-            &host,
-            DoctorArgs {
-                agent: DoctorAgent::Claude,
-            },
-            &socket,
-        )
-        .await;
+        let output = daemon.doctor(DoctorAgent::Claude).await;
 
         let daemon_auth = output.daemon.auth.as_ref().unwrap();
         assert_eq!(daemon_auth.status, "ready");
@@ -1279,15 +1269,12 @@ mod tests {
             .unwrap();
         assert!(!rendered.contains("daemon-secret"));
 
-        crate::shutdown_daemon(&socket).await.unwrap();
-        daemon.await.unwrap();
+        daemon.stop().await;
     }
 
     #[tokio::test]
     async fn daemon_records_an_organization_mismatch_for_status() {
-        let temp = tempfile::tempdir().unwrap();
-        let (socket, daemon) =
-            start_daemon_with_auth(temp.path(), Arc::new(OtherProfileDaemonAuth)).await;
+        let daemon = TestDaemon::start(Arc::new(OtherProfileDaemonAuth)).await;
         let route = SessionRoute {
             auth: AuthSelection {
                 org_name: Some("test-org".into()),
@@ -1295,10 +1282,12 @@ mod tests {
             },
             ..SessionRoute::default()
         };
-        forward_event(&socket, "claude-code", "wrong-org", route).await;
+        daemon
+            .forward_event("claude-code", "wrong-org", route)
+            .await;
 
         let status = run_status(StatusArgs {
-            socket: Some(socket.clone()),
+            socket: Some(daemon.socket.clone()),
             session_id: Some("wrong-org".into()),
         })
         .await
@@ -1307,18 +1296,10 @@ mod tests {
         let error = status.sessions[0].last_error.as_deref().unwrap();
         assert!(error.contains(r#"expected "test-org""#), "{error}");
 
-        let output = doctor_output_at(
-            &test_host(Arc::new(RecordingHost::new(None, None))),
-            DoctorArgs {
-                agent: DoctorAgent::Claude,
-            },
-            &socket,
-        )
-        .await;
+        let output = daemon.doctor(DoctorAgent::Claude).await;
         assert_eq!(output.daemon.session_errors, [error]);
 
-        crate::shutdown_daemon(&socket).await.unwrap();
-        daemon.await.unwrap();
+        daemon.stop().await;
     }
 
     #[tokio::test]
@@ -1332,7 +1313,7 @@ mod tests {
             &test_endpoint(temp.path()),
         )
         .await;
-        assert_eq!(output.daemon.status, "not_running");
+        assert_eq!(output.daemon.status, DaemonStatus::NotRunning);
         assert!(output.daemon.auth.is_none());
         assert!(!output
             .warnings
@@ -1342,10 +1323,9 @@ mod tests {
 
     #[tokio::test]
     async fn older_daemons_report_unknown_methods_as_typed_errors() {
-        let temp = tempfile::tempdir().unwrap();
-        let (socket, daemon) =
-            start_daemon_with_auth(temp.path(), Arc::new(DivergedDaemonAuth)).await;
-        let mut conn = crate::client::Conn::new(crate::client::connect(&socket).await.unwrap());
+        let daemon = TestDaemon::start(Arc::new(DivergedDaemonAuth)).await;
+        let mut conn =
+            crate::client::Conn::new(crate::client::connect(&daemon.socket).await.unwrap());
         let error = conn
             .request("auth.future", serde_json::json!({}))
             .await
@@ -1354,8 +1334,7 @@ mod tests {
         assert_eq!(error.code, crate::wire::error_code::METHOD_NOT_FOUND);
         drop(conn);
 
-        crate::shutdown_daemon(&socket).await.unwrap();
-        daemon.await.unwrap();
+        daemon.stop().await;
     }
 
     fn diagnostic(status: &str, error: Option<&str>) -> AuthDiagnostic {
@@ -1370,15 +1349,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn doctor_asks_an_older_daemon_to_restart() {
-        let daemon = DaemonDiagnostic {
-            status: "running".into(),
-            version: Some("0.21.0".into()),
-            auth: Some(diagnostic("unsupported", None)),
+    fn running_daemon(version: &str, auth: AuthDiagnostic) -> DaemonDiagnostic {
+        DaemonDiagnostic {
+            status: DaemonStatus::Running,
+            version: Some(version.into()),
+            auth: Some(auth),
             session_errors: vec!["could not resolve Braintrust auth for codex".into()],
             error: None,
-        };
+        }
+    }
+
+    #[test]
+    fn doctor_asks_an_older_daemon_to_restart() {
+        let daemon = running_daemon("0.21.0", diagnostic("unsupported", None));
         let warnings = daemon_warnings("Codex", &diagnostic("ready", None), &daemon, true);
         assert_eq!(
             warnings,
@@ -1391,13 +1374,10 @@ mod tests {
 
     #[test]
     fn doctor_does_not_blame_credential_divergence_when_both_processes_fail() {
-        let daemon = DaemonDiagnostic {
-            status: "running".into(),
-            version: Some("test".into()),
-            auth: Some(diagnostic("error", Some("failed to call login endpoint"))),
-            session_errors: vec!["could not resolve Braintrust auth for codex".into()],
-            error: None,
-        };
+        let daemon = running_daemon(
+            "test",
+            diagnostic("error", Some("failed to call login endpoint")),
+        );
         // Offline checks can pass while both processes fail to reach Braintrust.
         let warnings = daemon_warnings("Codex", &diagnostic("ready", None), &daemon, false);
         assert_eq!(

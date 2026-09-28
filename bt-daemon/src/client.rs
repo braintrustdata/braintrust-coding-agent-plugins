@@ -2,7 +2,9 @@
 //! JSON-RPC round-trips over the socket. Used by the `hook` and `status`
 //! entry points, and by tests.
 
-use crate::wire::{Message, Request, RequestId, Response};
+use crate::wire::{
+    method, InitializeResult, Message, Request, RequestId, Response, PROTOCOL_VERSION,
+};
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
@@ -95,6 +97,20 @@ impl Conn {
                 return Ok(result.unwrap_or(serde_json::Value::Null));
             }
         }
+    }
+
+    /// Perform the `initialize` handshake as a named, non-hook client.
+    pub async fn initialize(&mut self, source: &str) -> anyhow::Result<InitializeResult> {
+        let value = self
+            .request(
+                method::INITIALIZE,
+                serde_json::json!({
+                    "protocol_version": PROTOCOL_VERSION,
+                    "client": { "source": source }
+                }),
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
     }
 
     async fn write(&mut self, msg: &Message) -> anyhow::Result<()> {

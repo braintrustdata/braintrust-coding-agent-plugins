@@ -192,13 +192,12 @@ Params: `{ "auth": { "profile_id": "…", "profile": "work", "org_name": "acme" 
 Result:
 ```json
 {
-  "ready": true,
   "selection": { "source": "saved_profile", "profile_id": "…", "profile": "work", "org_name": "acme" },
   "org_name": "acme",
   "expires_at_ms": 1753639552123
 }
 ```
-On failure, `ready` is `false` and `error` explains why. Daemons that predate
+On failure, the result carries only `error`, explaining why. Daemons that predate
 this method answer with `-32601` (method not found).
 
 ### `daemon.shutdown` (request)

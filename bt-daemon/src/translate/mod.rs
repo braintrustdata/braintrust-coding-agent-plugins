@@ -159,6 +159,15 @@ pub struct Registry {
     factories: HashMap<String, Box<dyn TranslatorFactory>>,
 }
 
+/// Map a source alias to its canonical name. Unknown sources pass through.
+pub(crate) fn canonical_source_name(source: &str) -> &str {
+    match source {
+        "claude" => "claude-code",
+        "open-code" => "opencode",
+        other => other,
+    }
+}
+
 impl Registry {
     /// The production registry with every real agent translator registered.
     pub fn default_agents() -> Self {
@@ -189,14 +198,9 @@ impl Registry {
 
     /// Resolve daemon source aliases to one stable identity.
     pub fn canonical_source<'a>(&'a self, source: &'a str) -> Option<&'a str> {
-        let canonical = match source {
-            "claude" | "claude-code" => "claude-code",
-            "open-code" | "opencode" => "opencode",
-            "antigravity" => "antigravity",
-            "codex" => "codex",
-            "grok" => "grok",
-            "pi" => "pi",
-            "debug" => "debug",
+        let canonical = match canonical_source_name(source) {
+            canonical @ ("claude-code" | "opencode" | "antigravity" | "codex" | "grok" | "pi"
+            | "debug") => canonical,
             _ => return None,
         };
         self.factories.contains_key(canonical).then_some(canonical)
