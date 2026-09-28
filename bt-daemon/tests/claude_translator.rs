@@ -639,6 +639,17 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         translator
             .handle(
                 &event(
+                    "PostToolUse",
+                    json!({"session_id":"s","tool_name":"mcp__github__issue_read","tool_use_id":"d","tool_input":{},"tool_response":{"isError":true,"content":[{"type":"text","text":"Could not resolve issue 355"}]}}),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    ops.extend(
+        translator
+            .handle(
+                &event(
                     "PostToolUseFailure",
                     json!({"session_id":"s","tool_name":"Read","tool_use_id":"b","tool_input":{"file_path":"x"},"error":"missing"}),
                 ),
@@ -651,7 +662,7 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         .values()
         .filter(|row| row.span_type == SpanType::Tool)
         .collect();
-    assert_eq!(tools.len(), 3);
+    assert_eq!(tools.len(), 4);
     assert!(tools
         .iter()
         .any(|row| { row.metadata.as_ref().unwrap()["tool_approval"] == json!("denied") }));
@@ -674,6 +685,9 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
     assert!(tools
         .iter()
         .any(|row| row.error.as_deref() == Some("disk full")));
+    assert!(tools
+        .iter()
+        .any(|row| row.error.as_deref() == Some("Could not resolve issue 355")));
     assert!(rows.values().all(|row| {
         let metadata = row.metadata.as_ref().and_then(Value::as_object).unwrap();
         metadata.get("git_origin_url") == Some(&json!("https://example.com/acme/app.git"))

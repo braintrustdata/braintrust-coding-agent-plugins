@@ -6,6 +6,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
+use super::tool::nonempty_error_text;
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
@@ -163,6 +164,8 @@ struct CompletedTool {
     parent_span_id: String,
     end_ms: i64,
     terminal_update_seen: bool,
+    /// The terminal update already recorded a native failure message.
+    failure_recorded: bool,
 }
 
 #[derive(Clone, Default)]
@@ -749,6 +752,7 @@ impl GrokTranslator {
                     )
                 };
                 let end_ms = ts_ms.max(tool.start_ms);
+                let failed = matches!(status, Some("failed" | "error"));
                 self.completed_tools.insert(
                     call_key.clone(),
                     CompletedTool {
@@ -756,10 +760,10 @@ impl GrokTranslator {
                         parent_span_id: tool.parent_span_id.clone(),
                         end_ms,
                         terminal_update_seen: true,
+                        failure_recorded: failed,
                     },
                 );
                 let cancelled = status == Some("cancelled");
-                let failed = matches!(status, Some("failed" | "error"));
                 let mut metadata = Map::new();
                 if let Some(kind) = update.get("kind") {
                     metadata.insert("kind".into(), kind.clone());
@@ -783,7 +787,10 @@ impl GrokTranslator {
                         .get("rawOutput")
                         .or_else(|| update.get("content"))
                         .cloned(),
-                    error: failed.then(|| format!("Grok tool {}", status.unwrap_or("failed"))),
+                    error: failed.then(|| {
+                        tool_failure_text(update)
+                            .unwrap_or_else(|| format!("Grok tool {}", status.unwrap_or("failed")))
+                    }),
                     metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
                     late_merge_key: allow_late_merge.then(|| "tool:terminal_update".to_string()),
                     ..Default::default()
@@ -882,11 +889,15 @@ impl GrokTranslator {
                 parent_span_id: completed.parent_span_id.clone(),
                 end_ms,
                 terminal_update_seen: completed.terminal_update_seen,
+                failure_recorded: completed.failure_recorded,
             },
         );
         let outcome = record.get("outcome").and_then(Value::as_str);
         let cancelled = matches!(outcome, Some("cancelled" | "canceled"));
-        let failed = !cancelled && !matches!(outcome, Some("success") | None);
+        // Keep the precise message from the terminal update instead of
+        // overwriting it with the hook's bare outcome.
+        let failed =
+            !cancelled && !matches!(outcome, Some("success") | None) && !completed.failure_recorded;
         let mut metadata = Map::new();
         if let Some(duration) = record.get("duration_ms") {
             metadata.insert("duration_ms".into(), duration.clone());
@@ -971,6 +982,7 @@ impl GrokTranslator {
                 parent_span_id: tool.parent_span_id.clone(),
                 end_ms,
                 terminal_update_seen: false,
+                failure_recorded: false,
             },
         );
         ops.push(SpanOp::Merge(SpanRow {
@@ -997,6 +1009,7 @@ impl GrokTranslator {
                     parent_span_id: tool.parent_span_id.clone(),
                     end_ms,
                     terminal_update_seen: false,
+                    failure_recorded: false,
                 },
             );
             ops.push(SpanOp::Merge(SpanRow {
@@ -1565,4 +1578,36 @@ fn usage_metrics(usage: &Value) -> Value {
         }
     }
     Value::Object(metrics)
+}
+
+/// Grok's readable failure text is in ACP `content`; `rawOutput` is its
+/// serialized `ToolOutput` enum, which only carries text in a variant payload.
+fn tool_failure_text(update: &Value) -> Option<String> {
+    let raw = update.get("rawOutput");
+    if let Some(raw) = raw.filter(|raw| raw["type"] == "Bash") {
+        if raw["timed_out"] == true {
+            return Some("Command timed out".into());
+        }
+        if let Some(signal) = raw["signal"].as_str() {
+            return Some(format!("Command terminated by signal {signal}"));
+        }
+    }
+    if let Some(text) = update.get("content").and_then(nonempty_error_text) {
+        return Some(text);
+    }
+    let raw = raw?;
+    // Variant payloads such as `{"type":"ReadFile","FileNotFound":"..."}` or,
+    // for MCP, `{"type":"MCP","output":{"Error":"..."}}`.
+    let variant = |value: &Value| {
+        value.as_object()?.iter().find_map(|(key, value)| {
+            if key.starts_with(|c: char| c.is_ascii_uppercase()) {
+                nonempty_error_text(value)
+            } else {
+                None
+            }
+        })
+    };
+    variant(raw)
+        .or_else(|| variant(&raw["output"]))
+        .or_else(|| nonempty_error_text(raw))
 }

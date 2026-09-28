@@ -59,8 +59,14 @@ pub fn nonempty_error_text(value: &Value) -> Option<String> {
             .find(|line| !line.is_empty())
             .map(str::to_string);
     }
+    // MCP and ACP tool results carry their message in `content` text blocks.
+    if let Some(values) = value.as_array() {
+        return values.iter().find_map(nonempty_error_text);
+    }
     let object = value.as_object()?;
-    for key in ["error", "message", "stderr", "output", "result"] {
+    for key in [
+        "error", "message", "stderr", "output", "result", "content", "text",
+    ] {
         if let Some(text) = object.get(key).and_then(nonempty_error_text) {
             return Some(text);
         }
@@ -91,6 +97,26 @@ mod tests {
             "disk full"
         );
         assert_eq!(error_text(None, "fallback"), "fallback");
+        assert_eq!(
+            error_text(
+                Some(&json!({
+                    "content":[
+                        {"type":"image","data":"aGk="},
+                        {"type":"text","text":"ENOENT: missing\ntrace"}
+                    ],
+                    "details":{}
+                })),
+                "fallback"
+            ),
+            "ENOENT: missing"
+        );
+        assert_eq!(
+            error_text(
+                Some(&json!({"content":[{"type":"text","text":""}]})),
+                "fallback"
+            ),
+            "fallback"
+        );
         assert_eq!(
             nonempty_error_text(&json!("\n  disk full\ntrace")),
             Some("disk full".into())

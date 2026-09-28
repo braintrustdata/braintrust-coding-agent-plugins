@@ -1169,3 +1169,125 @@ fn grok_attached_session_merges_keep_the_external_parent() {
     }
     assert_merges_preserve_insert_identity(&ops);
 }
+
+#[test]
+fn grok_failed_tools_keep_the_native_failure_cause() {
+    // Terminal update fields as serialized by grok-build's `acp_tool_update`
+    // and tool-call error paths: readable text lives in ACP `content`, while
+    // `rawOutput` is Grok's tagged `ToolOutput` enum.
+    let text = |text: &str| json!([{"type":"content","content":{"type":"text","text":text}}]);
+    let bash = |timed_out: bool, signal: Option<&str>| {
+        json!({
+            "type":"Bash","output":b"compiling".to_vec(),"exit_code":-1,"command":"sleep 99",
+            "signal":signal,"timed_out":timed_out,"current_dir":"/repo"
+        })
+    };
+    let cases = [
+        (
+            "read_missing",
+            json!({
+                "content": text("File not found: /repo/missing.txt"),
+                "rawOutput": {"type":"ReadFile","FileNotFound":"File not found: /repo/missing.txt"}
+            }),
+            "File not found: /repo/missing.txt",
+        ),
+        (
+            "list_missing",
+            json!({"rawOutput": {"type":"ListDir","NotFound":"Directory not found: /repo/nope"}}),
+            "Directory not found: /repo/nope",
+        ),
+        (
+            "mcp_error",
+            json!({"rawOutput": {
+                "type":"MCP","tool_name":"issue_read","server_name":"github",
+                "output":{"Error":"Could not resolve issue 355"},"is_error":true
+            }}),
+            "Could not resolve issue 355",
+        ),
+        (
+            "bash_timeout",
+            json!({"content": text("compiling\nstill going"), "rawOutput": bash(true, None)}),
+            "Command timed out",
+        ),
+        (
+            "bash_signal",
+            json!({"content": text("compiling\nstill going"), "rawOutput": bash(false, Some("SIGKILL"))}),
+            "Command terminated by signal SIGKILL",
+        ),
+        (
+            "exec_failed",
+            json!({
+                "content": text("Tool `grep` failed: regex parse error: unclosed group"),
+                "rawOutput": {"error":"tool_execution_failed","message":"regex parse error: unclosed group"}
+            }),
+            "Tool `grep` failed: regex parse error: unclosed group",
+        ),
+        ("silent", json!({}), "Grok tool failed"),
+    ];
+    let mut updates = vec![json!({"params":{
+        "update":{"sessionUpdate":"user_message_chunk","content":{"text":"go"}},
+        "_meta":{"promptIndex":0,"agentTimestampMs":1000}
+    }})];
+    let mut events = Vec::new();
+    for (index, (call, fields, _)) in cases.iter().enumerate() {
+        let ts = 1_100 + index as i64 * 20;
+        let mut update =
+            json!({"sessionUpdate":"tool_call_update","toolCallId":call,"status":"failed"});
+        update
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        updates.push(json!({"params":{
+            "update":{"sessionUpdate":"tool_call","toolCallId":call,"title":call},
+            "_meta":{"agentTimestampMs":ts}
+        }}));
+        updates.push(json!({"params":{"update":update,"_meta":{"agentTimestampMs":ts + 10}}}));
+        // The later hook outcome must not replace the update's native message.
+        events.push(json!({
+            "ts":format!("1970-01-01T00:00:01.{:03}Z", ts % 1_000 + 10),
+            "type":"tool_completed","tool_call_id":call,"duration_ms":10,"outcome":"error"
+        }));
+    }
+    let jsonl = |records: Vec<serde_json::Value>| {
+        records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>()
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let updates_path = temp.path().join("updates.jsonl");
+    let events_path = temp.path().join("events.jsonl");
+    std::fs::write(&updates_path, jsonl(updates)).unwrap();
+    std::fs::write(&events_path, jsonl(events)).unwrap();
+    let mut event = envelope(0, 0);
+    point_at(&mut event, &updates_path, &events_path);
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("grok", "grok-session");
+    let mut ops = handle(&mut *translator, &event);
+    ops.extend(drain(&mut *translator));
+
+    let rows: Vec<_> = ops
+        .iter()
+        .map(|op| match op {
+            SpanOp::Insert(row) | SpanOp::Merge(row) => row,
+        })
+        .collect();
+    for (call, _, expected) in cases {
+        let span_id = &rows
+            .iter()
+            .find(|row| {
+                row.metadata
+                    .as_ref()
+                    .is_some_and(|m| m["tool_call_id"] == call)
+            })
+            .unwrap()
+            .span_id;
+        // Merges apply in order, so the last error written to a span is what lands.
+        let error = rows
+            .iter()
+            .rev()
+            .find(|row| &row.span_id == span_id && row.error.is_some())
+            .and_then(|row| row.error.as_deref());
+        assert_eq!(error, Some(expected), "{call}");
+    }
+}
