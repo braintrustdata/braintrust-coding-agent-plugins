@@ -6,6 +6,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
+use super::tool::nonempty_error_text;
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
@@ -163,6 +164,8 @@ struct CompletedTool {
     parent_span_id: String,
     end_ms: i64,
     terminal_update_seen: bool,
+    /// The terminal update already recorded a native failure message.
+    failure_recorded: bool,
 }
 
 #[derive(Clone, Default)]
@@ -749,6 +752,7 @@ impl GrokTranslator {
                     )
                 };
                 let end_ms = ts_ms.max(tool.start_ms);
+                let failed = matches!(status, Some("failed" | "error"));
                 self.completed_tools.insert(
                     call_key.clone(),
                     CompletedTool {
@@ -756,10 +760,10 @@ impl GrokTranslator {
                         parent_span_id: tool.parent_span_id.clone(),
                         end_ms,
                         terminal_update_seen: true,
+                        failure_recorded: failed,
                     },
                 );
                 let cancelled = status == Some("cancelled");
-                let failed = matches!(status, Some("failed" | "error"));
                 let mut metadata = Map::new();
                 if let Some(kind) = update.get("kind") {
                     metadata.insert("kind".into(), kind.clone());
@@ -774,16 +778,20 @@ impl GrokTranslator {
                     metadata.insert("incomplete".into(), json!(false));
                     metadata.insert("close_reason".into(), json!("tool_call_update"));
                 }
+                let output = update
+                    .get("rawOutput")
+                    .or_else(|| update.get("content"))
+                    .cloned();
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id: tool.span_id,
                     root_span_id: self.root_span_id.clone(),
                     parent_span_ids: vec![tool.parent_span_id],
                     end_ms: Some(end_ms),
-                    output: update
-                        .get("rawOutput")
-                        .or_else(|| update.get("content"))
-                        .cloned(),
-                    error: failed.then(|| format!("Grok tool {}", status.unwrap_or("failed"))),
+                    error: failed.then(|| {
+                        tool_failure_text(update)
+                            .unwrap_or_else(|| format!("Grok tool {}", status.unwrap_or("failed")))
+                    }),
+                    output,
                     metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
                     late_merge_key: allow_late_merge.then(|| "tool:terminal_update".to_string()),
                     ..Default::default()
@@ -882,11 +890,15 @@ impl GrokTranslator {
                 parent_span_id: completed.parent_span_id.clone(),
                 end_ms,
                 terminal_update_seen: completed.terminal_update_seen,
+                failure_recorded: completed.failure_recorded,
             },
         );
         let outcome = record.get("outcome").and_then(Value::as_str);
         let cancelled = matches!(outcome, Some("cancelled" | "canceled"));
-        let failed = !cancelled && !matches!(outcome, Some("success") | None);
+        // Keep the precise message from the terminal update instead of
+        // overwriting it with the hook's bare outcome.
+        let failed =
+            !cancelled && !matches!(outcome, Some("success") | None) && !completed.failure_recorded;
         let mut metadata = Map::new();
         if let Some(duration) = record.get("duration_ms") {
             metadata.insert("duration_ms".into(), duration.clone());
@@ -971,6 +983,7 @@ impl GrokTranslator {
                 parent_span_id: tool.parent_span_id.clone(),
                 end_ms,
                 terminal_update_seen: false,
+                failure_recorded: false,
             },
         );
         ops.push(SpanOp::Merge(SpanRow {
@@ -997,6 +1010,7 @@ impl GrokTranslator {
                     parent_span_id: tool.parent_span_id.clone(),
                     end_ms,
                     terminal_update_seen: false,
+                    failure_recorded: false,
                 },
             );
             ops.push(SpanOp::Merge(SpanRow {
@@ -1565,4 +1579,46 @@ fn usage_metrics(usage: &Value) -> Value {
         }
     }
     Value::Object(metrics)
+}
+
+/// Grok's readable failure text is in ACP `content`; `rawOutput` is its
+/// serialized `ToolOutput` enum, which only carries text in a variant payload.
+fn tool_failure_text(update: &Value) -> Option<String> {
+    let raw = update.get("rawOutput");
+    if let Some(raw) = raw.filter(|raw| raw.get("type").and_then(Value::as_str) == Some("Bash")) {
+        if raw.get("timed_out").and_then(Value::as_bool) == Some(true) {
+            return Some("Command timed out".into());
+        }
+        if let Some(signal) = raw.get("signal").and_then(Value::as_str) {
+            return Some(format!("Command terminated by signal {signal}"));
+        }
+    }
+    if let Some(text) = update.get("content").and_then(nonempty_error_text) {
+        return Some(text);
+    }
+    let raw = raw?;
+    if let Some(text) = raw.as_str() {
+        return nonempty_error_text(&Value::String(text.into()));
+    }
+    let object = raw.as_object()?;
+    if let Some(message) = object.get("message").and_then(nonempty_error_text) {
+        return Some(message);
+    }
+    // `{"type":"ReadFile","FileNotFound":"..."}` or `{"type":"MCP","output":{"Error":"..."}}`.
+    let variant = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "type")
+        .find_map(|(key, value)| {
+            key.starts_with(|c: char| c.is_ascii_uppercase())
+                .then(|| nonempty_error_text(value))
+                .flatten()
+        });
+    variant
+        .or_else(|| {
+            object
+                .get("output")
+                .and_then(|output| output.get("Error"))
+                .and_then(nonempty_error_text)
+        })
+        .or_else(|| nonempty_error_text(raw))
 }
