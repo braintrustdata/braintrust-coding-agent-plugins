@@ -446,7 +446,7 @@ async fn importing_codex_parent_also_imports_its_subagent_into_the_same_trace() 
         .collect::<Vec<_>>();
     let root = inserts
         .iter()
-        .find(|row| row.get("name").and_then(Value::as_str) == Some("codex: demo"))
+        .find(|row| row.get("name").and_then(Value::as_str) == Some("Codex session"))
         .unwrap();
     let turn = inserts
         .iter()
@@ -495,6 +495,16 @@ async fn imports_native_codex_rollout_through_codex_translator() {
     let rows = rows(&output.join("codex-past.ndjson"));
     assert_eq!(inserted(&rows, "task"), 3, "session and two turns");
     assert_eq!(inserted(&rows, "tool"), 1);
+    let root = rows
+        .iter()
+        .filter_map(|op| op.get("Insert"))
+        .find(|row| row.get("name").and_then(Value::as_str) == Some("Codex session"))
+        .unwrap();
+    assert!(root.get("input").is_none());
+    assert!(rows.iter().any(|op| {
+        op.pointer("/Merge/span_id") == root.get("span_id")
+            && op.pointer("/Merge/input") == Some(&json!("list files"))
+    }));
     assert!(rows.iter().any(|row| {
         row.pointer("/Insert/metadata/source")
             .and_then(Value::as_str)
@@ -597,6 +607,16 @@ async fn imports_native_claude_transcript_with_multiple_turns_and_tools() {
     assert_eq!(inserted(&rows, "task"), 3, "session and two turns");
     assert_eq!(inserted(&rows, "llm"), 3);
     assert_eq!(inserted(&rows, "tool"), 1);
+    let root = rows
+        .iter()
+        .filter_map(|op| op.get("Insert"))
+        .find(|row| row.get("name").and_then(Value::as_str) == Some("Claude Code session"))
+        .unwrap();
+    assert!(root.get("input").is_none());
+    assert!(rows.iter().any(|op| {
+        op.pointer("/Merge/span_id") == root.get("span_id")
+            && op.pointer("/Merge/input") == Some(&json!("run it"))
+    }));
     assert!(rows.iter().any(|row| {
         row.pointer("/Insert/metadata/recovered_from_transcript")
             .and_then(Value::as_bool)

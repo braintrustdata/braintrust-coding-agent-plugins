@@ -256,6 +256,8 @@ struct ClaudeTranslator {
     session_parent_span_ids: Vec<String>,
     root_open: bool,
     root_ended: bool,
+    root_repo: Option<String>,
+    root_prompt_recorded: bool,
     turn: Option<Turn>,
     last_turn_id: Option<String>,
     turn_count: u32,
@@ -291,6 +293,8 @@ impl ClaudeTranslator {
             session_parent_span_ids: Vec::new(),
             root_open: false,
             root_ended: false,
+            root_repo: None,
+            root_prompt_recorded: false,
             turn: None,
             last_turn_id: None,
             turn_count: 0,
@@ -338,7 +342,6 @@ impl ClaudeTranslator {
         }
         self.session_parent_span_ids = parent_span_id.into_iter().collect();
         let cwd = hook.cwd.clone().unwrap_or_default();
-        let workspace = basename(&cwd);
         let mut metadata = ctx
             .config
             .as_ref()
@@ -380,10 +383,9 @@ impl ClaudeTranslator {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: self.session_parent_span_ids.clone(),
-            name: format!("Claude Code: {workspace}"),
+            name: "Claude Code session".into(),
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
-            input: Some(json!(format!("Session: {workspace}"))),
             metadata: Some(Value::Object(metadata)),
             tags: root_tags(ctx),
             ..Default::default()
@@ -1006,10 +1008,19 @@ impl AgentTranslator for ClaudeTranslator {
                 }));
             }
         }
-        // Root creation moved below the passive-hook gate. Enrich it before
-        // handling the event so a later prompt can retain the prior turn's
-        // cwd while flushing its deferred transcript rows.
-        self.git.enrich_rows(self.current_cwd.as_deref(), &mut ops);
+        let repo = self.git.enrich_rows(self.current_cwd.as_deref(), &mut ops);
+        if self.root_open && self.root_repo.is_none() {
+            if let Some(repo) = repo {
+                self.root_repo = Some(repo.clone());
+                ops.push(SpanOp::Merge(SpanRow {
+                    span_id: self.session_span_id.clone(),
+                    root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: self.session_parent_span_ids.clone(),
+                    name: format!("Claude Code: {repo}"),
+                    ..Default::default()
+                }));
+            }
+        }
         let mut event_op_start = ops.len();
         match event.event.as_str() {
             "SessionStart" => {}
@@ -1017,6 +1028,20 @@ impl AgentTranslator for ClaudeTranslator {
                 self.flush_previous_turn_rows(&mut ops);
                 event_op_start = ops.len();
                 self.open_turn(event, &mut ops);
+                if !self.root_prompt_recorded {
+                    if let Some(prompt) = event.payload.get("prompt").and_then(Value::as_str) {
+                        if !prompt.trim().is_empty() {
+                            self.root_prompt_recorded = true;
+                            ops.push(SpanOp::Merge(SpanRow {
+                                span_id: self.session_span_id.clone(),
+                                root_span_id: self.root_span_id.clone(),
+                                parent_span_ids: self.session_parent_span_ids.clone(),
+                                input: Some(json!(prompt)),
+                                ..Default::default()
+                            }));
+                        }
+                    }
+                }
             }
             "UserPromptExpansion" => self.record_skill(event, &mut ops),
             "PreToolUse" => self.pre_tool(event, &mut ops),

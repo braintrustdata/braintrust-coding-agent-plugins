@@ -125,6 +125,12 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
             }
             SpanOp::Merge(update) => {
                 let row = rows.entry(update.span_id.clone()).or_default();
+                if !update.name.is_empty() {
+                    row.name = update.name;
+                }
+                if update.input.is_some() {
+                    row.input = update.input;
+                }
                 if update.end_ms.is_some() {
                     row.end_ms = update.end_ms;
                 }
@@ -174,7 +180,7 @@ fn claude_real_fixture_matches_session_turn_tool_and_token_contract() {
     let rows = reduce(replay("test-fixture"));
     let roots: Vec<_> = rows
         .values()
-        .filter(|row| row.name.starts_with("Claude Code:"))
+        .filter(|row| row.name.starts_with("Claude Code"))
         .collect();
     let turns: Vec<_> = rows
         .values()
@@ -306,7 +312,7 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
     let rows = reduce(ops);
     let root = rows
         .values()
-        .find(|row| row.name.starts_with("Claude Code:"))
+        .find(|row| row.name.starts_with("Claude Code"))
         .unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["team"], "platform");
     assert_eq!(root.metadata.as_ref().unwrap()["source"], "claude-code");
@@ -379,7 +385,7 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
     let root = ops
         .into_iter()
         .find_map(|op| match op {
-            SpanOp::Insert(row) if row.name == "Claude Code: demo" => Some(row),
+            SpanOp::Insert(row) if row.name == "Claude Code session" => Some(row),
             _ => None,
         })
         .expect("a user prompt starts a trace");
@@ -391,6 +397,72 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
         metadata["system_prompt"],
         "You are a precise coding assistant."
     );
+}
+
+#[test]
+fn claude_root_uses_first_late_repo_and_first_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first_repo = tmp.path().join("first-repo");
+    let second_repo = tmp.path().join("second-repo");
+    for repo in [&first_repo, &second_repo] {
+        std::fs::create_dir(repo).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+    }
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "late-repo");
+    let ctx = SessionCtx {
+        session_id: "late-repo".into(),
+        config: None,
+    };
+    let event = |name, ts, payload| claude_event("late-repo", name, ts, payload);
+    let mut ops = translator
+        .handle(
+            &event(
+                "UserPromptSubmit",
+                1,
+                json!({"session_id":"late-repo","cwd":tmp.path(),"prompt":"Fix the parser"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(translator.handle(&event("PreToolUse", 2,
+        json!({"session_id":"late-repo","cwd":first_repo,"tool_name":"Read","tool_use_id":"a",
+            "tool_input":{"file_path":"src/parser.rs"}})), &ctx).unwrap());
+    ops.extend(translator.handle(&event("UserPromptSubmit", 3,
+        json!({"session_id":"late-repo","cwd":second_repo,"prompt":"Now inspect the other repo"})), &ctx).unwrap());
+
+    let root_inserts: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "Claude Code session" => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(root_inserts.len(), 1);
+    assert!(root_inserts[0].input.is_none());
+    let title_updates: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Merge(row) if row.name.starts_with("Claude Code: ") => Some(row.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(title_updates, ["Claude Code: first-repo"]);
+    let rows = reduce(ops);
+    let root = rows
+        .values()
+        .find(|row| row.name == "Claude Code: first-repo")
+        .unwrap();
+    assert_eq!(root.input, Some(json!("Fix the parser")));
+    assert!(rows
+        .values()
+        .any(|row| row.name == "Turn 2" && row.input == Some(json!("Now inspect the other repo"))));
 }
 
 #[test]
@@ -485,7 +557,7 @@ fn claude_subagent_routing_tolerates_malformed_optional_metadata() {
     };
 
     let rows = reduce(translator.handle(&event, &ctx).unwrap());
-    assert!(rows.values().any(|row| row.name == "Claude Code: demo"));
+    assert!(rows.values().any(|row| row.name == "Claude Code session"));
     let subagent = rows
         .values()
         .find(|row| row.name == "subagent: agent")

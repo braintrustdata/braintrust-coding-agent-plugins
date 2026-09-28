@@ -187,8 +187,7 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
     assert_merges_preserve_insert_identity(&ops);
     let rows = reduce(ops);
 
-    // Root (session).
-    let root = find(&rows, SpanType::Task, "codex: myapp");
+    let root = find(&rows, SpanType::Task, "Codex session");
     assert!(
         root.parent_span_ids.is_empty(),
         "root should have no parent"
@@ -327,16 +326,142 @@ fn codex_root_preserves_canonical_source_across_lifecycle_events() {
         }
 
         let rows = reduce(ops);
-        let root = find(&rows, SpanType::Task, "codex: app");
-        assert_eq!(root.input.as_ref().unwrap()["source"], json!(source));
-        assert_eq!(root.input.as_ref().unwrap()["model"], json!("gpt-5.5"));
-        assert_eq!(root.input.as_ref().unwrap()["cwd"], json!("/x/app"));
+        let root = find(&rows, SpanType::Task, "Codex session");
+        assert!(root.input.is_none());
+        assert_eq!(root.metadata.as_ref().unwrap()["model"], json!("gpt-5.5"));
+        assert_eq!(root.metadata.as_ref().unwrap()["cwd"], json!("/x/app"));
         assert_eq!(root.metadata.as_ref().unwrap()["source"], json!("codex"));
         assert_eq!(
             root.metadata.as_ref().unwrap()["session_source"],
             json!(source)
         );
     }
+}
+
+#[test]
+fn codex_root_uses_first_late_repo_and_first_real_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first_repo = tmp.path().join("first-repo");
+    let second_repo = tmp.path().join("second-repo");
+    for repo in [&first_repo, &second_repo] {
+        std::fs::create_dir(repo).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+    }
+    let transcript = tmp.path().join("rollout.jsonl");
+    let path = transcript.to_str().unwrap();
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta",
+        "payload":{"id":"late-repo","cwd":tmp.path()}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg",
+        "payload":{"type":"task_started","turn_id":"t1"}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item",
+        "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp\nRead this"}]}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:04Z","type":"response_item",
+        "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the parser"}]}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:05Z","type":"event_msg",
+        "payload":{"type":"user_message","message":"Fix the parser"}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:06Z","type":"turn_context",
+        "payload":{"turn_id":"t1","model":"gpt-test","cwd":first_repo}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:07Z","type":"event_msg",
+        "payload":{"type":"task_complete","turn_id":"t1"}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:08Z","type":"event_msg",
+        "payload":{"type":"task_started","turn_id":"t2"}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:09Z","type":"turn_context",
+        "payload":{"turn_id":"t2","model":"gpt-test","cwd":second_repo}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:10Z","type":"event_msg",
+        "payload":{"type":"user_message","message":"Now inspect the other repo"}}),
+    );
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "late-repo");
+    let ctx = SessionCtx {
+        session_id: "late-repo".into(),
+        config: None,
+    };
+    let mut ops = translator
+        .handle(
+            &envelope(
+                "late-repo",
+                "SessionStart",
+                path,
+                json!({"source":"startup"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(
+        translator
+            .handle(
+                &envelope(
+                    "late-repo",
+                    "SessionStart",
+                    path,
+                    json!({"source":"resume"}),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+
+    let root_inserts: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "Codex session" => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(root_inserts.len(), 1);
+    assert!(root_inserts[0].input.is_none());
+    let title_updates: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Merge(row) if row.name.starts_with("Codex: ") => Some(row.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(title_updates, ["Codex: first-repo"]);
+    let rows = reduce(ops);
+    let root = find(&rows, SpanType::Task, "Codex: first-repo");
+    assert_eq!(root.input, Some(json!("Fix the parser")));
+    assert_eq!(root.metadata.as_ref().unwrap()["session_source"], "resume");
+    assert_eq!(
+        find(&rows, SpanType::Task, "turn: t2").input,
+        Some(json!("Now inspect the other repo"))
+    );
 }
 
 #[test]
@@ -474,7 +599,7 @@ fn attached_codex_root_merge_preserves_external_parent() {
     let rows = reduce(ops);
     let root = rows
         .values()
-        .find(|row| row.name.starts_with("codex:"))
+        .find(|row| row.name == "Codex session")
         .unwrap();
     assert_eq!(root.parent_span_ids, ["external-parent"]);
 }
@@ -759,7 +884,7 @@ fn codex_later_stop_extends_session_root_through_resumed_turn() {
     );
 
     let rows = reduce(ops);
-    let root = find(&rows, SpanType::Task, "codex: app");
+    let root = find(&rows, SpanType::Task, "Codex session");
     assert_eq!(root.end_ms, Some(1_767_225_605_000));
 }
 
@@ -817,7 +942,7 @@ fn codex_attached_root_uses_the_external_trace_root() {
             .handle(&envelope("attached", "SessionStart", path, json!({})), &ctx)
             .unwrap(),
     );
-    let root = find(&rows, SpanType::Task, "codex: myapp");
+    let root = find(&rows, SpanType::Task, "Codex session");
     assert_ne!(root.span_id, root.root_span_id);
     assert_eq!(root.root_span_id, "external-root");
     assert_eq!(root.parent_span_ids, vec!["external-parent"]);
@@ -957,7 +1082,7 @@ fn root_preserves_config_input_and_git_metadata() {
             )
             .unwrap(),
     );
-    let root = find(&rows, SpanType::Task, "codex: repo");
+    let root = find(&rows, SpanType::Task, "Codex: repo");
     let metadata = root.metadata.as_ref().unwrap();
     assert_eq!(metadata["team"], json!("platform"));
     assert_eq!(metadata["model"], json!("gpt-5.5"));
@@ -968,9 +1093,9 @@ fn root_preserves_config_input_and_git_metadata() {
     );
     assert_eq!(metadata["git_branch"], json!("main"));
     assert_eq!(metadata["git_commit_sha"], json!(commit));
-    assert_eq!(root.input.as_ref().unwrap()["model"], json!("gpt-5.5"));
-    assert_eq!(root.input.as_ref().unwrap()["source"], json!("resume"));
-    assert_eq!(root.input.as_ref().unwrap()["cwd"], json!(repo));
+    assert!(root.input.is_none());
+    assert_eq!(metadata["session_source"], json!("resume"));
+    assert_eq!(metadata["cwd"], json!(repo));
     assert_eq!(root.tags, Some(vec!["ci".into(), "docs".into()]));
     assert!(rows.values().all(|row| {
         let metadata = row.metadata.as_ref().and_then(Value::as_object).unwrap();
@@ -1541,7 +1666,7 @@ fn codex_subagent_with_malformed_optional_type_nests_under_spawning_turn() {
     assert_merges_preserve_insert_identity(&ops);
     let rows = reduce(ops);
 
-    let root = find(&rows, SpanType::Task, "codex: app");
+    let root = find(&rows, SpanType::Task, "Codex session");
     let main_turn = find(&rows, SpanType::Task, "turn: t1");
     let subagent = find(&rows, SpanType::Task, "subagent: a1");
     let sub_turn = find(&rows, SpanType::Task, "turn: st1");
@@ -1700,7 +1825,7 @@ fn codex_root_source_merge_after_stop_keeps_external_parent() {
     let root_span_id = ops
         .iter()
         .find_map(|op| match op {
-            SpanOp::Insert(row) if row.name.starts_with("codex:") => Some(row.span_id.clone()),
+            SpanOp::Insert(row) if row.name == "Codex session" => Some(row.span_id.clone()),
             _ => None,
         })
         .expect("root insert");

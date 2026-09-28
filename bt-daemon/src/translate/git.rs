@@ -31,6 +31,7 @@ struct RepoEntry {
     common_dir: PathBuf,
     fingerprint: GitFingerprint,
     metadata: Map<String, Value>,
+    name: Option<String>,
 }
 
 struct NegativeEntry {
@@ -90,16 +91,16 @@ impl Default for GitMetadataCache {
 }
 
 impl GitMetadataCache {
-    pub(super) fn metadata(&self, cwd: &str) -> Map<String, Value> {
+    fn observe(&self, cwd: &str) -> (Map<String, Value>, Option<String>) {
         if cwd.is_empty() {
-            return Map::new();
+            return (Map::new(), None);
         }
         let cwd = canonical_or_original(Path::new(cwd));
         let mut state = self.state.lock().unwrap();
 
         if let Some(negative) = state.negative.get(&cwd) {
             if negative.observed_at.elapsed() < NEGATIVE_TTL {
-                return Map::new();
+                return (Map::new(), None);
             }
             state.negative.remove(&cwd);
             state.negative_order.retain(|key| key != &cwd);
@@ -110,15 +111,16 @@ impl GitMetadataCache {
             if let Some(entry) = state.repos.get(&repo_root).cloned() {
                 if fingerprint(&entry.git_dir, &entry.common_dir) == entry.fingerprint {
                     touch(&mut state.repo_order, &repo_root);
-                    return entry.metadata;
+                    return (entry.metadata, entry.name);
                 }
             }
-            if let Some(entry) = inspect_repo(&cwd) {
+            if let Some(entry) = inspect_repo(&cwd, &repo_root) {
                 let metadata = entry.metadata.clone();
+                let name = entry.name.clone();
                 state.repos.insert(repo_root.clone(), entry);
                 touch(&mut state.repo_order, &repo_root);
                 state.trim_repos();
-                return metadata;
+                return (metadata, name);
             }
             state.cwd_to_repo.remove(&cwd);
         }
@@ -132,23 +134,29 @@ impl GitMetadataCache {
             );
             touch(&mut state.negative_order, &cwd);
             state.trim_negative();
-            return Map::new();
+            return (Map::new(), None);
         };
         let metadata = entry.metadata.clone();
+        let name = entry.name.clone();
         state.cwd_to_repo.insert(cwd.clone(), repo_root.clone());
         touch(&mut state.cwd_order, &cwd);
         state.trim_cwds();
         state.repos.insert(repo_root.clone(), entry);
         touch(&mut state.repo_order, &repo_root);
         state.trim_repos();
-        metadata
+        (metadata, name)
     }
 
-    pub(super) fn enrich_rows(&self, cwd: Option<&str>, ops: &mut [SpanOp]) {
-        let Some(cwd) = cwd else { return };
-        let metadata = self.metadata(cwd);
+    #[cfg(test)]
+    fn metadata(&self, cwd: &str) -> Map<String, Value> {
+        self.observe(cwd).0
+    }
+
+    pub(super) fn enrich_rows(&self, cwd: Option<&str>, ops: &mut [SpanOp]) -> Option<String> {
+        let cwd = cwd?;
+        let (metadata, name) = self.observe(cwd);
         if metadata.is_empty() {
-            return;
+            return name;
         }
         for op in ops {
             match op {
@@ -157,6 +165,7 @@ impl GitMetadataCache {
                 SpanOp::Merge(_) => {}
             }
         }
+        name
     }
 }
 
@@ -174,10 +183,10 @@ fn merge_metadata(row: &mut SpanRow, git: &Map<String, Value>) {
 
 fn discover_repo(cwd: &Path) -> Option<(PathBuf, RepoEntry)> {
     let root = canonical_or_original(Path::new(&git(cwd, &["rev-parse", "--show-toplevel"])?));
-    inspect_repo(cwd).map(|entry| (root, entry))
+    inspect_repo(cwd, &root).map(|entry| (root, entry))
 }
 
-fn inspect_repo(cwd: &Path) -> Option<RepoEntry> {
+fn inspect_repo(cwd: &Path, root: &Path) -> Option<RepoEntry> {
     let git_dir = absolute_git_path(cwd, &git(cwd, &["rev-parse", "--absolute-git-dir"])?);
     let common_dir = absolute_git_path(cwd, &git(cwd, &["rev-parse", "--git-common-dir"])?);
     let mut metadata = Map::new();
@@ -196,6 +205,12 @@ fn inspect_repo(cwd: &Path) -> Option<RepoEntry> {
     Some(RepoEntry {
         fingerprint: fingerprint(&git_dir, &common_dir),
         git_dir,
+        name: (common_dir.file_name().is_some_and(|name| name == ".git"))
+            .then(|| common_dir.parent())
+            .flatten()
+            .unwrap_or(root)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
         common_dir,
         metadata,
     })
@@ -337,5 +352,35 @@ mod tests {
         assert_eq!(second["git_branch"], "feature");
         assert_eq!(second["git_origin_url"], "https://example.com/acme/b.git");
         assert_ne!(first["git_commit_sha"], second["git_commit_sha"]);
+    }
+
+    #[test]
+    fn linked_worktree_uses_main_repository_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("project");
+        fs::create_dir(&repo).unwrap();
+        run(&repo, &["init", "-b", "main"]);
+        run(&repo, &["config", "user.email", "test@example.com"]);
+        run(&repo, &["config", "user.name", "Test"]);
+        fs::write(repo.join("README.md"), "test").unwrap();
+        run(&repo, &["add", "README.md"]);
+        run(&repo, &["commit", "-m", "initial"]);
+        let worktree = repo.join(".worktrees").join("ticket-75");
+        run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "ticket-75",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let cache = GitMetadataCache::default();
+        assert_eq!(
+            cache.observe(worktree.to_str().unwrap()).1.as_deref(),
+            Some("project")
+        );
     }
 }

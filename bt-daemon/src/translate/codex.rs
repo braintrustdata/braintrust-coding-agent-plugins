@@ -128,6 +128,8 @@ impl TranslatorFactory for CodexTranslatorFactory {
             effective_root_span_id: root_span_id,
             external_parent_span_id: None,
             root_opened: false,
+            root_repo: None,
+            root_prompt_turn_id: None,
             session_source: None,
             permission_mode: None,
             root_cwd: None,
@@ -242,6 +244,8 @@ struct CodexTranslator {
     effective_root_span_id: String,
     external_parent_span_id: Option<String>,
     root_opened: bool,
+    root_repo: Option<String>,
+    root_prompt_turn_id: Option<String>,
     session_source: Option<String>,
     permission_mode: Option<String>,
     root_cwd: Option<String>,
@@ -462,20 +466,10 @@ impl CodexTranslator {
         if !self.root_opened {
             return;
         }
-        let model = self
-            .main_path
-            .as_ref()
-            .and_then(|path| self.scopes.get(path))
-            .and_then(|scope| scope.model.clone());
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: self.external_parent_span_id.clone().into_iter().collect(),
-            input: Some(json!({
-                "model": model,
-                "cwd": self.root_cwd,
-                "source": source,
-            })),
             metadata: Some(json!({
                 "source": "codex",
                 "session_source": source,
@@ -660,24 +654,20 @@ impl CodexTranslator {
                         if scope.root_created {
                             let (input, metadata) = if scope.kind == ScopeKind::Main {
                                 (
-                                    json!({
-                                        "model": m,
-                                        "cwd": self.root_cwd,
-                                        "source": self.session_source,
-                                    }),
+                                    None,
                                     json!({
                                         "model": m,
                                         "source": "codex",
                                     }),
                                 )
                             } else {
-                                (json!({ "model": m }), json!({ "model": m }))
+                                (Some(json!({ "model": m })), json!({ "model": m }))
                             };
                             ops.push(SpanOp::Merge(SpanRow {
                                 span_id: scope.turn_parent_span_id.clone(),
                                 root_span_id: self.effective_root_span_id.clone(),
                                 parent_span_ids: self.scope_root_parent_span_ids(scope),
-                                input: Some(input),
+                                input,
                                 metadata: Some(metadata),
                                 ..Default::default()
                             }));
@@ -728,7 +718,19 @@ impl CodexTranslator {
             _ => {}
         }
         let cwd = scope.current_cwd.as_deref().or(self.root_cwd.as_deref());
-        self.git.enrich_rows(cwd, &mut ops[op_start..]);
+        let repo = self.git.enrich_rows(cwd, &mut ops[op_start..]);
+        if scope.kind == ScopeKind::Main && self.root_opened && self.root_repo.is_none() {
+            if let Some(repo) = repo {
+                self.root_repo = Some(repo.clone());
+                ops.push(SpanOp::Merge(SpanRow {
+                    span_id: self.root_span_id.clone(),
+                    root_span_id: self.effective_root_span_id.clone(),
+                    parent_span_ids: self.external_parent_span_id.clone().into_iter().collect(),
+                    name: format!("Codex: {repo}"),
+                    ..Default::default()
+                }));
+            }
+        }
     }
 
     fn open_root(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
@@ -738,10 +740,6 @@ impl CodexTranslator {
                     return;
                 }
                 self.root_opened = true;
-                let name = match str_field(payload, "cwd") {
-                    Some(cwd) => format!("codex: {}", basename(&cwd)),
-                    None => "codex session".to_string(),
-                };
                 let cwd = str_field(payload, "cwd");
                 self.root_cwd = cwd.clone();
                 let mut md = self.additional_metadata.clone();
@@ -782,14 +780,9 @@ impl CodexTranslator {
                     span_id: self.root_span_id.clone(),
                     root_span_id: self.effective_root_span_id.clone(),
                     parent_span_ids: self.scope_root_parent_span_ids(scope),
-                    name,
+                    name: "Codex session".into(),
                     span_type: SpanType::Task,
                     start_ms: Some(ts),
-                    input: Some(json!({
-                        "model": scope.model,
-                        "cwd": cwd,
-                        "source": self.session_source,
-                    })),
                     metadata: Some(Value::Object(md)),
                     tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
                     ..Default::default()
@@ -903,6 +896,19 @@ impl CodexTranslator {
                 metadata: explicit_skill_metadata(&turn.explicit_skill_names),
                 ..Default::default()
             }));
+            if scope.kind == ScopeKind::Main && !text.trim().is_empty() {
+                let first_turn = self.root_prompt_turn_id.as_deref();
+                if first_turn.is_none() || first_turn == Some(turn.turn_id.as_str()) {
+                    self.root_prompt_turn_id = Some(turn.turn_id.clone());
+                    ops.push(SpanOp::Merge(SpanRow {
+                        span_id: self.root_span_id.clone(),
+                        root_span_id: self.effective_root_span_id.clone(),
+                        parent_span_ids: self.external_parent_span_id.clone().into_iter().collect(),
+                        input: Some(json!(text)),
+                        ..Default::default()
+                    }));
+                }
+            }
         }
     }
 
@@ -1541,15 +1547,6 @@ fn str_field(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(|s| s.to_string())
 }
 
-fn basename(path: &str) -> String {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    trimmed
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(trimmed)
-        .to_string()
-}
-
 fn message_text(payload: &Value) -> String {
     payload
         .get("content")
@@ -2147,15 +2144,8 @@ fn num_at(v: &Value, path: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{basename, normalize_timestamp, RolloutRecord};
+    use super::{normalize_timestamp, RolloutRecord};
     use serde_json::json;
-
-    #[test]
-    fn basename_accepts_unix_and_windows_paths() {
-        assert_eq!(basename("/tmp/project"), "project");
-        assert_eq!(basename(r"C:\Users\agent\project"), "project");
-        assert_eq!(basename(r"C:\Users\agent\project\\"), "project");
-    }
 
     #[test]
     fn rollout_timestamps_normalize_supported_formats() {
