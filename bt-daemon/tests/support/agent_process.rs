@@ -362,22 +362,22 @@ fn write_bt_host_wrapper(directory: &Path, bt_binary: &Path) {
     std::fs::set_permissions(&path, permissions).expect("make bt host wrapper executable");
 }
 
+// Hooks run once per agent event, so the Windows wrappers stay in batch.
+// Starting PowerShell for each hook dominated Windows test time.
 #[cfg(windows)]
 fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
-    let powershell = directory.join("bt-wrapper.ps1");
-    let script = format!(
-        "$forward = @($args)\n\
-         if ($forward.Count -gt 0 -and $forward[0] -eq 'trace') {{\n\
-           if ($forward.Count -eq 1) {{ $forward = @() }} else {{ $forward = @($forward[1..($forward.Count - 1)]) }}\n\
-         }}\n\
-         & '{}' @forward\n\
-         exit $LASTEXITCODE\n",
-        daemon_binary.display()
-    );
-    std::fs::write(&powershell, script).expect("write bt PowerShell wrapper");
+    // `bt-daemon` has no `trace` subcommand; drop the prefix that hooks pass
+    // to `bt`. The hook arguments are plain flags, so `%*` forwards safely.
     std::fs::write(
         directory.join("bt.cmd"),
-        "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0bt-wrapper.ps1\" %*\r\n",
+        format!(
+            "@echo off\r\n\
+             setlocal\r\n\
+             set \"BT_ARGS=%*\"\r\n\
+             if /I \"%~1\"==\"trace\" set \"BT_ARGS=%BT_ARGS:~6%\"\r\n\
+             \"{}\" %BT_ARGS%\r\n",
+            daemon_binary.display()
+        ),
     )
     .expect("write bt command wrapper");
 
@@ -394,12 +394,9 @@ fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
 
 #[cfg(windows)]
 fn write_bt_host_wrapper(directory: &Path, bt_binary: &Path) {
-    let powershell = directory.join("bt-wrapper.ps1");
-    let script = format!("& '{}' @args\nexit $LASTEXITCODE\n", bt_binary.display());
-    std::fs::write(&powershell, script).expect("write bt host PowerShell wrapper");
     std::fs::write(
         directory.join("bt.cmd"),
-        "@echo off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0bt-wrapper.ps1\" %*\r\n",
+        format!("@\"{}\" %*\r\n", bt_binary.display()),
     )
     .expect("write bt host command wrapper");
 

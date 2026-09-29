@@ -276,6 +276,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
+ "libc",
  "regex",
  "reqwest",
  "rquickjs",

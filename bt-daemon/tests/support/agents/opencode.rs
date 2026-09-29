@@ -56,6 +56,7 @@ impl OpenCodeAgent {
         for directory in [&home, &config_home, &data_home, &cache_home] {
             std::fs::create_dir_all(directory).expect("create OpenCode test directory");
         }
+        mark_config_dependencies_installed(&config_home.join("opencode"));
         let plugin = std::env::var_os("OPENCODE_PLUGIN")
             .map(PathBuf::from)
             .expect("install the packed OpenCode plugin with its peer dependencies and set OPENCODE_PLUGIN to its dist/index.mjs entrypoint before running integration tests");
@@ -135,6 +136,10 @@ impl OpenCodeAgent {
             .stdout(Stdio::null())
             .stderr(Stdio::from(server_log_file))
             .kill_on_drop(true);
+        // Stop OpenCode along with its `bt-daemon run` parent. Killing only
+        // the parent orphans the server, which keeps running after the test.
+        #[cfg(unix)]
+        server.process_group(0);
         configure_environment(&mut server, self);
         server.env(
             "BT_TRACE_OPENCODE_PLUGIN_SPEC",
@@ -144,7 +149,7 @@ impl OpenCodeAgent {
         run.options.apply_env(&mut server);
         let mut server = server.spawn().expect("start OpenCode server");
         if let Err(error) = wait_for_server(&server_url, &mut server, &server_log).await {
-            let _ = server.kill().await;
+            kill_process_tree(&mut server).await;
             return AgentOutput::from_http_result(Err(error));
         }
 
@@ -156,9 +161,57 @@ impl OpenCodeAgent {
         // message is persisted. Give the server event bus a bounded window to
         // deliver completion and idle callbacks before stopping the plugin host.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = server.kill().await;
+        kill_process_tree(&mut server).await;
         AgentOutput::from_http_result(output)
     }
+}
+
+/// With any external plugin configured, OpenCode blocks startup until it has
+/// installed `@opencode-ai/plugin` into every config directory, and it only
+/// skips that install when `node_modules` exists and the lockfile already
+/// lists each required package. A fresh config directory therefore costs a
+/// cold npm install of thousands of files per test: about 10s on Linux and
+/// most of the OpenCode test time on Windows. The plugin under test resolves
+/// its peers from its own install, so record the dependency as present.
+fn mark_config_dependencies_installed(config_dir: &Path) {
+    const DEPENDENCY: &str = "@opencode-ai/plugin";
+    std::fs::create_dir_all(config_dir.join("node_modules"))
+        .expect("create OpenCode config node_modules");
+    std::fs::write(
+        config_dir.join("package.json"),
+        serde_json::to_vec_pretty(&json!({"dependencies": {DEPENDENCY: "*"}})).unwrap(),
+    )
+    .expect("write OpenCode config package.json");
+    std::fs::write(
+        config_dir.join("package-lock.json"),
+        serde_json::to_vec_pretty(&json!({
+            "lockfileVersion": 3,
+            "packages": {"": {"dependencies": {DEPENDENCY: "*"}}}
+        }))
+        .unwrap(),
+    )
+    .expect("write OpenCode config package-lock.json");
+}
+
+async fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // The server leads its own process group; signal the whole group.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.kill().await;
 }
 
 fn configure_environment(command: &mut tokio::process::Command, agent: &OpenCodeAgent) {
