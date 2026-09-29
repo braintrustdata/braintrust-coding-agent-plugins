@@ -38,6 +38,42 @@ pub(crate) struct AgentSettings {
 }
 
 impl AgentSettings {
+    /// Hook invocations must report broken configuration instead of treating
+    /// it as a successful event. A managed run's invocation route is complete
+    /// and intentionally supersedes any persistent settings file.
+    pub(crate) fn load_for_hook(source: &str) -> anyhow::Result<Self> {
+        let invocation = std::env::var(INVOCATION_SETTINGS_ENV).ok();
+        Self::load_hook_from_sources(
+            &paths::agent_settings_path(source, None),
+            invocation.as_deref(),
+        )
+    }
+
+    fn load_hook_from_sources(path: &Path, invocation: Option<&str>) -> anyhow::Result<Self> {
+        if let Some(raw) = invocation {
+            let settings: InvocationSettings = serde_json::from_str(raw).map_err(|error| {
+                anyhow::anyhow!("invalid managed run tracing settings: {error}")
+            })?;
+            return Ok(Self {
+                trace_to_braintrust: Some(settings.trace_to_braintrust),
+                route: Some(settings.route),
+            });
+        }
+        let raw = std::fs::read_to_string(path).map_err(|error| {
+            anyhow::anyhow!("read tracing settings at {}: {error}", path.display())
+        })?;
+        let settings: Self = serde_json::from_str(&raw).map_err(|error| {
+            anyhow::anyhow!("parse tracing settings at {}: {error}", path.display())
+        })?;
+        if settings.trace_to_braintrust.is_none() {
+            anyhow::bail!(
+                "tracing settings at {} have no `trace_to_braintrust` value",
+                path.display()
+            );
+        }
+        Ok(settings)
+    }
+
     pub(crate) fn load(source: &str) -> Self {
         let invocation = std::env::var(INVOCATION_SETTINGS_ENV).ok();
         Self::load_from_sources(
@@ -208,6 +244,46 @@ mod tests {
         let malformed = temp.path().join("malformed.json");
         std::fs::write(&malformed, "{").unwrap();
         assert!(AgentSettings::load_from(&malformed).route.is_none());
+    }
+
+    #[test]
+    fn hook_settings_report_missing_and_malformed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        assert!(AgentSettings::load_hook_from_sources(&path, None)
+            .unwrap_err()
+            .to_string()
+            .contains("read tracing settings"));
+        std::fs::write(&path, "{").unwrap();
+        assert!(AgentSettings::load_hook_from_sources(&path, None)
+            .unwrap_err()
+            .to_string()
+            .contains("parse tracing settings"));
+        std::fs::write(&path, "{}").unwrap();
+        assert!(AgentSettings::load_hook_from_sources(&path, None)
+            .unwrap_err()
+            .to_string()
+            .contains("no `trace_to_braintrust` value"));
+    }
+
+    #[test]
+    fn hook_settings_allow_explicit_disablement_and_managed_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        std::fs::write(&path, r#"{"trace_to_braintrust":false}"#).unwrap();
+        assert!(!AgentSettings::load_hook_from_sources(&path, None)
+            .unwrap()
+            .tracing_enabled());
+        let invocation = r#"{"trace_to_braintrust":true,"route":{}}"#;
+        assert!(
+            AgentSettings::load_hook_from_sources(&path, Some(invocation))
+                .unwrap()
+                .tracing_enabled()
+        );
+        assert!(AgentSettings::load_hook_from_sources(&path, Some("{"))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid managed run tracing settings"));
     }
 
     #[test]

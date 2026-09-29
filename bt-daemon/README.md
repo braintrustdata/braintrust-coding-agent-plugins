@@ -41,6 +41,23 @@ therefore reports the local view and asks the running daemon to resolve the
 same route through `auth.diagnose`. It also shows the latest session errors the
 daemon recorded, and warns when the two views disagree.
 
+### Hook exit status
+
+`bt trace hook` reports errors that occur before the daemon acknowledges the
+event: unreadable or malformed tracing settings, invalid hook input, an
+unresolved destination, an unreachable daemon, an unsupported source, or a
+journal write failure. It exits nonzero and normally writes the error to stderr
+(`bt --json` prints a structured error to stdout). An
+explicitly disabled tracing configuration exits successfully without sending
+an event. Command syntax errors are reported by the CLI's argument parser.
+
+A successful hook exit means the daemon durably captured the event; it does not
+confirm that a trace reached Braintrust. Authentication, translation, and upload
+run later. Check `bt trace status --session-id <ID>` for daemon session errors,
+or `bt trace doctor <agent>` for configuration, authentication, and recent
+session diagnostics. Hook exit codes can be observed by the caller while the
+coding agent decides whether to continue its turn.
+
 ## Per-agent plugin settings
 
 Each coding agent reads an independent non-credential `braintrust.json` file:
@@ -239,7 +256,8 @@ default suite; see the [test harness guide](tests/support/README.md).
 From the monorepo root, in a Unix shell:
 
 ```bash
-export BT_DAEMON_SOCKET=/tmp/btd.sock BT_DAEMON_DATA_DIR=/tmp/btd
+export BT_DAEMON_SOCKET=/tmp/btd.sock BT_DAEMON_DATA_DIR=/tmp/btd BT_DAEMON_CONFIG=/tmp/btd-config.json
+printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"debug"}}}' > "$BT_DAEMON_CONFIG"
 cargo build --manifest-path bt-daemon/Cargo.toml --features cli --locked --bin bt-daemon
 echo '{"session_id":"s1","hook_event_name":"SessionStart"}' | ./bt-daemon/target/debug/bt-daemon hook --source debug
 echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./bt-daemon/target/debug/bt-daemon hook --source debug

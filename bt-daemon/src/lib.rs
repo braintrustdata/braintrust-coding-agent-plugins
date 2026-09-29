@@ -385,21 +385,29 @@ pub(crate) fn should_flush_ingress_event(env: &wire::Envelope) -> bool {
 /// Capture one hook event from `stdin` and forward it to the daemon.
 ///
 /// `route` contains only non-secret profile and destination selection.
-/// Returns `Ok` once the daemon has durably journaled the event. Callers that
-/// must never fail the agent's turn should treat any `Err` as non-fatal and
-/// exit 0.
-pub async fn run_hook(
+/// Returns `Ok` once the daemon has durably journaled the event. Delivery
+/// happens later; an `Err` means capture failed before acknowledgement.
+pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> anyhow::Result<()> {
+    if suppress_inherited_hook(&args) {
+        return Ok(());
+    }
+    let settings = settings::AgentSettings::load_for_hook(&args.source)?;
+    run_hook_with_settings(args, route, host, settings).await
+}
+
+/// A managed run injects its own hook definitions. Suppress an inherited
+/// Braintrust plugin hook for the same child, but allow the injected hook
+/// process, which carries the second marker.
+pub(crate) fn suppress_inherited_hook(args: &HookArgs) -> bool {
+    std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook
+}
+
+pub(crate) async fn run_hook_with_settings(
     mut args: HookArgs,
     mut route: SessionRoute,
     host: HostInfo,
+    settings: settings::AgentSettings,
 ) -> anyhow::Result<()> {
-    // A managed run injects its own hook definitions. Suppress an inherited
-    // Braintrust plugin hook for the same child, but allow the injected hook
-    // process, which carries the second marker.
-    if std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook {
-        return Ok(());
-    }
-    let settings = settings::AgentSettings::load(&args.source);
     if !settings.tracing_enabled() {
         return Ok(());
     }
@@ -424,6 +432,9 @@ pub async fn run_hook(
     }
     if args.flush_on_turn_end {
         route.flush_mode = wire::FlushMode::FlushOnTurnEnd;
+    }
+    if route.destination.is_none() {
+        anyhow::bail!("trace destination is not configured for {}", args.source);
     }
     apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
     let env = build_hook_envelope(&args, route, payload, session_id, event);
