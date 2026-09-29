@@ -65,19 +65,23 @@ impl SecurityDescriptor {
         }
     }
 
-    fn dacl(&self) -> io::Result<*mut ACL> {
+    /// The descriptor's DACL, which lives inside the descriptor's allocation.
+    fn dacl(&self) -> io::Result<&ACL> {
         let mut present = 0;
         let mut defaulted = 0;
-        let mut dacl = null_mut();
+        let mut dacl: *mut ACL = null_mut();
         let ok =
             unsafe { GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        if present == 0 || dacl.is_null() {
-            return Err(io::Error::other("security descriptor has no DACL"));
-        }
-        Ok(dacl)
+        // SAFETY: a non-null DACL points into `self`, which outlives the borrow.
+        let dacl = if present != 0 {
+            unsafe { dacl.as_ref() }
+        } else {
+            None
+        };
+        dacl.ok_or_else(|| io::Error::other("security descriptor has no DACL"))
     }
 }
 
@@ -108,10 +112,10 @@ pub(crate) fn is_owner_only(path: &Path, directory: bool) -> io::Result<bool> {
     {
         return Err(io::Error::last_os_error());
     }
-    if control & SE_DACL_PROTECTED == 0 || current.dacl.is_null() {
+    let Some(dacl) = current.dacl() else {
         return Ok(false);
-    }
-    Ok(unsafe { same_aces(current.dacl, expected.dacl()?) })
+    };
+    Ok(control & SE_DACL_PROTECTED != 0 && same_aces(dacl, expected.dacl()?))
 }
 
 fn set_dacl(path: &Path, descriptor: &SecurityDescriptor) -> io::Result<()> {
@@ -136,6 +140,13 @@ struct NamedDacl {
 }
 
 impl NamedDacl {
+    /// The object's DACL, or `None` for a NULL DACL (unrestricted access).
+    fn dacl(&self) -> Option<&ACL> {
+        // SAFETY: a non-null DACL points into `self.descriptor`, which
+        // outlives the borrow.
+        unsafe { self.dacl.as_ref() }
+    }
+
     fn read(path: &Path) -> io::Result<Self> {
         let name = wide(path.as_os_str());
         let mut dacl = null_mut();
@@ -161,29 +172,26 @@ impl NamedDacl {
 }
 
 /// Compare two ACLs entry by entry, ignoring allocation slack in their headers.
-unsafe fn same_aces(left: *const ACL, right: *const ACL) -> bool {
-    let count = (*left).AceCount;
-    if count != (*right).AceCount {
-        return false;
-    }
-    (0..u32::from(count)).all(|index| {
-        let (Some(left), Some(right)) = (ace_bytes(left, index), ace_bytes(right, index)) else {
-            return false;
-        };
-        left == right
-    })
+fn same_aces(left: &ACL, right: &ACL) -> bool {
+    left.AceCount == right.AceCount
+        && (0..u32::from(left.AceCount)).all(|index| {
+            matches!(
+                (ace_bytes(left, index), ace_bytes(right, index)),
+                (Some(left), Some(right)) if left == right
+            )
+        })
 }
 
-unsafe fn ace_bytes<'a>(acl: *const ACL, index: u32) -> Option<&'a [u8]> {
+/// The raw bytes of one access control entry, borrowed from its ACL.
+fn ace_bytes(acl: &ACL, index: u32) -> Option<&[u8]> {
     let mut ace: *mut c_void = null_mut();
-    if GetAce(acl, index, &mut ace) == 0 {
+    if unsafe { GetAce(acl, index, &mut ace) } == 0 {
         return None;
     }
-    let size = (*ace.cast::<ACE_HEADER>()).AceSize;
-    Some(std::slice::from_raw_parts(
-        ace.cast::<u8>(),
-        usize::from(size),
-    ))
+    // SAFETY: on success `ace` points at an entry inside `acl`, beginning with
+    // an ACE_HEADER whose AceSize covers the whole entry.
+    let header = unsafe { ace.cast::<ACE_HEADER>().as_ref() }?;
+    Some(unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), usize::from(header.AceSize)) })
 }
 
 pub(crate) fn current_user_sid() -> io::Result<String> {
