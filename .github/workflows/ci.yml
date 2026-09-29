@@ -140,6 +140,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       versions: ${{ steps.versions.outputs.versions }}
+      latest: ${{ steps.versions.outputs.latest }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - id: versions
@@ -169,23 +170,41 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: src/plugins/pi/content/pnpm-lock.yaml
-      # `plugins` validates the package once; this job only checks the
-      # packed tarball installs and loads alongside each Pi release line.
+      # `plugins` validates the package once. This job runs a real Pi session
+      # with the packed extension against each Pi release line, so a Pi
+      # release that breaks tracing fails here rather than only at import.
       - name: Build Pi package
         run: make build-pi
-      - name: Test resolved Pi compatibility target
+      - name: Install packed extension with resolved Pi
         shell: bash
         run: |
           set -euo pipefail
           package_dir="$(mktemp -d)"
           (cd dist/pi && pnpm pack --pack-destination "$package_dir" >/dev/null)
           tarball="$(find "$package_dir" -name 'braintrust-pi-extension-*.tgz' -print -quit)"
-          mkdir pi-install-test
-          npm install --prefix pi-install-test --no-audit --no-fund \
+          npm install --prefix "$RUNNER_TEMP/pi-install-test" --no-audit --no-fund \
             "$tarball" \
             '${{ matrix.pi-target.piCodingAgentSpec }}'
-          node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
-            "$PWD/pi-install-test/node_modules/@braintrust/pi-extension/dist/index.mjs"
+          "$RUNNER_TEMP/pi-install-test/node_modules/.bin/pi" --version
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # One cache for every Pi target; pushes to main refresh it from the
+      # latest target and PRs restore it.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: bt-daemon -> target
+          shared-key: pi-compatibility
+          save-if: ${{ github.event_name != 'pull_request' && matrix.pi-target.version == needs.resolve-pi-compatibility.outputs.latest }}
+      - name: Trace a Pi session with deterministic inference
+        env:
+          BT_AGENT_INFERENCE_MODE: mock
+          BT_AGENT_INGEST_MODE: mock
+          PI_BIN: ${{ runner.temp }}/pi-install-test/node_modules/.bin/pi
+          PI_EXTENSION_PATH: ${{ runner.temp }}/pi-install-test/node_modules/@braintrust/pi-extension/dist/index.mjs
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration pi_session_emits_traces -- --ignored --nocapture --exact
 
   daemon:
     name: Daemon (${{ matrix.os }})

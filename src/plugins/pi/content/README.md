@@ -64,9 +64,10 @@ new daemon session instead.
 
 ## Compatibility
 
-CI installs the package against the latest patch from each of the last five
-stable Pi release lines. The compatibility job resolves these versions on each
-run, including releases from Pi's former npm package name when needed.
+CI runs a traced Pi session with the packed extension against the latest patch
+from each of the last five stable Pi release lines. The compatibility job
+resolves these versions on each run, including releases from Pi's former npm
+package name when needed.
 
 ## Configuration
 
