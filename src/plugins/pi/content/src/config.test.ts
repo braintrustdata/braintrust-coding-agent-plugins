@@ -16,7 +16,9 @@ const ENVIRONMENT_KEYS = [
 ] as const;
 
 const originalEnvironment = new Map<string, string | undefined>();
-const originalHome = process.env.HOME;
+// os.homedir() reads HOME on POSIX and USERPROFILE on Windows.
+const HOME_KEYS = ["HOME", "USERPROFILE"] as const;
+const originalHome = new Map<string, string | undefined>();
 let home: string;
 let cwd: string;
 
@@ -28,7 +30,10 @@ function writeJson(path: string, value: unknown): void {
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "pi-config-home-"));
   cwd = mkdtempSync(join(tmpdir(), "pi-config-project-"));
-  process.env.HOME = home;
+  for (const key of HOME_KEYS) {
+    originalHome.set(key, process.env[key]);
+    process.env[key] = home;
+  }
   for (const key of ENVIRONMENT_KEYS) {
     originalEnvironment.set(key, process.env[key]);
     delete process.env[key];
@@ -43,8 +48,11 @@ afterEach(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  for (const key of HOME_KEYS) {
+    const value = originalHome.get(key);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 describe("loadConfig", () => {

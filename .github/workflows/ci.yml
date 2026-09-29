@@ -80,13 +80,19 @@ jobs:
         run: |
           node scripts/prepare-js-daemon-client.mjs all
           node scripts/prepare-js-daemon-client.mjs all --check
-      - name: Test Pi and OpenCode packages
+      - name: Test Pi package
         shell: bash
+        working-directory: src/plugins/pi/content
         run: |
-          set -euo pipefail
-          for plugin in pi opencode; do
-            (cd "src/plugins/$plugin/content" && pnpm install --frozen-lockfile && pnpm test)
-          done
+          pnpm install --frozen-lockfile
+          pnpm test
+      - name: Test OpenCode package
+        shell: bash
+        if: ${{ !cancelled() }}
+        working-directory: src/plugins/opencode/content
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
 
   opencode-compatibility:
     name: OpenCode package (${{ matrix.peer-version }})
