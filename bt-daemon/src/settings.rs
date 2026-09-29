@@ -312,10 +312,7 @@ mod tests {
         assert!(settings.route.is_none());
     }
 
-    #[test]
-    fn migration_replaces_only_the_matching_legacy_route() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.json");
+    fn legacy_and_canonical_routes() -> (SessionRoute, SessionRoute) {
         let legacy = SessionRoute {
             auth: crate::wire::AuthSelection {
                 source: crate::wire::AuthSource::Auto,
@@ -332,6 +329,14 @@ mod tests {
         let mut canonical = legacy.clone();
         canonical.auth.source = crate::wire::AuthSource::SavedProfile;
         canonical.auth.profile_id = Some("00000000-0000-4000-8000-000000000001".into());
+        (legacy, canonical)
+    }
+
+    #[test]
+    fn migration_replaces_only_the_matching_legacy_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        let (legacy, canonical) = legacy_and_canonical_routes();
         let settings = serde_json::json!({
             "trace_to_braintrust": true,
             "route": legacy,
@@ -348,5 +353,36 @@ mod tests {
         assert_eq!(migrated["unrelated"]["preserved"], true);
 
         assert!(!migrate_persisted_route_at(&path, &legacy, &canonical).unwrap());
+    }
+
+    #[test]
+    fn migration_keeps_settings_private_to_the_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        // Replacements inherit from a configuration directory others can read.
+        #[cfg(windows)]
+        crate::win_acl::test_support::set_sddl(&config, "D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;WD)");
+        let path = config.join("braintrust.json");
+        let (legacy, canonical) = legacy_and_canonical_routes();
+        let settings = serde_json::json!({ "trace_to_braintrust": true, "route": legacy });
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        paths::restrict_file_to_owner(&path).unwrap();
+
+        assert!(migrate_persisted_route_at(&path, &legacy, &canonical).unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        {
+            use crate::win_acl::test_support::{assert_owner_only, path_dacl_sddl};
+            assert_owner_only(&path_dacl_sddl(&path), false);
+        }
     }
 }
