@@ -14,7 +14,7 @@ pub use opencode::{OpenCodeAgent, OpenCodeRun};
 pub use pi::{PiAgent, PiRun};
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 pub struct AgentOutput {
@@ -102,6 +102,25 @@ impl ProcessOptions {
     fn apply_env(&self, command: &mut Command) {
         command.envs(self.env.iter().map(|(k, v)| (k, v)));
     }
+}
+
+/// Read the version a packed plugin reports in its trace metadata. The
+/// plugins embed their `package.json` version, which sits above the `dist/`
+/// directory holding the entrypoint.
+fn package_version(entrypoint: &Path) -> String {
+    let manifest = entrypoint
+        .ancestors()
+        .skip(1)
+        .map(|directory| directory.join("package.json"))
+        .find(|manifest| manifest.is_file())
+        .unwrap_or_else(|| panic!("no package.json above {}", entrypoint.display()));
+    let package: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).expect("read plugin package.json"))
+            .expect("parse plugin package.json");
+    package["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{} has no version", manifest.display()))
+        .to_string()
 }
 
 fn command_from_env(name: &str, fallback: &str) -> Command {
