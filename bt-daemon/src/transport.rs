@@ -69,6 +69,7 @@ impl Listener {
 #[cfg(windows)]
 pub(crate) struct Listener {
     endpoint: std::ffi::OsString,
+    security: crate::win_acl::SecurityDescriptor,
     next: tokio::net::windows::named_pipe::NamedPipeServer,
 }
 
@@ -77,26 +78,46 @@ impl Listener {
     /// Create the first server instance exclusively. This is the named-pipe
     /// equivalent of binding a Unix socket and is what resolves daemon races.
     fn bind_raw(endpoint: &Path) -> std::io::Result<Self> {
-        use tokio::net::windows::named_pipe::ServerOptions;
-
-        let next = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(endpoint)?;
+        // The default named-pipe DACL lets Everyone and Anonymous read. Every
+        // instance instead admits only the current user, like the private
+        // socket directory on unix.
+        let security = crate::win_acl::owner_only(false)?;
+        let next = create_instance(endpoint.as_os_str(), &security, true)?;
         Ok(Self {
             endpoint: endpoint.as_os_str().to_owned(),
+            security,
             next,
         })
     }
 
     pub(crate) async fn accept(&mut self) -> std::io::Result<ServerStream> {
-        use tokio::net::windows::named_pipe::ServerOptions;
-
         self.next.connect().await?;
         // Install another listening instance before handing the connected
         // stream to a task, avoiding a gap where concurrent hook clients see
         // ERROR_PIPE_BUSY.
-        let next = ServerOptions::new().create(&self.endpoint)?;
+        let next = create_instance(&self.endpoint, &self.security, false)?;
         Ok(std::mem::replace(&mut self.next, next))
+    }
+}
+
+#[cfg(windows)]
+fn create_instance(
+    endpoint: &std::ffi::OsStr,
+    security: &crate::win_acl::SecurityDescriptor,
+    first: bool,
+) -> std::io::Result<ServerStream> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let mut attributes = security.attributes();
+    // SAFETY: `attributes` and the descriptor it points to outlive the call,
+    // which copies them into the new pipe instance.
+    unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .create_with_security_attributes_raw(
+                endpoint,
+                std::ptr::addr_of_mut!(attributes).cast(),
+            )
     }
 }
 

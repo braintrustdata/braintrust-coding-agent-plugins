@@ -830,13 +830,8 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
         settings.remove(key);
     }
     write_object_atomic(path, settings)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to protect agent settings: {}", path.display()))?;
-    }
+    paths::restrict_file_to_owner(path)
+        .with_context(|| format!("failed to protect agent settings: {}", path.display()))?;
     Ok(())
 }
 

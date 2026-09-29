@@ -140,7 +140,8 @@ pub(crate) fn antigravity_config_dir() -> PathBuf {
     home().join(".gemini").join("config")
 }
 
-/// Create `dir` (and parents) mode 0700 on unix.
+/// Create `dir` (and parents) accessible only to the current user: mode 0700
+/// on unix, an inheritable owner-only DACL on Windows.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -149,7 +150,27 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
         let perms = std::fs::Permissions::from_mode(0o700);
         std::fs::set_permissions(dir, perms)?;
     }
+    // Replacing a directory's DACL re-applies inheritance to everything
+    // beneath it, so only do so when it is not already private.
+    #[cfg(windows)]
+    if !crate::win_acl::is_owner_only(dir, true)? {
+        crate::win_acl::restrict_to_owner(dir, true)?;
+    }
     Ok(())
+}
+
+/// Make an existing file readable and writable only by the current user:
+/// mode 0600 on unix, an owner-only DACL on Windows.
+pub(crate) fn restrict_file_to_owner(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(windows)]
+    {
+        crate::win_acl::restrict_to_owner(path, false)
+    }
 }
 
 #[cfg(test)]
