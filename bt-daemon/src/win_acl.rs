@@ -247,7 +247,7 @@ pub(crate) mod test_support {
     use super::*;
     use std::os::windows::io::RawHandle;
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
 
@@ -263,15 +263,17 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn handle_dacl_sddl(handle: RawHandle) -> String {
+        let mut dacl = null_mut();
         let mut descriptor = null_mut();
+        // Pipe handles are kernel objects; SE_FILE_OBJECT is rejected.
         let status = unsafe {
             GetSecurityInfo(
                 handle,
-                SE_FILE_OBJECT,
+                SE_KERNEL_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 null_mut(),
                 null_mut(),
-                null_mut(),
+                &mut dacl,
                 null_mut(),
                 &mut descriptor,
             )
