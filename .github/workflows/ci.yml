@@ -108,8 +108,10 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: src/plugins/opencode/content/pnpm-lock.yaml
-      - name: Build and validate package
-        run: make validate-opencode
+      # `plugins` validates the package once; this job only checks the
+      # packed tarball against each supported OpenCode peer.
+      - name: Build package
+        run: make build-opencode
       - name: Install package with OpenCode peers
         env:
           PEER_VERSION: ${{ matrix.peer-version }}
@@ -161,8 +163,10 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: src/plugins/pi/content/pnpm-lock.yaml
-      - name: Build and validate Pi package
-        run: make validate-pi
+      # `plugins` validates the package once; this job only checks the
+      # packed tarball installs and loads alongside each Pi release line.
+      - name: Build Pi package
+        run: make build-pi
       - name: Test resolved Pi compatibility target
         shell: bash
         run: |
@@ -310,5 +314,7 @@ jobs:
           PI_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/pi${{ matrix.agent_suffix }}
           PI_EXTENSION_PATH: ${{ runner.temp }}/pi-extension/node_modules/@braintrust/pi-extension/dist/index.mjs
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
+      # macOS has no cfg-specific code beyond the unix paths linted on Linux.
       - name: Lint daemon
+        if: runner.os != 'macOS'
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings
