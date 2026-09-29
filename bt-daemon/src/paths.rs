@@ -32,18 +32,10 @@ pub fn socket_path(explicit: Option<&Path>) -> PathBuf {
     }
     #[cfg(windows)]
     {
-        use sha2::{Digest, Sha256};
-        let identity = format!(
-            "{}\\{}",
-            std::env::var("USERDOMAIN").unwrap_or_default(),
-            std::env::var("USERNAME").unwrap_or_default()
-        );
-        let digest = Sha256::digest(identity.as_bytes());
-        let suffix: String = digest[..8]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        PathBuf::from(format!(r"\\.\pipe\braintrust-bt-daemon-{suffix}"))
+        PathBuf::from(windows_pipe_name(
+            &std::env::var("USERDOMAIN").unwrap_or_default(),
+            &std::env::var("USERNAME").unwrap_or_default(),
+        ))
     }
     #[cfg(unix)]
     if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -55,6 +47,18 @@ pub fn socket_path(explicit: Option<&Path>) -> PathBuf {
     {
         home().join(".braintrust").join("run").join("daemon.sock")
     }
+}
+
+/// Per-user Windows pipe. The JS daemon client derives the same name.
+#[cfg(any(windows, test))]
+fn windows_pipe_name(domain: &str, user: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{domain}\\{user}").as_bytes());
+    let suffix: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(r"\\.\pipe\braintrust-bt-daemon-{suffix}")
 }
 
 /// Resolve the data dir: explicit `override` → `$BT_DAEMON_DATA_DIR` →
@@ -165,6 +169,19 @@ mod tests {
         assert_eq!(
             agent_settings_path("codex", Some(Path::new("config.json"))),
             Path::new("config.json")
+        );
+    }
+
+    // Shared vectors with src/runtime/js-daemon-client/tests/client.test.ts.
+    #[test]
+    fn windows_pipe_name_matches_the_js_client_contract() {
+        assert_eq!(
+            windows_pipe_name("ACME", "alice"),
+            r"\\.\pipe\braintrust-bt-daemon-d2c39c8776cb1638"
+        );
+        assert_eq!(
+            windows_pipe_name("", ""),
+            r"\\.\pipe\braintrust-bt-daemon-a9253dc8529dd214"
         );
     }
 
