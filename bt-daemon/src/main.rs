@@ -229,6 +229,18 @@ fn host_info() -> HostInfo {
     }
 }
 
+/// Accept `bt-daemon trace <command>` as `bt-daemon <command>`, so real-agent
+/// tests can stand this binary in for `bt` behind a plain command shim. Hooks
+/// invoke `bt trace hook`, and stripping the prefix in a shell wrapper instead
+/// costs a PowerShell launch per hook on Windows.
+fn strip_bt_trace_prefix(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut args = args.into_iter().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|arg| arg == "trace") {
+        args.remove(1);
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -239,7 +251,7 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(strip_bt_trace_prefix(std::env::args_os()));
     match cli.command {
         Command::Serve {
             args,
@@ -316,5 +328,27 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn strips_only_a_leading_bt_trace_prefix() {
+        assert_eq!(
+            strip_bt_trace_prefix(args(&["bt", "trace", "hook", "--source", "codex"])),
+            args(&["bt", "hook", "--source", "codex"])
+        );
+        assert_eq!(
+            strip_bt_trace_prefix(args(&["bt-daemon", "hook", "--source", "trace"])),
+            args(&["bt-daemon", "hook", "--source", "trace"])
+        );
+        assert_eq!(strip_bt_trace_prefix(args(&["bt"])), args(&["bt"]));
     }
 }
