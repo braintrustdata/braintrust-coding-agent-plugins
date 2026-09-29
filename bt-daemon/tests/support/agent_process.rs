@@ -335,46 +335,77 @@ impl Drop for AgentTestWorld {
     }
 }
 
-// `bt-daemon` accepts the `bt trace` prefix itself, so every wrapper is a
-// direct forwarder. Hooks run once per agent event; keep them free of an
-// interpreter launch so wrapper cost does not dominate Windows test time.
-fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
-    write_forwarding_wrapper(directory, daemon_binary);
-}
-
-fn write_bt_host_wrapper(directory: &Path, bt_binary: &Path) {
-    write_forwarding_wrapper(directory, bt_binary);
-}
-
 #[cfg(unix)]
-fn write_forwarding_wrapper(directory: &Path, binary: &Path) {
+fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
     let path = directory.join("bt");
-    let script = format!("#!/bin/sh\nexec '{}' \"$@\"\n", binary.display());
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in trace) shift;; esac\nexec '{}' \"$@\"\n",
+        daemon_binary.display()
+    );
     std::fs::write(&path, script).expect("write bt test wrapper");
     let mut permissions = std::fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).expect("make bt wrapper executable");
 }
 
+#[cfg(unix)]
+fn write_bt_host_wrapper(directory: &Path, bt_binary: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = directory.join("bt");
+    let script = format!("#!/bin/sh\nexec '{}' \"$@\"\n", bt_binary.display());
+    std::fs::write(&path, script).expect("write bt host wrapper");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("make bt host wrapper executable");
+}
+
+// Hooks run once per agent event, so the Windows wrappers stay in batch.
+// Starting PowerShell for each hook dominated Windows test time.
 #[cfg(windows)]
-fn write_forwarding_wrapper(directory: &Path, binary: &Path) {
+fn write_bt_wrapper(directory: &Path, daemon_binary: &Path) {
+    // `bt-daemon` has no `trace` subcommand; drop the prefix that hooks pass
+    // to `bt`. The hook arguments are plain flags, so `%*` forwards safely.
     std::fs::write(
         directory.join("bt.cmd"),
-        format!("@\"{}\" %*\r\n", binary.display()),
+        format!(
+            "@echo off\r\n\
+             setlocal\r\n\
+             set \"BT_ARGS=%*\"\r\n\
+             if /I \"%~1\"==\"trace\" set \"BT_ARGS=%BT_ARGS:~6%\"\r\n\
+             \"{}\" %BT_ARGS%\r\n",
+            daemon_binary.display()
+        ),
     )
     .expect("write bt command wrapper");
 
     // Claude Code, and some Codex releases, launch the portable `command`
     // hook through Git Bash even on Windows. Git Bash does not resolve
     // PATHEXT, so expose an extensionless shim in addition to bt.cmd.
-    let shell_binary = binary.to_string_lossy().replace('\\', "/");
+    let shell_binary = daemon_binary.to_string_lossy().replace('\\', "/");
+    let shell = format!(
+        "#!/bin/sh\ncase \"$1\" in trace) shift;; esac\nexec '{}' \"$@\"\n",
+        shell_binary
+    );
+    std::fs::write(directory.join("bt"), shell).expect("write bt Git Bash wrapper");
+}
+
+#[cfg(windows)]
+fn write_bt_host_wrapper(directory: &Path, bt_binary: &Path) {
+    std::fs::write(
+        directory.join("bt.cmd"),
+        format!("@\"{}\" %*\r\n", bt_binary.display()),
+    )
+    .expect("write bt host command wrapper");
+
+    let shell_binary = bt_binary.to_string_lossy().replace('\\', "/");
     std::fs::write(
         directory.join("bt"),
         format!("#!/bin/sh\nexec '{}' \"$@\"\n", shell_binary),
     )
-    .expect("write bt Git Bash wrapper");
+    .expect("write bt host Git Bash wrapper");
 }
 
 #[cfg(unix)]
