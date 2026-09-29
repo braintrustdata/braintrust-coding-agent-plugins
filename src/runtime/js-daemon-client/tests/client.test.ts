@@ -1,5 +1,4 @@
 import assert from "node:assert/strict"
-import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
@@ -41,9 +40,17 @@ describe("daemonSocketPath", () => {
     )
   })
 
-  test("documents the Windows identity hash contract", () => {
-    const identity = "ACME\\alice"
-    assert.equal(createHash("sha256").update(identity).digest("hex").slice(0, 16).length, 16)
+  // Shared vectors with bt-daemon/src/paths.rs; both sides must derive the
+  // same per-user pipe or Windows hooks silently miss the daemon.
+  test("matches the daemon's Windows named-pipe contract", () => {
+    assert.equal(
+      daemonSocketPath({ USERDOMAIN: "ACME", USERNAME: "alice" }, "win32"),
+      "\\\\.\\pipe\\braintrust-bt-daemon-d2c39c8776cb1638",
+    )
+    assert.equal(
+      daemonSocketPath({}, "win32"),
+      "\\\\.\\pipe\\braintrust-bt-daemon-a9253dc8529dd214",
+    )
   })
 })
 

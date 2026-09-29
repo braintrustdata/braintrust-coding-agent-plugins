@@ -50,8 +50,10 @@ jobs:
       - name: Build and validate plugins
         run: make test
 
-  js-daemon-client:
-    name: JavaScript daemon client (${{ matrix.os }})
+  # Pi and OpenCode run inside the user's agent process, so their unit tests
+  # run on every host OS. Packaging and validation stay in `plugins`.
+  js-packages:
+    name: JavaScript packages (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -60,16 +62,37 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          version: 11.21.0
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24
+          cache: pnpm
+          cache-dependency-path: |
+            src/plugins/opencode/content/pnpm-lock.yaml
+            src/plugins/pi/content/pnpm-lock.yaml
       - name: Test RPC transport contracts
         run: node --test src/runtime/js-daemon-client/tests/client.test.ts
       - name: Verify generated client preparation
         run: |
           node scripts/prepare-js-daemon-client.mjs all
           node scripts/prepare-js-daemon-client.mjs all --check
+      - name: Test Pi package
+        shell: bash
+        working-directory: src/plugins/pi/content
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
+      - name: Test OpenCode package
+        shell: bash
+        if: ${{ !cancelled() }}
+        working-directory: src/plugins/opencode/content
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
 
   opencode-compatibility:
     name: OpenCode package (${{ matrix.peer-version }})
@@ -91,8 +114,10 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: src/plugins/opencode/content/pnpm-lock.yaml
-      - name: Build and validate package
-        run: make validate-opencode
+      # `plugins` validates the package once; this job only checks the
+      # packed tarball against each supported OpenCode peer.
+      - name: Build package
+        run: make build-opencode
       - name: Install package with OpenCode peers
         env:
           PEER_VERSION: ${{ matrix.peer-version }}
@@ -144,8 +169,10 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: src/plugins/pi/content/pnpm-lock.yaml
-      - name: Build and validate Pi package
-        run: make validate-pi
+      # `plugins` validates the package once; this job only checks the
+      # packed tarball installs and loads alongside each Pi release line.
+      - name: Build Pi package
+        run: make build-pi
       - name: Test resolved Pi compatibility target
         shell: bash
         run: |
@@ -176,11 +203,34 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Defender scanning of C: dominates Windows compile and agent I/O time.
+      # Keep the Cargo target and temp directories on a trusted ReFS Dev Drive.
+      - name: Set up Windows Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@562171fe8df7401fdf582d766cd3b6ab80d5b1a0 # v4.1.0
+        with:
+          drive-size: 12GB
+          mount-path: ${{ github.workspace }}/.devdrive
+          trusted-dev-drive: true
+          env-mapping: |
+            CARGO_TARGET_DIR,{{ DEV_DRIVE }}/target
+            TMP,{{ DEV_DRIVE }}/tmp
+            TEMP,{{ DEV_DRIVE }}/tmp
+      - name: Create Dev Drive temp directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add clippy rustfmt
+      # PRs restore main's cache; pushes to main and manual runs refresh it.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ runner.os == 'Windows' && 'bt-daemon -> ../.devdrive/target' || 'bt-daemon -> target' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install latest coding agents
         run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest @earendil-works/pi-coding-agent@latest
       - name: Ensure Codex platform binary is available
@@ -270,5 +320,7 @@ jobs:
           PI_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/pi${{ matrix.agent_suffix }}
           PI_EXTENSION_PATH: ${{ runner.temp }}/pi-extension/node_modules/@braintrust/pi-extension/dist/index.mjs
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
+      # macOS has no cfg-specific code beyond the unix paths linted on Linux.
       - name: Lint daemon
+        if: runner.os != 'macOS'
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings

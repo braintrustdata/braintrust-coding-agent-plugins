@@ -104,9 +104,11 @@ A Codex deployment can run `smoke-codex.yml`, which installs the deployed
 plugin and runs a real Codex session through the daemon when
 `OPENAI_API_KEY` is available.
 
-CI builds and validates both plugin packages and builds, tests, and lints the
-Rust daemon on Linux, macOS, and Windows. Concurrent runs for an obsolete
-branch revision are cancelled.
+CI builds and validates the plugin packages on Linux. It runs the JavaScript
+daemon client and the Pi and OpenCode unit tests, and builds, tests, and lints
+the Rust daemon, on Linux, macOS, and Windows. Pushes to `main` and manual runs
+refresh the Rust build cache that pull requests restore. Concurrent runs for an
+obsolete branch revision are cancelled.
 
 ## Secrets
 

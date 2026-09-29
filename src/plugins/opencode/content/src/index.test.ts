@@ -52,7 +52,9 @@ describe("BraintrustPlugin", () => {
     "BRAINTRUST_OPENCODE_ENABLE_TOOLS",
     "BT_TRACE_INVOCATION_SETTINGS",
     "BT_TRACE_MANAGED_RUN_ID",
+    // os.homedir() reads HOME on POSIX and USERPROFILE on Windows.
     "HOME",
+    "USERPROFILE",
     "XDG_CONFIG_HOME",
   ];
   let directory: string;
@@ -64,6 +66,7 @@ describe("BraintrustPlugin", () => {
       delete process.env[key];
     }
     process.env.HOME = directory;
+    process.env.USERPROFILE = directory;
     process.env.TRACE_TO_BRAINTRUST = "false";
     process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS = "true";
   });

@@ -129,9 +129,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-export function daemonSocketPath(env: NodeJS.ProcessEnv = process.env): string {
+export function daemonSocketPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
   if (env.BT_DAEMON_SOCKET) return env.BT_DAEMON_SOCKET
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     const identity = `${env.USERDOMAIN ?? ""}\\${env.USERNAME ?? ""}`
     const suffix = createHash("sha256").update(identity).digest("hex").slice(0, 16)
     return `\\\\.\\pipe\\braintrust-bt-daemon-${suffix}`
