@@ -392,7 +392,10 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
         return Ok(());
     }
     let settings = settings::AgentSettings::load_for_hook(&args.source)?;
-    run_hook_with_settings(args, route, host, settings).await
+    if !settings.tracing_enabled() {
+        return Ok(());
+    }
+    run_hook_with_route(args, settings.route.unwrap_or(route), host).await
 }
 
 /// A managed run injects its own hook definitions. Suppress an inherited
@@ -402,15 +405,11 @@ pub(crate) fn suppress_inherited_hook(args: &HookArgs) -> bool {
     std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook
 }
 
-pub(crate) async fn run_hook_with_settings(
+pub(crate) async fn run_hook_with_route(
     mut args: HookArgs,
     mut route: SessionRoute,
     host: HostInfo,
-    settings: settings::AgentSettings,
 ) -> anyhow::Result<()> {
-    if !settings.tracing_enabled() {
-        return Ok(());
-    }
     let mut payload = read_stdin_json()?;
 
     resolve_dynamic_hook_versions(&mut args, &payload);
@@ -427,9 +426,6 @@ pub(crate) async fn run_hook_with_settings(
         .or_else(|| json_str_field(&payload, &args.event_field))
         .unwrap_or_default();
 
-    if let Some(configured_route) = settings.route {
-        route = configured_route;
-    }
     if args.flush_on_turn_end {
         route.flush_mode = wire::FlushMode::FlushOnTurnEnd;
     }

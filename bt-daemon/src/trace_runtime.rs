@@ -716,11 +716,11 @@ async fn run_hook_command(
     if !settings.tracing_enabled() {
         return Ok(());
     }
-    let route = match &settings.route {
-        Some(route) => route.clone(),
+    let route = match settings.route {
+        Some(route) => route,
         None => resolve_host_route(host, RouteRequirements::default()).await?,
     };
-    crate::run_hook_with_settings(hook_args, route, host_info(host), settings).await
+    crate::run_hook_with_route(hook_args, route, host_info(host)).await
 }
 
 #[cfg(test)]
