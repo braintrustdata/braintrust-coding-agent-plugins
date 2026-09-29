@@ -1702,6 +1702,39 @@ mod tests {
         }
     }
 
+    /// Settings must be protected before they replace the old file: if the
+    /// protection cannot be applied, the previous settings stay in place
+    /// rather than a replacement carrying the directory's shared access.
+    #[cfg(windows)]
+    #[test]
+    fn tracing_settings_are_not_published_when_they_cannot_be_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("braintrust.json");
+        std::fs::write(&path, r#"{"trace_to_braintrust":false}"#).unwrap();
+        // Everyone may create, modify, rename, and delete files here, but
+        // OWNER RIGHTS withholds the creator's implicit WRITE_DAC, so new
+        // files cannot be given an owner-only DACL.
+        crate::win_acl::test_support::set_sddl(
+            &config,
+            "D:P(A;OICI;0x1301bf;;;WD)(A;OICI;0x1301bf;;;OW)",
+        );
+
+        assert!(enable_tracing_at(&path, SessionRoute::default()).is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"trace_to_braintrust":false}"#
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&config)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     #[test]
     fn tracing_settings_preserve_plugins_until_setup_explicitly_replaces_them() {
         let temp = tempfile::tempdir().unwrap();
