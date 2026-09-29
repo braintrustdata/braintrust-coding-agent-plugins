@@ -9,10 +9,10 @@ use crate::trace_command::{DoctorAgent, DoctorArgs, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
     apply_additional_metadata, apply_tags, braintrust_serve_options, paths, run_disable,
-    run_enable, run_hook, run_import, run_serve, run_status, run_traced, shutdown_daemon,
-    AuthDiagnostic, AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig,
-    DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, HostInfo, OutputFormat, Registry,
-    RunHookCommand, ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
+    run_enable, run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthDiagnostic,
+    AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, DaemonDiagnostic,
+    DaemonStatus, DoctorCommandOutput, HostInfo, OutputFormat, Registry, RunHookCommand,
+    ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -643,16 +643,11 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             run_serve(serve_args, serve_options(&host)).await
         }
         TraceCommand::Hook(hook_args) => {
-            // A persistent hook must never fail the coding agent's turn.
-            let result = async {
-                let route = resolve_host_route(&host, RouteRequirements::default()).await?;
-                run_hook(hook_args, route, host_info(&host)).await
+            if crate::suppress_inherited_hook(&hook_args) {
+                return Ok(());
             }
-            .await;
-            if let Err(error) = result {
-                eprintln!("bt trace hook (non-fatal): {error}");
-            }
-            Ok(())
+            let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
+            run_hook_command(hook_args, &host, settings).await
         }
         TraceCommand::Status(status_args) => print_output(
             TraceCommandOutput::status(run_status(status_args).await?),
@@ -711,6 +706,21 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             }
         }
     }
+}
+
+async fn run_hook_command(
+    hook_args: crate::HookArgs,
+    host: &TraceHostContext,
+    settings: crate::settings::AgentSettings,
+) -> anyhow::Result<()> {
+    if !settings.tracing_enabled() {
+        return Ok(());
+    }
+    let route = match settings.route {
+        Some(route) => route,
+        None => resolve_host_route(host, RouteRequirements::default()).await?,
+    };
+    crate::run_hook_with_route(hook_args, route, host_info(host)).await
 }
 
 #[cfg(test)]
@@ -1025,10 +1035,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn hook_host_failures_are_non_fatal() {
-        let services = Arc::new(RecordingHost::new(Some("route unavailable"), None));
-        let args = crate::HookArgs {
+    fn hook_args() -> crate::HookArgs {
+        crate::HookArgs {
             source: "codex".into(),
             source_version: None,
             plugin_version: None,
@@ -1042,19 +1050,36 @@ mod tests {
             flush_timeout_ms: 10_000,
             additional_metadata: None,
             managed_run_hook: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_host_failures_are_reported() {
+        let services = Arc::new(RecordingHost::new(Some("route unavailable"), None));
+        let host = test_host(services.clone());
+        let settings = crate::settings::AgentSettings {
+            trace_to_braintrust: Some(true),
+            route: None,
         };
-        run_trace(
-            TraceArgs {
-                command: TraceCommand::Hook(args),
-            },
-            test_host(services.clone()),
-        )
-        .await
-        .unwrap();
+        let error = run_hook_command(hook_args(), &host, settings)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "route unavailable");
         assert_eq!(
             *services.route_requests.lock().unwrap(),
             [RouteRequirements::default()]
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_hook_skips_host_resolution() {
+        let settings = crate::settings::AgentSettings {
+            trace_to_braintrust: Some(false),
+            route: None,
+        };
+        run_hook_command(hook_args(), &test_host(Arc::new(PanicHost)), settings)
+            .await
+            .unwrap();
     }
 
     /// The daemon's credential view: a packaged app's virtualized store holds

@@ -56,6 +56,12 @@ bt trace disable claude
 daemon can authenticate it. `status` reports trace delivery.
 `update` keeps your settings; `disable` removes the plugin and its settings.
 
+For command hooks, `bt trace hook` exits nonzero when it cannot capture an
+event. Exit `0` means the daemon accepted the event into its journal; delivery
+can still fail later. Use `bt trace status --session-id <ID>` or `doctor` to
+inspect those later failures. See [hook exit status](bt-daemon/README.md#hook-exit-status)
+for the full contract.
+
 ## Development
 
 ```text

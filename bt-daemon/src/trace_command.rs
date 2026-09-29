@@ -29,7 +29,7 @@ pub enum TraceCommand {
     /// Run the tracing daemon (foreground).
     #[command(hide = true)]
     Daemon(ServeArgs),
-    /// Forward one coding-agent hook event (read from stdin) to the daemon.
+    /// Capture one coding-agent hook event from stdin; exits nonzero if capture fails.
     #[command(hide = true)]
     Hook(HookArgs),
     /// Print daemon/session status.

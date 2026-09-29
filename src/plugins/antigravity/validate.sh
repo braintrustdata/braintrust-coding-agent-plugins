@@ -38,7 +38,7 @@ for event, expected_event in expected.items():
             assert hook["command"] == (
                 "bt trace hook --source antigravity --session-id-field conversationId "
                 f"--event {expected_event} --transcript-path-field transcriptPath "
-                "--flush-on-turn-end"
+                "--flush-on-turn-end || exit 0"
             )
 PY
 echo "validate: antigravity dist OK ($TARGET_DIR)"

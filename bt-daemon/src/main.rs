@@ -267,11 +267,10 @@ async fn main() {
             }
         }
         Command::Hook { args, route } => {
-            // A hook must NEVER fail the agent's turn: log and exit 0 on error.
             if let Err(e) = run_hook(args, route.into_route(), host_info()).await {
-                eprintln!("bt-daemon hook (non-fatal): {e}");
+                eprintln!("bt-daemon hook: {e}");
+                std::process::exit(1);
             }
-            std::process::exit(0);
         }
         Command::Status(args) => match run_status(args).await {
             Ok(status) => {
