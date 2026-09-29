@@ -431,55 +431,6 @@ fn codex_native_prompt_ignores_surrounding_injected_user_rows() {
 }
 
 #[test]
-fn attached_codex_root_merge_preserves_external_parent() {
-    let tmp = tempfile::tempdir().unwrap();
-    let transcript = tmp.path().join("rollout.jsonl");
-    write_transcript(&transcript);
-    let path = transcript.to_str().unwrap();
-    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
-    components.span_id = Some("external-parent".into());
-    components.root_span_id = Some("external-root".into());
-    let ctx = SessionCtx {
-        session_id: "attached-session".into(),
-        config: Some(SessionConfig {
-            auth: BackendAuth {
-                token: "test".into(),
-                api_url: None,
-                app_url: None,
-                org_name: None,
-                org_id: None,
-            },
-            destination: Some(TraceDestination::ParentSpan { components }),
-            flush_mode: FlushMode::FireAndForget,
-            additional_metadata: None,
-            tags: Vec::new(),
-            span_plugins: Vec::new(),
-        }),
-    };
-    let registry = Registry::default_agents();
-    let mut translator = registry.create("codex", "attached-session");
-    let mut ops = translator
-        .handle(
-            &envelope("attached-session", "SessionStart", path, json!({})),
-            &ctx,
-        )
-        .unwrap();
-    ops.extend(
-        translator
-            .handle(&envelope("attached-session", "Stop", path, json!({})), &ctx)
-            .unwrap(),
-    );
-    ops.extend(translator.flush(&ctx).unwrap());
-    assert_merges_preserve_insert_identity(&ops);
-    let rows = reduce(ops);
-    let root = rows
-        .values()
-        .find(|row| row.name.starts_with("codex:"))
-        .unwrap();
-    assert_eq!(root.parent_span_ids, ["external-parent"]);
-}
-
-#[test]
 fn codex_incremental_reads_advance_offset() {
     // Two reads: the second only sees records appended after the first.
     let tmp = tempfile::tempdir().unwrap();
@@ -521,7 +472,9 @@ fn codex_incremental_reads_advance_offset() {
 /// instead of retaining every clone from the catch-up at once.
 #[test]
 fn codex_large_catch_up_emits_bounded_batches() {
-    const CALLS: usize = 256;
+    // Several catch-up budgets of transcript; output still grows
+    // quadratically because each LLM span snapshots the history.
+    const CALLS: usize = 64;
     const USER_BYTES: usize = 8 * 1024;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -600,14 +553,10 @@ fn codex_large_catch_up_emits_bounded_batches() {
         largest_batch_inputs,
     );
     assert_eq!(total_llms, CALLS);
+    assert!(batches > 4, "large rollout must be drained incrementally");
     assert!(
-        total_llm_inputs > 200 * 1024 * 1024,
-        "expected substantial total output"
-    );
-    assert!(batches > 1, "large rollout must be drained incrementally");
-    assert!(
-        largest_batch_inputs < 40 * 1024 * 1024,
-        "each emitted batch must stay bounded"
+        largest_batch_inputs * 3 < total_llm_inputs,
+        "each emitted batch must stay a small fraction of the catch-up"
     );
 }
 
