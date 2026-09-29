@@ -320,13 +320,17 @@ async fn diagnose_daemon(
     source: &str,
     selection: Option<&AuthSelection>,
 ) -> DaemonDiagnostic {
-    let status = tokio::time::timeout(
-        DAEMON_PROBE_TIMEOUT,
-        run_status(StatusArgs {
-            socket: Some(socket.to_path_buf()),
-            session_id: None,
-        }),
-    );
+    let unreachable = |error: String| DaemonDiagnostic {
+        status: DaemonStatus::Unreachable,
+        error: Some(error),
+        ..DaemonDiagnostic::default()
+    };
+    let stream = match crate::client::connect(socket).await {
+        Ok(stream) => stream,
+        Err(error) if crate::client::daemon_absent(&error) => return DaemonDiagnostic::default(),
+        Err(error) => return unreachable(format!("{}: {error}", socket.display())),
+    };
+    let status = tokio::time::timeout(DAEMON_PROBE_TIMEOUT, crate::status_over(stream, None));
     let auth = async {
         match selection {
             Some(selection) => Some(diagnose_daemon_auth(socket, selection).await),
@@ -335,15 +339,8 @@ async fn diagnose_daemon(
     };
     let (status, auth) = tokio::join!(status, auth);
     let mut diagnostic = match status {
-        Ok(Ok(None)) => return DaemonDiagnostic::default(),
-        Ok(Err(error)) => {
-            return DaemonDiagnostic {
-                status: DaemonStatus::Unreachable,
-                error: Some(error.to_string()),
-                ..DaemonDiagnostic::default()
-            }
-        }
-        Ok(Ok(Some(status))) => {
+        Ok(Err(error)) => return unreachable(error.to_string()),
+        Ok(Ok(status)) => {
             let mut session_errors = Vec::new();
             let errors = status
                 .sessions
@@ -426,7 +423,7 @@ fn daemon_warnings(
     let (source, display_name) = (agent.source(), agent.display_name());
     if daemon.status == DaemonStatus::Unreachable {
         return vec![format!(
-            "the tracing daemon did not answer: {}",
+            "could not reach the tracing daemon: {}",
             daemon.error.as_deref().unwrap_or("unknown error")
         )];
     }
@@ -1316,6 +1313,38 @@ mod tests {
         );
 
         daemon.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn doctor_reports_an_endpoint_it_cannot_open_as_unreachable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("d.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            return; // Running as root bypasses socket permissions.
+        }
+
+        let output = doctor_output_at(
+            &test_host(Arc::new(RecordingHost::new(None, None))),
+            DoctorArgs {
+                agent: DoctorAgent::Codex,
+            },
+            &socket,
+        )
+        .await;
+
+        assert_eq!(output.daemon.status, DaemonStatus::Unreachable);
+        assert!(
+            output
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("could not reach the tracing daemon")),
+            "{:#?}",
+            output.warnings
+        );
     }
 
     #[tokio::test]

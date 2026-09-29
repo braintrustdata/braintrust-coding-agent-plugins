@@ -723,12 +723,18 @@ pub async fn run_status(args: StatusArgs) -> anyhow::Result<Option<StatusResult>
         Ok(s) => s,
         Err(_) => return Ok(None),
     };
+    Ok(Some(status_over(stream, args.session_id).await?))
+}
+
+/// Query status over an already-open daemon connection.
+pub(crate) async fn status_over(
+    stream: transport::ClientStream,
+    session_id: Option<String>,
+) -> anyhow::Result<StatusResult> {
     let mut conn = client::Conn::new(stream);
     conn.initialize("status").await?;
-    let params = wire::StatusParams {
-        session_id: args.session_id.clone(),
-    };
-    Ok(Some(conn.call(method::STATUS_GET, params).await?))
+    conn.call(method::STATUS_GET, wire::StatusParams { session_id })
+        .await
 }
 
 /// Request a graceful daemon shutdown. Primarily useful for lifecycle

@@ -129,6 +129,15 @@ impl Conn {
     }
 }
 
+/// Whether a connect error means no daemon is listening, as opposed to a
+/// daemon endpoint that exists but cannot be opened.
+pub(crate) fn daemon_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
 pub(crate) async fn connect(socket: &Path) -> std::io::Result<ClientStream> {
     crate::transport::connect(socket).await
 }
