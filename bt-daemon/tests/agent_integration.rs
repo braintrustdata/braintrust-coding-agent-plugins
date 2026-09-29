@@ -278,6 +278,7 @@ async fn opencode_session_emits_traces() {
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
     let opencode = OpenCodeAgent::new(&world);
+    let plugin_version = opencode.plugin_version();
 
     let output = opencode
         .run(
@@ -305,14 +306,14 @@ async fn opencode_session_emits_traces() {
     if world.uses_mock_ingest() {
         assert!(
             rows.iter()
-                .any(|row| row_contains(row, &["braintrust.plugin.opencode", "2.1.0"])),
+                .any(|row| row_contains(row, &["braintrust.plugin.opencode", &plugin_version])),
             "OpenCode trace origin metadata was not emitted"
         );
     }
     if world.uses_mock_inference() && world.uses_mock_ingest() {
         let scenario = IngestScenario::new()
-            .expect("OpenCode trace origin", |row| {
-                row_contains(row, &["braintrust.plugin.opencode", "2.1.0"])
+            .expect("OpenCode trace origin", move |row| {
+                row_contains(row, &["braintrust.plugin.opencode", &plugin_version])
             })
             .expect("OpenCode turn input", |row| {
                 row_contains(row, &["Turn 1", "OPENCODE_TOOL_OK"])
@@ -347,6 +348,7 @@ async fn pi_session_emits_traces() {
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
     let pi = PiAgent::new(&world);
+    let plugin_version = pi.plugin_version();
 
     let output = pi
         .run(
@@ -377,7 +379,7 @@ async fn pi_session_emits_traces() {
     if world.uses_mock_ingest() {
         assert!(
             rows.iter()
-                .any(|row| row_contains(row, &["braintrust.plugin.pi", "2.1.1"])),
+                .any(|row| row_contains(row, &["braintrust.plugin.pi", &plugin_version])),
             "Pi trace origin metadata was not emitted"
         );
     }

@@ -1,4 +1,4 @@
-use super::{AgentOutput, ProcessOptions};
+use super::{package_version, AgentOutput, ProcessOptions};
 use crate::support::agent_process::AgentTestWorld;
 use serde_json::json;
 use std::ffi::OsString;
@@ -71,6 +71,11 @@ impl OpenCodeAgent {
             cache_home,
             plugin,
         }
+    }
+
+    /// The version the plugin under test reports in trace metadata.
+    pub fn plugin_version(&self) -> String {
+        package_version(&self.plugin)
     }
 
     pub async fn run(&self, world: &AgentTestWorld, run: OpenCodeRun) -> AgentOutput {

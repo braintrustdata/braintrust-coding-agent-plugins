@@ -1,4 +1,4 @@
-use super::{AgentOutput, ProcessOptions};
+use super::{package_version, AgentOutput, ProcessOptions};
 use crate::support::agent_process::AgentTestWorld;
 use serde_json::json;
 use std::ffi::OsString;
@@ -66,6 +66,11 @@ impl PiAgent {
             session_dir,
             extension,
         }
+    }
+
+    /// The version the extension under test reports in trace metadata.
+    pub fn plugin_version(&self) -> String {
+        package_version(&self.extension)
     }
 
     pub async fn run(&self, world: &AgentTestWorld, run: PiRun) -> AgentOutput {
