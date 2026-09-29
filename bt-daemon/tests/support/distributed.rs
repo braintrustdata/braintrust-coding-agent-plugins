@@ -69,7 +69,10 @@ impl ProcessTree {
         }
         process_chain.push(self.agent.clone());
         process_chain.extend(self.ancestors.iter().cloned());
-        CaptureContext { process_chain }
+        CaptureContext {
+            process_chain,
+            truncated: false,
+        }
     }
 }
 

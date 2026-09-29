@@ -349,6 +349,7 @@ struct NativeSession {
     effective_root_span_id: String,
     parent_span_ids: Vec<String>,
     parent_session_id: Option<String>,
+    root_idle: bool,
     current_turn_span_id: Option<String>,
     turn_number: u32,
     tool_call_count: u32,
@@ -665,6 +666,18 @@ impl OpenCodeTranslator {
         let Some(state) = self.sessions.get_mut(&sid) else {
             return ops;
         };
+        if state.root_idle {
+            // The root keeps its span identity across idle/resume. A merge
+            // without an end time reactivates it as a possible parent in the
+            // process registry until the next idle boundary extends its end.
+            state.root_idle = false;
+            ops.push(SpanOp::Merge(SpanRow {
+                span_id: state.root_span_id.clone(),
+                root_span_id: state.effective_root_span_id.clone(),
+                parent_span_ids: state.parent_span_ids.clone(),
+                ..Default::default()
+            }));
+        }
         if let Some(turn) = state.current_turn_span_id.take() {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn,
@@ -1305,6 +1318,7 @@ impl OpenCodeTranslator {
                 ),
                 ..Default::default()
             }));
+            s.root_idle = true;
             self.sessions.insert(sid.into(), s);
         }
         ops

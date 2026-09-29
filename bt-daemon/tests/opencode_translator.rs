@@ -185,6 +185,11 @@ fn opencode_idle_updates_a_resumable_session_root() {
     for event in events {
         ops.extend(translator.handle(&event, &ctx).unwrap());
     }
+    let reopened_roots = ops
+        .iter()
+        .filter(|op| matches!(op, SpanOp::Merge(row) if row.name.is_empty() && row.end_ms.is_none() && row.parent_span_ids.is_empty()))
+        .count();
+    assert_eq!(reopened_roots, 1);
     let rows = reduce(ops);
     let root = rows.values().find(|row| row.name == "OpenCode").unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["total_turns"], 2);

@@ -1,14 +1,12 @@
 //! Best-effort local process identity capture for cross-agent correlation.
 //!
 //! The daemon snapshots a connecting client's ancestry while that process is
-//! still alive. Collection is deliberately metadata-only: no command lines,
-//! environment variables, or working directories are read.
+//! still alive. Only process identities and parent relationships are inspected;
+//! executable paths, command arguments, environments, and cwd are not read.
 
 use crate::wire::{CaptureContext, ProcessIdentity};
 use std::collections::HashSet;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-
-const MAX_PROCESS_CHAIN_DEPTH: usize = 64;
 
 /// Capture `pid` and its ancestors, nearest process first.
 ///
@@ -17,7 +15,7 @@ const MAX_PROCESS_CHAIN_DEPTH: usize = 64;
 /// than failing event capture.
 pub(crate) fn capture_process_context(pid: u32) -> CaptureContext {
     let mut system = System::new();
-    let process_chain = build_process_chain(pid, |pid| {
+    let (process_chain, truncated) = build_process_chain(pid, |pid| {
         let sysinfo_pid = Pid::from_u32(pid);
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[sysinfo_pid]),
@@ -33,7 +31,25 @@ pub(crate) fn capture_process_context(pid: u32) -> CaptureContext {
             parent_pid: process.parent().map(Pid::as_u32),
         })
     });
-    CaptureContext { process_chain }
+    CaptureContext {
+        process_chain,
+        truncated,
+    }
+}
+
+/// Whether `identity` still names a running process. A reused PID has a
+/// different start time and is reported as exited.
+pub(crate) fn process_is_alive(identity: &ProcessIdentity) -> bool {
+    let mut system = System::new();
+    let pid = Pid::from_u32(identity.pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system
+        .process(pid)
+        .is_some_and(|process| process.start_time() == identity.start_time_secs)
 }
 
 #[derive(Debug, Clone)]
@@ -45,27 +61,39 @@ struct ProcessSnapshot {
 fn build_process_chain(
     start_pid: u32,
     mut inspect: impl FnMut(u32) -> Option<ProcessSnapshot>,
-) -> Vec<ProcessIdentity> {
+) -> (Vec<ProcessIdentity>, bool) {
     if start_pid == 0 {
-        return Vec::new();
+        return (Vec::new(), true);
     }
 
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
     let mut current = start_pid;
 
-    while chain.len() < MAX_PROCESS_CHAIN_DEPTH && seen.insert(current) {
+    // A fixed depth would misclassify agents launched through deep wrapper
+    // chains. A PID seen twice would belong to different observations, not a
+    // valid lineage; stop before crossing that inconsistent boundary.
+    while seen.insert(current) {
         let Some(snapshot) = inspect(current) else {
-            break;
+            return (chain, true);
         };
+        if chain.last().is_some_and(|child: &ProcessIdentity| {
+            child.start_time_secs != 0
+                && snapshot.identity.start_time_secs != 0
+                && snapshot.identity.start_time_secs > child.start_time_secs
+        }) {
+            // A real parent cannot have started after its child. The PID was
+            // likely reused between our per-process reads.
+            return (chain, true);
+        }
         chain.push(snapshot.identity);
         let Some(parent) = snapshot.parent_pid.filter(|parent| *parent != 0) else {
-            break;
+            return (chain, false);
         };
         current = parent;
     }
 
-    chain
+    (chain, true)
 }
 
 #[cfg(test)]
@@ -93,7 +121,8 @@ mod tests {
             (10, snapshot(10, None)),
         ]);
 
-        let chain = build_process_chain(30, |pid| processes.get(&pid).cloned());
+        let (chain, truncated) = build_process_chain(30, |pid| processes.get(&pid).cloned());
+        assert!(!truncated);
 
         assert_eq!(
             chain
@@ -108,7 +137,8 @@ mod tests {
     fn returns_available_prefix_when_an_ancestor_disappears() {
         let processes = HashMap::from([(30, snapshot(30, Some(20)))]);
 
-        let chain = build_process_chain(30, |pid| processes.get(&pid).cloned());
+        let (chain, truncated) = build_process_chain(30, |pid| processes.get(&pid).cloned());
+        assert!(truncated);
 
         assert_eq!(
             chain
@@ -120,9 +150,10 @@ mod tests {
     }
 
     #[test]
-    fn stops_at_cycles_and_depth_limit() {
+    fn stops_at_inconsistent_parentage_and_walks_past_arbitrary_wrapper_depth() {
         let cycle = HashMap::from([(30, snapshot(30, Some(20))), (20, snapshot(20, Some(30)))]);
-        let chain = build_process_chain(30, |pid| cycle.get(&pid).cloned());
+        let (chain, truncated) = build_process_chain(30, |pid| cycle.get(&pid).cloned());
+        assert!(truncated);
         assert_eq!(
             chain
                 .iter()
@@ -131,8 +162,34 @@ mod tests {
             vec![30, 20]
         );
 
-        let chain = build_process_chain(1, |pid| snapshot(pid, Some(pid + 1)).into());
-        assert_eq!(chain.len(), MAX_PROCESS_CHAIN_DEPTH);
+        let replaced_parent = HashMap::from([
+            (30, snapshot(30, Some(20))),
+            (
+                20,
+                ProcessSnapshot {
+                    identity: ProcessIdentity {
+                        pid: 20,
+                        start_time_secs: 400,
+                    },
+                    parent_pid: Some(10),
+                },
+            ),
+        ]);
+        let (chain, truncated) = build_process_chain(30, |pid| replaced_parent.get(&pid).cloned());
+        assert!(truncated);
+        assert_eq!(chain.len(), 1, "do not traverse a newer reused parent PID");
+
+        let (chain, truncated) = build_process_chain(1, |pid| {
+            (pid <= 128).then(|| ProcessSnapshot {
+                identity: ProcessIdentity {
+                    pid,
+                    start_time_secs: 1_000 - u64::from(pid),
+                },
+                parent_pid: (pid < 128).then_some(pid + 1),
+            })
+        });
+        assert!(!truncated);
+        assert_eq!(chain.len(), 128);
     }
 
     #[test]

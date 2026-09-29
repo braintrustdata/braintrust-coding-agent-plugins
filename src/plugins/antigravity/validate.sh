@@ -24,6 +24,7 @@ with open(sys.argv[1]) as f:
     hooks = json.load(f)["braintrust-antigravity-tracing"]
 
 expected = {
+    "PreToolUse": "PreToolUse",
     "PostToolUse": "PostToolUse",
     "PreInvocation": "PreInvocation",
     "PostInvocation": "PostInvocation",
