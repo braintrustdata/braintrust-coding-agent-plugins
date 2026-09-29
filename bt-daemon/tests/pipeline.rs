@@ -45,13 +45,16 @@ struct TrackingSink {
     flushes: Arc<Mutex<HashMap<String, usize>>>,
 }
 
-struct SlowSink;
+/// Holds every emit, for every route, until the test releases delivery.
+struct HeldSink {
+    released: tokio::sync::watch::Receiver<bool>,
+}
 
 #[async_trait]
-impl Sink for SlowSink {
+impl Sink for HeldSink {
     fn configure(&mut self, _config: &SessionConfig) {}
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = self.released.wait_for(|released| *released).await;
         Ok(ops.len() as u64)
     }
     async fn flush(&mut self) -> anyhow::Result<()> {
@@ -59,11 +62,15 @@ impl Sink for SlowSink {
     }
 }
 
-struct SlowSinkFactory;
+struct HeldSinkFactory {
+    released: tokio::sync::watch::Receiver<bool>,
+}
 
-impl SinkFactory for SlowSinkFactory {
+impl SinkFactory for HeldSinkFactory {
     fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
-        Ok(Box::new(SlowSink))
+        Ok(Box::new(HeldSink {
+            released: self.released.clone(),
+        }))
     }
 }
 
@@ -478,14 +485,20 @@ async fn start_tracking_daemon(
     (socket, handle, flushes, tmp)
 }
 
-async fn start_slow_daemon() -> (PathBuf, tokio::task::JoinHandle<()>, tempfile::TempDir) {
+async fn start_held_daemon() -> (
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+    tokio::sync::watch::Sender<bool>,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
+    let (release, released) = tokio::sync::watch::channel(false);
     let opts = ServeOptions {
         version: "test".into(),
         translators: Arc::new(Registry::default_agents()),
-        sink_factory: Arc::new(SlowSinkFactory),
+        sink_factory: Arc::new(HeldSinkFactory { released }),
         auth_provider: Some(Arc::new(TestAuthProvider {
             calls: Mutex::new(Vec::new()),
             fail: false,
@@ -502,7 +515,7 @@ async fn start_slow_daemon() -> (PathBuf, tokio::task::JoinHandle<()>, tempfile:
         let _ = run_serve(args, opts).await;
     });
     wait_for(&socket).await;
-    (socket, handle, tmp)
+    (socket, handle, tmp, release)
 }
 
 async fn start_gated_daemon(
@@ -1360,7 +1373,10 @@ async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
 
 #[tokio::test]
 async fn hook_capture_stops_at_the_durable_journal_boundary() {
-    let (socket, handle, tmp) = start_slow_daemon().await;
+    // Delivery stays held until the end of the test, so a hook that waited
+    // for translation or flushing would never return. The timeout only bounds
+    // that failure; it does not race the hook against the sink.
+    let (socket, handle, tmp, release) = start_held_daemon().await;
     let host = dummy_host();
     forward_envelope(
         &envelope("fast-capture", "SessionStart", 1),
@@ -1370,12 +1386,11 @@ async fn hook_capture_stops_at_the_durable_journal_boundary() {
     )
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(25)).await;
 
     let mut turn_end = envelope("fast-capture", "Stop", 2);
     turn_end.route.as_mut().unwrap().flush_mode = bt_daemon::wire::FlushMode::FlushOnTurnEnd;
     let accepted = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(10),
         forward_envelope(&turn_end, &socket, &host, false),
     )
     .await;
@@ -1394,6 +1409,7 @@ async fn hook_capture_stops_at_the_durable_journal_boundary() {
         2,
         "hook returned before journaling"
     );
+    release.send_replace(true);
     shutdown(&socket).await;
     handle.await.unwrap();
 }

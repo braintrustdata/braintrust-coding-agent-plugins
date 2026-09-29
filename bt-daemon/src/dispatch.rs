@@ -1009,7 +1009,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // Paused time orders the late write between hydration passes
+    // deterministically; wall-clock sleeps race on coarse Windows timers.
+    #[tokio::test(start_paused = true)]
     async fn terminal_grok_hydration_waits_for_a_stable_transcript_boundary() {
         let tmp = tempfile::tempdir().unwrap();
         let session = tmp.path().join("native-session");
