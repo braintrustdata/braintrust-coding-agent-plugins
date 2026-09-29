@@ -183,6 +183,43 @@ mod tests {
                 0o700
             );
         }
+        #[cfg(windows)]
+        {
+            use crate::win_acl::test_support::{
+                assert_only_owner_access, assert_owner_only, path_dacl_sddl,
+            };
+            assert_owner_only(&path_dacl_sddl(&nested), true);
+            // Later starts recognize the DACL and skip re-propagating it.
+            assert!(crate::win_acl::is_owner_only(&nested, true).unwrap());
+            let child = nested.join("journal.jsonl");
+            std::fs::write(&child, "{}").unwrap();
+            assert_only_owner_access(&path_dacl_sddl(&child));
+        }
+    }
+
+    /// A directory ACL does not stop Windows users from opening the files
+    /// beneath it, so existing children must lose access inherited from a
+    /// shared parent.
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_revokes_access_children_inherited_from_a_shared_parent() {
+        use crate::win_acl::test_support::{
+            assert_only_owner_access, assert_owner_only, path_dacl_sddl, set_sddl,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        set_sddl(&shared, "D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;WD)");
+        let data = shared.join("bt-daemon");
+        std::fs::create_dir(&data).unwrap();
+        let child = data.join("journal.jsonl");
+        std::fs::write(&child, "{}").unwrap();
+        assert!(path_dacl_sddl(&child).contains(";WD)"));
+
+        ensure_private_dir(&data).unwrap();
+
+        assert_owner_only(&path_dacl_sddl(&data), true);
+        assert_only_owner_access(&path_dacl_sddl(&child));
     }
 
     #[test]

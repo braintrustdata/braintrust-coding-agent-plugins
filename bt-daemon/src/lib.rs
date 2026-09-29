@@ -32,6 +32,8 @@ mod transcript_import;
 mod transcript_mirror;
 mod translate;
 mod transport;
+#[cfg(windows)]
+mod win_acl;
 
 pub mod wire;
 pub use client::HostInfo;

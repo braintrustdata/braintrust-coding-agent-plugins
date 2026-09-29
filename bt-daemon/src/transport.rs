@@ -192,3 +192,26 @@ pub(crate) fn cleanup(endpoint: &Path) {
 
 #[cfg(windows)]
 pub(crate) fn cleanup(_endpoint: &Path) {}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::win_acl::test_support::{assert_owner_only, handle_dacl_sddl};
+    use std::os::windows::io::AsRawHandle;
+
+    #[tokio::test]
+    async fn named_pipe_instances_are_private_to_the_owner() {
+        let endpoint = std::path::PathBuf::from(format!(
+            r"\\.\pipe\bt-daemon-acl-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut listener = claim(&endpoint, || async { false }).await.unwrap().unwrap();
+        assert_owner_only(&handle_dacl_sddl(listener.next.as_raw_handle()), false);
+
+        // The owner can still connect, and the replacement instance `accept`
+        // installs for the next client is private as well.
+        let _client = connect(&endpoint).await.unwrap();
+        let _server = listener.accept().await.unwrap();
+        assert_owner_only(&handle_dacl_sddl(listener.next.as_raw_handle()), false);
+    }
+}

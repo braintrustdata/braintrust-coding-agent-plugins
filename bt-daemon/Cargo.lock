@@ -278,9 +278,9 @@ dependencies = [
  "fs2",
  "regex",
  "reqwest",
- "semver",
  "rquickjs",
  "rquickjs-serde",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -291,6 +291,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
  "wiremock",
  "zstd",
 ]

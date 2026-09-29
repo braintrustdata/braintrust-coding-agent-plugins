@@ -1675,6 +1675,39 @@ mod tests {
     }
 
     #[test]
+    fn tracing_settings_are_private_to_the_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("braintrust.json");
+        std::fs::write(&path, "{}").unwrap();
+        // Simulate a configuration directory other users can read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(windows)]
+        crate::win_acl::test_support::set_sddl(&config, "D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;WD)");
+
+        enable_tracing_at(&path, SessionRoute::default()).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        {
+            use crate::win_acl::test_support::{assert_owner_only, path_dacl_sddl};
+            assert_owner_only(&path_dacl_sddl(&path), false);
+        }
+    }
+
+    #[test]
     fn tracing_settings_preserve_plugins_until_setup_explicitly_replaces_them() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("braintrust.json");

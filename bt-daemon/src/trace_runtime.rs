@@ -1315,17 +1315,41 @@ mod tests {
         daemon.stop().await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn doctor_reports_an_endpoint_it_cannot_open_as_unreachable() {
-        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("d.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-            return; // Running as root bypasses socket permissions.
-        }
+        let socket = test_endpoint(temp.path());
+        #[cfg(unix)]
+        let _listener = {
+            use std::os::unix::fs::PermissionsExt;
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                return; // Running as root bypasses socket permissions.
+            }
+            listener
+        };
+        // Like another user's daemon: a pipe only SYSTEM may open.
+        #[cfg(windows)]
+        let _listener = {
+            use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+            let descriptor =
+                crate::win_acl::SecurityDescriptor::from_sddl("D:P(A;;FA;;;SY)").unwrap();
+            let mut attributes = descriptor.attributes();
+            let listener = unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create_with_security_attributes_raw(
+                        &socket,
+                        std::ptr::addr_of_mut!(attributes).cast(),
+                    )
+            }
+            .unwrap();
+            if ClientOptions::new().open(&socket).is_ok() {
+                return; // Running as SYSTEM.
+            }
+            listener
+        };
 
         let output = doctor_output_at(
             &test_host(Arc::new(RecordingHost::new(None, None))),
