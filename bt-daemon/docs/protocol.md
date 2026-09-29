@@ -111,11 +111,16 @@ The hot path. Params are the **Envelope** (see below). Request result:
 `accepted: true` means the raw capture is durably recorded in the source
 journal. It does not mean authentication, correlation, translation, session
 queueing, or Braintrust delivery has completed. Those steps run out-of-band;
-errors are surfaced via `status.get`. A child that arrives before its parent's
-tool marker is translated is held in durable pending-correlation state and
-reconciled by the daemon. On restart, uncheckpointed journal entries are queued
-again automatically. Explicit status and flush requests act as daemon-worker
-barriers, but hook capture never does.
+errors are surfaced via `status.get`. Before correlating a new session, the
+daemon settles previously dispatched parent events. Command-hook correlation
+may briefly hold events while a second distinct hook identifies the agent
+process. This discovery window ends after five seconds or three events, whichever
+comes first; insufficient evidence falls back to the original standalone route.
+A timer enforces the deadline even if no further events arrive. Pending
+sessions remain visible in status with a nonzero `queued` count and an
+explanation in `last_error`. On restart, uncheckpointed journal entries are
+queued again automatically. Explicit status and flush requests act as
+daemon-worker barriers, but hook capture never does.
 
 During version handover, the draining daemon returns `{ "accepted": false }`.
 The client waits for the replacement daemon, initializes a new connection, and
@@ -140,6 +145,11 @@ Result:
 outstanding across one or more routes. `accepted_sessions` counts how many
 independent routes this session_id has open. Used by session-end hooks and
 flush-on-turn-end mode.
+
+Explicit session and managed-run flushes resolve any remaining parent discovery
+for their target sessions to standalone before flushing delivery. They cannot
+report successful empty work merely because correlation has not created an
+actor yet. Graceful shutdown also drains pending discovery as standalone.
 
 ### `managed_run.flush` (request)
 
@@ -261,21 +271,46 @@ span so the daemon build that performed translation can be queried separately.
   `bt trace run` process tree. It groups native sessions for the final
   invocation flush and is not trace metadata.
 - **`capture`** is optional daemon-owned process evidence. After
-  `initialize`, the daemon snapshots the connecting client's PID and bounded
+  `initialize`, the daemon snapshots the connecting client's PID and
   ancestry as PID/start-time pairs and adds it before journaling. Hooks do not
   construct this field and it contains no command line, environment, or
-  working-directory data. The daemon uses it as a local side channel to attach
-  an instrumented child session to an active parent tool span; agent-native
-  input and output payloads are reduced to hashes only when more than one
-  active call is a candidate. For Codex, whose hook payload references its
-  rollout rather than embedding the prompt, matching also considers at most
-  the final 256 KiB of native JSONL records. Active parent-tool state is
-  atomically snapshotted under `<data_dir>/correlation/parents` before a
-  blocking tool lifecycle hook is acknowledged. The compact snapshot contains
-  only process identities, span attachment components, non-secret routing, and
-  hashed matching fingerprints. It contains no raw prompt, tool input/output,
-  command line, environment, or resolved credential, and lets a child attach
-  even if the daemon restarts between the parent spawn and child session start.
+  working-directory data. Command hooks use two distinct captures within one
+  native session-start generation to identify their nearest stable agent process;
+  in-process adapters identify their own process directly. A resumed session
+  relearns its process without changing already-decided parentage; its
+  previous agent stays registered until the replacement is confirmed, so a
+  compaction in the same process does not interrupt linkage. Retiring an idle
+  pipeline keeps its agent registered until that process exits.
+
+  Only a registered agent process in the child's strict ancestry can provide
+  an automatic parent. A shared shell or SSH service is not evidence of
+  parenthood. The nearest registered agent is a hard boundary: if multiple
+  open native sessions share it, the child stays standalone. Independent delivery
+  routes for the same `(source, session_id)` count as one native session. Exactly
+  one of its open routes must be compatible with the child's profile, organization,
+  and destination; zero or multiple compatible routes leave the child standalone.
+  Sessions whose root span has ended and that have no open tools do not count.
+  Within the selected route, one open tool is selected; concurrent tools fall
+  back to the active session span. No prompt, output, executable name, or timing
+  heuristic chooses a tool.
+  The candidate is frozen at the first observation; later tool completion cannot
+  select a replacement. Missing initial evidence stays standalone rather than
+  reconsidering an already delivered trace.
+
+  Explicit parent spans take precedence. Automatic linking cannot override a
+  different profile, organization, or destination, and retains the child's
+  metadata, tags, span plugins, and flush mode. Native subagent relationships
+  remain the responsibility of each translator and do not use this fallback.
+
+  Active parent state is snapshotted under `<data_dir>/correlation/parents`
+  by the session actor. Version 4 snapshots contain process identities, span
+  attachment components, and non-secret routing, not payload fingerprints.
+  Earlier parent snapshots are not trusted. An unversioned link that was
+  already decided is kept, because its earlier rows are already in that
+  parent's trace. Legacy undecided events recover under their original routes
+  as standalone;
+  current pending state preserves the original discovery deadline across
+  restart. This does not delete previously uploaded misattributed spans.
 - **`route`** carries non-secret auth selection and trace settings. `profile`
   is optional and resolves through `bt`'s default profile when absent;
   `org_name` optionally constrains organization selection. The daemon resolves
