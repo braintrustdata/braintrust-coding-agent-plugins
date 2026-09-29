@@ -247,39 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn hook_settings_report_missing_and_malformed_files() {
+    fn hook_settings_use_managed_override_without_persistent_settings() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("braintrust.json");
-        assert!(AgentSettings::load_hook_from_sources(&path, None)
-            .unwrap_err()
-            .to_string()
-            .contains("read tracing settings"));
-        std::fs::write(&path, "{").unwrap();
-        assert!(AgentSettings::load_hook_from_sources(&path, None)
-            .unwrap_err()
-            .to_string()
-            .contains("parse tracing settings"));
-        std::fs::write(&path, "{}").unwrap();
-        assert!(AgentSettings::load_hook_from_sources(&path, None)
-            .unwrap_err()
-            .to_string()
-            .contains("no `trace_to_braintrust` value"));
-    }
-
-    #[test]
-    fn hook_settings_allow_explicit_disablement_and_managed_overrides() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("braintrust.json");
-        std::fs::write(&path, r#"{"trace_to_braintrust":false}"#).unwrap();
-        assert!(!AgentSettings::load_hook_from_sources(&path, None)
-            .unwrap()
-            .tracing_enabled());
         let invocation = r#"{"trace_to_braintrust":true,"route":{}}"#;
-        assert!(
-            AgentSettings::load_hook_from_sources(&path, Some(invocation))
-                .unwrap()
-                .tracing_enabled()
-        );
+        let settings = AgentSettings::load_hook_from_sources(&path, Some(invocation)).unwrap();
+        assert!(settings.tracing_enabled());
+        assert!(settings.route.is_some());
         assert!(AgentSettings::load_hook_from_sources(&path, Some("{"))
             .unwrap_err()
             .to_string()

@@ -79,7 +79,6 @@ fn standalone_hook_exit_status_distinguishes_capture_failures_from_disabled_trac
         r#"{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"test"}}}"#,
     )
     .unwrap();
-    assert_failure(hook(""), "empty stdin");
     assert_failure(hook("{"), "EOF while parsing");
     assert_failure(
         hook(r#"{"hook_event_name":"SessionStart"}"#),

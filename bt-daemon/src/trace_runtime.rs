@@ -1035,10 +1035,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn hook_host_failures_are_reported() {
-        let services = Arc::new(RecordingHost::new(Some("route unavailable"), None));
-        let args = crate::HookArgs {
+    fn hook_args() -> crate::HookArgs {
+        crate::HookArgs {
             source: "codex".into(),
             source_version: None,
             plugin_version: None,
@@ -1052,13 +1050,20 @@ mod tests {
             flush_timeout_ms: 10_000,
             additional_metadata: None,
             managed_run_hook: false,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_host_failures_are_reported() {
+        let services = Arc::new(RecordingHost::new(Some("route unavailable"), None));
         let host = test_host(services.clone());
         let settings = crate::settings::AgentSettings {
             trace_to_braintrust: Some(true),
             route: None,
         };
-        let error = run_hook_command(args, &host, settings).await.unwrap_err();
+        let error = run_hook_command(hook_args(), &host, settings)
+            .await
+            .unwrap_err();
         assert_eq!(error.to_string(), "route unavailable");
         assert_eq!(
             *services.route_requests.lock().unwrap(),
@@ -1068,26 +1073,11 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_hook_skips_host_resolution() {
-        let args = crate::HookArgs {
-            source: "codex".into(),
-            source_version: None,
-            plugin_version: None,
-            socket: None,
-            session_id_field: "session_id".into(),
-            event_field: "hook_event_name".into(),
-            event: None,
-            transcript_path_field: None,
-            no_spawn: false,
-            flush_on_turn_end: false,
-            flush_timeout_ms: 10_000,
-            additional_metadata: None,
-            managed_run_hook: false,
-        };
         let settings = crate::settings::AgentSettings {
             trace_to_braintrust: Some(false),
             route: None,
         };
-        run_hook_command(args, &test_host(Arc::new(PanicHost)), settings)
+        run_hook_command(hook_args(), &test_host(Arc::new(PanicHost)), settings)
             .await
             .unwrap();
     }
