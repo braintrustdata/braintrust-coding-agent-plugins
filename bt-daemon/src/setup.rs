@@ -506,11 +506,31 @@ fn load_object(path: &Path) -> anyhow::Result<Map<String, Value>> {
     }
 }
 
-fn write_object_atomic(path: &Path, object: Map<String, Value>) -> anyhow::Result<()> {
-    crate::settings::with_settings_lock(path, || write_object_atomic_unlocked(path, object))
+/// Whether an atomic replacement keeps the directory's inherited access or is
+/// restricted to the current user before it is written and published.
+#[derive(Clone, Copy)]
+enum FileAccess {
+    Inherited,
+    OwnerOnly,
 }
 
-fn write_object_atomic_unlocked(path: &Path, object: Map<String, Value>) -> anyhow::Result<()> {
+fn write_object_atomic(path: &Path, object: Map<String, Value>) -> anyhow::Result<()> {
+    write_object_atomic_with(path, object, FileAccess::Inherited)
+}
+
+fn write_object_atomic_with(
+    path: &Path,
+    object: Map<String, Value>,
+    access: FileAccess,
+) -> anyhow::Result<()> {
+    crate::settings::with_settings_lock(path, || write_object_atomic_unlocked(path, object, access))
+}
+
+fn write_object_atomic_unlocked(
+    path: &Path,
+    object: Map<String, Value>,
+    access: FileAccess,
+) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("configuration path has no parent: {}", path.display()))?;
@@ -524,6 +544,12 @@ fn write_object_atomic_unlocked(path: &Path, object: Map<String, Value>) -> anyh
     encoded.push('\n');
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+    if let FileAccess::OwnerOnly = access {
+        // Protect the replacement before it holds content or takes the
+        // target's place; on failure the previous file stays untouched.
+        paths::restrict_file_to_owner(temporary.path())
+            .with_context(|| format!("failed to protect {}", path.display()))?;
+    }
     temporary.write_all(encoded.as_bytes()).with_context(|| {
         format!(
             "failed to write temporary configuration for {}",
@@ -829,10 +855,8 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
     ] {
         settings.remove(key);
     }
-    write_object_atomic(path, settings)?;
-    paths::restrict_file_to_owner(path)
-        .with_context(|| format!("failed to protect agent settings: {}", path.display()))?;
-    Ok(())
+    write_object_atomic_with(path, settings, FileAccess::OwnerOnly)
+        .with_context(|| format!("failed to write agent settings: {}", path.display()))
 }
 
 fn enable_tracing(source: &str, route: SessionRoute) -> anyhow::Result<PathBuf> {
