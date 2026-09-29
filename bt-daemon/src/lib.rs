@@ -1251,7 +1251,7 @@ async fn import_transcript_with_ledger(
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
-    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut finalizing = !attach;
@@ -1295,7 +1295,7 @@ async fn import_transcripts_with_ledger(
     config: Option<SessionConfig>,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
-    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
     let mut summaries = Vec::new();
     for file in files {
         let mut tail = transcript_import::TranscriptTail::new(file.clone(), source);
@@ -1337,13 +1337,22 @@ struct ImportProcessor {
 }
 
 impl ImportProcessor {
-    fn new(opts: ServeOptions, config: Option<SessionConfig>, ledger_dir: Option<PathBuf>) -> Self {
-        Self {
+    /// Without a daemon, import is the entry point that creates the ledger's
+    /// data directory, so it must make that directory private itself.
+    fn new(
+        opts: ServeOptions,
+        config: Option<SessionConfig>,
+        ledger_dir: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        if let Some(dir) = &ledger_dir {
+            paths::ensure_private_dir(dir)?;
+        }
+        Ok(Self {
             sessions: std::collections::HashMap::new(),
             opts,
             config,
             ledger_dir,
-        }
+        })
     }
 
     async fn process(&mut self, entries: Vec<Envelope>) -> anyhow::Result<()> {

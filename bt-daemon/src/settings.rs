@@ -164,6 +164,9 @@ fn write_json_atomic(path: &Path, settings: &Map<String, Value>) -> anyhow::Resu
     let mut encoded = serde_json::to_string_pretty(&Value::Object(settings.clone()))?;
     encoded.push('\n');
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    // Protect the replacement before it takes the settings file's place;
+    // otherwise it would carry the directory's inherited access.
+    paths::restrict_file_to_owner(temporary.path())?;
     temporary.write_all(encoded.as_bytes())?;
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
