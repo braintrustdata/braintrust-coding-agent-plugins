@@ -101,6 +101,49 @@ pub struct AuthDiagnostic {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonStatus {
+    Running,
+    #[default]
+    NotRunning,
+    Unreachable,
+}
+
+/// What the running daemon, rather than the doctor's own process, sees. The
+/// two can read different credential stores or environments.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DaemonDiagnostic {
+    pub status: DaemonStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The daemon's own resolution of the route's credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthDiagnostic>,
+    /// Distinct latest errors the daemon recorded for this agent's sessions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub session_errors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl DaemonDiagnostic {
+    /// ` (<version>)` when the daemon reported one.
+    pub fn version_suffix(&self) -> String {
+        self.version
+            .as_deref()
+            .map(|version| format!(" ({version})"))
+            .unwrap_or_default()
+    }
+
+    /// The daemon answered and could not authenticate the route.
+    pub fn auth_failed(&self) -> bool {
+        self.auth
+            .as_ref()
+            .is_some_and(|auth| auth.status == "error")
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorCommandOutput {
     pub source: String,
@@ -112,6 +155,7 @@ pub struct DoctorCommandOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<SessionRoute>,
     pub auth: AuthDiagnostic,
+    pub daemon: DaemonDiagnostic,
     pub warnings: Vec<String>,
     pub plugin_diagnostics: Vec<crate::PluginDiagnostic>,
 }
@@ -202,24 +246,30 @@ impl TraceCommandOutput {
                     .transpose()?
                     .unwrap_or_else(|| "(unresolved)".into());
                 let mut rendered = format!(
-                    "Braintrust tracing doctor: {}\nEnabled: {}\nSettings: {}{}\nRoute source: {}\nRoute: {}\nAuth: {} ({})",
+                    "Braintrust tracing doctor: {}\nEnabled: {}\nSettings: {}{}\nRoute source: {}\nRoute: {}",
                     doctor.display_name,
                     doctor.enabled,
                     doctor.settings_path.display(),
                     if doctor.settings_present { "" } else { " (missing)" },
                     doctor.route_source,
                     route,
-                    doctor.auth.status,
-                    doctor.auth.source,
                 );
-                if let Some(profile) = &doctor.auth.profile {
-                    rendered.push_str(&format!("\nProfile: {profile}"));
+                push_auth_lines(&mut rendered, "", &doctor.auth);
+                let daemon = &doctor.daemon;
+                let status = match daemon.status {
+                    DaemonStatus::Running => "running",
+                    DaemonStatus::NotRunning => "not running",
+                    DaemonStatus::Unreachable => "unreachable",
+                };
+                rendered.push_str(&format!("\nDaemon: {status}{}", daemon.version_suffix()));
+                if let Some(error) = &daemon.error {
+                    rendered.push_str(&format!("\nDaemon error: {error}"));
                 }
-                if let Some(org_name) = &doctor.auth.org_name {
-                    rendered.push_str(&format!("\nOrganization: {org_name}"));
+                if let Some(auth) = &daemon.auth {
+                    push_auth_lines(&mut rendered, "Daemon ", auth);
                 }
-                if let Some(error) = &doctor.auth.error {
-                    rendered.push_str(&format!("\nAuth error: {error}"));
+                for error in &daemon.session_errors {
+                    rendered.push_str(&format!("\nDaemon session error: {error}"));
                 }
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
@@ -273,6 +323,32 @@ impl TraceCommandOutput {
                 })
                 .collect::<Vec<_>>()
                 .join("\n")),
+        }
+    }
+}
+
+/// Render one auth view; `prefix` distinguishes the daemon's from the local.
+fn push_auth_lines(rendered: &mut String, prefix: &str, auth: &AuthDiagnostic) {
+    let label = |name: &str| {
+        if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}{}", name.to_lowercase())
+        }
+    };
+    rendered.push_str(&format!(
+        "\n{}: {} ({})",
+        label("Auth"),
+        auth.status,
+        auth.source
+    ));
+    for (name, value) in [
+        ("Profile", &auth.profile),
+        ("Organization", &auth.org_name),
+        ("Auth error", &auth.error),
+    ] {
+        if let Some(value) = value {
+            rendered.push_str(&format!("\n{}: {value}", label(name)));
         }
     }
 }
@@ -443,6 +519,21 @@ mod tests {
                 expires_at_ms: Some(123),
                 error: None,
             },
+            daemon: DaemonDiagnostic {
+                status: DaemonStatus::Running,
+                version: Some("1.2.3".into()),
+                auth: Some(AuthDiagnostic {
+                    status: "error".into(),
+                    source: "saved_profile".into(),
+                    kind: None,
+                    profile: None,
+                    org_name: None,
+                    expires_at_ms: None,
+                    error: Some("saved profile ID 'p' no longer exists".into()),
+                }),
+                session_errors: vec!["could not resolve Braintrust auth for codex".into()],
+                error: None,
+            },
             warnings: Vec::new(),
             plugin_diagnostics: vec![crate::PluginDiagnostic {
                 source: "codex".into(),
@@ -458,6 +549,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["command"], "doctor");
         assert_eq!(value["auth"]["source"], "saved_profile");
+        assert_eq!(value["daemon"]["status"], "running");
+        assert_eq!(value["daemon"]["auth"]["status"], "error");
+        assert_eq!(
+            value["daemon"]["session_errors"][0],
+            "could not resolve Braintrust auth for codex"
+        );
         assert!(!rendered.contains("token"));
         assert!(!rendered.contains("api_key"));
         assert_eq!(

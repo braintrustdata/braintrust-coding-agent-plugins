@@ -8,10 +8,10 @@ use crate::sink::SinkFactory;
 use crate::translate::Registry;
 use crate::transport::{self, Listener, ServerStream};
 use crate::wire::{
-    error_code, method, Capabilities, ClientInfo, Envelope, EventLogResult, FlushParams,
-    FlushResult, InitializeParams, InitializeResult, ManagedRunFlushParams, Message, Request,
-    Response, RpcError, SessionStatus, ShutdownResult, StatusParams, StatusResult,
-    PROTOCOL_VERSION,
+    error_code, method, AuthDiagnoseParams, AuthDiagnoseResult, Capabilities, ClientInfo, Envelope,
+    EventLogResult, FlushParams, FlushResult, InitializeParams, InitializeResult,
+    ManagedRunFlushParams, Message, Request, Response, RpcError, SessionStatus, ShutdownResult,
+    StatusParams, StatusResult, PROTOCOL_VERSION,
 };
 use crate::wire::{AuthSelection, BackendAuth, SessionRoute};
 use crate::{paths, ServeArgs};
@@ -282,15 +282,19 @@ impl Daemon {
             }
         };
 
-        let lease = provider.resolve(&selection, reason).await.map_err(|error| {
+        let lease = resolve_route_auth(
+            provider.as_ref(),
+            &selection,
+            reason,
+            requested_route.auth.org_name.as_deref(),
+        )
+        .await
+        .map_err(|error| {
             let message = format!(
                 "could not resolve Braintrust auth for {}: {error}; run `bt login` or select a profile explicitly",
                 env.source
             );
-            self.auth_errors.lock().unwrap().insert(
-                key.clone(),
-                (env.source.clone(), message.clone()),
-            );
+            self.record_auth_error(&key, &env.source, message.clone());
             anyhow::anyhow!(message)
         })?;
         if let Some(expected) = expected_selection {
@@ -298,16 +302,6 @@ impl Daemon {
                 anyhow::bail!(
                     "credential refresh changed auth selection from {expected:?} to {:?}",
                     lease.selection
-                );
-            }
-        }
-        if let Some(expected_org) = requested_route.auth.org_name.as_deref() {
-            if lease.auth.org_name.as_deref() != Some(expected_org) {
-                anyhow::bail!(
-                    "profile {:?} resolved organization {:?}, expected {:?}",
-                    lease.selection,
-                    lease.auth.org_name,
-                    expected_org
                 );
             }
         }
@@ -341,6 +335,46 @@ impl Daemon {
             .insert(canonical_key.clone(), SessionAuthState { route, lease });
         self.auth_errors.lock().unwrap().remove(&canonical_key);
         Ok(canonical_key)
+    }
+
+    /// Keep a route's auth failure visible to `status.get` until it succeeds.
+    fn record_auth_error(&self, key: &DeliveryKey, source: &str, message: String) {
+        self.auth_errors
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (source.to_string(), message));
+    }
+
+    /// Resolve a route's credentials exactly as event delivery would, so
+    /// diagnostics see this process's credential store and environment rather
+    /// than the caller's.
+    async fn diagnose_auth(&self, selection: AuthSelection) -> AuthDiagnoseResult {
+        let result = match &self.auth_provider {
+            Some(provider) => {
+                resolve_route_auth(
+                    provider.as_ref(),
+                    &selection,
+                    AuthResolveReason::Initial,
+                    selection.org_name.as_deref(),
+                )
+                .await
+            }
+            None => Err(anyhow::anyhow!(
+                "daemon host has no Braintrust auth provider"
+            )),
+        };
+        match result {
+            Ok(lease) => AuthDiagnoseResult {
+                selection: Some(lease.selection),
+                org_name: lease.auth.org_name,
+                expires_at_ms: lease.expires_at_ms,
+                error: None,
+            },
+            Err(error) => AuthDiagnoseResult {
+                error: Some(error.to_string()),
+                ..AuthDiagnoseResult::default()
+            },
+        }
     }
 
     async fn refresh_session_before_flush(&self, key: &DeliveryKey) -> anyhow::Result<()> {
@@ -1965,6 +1999,13 @@ async fn handle_request(
             daemon.settle_ingress().await;
             Response::ok(id, serde_json::to_value(daemon.status(p)).unwrap())
         }
+        method::AUTH_DIAGNOSE => {
+            let p = parse!(AuthDiagnoseParams);
+            Response::ok(
+                id,
+                serde_json::to_value(daemon.diagnose_auth(p.auth).await).unwrap(),
+            )
+        }
         method::DAEMON_SHUTDOWN => {
             if !client_may_shutdown(client.as_ref(), &daemon.version) {
                 return Response::ok(
@@ -1986,6 +2027,28 @@ async fn handle_request(
             ),
         ),
     }
+}
+
+/// Resolve a route's lease the way event delivery does, including the
+/// organization the route requires.
+pub(crate) async fn resolve_route_auth(
+    provider: &dyn AuthProvider,
+    selection: &AuthSelection,
+    reason: AuthResolveReason,
+    required_org: Option<&str>,
+) -> anyhow::Result<AuthLease> {
+    let lease = provider.resolve(selection, reason).await?;
+    if let Some(expected_org) = required_org {
+        if lease.auth.org_name.as_deref() != Some(expected_org) {
+            anyhow::bail!(
+                "profile {:?} resolved organization {:?}, expected {:?}",
+                lease.selection,
+                lease.auth.org_name,
+                expected_org
+            );
+        }
+    }
+    Ok(lease)
 }
 
 fn client_may_shutdown(client: Option<&ClientInfo>, daemon_version: &str) -> bool {

@@ -36,8 +36,8 @@ mod transport;
 pub mod wire;
 pub use client::HostInfo;
 pub use command_output::{
-    AuthDiagnostic, DoctorCommandOutput, ImportSummary, OutputFormat, SetupCommandOutput,
-    StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
+    AuthDiagnostic, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, ImportSummary,
+    OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
 };
 #[doc(hidden)]
 pub use journal::source_journal_path;
@@ -668,17 +668,12 @@ pub async fn flush_session(
 ) -> anyhow::Result<wire::FlushResult> {
     let stream = client::connect(socket).await?;
     let mut conn = client::Conn::new(stream);
-    conn.request(
-        method::INITIALIZE,
-        serde_json::json!({ "protocol_version": PROTOCOL_VERSION, "client": { "source": "flush" } }),
-    )
-    .await?;
+    conn.initialize("flush").await?;
     let params = wire::FlushParams {
         session_id: session_id.to_string(),
         timeout_ms,
     };
-    let value = conn.request(method::SESSION_FLUSH, params).await?;
-    Ok(serde_json::from_value(value)?)
+    conn.call(method::SESSION_FLUSH, params).await
 }
 
 /// Flush every daemon session accepted from one managed child process tree.
@@ -713,20 +708,12 @@ async fn flush_managed_run_in(
         }
     };
     let mut conn = client::Conn::new(stream);
-    conn.request(
-        method::INITIALIZE,
-        serde_json::json!({
-            "protocol_version": PROTOCOL_VERSION,
-            "client": { "source": "managed-run-flush" }
-        }),
-    )
-    .await?;
+    conn.initialize("managed-run-flush").await?;
     let params = ManagedRunFlushParams {
         managed_run_id: managed_run_id.to_string(),
         timeout_ms,
     };
-    let value = conn.request(method::MANAGED_RUN_FLUSH, params).await?;
-    Ok(serde_json::from_value(value)?)
+    conn.call(method::MANAGED_RUN_FLUSH, params).await
 }
 
 /// Query daemon status. `Ok(None)` means no daemon is running.
@@ -736,20 +723,18 @@ pub async fn run_status(args: StatusArgs) -> anyhow::Result<Option<StatusResult>
         Ok(s) => s,
         Err(_) => return Ok(None),
     };
+    Ok(Some(status_over(stream, args.session_id).await?))
+}
+
+/// Query status over an already-open daemon connection.
+pub(crate) async fn status_over(
+    stream: transport::ClientStream,
+    session_id: Option<String>,
+) -> anyhow::Result<StatusResult> {
     let mut conn = client::Conn::new(stream);
-    conn.request(
-        method::INITIALIZE,
-        serde_json::json!({
-            "protocol_version": PROTOCOL_VERSION,
-            "client": { "source": "status" }
-        }),
-    )
-    .await?;
-    let params = wire::StatusParams {
-        session_id: args.session_id.clone(),
-    };
-    let value = conn.request(method::STATUS_GET, params).await?;
-    Ok(Some(serde_json::from_value(value)?))
+    conn.initialize("status").await?;
+    conn.call(method::STATUS_GET, wire::StatusParams { session_id })
+        .await
 }
 
 /// Request a graceful daemon shutdown. Primarily useful for lifecycle

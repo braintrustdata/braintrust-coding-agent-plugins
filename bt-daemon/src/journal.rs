@@ -169,11 +169,7 @@ pub async fn legacy_journal_has_session(
         return false;
     };
     while let Ok(Some(entry)) = reader.next_entry().await {
-        let recorded_source = match entry.source.as_str() {
-            "claude" => "claude-code",
-            "open-code" => "opencode",
-            source => source,
-        };
+        let recorded_source = crate::translate::canonical_source_name(&entry.source);
         if entry.session_id == session_id {
             return recorded_source == canonical_source;
         }

@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_uses_shared_enable_disable_and_doctor_commands() {
+    fn grok_uses_shared_enable_and_disable_commands() {
         for command in ["enable", "setup"] {
             let parsed = Cli::try_parse_from(["bt", command, "grok"]).unwrap();
             assert!(matches!(
@@ -339,17 +339,6 @@ mod tests {
                 agent: SetupAgent::Grok
             })
         ));
-
-        let parsed = Cli::try_parse_from(["bt", "doctor", "grok"]).unwrap();
-        assert!(matches!(
-            parsed.trace.command,
-            TraceCommand::Doctor(DoctorArgs {
-                agent: DoctorAgent::Grok
-            })
-        ));
-
-        assert_eq!(DoctorAgent::Grok.source(), "grok");
-        assert_eq!(DoctorAgent::Grok.display_name(), "Grok");
     }
 
     #[test]

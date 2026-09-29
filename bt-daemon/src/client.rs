@@ -2,7 +2,9 @@
 //! JSON-RPC round-trips over the socket. Used by the `hook` and `status`
 //! entry points, and by tests.
 
-use crate::wire::{Message, Request, RequestId, Response};
+use crate::wire::{
+    method, InitializeResult, Message, Request, RequestId, Response, PROTOCOL_VERSION,
+};
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
@@ -18,6 +20,27 @@ pub struct HostInfo {
     pub serve_argv: Vec<OsString>,
     pub version: String,
 }
+
+/// A JSON-RPC error response from the daemon, kept typed so callers can tell
+/// an older daemon's unknown method apart from a failed call.
+#[derive(Debug)]
+pub struct RpcCallError {
+    pub method: String,
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rpc error {} on {}: {}",
+            self.code, self.method, self.message
+        )
+    }
+}
+
+impl std::error::Error for RpcCallError {}
 
 /// A framed JSON-RPC connection with request/response correlation.
 pub struct Conn {
@@ -64,11 +87,37 @@ impl Conn {
                     continue;
                 }
                 if let Some(err) = error {
-                    anyhow::bail!("rpc error {} on {method}: {}", err.code, err.message);
+                    return Err(RpcCallError {
+                        method: method.to_string(),
+                        code: err.code,
+                        message: err.message,
+                    }
+                    .into());
                 }
                 return Ok(result.unwrap_or(serde_json::Value::Null));
             }
         }
+    }
+
+    /// Send a request and decode its result.
+    pub async fn call<R: serde::de::DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: impl serde::Serialize,
+    ) -> anyhow::Result<R> {
+        Ok(serde_json::from_value(self.request(method, params).await?)?)
+    }
+
+    /// Perform the `initialize` handshake as a named, non-hook client.
+    pub async fn initialize(&mut self, source: &str) -> anyhow::Result<InitializeResult> {
+        self.call(
+            method::INITIALIZE,
+            serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "client": { "source": source }
+            }),
+        )
+        .await
     }
 
     async fn write(&mut self, msg: &Message) -> anyhow::Result<()> {
@@ -78,6 +127,15 @@ impl Conn {
         self.writer.flush().await?;
         Ok(())
     }
+}
+
+/// Whether a connect error means no daemon is listening, as opposed to a
+/// daemon endpoint that exists but cannot be opened.
+pub(crate) fn daemon_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 pub(crate) async fn connect(socket: &Path) -> std::io::Result<ClientStream> {
