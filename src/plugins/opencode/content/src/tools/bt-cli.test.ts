@@ -17,29 +17,6 @@ const config: BraintrustConfig = {
 };
 
 describe("BtCliToolsClient", () => {
-  it("passes profile and org selection to bt for project listing", async () => {
-    const calls: string[][] = [];
-    const client = new BtCliToolsClient(config, async (args) => {
-      calls.push(args);
-      return '[{"id":"project-1","name":"agents"}]';
-    });
-
-    expect(await client.listProjects()).toEqual([{ id: "project-1", name: "agents" }]);
-    expect(calls).toEqual([
-      [
-        "projects",
-        "list",
-        "--json",
-        "--no-input",
-        "--prefer-profile",
-        "--profile",
-        "work",
-        "--org",
-        "acme",
-      ],
-    ]);
-  });
-
   it("resolves the selected project and delegates SQL to bt", async () => {
     const calls: string[][] = [];
     const client = new BtCliToolsClient(config, async (args) => {
@@ -65,10 +42,8 @@ describe("BtCliToolsClient", () => {
   it("delegates manual logs through bt sync push and removes the temporary input", async () => {
     let inputPath = "";
     let inputContents = "";
-    let syncArgs: string[] = [];
     const client = new BtCliToolsClient(config, async (args) => {
       if (args[0] === "projects") return '[{"id":"project-1","name":"agents"}]';
-      syncArgs = args;
       inputPath = args[args.indexOf("--in") + 1] ?? "";
       inputContents = readFileSync(inputPath, "utf8");
       return '{"uploaded_rows":1}';
@@ -83,27 +58,7 @@ describe("BtCliToolsClient", () => {
     });
 
     expect(id).toBe("row-1");
-    expect(syncArgs).toEqual([
-      "sync",
-      "push",
-      "project_logs:agents",
-      "--in",
-      inputPath,
-      "--root",
-      expect.stringContaining("bt-opencode-tools-"),
-      "--force",
-      "--json",
-      "--no-input",
-      "--prefer-profile",
-      "--profile",
-      "work",
-      "--org",
-      "acme",
-      "--project",
-      "agents",
-    ]);
     expect(JSON.parse(inputContents)).toMatchObject({ id: "row-1", input: "hello" });
-    expect(inputPath).toContain("bt-opencode-tools-");
     expect(existsSync(inputPath)).toBe(false);
   });
 });

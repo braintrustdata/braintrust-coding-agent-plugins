@@ -97,6 +97,10 @@ fn build_process_chain(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures intentionally launch raw children."
+)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

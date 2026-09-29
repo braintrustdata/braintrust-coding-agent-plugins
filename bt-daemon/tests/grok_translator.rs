@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures intentionally launch raw children."
+)]
+
 #[path = "support/span_identity.rs"]
 mod span_identity;
 

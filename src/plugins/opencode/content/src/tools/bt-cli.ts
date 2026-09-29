@@ -1,11 +1,9 @@
-import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import type { BraintrustConfig } from "../config";
 
-const execFileAsync = promisify(execFile);
+import { execFileBackground } from "../runtime/background-process";
 
 export interface ProjectInfo {
   id: string;
@@ -30,7 +28,7 @@ export type BtCliRunner = (args: string[]) => Promise<string>;
 async function defaultRunner(args: string[]): Promise<string> {
   const executable = process.env.BT_EXECUTABLE || "bt";
   try {
-    const { stdout } = await execFileAsync(executable, args, {
+    const { stdout } = await execFileBackground(executable, args, {
       encoding: "utf8",
       timeout: 30_000,
       maxBuffer: 10 * 1024 * 1024,

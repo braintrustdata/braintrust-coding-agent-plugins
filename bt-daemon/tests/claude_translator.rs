@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures intentionally launch raw children."
+)]
+
 #[path = "support/span_identity.rs"]
 mod span_identity;
 
@@ -524,13 +529,144 @@ fn claude_ignores_empty_subagent_identifier() {
 }
 
 #[test]
+fn claude_ignores_untracked_empty_type_subagent_stops() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "internal-completions");
+    let ctx = SessionCtx {
+        session_id: "internal-completions".into(),
+        config: None,
+    };
+    let event = |name, ts_ms, payload| claude_event(&ctx.session_id, name, ts_ms, payload);
+    let internal_stop = |agent_id| {
+        json!({
+            "agent_id": agent_id,
+            "agent_type": "",
+            "agent_transcript_path": "/unavailable/internal-agent.jsonl",
+            "last_assistant_message": "Suggested next prompt"
+        })
+    };
+
+    // Internal completion alone must not manufacture a session trace.
+    assert!(translator
+        .handle(
+            &event("SubagentStop", 10, internal_stop("idle-agent")),
+            &ctx,
+        )
+        .unwrap()
+        .is_empty());
+    let mut ops = Vec::new();
+    for envelope in [
+        event("UserPromptSubmit", 20, json!({"prompt": "hello"})),
+        event("Stop", 30, json!({"last_assistant_message": "Hello!"})),
+        event("SubagentStop", 40, internal_stop("suggestion-agent")),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    assert_eq!(
+        rows.len(),
+        2,
+        "only the session and user turn should remain"
+    );
+    let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    assert_eq!(turn.end_ms, Some(30));
+    assert_eq!(turn.output, Some(json!("Hello!")));
+}
+
+#[test]
+fn claude_subagent_stops_preserve_lifecycle_and_missing_start_recovery() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "subagent-recovery");
+    let ctx = SessionCtx {
+        session_id: "subagent-recovery".into(),
+        config: None,
+    };
+    let event = |name, ts_ms, payload| claude_event(&ctx.session_id, name, ts_ms, payload);
+    let mut ops = Vec::new();
+    for envelope in [
+        event("UserPromptSubmit", 10, json!({"prompt": "delegate"})),
+        event(
+            "SubagentStart",
+            20,
+            json!({"agent_id": "started", "agent_type": "worker"}),
+        ),
+        event(
+            "SubagentStop",
+            30,
+            json!({"agent_id": "started", "agent_type": ""}),
+        ),
+        event(
+            "PreToolUse",
+            40,
+            json!({
+                "agent_id": "tool-recovered", "tool_name": "Read",
+                "tool_use_id": "read-call", "tool_input": {"file_path": "example.txt"}
+            }),
+        ),
+        event(
+            "SubagentStop",
+            50,
+            json!({"agent_id": "tool-recovered", "agent_type": ""}),
+        ),
+        event(
+            "SubagentStop",
+            60,
+            json!({
+                "agent_id": "stop-recovered", "agent_type": "reviewer",
+                "last_assistant_message": "Review complete"
+            }),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let subagents: HashMap<_, _> = rows
+        .values()
+        .filter(|row| row.name.starts_with("subagent:"))
+        .map(|row| {
+            (
+                row.metadata.as_ref().unwrap()["agent_id"].as_str().unwrap(),
+                row,
+            )
+        })
+        .collect();
+    assert_eq!(subagents.len(), 3);
+    for (agent_id, start, end) in [
+        ("started", 20, 30),
+        ("tool-recovered", 40, 50),
+        ("stop-recovered", 60, 60),
+    ] {
+        let agent = subagents[agent_id];
+        assert_eq!(agent.start_ms, Some(start));
+        assert_eq!(agent.end_ms, Some(end));
+    }
+    assert_eq!(
+        subagents["stop-recovered"].output,
+        Some(json!("Review complete"))
+    );
+    let tool = rows
+        .values()
+        .find(|row| row.span_type == SpanType::Tool)
+        .unwrap();
+    assert_eq!(
+        tool.parent_span_ids,
+        vec![subagents["tool-recovered"].span_id.clone()]
+    );
+    assert_eq!(tool.end_ms, Some(50));
+}
+
+#[test]
 fn claude_subagent_fixture_builds_nested_subagent_llms() {
     let rows = reduce(replay("subagent-compact"));
     let subagents: Vec<_> = rows
         .values()
         .filter(|row| row.name.starts_with("subagent:"))
         .collect();
-    assert!(subagents.len() >= 2);
+    assert_eq!(
+        subagents.len(),
+        2,
+        "only the two delegated agents should produce task spans"
+    );
     assert!(subagents.iter().all(|row| row.end_ms.is_some()));
 
     let subagent_ids: Vec<_> = subagents.iter().map(|row| row.span_id.as_str()).collect();

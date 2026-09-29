@@ -39,6 +39,12 @@ make test
 cargo test --manifest-path bt-daemon/Cargo.toml --all-features
 ```
 
+Background subprocesses must use `bt-daemon/src/subprocess.rs` (Rust) or
+`src/runtime/js-daemon-client/src/background-process.ts` (JavaScript), not raw
+process APIs. These helpers prevent Windows console flashes. Foreground commands
+and daemon detachment have explicit exceptions; do not reuse them for background
+work. Clippy and Oxlint enforce use of these helpers in CI.
+
 ## Versioning and distribution
 
 Versioning is per distribution. Claude, Codex, and Grok plugins carry their version in

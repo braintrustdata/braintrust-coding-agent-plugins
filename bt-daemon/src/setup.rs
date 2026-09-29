@@ -8,7 +8,6 @@ use anyhow::{bail, Context};
 use serde_json::{Map, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 
 const CODEX_MARKETPLACE: &str = "braintrust-codex-plugins";
 const CODEX_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-codex-plugin";
@@ -90,7 +89,9 @@ fn installed_json_version(
     find_version: impl Fn(&Value) -> Option<&str>,
     expected: &str,
 ) -> bool {
-    let output = ProcessCommand::new(program).args(args).output();
+    let output = crate::subprocess::background_command(program)
+        .args(args)
+        .output();
     let Ok(output) = output else { return false };
     if !output.status.success() {
         return false;
@@ -128,7 +129,9 @@ fn opencode_update_required() -> bool {
 }
 
 fn pi_update_required() -> bool {
-    let output = ProcessCommand::new("pi").arg("list").output();
+    let output = crate::subprocess::background_command("pi")
+        .arg("list")
+        .output();
     let Ok(output) = output else { return false };
     if !output.status.success() {
         return false;
@@ -152,7 +155,7 @@ struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value> {
-        let output = ProcessCommand::new(program)
+        let output = crate::subprocess::background_command(program)
             .args(args)
             .output()
             .with_context(|| {
@@ -167,7 +170,7 @@ impl CommandRunner for SystemCommandRunner {
     }
 
     fn json_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<Value> {
-        let output = ProcessCommand::new(program)
+        let output = crate::subprocess::background_command(program)
             .args(args)
             .env("HOME", home)
             .output()
@@ -183,7 +186,7 @@ impl CommandRunner for SystemCommandRunner {
     }
 
     fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<()> {
-        let status = ProcessCommand::new(program)
+        let status = crate::subprocess::interactive_command(program)
             .args(args)
             .status()
             .with_context(|| {
@@ -196,7 +199,7 @@ impl CommandRunner for SystemCommandRunner {
     }
 
     fn run_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<()> {
-        let output = ProcessCommand::new(program)
+        let output = crate::subprocess::background_command(program)
             .args(args)
             .env("HOME", home)
             .output()

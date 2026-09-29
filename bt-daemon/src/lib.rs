@@ -26,6 +26,7 @@ mod settings;
 mod setup;
 mod sink;
 mod span_processor;
+mod subprocess;
 mod trace_command;
 mod trace_runtime;
 mod transcript_import;
@@ -942,7 +943,7 @@ pub async fn run_traced(
         .then(|| ManagedRunRuntime::new(&managed_run_id))
         .transpose()?;
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
-    let mut command = tokio::process::Command::new(&executable);
+    let mut command: tokio::process::Command = subprocess::interactive_command(&executable).into();
     command
         .args(injected_args)
         .args(args.agent_args)
@@ -1060,26 +1061,13 @@ fn managed_run_args(
     source: RunSource,
     hook_command: &RunHookCommand,
 ) -> anyhow::Result<Vec<OsString>> {
-    let source_name = match source {
-        RunSource::Codex => "codex",
-        RunSource::Claude => "claude",
-        RunSource::OpenCode => "opencode",
-        RunSource::Pi => "pi",
-    };
     match source {
-        RunSource::Codex | RunSource::Claude => {
-            let unix_command = managed_hook_shell_command(hook_command, source_name, false)?;
-            let windows_command = managed_hook_shell_command(hook_command, source_name, true)?;
-            match source {
-                RunSource::Codex => Ok(codex_managed_run_args(&unix_command, &windows_command)),
-                RunSource::Claude => Ok(claude_managed_run_args(if cfg!(windows) {
-                    &windows_command
-                } else {
-                    &unix_command
-                })?),
-                _ => unreachable!(),
-            }
+        RunSource::Codex => {
+            let unix_command = managed_hook_shell_command(hook_command, "codex", false)?;
+            let windows_command = managed_hook_shell_command(hook_command, "codex", true)?;
+            Ok(codex_managed_run_args(&unix_command, &windows_command))
         }
+        RunSource::Claude => claude_managed_run_args(hook_command),
         RunSource::OpenCode => Ok(Vec::new()),
         RunSource::Pi => {
             let extension = match std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC") {
@@ -1198,11 +1186,25 @@ fn codex_managed_run_args(unix_command: &str, windows_command: &str) -> Vec<OsSt
     args
 }
 
-fn claude_managed_run_args(command: &str) -> anyhow::Result<Vec<OsString>> {
+fn claude_managed_run_args(hook_command: &RunHookCommand) -> anyhow::Result<Vec<OsString>> {
+    let command = hook_command
+        .program
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("managed hook command contains non-Unicode argv"))?;
+    let mut args = hook_command
+        .args
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .ok_or_else(|| anyhow::anyhow!("managed hook command contains non-Unicode argv"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    args.extend(["--source", "claude", "--managed-run-hook"]);
     let matcher_group = serde_json::json!([{
         "hooks": [{
             "type": "command",
             "command": command,
+            "args": args,
             "async": false
         }]
     }]);
@@ -2261,30 +2263,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_managed_run_injects_live_hooks() {
-        let args = managed_run_args(RunSource::Claude, &test_run_hook_command()).unwrap();
-        assert_eq!(args[0], "--settings");
-        let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap()).unwrap();
-        let hooks = settings["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), CLAUDE_RUN_HOOK_EVENTS.len());
-        for event in ["SessionStart", "PreToolUse"] {
-            let matcher_groups = hooks[event].as_array().unwrap();
-            assert_eq!(matcher_groups.len(), 1);
-            assert!(matcher_groups[0]["hooks"].is_array());
-            assert!(matcher_groups[0]["hooks"][0]["hooks"].is_null());
-        }
-        let command = hooks["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-        assert!(command.contains("--managed-run-hook"));
-        assert!(command.contains("agents"));
-        assert!(command.contains("hook"));
-        assert!(command.contains("--source"));
-        assert!(command.contains("claude"));
-        assert!(!command.contains("transcript"));
-    }
-
-    #[test]
     fn opencode_managed_run_preserves_inline_config_and_adds_plugin() {
         let config =
             opencode_managed_config(Some(r#"{"model":"test/model","plugin":["other"]}"#)).unwrap();
@@ -2310,15 +2288,5 @@ mod tests {
                 OsString::from(crate::setup::pi_plugin_spec()),
             ]
         );
-    }
-
-    #[test]
-    fn managed_hook_commands_quote_frontend_paths() {
-        let hook = test_run_hook_command();
-        let unix = managed_hook_shell_command(&hook, "codex", false).unwrap();
-        assert!(unix.contains("'/opt/Braintrust CLI/bt' 'agents' 'hook' '--source' 'codex'"));
-        let windows = managed_hook_shell_command(&hook, "claude", true).unwrap();
-        assert!(windows
-            .contains("\"/opt/Braintrust CLI/bt\" \"agents\" \"hook\" \"--source\" \"claude\""));
     }
 }

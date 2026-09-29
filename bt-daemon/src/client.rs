@@ -169,10 +169,8 @@ pub async fn ensure_daemon(
     anyhow::bail!("daemon did not come up at {}", socket.display())
 }
 
-#[cfg(unix)]
 fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     let (exe, rest) = host
         .serve_argv
@@ -187,7 +185,7 @@ fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
         .open(data_dir.join("serve.log"))
         .ok();
 
-    let mut cmd = Command::new(exe);
+    let mut cmd = crate::subprocess::detached_daemon_command(exe);
     cmd.args(rest);
     cmd.arg("--socket").arg(socket);
     cmd.stdin(Stdio::null());
@@ -202,50 +200,6 @@ fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
             cmd.stderr(Stdio::null());
         }
     }
-    // Detach into our own process group so the daemon outlives the hook (and
-    // the agent's) process and its controlling terminal.
-    cmd.process_group(0);
-    cmd.spawn()?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-    let (exe, rest) = host
-        .serve_argv
-        .split_first()
-        .ok_or_else(|| anyhow::anyhow!("empty serve_argv"))?;
-
-    let data_dir = crate::paths::data_dir(None);
-    let _ = crate::paths::ensure_private_dir(&data_dir);
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data_dir.join("serve.log"))
-        .ok();
-
-    let mut cmd = Command::new(exe);
-    cmd.args(rest);
-    cmd.arg("--socket").arg(socket);
-    cmd.stdin(Stdio::null());
-    match log {
-        Some(file) => {
-            let stderr = file.try_clone()?;
-            cmd.stdout(Stdio::from(file));
-            cmd.stderr(Stdio::from(stderr));
-        }
-        None => {
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
-        }
-    }
-    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     cmd.spawn()?;
     Ok(())
 }
