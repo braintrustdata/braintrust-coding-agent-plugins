@@ -93,6 +93,16 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm test
+      - name: Lint shared daemon client
+        shell: bash
+        working-directory: src/runtime/js-daemon-client
+        run: ../../plugins/opencode/content/node_modules/.bin/vp lint --config .oxlintrc.json src
+      - name: Install Rust for native Windows console probes
+        if: runner.os == 'Windows'
+        run: rustup default stable
+      - name: Verify JavaScript background launches have no Windows console
+        if: runner.os == 'Windows'
+        run: node scripts/tests/windows-background-process.mjs
 
   opencode-compatibility:
     name: OpenCode package (${{ matrix.peer-version }})

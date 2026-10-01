@@ -316,6 +316,7 @@ trap cleanup EXIT INT TERM
 # this installed copy, then restore the original file when the session exits.
 python3 - "$installed_hooks" "$dist_hooks" "$BT_WRAPPER" <<'PY'
 import json
+import shlex
 import sys
 
 installed_path, dist_path, bt_bin = sys.argv[1:]
@@ -325,7 +326,7 @@ for path in (installed_path, dist_path):
     for groups in document["hooks"].values():
         for group in groups:
             for handler in group["hooks"]:
-                handler["command"] = bt_bin
+                handler["command"] = shlex.join([bt_bin, *shlex.split(handler["command"])[1:]])
     with open(path, "w") as f:
         json.dump(document, f, indent=2)
         f.write("\n")
@@ -339,6 +340,7 @@ if [[ "$SKIP_PLUGIN_RELOAD" == true ]]; then
   mkdir -p "$direct_hooks_dir"
   python3 - "$dist_hooks" "$direct_hooks_dir/braintrust.json" "$BT_WRAPPER" <<'PY'
 import json
+import shlex
 import sys
 
 source, destination, bt_bin = sys.argv[1:]
@@ -347,7 +349,7 @@ with open(source) as f:
 for groups in document["hooks"].values():
     for group in groups:
         for handler in group["hooks"]:
-            handler["command"] = bt_bin
+            handler["command"] = shlex.join([bt_bin, *shlex.split(handler["command"])[1:]])
 with open(destination, "w") as f:
     json.dump(document, f, indent=2)
     f.write("\n")

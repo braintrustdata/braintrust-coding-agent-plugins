@@ -1,0 +1,27 @@
+{
+  "rules": {
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "child_process",
+            "message": "Use the shared src/background-process helper instead."
+          },
+          {
+            "name": "node:child_process",
+            "message": "Use the shared src/background-process helper instead."
+          }
+        ]
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["src/background-process.ts", "**/*.test.ts"],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    }
+  ]
+}

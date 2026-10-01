@@ -2,7 +2,6 @@ use super::{SpanOp, SpanRow};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -202,7 +201,7 @@ fn inspect_repo(cwd: &Path) -> Option<RepoEntry> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::subprocess::background_command("git")
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -278,9 +277,14 @@ fn touch<K: PartialEq + Clone>(order: &mut VecDeque<K>, key: &K) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures intentionally launch raw children."
+)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
 
     fn run(repo: &Path, args: &[&str]) {
         assert!(Command::new("git")

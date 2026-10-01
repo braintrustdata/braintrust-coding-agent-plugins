@@ -12,6 +12,7 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTENT_DIR="$REPO_ROOT/src/plugins/$AGENT/content"
+node "$REPO_ROOT/scripts/prepare-js-daemon-client.mjs" "$AGENT"
 
 rm -rf "$TARGET_DIR"
 mkdir -p "$TARGET_DIR/src/runtime"
@@ -21,10 +22,7 @@ tar \
   --exclude=dist \
   --exclude=.cache \
   --exclude=.vite \
-  --exclude=src/runtime/daemon-client.ts \
   -cf - -C "$CONTENT_DIR" . | tar -xf - -C "$TARGET_DIR"
-cp "$REPO_ROOT/src/runtime/js-daemon-client/src/index.ts" \
-  "$TARGET_DIR/src/runtime/daemon-client.ts"
 
 (cd "$TARGET_DIR" && pnpm install --frozen-lockfile && pnpm run build:prepared)
 rm -rf "$TARGET_DIR/node_modules"

@@ -42,12 +42,11 @@ for event, groups in hooks.items():
         for hook in group["hooks"]:
             assert hook == {
                 "type": "command",
-                "command": "bt",
-                "args": [
-                    "trace", "hook", "--source", "grok",
-                    "--session-id-field", "sessionId", "--event-field", "hookEventName",
-                    "--transcript-path-field", "transcriptPath",
-                ],
+                "command": (
+                    "bt trace hook --source grok"
+                    " --session-id-field sessionId --event-field hookEventName"
+                    " --transcript-path-field transcriptPath"
+                ),
             }
 PY
 

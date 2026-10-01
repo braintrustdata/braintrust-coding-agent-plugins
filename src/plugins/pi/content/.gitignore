@@ -21,6 +21,7 @@ pnpm-debug.log*
 .cache/
 dist/
 src/runtime/daemon-client.ts
+src/runtime/background-process.ts
 
 # OS files
 .DS_Store

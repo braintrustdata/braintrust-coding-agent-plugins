@@ -1,6 +1,7 @@
 node_modules/
 dist/
 src/runtime/daemon-client.ts
+src/runtime/background-process.ts
 *.log
 .env
 .env.local

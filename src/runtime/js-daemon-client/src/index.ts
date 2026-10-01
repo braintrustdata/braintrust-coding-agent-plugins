@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process"
+import { spawnBackground } from "./background-process.ts"
 import { createHash } from "node:crypto"
 import { createConnection, type Socket } from "node:net"
 import { homedir } from "node:os"
@@ -369,10 +369,10 @@ export class DaemonClient {
 
   private startDaemon(): void {
     try {
-      const child = spawn(
+      const child = spawnBackground(
         this.options.btExecutable,
         this.options.startArguments ?? ["trace", "daemon"],
-        { detached: true, stdio: "ignore", windowsHide: true },
+        { detached: true, stdio: "ignore" },
       )
       child.once("error", (error) => this.warnOnce(`start:${String(error)}`))
       child.unref()

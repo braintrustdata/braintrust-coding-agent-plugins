@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "Use crate::subprocess helpers to preserve background, interactive, and daemon process policy." },
+    { path = "tokio::process::Command::new", reason = "Convert a crate::subprocess helper command with .into() to preserve process policy." },
+]

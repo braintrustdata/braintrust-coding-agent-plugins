@@ -2,6 +2,11 @@
 //! debug sink. Runs the daemon in-process on a temp socket (no process
 //! spawning, so it's deterministic).
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures intentionally launch raw children."
+)]
+
 use async_trait::async_trait;
 use bt_daemon::wire::{
     AuthSelection, AuthSource, BackendAuth, Envelope, SessionConfig, SessionRoute,
@@ -2452,35 +2457,6 @@ fn prefix_through_lines(bytes: &[u8], line_count: usize) -> usize {
 }
 
 #[cfg(all(feature = "cli", unix))]
-fn assert_packaged_grok_hook_mapping() {
-    let hooks: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(grok_package_path("hooks/hooks.json")).unwrap(),
-    )
-    .unwrap();
-    let expected_args = serde_json::json!([
-        "trace",
-        "hook",
-        "--source",
-        "grok",
-        "--session-id-field",
-        "sessionId",
-        "--event-field",
-        "hookEventName",
-        "--transcript-path-field",
-        "transcriptPath",
-    ]);
-    for groups in hooks["hooks"].as_object().unwrap().values() {
-        for group in groups.as_array().unwrap() {
-            for hook in group["hooks"].as_array().unwrap() {
-                assert_eq!(hook["type"], "command");
-                assert_eq!(hook["command"], "bt");
-                assert_eq!(hook["args"], expected_args);
-            }
-        }
-    }
-}
-
-#[cfg(all(feature = "cli", unix))]
 async fn invoke_grok_hook(
     socket: &Path,
     plugin_version: &str,
@@ -2640,7 +2616,6 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
         "cwd": "/repo/primary",
         "workspaceRoot": "/repo"
     });
-    assert_packaged_grok_hook_mapping();
 
     let flushes = Arc::new(Mutex::new(HashMap::new()));
     let created = Arc::new(Mutex::new(Vec::new()));

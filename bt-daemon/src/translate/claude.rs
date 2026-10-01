@@ -20,7 +20,6 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Seek, SeekFrom};
-use std::process::Command;
 use std::sync::Arc;
 
 #[derive(Default, Deserialize)]
@@ -991,6 +990,20 @@ impl AgentTranslator for ClaudeTranslator {
         }
         self.tail_main(event, &hook);
         self.observe_session_details(&hook);
+        let subagent_stop = if event.event == "SubagentStop" {
+            decode::<SubagentHook>(&event.payload)
+        } else {
+            None
+        };
+        if let Some(hook) = &subagent_stop {
+            // Claude's internal agents (such as prompt suggestions) emit
+            // unpaired stops with an empty type. They are not delegated tasks.
+            // Keep known agents even if their stop omits the type, and recover
+            // named agents whose start hook was missed.
+            if hook.agent_type.is_none() && !self.subagents.contains_key(&hook.agent_id) {
+                return Ok(ops);
+            }
+        }
         if Self::starts_trace(event) {
             self.ensure_root(event, ctx, &hook, &mut ops);
         }
@@ -1047,7 +1060,7 @@ impl AgentTranslator for ClaudeTranslator {
                 }
             }
             "SubagentStop" => {
-                if let Some(hook) = decode::<SubagentHook>(&event.payload) {
+                if let Some(hook) = subagent_stop {
                     self.stop_subagent(event, hook, &mut ops);
                 }
             }
@@ -1983,7 +1996,7 @@ fn hostname() -> String {
 }
 
 fn command_output(cwd: &str, command: &str, args: &[&str]) -> Option<String> {
-    let mut process = Command::new(command);
+    let mut process = crate::subprocess::background_command(command);
     if !cwd.is_empty() {
         process.current_dir(cwd);
     }

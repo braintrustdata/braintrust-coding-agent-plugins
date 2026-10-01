@@ -5,17 +5,17 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)))
-const source = join(repoRoot, "src/runtime/js-daemon-client/src/index.ts")
-const destinations = {
-  opencode: join(repoRoot, "src/plugins/opencode/content/src/runtime/daemon-client.ts"),
-  pi: join(repoRoot, "src/plugins/pi/content/src/runtime/daemon-client.ts"),
-}
+const sources = [
+  ["index.ts", "daemon-client.ts"],
+  ["background-process.ts", "background-process.ts"],
+]
+const plugins = ["opencode", "pi"]
 
 const args = process.argv.slice(2)
 const check = args.includes("--check")
 const target = args.find((arg) => !arg.startsWith("--"))
 
-if (!target || !["opencode", "pi", "all"].includes(target)) {
+if (!target || ![...plugins, "all"].includes(target)) {
   console.error("usage: prepare-js-daemon-client.mjs <opencode|pi|all> [--check]")
   process.exit(2)
 }
@@ -30,34 +30,40 @@ const exists = async (path) => {
   }
 }
 
-const selected = target === "all" ? Object.entries(destinations) : [[target, destinations[target]]]
-const sourceContents = await readFile(source)
+const selected = target === "all" ? plugins : [target]
+const sourceFiles = await Promise.all(sources.map(async ([source, destination]) => ({
+  destination,
+  contents: await readFile(join(repoRoot, "src/runtime/js-daemon-client/src", source)),
+})))
 
-for (const [name, destination] of selected) {
+for (const name of selected) {
   const packageRoot = join(repoRoot, "src/plugins", name, "content")
   if (!(await exists(packageRoot))) {
     if (target === "all") continue
     throw new Error(`plugin content directory does not exist: ${packageRoot}`)
   }
 
-  if (check) {
-    let generated
-    try {
-      generated = await readFile(destination)
-    } catch (error) {
-      if (error?.code === "ENOENT") {
-        throw new Error(`generated daemon client is missing: ${destination}`)
+  for (const { destination: file, contents } of sourceFiles) {
+    const destination = join(packageRoot, "src/runtime", file)
+    if (check) {
+      let generated
+      try {
+        generated = await readFile(destination)
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          throw new Error(`generated daemon client is missing: ${destination}`)
+        }
+        throw error
       }
-      throw error
+      if (!contents.equals(generated)) {
+        throw new Error(`generated daemon client differs from the canonical source: ${destination}`)
+      }
+      console.log(`Verified ${name} ${file}`)
+      continue
     }
-    if (!sourceContents.equals(generated)) {
-      throw new Error(`generated daemon client differs from the canonical source: ${destination}`)
-    }
-    console.log(`Verified ${name} daemon client`)
-    continue
-  }
 
-  await mkdir(dirname(destination), { recursive: true })
-  await writeFile(destination, sourceContents)
-  console.log(`Prepared ${name} daemon client`)
+    await mkdir(dirname(destination), { recursive: true })
+    await writeFile(destination, contents)
+    console.log(`Prepared ${name} ${file}`)
+  }
 }

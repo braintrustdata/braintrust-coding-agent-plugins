@@ -1,4 +1,8 @@
 #![cfg(feature = "cli")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures intentionally launch raw children."
+)]
 
 use std::io::Write;
 use std::process::Command;
