@@ -5,6 +5,7 @@
 //! slightly reordered events; keeping every identifier for the whole session
 //! makes payload-free bookkeeping grow without bound.
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
@@ -75,8 +76,10 @@ impl<K, V> Default for RecentMap<K, V> {
 }
 
 impl<K: Eq + Hash + Clone, V> RecentMap<K, V> {
-    #[cfg(test)]
-    pub(super) fn get(&self, key: &K) -> Option<&V> {
+    pub(super) fn get<Q: Eq + Hash + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
         self.values.get(key)
     }
 

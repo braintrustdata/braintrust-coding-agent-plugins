@@ -232,15 +232,11 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
         hydrate_grok_transcript_references(data_dir, env).await;
         return;
     }
-    let should_capture = match env.source.as_str() {
-        "codex" => true,
-        "claude-code" => matches!(
-            env.event.as_str(),
-            "UserPromptSubmit" | "Stop" | "StopFailure" | "SubagentStop" | "SessionEnd"
-        ),
-        _ => false,
-    };
-    if !should_capture {
+    if env.source == "claude-code" {
+        hydrate_claude_transcript_references(data_dir, env).await;
+        return;
+    }
+    if env.source != "codex" {
         return;
     }
     let field = if env.event == "SubagentStop" {
@@ -275,6 +271,46 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
             }),
         );
     }
+}
+
+async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &mut Envelope) {
+    // Historical snapshots and newly captured references are observations,
+    // not invitations to reread an external file during journal recovery.
+    if env.payload.get("_bt_claude_transcript_mirrors").is_some()
+        || env.payload.get("_bt_transcript_mirror").is_some()
+        || env.payload.get("_bt_transcript_snapshot").is_some()
+        || env.payload.get("_bt_transcript_replay").is_some()
+    {
+        return;
+    }
+    let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
+    let mut mirrors = serde_json::Map::new();
+    for field in ["transcript_path", "agent_transcript_path"] {
+        let Some(path) = env.payload.get(field).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if mirrors.contains_key(path) {
+            continue;
+        }
+        match crate::transcript_mirror::capture(data_dir, &mirror_session, path).await {
+            Ok((mirror, through)) => {
+                mirrors.insert(
+                    path.to_string(),
+                    serde_json::json!({"path": path, "mirror": mirror, "through": through}),
+                );
+            }
+            Err(error) => {
+                tracing::debug!(session_id = %env.session_id, %error, "Claude transcript mirror skipped");
+            }
+        }
+    }
+    if !env.payload.is_object() {
+        env.payload = serde_json::json!({});
+    }
+    env.payload.as_object_mut().unwrap().insert(
+        "_bt_claude_transcript_mirrors".to_string(),
+        serde_json::Value::Object(mirrors),
+    );
 }
 
 const GROK_TERMINAL_SNAPSHOT_ATTEMPTS: usize = 4;
@@ -759,6 +795,11 @@ impl SessionActor {
                 continue;
             }
             env.source = self.source.clone();
+            if env.source == "claude-code" {
+                if let Some(payload) = env.payload.as_object_mut() {
+                    payload.insert("_bt_transcript_replay".to_string(), serde_json::json!(true));
+                }
+            }
             let translated = translator.handle(&env, ctx);
             if entry_through <= plan.acknowledged_through {
                 self.replay_without_delivery(translator, ctx, translated)

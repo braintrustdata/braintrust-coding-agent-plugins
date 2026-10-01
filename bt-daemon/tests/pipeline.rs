@@ -1905,60 +1905,6 @@ async fn a_failing_span_plugin_discards_rows_and_persists_the_raw_exception() {
     restarted.await.unwrap();
 }
 
-#[tokio::test]
-async fn claude_boundary_journal_references_a_self_contained_transcript_mirror() {
-    let (data_dir, socket, handle, tmp) = start_daemon().await;
-    let transcript = tmp.path().join("claude.jsonl");
-    std::fs::write(
-        &transcript,
-        r#"{"type":"assistant","timestamp":"2026-07-29T00:00:00Z","message":{"id":"m1","model":"claude","content":[{"type":"text","text":"durable"}]}}"#,
-    )
-    .unwrap();
-    let mut env = envelope("claude-journal", "Stop", 1_775_000_000_000);
-    env.source = "claude-code".into();
-    env.payload = serde_json::json!({
-        "session_id":"claude-journal",
-        "hook_event_name":"Stop",
-        "transcript_path":transcript
-    });
-    forward_envelope(&env, &socket, &dummy_host(), false)
-        .await
-        .unwrap();
-    flush_session("claude-journal", &socket, 5000)
-        .await
-        .unwrap();
-
-    let journal = std::fs::read_to_string(source_journal_path(
-        &data_dir,
-        "claude-code",
-        "claude-journal",
-    ))
-    .unwrap();
-    assert!(!journal.contains("sk-TOP-SECRET-abc123"));
-
-    // The journal references the mirror rather than inlining the transcript,
-    // so re-journaling a growing transcript stays linear in its size.
-    let entry: serde_json::Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
-    let reference = &entry["payload"]["_bt_transcript_mirror"];
-    assert_eq!(reference["path"], transcript.to_str().unwrap());
-    assert!(
-        !journal.contains("durable"),
-        "the journal must not inline transcript contents: {journal}"
-    );
-
-    // The mirror is daemon-owned and survives the original being rewritten.
-    let mirror = std::path::PathBuf::from(reference["mirror"].as_str().unwrap());
-    assert!(mirror.starts_with(data_dir.join("transcripts")));
-    let mirrored = std::fs::read_to_string(&mirror).unwrap();
-    assert!(mirrored.contains("durable"));
-    assert_eq!(
-        reference["through"].as_u64().unwrap(),
-        mirrored.len() as u64,
-        "the journaled offset must bound replay to the bytes captured here"
-    );
-    handle.abort();
-}
-
 /// Start a daemon that retires sessions after `ttl_secs` of quiet.
 async fn start_daemon_with_session_ttl(
     ttl_secs: u64,
@@ -2000,6 +1946,253 @@ fn claude_stop(session_id: &str, transcript: &Path, ts_ms: i64) -> Envelope {
         "transcript_path": transcript,
     });
     env
+}
+
+async fn start_claude_recording_daemon(
+    data_dir: PathBuf,
+    socket: PathBuf,
+    recording: Arc<RouteRecordingSinkFactory>,
+    session_idle_timeout_secs: u64,
+) -> tokio::task::JoinHandle<()> {
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs,
+    };
+    let opts = ServeOptions {
+        version: "test".into(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory: recording,
+        auth_provider: Some(Arc::new(TestAuthProvider {
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+            first_lease_expired: false,
+        })),
+    };
+    let handle = tokio::spawn(async move {
+        run_serve(args, opts).await.unwrap();
+    });
+    wait_for(&socket).await;
+    handle
+}
+
+fn claude_recorded_ops(recording: &RouteRecordingSinkFactory) -> Vec<SpanOp> {
+    recording
+        .sinks
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|record| record.ops.lock().unwrap().clone())
+        .collect()
+}
+
+async fn claude_stop_before_response(socket: &Path, transcript: &Path) {
+    std::fs::write(
+        transcript,
+        concat!(
+            r#"{"type":"user","uuid":"prompt-one","parentUuid":null,"timestamp":"2026-10-01T16:48:20Z","message":{"role":"user","content":"first question"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let mut prompt = claude_stop("late-claude", transcript, 1_790_873_300_000);
+    prompt.event = "UserPromptSubmit".into();
+    prompt.payload["hook_event_name"] = serde_json::json!("UserPromptSubmit");
+    prompt.payload["prompt"] = serde_json::json!("first question");
+    prompt.payload["prompt_id"] = serde_json::json!("prompt-one");
+    prompt.managed_run_id = Some("late-claude-run".into());
+    forward_envelope(&prompt, socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    let mut stop = claude_stop("late-claude", transcript, 1_790_873_302_000);
+    stop.payload["prompt_id"] = serde_json::json!("prompt-one");
+    stop.managed_run_id = prompt.managed_run_id;
+    forward_envelope(&stop, socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    assert!(
+        flush_session("late-claude", socket, 5_000)
+            .await
+            .unwrap()
+            .flushed
+    );
+}
+
+fn append_claude_late_response(transcript: &Path) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(transcript)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": "assistant-one",
+            "parentUuid": "prompt-one",
+            "timestamp": "2026-10-01T16:48:21Z",
+            "message": {
+                "id": "late-response",
+                "role": "assistant",
+                "model": "claude-test",
+                "content": [{"type": "text", "text": "the late final answer"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 13, "output_tokens": 7}
+            }
+        })
+    )
+    .unwrap();
+}
+
+fn assert_claude_late_response(recording: &RouteRecordingSinkFactory) {
+    let ops = claude_recorded_ops(recording);
+    let inserts: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Insert(row) => Some(row),
+            _ => None,
+        })
+        .collect();
+    let original = inserts
+        .iter()
+        .find(|row| {
+            row.span_type == bt_daemon::SpanType::Task
+                && row.input == Some(serde_json::json!("first question"))
+        })
+        .expect("the original prompt must create its execution");
+    let llms: Vec<_> = inserts
+        .iter()
+        .filter(|row| row.span_type == bt_daemon::SpanType::Llm)
+        .collect();
+    assert_eq!(
+        llms.len(),
+        1,
+        "late native work must be delivered exactly once"
+    );
+    let llm = llms[0];
+    assert_eq!(llm.parent_span_ids, vec![original.span_id.clone()]);
+    assert_eq!(
+        llm.output.as_ref().unwrap()["content"],
+        "the late final answer"
+    );
+    assert_eq!(llm.metrics.as_ref().unwrap()["prompt_tokens"], 13);
+    assert_eq!(llm.metrics.as_ref().unwrap()["completion_tokens"], 7);
+}
+
+#[tokio::test]
+async fn claude_late_response_survives_acknowledged_idle_replay_and_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let transcript = tmp.path().join("claude.jsonl");
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let first =
+        start_claude_recording_daemon(data_dir.clone(), socket.clone(), recording.clone(), 1).await;
+    claude_stop_before_response(&socket, &transcript).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: Some("late-claude".into()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status.sessions.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("stopped session must retire");
+    shutdown(&socket).await;
+    first.await.unwrap();
+
+    // The native append is newer than every acknowledged observation. Replaying
+    // those observations must not consume it into an already delivered checkpoint.
+    append_claude_late_response(&transcript);
+    let second =
+        start_claude_recording_daemon(data_dir, socket.clone(), recording.clone(), 0).await;
+    let mut next = claude_stop("late-claude", &transcript, 1_790_873_310_000);
+    next.event = "UserPromptSubmit".into();
+    next.payload["hook_event_name"] = serde_json::json!("UserPromptSubmit");
+    next.payload["prompt"] = serde_json::json!("second question");
+    next.payload["prompt_id"] = serde_json::json!("prompt-two");
+    forward_envelope(&next, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    assert!(
+        flush_session("late-claude", &socket, 5_000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    assert_claude_late_response(&recording);
+
+    shutdown(&socket).await;
+    second.await.unwrap();
+    assert_claude_late_response(&recording);
+}
+
+#[tokio::test]
+async fn claude_late_response_is_delivered_without_another_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = test_endpoint(tmp.path());
+    let transcript = tmp.path().join("claude.jsonl");
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let handle = start_claude_recording_daemon(
+        tmp.path().join("data"),
+        socket.clone(),
+        recording.clone(),
+        0,
+    )
+    .await;
+    claude_stop_before_response(&socket, &transcript).await;
+    append_claude_late_response(&transcript);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if claude_recorded_ops(&recording).iter().any(
+                |op| matches!(op, SpanOp::Insert(row) if row.span_type == bt_daemon::SpanType::Llm),
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("a post-Stop native append must not require another external hook");
+    assert_claude_late_response(&recording);
+    shutdown(&socket).await;
+    handle.await.unwrap();
+    assert_claude_late_response(&recording);
+}
+
+#[tokio::test]
+async fn claude_managed_finalize_captures_response_appended_after_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = test_endpoint(tmp.path());
+    let transcript = tmp.path().join("claude.jsonl");
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let handle = start_claude_recording_daemon(
+        tmp.path().join("data"),
+        socket.clone(),
+        recording.clone(),
+        0,
+    )
+    .await;
+    claude_stop_before_response(&socket, &transcript).await;
+    append_claude_late_response(&transcript);
+    let finalized = flush_managed_run("late-claude-run", &socket, 5_000)
+        .await
+        .unwrap();
+    assert!(finalized.flushed, "managed completion must drain late work");
+    assert_claude_late_response(&recording);
+    shutdown(&socket).await;
+    handle.await.unwrap();
+    assert_claude_late_response(&recording);
 }
 
 /// The 20 GB crash: every lifecycle event used to journal the whole transcript,

@@ -654,7 +654,9 @@ mod tests {
     }
 
     #[test]
-    fn claude_import_emits_related_subagent_lifecycle_inside_parent_turn() {
+    fn claude_import_keeps_delayed_child_and_native_handback_under_launching_turn() {
+        use crate::translate::{Registry, SessionCtx, SpanOp, SpanType};
+
         let temp = tempfile::tempdir().unwrap();
         let transcript = temp.path().join("session-a.jsonl");
         let subagent = temp.path().join("session-a/subagents/agent-child-a.jsonl");
@@ -662,8 +664,12 @@ mod tests {
         let records = [
             json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:01Z","message":{"content":"delegate"}}),
             json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"call-a","name":"Agent","input":{"subagent_type":"reviewer"}}]}}),
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:03Z","message":{"content":"unrelated question"}}),
             json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:05Z","toolUseResult":{"agentId":"child-a"},"message":{"content":[{"type":"tool_result","tool_use_id":"call-a","content":"done"}]}}),
             json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:06Z","message":{"content":[{"type":"text","text":"complete"}]}}),
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:07Z","origin":{"kind":"peer","handback":true,"senderTaskId":"child-a","from":"child-a","name":"reviewer"},"message":{"content":"Another Claude session sent a message:\n<agent-message from=\"child-a\">reviewed</agent-message>\nThis agent is working inside the same session."}}),
+            json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:08Z","message":{"id":"handback-response","content":[{"type":"text","text":"accepted review"}]}}),
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:09Z","message":{"content":"next human question"}}),
         ];
         std::fs::write(
             &transcript,
@@ -681,27 +687,72 @@ mod tests {
         .unwrap();
 
         let events = transcript_envelopes(&transcript, ImportSource::Claude).unwrap();
-        let names = events
+        let context = SessionCtx {
+            session_id: "session-a".into(),
+            config: None,
+        };
+        let mut translator = Registry::default_agents().create("claude-code", "session-a");
+        let mut ops = Vec::new();
+        for event in &events {
+            ops.extend(translator.handle(event, &context).unwrap());
+            while let Some(pending) = translator.drain_pending(&context).unwrap() {
+                ops.extend(pending);
+            }
+        }
+        ops.extend(translator.finalize(&context).unwrap());
+        while let Some(pending) = translator.drain_pending(&context).unwrap() {
+            ops.extend(pending);
+        }
+        let inserts = ops
             .iter()
-            .map(|event| event.event.as_str())
+            .filter_map(|op| match op {
+                SpanOp::Insert(row) => Some(row),
+                SpanOp::Merge(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let turns = inserts
+            .iter()
+            .filter(|row| row.name.starts_with("Turn "))
             .collect::<Vec<_>>();
         assert_eq!(
-            names,
-            vec![
-                "SessionStart",
-                "UserPromptSubmit",
-                "SubagentStart",
-                "SubagentStop",
-                "Stop",
-                "SessionEnd"
-            ]
+            turns
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Turn 1", "Turn 2", "Turn 3"]
         );
-        assert_eq!(events[2].payload["agent_id"], json!("child-a"));
-        assert_eq!(events[2].payload["agent_type"], json!("reviewer"));
+        let launch = turns[0];
+        let child = inserts
+            .iter()
+            .find(|row| {
+                row.span_type == SpanType::Task
+                    && row
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| value.get("agent_id"))
+                        == Some(&json!("child-a"))
+            })
+            .unwrap();
+        assert_eq!(child.parent_span_ids, std::slice::from_ref(&launch.span_id));
+        let continuation = inserts
+            .iter()
+            .find(|row| {
+                row.metadata
+                    .as_ref()
+                    .and_then(|value| value.get("turn_trigger"))
+                    == Some(&json!("agent_message"))
+            })
+            .unwrap();
         assert_eq!(
-            Path::new(events[3].payload["agent_transcript_path"].as_str().unwrap()),
-            subagent
+            continuation.parent_span_ids,
+            std::slice::from_ref(&launch.span_id)
         );
+        assert!(ops.iter().any(|op| match op {
+            SpanOp::Insert(row) | SpanOp::Merge(row) => {
+                row.span_id == continuation.span_id
+                    && row.output.as_ref() == Some(&json!("accepted review"))
+            }
+        }));
     }
 
     #[test]
