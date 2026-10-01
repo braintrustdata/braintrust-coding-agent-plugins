@@ -17,6 +17,9 @@ use crate::wire::SessionConfig;
 /// A per-session sink. Created once per session; `configure` supplies the
 /// resolved credentials/project/trace-attach settings (and may be re-called if
 /// they change).
+// `async_trait` marks its boxed futures as `must_use`; Clippy 1.99 flags that
+// generated annotation as redundant on async trait methods.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait Sink: Send {
     /// Called when the session's config is (re)resolved.
