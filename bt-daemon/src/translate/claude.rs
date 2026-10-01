@@ -7,7 +7,7 @@
 //! transcript that already contains the completed session.
 
 use super::git::GitMetadataCache;
-use super::recent::RecentSet;
+use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
 use super::tool::{add_tool_approval, nonempty_error_text, ToolApproval};
 use super::{
     local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
@@ -143,6 +143,13 @@ struct Turn {
     id: String,
     number: u32,
     cwd: Option<String>,
+    parent_id: String,
+    user_turn_id: Option<String>,
+}
+
+struct PendingPrompt {
+    turn_id: Arc<String>,
+    content: Value,
 }
 
 #[derive(Default)]
@@ -155,6 +162,12 @@ struct Subagent {
     span_id: String,
     parent_span_id: String,
     transcript_path: Option<String>,
+}
+
+#[derive(Clone)]
+struct AgentOrigin {
+    parent_id: String,
+    user_turn_id: Option<String>,
 }
 
 struct PendingTool {
@@ -172,6 +185,7 @@ enum PendingHistory {
 struct MessageHistory {
     messages: Vec<HistoryMessage>,
     preserved_after_compaction: Vec<String>,
+    fork_context_prefix: bool,
 }
 
 struct HistoryMessage {
@@ -254,10 +268,20 @@ struct ClaudeTranslator {
     root_span_id: String,
     session_parent_span_ids: Vec<String>,
     root_open: bool,
-    root_ended: bool,
+    root_end_ms: Option<i64>,
     turn: Option<Turn>,
     last_turn_id: Option<String>,
     turn_count: u32,
+    continuation_count: u32,
+    last_user_turn_id: Option<String>,
+    agent_origins: RecentMap<String, AgentOrigin>,
+    user_turn_ends: RecentMap<String, i64>,
+    prompt_turns: RecentMap<String, Arc<String>>,
+    pending_prompts: VecDeque<PendingPrompt>,
+    record_turns: RecentMap<String, Arc<String>>,
+    request_turns: RecentMap<String, Arc<String>>,
+    tool_turns: RecentMap<String, Arc<String>>,
+    main_record_turn: Option<Arc<String>>,
     tool_seq: u32,
     main_transcript: Option<String>,
     transcripts: HashMap<String, TranscriptCursor>,
@@ -289,11 +313,21 @@ impl ClaudeTranslator {
             root_span_id: root,
             session_parent_span_ids: Vec::new(),
             root_open: false,
-            root_ended: false,
+            root_end_ms: None,
             turn: None,
             last_turn_id: None,
             turn_count: 0,
+            continuation_count: 0,
+            last_user_turn_id: None,
+            agent_origins: RecentMap::default(),
+            user_turn_ends: RecentMap::default(),
             tool_seq: 0,
+            prompt_turns: RecentMap::default(),
+            pending_prompts: VecDeque::new(),
+            record_turns: RecentMap::default(),
+            request_turns: RecentMap::default(),
+            tool_turns: RecentMap::default(),
+            main_record_turn: None,
             main_transcript: None,
             transcripts: HashMap::new(),
             main_history: MessageHistory::default(),
@@ -443,16 +477,44 @@ impl ClaudeTranslator {
                 "Turn ended before tool completion",
                 ops,
             );
+            let end_ms = self.execution_end(&old, event.ts_ms, ops);
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: old.id,
                 root_span_id: self.root_span_id.clone(),
-                parent_span_ids: vec![self.session_span_id.clone()],
-                end_ms: Some(event.ts_ms),
+                parent_span_ids: vec![old.parent_id],
+                end_ms: Some(end_ms),
+                late_merge_key: Some(format!("execution:stop:{}", event.ts_ms)),
                 ..Default::default()
             }));
         }
-        self.turn_count += 1;
-        let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_count));
+        let continuation = continuation_origin(&event.payload);
+        let (id, parent_id, user_turn_id, name) = if let Some((_, task_id)) = continuation {
+            self.continuation_count += 1;
+            let owner = self
+                .agent_origins
+                .get(task_id)
+                .and_then(|origin| origin.user_turn_id.clone());
+            (
+                ids::span_id(
+                    &self.session_id,
+                    &format!("continuation:{}", self.continuation_count),
+                ),
+                owner
+                    .clone()
+                    .unwrap_or_else(|| self.session_span_id.clone()),
+                owner,
+                "Continuation: subagent result".to_owned(),
+            )
+        } else {
+            self.turn_count += 1;
+            let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_count));
+            (
+                id.clone(),
+                self.session_span_id.clone(),
+                Some(id),
+                format!("Turn {}", self.turn_count),
+            )
+        };
         let mut metadata = explicit_skill_metadata(&self.pending_skills)
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
@@ -460,22 +522,84 @@ impl ClaudeTranslator {
         if let Some(permission_mode) = &self.permission_mode {
             metadata.insert("permission_mode".into(), json!(permission_mode));
         }
+        if let Some((trigger, task_id)) = continuation {
+            metadata.insert("turn_trigger".into(), json!(trigger));
+            metadata.insert("task_id".into(), json!(task_id));
+        }
         ops.push(SpanOp::Insert(SpanRow {
             span_id: id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: vec![self.session_span_id.clone()],
-            name: format!("Turn {}", self.turn_count),
+            parent_span_ids: vec![parent_id.clone()],
+            name,
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
             input: event.payload.get("prompt").cloned(),
             metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
             ..Default::default()
         }));
+        let turn_id = Arc::new(id.clone());
+        if let Some(prompt_id) = event.payload.get("prompt_id").and_then(Value::as_str) {
+            self.prompt_turns
+                .insert(prompt_id.to_owned(), turn_id.clone());
+        }
+        if let Some(content) = event.payload.get("prompt").filter(|value| !value.is_null()) {
+            if self.pending_prompts.len() == RECENT_ID_CAPACITY {
+                self.pending_prompts.pop_front();
+            }
+            self.pending_prompts.push_back(PendingPrompt {
+                turn_id,
+                content: content.clone(),
+            });
+        }
         self.turn = Some(Turn {
             id,
             number: self.turn_count,
             cwd: self.current_cwd.clone(),
+            parent_id,
+            user_turn_id,
         });
+    }
+
+    // A stopped foreground response can still own background work. Retain its
+    // causal identity and extend its duration without replacing its response.
+    fn extend_user_turn(&mut self, id: &String, end_ms: i64, ops: &mut Vec<SpanOp>) {
+        if self
+            .user_turn_ends
+            .get(id)
+            .is_some_and(|previous| *previous >= end_ms)
+        {
+            return;
+        }
+        self.user_turn_ends.insert(id.clone(), end_ms);
+        if self.turn.as_ref().is_some_and(|turn| &turn.id == id) {
+            return;
+        }
+        ops.push(SpanOp::Merge(SpanRow {
+            span_id: id.clone(),
+            root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![self.session_span_id.clone()],
+            end_ms: Some(end_ms),
+            late_merge_key: Some(format!("turn:activity:{end_ms}")),
+            ..Default::default()
+        }));
+    }
+
+    fn execution_end(&mut self, turn: &Turn, end_ms: i64, ops: &mut Vec<SpanOp>) -> i64 {
+        if let Some(owner) = &turn.user_turn_id {
+            if owner != &turn.id {
+                self.extend_user_turn(owner, end_ms, ops);
+            } else {
+                let end_ms = self
+                    .user_turn_ends
+                    .get(owner)
+                    .copied()
+                    .unwrap_or(end_ms)
+                    .max(end_ms);
+                self.user_turn_ends.insert(owner.clone(), end_ms);
+                return end_ms;
+            }
+        }
+        end_ms
     }
 
     fn record_skill(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
@@ -515,7 +639,7 @@ impl ClaudeTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.id.clone(),
                 root_span_id: self.root_span_id.clone(),
-                parent_span_ids: vec![self.session_span_id.clone()],
+                parent_span_ids: vec![turn.parent_id.clone()],
                 metadata: explicit_skill_metadata(&self.pending_skills),
                 ..Default::default()
             }));
@@ -538,12 +662,25 @@ impl ClaudeTranslator {
         if let Some(agent) = self.subagents.get(&hook.agent_id) {
             return agent.span_id.clone();
         }
-        let parent_id = self
-            .turn
-            .as_ref()
-            .map(|turn| turn.id.clone())
-            .or_else(|| self.last_turn_id.clone())
-            .unwrap_or_else(|| self.session_span_id.clone());
+        let origin = self
+            .agent_origins
+            .get(&hook.agent_id)
+            .cloned()
+            .unwrap_or_else(|| AgentOrigin {
+                parent_id: self
+                    .turn
+                    .as_ref()
+                    .map(|turn| turn.id.clone())
+                    .or_else(|| self.last_turn_id.clone())
+                    .unwrap_or_else(|| self.session_span_id.clone()),
+                user_turn_id: self
+                    .turn
+                    .as_ref()
+                    .map(|turn| turn.user_turn_id.clone())
+                    .unwrap_or_else(|| self.last_user_turn_id.clone()),
+            });
+        let parent_id = origin.parent_id.clone();
+        self.agent_origins.insert(hook.agent_id.clone(), origin);
         let agent_type = hook.agent_type.clone().unwrap_or_else(|| "agent".into());
         let span_id = ids::span_id(&self.session_id, &format!("subagent:{}", hook.agent_id));
         ops.push(SpanOp::Insert(SpanRow {
@@ -711,6 +848,14 @@ impl ClaudeTranslator {
             ..Default::default()
         }));
         self.subagents.remove(&agent_id);
+        if let Some(owner) = self
+            .agent_origins
+            .get(&agent_id)
+            .and_then(|origin| origin.user_turn_id.clone())
+        {
+            self.extend_user_turn(&owner, event.ts_ms, ops);
+        }
+        self.end_root(event.ts_ms, ops);
     }
 
     fn emit_main(&mut self, parent: &str, ops: &mut Vec<SpanOp>) {
@@ -764,6 +909,9 @@ impl ClaudeTranslator {
             }
             return None;
         };
+        if matches!(pending.history, PendingHistory::Main) {
+            self.observe_record_turns(&records);
+        }
         let history = match &mut pending.history {
             PendingHistory::Main => std::mem::take(&mut self.main_history),
             PendingHistory::Owned(history) => std::mem::take(history),
@@ -795,10 +943,91 @@ impl ClaudeTranslator {
         self.main_history = MessageHistory::default();
         self.transcripts.clear();
         self.subagents.clear();
+        self.agent_origins = RecentMap::default();
+        self.user_turn_ends = RecentMap::default();
+        self.last_user_turn_id = None;
         self.pending_tools.clear();
         self.pending_skills.clear();
         self.emitted_requests.clear();
         self.emitted_tools.clear();
+        self.prompt_turns = RecentMap::default();
+        self.pending_prompts.clear();
+        self.record_turns = RecentMap::default();
+        self.request_turns = RecentMap::default();
+        self.tool_turns = RecentMap::default();
+        self.main_record_turn = None;
+    }
+
+    // Native hooks omit prompt_id. Match their prompts in submission order,
+    // then retain transcript identities so repeats cannot consume another turn.
+    fn user_record_turn(&mut self, record: &Value) -> Option<Arc<String>> {
+        let prompt_id = record.get("promptId").and_then(Value::as_str);
+        let mut owner = prompt_id
+            .and_then(|id| self.prompt_turns.get(id))
+            .or_else(|| {
+                record
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.record_turns.get(id))
+            })
+            .cloned();
+        if let Some(index) = self.pending_prompts.iter().position(|pending| {
+            if let Some(owner) = &owner {
+                &pending.turn_id == owner
+            } else {
+                record
+                    .pointer("/message/content")
+                    .is_some_and(|content| prompt_matches(&pending.content, content))
+            }
+        }) {
+            owner = self
+                .pending_prompts
+                .remove(index)
+                .map(|pending| pending.turn_id);
+        }
+        if let (Some(prompt_id), Some(owner)) = (prompt_id, &owner) {
+            self.prompt_turns
+                .insert(prompt_id.to_owned(), owner.clone());
+        }
+        owner
+    }
+
+    // Hooks may precede their native records by an entire execution. Resolve
+    // each user record before propagating its owner through record ancestry.
+    fn observe_record_turns(&mut self, records: &[Value]) {
+        for record in records {
+            let user_prompt = is_real_user_record(record)
+                && record.get("queueTranscriptOnly").and_then(Value::as_bool) != Some(true);
+            if user_prompt {
+                self.main_record_turn = self.user_record_turn(record);
+            }
+            let owner = if user_prompt {
+                self.main_record_turn.clone()
+            } else {
+                record
+                    .get("parentUuid")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.record_turns.get(id))
+                    .cloned()
+                    .or_else(|| self.main_record_turn.clone())
+            };
+            let Some(owner) = owner else { continue };
+            if let Some(uuid) = record.get("uuid").and_then(Value::as_str) {
+                self.record_turns.insert(uuid.to_owned(), owner.clone());
+            }
+            if let Some(request_id) = assistant_request_id(record) {
+                self.request_turns.insert(request_id, owner.clone());
+                if let Some(blocks) = record.pointer("/message/content").and_then(Value::as_array) {
+                    for block in blocks {
+                        if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                                self.tool_turns.insert(id.to_owned(), owner.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn emit_parsed(
@@ -810,9 +1039,16 @@ impl ClaudeTranslator {
         ops: &mut Vec<SpanOp>,
     ) {
         for call in calls {
-            let request_key = format!("{scope}:{}", call.request_id);
-            if self.emitted_requests.insert(request_key.clone()) {
+            if self.emitted_requests.insert(call.request_id.clone()) {
                 let span_key = format!("{scope}:llm:{}", call.request_id);
+                let parent = if scope == "main" {
+                    self.request_turns
+                        .get(&call.request_id)
+                        .map(|id| id.as_str())
+                        .unwrap_or(parent)
+                } else {
+                    parent
+                };
                 ops.push(SpanOp::Insert(call.into_row(
                     ids::span_id(&self.session_id, &span_key),
                     self.root_span_id.clone(),
@@ -838,6 +1074,14 @@ impl ClaudeTranslator {
                 )));
             } else {
                 let span_key = format!("tool:{}", tool.call_id);
+                let parent = if scope == "main" {
+                    self.tool_turns
+                        .get(&tool.call_id)
+                        .map(|id| id.as_str())
+                        .unwrap_or(parent)
+                } else {
+                    parent
+                };
                 ops.push(SpanOp::Insert(tool.into_row(
                     ids::span_id(&self.session_id, &span_key),
                     self.root_span_id.clone(),
@@ -883,11 +1127,14 @@ impl ClaudeTranslator {
             "Turn ended before tool completion",
             ops,
         );
+        let turn = self.turn.take().expect("active turn");
+        let end_ms = self.execution_end(&turn, event.ts_ms, ops);
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: vec![self.session_span_id.clone()],
-            end_ms: Some(event.ts_ms),
+            parent_span_ids: vec![turn.parent_id],
+            end_ms: Some(end_ms),
+            late_merge_key: Some(format!("execution:stop:{}", event.ts_ms)),
             output: event
                 .payload
                 .get("last_assistant_message")
@@ -896,10 +1143,11 @@ impl ClaudeTranslator {
             error,
             ..Default::default()
         }));
-        self.last_turn_cwd = self.turn.as_ref().and_then(|turn| turn.cwd.clone());
+        self.last_turn_cwd = turn.cwd;
+        self.last_user_turn_id = turn.user_turn_id;
         self.last_turn_id = Some(turn_id);
-        self.turn = None;
         self.pending_skills.clear();
+        self.end_root(event.ts_ms, ops);
     }
 
     fn close_pending_tools(
@@ -933,6 +1181,22 @@ impl ClaudeTranslator {
         }
     }
 
+    fn end_root(&mut self, end_ms: i64, ops: &mut Vec<SpanOp>) {
+        let end_ms = end_ms.max(self.last_ts_ms);
+        if !self.root_open || self.root_end_ms.is_some_and(|previous| previous >= end_ms) {
+            return;
+        }
+        self.root_end_ms = Some(end_ms);
+        ops.push(SpanOp::Merge(SpanRow {
+            span_id: self.session_span_id.clone(),
+            root_span_id: self.root_span_id.clone(),
+            parent_span_ids: self.session_parent_span_ids.clone(),
+            end_ms: Some(end_ms),
+            late_merge_key: Some(format!("session:stop:{end_ms}")),
+            ..Default::default()
+        }));
+    }
+
     fn end_session(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
         if let Some(turn_id) = self
             .turn
@@ -949,25 +1213,19 @@ impl ClaudeTranslator {
                 "Session ended before tool completion",
                 ops,
             );
+            let end_ms = self.execution_end(&turn, event.ts_ms, ops);
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.id.clone(),
                 root_span_id: self.root_span_id.clone(),
-                parent_span_ids: vec![self.session_span_id.clone()],
-                end_ms: Some(event.ts_ms),
+                parent_span_ids: vec![turn.parent_id],
+                end_ms: Some(end_ms),
+                late_merge_key: Some(format!("execution:stop:{}", event.ts_ms)),
                 ..Default::default()
             }));
             self.last_turn_id = Some(turn.id);
+            self.last_user_turn_id = turn.user_turn_id;
         }
-        if self.root_open && !self.root_ended {
-            self.root_ended = true;
-            ops.push(SpanOp::Merge(SpanRow {
-                span_id: self.session_span_id.clone(),
-                root_span_id: self.root_span_id.clone(),
-                parent_span_ids: self.session_parent_span_ids.clone(),
-                end_ms: Some(event.ts_ms),
-                ..Default::default()
-            }));
-        }
+        self.end_root(event.ts_ms, ops);
         if let Some(pending) = &mut self.pending_emission {
             pending.clear_after = true;
         } else {
@@ -1064,6 +1322,11 @@ impl AgentTranslator for ClaudeTranslator {
                     self.stop_subagent(event, hook, &mut ops);
                 }
             }
+            "TranscriptUpdate" if self.turn.is_none() => {
+                if let Some(parent) = self.last_turn_id.clone() {
+                    self.emit_main(&parent, &mut ops);
+                }
+            }
             "Stop" => self.stop_turn(event, None, &mut ops),
             "StopFailure" => self.stop_turn(
                 event,
@@ -1091,6 +1354,14 @@ impl AgentTranslator for ClaudeTranslator {
     fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let end_ms = self.last_ts_ms;
         let mut ops = Vec::new();
+        if let Some(parent) = self
+            .turn
+            .as_ref()
+            .map(|turn| turn.id.clone())
+            .or_else(|| self.last_turn_id.clone())
+        {
+            self.emit_main(&parent, &mut ops);
+        }
         for (_, tool) in self.pending_tools.drain() {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: tool.span_id,
@@ -1102,16 +1373,25 @@ impl AgentTranslator for ClaudeTranslator {
             }));
         }
         if let Some(turn) = self.turn.take() {
+            let turn_end_ms = self.execution_end(&turn, end_ms, &mut ops);
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.id,
                 root_span_id: self.root_span_id.clone(),
-                parent_span_ids: vec![self.session_span_id.clone()],
-                end_ms: Some(end_ms),
+                parent_span_ids: vec![turn.parent_id],
+                end_ms: Some(turn_end_ms),
+                late_merge_key: Some(format!("execution:stop:{end_ms}")),
                 error: Some("Session ended before turn completion".into()),
                 ..Default::default()
             }));
         }
-        for (_, subagent) in self.subagents.drain() {
+        for (agent_id, subagent) in std::mem::take(&mut self.subagents) {
+            if let Some(owner) = self
+                .agent_origins
+                .get(&agent_id)
+                .and_then(|origin| origin.user_turn_id.clone())
+            {
+                self.extend_user_turn(&owner, end_ms, &mut ops);
+            }
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: subagent.span_id,
                 root_span_id: self.root_span_id.clone(),
@@ -1121,17 +1401,12 @@ impl AgentTranslator for ClaudeTranslator {
                 ..Default::default()
             }));
         }
-        if self.root_open && !self.root_ended {
-            self.root_ended = true;
-            ops.push(SpanOp::Merge(SpanRow {
-                span_id: self.session_span_id.clone(),
-                root_span_id: self.root_span_id.clone(),
-                parent_span_ids: self.session_parent_span_ids.clone(),
-                end_ms: Some(end_ms),
-                ..Default::default()
-            }));
+        self.end_root(end_ms, &mut ops);
+        if let Some(pending) = &mut self.pending_emission {
+            pending.clear_after = true;
+        } else {
+            self.release_terminal_state();
         }
-        self.release_terminal_state();
         Ok(ops)
     }
 }
@@ -1210,7 +1485,12 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
                     calls.push(LlmCall::new(
                         request_id.clone(),
                         parse_timestamp_ms(record).unwrap_or(0),
-                        history.active(),
+                        if history.fork_context_prefix {
+                            Vec::new()
+                        } else {
+                            history.active()
+                        },
+                        history.fork_context_prefix,
                     ));
                     index
                 });
@@ -1222,6 +1502,11 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
                 } else {
                     let history_index = history.push(output, source_uuid);
                     assistant_history_indexes.insert(request_id.clone(), history_index);
+                }
+                // Fork transcripts copy the launching response before their
+                // first user row. It is input context, not child work or usage.
+                if calls[index].inherited {
+                    continue;
                 }
                 if let Some(content) = record.pointer("/message/content").and_then(Value::as_array)
                 {
@@ -1257,6 +1542,7 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
                 }
             }
             Some("user") => {
+                history.fork_context_prefix = false;
                 // Claude persists a synthetic user message containing the new
                 // active context immediately after a compact_boundary record.
                 // It is the first model-visible message after the boundary.
@@ -1337,9 +1623,11 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
             Some("system") if envelope.subtype.as_deref() == Some("compact_boundary") => {
                 history.observe_compact_boundary(record);
             }
+            Some("fork-context-ref") => history.fork_context_prefix = true,
             _ => {}
         }
     }
+    calls.retain(|call| !call.inherited);
     ParsedTranscript {
         calls,
         tools: tool_order
@@ -1348,6 +1636,65 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
             .collect(),
         history,
     }
+}
+
+fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
+    if let Some(origin) = payload.get("origin") {
+        if origin.get("kind").and_then(Value::as_str) == Some("peer")
+            && origin.get("handback").and_then(Value::as_bool) == Some(true)
+        {
+            let id = origin
+                .get("senderTaskId")
+                .or_else(|| origin.get("from"))?
+                .as_str()?;
+            return (!id.is_empty()).then_some(("agent_message", id));
+        }
+    }
+    let prompt = payload.get("prompt")?.as_str()?.trim();
+    if let Some(id) = task_notification_id(prompt) {
+        return Some(("task_notification", id));
+    }
+    let body = prompt.strip_prefix("<agent-message from=\"")?;
+    let (id, body) = body.split_once("\">")?;
+    if id.is_empty() || id.contains(['"', '<', '>']) || !body.ends_with("</agent-message>") {
+        return None;
+    }
+    Some(("agent_message", id))
+}
+
+fn task_notification_id(prompt: &str) -> Option<&str> {
+    let body = prompt
+        .trim()
+        .strip_prefix("<task-notification>")?
+        .strip_suffix("</task-notification>")?;
+    let (_, rest) = body.split_once("<task-id>")?;
+    let (id, _) = rest.split_once("</task-id>")?;
+    let id = id.trim();
+    (!id.is_empty()).then_some(id)
+}
+
+fn prompt_matches(prompt: &Value, content: &Value) -> bool {
+    if prompt == content {
+        return true;
+    }
+    let (Some(mut remaining), Some(blocks)) = (prompt.as_str(), content.as_array()) else {
+        return false;
+    };
+    // Native hooks use a string, while transcripts may wrap the same prompt
+    // in text blocks alongside images. Compare without allocating a joined copy.
+    let mut has_text = false;
+    for text in blocks.iter().filter_map(|block| {
+        (block.get("type").and_then(Value::as_str) == Some("text"))
+            .then(|| block.get("text").and_then(Value::as_str))
+            .flatten()
+    }) {
+        has_text = true;
+        let Some(rest) = remaining.strip_prefix(text) else {
+            return false;
+        };
+        remaining = rest;
+    }
+    has_text && remaining.is_empty()
 }
 
 fn is_real_user_record(record: &Value) -> bool {
@@ -1372,6 +1719,7 @@ fn is_real_user_record(record: &Value) -> bool {
 
 struct LlmCall {
     request_id: String,
+    inherited: bool,
     model: String,
     start_ms: i64,
     end_ms: i64,
@@ -1389,9 +1737,10 @@ struct LlmCall {
 }
 
 impl LlmCall {
-    fn new(request_id: String, start_ms: i64, input: Vec<Value>) -> Self {
+    fn new(request_id: String, start_ms: i64, input: Vec<Value>, inherited: bool) -> Self {
         Self {
             request_id,
+            inherited,
             model: "claude".into(),
             start_ms,
             end_ms: start_ms,
@@ -1762,6 +2111,11 @@ fn read_buffered_bounded<R: std::io::Read>(
             break;
         }
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            // A capture can end halfway through an asynchronous append. Keep
+            // the fragment unread so the next capture can complete the record.
+            if !line.ends_with('\n') {
+                break;
+            }
             *offset += read as u64;
             continue;
         };
@@ -1828,6 +2182,26 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
         .payload
         .get("_bt_import_through_offset")
         .and_then(Value::as_u64);
+    if let Some(mirrors) = event.payload.get("_bt_claude_transcript_mirrors") {
+        // This marker records even an absent/unreadable file. Never replace a
+        // captured absence with bytes appended later to the mutable native path.
+        let Some(reference) = mirrors.get(path) else {
+            return Vec::new();
+        };
+        let Some(mirror) = reference.get("mirror").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Some(through) = reference.get("through").and_then(Value::as_u64) else {
+            return Vec::new();
+        };
+        let through = if event.payload.get("transcript_path").and_then(Value::as_str) == Some(path)
+        {
+            import_through_offset.map_or(through, |offset| offset.min(through))
+        } else {
+            through
+        };
+        return read_file_bounded(mirror, offset, None, Some(through));
+    }
 
     let mirror = event
         .payload
@@ -1861,6 +2235,15 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
         }
         (Some(contents), None) => read_snapshot_bounded(contents, offset, Some(event.ts_ms), None),
         (None, through @ Some(_)) => read_file_bounded(path, offset, None, through),
+        (None, None)
+            if event
+                .payload
+                .get("_bt_transcript_replay")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            Vec::new()
+        }
         (None, None) => read_file_bounded(path, offset, Some(event.ts_ms), None),
     }
 }
@@ -2128,5 +2511,28 @@ mod tests {
 
         assert!(records.is_empty());
         assert_eq!(offset, 0, "the future record remains unread");
+    }
+
+    #[test]
+    fn transcript_partial_record_survives_the_next_capture() {
+        let first = serde_json::json!({"type":"user","message":{"content":"hello"}});
+        let final_row = serde_json::json!({
+            "type":"assistant",
+            "message":{"id":"final-request","content":[{"type":"text","text":"done"}]}
+        });
+        let prefix = format!("{first}\r\nmalformed complete row\r\n");
+        let contents = format!("{prefix}{final_row}\r\n");
+        let partial = &contents[..prefix.len() + 20];
+        let mut offset = 0;
+        assert_eq!(
+            read_snapshot_bounded(partial, &mut offset, None, None),
+            vec![first]
+        );
+        assert_eq!(
+            read_snapshot_bounded(&contents, &mut offset, None, None),
+            vec![final_row],
+            "a row split across captures must not be permanently skipped"
+        );
+        assert!(read_snapshot_bounded(&contents, &mut offset, None, None).is_empty());
     }
 }

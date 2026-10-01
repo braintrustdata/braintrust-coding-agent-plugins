@@ -124,6 +124,17 @@ pub(super) fn envelopes(
     let (start_ms, end_ms) = timestamp_bounds(records);
     let transcript_path = path.to_string_lossy().into_owned();
     let subagents = subagents(path, records)?;
+    let mut subagent_events = subagents
+        .iter()
+        .flat_map(|subagent| {
+            [
+                (subagent.start_index, true, subagent),
+                (subagent.record_index, false, subagent),
+            ]
+        })
+        .collect::<Vec<_>>();
+    // Lifecycle boundaries follow native file order, not wall-clock order.
+    subagent_events.sort_by_key(|(index, _, _)| *index);
     let mut events = vec![import_envelope(
         source_version.clone(),
         &session_id,
@@ -179,44 +190,39 @@ pub(super) fn envelopes(
                 "hook_event_name": "UserPromptSubmit",
                 "transcript_path": transcript_path,
                 "cwd": turn_cwd,
-                "prompt": prompt
+                "prompt": prompt,
+                "prompt_id": records[index].get("promptId"),
+                "origin": records[index].get("origin")
             }),
             record_end_offsets[index],
         ));
-        for subagent in subagents
+        for &(record_index, is_start, subagent) in subagent_events
             .iter()
-            .filter(|subagent| subagent.record_index >= index && subagent.record_index < next)
+            .filter(|(record_index, _, _)| *record_index >= index && *record_index < next)
         {
+            let (event, timestamp) = if is_start {
+                ("SubagentStart", subagent.start_ms)
+            } else {
+                ("SubagentStop", subagent.end_ms)
+            };
+            let mut payload = json!({
+                "session_id": session_id,
+                "hook_event_name": event,
+                "transcript_path": transcript_path,
+                "agent_id": subagent.agent_id,
+                "agent_type": subagent.agent_type,
+                "agent_transcript_path": subagent.path
+            });
+            if !is_start {
+                payload["last_assistant_message"] = json!(subagent.last_assistant_message);
+            }
             events.push(import_envelope(
                 source_version.clone(),
                 &session_id,
-                "SubagentStart",
-                subagent.start_ms,
-                json!({
-                    "session_id": session_id,
-                    "hook_event_name": "SubagentStart",
-                    "transcript_path": transcript_path,
-                    "agent_id": subagent.agent_id,
-                    "agent_type": subagent.agent_type,
-                    "agent_transcript_path": subagent.path
-                }),
-                record_end_offsets[subagent.start_index],
-            ));
-            events.push(import_envelope(
-                source_version.clone(),
-                &session_id,
-                "SubagentStop",
-                subagent.end_ms,
-                json!({
-                    "session_id": session_id,
-                    "hook_event_name": "SubagentStop",
-                    "transcript_path": transcript_path,
-                    "agent_id": subagent.agent_id,
-                    "agent_type": subagent.agent_type,
-                    "agent_transcript_path": subagent.path,
-                    "last_assistant_message": subagent.last_assistant_message
-                }),
-                record_end_offsets[subagent.record_index],
+                event,
+                timestamp,
+                payload,
+                record_end_offsets[record_index],
             ));
         }
         let error = last_assistant_error(segment);

@@ -1364,6 +1364,584 @@ fn claude_groups_streamed_rows_and_reads_late_final_output_at_session_end() {
     );
 }
 
+fn replay_continuation_events(
+    events: Vec<(&str, i64, Value)>,
+    finalize: bool,
+) -> HashMap<String, SpanRow> {
+    let session = "continuation";
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", session);
+    let ctx = SessionCtx {
+        session_id: session.into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for (name, ts, payload) in events {
+        ops.extend(
+            translator
+                .handle(&claude_event(session, name, ts, payload), &ctx)
+                .unwrap(),
+        );
+        while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+            ops.extend(batch);
+        }
+    }
+    if finalize {
+        ops.extend(translator.finalize(&ctx).unwrap());
+    }
+    reduce(ops)
+}
+
+#[test]
+fn claude_handbacks_continue_the_originating_human_turn_with_real_model_work() {
+    let notification = "<task-notification>\n<task-id>fork-1</task-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>Done</result>\n</task-notification>";
+    let message = "<agent-message from=\"fork-1\">Done</agent-message>";
+    let transcript = json!({
+        "type": "assistant",
+        "timestamp": "2026-10-01T16:48:31Z",
+        "message": {
+            "id": "notification-response",
+            "model": "claude-test",
+            "content": [{"type": "text", "text": "The fork finished."}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }
+    });
+    let base = 1_790_873_300_000;
+    for payload in [
+        json!({"prompt": notification}),
+        json!({"prompt": message}),
+        json!({
+            "prompt": format!("Native prefix\n{notification}\nNative suffix"),
+            "origin": {"kind": "peer", "handback": true, "senderTaskId": "fork-1"}
+        }),
+        json!({
+            "prompt": format!("Native prefix\n{message}\nNative suffix"),
+            "origin": {"kind": "peer", "handback": true, "from": "fork-1"}
+        }),
+    ] {
+        for child_stops_first in [true, false] {
+            let mut events = vec![
+                ("UserPromptSubmit", base, json!({"prompt": "delegate"})),
+                (
+                    "SubagentStart",
+                    base + 100,
+                    json!({"agent_id": "fork-1", "agent_type": "fork"}),
+                ),
+                (
+                    "Stop",
+                    base + 1_000,
+                    json!({"last_assistant_message": "Working in background"}),
+                ),
+                (
+                    "UserPromptSubmit",
+                    base + 4_000,
+                    json!({"prompt": "unrelated question"}),
+                ),
+                (
+                    "Stop",
+                    base + 5_000,
+                    json!({"last_assistant_message": "Unrelated answer"}),
+                ),
+            ];
+            let child_stop = (
+                "SubagentStop",
+                base + 8_000 + if child_stops_first { -43 } else { 43 },
+                json!({
+                    "agent_id": "fork-1", "agent_type": "fork",
+                    "last_assistant_message": "Done"
+                }),
+            );
+            if child_stops_first {
+                events.push(child_stop.clone());
+            }
+            events.push(("UserPromptSubmit", base + 8_000, payload.clone()));
+            if !child_stops_first {
+                events.push(child_stop);
+            }
+            events.extend([
+                (
+                    "Stop",
+                    base + 12_000,
+                    json!({
+                        "last_assistant_message": "The fork finished.",
+                        "transcript_path": "C:\\sessions\\main.jsonl",
+                        "_bt_transcript_snapshot": {
+                            "path": "C:\\sessions\\main.jsonl",
+                            "contents": format!("{transcript}\n")
+                        }
+                    }),
+                ),
+                (
+                    "UserPromptSubmit",
+                    base + 13_000,
+                    json!({"prompt": "thanks"}),
+                ),
+                ("Stop", base + 14_000, json!({})),
+            ]);
+            let rows = replay_continuation_events(events, false);
+            let original = rows.values().find(|row| row.name == "Turn 1").unwrap();
+            let unrelated = rows.values().find(|row| row.name == "Turn 2").unwrap();
+            let next = rows.values().find(|row| row.name == "Turn 3").unwrap();
+            assert_eq!(original.input, Some(json!("delegate")));
+            assert_eq!(unrelated.input, Some(json!("unrelated question")));
+            assert_eq!(next.input, Some(json!("thanks")));
+            assert_eq!(
+                rows.values()
+                    .filter(|row| row.name.starts_with("Turn "))
+                    .count(),
+                3
+            );
+            let continuation = rows
+                .values()
+                .find(|row| row.input.as_ref() == Some(&payload["prompt"]))
+                .unwrap();
+            assert_eq!(continuation.span_type, SpanType::Task);
+            assert_eq!(continuation.parent_span_ids, vec![original.span_id.clone()]);
+            assert_eq!(continuation.output, Some(json!("The fork finished.")));
+            assert_eq!(continuation.end_ms, Some(base + 12_000));
+            assert_eq!(original.end_ms, continuation.end_ms);
+            assert_eq!(original.output, Some(json!("Working in background")));
+            assert_eq!(unrelated.end_ms, Some(base + 5_000));
+            let child = rows
+                .values()
+                .find(|row| row.output == Some(json!("Done")))
+                .unwrap();
+            assert_eq!(child.parent_span_ids, vec![original.span_id.clone()]);
+            let llms: Vec<_> = rows
+                .values()
+                .filter(|row| row.span_type == SpanType::Llm)
+                .collect();
+            assert_eq!(llms.len(), 1);
+            let llm = llms[0];
+            assert_eq!(llm.parent_span_ids, vec![continuation.span_id.clone()]);
+            assert_eq!(
+                llm.output.as_ref().unwrap()["content"],
+                "The fork finished."
+            );
+            assert_eq!(llm.metrics.as_ref().unwrap()["prompt_tokens"], 10);
+            assert_eq!(llm.metrics.as_ref().unwrap()["completion_tokens"], 5);
+        }
+    }
+}
+
+#[test]
+fn claude_unknown_handbacks_are_session_children_but_quoted_tags_are_human_turns() {
+    let notification =
+        "<task-notification><task-id>unknown</task-id><result>Done</result></task-notification>";
+    let message = "<agent-message from=\"unknown\">Done</agent-message>";
+    let quoted_notification = format!("Explain this format: {notification}");
+    let quoted_message = format!("{message}\nExplain the tag above.");
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt": "hello"})),
+            ("Stop", 20, json!({})),
+            ("UserPromptSubmit", 30, json!({"prompt": notification})),
+            ("Stop", 40, json!({"last_assistant_message": "received"})),
+            ("UserPromptSubmit", 50, json!({"prompt": message})),
+            (
+                "Stop",
+                60,
+                json!({"last_assistant_message": "received again"}),
+            ),
+            (
+                "UserPromptSubmit",
+                70,
+                json!({"prompt": quoted_notification}),
+            ),
+            ("Stop", 80, json!({})),
+            ("UserPromptSubmit", 90, json!({"prompt": quoted_message})),
+            ("Stop", 100, json!({})),
+        ],
+        false,
+    );
+    let root = rows
+        .values()
+        .find(|row| row.parent_span_ids.is_empty())
+        .unwrap();
+    for prompt in [notification, message] {
+        let continuation = rows
+            .values()
+            .find(|row| row.input == Some(json!(prompt)))
+            .unwrap();
+        assert_eq!(continuation.span_type, SpanType::Task);
+        assert!(!continuation.name.starts_with("Turn "));
+        assert_eq!(continuation.parent_span_ids, vec![root.span_id.clone()]);
+    }
+    for (name, prompt) in [
+        ("Turn 1", "hello"),
+        ("Turn 2", quoted_notification.as_str()),
+        ("Turn 3", quoted_message.as_str()),
+    ] {
+        let human = rows.values().find(|row| row.name == name).unwrap();
+        assert_eq!(human.input, Some(json!(prompt)));
+        assert_eq!(human.parent_span_ids, vec![root.span_id.clone()]);
+    }
+    assert_eq!(
+        rows.values()
+            .find(|row| row.name == "Turn 1")
+            .unwrap()
+            .end_ms,
+        Some(20)
+    );
+    assert_eq!(
+        rows.values()
+            .filter(|row| row.name.starts_with("Turn "))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn claude_repeated_handbacks_retain_distinct_work_without_consuming_human_numbers() {
+    let prompt = "<agent-message from=\"fork-1\">Done</agent-message>";
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt": "delegate"})),
+            (
+                "SubagentStart",
+                20,
+                json!({"agent_id": "fork-1", "agent_type": "fork"}),
+            ),
+            ("Stop", 30, json!({})),
+            (
+                "SubagentStop",
+                40,
+                json!({"agent_id": "fork-1", "agent_type": "fork"}),
+            ),
+            ("UserPromptSubmit", 50, json!({"prompt": prompt})),
+            (
+                "Stop",
+                60,
+                json!({"last_assistant_message": "first return"}),
+            ),
+            ("UserPromptSubmit", 70, json!({"prompt": prompt})),
+            (
+                "Stop",
+                80,
+                json!({"last_assistant_message": "second return"}),
+            ),
+            ("UserPromptSubmit", 90, json!({"prompt": "next question"})),
+            ("Stop", 100, json!({})),
+        ],
+        false,
+    );
+    let original = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    let mut returns: Vec<_> = rows
+        .values()
+        .filter(|row| row.input == Some(json!(prompt)))
+        .collect();
+    returns.sort_by_key(|row| row.start_ms);
+    assert_eq!(returns.len(), 2);
+    assert_ne!(returns[0].span_id, returns[1].span_id);
+    assert_eq!(returns[0].output, Some(json!("first return")));
+    assert_eq!(returns[1].output, Some(json!("second return")));
+    assert!(returns
+        .iter()
+        .all(|row| row.parent_span_ids == vec![original.span_id.clone()]));
+    assert_eq!(original.end_ms, Some(80));
+    assert_eq!(
+        rows.values()
+            .find(|row| row.name == "Turn 2")
+            .unwrap()
+            .input,
+        Some(json!("next question"))
+    );
+    assert_eq!(
+        rows.values()
+            .filter(|row| row.name.starts_with("Turn "))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn claude_active_continuation_tool_skill_and_terminal_merges_preserve_causal_parent() {
+    let prompt =
+        "<task-notification><task-id>fork-1</task-id><result>Done</result></task-notification>";
+    for terminal in ["Stop", "SessionEnd", "finalize"] {
+        let rows = replay_continuation_events(
+            vec![
+                ("UserPromptSubmit", 10, json!({"prompt": "delegate"})),
+                (
+                    "SubagentStart",
+                    20,
+                    json!({"agent_id": "fork-1", "agent_type": "fork"}),
+                ),
+                ("Stop", 30, json!({"last_assistant_message": "background"})),
+                (
+                    "SubagentStop",
+                    40,
+                    json!({"agent_id": "fork-1", "agent_type": "fork"}),
+                ),
+                ("UserPromptSubmit", 50, json!({"prompt": prompt})),
+                (
+                    "UserPromptExpansion",
+                    60,
+                    json!({"expansion_type": "slash_command", "skill_name": "review"}),
+                ),
+                (
+                    "PreToolUse",
+                    70,
+                    json!({"tool_name": "Skill", "tool_use_id": "skill-1", "tool_input": {"skill": "review"}}),
+                ),
+                (
+                    "PostToolUse",
+                    80,
+                    json!({"tool_name": "Skill", "tool_use_id": "skill-1", "tool_response": {"output": "loaded"}}),
+                ),
+                (
+                    "PreToolUse",
+                    90,
+                    json!({"tool_name": "Bash", "tool_use_id": "unfinished", "tool_input": {"command": "sleep 10"}}),
+                ),
+                (
+                    if terminal == "finalize" {
+                        "Notification"
+                    } else {
+                        terminal
+                    },
+                    100,
+                    json!({}),
+                ),
+            ],
+            terminal == "finalize",
+        );
+        let original = rows.values().find(|row| row.name == "Turn 1").unwrap();
+        let continuation = rows
+            .values()
+            .find(|row| row.input == Some(json!(prompt)))
+            .unwrap();
+        assert_eq!(continuation.parent_span_ids, vec![original.span_id.clone()]);
+        assert_eq!(continuation.end_ms, Some(100), "{terminal}");
+        assert_eq!(original.end_ms, continuation.end_ms, "{terminal}");
+        assert_eq!(original.output, Some(json!("background")));
+        let tools: Vec<_> = rows
+            .values()
+            .filter(|row| row.span_type == SpanType::Tool)
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert!(tools
+            .iter()
+            .all(|row| row.parent_span_ids == vec![continuation.span_id.clone()]));
+        let completed = tools.iter().find(|row| row.start_ms == Some(70)).unwrap();
+        assert_eq!(completed.end_ms, Some(80));
+        assert_eq!(completed.output, Some(json!({"output": "loaded"})));
+        let unfinished = tools.iter().find(|row| row.start_ms == Some(90)).unwrap();
+        assert_eq!(unfinished.end_ms, Some(100), "{terminal}");
+    }
+}
+
+#[test]
+fn claude_background_child_completion_extends_the_originating_human_turn() {
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt": "delegate"})),
+            (
+                "SubagentStart",
+                20,
+                json!({"agent_id": "fork-1", "agent_type": "fork"}),
+            ),
+            ("Stop", 30, json!({"last_assistant_message": "background"})),
+            ("UserPromptSubmit", 40, json!({"prompt": "unrelated"})),
+            ("Stop", 50, json!({})),
+            (
+                "SubagentStop",
+                100,
+                json!({"agent_id": "fork-1", "agent_type": "fork", "last_assistant_message": "child result"}),
+            ),
+        ],
+        false,
+    );
+    let original = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    let unrelated = rows.values().find(|row| row.name == "Turn 2").unwrap();
+    let child = rows
+        .values()
+        .find(|row| row.output == Some(json!("child result")))
+        .unwrap();
+    assert_eq!(child.parent_span_ids, vec![original.span_id.clone()]);
+    assert_eq!(child.end_ms, Some(100));
+    assert_eq!(original.end_ms, child.end_ms);
+    assert_eq!(original.output, Some(json!("background")));
+    assert_eq!(unrelated.end_ms, Some(50));
+}
+
+#[test]
+fn claude_later_turns_extend_an_already_closed_session_root() {
+    let session = "resumed-root";
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", session);
+    let ctx = SessionCtx {
+        session_id: session.into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for (name, ts, payload) in [
+        ("UserPromptSubmit", 10, json!({"prompt": "first"})),
+        ("Stop", 20, json!({"last_assistant_message": "done"})),
+        ("SessionEnd", 25, json!({})),
+        ("SessionStart", 30, json!({"source": "resume"})),
+        ("UserPromptSubmit", 40, json!({"prompt": "thank you"})),
+        (
+            "Stop",
+            50,
+            json!({"last_assistant_message": "You're welcome"}),
+        ),
+    ] {
+        ops.extend(
+            translator
+                .handle(&claude_event(session, name, ts, payload), &ctx)
+                .unwrap(),
+        );
+    }
+    let rows = reduce(ops.clone());
+    let root = rows
+        .values()
+        .find(|row| row.parent_span_ids.is_empty())
+        .unwrap();
+    assert_eq!(root.start_ms, Some(10));
+    assert_eq!(root.end_ms, Some(50));
+    assert!(rows
+        .values()
+        .filter(|row| row.name.starts_with("Turn "))
+        .all(|row| row.end_ms <= root.end_ms));
+    // A delayed terminal hook must not shrink the root behind completed work.
+    ops.extend(
+        translator
+            .handle(&claude_event(session, "SessionEnd", 45, json!({})), &ctx)
+            .unwrap(),
+    );
+    let rows = reduce(ops);
+    assert_eq!(
+        rows.values()
+            .find(|row| row.parent_span_ids.is_empty())
+            .unwrap()
+            .end_ms,
+        Some(50)
+    );
+}
+
+#[test]
+fn claude_fork_inherits_parent_history_without_recounting_parent_work() {
+    // The child can finish before the parent's buffered transcript is emitted.
+    for parent_stops_first in [false, true] {
+        let session = "fork-ownership";
+        let base = 1_790_873_300_000;
+        let parent = json!({
+            "type": "assistant", "timestamp": "2026-10-01T16:48:21Z",
+            "message": {
+                "id": "parent-request", "model": "claude-test",
+                "content": [{"type":"tool_use","id":"spawn-fork","name":"Agent","input":{"subagent_type":"fork"}}],
+                "usage": {"input_tokens": 20, "output_tokens": 10}
+            }
+        });
+        let result = json!({
+            "type": "user", "timestamp": "2026-10-01T16:48:22Z",
+            "message": {"content": [{"type":"tool_result","tool_use_id":"spawn-fork","content":"Fork started"}]}
+        });
+        let child = json!({
+            "type": "assistant", "timestamp": "2026-10-01T16:48:23Z",
+            "message": {
+                "id": "child-request", "model": "claude-test",
+                "content": [{"type":"text","text":"Analyzed"}],
+                "usage": {"input_tokens": 30, "output_tokens": 5}
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.jsonl");
+        std::fs::write(&main_path, format!("{parent}\n{result}\n")).unwrap();
+        let registry = Registry::default_agents();
+        let mut translator = registry.create("claude-code", session);
+        let ctx = SessionCtx {
+            session_id: session.into(),
+            config: None,
+        };
+        let mut events = vec![
+            claude_event(
+                session,
+                "UserPromptSubmit",
+                base,
+                json!({"prompt":"delegate","transcript_path":main_path}),
+            ),
+            claude_event(
+                session,
+                "SubagentStart",
+                base + 2_000,
+                json!({"agent_id":"fork-1","agent_type":"fork"}),
+            ),
+        ];
+        let stop = claude_event(
+            session,
+            "Stop",
+            base + 2_500,
+            json!({"last_assistant_message":"Working in background"}),
+        );
+        if parent_stops_first {
+            events.push(stop.clone());
+        }
+        events.push(claude_event(session, "SubagentStop", base + 4_000, json!({
+            "agent_id":"fork-1","agent_type":"fork","agent_transcript_path":"C:\\sessions\\fork.jsonl",
+            "last_assistant_message":"Analyzed",
+            "_bt_transcript_snapshot": {
+                "path":"C:\\sessions\\fork.jsonl",
+                "contents":format!("{{\"type\":\"fork-context-ref\"}}\n{parent}\n{result}\n{child}\n")
+            }
+        })));
+        if !parent_stops_first {
+            events.push(stop);
+        }
+        let mut ops = Vec::new();
+        for event in events {
+            ops.extend(translator.handle(&event, &ctx).unwrap());
+            while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+                ops.extend(batch);
+            }
+        }
+        let rows = reduce(ops);
+        let llms: Vec<_> = rows
+            .values()
+            .filter(|row| row.span_type == SpanType::Llm)
+            .collect();
+        assert_eq!(
+            llms.len(),
+            2,
+            "inherited parent request is not a new child call"
+        );
+        assert_eq!(
+            llms.iter()
+                .map(|row| row.metrics.as_ref().unwrap()["completion_tokens"]
+                    .as_u64()
+                    .unwrap())
+                .sum::<u64>(),
+            15
+        );
+        let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+        let fork = rows
+            .values()
+            .find(|row| row.name == "subagent: fork")
+            .unwrap();
+        let parent_call = llms
+            .iter()
+            .find(|row| row.metadata.as_ref().unwrap()["request_id"] == "parent-request")
+            .unwrap();
+        assert_eq!(parent_call.parent_span_ids, vec![turn.span_id.clone()]);
+        let child_call = llms
+            .iter()
+            .find(|row| row.metadata.as_ref().unwrap()["request_id"] == "child-request")
+            .unwrap();
+        assert_eq!(child_call.parent_span_ids, vec![fork.span_id.clone()]);
+        let input = child_call.input.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(input[0]["tool_calls"][0]["id"], "spawn-fork");
+        assert_eq!(input[1]["content"], "Fork started");
+        let tools: Vec<_> = rows
+            .values()
+            .filter(|row| row.span_type == SpanType::Tool)
+            .collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].parent_span_ids, vec![turn.span_id.clone()]);
+        assert_eq!(tools[0].output, Some(json!("Fork started")));
+    }
+}
+
 #[test]
 fn claude_large_catch_up_emits_one_historical_snapshot_per_batch() {
     const CALLS: usize = 24;
@@ -1675,4 +2253,208 @@ fn claude_post_compact_replaces_old_prefix_and_preserves_recent_window() {
             Some("old question" | "old answer" | "attachment metadata")
         )
     }));
+}
+
+#[test]
+fn claude_late_model_records_keep_prompt_ownership_across_turns() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("main.jsonl");
+    let records = [
+        json!({"type":"user","uuid":"user-a","promptId":"prompt-a","message":{"content":"first"}}),
+        json!({"type":"assistant","uuid":"answer-a","parentUuid":"user-a","message":{"id":"request-a","model":"claude-test","content":[{"type":"text","text":"first answer"}],"usage":{"input_tokens":11,"output_tokens":3}}}),
+        json!({"type":"user","uuid":"user-b","parentUuid":"answer-a","promptId":"prompt-b","message":{"content":"second"}}),
+        json!({"type":"assistant","uuid":"answer-b","parentUuid":"user-b","message":{"id":"request-b","model":"claude-test","content":[{"type":"text","text":"second answer"}],"usage":{"input_tokens":17,"output_tokens":5}}}),
+        // Neither a repeated native row nor a queue-only copy may consume the
+        // third submission, even though its prompt text repeats the first.
+        json!({"type":"user","uuid":"user-a","promptId":"prompt-a","message":{"content":"first"}}),
+        json!({"type":"user","uuid":"queued-c","queueTranscriptOnly":true,"message":{"content":"first"}}),
+        json!({"type":"user","uuid":"user-c","parentUuid":"answer-b","message":{"content":[{"type":"text","text":"first"}]}}),
+        json!({"type":"assistant","uuid":"answer-c","parentUuid":"user-c","message":{"id":"request-c","model":"claude-test","content":[{"type":"text","text":"third answer"}],"usage":{"input_tokens":19,"output_tokens":7}}}),
+        // A late descendant of the first response must follow ancestry, not
+        // the most recently encountered prompt. Its tool has no live hook.
+        json!({"type":"assistant","uuid":"late-a","parentUuid":"answer-a","message":{"id":"request-late-a","model":"claude-test","content":[{"type":"text","text":"late first answer"},{"type":"tool_use","id":"tool-a","name":"Read","input":{"file_path":"a.txt"}}],"usage":{"input_tokens":23,"output_tokens":9}}}),
+        json!({"type":"user","uuid":"result-a","parentUuid":"late-a","message":{"content":[{"type":"tool_result","tool_use_id":"tool-a","content":"file contents"}]}}),
+    ];
+    let contents = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+    std::fs::write(&path, &contents).unwrap();
+    let frozen = |through| {
+        json!({
+            "transcript_path":path,
+            "_bt_claude_transcript_mirrors": {
+                path.to_str().unwrap(): {"path":path,"mirror":path,"through":through}
+            }
+        })
+    };
+    let mut first = frozen(0);
+    first["prompt"] = json!("first");
+    let mut second = frozen(0);
+    second["prompt"] = json!("second");
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, first.clone()),
+            ("Stop", 20, frozen(0)),
+            ("UserPromptSubmit", 30, second),
+            ("Stop", 40, frozen(0)),
+            ("UserPromptSubmit", 50, first),
+            ("Stop", 60, frozen(contents.len())),
+        ],
+        false,
+    );
+    for (request, turn, answer, tokens) in [
+        ("request-a", "Turn 1", "first answer", 3),
+        ("request-b", "Turn 2", "second answer", 5),
+        ("request-c", "Turn 3", "third answer", 7),
+        ("request-late-a", "Turn 1", "late first answer", 9),
+    ] {
+        let owner = rows.values().find(|r| r.name == turn).unwrap();
+        let llm = rows
+            .values()
+            .find(|r| {
+                r.metadata.as_ref().and_then(|m| m.get("request_id")) == Some(&json!(request))
+            })
+            .unwrap();
+        assert_eq!(
+            llm.parent_span_ids,
+            vec![owner.span_id.clone()],
+            "{request}"
+        );
+        assert_eq!(llm.output.as_ref().unwrap()["content"], answer);
+        assert_eq!(llm.metrics.as_ref().unwrap()["completion_tokens"], tokens);
+    }
+    let first = rows.values().find(|r| r.name == "Turn 1").unwrap();
+    let tool = rows
+        .values()
+        .find(|r| r.span_type == SpanType::Tool)
+        .unwrap();
+    assert_eq!(tool.parent_span_ids, vec![first.span_id.clone()]);
+    assert_eq!(tool.output, Some(json!("file contents")));
+}
+
+#[test]
+fn claude_late_native_handback_records_belong_to_the_continuation() {
+    let handback =
+        "<task-notification><task-id>worker</task-id><summary>Done</summary></task-notification>";
+    let records = [
+        json!({"type":"user","uuid":"delegate","promptId":"p1","message":{"content":"delegate"}}),
+        json!({"type":"assistant","uuid":"answer-1","parentUuid":"delegate","message":{"id":"request-1","content":[{"type":"text","text":"working"}]}}),
+        json!({"type":"user","uuid":"unrelated","promptId":"p2","message":{"content":"unrelated"}}),
+        json!({"type":"assistant","uuid":"answer-2","parentUuid":"unrelated","message":{"id":"request-2","content":[{"type":"text","text":"other answer"}]}}),
+        json!({"type":"user","uuid":"queued-handback","queueTranscriptOnly":true,"message":{"content":handback}}),
+        json!({"type":"user","uuid":"handback","promptId":"p3","parentUuid":"answer-2","message":{"content":handback}}),
+        json!({"type":"assistant","uuid":"answer-3","parentUuid":"handback","message":{"id":"request-3","content":[{"type":"text","text":"worker result"}]}}),
+    ];
+    let contents = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt":"delegate"})),
+            (
+                "SubagentStart",
+                11,
+                json!({"agent_id":"worker","agent_type":"Explore"}),
+            ),
+            ("Stop", 20, json!({})),
+            ("UserPromptSubmit", 30, json!({"prompt":"unrelated"})),
+            ("Stop", 40, json!({})),
+            ("UserPromptSubmit", 50, json!({"prompt":handback})),
+            ("Stop", 60, json!({})),
+            (
+                "TranscriptUpdate",
+                70,
+                json!({
+                    "transcript_path":"main.jsonl",
+                    "_bt_transcript_snapshot":{"path":"main.jsonl","contents":contents}
+                }),
+            ),
+        ],
+        false,
+    );
+    let first = rows.values().find(|r| r.name == "Turn 1").unwrap();
+    let continuation = rows
+        .values()
+        .find(|r| r.name == "Continuation: subagent result")
+        .unwrap();
+    assert_eq!(continuation.parent_span_ids, vec![first.span_id.clone()]);
+    assert_eq!(
+        rows.values()
+            .filter(|r| r.name.starts_with("Turn "))
+            .count(),
+        2
+    );
+    for (request, owner) in [
+        ("request-1", first),
+        (
+            "request-2",
+            rows.values().find(|r| r.name == "Turn 2").unwrap(),
+        ),
+        ("request-3", continuation),
+    ] {
+        let llm = rows
+            .values()
+            .find(|r| {
+                r.metadata.as_ref().and_then(|m| m.get("request_id")) == Some(&json!(request))
+            })
+            .unwrap();
+        assert_eq!(
+            llm.parent_span_ids,
+            vec![owner.span_id.clone()],
+            "{request}"
+        );
+    }
+}
+
+#[test]
+fn claude_frozen_empty_capture_does_not_read_future_native_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("late.jsonl");
+    std::fs::write(&path, format!("{}\n",json!({"type":"assistant","message":{"id":"future","content":[{"type":"text","text":"not captured"}]}}))).unwrap();
+    for boundary in [
+        json!({"_bt_claude_transcript_mirrors":{}}),
+        json!({"_bt_transcript_replay":true}),
+    ] {
+        let mut payload = boundary;
+        payload["transcript_path"] = json!(path);
+        payload["prompt"] = json!("hello");
+        let rows = replay_continuation_events(
+            vec![
+                ("UserPromptSubmit", 10, payload.clone()),
+                ("Stop", 20, payload),
+            ],
+            true,
+        );
+        assert!(!rows.values().any(|row| row.span_type == SpanType::Llm));
+    }
+}
+
+#[test]
+fn claude_finalization_drains_observed_late_response() {
+    let transcript = format!(
+        "{}\n",
+        json!({
+            "type":"assistant","message":{"id":"late-final","model":"claude-test",
+            "content":[{"type":"text","text":"late answer"}],"usage":{"input_tokens":13,"output_tokens":7}}
+        })
+    );
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt":"hello"})),
+            ("Stop", 20, json!({})),
+            (
+                "Notification",
+                30,
+                json!({
+                    "transcript_path":"late.jsonl",
+                    "_bt_transcript_snapshot":{"path":"late.jsonl","contents":transcript}
+                }),
+            ),
+        ],
+        true,
+    );
+    let turn = rows.values().find(|r| r.name == "Turn 1").unwrap();
+    let llm = rows
+        .values()
+        .find(|r| r.span_type == SpanType::Llm)
+        .unwrap();
+    assert_eq!(llm.parent_span_ids, vec![turn.span_id.clone()]);
+    assert_eq!(llm.output.as_ref().unwrap()["content"], "late answer");
+    assert_eq!(llm.metrics.as_ref().unwrap()["completion_tokens"], 7);
 }

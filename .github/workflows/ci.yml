@@ -97,6 +97,22 @@ jobs:
         shell: bash
         working-directory: src/runtime/js-daemon-client
         run: ../../plugins/opencode/content/node_modules/.bin/vp lint --config .oxlintrc.json src
+      # Match the native daemon job: compiling/linking the console probe in
+      # the default C: temp directory can stall under Defender scanning.
+      - name: Set up Windows Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@562171fe8df7401fdf582d766cd3b6ab80d5b1a0 # v4.1.0
+        with:
+          drive-size: 12GB
+          mount-path: ${{ github.workspace }}/.devdrive
+          trusted-dev-drive: true
+          env-mapping: |
+            TMP,{{ DEV_DRIVE }}/tmp
+            TEMP,{{ DEV_DRIVE }}/tmp
+      - name: Create Dev Drive temp directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
       - name: Install Rust for native Windows console probes
         if: runner.os == 'Windows'
         run: rustup default stable

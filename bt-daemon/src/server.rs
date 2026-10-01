@@ -235,6 +235,13 @@ impl DeliveryKey {
     }
 }
 
+#[derive(Clone)]
+struct ClaudeTranscriptObservation {
+    /// Synthetic-event provenance only: never retain native prompts or responses.
+    template: Envelope,
+    through: Option<u64>,
+}
+
 pub struct Daemon {
     version: String,
     data_dir: PathBuf,
@@ -249,6 +256,7 @@ pub struct Daemon {
     /// capture, which must never inherit actor or sink backpressure.
     dispatch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     journals: Mutex<HashMap<String, Arc<tokio::sync::Mutex<JournalWriter>>>>,
+    claude_transcripts: Mutex<HashMap<DeliveryKey, ClaudeTranscriptObservation>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
     auth_errors: Mutex<HashMap<DeliveryKey, (String, String)>>,
     sessions: Mutex<HashMap<DeliveryKey, Arc<Session>>>,
@@ -287,6 +295,7 @@ impl Daemon {
             session_locks: Mutex::new(HashMap::new()),
             dispatch_locks: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
+            claude_transcripts: Mutex::new(HashMap::new()),
             managed_run_sessions: Mutex::new(HashMap::new()),
             auth_errors: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -573,6 +582,8 @@ impl Daemon {
     /// journal file for the rest of the daemon's life; deterministic span ids
     /// mean a late event simply rebuilds it from the journal.
     async fn retire_session(&self, key: &DeliveryKey) {
+        self.observe_claude_transcripts(Some(key), false).await;
+        self.ingress_barrier().await;
         let lock = self.dispatch_lock(&key.source, &key.session_id);
         let _guard = lock.lock().await;
 
@@ -608,8 +619,21 @@ impl Daemon {
             // lock for the brief writer-map cleanup after daemon work ends.
             let capture_lock = self.session_lock(&key.source, &key.session_id);
             let _capture_guard = capture_lock.lock().await;
+            self.claude_transcripts
+                .lock()
+                .unwrap()
+                .retain(|candidate, _| {
+                    candidate.source != key.source || candidate.session_id != key.session_id
+                });
             self.journals.lock().unwrap().remove(&storage_key);
-            self.session_locks.lock().unwrap().remove(&storage_key);
+            {
+                let mut locks = self.session_locks.lock().unwrap();
+                // A waiting capture or observer must keep using this same
+                // lock, rather than race a newly allocated mirror writer.
+                if Arc::strong_count(&capture_lock) == 2 {
+                    locks.remove(&storage_key);
+                }
+            }
             self.dispatch_locks.lock().unwrap().remove(&storage_key);
             self.ingress_dispatched
                 .lock()
@@ -660,7 +684,6 @@ impl Daemon {
     }
 
     async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<(u64, u64)> {
-        hydrate_transcript_reference(&self.data_dir, env).await;
         let writer = self
             .journal_writer_for(&env.source, &env.session_id)
             .await?;
@@ -730,10 +753,18 @@ impl Daemon {
         self.touch();
         let lock = self.session_lock(&env.source, &env.session_id);
         let _guard = lock.lock().await;
+        hydrate_transcript_reference(&self.data_dir, &mut env).await;
+        self.journal_and_enqueue(env).await
+    }
+
+    /// Caller holds the source-session capture lock; frozen observations enter
+    /// the same durable queue as hooks without reacquiring that lock.
+    async fn journal_and_enqueue(&self, mut env: Envelope) -> Result<bool, String> {
         let (replay_through, journal_through) = self
             .append_to_journal(&mut env)
             .await
             .map_err(|error| format!("journal failed: {error}"))?;
+        self.remember_claude_transcripts(&env);
         match self
             .ingress_tx
             .try_send(IngressMsg::Event(Box::new(PendingEvent {
@@ -751,6 +782,136 @@ impl Daemon {
             }
         }
         Ok(true)
+    }
+
+    fn remember_claude_transcripts(&self, env: &Envelope) {
+        if env.source != "claude-code" || env.payload.get("_bt_import_through_offset").is_some() {
+            return;
+        }
+        if env.event == "SessionEnd" {
+            self.claude_transcripts
+                .lock()
+                .unwrap()
+                .retain(|key, _| key.source != env.source || key.session_id != env.session_id);
+            return;
+        }
+        let Some(route) = env.route.as_ref() else {
+            return;
+        };
+        let Some(path) = env.payload.get("transcript_path").and_then(Value::as_str) else {
+            return;
+        };
+        let Ok(key) = DeliveryKey::new(&env.source, &env.session_id, route) else {
+            return;
+        };
+        let through = env
+            .payload
+            .get("_bt_claude_transcript_mirrors")
+            .and_then(|mirrors| mirrors.get(path))
+            .or_else(|| {
+                env.payload
+                    .get("_bt_transcript_mirror")
+                    .filter(|mirror| mirror.get("path").and_then(Value::as_str) == Some(path))
+            })
+            .and_then(|mirror| mirror.get("through"))
+            .and_then(Value::as_u64);
+        let mut payload = serde_json::json!({"transcript_path": path});
+        if let Some(cwd) = env.payload.get("cwd").and_then(Value::as_str) {
+            payload["cwd"] = Value::String(cwd.to_string());
+        }
+        let template = Envelope {
+            source: env.source.clone(),
+            source_version: env.source_version.clone(),
+            plugin_version: env.plugin_version.clone(),
+            session_id: env.session_id.clone(),
+            event: "TranscriptUpdate".to_string(),
+            ts_ms: env.ts_ms,
+            managed_run_id: env.managed_run_id.clone(),
+            capture: None,
+            payload,
+            route: env.route.clone(),
+            config: None,
+        };
+        let mut observations = self.claude_transcripts.lock().unwrap();
+        let previous = observations
+            .get(&key)
+            .filter(|observation| {
+                observation
+                    .template
+                    .payload
+                    .get("transcript_path")
+                    .and_then(Value::as_str)
+                    == Some(path)
+            })
+            .and_then(|observation| observation.through);
+        observations.insert(
+            key,
+            ClaudeTranscriptObservation {
+                template,
+                through: through.or(previous),
+            },
+        );
+    }
+
+    /// Poll native paths only on the capture side. Each observed boundary is
+    /// journaled before translation, including observations made during shutdown.
+    async fn observe_claude_transcripts(&self, only: Option<&DeliveryKey>, quiesced: bool) {
+        // Shutdown already owns the exclusive gate. Ordinary polling must not
+        // append after that final drain begins.
+        let _gate = if quiesced {
+            None
+        } else {
+            Some(self.capture_gate.read().await)
+        };
+        if !quiesced && self.quiescing.load(Ordering::SeqCst) {
+            return;
+        }
+        let keys: Vec<_> = self
+            .claude_transcripts
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| {
+                only.is_none_or(|only| {
+                    key.source == only.source && key.session_id == only.session_id
+                })
+            })
+            .cloned()
+            .collect();
+        for key in keys {
+            // Routes share mirror files, so serialize by source session, not
+            // destination. Never hold this lock across an ingress barrier.
+            let lock = self.session_lock(&key.source, &key.session_id);
+            let _guard = lock.lock().await;
+            let observation = self.claude_transcripts.lock().unwrap().get(&key).cloned();
+            let Some(observation) = observation else {
+                continue;
+            };
+            let path = observation.template.payload["transcript_path"]
+                .as_str()
+                .unwrap();
+            let Ok(metadata) = tokio::fs::metadata(path).await else {
+                continue;
+            };
+            if observation.through == Some(metadata.len()) {
+                continue;
+            }
+            let mut env = observation.template;
+            env.ts_ms = now_ms();
+            hydrate_transcript_reference(&self.data_dir, &mut env).await;
+            let through = env
+                .payload
+                .get("_bt_claude_transcript_mirrors")
+                .and_then(|mirrors| mirrors.get(env.payload["transcript_path"].as_str().unwrap()))
+                .and_then(|mirror| mirror.get("through"))
+                .and_then(Value::as_u64);
+            if through.is_none() || through == observation.through {
+                continue;
+            }
+            if let Err(error) = self.journal_and_enqueue(env).await {
+                tracing::warn!(session_id = %key.session_id, %error, "Claude transcript observation failed");
+            }
+        }
     }
 
     async fn ingress_barrier(&self) {
@@ -868,6 +1029,25 @@ impl Daemon {
             pending: 0,
             accepted_sessions: delivery_keys.len() as u64,
         };
+        for key in &delivery_keys {
+            self.observe_claude_transcripts(Some(key), false).await;
+        }
+        // Managed completion is terminal. Stop polling before the barrier so
+        // an in-flight observer cannot enqueue after translator finalization.
+        for key in &delivery_keys {
+            let lock = self.session_lock(&key.source, &key.session_id);
+            let _guard = lock.lock().await;
+            self.claude_transcripts
+                .lock()
+                .unwrap()
+                .retain(|candidate, observation| {
+                    candidate.source != key.source
+                        || candidate.session_id != key.session_id
+                        || observation.template.managed_run_id.as_deref()
+                            != Some(params.managed_run_id.as_str())
+                });
+        }
+        self.ingress_barrier().await;
         for key in delivery_keys {
             if let Err(error) = self.refresh_session_before_flush(&key).await {
                 tracing::warn!(
@@ -1124,6 +1304,7 @@ fn spawn_pending_reconciler(daemon: Arc<Daemon>) {
                 _ = daemon.correlation_changed.notified() => {},
                 _ = tick.tick() => {},
             }
+            daemon.observe_claude_transcripts(None, false).await;
             if let Err(error) = retry_pending_sessions(&daemon).await {
                 tracing::warn!(%error, "pending child-session reconciliation failed");
             }
@@ -1811,6 +1992,15 @@ async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                         continue;
                     };
                     env.source = source.to_string();
+                    daemon.remember_claude_transcripts(&env);
+                    if env.source == "claude-code" {
+                        if let Some(payload) = env.payload.as_object_mut() {
+                            payload.insert(
+                                "_bt_transcript_replay".to_string(),
+                                serde_json::json!(true),
+                            );
+                        }
+                    }
                     if let Some(route) = env.route.as_ref() {
                         let key = serde_json::to_string(route).unwrap_or_default();
                         latest_by_route.insert(
@@ -1846,6 +2036,26 @@ async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                 .unwrap_or_default();
             if acknowledged_by_route.get(&route).copied().unwrap_or(0) < event.journal_through {
                 candidates.push(event);
+            } else if event.env.source == "claude-code" {
+                // A fully delivered historical session has no actor to retire
+                // its observer. Probe once for bytes appended after the final
+                // checkpoint, retaining only paths that have new work.
+                if let Some(key) = event.env.route.as_ref().and_then(|route| {
+                    DeliveryKey::new(&event.env.source, &event.env.session_id, route).ok()
+                }) {
+                    let observation = daemon.claude_transcripts.lock().unwrap().get(&key).cloned();
+                    if let Some(observation) = observation {
+                        let path = observation.template.payload["transcript_path"]
+                            .as_str()
+                            .unwrap();
+                        let changed = tokio::fs::metadata(path)
+                            .await
+                            .is_ok_and(|metadata| observation.through != Some(metadata.len()));
+                        if !changed {
+                            daemon.claude_transcripts.lock().unwrap().remove(&key);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1876,7 +2086,15 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Res
         replay_through,
         journal_through,
     } = event;
-    let schedule_flush = crate::should_flush_ingress_event(&env);
+    // Every fresh Claude capture carries a bounded observation marker. Older
+    // persisted ingress must never consume live bytes while rebuilding state.
+    if env.source == "claude-code" && env.payload.get("_bt_claude_transcript_mirrors").is_none() {
+        if let Some(payload) = env.payload.as_object_mut() {
+            payload.insert("_bt_transcript_replay".to_string(), serde_json::json!(true));
+        }
+    }
+    let schedule_flush = crate::should_flush_ingress_event(&env)
+        || (env.source == "claude-code" && env.event == "TranscriptUpdate");
     let source = env.source.clone();
     let event = env.event.clone();
     let session_id = env.session_id.clone();
@@ -2361,6 +2579,7 @@ async fn drain_all(daemon: &Arc<Daemon>) {
     }
     daemon.begin_quiesce();
     let _capture_guard = daemon.capture_gate.write().await;
+    daemon.observe_claude_transcripts(None, true).await;
     daemon.settle_ingress().await;
     if let Err(error) = resolve_pending_sessions(daemon, |_| true).await {
         tracing::warn!(%error, "pending correlation events retained for recovery during shutdown");
