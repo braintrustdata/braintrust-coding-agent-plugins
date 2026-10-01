@@ -32,6 +32,8 @@ mod transcript_import;
 mod transcript_mirror;
 mod translate;
 mod transport;
+#[cfg(windows)]
+mod win_acl;
 
 pub mod wire;
 pub use client::HostInfo;
@@ -1256,7 +1258,7 @@ async fn import_transcript_with_ledger(
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
-    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut finalizing = !attach;
@@ -1300,7 +1302,7 @@ async fn import_transcripts_with_ledger(
     config: Option<SessionConfig>,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
-    let mut processor = ImportProcessor::new(opts, config, ledger_dir);
+    let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
     let mut summaries = Vec::new();
     for file in files {
         let mut tail = transcript_import::TranscriptTail::new(file.clone(), source);
@@ -1342,13 +1344,22 @@ struct ImportProcessor {
 }
 
 impl ImportProcessor {
-    fn new(opts: ServeOptions, config: Option<SessionConfig>, ledger_dir: Option<PathBuf>) -> Self {
-        Self {
+    /// Without a daemon, import is the entry point that creates the ledger's
+    /// data directory, so it must make that directory private itself.
+    fn new(
+        opts: ServeOptions,
+        config: Option<SessionConfig>,
+        ledger_dir: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        if let Some(dir) = &ledger_dir {
+            paths::ensure_private_dir(dir)?;
+        }
+        Ok(Self {
             sessions: std::collections::HashMap::new(),
             opts,
             config,
             ledger_dir,
-        }
+        })
     }
 
     async fn process(&mut self, entries: Vec<Envelope>) -> anyhow::Result<()> {
@@ -2178,6 +2189,64 @@ mod tests {
             imported_terminal_span_ids(&second_output.join("spans/ledger-import.ndjson")),
             first_terminals
         );
+    }
+
+    /// `bt trace import` writes the delivery ledger without a daemon, so it
+    /// must make the data directory private itself.
+    #[tokio::test]
+    async fn import_keeps_the_delivery_ledger_private_to_the_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        #[cfg(windows)]
+        crate::win_acl::test_support::set_sddl(&shared, "D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;WD)");
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n{}\n",
+                json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"private-ledger","cwd":"/tmp/demo"}}),
+                json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+                json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
+            ),
+        )
+        .unwrap();
+        let data_dir = shared.join("bt-daemon");
+
+        import_transcript_with_ledger(
+            &transcript,
+            ImportSource::Codex,
+            debug_serve_options("test", &temp.path().join("output")),
+            Some(import_test_config("project-a")),
+            false,
+            Some(data_dir.clone()),
+        )
+        .await
+        .unwrap();
+
+        let ledger = std::fs::read_dir(data_dir.join("delivery-ledger"))
+            .unwrap()
+            .next()
+            .expect("a delivery ledger was written")
+            .unwrap()
+            .path();
+        assert!(ledger.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        #[cfg(windows)]
+        {
+            use crate::win_acl::test_support::{
+                assert_only_owner_access, assert_owner_only, path_dacl_sddl,
+            };
+            assert_owner_only(&path_dacl_sddl(&data_dir), true);
+            assert_only_owner_access(&path_dacl_sddl(&ledger));
+        }
     }
 
     fn test_run_hook_command() -> RunHookCommand {

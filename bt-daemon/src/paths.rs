@@ -144,7 +144,8 @@ pub(crate) fn antigravity_config_dir() -> PathBuf {
     home().join(".gemini").join("config")
 }
 
-/// Create `dir` (and parents) mode 0700 on unix.
+/// Create `dir` (and parents) accessible only to the current user: mode 0700
+/// on unix, an inheritable owner-only DACL on Windows.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -153,7 +154,27 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
         let perms = std::fs::Permissions::from_mode(0o700);
         std::fs::set_permissions(dir, perms)?;
     }
+    // Replacing a directory's DACL re-applies inheritance to everything
+    // beneath it, so only do so when it is not already private.
+    #[cfg(windows)]
+    if !crate::win_acl::is_owner_only(dir, true)? {
+        crate::win_acl::restrict_to_owner(dir, true)?;
+    }
     Ok(())
+}
+
+/// Make an existing file readable and writable only by the current user:
+/// mode 0600 on unix, an owner-only DACL on Windows.
+pub(crate) fn restrict_file_to_owner(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(windows)]
+    {
+        crate::win_acl::restrict_to_owner(path, false)
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +221,43 @@ mod tests {
                 0o700
             );
         }
+        #[cfg(windows)]
+        {
+            use crate::win_acl::test_support::{
+                assert_only_owner_access, assert_owner_only, path_dacl_sddl,
+            };
+            assert_owner_only(&path_dacl_sddl(&nested), true);
+            // Later starts recognize the DACL and skip re-propagating it.
+            assert!(crate::win_acl::is_owner_only(&nested, true).unwrap());
+            let child = nested.join("journal.jsonl");
+            std::fs::write(&child, "{}").unwrap();
+            assert_only_owner_access(&path_dacl_sddl(&child));
+        }
+    }
+
+    /// A directory ACL does not stop Windows users from opening the files
+    /// beneath it, so existing children must lose access inherited from a
+    /// shared parent.
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_revokes_access_children_inherited_from_a_shared_parent() {
+        use crate::win_acl::test_support::{
+            assert_only_owner_access, assert_owner_only, path_dacl_sddl, set_sddl,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        set_sddl(&shared, "D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;WD)");
+        let data = shared.join("bt-daemon");
+        std::fs::create_dir(&data).unwrap();
+        let child = data.join("journal.jsonl");
+        std::fs::write(&child, "{}").unwrap();
+        assert!(path_dacl_sddl(&child).contains(";WD)"));
+
+        ensure_private_dir(&data).unwrap();
+
+        assert_owner_only(&path_dacl_sddl(&data), true);
+        assert_only_owner_access(&path_dacl_sddl(&child));
     }
 
     #[test]
