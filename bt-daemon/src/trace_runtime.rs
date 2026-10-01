@@ -105,6 +105,9 @@ fn unconfirmed_auth_diagnostic(
 ///
 /// Implementations resolve Braintrust profiles and destination choices but do
 /// not dispatch or interpret coding-agent commands.
+// `async_trait` marks its boxed futures as `must_use`; Clippy 1.99 flags that
+// generated annotation as redundant on async trait methods.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TraceHostServices: Send + Sync {
     /// Resolve only the host-owned auth and default project selections.

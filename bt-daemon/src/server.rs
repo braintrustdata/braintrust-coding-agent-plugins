@@ -58,6 +58,9 @@ pub struct AuthLease {
     pub expires_at_ms: Option<i64>,
 }
 
+// `async_trait` marks its boxed futures as `must_use`; Clippy 1.99 flags that
+// generated annotation as redundant on async trait methods.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AuthProvider: Send + Sync {
     /// Resolve without prompting. On refresh, `selection` is the canonical
