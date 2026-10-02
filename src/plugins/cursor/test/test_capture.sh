@@ -51,8 +51,10 @@ exit "${BT_EXIT_CODE:-0}"
             args = (root / 'args').read_text().splitlines()[-1]
             assert args == ('trace hook --source cursor '
                             '--session-id-field conversation_id --event-field hook_event_name '
-                            '--transcript-path-field transcript_path --flush-on-turn-end'), args
+                            '--transcript-path-field transcript_path --flush-on-turn-end '
+                            '--capture-timeout-ms 8000'), args
             assert registration['failClosed'] is False
+            assert registration['timeout'] * 1000 > 8000
     # Cursor's login shell can reset PATH; an explicit binary selection survives.
     # It must be treated as one executable even when the path has shell syntax.
     override = root / 'bt override ; literal'

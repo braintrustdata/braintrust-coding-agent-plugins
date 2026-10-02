@@ -18,6 +18,130 @@ use std::time::Duration;
 
 struct TestAuth;
 
+#[cfg(all(feature = "cli", unix))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Runs a foreground Cursor hook to exercise its policy response deadline."
+)]
+async fn assert_stalled_daemon_preserves_policy_response(
+    event: &str,
+    stall_after_initialize: bool,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = endpoint(tmp.path());
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let initialize: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(initialize["method"], "initialize");
+        if stall_after_initialize {
+            let response = json!({
+                "jsonrpc":"2.0", "id":initialize["id"],
+                "result":{
+                    "protocol_version":1, "daemon_version":env!("CARGO_PKG_VERSION")
+                }
+            });
+            write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            let event: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(event["method"], "event.log");
+            assert_eq!(
+                event["params"]["payload"]["conversation_id"],
+                "stalled-cursor"
+            );
+        }
+        reached_tx.send(()).unwrap();
+        // Keep the socket connected while withholding the matching RPC response.
+        std::future::pending::<()>().await;
+    });
+    let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/plugins/cursor");
+    let started = tokio::time::Instant::now();
+    // This is a foreground hook invocation, with the same script Cursor executes.
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .arg(plugin.join("content/hooks/trace.sh"))
+        .arg(event)
+        .env("BT_BIN", plugin.join("test/bt-standalone-wrapper.sh"))
+        .env("BT_DAEMON_BIN", env!("CARGO_BIN_EXE_bt-daemon"))
+        .env("BT_DAEMON_SOCKET", &socket)
+        .env("BT_DAEMON_CONFIG", tmp.path().join("settings.json"))
+        .env("BT_DAEMON_DATA_DIR", tmp.path().join("data"))
+        .env("CURSOR_PLUGIN_ROOT", plugin.join("content"))
+        .env_remove("_BT_TRACE_MANAGED_RUN")
+        .env(
+            "BT_TRACE_INVOCATION_SETTINGS",
+            json!({
+                "trace_to_braintrust":true,
+                "route":{"destination":{"type":"project_logs","project_name":"cursor-tests"}}
+            })
+            .to_string(),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({
+                "conversation_id":"stalled-cursor", "hook_event_name":event, "transcript_path":null
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), reached_rx)
+        .await
+        .expect("hook never reached the stalled RPC")
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(9), child.wait_with_output()).await;
+    server.abort();
+    let _ = server.await;
+    let output = output
+        .expect("capture exceeded Cursor's policy response deadline")
+        .unwrap();
+    assert!(output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let expected = if event == "beforeSubmitPrompt" {
+        json!({"continue":true})
+    } else {
+        json!({"permission":"allow"})
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        expected
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "trace-cursor: event capture unavailable; continuing.\n"
+    );
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[tokio::test]
+async fn stalled_initialize_still_allows_cursor_tool_execution() {
+    assert_stalled_daemon_preserves_policy_response("preToolUse", false).await;
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[tokio::test]
+async fn stalled_capture_acknowledgement_still_allows_cursor_prompt_submission() {
+    assert_stalled_daemon_preserves_policy_response("beforeSubmitPrompt", true).await;
+}
+
 #[async_trait]
 impl AuthProvider for TestAuth {
     async fn resolve(

@@ -127,6 +127,10 @@ pub struct HookArgs {
     /// Fail instead of spawning a daemon if none is running.
     #[arg(long)]
     pub no_spawn: bool,
+    /// Maximum time to resolve routing, connect or start the daemon, and
+    /// receive durable capture acknowledgement.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub capture_timeout_ms: Option<u64>,
     /// Ask the daemon to flush the session after a turn-ending event. The
     /// flush is scheduled out-of-band; hook capture still returns immediately
     /// after the durable journal write.
@@ -412,6 +416,28 @@ pub(crate) fn suppress_inherited_hook(args: &HookArgs) -> bool {
 }
 
 pub(crate) async fn run_hook_with_route(
+    args: HookArgs,
+    route: SessionRoute,
+    host: HostInfo,
+) -> anyhow::Result<()> {
+    with_hook_capture_timeout(args.capture_timeout_ms, capture_hook(args, route, host)).await
+}
+
+pub(crate) async fn with_hook_capture_timeout<T>(
+    timeout_ms: Option<u64>,
+    capture: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match timeout_ms {
+        Some(timeout_ms) => {
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), capture)
+                .await
+                .context("hook capture timed out")?
+        }
+        None => capture.await,
+    }
+}
+
+async fn capture_hook(
     mut args: HookArgs,
     mut route: SessionRoute,
     host: HostInfo,
