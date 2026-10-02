@@ -114,13 +114,6 @@ contain your prompts and tool data; keep the temporary directory private.
 hooks through a login shell that changes `PATH`, so use the absolute wrapper
 path above.
 
-For a reproducible real smoke on macOS/Linux, after building the standalone
-daemon, run `python3 src/plugins/cursor/test/test_real_cursor.py --run` from the
-monorepo. This explicit test makes real model requests, requires an authenticated
-`agent`, and verifies two completed turns, tool/model parentage, and turn usage
-in the offline sink. It retains private evidence in its printed temporary
-directory. Without `--run`, it skips execution.
-
 ## Capture behavior and available evidence
 
 The plugin registers session, prompt, generic tool, subagent, compaction,
