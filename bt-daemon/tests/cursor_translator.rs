@@ -330,10 +330,31 @@ fn missing_pre_tool_hook_uses_duration_to_end_completion_before_execution() {
     h.handle(&event(
         "postToolUse",
         150,
-        json!({"tool_name":"Shell","tool_use_id":"missing-pre","tool_output":"done","duration":30}),
+        json!({"tool_name":"Shell","tool_use_id":"missing-pre","tool_input":{"command":"echo done"},"tool_output":"done","duration":30}),
     ));
-    assert_eq!(h.inserted(SpanType::Llm)[0].end_ms, Some(120));
+    h.handle(&event(
+        "afterAgentThought",
+        160,
+        json!({"text":"the command returned"}),
+    ));
+    h.finish();
+    let llms = h.inserted(SpanType::Llm);
+    assert_eq!(llms.len(), 2);
+    assert_eq!(llms[0].end_ms, Some(120));
     assert_eq!(h.inserted(SpanType::Tool)[0].start_ms, Some(120));
+    assert_eq!(
+        llms[0].output.as_ref().unwrap()[0]["message"]["tool_calls"],
+        json!([{
+            "id":"missing-pre", "type":"function", "function":{
+                "name":"Shell", "arguments":"{\"command\":\"echo done\"}"
+            }
+        }])
+    );
+    let next_input = llms[1].input.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(next_input[1]["tool_calls"][0]["id"], "missing-pre");
+    assert_eq!(next_input[2]["role"], "tool");
+    assert_eq!(next_input[2]["tool_call_id"], "missing-pre");
+    assert_eq!(next_input[2]["content"], "done");
 }
 
 #[test]

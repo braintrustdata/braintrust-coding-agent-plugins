@@ -683,16 +683,39 @@ impl CursorTranslator {
             self.tools.get(&key).is_some_and(|tool| t.id == tool.turn) && t.end.is_none()
         });
         if current {
-            let tool = self.tools.get(&key).unwrap();
-            if tool.row.metadata.as_ref().is_some_and(|metadata| {
-                metadata
-                    .get("start_time_estimated")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-            }) {
+            let terminal_only = self.tools.get(&key).and_then(|tool| {
+                tool.row
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| {
+                        metadata
+                            .get("start_time_estimated")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                    })
+                    .then(|| {
+                        (
+                            tool.row.start_ms.unwrap_or(e.ts_ms),
+                            tool.call_id.clone(),
+                            tool.row.name.clone(),
+                            tool.row.input.clone(),
+                        )
+                    })
+            });
+            if let Some((boundary, call_id, name, input)) = terminal_only {
                 // Without preToolUse, the duration is the only available
                 // tool-request boundary. Tool execution is not model latency.
-                self.close_model(tool.row.start_ms.unwrap_or(e.ts_ms), ops);
+                self.model_content(
+                    json!({
+                        "type":"tool_use",
+                        "id":call_id,
+                        "name":name,
+                        "input":input,
+                    }),
+                    boundary,
+                    ops,
+                );
+                self.close_model(boundary, ops);
             }
         }
         let mut tool = self.remove_open_tool(&key).unwrap();
