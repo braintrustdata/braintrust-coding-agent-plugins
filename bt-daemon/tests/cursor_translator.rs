@@ -974,6 +974,17 @@ fn synthetic_late_old_turn_response_cannot_end_current_turn_model() {
         140,
         json!({"generation_id":"t1","text":"first answer","input_tokens":20,"output_tokens":2}),
     ));
+    assert!(h.inserted(SpanType::Llm).is_empty());
+    h.handle(&event(
+        "preToolUse",
+        145,
+        json!({"generation_id":"t2","tool_name":"Read","tool_use_id":"r1","tool_input":{"file_path":"/tmp/a"}}),
+    ));
+    h.handle(&event(
+        "postToolUse",
+        146,
+        json!({"generation_id":"t2","tool_name":"Read","tool_use_id":"r1","tool_output":"file content"}),
+    ));
     h.handle(&event(
         "afterAgentResponse",
         150,
@@ -994,14 +1005,28 @@ fn synthetic_late_old_turn_response_cannot_end_current_turn_model() {
         .into_iter()
         .filter(|r| r.parent_span_ids == vec![h.turns()[1].span_id.clone()])
         .collect();
-    assert_eq!(second.len(), 1);
+    assert_eq!(second.len(), 2);
+    assert_eq!(second[0].end_ms, Some(145));
+    assert_eq!(second[1].start_ms, Some(146));
+    for completion in &second {
+        assert_eq!(
+            completion.metadata.as_ref().unwrap()["history_truncated"],
+            true
+        );
+        assert!(!completion
+            .input
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("first answer"));
+    }
     assert!(second[0]
         .output
         .as_ref()
         .unwrap()
         .to_string()
         .contains("second thinking"));
-    assert!(second[0]
+    assert!(second[1]
         .output
         .as_ref()
         .unwrap()

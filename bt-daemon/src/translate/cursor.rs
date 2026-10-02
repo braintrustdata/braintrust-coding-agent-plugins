@@ -424,6 +424,16 @@ impl CursorTranslator {
             truncated: false,
         });
     }
+    fn mark_history_truncated(&mut self) {
+        self.history.truncated = true;
+        if let Some(metadata) = self
+            .model_step
+            .as_mut()
+            .and_then(|step| step.row.metadata.as_mut())
+        {
+            metadata["history_truncated"] = json!(true);
+        }
+    }
     fn model_content(&mut self, content: Value, ts: i64, ops: &mut Vec<SpanOp>) {
         if let Some(turn) = self.turn.as_mut().filter(|turn| turn.end.is_some()) {
             // Late output belongs to the closed turn. Its receipt time does
@@ -1037,7 +1047,7 @@ impl CursorTranslator {
                         ids::span_id(&self.namespace, &record.to_string())
                     ));
                     ops.push(SpanOp::Merge(row));
-                    self.history.truncated = true;
+                    self.mark_history_truncated();
                     return;
                 }
                 if self
@@ -1235,6 +1245,7 @@ impl CursorTranslator {
                         ids::span_id(&self.namespace, &native.to_string())
                     ));
                     ops.push(SpanOp::Merge(row));
+                    self.mark_history_truncated();
                     self.turn_usage(e, ops);
                 } else {
                     if let Some(text) = e.payload.get("text").and_then(Value::as_str) {
