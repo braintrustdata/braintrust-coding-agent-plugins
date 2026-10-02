@@ -15,6 +15,8 @@ pub const SETTINGS_ENV: &str = "BT_DAEMON_CONFIG";
 pub const ANTIGRAVITY_CONFIG_DIR_ENV: &str = "BT_ANTIGRAVITY_CONFIG_DIR";
 /// Env override for Cursor's per-user local plugin directory.
 pub const CURSOR_PLUGIN_DIR_ENV: &str = "BT_CURSOR_PLUGIN_DIR";
+/// Env override for Cursor's per-user configuration directory.
+pub const CURSOR_CONFIG_DIR_ENV: &str = "BT_CURSOR_CONFIG_DIR";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -154,6 +156,15 @@ pub(crate) fn cursor_plugin_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".cursor").join("plugins").join("local"))
         .join("trace-cursor")
+}
+
+/// Resolve Cursor's per-user configuration directory.
+pub(crate) fn cursor_config_dir() -> PathBuf {
+    std::env::var_os(CURSOR_CONFIG_DIR_ENV)
+        .or_else(|| std::env::var_os("CURSOR_CONFIG_DIR"))
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".cursor"))
 }
 
 /// Create `dir` (and parents) accessible only to the current user: mode 0700

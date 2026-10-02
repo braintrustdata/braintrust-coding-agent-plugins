@@ -945,6 +945,11 @@ pub async fn run_traced(
     mut route: SessionRoute,
 ) -> anyhow::Result<std::process::ExitStatus> {
     apply_run_span_plugins(&mut route, &args.plugin)?;
+    if args.source == RunSource::Cursor && cursor_run_requires_interactive(&args.agent_args) {
+        anyhow::bail!(
+            "bt trace run cursor requires interactive mode for complete lifecycle tracing; Cursor `--print` / `-p` mode does not emit the required prompt, response, and stop hooks"
+        );
+    }
     if route.destination.is_none() {
         anyhow::bail!(
             "managed run requires a trace destination; select a project, object destination, or parent span"
@@ -1013,6 +1018,18 @@ pub async fn run_traced(
             opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?,
         );
     }
+    // Cursor's CLI only discovers the plugin lifecycle callbacks when these
+    // events exist in user/project hook configuration. Keep temporary no-op
+    // discovery entries for this process and remove only our own entries when
+    // the managed run exits.
+    let _cursor_hooks = if args.source == RunSource::Cursor {
+        Some(crate::setup::CursorManagedHooks::install(
+            &paths::cursor_config_dir(),
+            &managed_run_id,
+        )?)
+    } else {
+        None
+    };
     let mut child = command.spawn().map_err(|error| {
         anyhow::anyhow!("failed to launch {}: {error}", executable.to_string_lossy())
     })?;
@@ -1139,6 +1156,13 @@ fn managed_run_args(
             Ok(vec![OsString::from("-e"), extension])
         }
     }
+}
+
+fn cursor_run_requires_interactive(args: &[OsString]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "-p" || arg == "--print" || arg.starts_with("--print=")
+    })
 }
 
 const CURSOR_HOOKS_MANIFEST: &str =

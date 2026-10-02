@@ -25,9 +25,10 @@ bt login
 bt trace enable cursor --project my-coding-agent
 ```
 
-Setup installs or refreshes `trace-cursor` and saves the selected route in
-`~/.cursor/braintrust.json`. Cursor must allow local plugin imports. Reload the
-Cursor window after setup so the plugin is active.
+Setup installs or refreshes `trace-cursor`, configures the hooks needed to trace
+Cursor sessions, and saves the selected route in `~/.cursor/braintrust.json`.
+Cursor must allow local plugin imports. Reload the Cursor window after setup so
+the plugin is active.
 
 Use `--profile` or `--org` to select a different Braintrust account or
 organization. This plugin only configures tracing; it does not install or
@@ -79,6 +80,9 @@ a saved Cursor transcript; `--attach` follows it until Ctrl-C. Imports include
 conversation text and the final recorded turn status. They omit tool activity
 and usage, and session timing may be approximate. Cursor may retain only the
 latest turn in a transcript.
+
+Managed Cursor runs require interactive CLI mode. Cursor's `-p`/`--print` mode
+does not provide the full lifecycle needed for a complete trace.
 
 ## Manage tracing
 

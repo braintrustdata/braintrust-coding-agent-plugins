@@ -33,7 +33,6 @@ const CURSOR_HOOKS_MANIFEST: &str =
 const CURSOR_HOOK_LAUNCHER: &str = include_str!("../../src/plugins/cursor/content/hooks/trace.sh");
 const CURSOR_README: &str = include_str!("../../src/plugins/cursor/content/README.md");
 const CURSOR_LICENSE: &str = include_str!("../../src/plugins/cursor/content/LICENSE");
-
 fn package_version(manifest: &str) -> anyhow::Result<String> {
     let manifest = serde_json::from_str::<Value>(manifest)?;
     manifest
@@ -223,6 +222,137 @@ fn setup_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
     install_cursor_plugin_at(plugin_dir)
 }
 
+fn cursor_discovery_hook_specs(marker: &str) -> Vec<(String, String)> {
+    [
+        ("beforeSubmitPrompt", r#"'{"continue":true}'"#),
+        ("afterAgentResponse", "'{}'"),
+        ("stop", "'{}'"),
+    ]
+    .into_iter()
+    .map(|(event, response)| {
+        (
+            event.to_owned(),
+            format!("printf '%s\\n' {response} # {marker}"),
+        )
+    })
+    .collect()
+}
+
+fn apply_cursor_hook_specs(
+    config: &mut Map<String, Value>,
+    path: &Path,
+    specs: &[(String, String)],
+    enable: bool,
+) -> anyhow::Result<()> {
+    if enable {
+        config
+            .entry("version")
+            .or_insert_with(|| Value::Number(1.into()));
+    }
+
+    if enable || config.contains_key("hooks") {
+        let hooks = config
+            .entry("hooks")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cursor hooks must be a JSON object: {}", path.display())
+            })?;
+
+        for (event, command) in specs {
+            let Some(entries) = hooks.get_mut(event) else {
+                if enable {
+                    hooks.insert(
+                        event.clone(),
+                        Value::Array(vec![cursor_discovery_hook(command)]),
+                    );
+                }
+                continue;
+            };
+            let entries = entries.as_array_mut().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cursor hook event `{event}` must be an array: {}",
+                    path.display()
+                )
+            })?;
+            entries.retain(|entry| {
+                entry.get("command").and_then(Value::as_str) != Some(command.as_str())
+            });
+            if enable {
+                entries.push(cursor_discovery_hook(command));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_cursor_hooks_at(
+    config_dir: &Path,
+    specs: &[(String, String)],
+    enable: bool,
+) -> anyhow::Result<()> {
+    let path = config_dir.join("hooks.json");
+    let mut config = load_object(&path)?;
+    apply_cursor_hook_specs(&mut config, &path, specs, enable)
+}
+
+fn update_cursor_hooks_at(
+    config_dir: &Path,
+    specs: &[(String, String)],
+    enable: bool,
+) -> anyhow::Result<()> {
+    let path = config_dir.join("hooks.json");
+    crate::settings::with_settings_lock(&path, || {
+        let mut config = load_object(&path)?;
+        let original = config.clone();
+        apply_cursor_hook_specs(&mut config, &path, specs, enable)?;
+        if config != original {
+            write_object_atomic_unlocked(&path, config, FileAccess::Inherited)?;
+        }
+        Ok(())
+    })
+}
+
+fn cursor_discovery_hook(command: &str) -> Value {
+    serde_json::json!({
+        "command": command,
+        "timeout": 10,
+        "failClosed": false
+    })
+}
+
+fn setup_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    validate_cursor_hooks_at(config_dir, &hooks, true)?;
+    setup_cursor_at(plugin_dir)?;
+    update_cursor_hooks_at(config_dir, &hooks, true)
+}
+
+pub(crate) struct CursorManagedHooks {
+    config_dir: PathBuf,
+    specs: Vec<(String, String)>,
+}
+
+impl CursorManagedHooks {
+    pub(crate) fn install(config_dir: &Path, run_id: &str) -> anyhow::Result<Self> {
+        let specs = cursor_discovery_hook_specs(&format!("braintrust-cursor-managed-{run_id}"));
+        update_cursor_hooks_at(config_dir, &specs, true)?;
+        Ok(Self {
+            config_dir: config_dir.to_path_buf(),
+            specs,
+        })
+    }
+}
+
+impl Drop for CursorManagedHooks {
+    fn drop(&mut self) {
+        if let Err(error) = update_cursor_hooks_at(&self.config_dir, &self.specs, false) {
+            tracing::warn!(%error, "failed to remove managed Cursor hook discovery entries");
+        }
+    }
+}
+
 fn disable_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
     if !plugin_dir.exists() {
         return Ok(());
@@ -248,6 +378,13 @@ fn disable_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("failed to remove Cursor plugin at {}", plugin_dir.display()))
 }
 
+fn disable_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    validate_cursor_hooks_at(config_dir, &hooks, false)?;
+    disable_cursor_at(plugin_dir)?;
+    update_cursor_hooks_at(config_dir, &hooks, false)
+}
+
 fn update_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
     if !plugin_dir.exists() {
         bail!("Cursor tracing plugin is not installed; run `bt trace enable cursor`");
@@ -264,6 +401,13 @@ fn update_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
         bail!("Cursor tracing plugin is not the Braintrust plugin; run `bt trace enable cursor`");
     }
     install_cursor_plugin_at(plugin_dir)
+}
+
+fn update_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    validate_cursor_hooks_at(config_dir, &hooks, true)?;
+    update_cursor_at(plugin_dir)?;
+    update_cursor_hooks_at(config_dir, &hooks, true)
 }
 
 fn installed_json_version(
@@ -1081,7 +1225,10 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => disable_opencode(),
         SetupAgent::Pi => disable_pi(&mut runner),
         SetupAgent::Grok => disable_grok(&mut runner),
-        SetupAgent::Cursor => disable_cursor_at(&paths::cursor_plugin_dir()),
+        SetupAgent::Cursor => disable_cursor_with_hooks_at(
+            &paths::cursor_plugin_dir(),
+            &paths::cursor_config_dir(),
+        ),
         SetupAgent::Antigravity => disable_antigravity(&mut runner),
     };
     let settings_path = paths::agent_settings_path(source, None);
@@ -1104,7 +1251,10 @@ pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => update_opencode()?,
         SetupAgent::Pi => update_pi(&mut runner)?,
         SetupAgent::Grok => update_grok(&mut runner)?,
-        SetupAgent::Cursor => update_cursor_at(&paths::cursor_plugin_dir())?,
+        SetupAgent::Cursor => update_cursor_with_hooks_at(
+            &paths::cursor_plugin_dir(),
+            &paths::cursor_config_dir(),
+        )?,
         SetupAgent::Antigravity => update_antigravity(&mut runner)?,
     }
     Ok(TraceCommandOutput::update(source, display_name))
@@ -1149,7 +1299,10 @@ pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<Trace
             ("grok", "Grok")
         }
         SetupAgent::Cursor => {
-            setup_cursor_at(&paths::cursor_plugin_dir())?;
+            setup_cursor_with_hooks_at(
+                &paths::cursor_plugin_dir(),
+                &paths::cursor_config_dir(),
+            )?;
             ("cursor", "Cursor")
         }
         SetupAgent::Antigravity => {
