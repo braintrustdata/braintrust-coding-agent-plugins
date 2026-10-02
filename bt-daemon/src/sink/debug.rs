@@ -1,8 +1,11 @@
 //! Debug sink: appends each emitted [`SpanOp`] as one NDJSON line to
-//! `<data_dir>/spans/<session_id>.ndjson`. Lets tests assert on exactly what
-//! the pipeline produced without touching Braintrust.
+//! `<data_dir>/spans/<session_id>.ndjson` (a digest for overlong ids). Lets
+//! tests assert on exactly what the pipeline produced without touching
+//! Braintrust.
 
 use super::{Sink, SinkFactory};
+use crate::ids::session_storage_id;
+use crate::journal::{sanitize, MAX_FILE_NAME_BYTES};
 use crate::translate::SpanOp;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -16,11 +19,18 @@ impl SinkFactory for DebugSinkFactory {
     fn create(
         &self,
         session_id: &str,
-        _source: &str,
+        source: &str,
         _plugin_version: Option<&str>,
     ) -> anyhow::Result<Box<dyn Sink>> {
         std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(format!("{}.ndjson", sanitize(session_id)));
+        let name = format!("{}.ndjson", sanitize(session_id));
+        // Fall back to a stable digest when the id cannot be one file name.
+        let name = if name.len() > MAX_FILE_NAME_BYTES {
+            format!("{}.ndjson", session_storage_id(source, session_id))
+        } else {
+            name
+        };
+        let path = self.dir.join(name);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Box::new(DebugSink {
             writer: BufWriter::new(file),
@@ -51,17 +61,4 @@ impl Sink for DebugSink {
         self.writer.flush()?;
         Ok(())
     }
-}
-
-/// Keep session ids filesystem-safe for the per-session file name.
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }

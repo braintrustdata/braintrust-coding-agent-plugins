@@ -401,8 +401,10 @@ continue using setup settings, and concurrent managed runs can select distinct
 profiles, organizations, and destinations while sharing one daemon.
 
 - **Journal (WAL).** Every accepted event is appended (auth-redacted) to
-  `<data_dir>/journal/<session_id>.ndjson` before/at enqueue — one journal
-  file per session_id, shared across every route that session_id has opened.
+  `<data_dir>/journal/<source>--<session_id>--<stable-id>.ndjson` before/at
+  enqueue — one journal file per source and session_id, shared across every
+  route that session has opened. The sanitized session_id keeps only its tail
+  when the name would exceed 255 bytes; the stable id keeps names distinct.
   `data_dir` defaults to `$XDG_STATE_HOME/braintrust/bt-daemon` or
   `$HOME/.braintrust/state/bt-daemon` on Unix, and
   `%LOCALAPPDATA%\Braintrust\bt-daemon` on Windows. On restart the daemon

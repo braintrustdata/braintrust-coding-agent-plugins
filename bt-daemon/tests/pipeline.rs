@@ -1130,6 +1130,42 @@ async fn events_are_ordered_journaled_and_emitted() {
 }
 
 #[tokio::test]
+async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let host = dummy_host();
+    // Pi keys sessions by their session-file path, which a deep
+    // `--session-dir` can push past the 255-byte file-name limit.
+    let session = format!(
+        "file:/{}/2026-10-02T12-00-00-000Z_019a0000-0000-7000-8000-000000000000.jsonl",
+        ["deeply-nested-session-directory"; 8].join("/")
+    );
+    assert!(session.len() > 255);
+
+    for (i, event) in ["SessionStart", "Stop"].iter().enumerate() {
+        let env = envelope(&session, event, 1000 + i as i64);
+        forward_envelope(&env, &socket, &host, false).await.unwrap();
+    }
+    let flushed = flush_session(&session, &socket, 5000).await.unwrap();
+    assert!(flushed.flushed, "flush did not complete: {flushed:?}");
+
+    let jtext = std::fs::read_to_string(source_journal_path(&data_dir, "debug", &session)).unwrap();
+    assert_eq!(
+        jtext
+            .lines()
+            .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
+            .count(),
+        2
+    );
+    let spans: Vec<_> = std::fs::read_dir(data_dir.join("spans"))
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].lines().count(), 3, "{}", spans[0]);
+    handle.abort();
+}
+
+#[tokio::test]
 async fn unknown_sources_are_rejected_before_journaling() {
     let (data_dir, socket, handle, _tmp) = start_daemon().await;
     let mut env = envelope("unknown-session", "SessionStart", 1);
