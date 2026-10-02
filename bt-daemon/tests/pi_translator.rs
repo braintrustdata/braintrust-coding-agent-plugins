@@ -94,7 +94,11 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
                 "model":"gpt-5",
                 "instructions":"system prompt",
                 "messages":[{"role":"user","content":"inspect"}],
-                "tools":[{"type":"function","name":"read"}],
+                "tools":[
+                    {"type":"function","name":"read","description":"Read a file","parameters":{"type":"object"},"strict":null},
+                    {"type":"web_search"}
+                ],
+                "tool_choice":"auto",
                 "max_output_tokens":4096,
                 "temperature":0.2
             }}),
@@ -219,8 +223,8 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
             "estimated_cost": 0.3,
         })
     );
-    // Only allowlisted request configuration reaches metadata, never the
-    // provider payload's instructions or tool schemas.
+    // Only allowlisted request configuration and the available tools reach
+    // metadata, never the provider payload's instructions or messages.
     assert_eq!(
         metadata_without(first_llm, &[]),
         json!({
@@ -228,6 +232,15 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
             "provider": "openai",
             "temperature": 0.2,
             "max_tokens": 4096,
+            "tools": [
+                {"type": "function", "function": {
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object"},
+                }},
+                {"type": "web_search"},
+            ],
+            "tool_choice": "auto",
         })
     );
     let continued_llm = rows
@@ -880,10 +893,36 @@ fn pi_llm_metadata_selects_request_configuration_across_provider_payloads() {
         session_id: "pi-session".into(),
         config: None,
     };
+    let schema = json!({"type":"object","properties":{"path":{"type":"string"}}});
     let payloads = [
-        json!({"model":"claude","system":"secret","max_tokens":1024,"stop_sequences":["END"],"tools":[]}),
-        json!({"model":"gemini","contents":[],"config":{"temperature":0.5,"maxOutputTokens":2048,"systemInstruction":"secret"}}),
-        json!({"modelId":"nova","inferenceConfig":{"maxTokens":512,"topP":0.9},"system":[{"text":"secret"}]}),
+        json!({
+            "model":"claude","system":"secret","max_tokens":1024,"stop_sequences":["END"],
+            "tools":[
+                {"name":"read","description":"Read","input_schema":schema,"strict":true,"cache_control":{"type":"ephemeral"}},
+                {"type":"web_search_20250305","name":"web_search","max_uses":3}
+            ],
+            "tool_choice":{"type":"any","disable_parallel_tool_use":true}
+        }),
+        json!({"model":"gemini","contents":[],"config":{
+            "temperature":0.5,"maxOutputTokens":2048,"systemInstruction":"secret",
+            "tools":[{"functionDeclarations":[{"name":"read","description":"Read","parametersJsonSchema":schema}]}],
+            "toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["read"]}}
+        }}),
+        json!({"modelId":"nova","inferenceConfig":{"maxTokens":512,"topP":0.9},"system":[{"text":"secret"}],
+            "toolConfig":{
+                "tools":[{"toolSpec":{"name":"read","description":"Read","inputSchema":{"json":schema}}},{"cachePoint":{"type":"default"}}],
+                "toolChoice":{"auto":{}}
+            }
+        }),
+        json!({"model":"mistral-large","messages":[],
+            "tools":[{"type":"function","function":{"name":"read","description":"Read","parameters":schema,"strict":false}}],
+            "tool_choice":"none","parallel_tool_calls":false
+        }),
+        // Pi's own API sends its canonical context and options.
+        json!({"model":"pi","context":{"systemPrompt":"secret","messages":[],"tools":[{"name":"read","description":"Read","parameters":schema}]},
+            "options":{"temperature":1.0,"toolChoice":"auto"}
+        }),
+        json!({"model":"plain","messages":[]}),
     ];
     let mut ops = translator
         .handle(
@@ -913,7 +952,38 @@ fn pi_llm_metadata_selects_request_configuration_across_provider_payloads() {
             .unwrap();
         metadata_without(row, &["model", "provider"])
     };
-    assert_eq!(config(10), json!({"max_tokens":1024,"stop":["END"]}));
-    assert_eq!(config(20), json!({"temperature":0.5,"max_tokens":2048}));
-    assert_eq!(config(30), json!({"max_tokens":512,"top_p":0.9}));
+    let read = |strict: Option<bool>| {
+        let mut function = json!({"name":"read","description":"Read","parameters":schema});
+        if let Some(strict) = strict {
+            function["strict"] = json!(strict);
+        }
+        json!({"type":"function","function":function})
+    };
+    let read_only = json!({"type":"function","function":{"name":"read"}});
+    assert_eq!(
+        config(10),
+        json!({
+            "max_tokens":1024,"stop":["END"],
+            "tools":[read(Some(true)),{"type":"web_search_20250305","name":"web_search","max_uses":3}],
+            "tool_choice":"required","parallel_tool_calls":false
+        })
+    );
+    assert_eq!(
+        config(20),
+        json!({"temperature":0.5,"max_tokens":2048,"tools":[read(None)],"tool_choice":read_only})
+    );
+    assert_eq!(
+        config(30),
+        json!({"max_tokens":512,"top_p":0.9,"tools":[read(None)],"tool_choice":"auto"})
+    );
+    assert_eq!(
+        config(40),
+        json!({"tools":[read(Some(false))],"tool_choice":"none","parallel_tool_calls":false})
+    );
+    assert_eq!(
+        config(50),
+        json!({"temperature":1.0,"tools":[read(None)],"tool_choice":"auto"})
+    );
+    // A request without tools omits metadata.tools rather than emitting [].
+    assert_eq!(config(60), json!({}));
 }

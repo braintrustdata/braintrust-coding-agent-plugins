@@ -1042,9 +1042,13 @@ fn response_model(message: &AssistantMessage) -> Option<String> {
     .next()
     .cloned()
 }
-/// The request configuration fields the instrumentation spec allows on LLM
-/// spans, read individually from the provider-native payload. Pi's API
-/// adapters name them per provider and nest them for Google and Bedrock.
+/// The request configuration the instrumentation spec allows on LLM spans,
+/// read individually from the provider-native payload: sampling settings plus
+/// the available tool definitions and controls. Pi's API adapters name these
+/// per provider and nest them for Google, Bedrock, and Pi's own API.
+///
+/// The output is itself a valid payload for this function, because the
+/// journal stores it in place of the provider payload.
 pub(crate) fn request_config(payload: &Value) -> Map<String, Value> {
     const FIELDS: &[(&str, &[&str])] = &[
         ("temperature", &["temperature"]),
@@ -1072,8 +1076,9 @@ pub(crate) fn request_config(payload: &Value) -> Map<String, Value> {
         payload.get("config"),
         payload.get("generationConfig"),
         payload.get("inferenceConfig"),
+        payload.get("options"),
     ];
-    let mut config = Map::new();
+    let mut config = tool_config(payload);
     for (field, aliases) in FIELDS {
         let value = scopes.iter().flatten().find_map(|scope| {
             aliases
@@ -1085,6 +1090,154 @@ pub(crate) fn request_config(payload: &Value) -> Map<String, Value> {
         }
     }
     config
+}
+/// `metadata.tools`, `tool_choice`, and `parallel_tool_calls` in the spec's
+/// OpenAI shape. Built-in provider tools keep their native definition.
+fn tool_config(payload: &Value) -> Map<String, Value> {
+    let google = payload.get("config");
+    let bedrock = payload.get("toolConfig");
+    let tools: Vec<Value> = [
+        payload.get("tools"),
+        payload.pointer("/context/tools"),
+        google.and_then(|config| config.get("tools")),
+        bedrock.and_then(|config| config.get("tools")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_array)
+    .into_iter()
+    .flatten()
+    .flat_map(tool_definitions)
+    .collect();
+    let choice = [
+        payload.get("tool_choice"),
+        payload.get("toolChoice"),
+        payload.pointer("/options/toolChoice"),
+        google.and_then(|config| config.pointer("/toolConfig/functionCallingConfig")),
+        bedrock.and_then(|config| config.get("toolChoice")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|choice| !choice.is_null());
+    // Anthropic expresses parallelism inside its tool_choice object.
+    let parallel = payload
+        .get("parallel_tool_calls")
+        .or_else(|| payload.get("parallelToolCalls"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            choice
+                .and_then(|choice| choice.get("disable_parallel_tool_use"))
+                .and_then(Value::as_bool)
+                .map(|disabled| !disabled)
+        });
+    let mut config = Map::new();
+    if !tools.is_empty() {
+        config.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(choice) = choice.and_then(tool_choice) {
+        config.insert("tool_choice".into(), choice);
+    }
+    if let Some(parallel) = parallel {
+        config.insert("parallel_tool_calls".into(), json!(parallel));
+    }
+    if let Some(max) = payload.get("max_tool_calls").filter(|max| max.is_u64()) {
+        config.insert("max_tool_calls".into(), max.clone());
+    }
+    config
+}
+fn tool_definitions(tool: &Value) -> Vec<Value> {
+    let function = |definition: &Value, parameters: Option<&Value>| {
+        json!({
+            "type": "function",
+            "function": without_nulls(json!({
+                "name": definition.get("name"),
+                "description": definition.get("description"),
+                "parameters": parameters,
+                "strict": definition.get("strict").filter(|strict| strict.is_boolean()),
+            })),
+        })
+    };
+    if let Some(declarations) = tool.get("functionDeclarations").and_then(Value::as_array) {
+        return declarations
+            .iter()
+            .map(|declaration| {
+                let parameters = declaration
+                    .get("parametersJsonSchema")
+                    .or_else(|| declaration.get("parameters"));
+                function(declaration, parameters)
+            })
+            .collect();
+    }
+    if let Some(spec) = tool.get("toolSpec") {
+        return vec![function(spec, spec.pointer("/inputSchema/json"))];
+    }
+    if tool.get("cachePoint").is_some() {
+        return vec![];
+    }
+    let native_type = tool.get("type").and_then(Value::as_str);
+    let definition = match (native_type, tool.get("function")) {
+        // OpenAI Chat Completions and Mistral, including this function's output.
+        (Some("function"), Some(chat)) => function(chat, chat.get("parameters")),
+        // OpenAI Responses.
+        (Some("function"), None) => function(tool, tool.get("parameters")),
+        // Anthropic, or Pi's own API, whose function tools carry no type.
+        (None, _) if tool.get("name").is_some() => {
+            let parameters = tool.get("input_schema").or_else(|| tool.get("parameters"));
+            function(tool, parameters)
+        }
+        // Built-in provider tools such as web search.
+        _ => tool.clone(),
+    };
+    vec![definition]
+}
+/// Normalizes a provider's tool choice to `auto`, `none`, `required`, or a
+/// named function. Unrecognized choices are omitted rather than guessed.
+fn tool_choice(choice: &Value) -> Option<Value> {
+    let named = |name: Option<&Value>| {
+        let name = name.and_then(Value::as_str)?;
+        Some(json!({"type": "function", "function": {"name": name}}))
+    };
+    let mode = |mode: &str| match mode.to_ascii_lowercase().as_str() {
+        // Google's VALIDATED mode lets the model choose, with schema checks.
+        "auto" | "validated" => Some(json!("auto")),
+        "none" => Some(json!("none")),
+        "any" | "required" => Some(json!("required")),
+        _ => None,
+    };
+    if let Some(choice) = choice.as_str() {
+        return mode(choice);
+    }
+    // Google `functionCallingConfig`.
+    if let Some(google) = choice.get("mode").and_then(Value::as_str) {
+        let allowed = choice
+            .get("allowedFunctionNames")
+            .and_then(Value::as_array)
+            .filter(|names| names.len() == 1);
+        return match (google.eq_ignore_ascii_case("any"), allowed) {
+            (true, Some(names)) => named(names.first()),
+            _ => mode(google),
+        };
+    }
+    // Bedrock `toolChoice`.
+    if let Some(tool) = choice.get("tool") {
+        return named(tool.get("name"));
+    }
+    if choice.get("auto").is_some() {
+        return mode("auto");
+    }
+    if choice.get("any").is_some() {
+        return mode("any");
+    }
+    match choice.get("type").and_then(Value::as_str)? {
+        "function" => named(
+            choice
+                .pointer("/function/name")
+                .or_else(|| choice.get("name")),
+        ),
+        // Anthropic.
+        "tool" => named(choice.get("name")),
+        other => mode(other),
+    }
 }
 /// Pi runs every tool it reports, so tool spans are always approved.
 fn tool_metadata(name: &str, call: &str, parent_call: Option<&str>, extra: Value) -> Value {

@@ -462,7 +462,7 @@ fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_jso
         }
         "before_provider_request" => {
             // The translator records only the allowlisted request
-            // configuration, never the prompt, messages, or tool schemas.
+            // configuration and tool definitions, never the prompt or messages.
             if let Some(payload) = native.get_mut("payload") {
                 *payload = serde_json::Value::Object(crate::translate::pi_request_config(payload));
             }
@@ -726,7 +726,8 @@ mod tests {
                     "type": "before_provider_request",
                     "payload": {
                         "system": "system-prompt-marker",
-                        "tools": [{"name": "tool-schema-marker"}],
+                        "messages": [{"role": "user", "content": "message-marker"}],
+                        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
                         "max_tokens": 1024,
                     },
                 }
@@ -740,7 +741,7 @@ mod tests {
         let stored = tokio::fs::read(&path).await.unwrap();
         let stored_text = String::from_utf8_lossy(&stored);
         assert!(!stored_text.contains("system-prompt-marker"));
-        assert!(!stored_text.contains("tool-schema-marker"));
+        assert!(!stored_text.contains("message-marker"));
 
         let mut reader = JournalReader::open(&path, stored.len() as u64)
             .await
@@ -749,8 +750,45 @@ mod tests {
         let replayed = reader.next_entry().await.unwrap().unwrap();
         assert_eq!(
             replayed.payload.pointer("/event/payload"),
-            Some(&serde_json::json!({"max_tokens": 1024}))
+            Some(&serde_json::json!({
+                "max_tokens": 1024,
+                "tools": [{"type": "function", "function": {
+                    "name": "read",
+                    "parameters": {"type": "object"},
+                }}],
+            }))
         );
+    }
+
+    #[test]
+    fn pi_journaled_request_configuration_replays_unchanged() {
+        let schema = serde_json::json!({"type": "object"});
+        for payload in [
+            serde_json::json!({
+                "max_tokens": 1024,
+                "tools": [
+                    {"name": "read", "input_schema": schema, "strict": true},
+                    {"type": "web_search_20250305", "name": "web_search"},
+                ],
+                "tool_choice": {"type": "tool", "name": "read", "disable_parallel_tool_use": true},
+            }),
+            serde_json::json!({"config": {
+                "temperature": 0.5,
+                "tools": [{"functionDeclarations": [{"name": "read", "parameters": schema}]}, {"googleSearch": {}}],
+                "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+            }}),
+            serde_json::json!({
+                "toolConfig": {"tools": [{"toolSpec": {"name": "read", "inputSchema": {"json": schema}}}]},
+                "inferenceConfig": {"maxTokens": 512},
+            }),
+        ] {
+            let journaled =
+                serde_json::Value::Object(crate::translate::pi_request_config(&payload));
+            assert_eq!(
+                serde_json::Value::Object(crate::translate::pi_request_config(&journaled)),
+                journaled
+            );
+        }
     }
 
     #[tokio::test]
