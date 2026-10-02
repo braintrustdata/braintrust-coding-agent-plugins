@@ -1159,12 +1159,10 @@ fn assert_transcript_fragments_and_aggregate_emit_once(response_after_stop: bool
     assert_eq!(rows[&h.turns()[0].span_id]["metrics"]["prompt_tokens"], 20);
 }
 #[test]
-fn synthetic_transcript_fragments_and_native_aggregate_before_stop_emit_once() {
-    assert_transcript_fragments_and_aggregate_emit_once(false);
-}
-#[test]
-fn synthetic_transcript_fragments_and_native_aggregate_after_stop_emit_once() {
-    assert_transcript_fragments_and_aggregate_emit_once(true);
+fn synthetic_transcript_fragments_and_native_aggregate_emit_once_in_either_order() {
+    for response_after_stop in [false, true] {
+        assert_transcript_fragments_and_aggregate_emit_once(response_after_stop);
+    }
 }
 #[test]
 fn synthetic_late_old_turn_stop_cannot_close_current_model_or_turn() {

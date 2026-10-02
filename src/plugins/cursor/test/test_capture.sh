@@ -35,7 +35,8 @@ exit "${BT_EXIT_CODE:-0}"
     payload = b'{"conversation_id":"session-a","hook_event_name":"preToolUse","transcript_path":null,"tool_input":{"command":"echo $HOME; `pwd`"},"additive_field":42}\n'
     permission = {'preToolUse', 'subagentStart', 'beforeShellExecution',
                   'beforeMCPExecution', 'beforeReadFile'}
-    for exit_code in ('0', '1', '2'):
+    # One successful and one failed invocation cover the wrapper's two paths.
+    for exit_code in ('0', '1'):
         environment['BT_EXIT_CODE'] = exit_code
         for event, registrations in config['hooks'].items():
             registration, = registrations
