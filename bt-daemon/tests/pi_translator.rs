@@ -488,7 +488,12 @@ fn pi_finalization_closes_missing_llm_and_tool_events() {
         event(
             "tool_execution_start",
             3,
-            json!({"toolCallId":"call","toolName":"read","args":{"path":"x"}}),
+            json!({"toolCallId":"call","toolName":"codemode","args":{"code":"..."}}),
+        ),
+        event(
+            "tool_execution_start",
+            4,
+            json!({"toolCallId":"call/1","toolName":"read","args":{"path":"x"},"parentToolCallId":"call"}),
         ),
     ] {
         translator.handle(&envelope, &ctx).unwrap();
@@ -498,10 +503,20 @@ fn pi_finalization_closes_missing_llm_and_tool_events() {
         op,
         SpanOp::Insert(row) if row.span_type == SpanType::Llm && row.error.is_some()
     )));
-    assert!(ops.iter().any(|op| matches!(
-        op,
-        SpanOp::Insert(row) if row.span_type == SpanType::Tool && row.error.is_some()
-    )));
+    let tool = |name: &str| {
+        ops.iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.span_type == SpanType::Tool && row.name == name => {
+                    Some(row)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no closed {name} span"))
+    };
+    let (codemode, read) = (tool("codemode"), tool("read"));
+    assert!(codemode.error.is_some() && read.error.is_some());
+    // An interrupted nested call stays under the tool that made it.
+    assert_eq!(read.parent_span_ids, vec![codemode.span_id.clone()]);
 }
 
 #[test]
@@ -677,4 +692,116 @@ fn pi_tool_errors_keep_the_native_failure_cause() {
             json!(text)
         );
     }
+}
+
+#[test]
+fn pi_nests_tool_calls_made_by_other_tools() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    // Pi 1.0 codemode runs `tools.<name>()` through `ctx.executeTool()`. Each
+    // nested call is `<calling id>/<n>` and names its caller in
+    // `parentToolCallId`.
+    for envelope in [
+        event("before_agent_start", 1, json!({"prompt":"work"})),
+        event(
+            "tool_execution_start",
+            2,
+            json!({"toolCallId":"cm","toolName":"codemode","args":{"code":"..."}}),
+        ),
+        event(
+            "tool_execution_start",
+            3,
+            json!({"toolCallId":"cm/1","toolName":"bash","args":{"command":"ls"},"parentToolCallId":"cm"}),
+        ),
+        event(
+            "tool_execution_end",
+            4,
+            json!({"toolCallId":"cm/1","toolName":"bash","result":"ok","isError":false,"parentToolCallId":"cm"}),
+        ),
+        event(
+            "tool_execution_end",
+            5,
+            json!({"toolCallId":"cm","toolName":"codemode","result":"done","isError":false}),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let tool = |call: &str| {
+        rows.values()
+            .find(|row| {
+                row.span_type == SpanType::Tool
+                    && row.metadata.as_ref().unwrap()["tool_call_id"] == call
+            })
+            .unwrap_or_else(|| panic!("no tool span for {call}"))
+    };
+    let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    let codemode = tool("cm");
+    assert_eq!(codemode.parent_span_ids, vec![turn.span_id.clone()]);
+    assert!(codemode.metadata.as_ref().unwrap()["parent_tool_call_id"].is_null());
+
+    let bash = tool("cm/1");
+    assert_eq!(bash.parent_span_ids, vec![codemode.span_id.clone()]);
+    assert_eq!(bash.metadata.as_ref().unwrap()["parent_tool_call_id"], "cm");
+    assert_eq!(bash.output, Some(json!("ok")));
+}
+
+#[test]
+fn pi_llm_spans_record_the_physical_dispatch_of_a_virtual_model() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let context = |ts, model: serde_json::Value| {
+        let mut envelope = event("context", ts, json!({"messages":[]}));
+        envelope.payload["model"] = model;
+        envelope
+    };
+    let mut ops = Vec::new();
+    for envelope in [
+        event("thinking_level_select", 1, json!({"level":"low"})),
+        event("before_agent_start", 2, json!({"prompt":"route"})),
+        // A virtual selection is routed to a physical model and level.
+        context(3, json!({"provider":"router","id":"auto"})),
+        event(
+            "message_end",
+            4,
+            json!({"message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-5-5","thinkingLevel":"high","providerThinkingLevel":"max","content":[],"usage":{}}}),
+        ),
+        // A physical selection answered by itself is not repeated.
+        context(5, json!({"provider":"anthropic","id":"claude-sonnet-5-5"})),
+        event(
+            "message_end",
+            6,
+            json!({"message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-5-5","content":[],"usage":{}}}),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let llm = |start: i64| {
+        rows.values()
+            .find(|row| row.span_type == SpanType::Llm && row.start_ms == Some(start))
+            .unwrap()
+            .metadata
+            .clone()
+            .unwrap()
+    };
+    let routed = llm(3);
+    assert_eq!(routed["model"], "claude-sonnet-5-5");
+    assert_eq!(routed["selected_model"], "router/auto");
+    assert_eq!(routed["thinking_level"], "high");
+    assert_eq!(routed["provider_thinking_level"], "max");
+
+    let direct = llm(5);
+    assert!(direct["selected_model"].is_null());
+    // Pi releases before 1.0 do not record a dispatched level.
+    assert_eq!(direct["thinking_level"], "low");
 }

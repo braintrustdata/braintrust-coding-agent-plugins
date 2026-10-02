@@ -3,14 +3,14 @@ import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
 import { legacyContinuationFor, type LegacyContinuation } from "./legacy-session.ts";
-import { loadPiPackageMetadata } from "./pi-package.ts";
+import { runningPiPackage } from "./pi-package.ts";
 import { claimManagedTracingInstance, DaemonClient } from "./runtime/daemon-client.ts";
 import { EXTENSION_VERSION } from "./version.ts";
 
 const STATUS_KEY = "braintrust-tracing";
 const WIDGET_KEY = "braintrust-trace-link";
 const UI_STATUS_TIMEOUT_MS = 250;
-const PI_VERSION = loadPiPackageMetadata().version;
+const PI_VERSION = runningPiPackage().version;
 
 function sessionKeyFor(
   sessionFile: string | undefined,

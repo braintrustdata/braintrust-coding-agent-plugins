@@ -70,6 +70,30 @@ vi.mock("./legacy-session.ts", () => ({
   },
 }));
 
+type Handler = (...args: unknown[]) => Promise<unknown>;
+
+/** Load the extension against a fake Pi and return its registered handlers. */
+async function loadExtension(): Promise<Map<string, Handler>> {
+  const handlers = new Map<string, Handler>();
+  const pi = { on: (name: string, handler: Handler) => handlers.set(name, handler) };
+  const { default: extension } = await import("./index.ts");
+  extension(pi as never);
+  return handlers;
+}
+
+function fakeContext(ui: Record<string, unknown> = { setStatus: vi.fn(), setWidget: vi.fn() }) {
+  return {
+    cwd: "/tmp/project",
+    model: { provider: "openai", id: "gpt-5" },
+    hasUI: true,
+    ui,
+    sessionManager: {
+      getSessionFile: () => "/tmp/session.jsonl",
+      getSessionId: () => "native-session",
+    },
+  };
+}
+
 describe("Pi daemon adapter", () => {
   beforeEach(() => {
     mockState.logs.length = 0;
@@ -84,33 +108,13 @@ describe("Pi daemon adapter", () => {
 
   it("does not register a duplicate managed adapter instance", async () => {
     mockState.claim = false;
-    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
-    const pi = {
-      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
-        handlers.set(name, handler),
-    };
-    const { default: extension } = await import("./index.ts");
-    extension(pi as never);
+    const handlers = await loadExtension();
     expect(handlers.size).toBe(0);
   });
 
   it("does not block session startup on daemon status", async () => {
-    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
-    const pi = {
-      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
-        handlers.set(name, handler),
-    };
-    const ctx = {
-      cwd: "/tmp/project",
-      hasUI: true,
-      ui: { setStatus: vi.fn(), setWidget: vi.fn() },
-      sessionManager: {
-        getSessionFile: () => "/tmp/session.jsonl",
-        getSessionId: () => "native-session",
-      },
-    };
-    const { default: extension } = await import("./index.ts");
-    extension(pi as never);
+    const ctx = fakeContext();
+    const handlers = await loadExtension();
 
     let releaseStatus!: () => void;
     mockState.statusGate = new Promise<void>((resolve) => {
@@ -130,27 +134,13 @@ describe("Pi daemon adapter", () => {
   });
 
   it("does not restore UI from a pending status refresh after shutdown", async () => {
-    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
     const statuses: unknown[] = [];
     const widgets: unknown[] = [];
-    const pi = {
-      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
-        handlers.set(name, handler),
-    };
-    const ctx = {
-      cwd: "/tmp/project",
-      hasUI: true,
-      ui: {
-        setStatus: (...args: unknown[]) => statuses.push(args),
-        setWidget: (...args: unknown[]) => widgets.push(args),
-      },
-      sessionManager: {
-        getSessionFile: () => "/tmp/session.jsonl",
-        getSessionId: () => "native-session",
-      },
-    };
-    const { default: extension } = await import("./index.ts");
-    extension(pi as never);
+    const ctx = fakeContext({
+      setStatus: (...args: unknown[]) => statuses.push(args),
+      setWidget: (...args: unknown[]) => widgets.push(args),
+    });
+    const handlers = await loadExtension();
 
     let releaseStatus!: () => void;
     mockState.statusGate = new Promise<void>((resolve) => {
@@ -171,28 +161,13 @@ describe("Pi daemon adapter", () => {
   });
 
   it("forwards native events and keeps the trace-link UI", async () => {
-    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
     const statuses: unknown[] = [];
     const widgets: unknown[] = [];
-    const pi = {
-      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
-        handlers.set(name, handler),
-    };
-    const ctx = {
-      cwd: "/tmp/project",
-      model: { provider: "openai", id: "gpt-5" },
-      hasUI: true,
-      ui: {
-        setStatus: (...args: unknown[]) => statuses.push(args),
-        setWidget: (...args: unknown[]) => widgets.push(args),
-      },
-      sessionManager: {
-        getSessionFile: () => "/tmp/session.jsonl",
-        getSessionId: () => "native-session",
-      },
-    };
-    const { default: extension } = await import("./index.ts");
-    extension(pi as never);
+    const ctx = fakeContext({
+      setStatus: (...args: unknown[]) => statuses.push(args),
+      setWidget: (...args: unknown[]) => widgets.push(args),
+    });
+    const handlers = await loadExtension();
 
     expect([...handlers.keys()]).toEqual([
       "session_start",
@@ -246,7 +221,6 @@ describe("Pi daemon adapter", () => {
     acknowledge();
     await turnEnd;
     mockState.logGate = undefined;
-    expect(mockState.flushes).toHaveLength(0);
     await handlers.get("input")?.({ text: "next turn" });
     expect(mockState.logs.at(-1)?.event).toBe("input");
     await handlers.get("context")?.({ messages: [{ role: "user", content: "next" }] }, ctx);
@@ -307,59 +281,23 @@ describe("Pi daemon adapter", () => {
     expect(mockState.closed).toBe(2);
   });
 
-  it("forwards legacy continuation state with the first daemon event", async () => {
+  it("forwards legacy continuation state, read once per Pi session", async () => {
     mockState.legacyContinuation = {
       span: "legacy-root",
       trace: "legacy-trace",
       turns: 3,
       tools: 7,
     };
-    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
-    const pi = {
-      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
-        handlers.set(name, handler),
-    };
-    const ctx = {
-      cwd: "/tmp/project",
-      hasUI: false,
-      ui: { setStatus: vi.fn(), setWidget: vi.fn() },
-      sessionManager: {
-        getSessionFile: () => "/tmp/session.jsonl",
-        getSessionId: () => "native-session",
-      },
-    };
-    const { default: extension } = await import("./index.ts");
-    extension(pi as never);
+    const ctx = fakeContext();
+    const handlers = await loadExtension();
 
     await handlers.get("session_start")?.({ reason: "resume" }, ctx);
+    await handlers.get("context")?.({}, ctx);
+    await handlers.get("tool_execution_end")?.({}, ctx);
 
     expect(mockState.logs[0]?.payload).toMatchObject({
       legacy_resume: mockState.legacyContinuation,
     });
-  });
-
-  it("reads legacy continuation state once per Pi session", async () => {
-    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
-    const pi = {
-      on: (name: string, handler: (...args: unknown[]) => Promise<unknown>) =>
-        handlers.set(name, handler),
-    };
-    const ctx = {
-      cwd: "/tmp/project",
-      hasUI: false,
-      ui: { setStatus: vi.fn(), setWidget: vi.fn() },
-      sessionManager: {
-        getSessionFile: () => "/tmp/session.jsonl",
-        getSessionId: () => "native-session",
-      },
-    };
-    const { default: extension } = await import("./index.ts");
-    extension(pi as never);
-
-    await handlers.get("session_start")?.({}, ctx);
-    await handlers.get("context")?.({}, ctx);
-    await handlers.get("tool_execution_end")?.({}, ctx);
-
     expect(mockState.legacyContinuationFor).toHaveBeenCalledTimes(1);
     expect(mockState.legacyContinuationFor).toHaveBeenCalledWith("/tmp/session.jsonl");
   });

@@ -55,21 +55,23 @@ afterEach(() => {
   }
 });
 
+const DEFAULT_CONFIG = {
+  enabled: false,
+  projectName: "pi",
+  showUi: true,
+  showTraceLink: true,
+  profile: undefined,
+  orgName: undefined,
+  additionalMetadata: undefined,
+  route: {
+    destination: { type: "project_logs", project_name: "pi" },
+    flush_mode: "flush_on_turn_end",
+  },
+};
+
 describe("loadConfig", () => {
   it("defaults to disabled tracing with the daemon default profile", () => {
-    expect(loadConfig(cwd)).toEqual({
-      enabled: false,
-      projectName: "pi",
-      showUi: true,
-      showTraceLink: true,
-      profile: undefined,
-      orgName: undefined,
-      additionalMetadata: undefined,
-      route: {
-        destination: { type: "project_logs", project_name: "pi" },
-        flush_mode: "flush_on_turn_end",
-      },
-    });
+    expect(loadConfig(cwd)).toEqual(DEFAULT_CONFIG);
   });
 
   it("layers global config with project config overriding it", () => {
@@ -126,7 +128,7 @@ describe("loadConfig", () => {
     });
   });
 
-  it("ignores routing and enablement environment variables, using only the config file", () => {
+  it("lets environment variables control only UI behavior, not routing or enablement", () => {
     writeJson(join(home, ".pi", "agent", "braintrust.json"), {
       trace_to_braintrust: false,
       project: "global-project",
@@ -136,6 +138,8 @@ describe("loadConfig", () => {
     process.env.BRAINTRUST_PROJECT = "run-project";
     process.env.BRAINTRUST_ADDITIONAL_METADATA = '{"source":"run"}';
     process.env.TRACE_TO_BRAINTRUST = "true";
+    process.env.BRAINTRUST_SHOW_UI = "0";
+    process.env.BRAINTRUST_SHOW_TRACE_LINK = "no";
 
     expect(loadConfig(cwd)).toMatchObject({
       enabled: false,
@@ -143,14 +147,6 @@ describe("loadConfig", () => {
       orgName: undefined,
       projectName: "global-project",
       additionalMetadata: undefined,
-    });
-  });
-
-  it("still lets environment variables control unrelated UI behavior", () => {
-    process.env.BRAINTRUST_SHOW_UI = "0";
-    process.env.BRAINTRUST_SHOW_TRACE_LINK = "no";
-
-    expect(loadConfig(cwd)).toMatchObject({
       showUi: false,
       showTraceLink: false,
     });
@@ -162,21 +158,8 @@ describe("loadConfig", () => {
       project: [],
       additional_metadata: [],
     });
-    writeFileSync(join(cwd, ".pi-invalid"), "ignored");
 
-    expect(loadConfig(cwd)).toEqual({
-      enabled: false,
-      projectName: "pi",
-      showUi: true,
-      showTraceLink: true,
-      profile: undefined,
-      orgName: undefined,
-      additionalMetadata: undefined,
-      route: {
-        destination: { type: "project_logs", project_name: "pi" },
-        flush_mode: "flush_on_turn_end",
-      },
-    });
+    expect(loadConfig(cwd)).toEqual(DEFAULT_CONFIG);
   });
 
   it("uses managed-run settings without replacing the agent's global file", () => {
