@@ -607,8 +607,134 @@ fn real_successful_interactive_capture_reuses_stopped_turn_for_late_response() {
             .iter()
             .any(|t| llm.parent_span_ids == vec![t.span_id.clone()]));
         assert!(llm.metrics.is_none(), "native totals are turn-scoped");
+        let parent = &rows[&llm.parent_span_ids[0]];
+        assert!(llm.end_ms.unwrap() <= parent["end_ms"].as_i64().unwrap());
     }
 }
+#[test]
+fn response_after_stop_enriches_turn_and_history_without_opening_a_completion() {
+    for observed_thought in [false, true] {
+        let mut h = Harness::new("test-session");
+        h.handle(&event(
+            "beforeSubmitPrompt",
+            100,
+            json!({"generation_id":"t1","prompt":"first","transcript_path":null}),
+        ));
+        if observed_thought {
+            h.handle(&event("afterAgentThought", 110, json!({"text":"thinking"})));
+        }
+        h.handle(&event(
+            "stop",
+            120,
+            json!({"generation_id":"t1","status":"completed","transcript_path":null}),
+        ));
+        let before = serde_json::to_value(h.inserted(SpanType::Llm)).unwrap();
+        let response = event(
+            "afterAgentResponse",
+            5000,
+            json!({"generation_id":"t1","text":"late answer","input_tokens":20,"output_tokens":4}),
+        );
+        h.handle(&response);
+        h.handle(&response);
+        assert_eq!(
+            serde_json::to_value(h.inserted(SpanType::Llm)).unwrap(),
+            before
+        );
+        let first_id = h.turns()[0].span_id.clone();
+        let rows = h.rows();
+        assert_eq!(rows[&first_id]["end_ms"], 120);
+        assert_eq!(rows[&first_id]["output"], "late answer");
+        assert_eq!(rows[&first_id]["metrics"]["tokens"], 24);
+        h.handle(&event(
+            "beforeSubmitPrompt",
+            6000,
+            json!({"generation_id":"t2","prompt":"second"}),
+        ));
+        h.handle(&event(
+            "afterAgentResponse",
+            6010,
+            json!({"generation_id":"t2","text":"second answer"}),
+        ));
+        h.finish();
+        let llms = h.inserted(SpanType::Llm);
+        assert_eq!(llms.len(), usize::from(observed_thought) + 1);
+        let input = llms
+            .last()
+            .unwrap()
+            .input
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .filter(|message| **message == json!({"role":"assistant","content":"late answer"}))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn transcript_first_seen_after_stop_enriches_closed_turn_without_a_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("late.jsonl");
+    let transcript = transcript_record("user", "hello")
+        + &transcript_record("assistant", "fragment A")
+        + &transcript_record("assistant", " + fragment B");
+    std::fs::write(&path, &transcript).unwrap();
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        100,
+        json!({"generation_id":"t1","prompt":"hello","transcript_path":null}),
+    ));
+    h.handle(&event(
+        "stop",
+        120,
+        json!({"generation_id":"t1","status":"completed"}),
+    ));
+    let response = mirrored(
+        "afterAgentResponse",
+        5000,
+        &path,
+        transcript.len() as u64,
+        json!({"generation_id":"t1","text":"fragment A + fragment B"}),
+    );
+    h.handle(&response);
+    h.handle(&response);
+    assert!(h.inserted(SpanType::Llm).is_empty());
+    let rows = h.rows();
+    let turn = &rows[&h.turns()[0].span_id];
+    assert_eq!(turn["end_ms"], 120);
+    assert_eq!(turn["output"], "fragment A + fragment B");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        6000,
+        json!({"generation_id":"t2","prompt":"continue"}),
+    ));
+    h.handle(&event(
+        "afterAgentResponse",
+        6010,
+        json!({"generation_id":"t2","text":"done"}),
+    ));
+    h.finish();
+    let llms = h.inserted(SpanType::Llm);
+    assert_eq!(llms.len(), 1);
+    let prior_text = llms[0]
+        .input
+        .as_ref()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["content"].as_str())
+        .collect::<String>();
+    assert_eq!(prior_text, "fragment A + fragment B");
+}
+
 #[test]
 fn real_successful_headless_capture_correlates_tools_and_records_completion() {
     let h = real_capture("headless-tools-success");

@@ -425,6 +425,29 @@ impl CursorTranslator {
         });
     }
     fn model_content(&mut self, content: Value, ts: i64, ops: &mut Vec<SpanOp>) {
+        if let Some(turn) = self.turn.as_mut().filter(|turn| turn.end.is_some()) {
+            // Late output belongs to the closed turn. Its receipt time does
+            // not establish another model request or extend model latency.
+            if let Some(text) = content
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|_| content.get("type").and_then(Value::as_str) == Some("text"))
+            {
+                self.history
+                    .push(json!({"role":"assistant","content":text}));
+                self.seen.insert(format!(
+                    "output-text:{}:{}",
+                    turn.id,
+                    ids::span_id(&self.namespace, text)
+                ));
+                if turn.emitted_text.len() + text.len() <= MAX_HISTORY_BYTES {
+                    turn.emitted_text.push_str(text);
+                } else {
+                    self.history.truncated = true;
+                }
+            }
+            return;
+        }
         self.ensure_model(ts, ops);
         self.model_step.as_mut().unwrap().push(content);
     }
@@ -1028,17 +1051,16 @@ impl CursorTranslator {
                 if let Some(t) = &mut self.turn {
                     t.output = Some(text);
                 }
-                self.merge_late_answer(ts, ops);
+                self.merge_late_answer(ops);
                 // Tool inputs have no IDs and may differ from hook arguments;
                 // they do not create a second copy of the native tool span.
             }
         }
     }
-    fn merge_late_answer(&mut self, ts: i64, ops: &mut Vec<SpanOp>) {
+    fn merge_late_answer(&mut self, ops: &mut Vec<SpanOp>) {
         let Some(turn) = self.turn.as_ref().filter(|t| t.end.is_some()).cloned() else {
             return;
         };
-        self.close_model(ts, ops);
         let mut row = self.row(turn.id, self.root.clone(), "", SpanType::Task);
         row.output = turn.output.map(|s| json!(s));
         row.metadata = Some(json!({"late_output_enrichment":true}));
@@ -1240,7 +1262,7 @@ impl CursorTranslator {
                     }
                     self.turn_usage(e, ops);
                     self.close_model(e.ts_ms, ops);
-                    self.merge_late_answer(e.ts_ms, ops);
+                    self.merge_late_answer(ops);
                 }
             }
             "stop" => {
