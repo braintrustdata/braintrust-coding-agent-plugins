@@ -80,7 +80,7 @@ jobs:
             echo "::error::version '$VERSION' is not semver (MAJOR.MINOR.PATCH)."; exit 1
           fi
           case "$PLUGIN" in
-            antigravity|claude|codex|grok) ;;
+            antigravity|claude|codex|cursor|grok) ;;
             *) echo "::error::Unsupported plugin '$PLUGIN'."; exit 1 ;;
           esac
           if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
@@ -231,3 +231,11 @@ jobs:
     uses: ./.github/workflows/smoke-antigravity.yml
     with:
       dist_repo: ${{ inputs.dist_repo }}
+
+  smoke-cursor:
+    needs: release
+    if: ${{ inputs.plugin == 'cursor' }}
+    uses: ./.github/workflows/smoke-cursor.yml
+    with:
+      dist_repo: ${{ inputs.dist_repo }}
+    secrets: inherit

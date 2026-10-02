@@ -14,12 +14,13 @@ sh -n "$TARGET_DIR/hooks/trace.sh" || fail "invalid hook shell syntax"
 python3 - "$TARGET_DIR" <<'PY' || fail "invalid Cursor plugin"
 import json
 from pathlib import Path
+import re
 import sys
 
 root = Path(sys.argv[1])
 manifest = json.loads((root / '.cursor-plugin/plugin.json').read_text())
 assert manifest['name'] == 'trace-cursor'
-assert manifest['version'] == '0.1.0'
+assert re.fullmatch(r'\d+\.\d+\.\d+', manifest['version'])
 assert manifest['hooks'] == 'hooks/hooks.json'
 assert 'mcpServers' not in manifest and not (root / 'mcp.json').exists()
 config = json.loads((root / manifest['hooks']).read_text())
