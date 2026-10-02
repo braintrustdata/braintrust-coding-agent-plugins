@@ -2,16 +2,18 @@
 //! Recovery must use those mirrors even after native files change or disappear.
 
 use async_trait::async_trait;
-use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionRoute, TraceDestination};
+use bt_daemon::wire::{
+    AuthSelection, BackendAuth, Envelope, FlushMode, SessionRoute, TraceDestination,
+};
 use bt_daemon::{
     debug_serve_options, flush_session, forward_envelope, run_serve, run_status, shutdown_daemon,
-    source_journal_path, AuthLease, AuthProvider, AuthResolveReason, HostInfo, ServeArgs,
-    StatusArgs,
+    source_journal_path, AuthLease, AuthProvider, AuthResolveReason, HostInfo, ServeArgs, Sink,
+    SinkFactory, SpanOp, StatusArgs,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct TestAuth;
@@ -50,6 +52,14 @@ fn endpoint(dir: &Path) -> PathBuf {
 }
 
 async fn start(data: &Path, socket: &Path) -> tokio::task::JoinHandle<()> {
+    start_with_sink(data, socket, None).await
+}
+
+async fn start_with_sink(
+    data: &Path,
+    socket: &Path,
+    sink_factory: Option<Arc<dyn SinkFactory>>,
+) -> tokio::task::JoinHandle<()> {
     let args = ServeArgs {
         data_dir: Some(data.into()),
         socket: Some(socket.into()),
@@ -58,6 +68,9 @@ async fn start(data: &Path, socket: &Path) -> tokio::task::JoinHandle<()> {
     };
     let mut options = debug_serve_options("test", data);
     options.auth_provider = Some(Arc::new(TestAuth));
+    if let Some(sink_factory) = sink_factory {
+        options.sink_factory = sink_factory;
+    }
     let task = tokio::spawn(async move {
         run_serve(args, options).await.unwrap();
     });
@@ -76,7 +89,17 @@ async fn start(data: &Path, socket: &Path) -> tokio::task::JoinHandle<()> {
     panic!("Cursor test daemon never answered");
 }
 
-async fn send(socket: &Path, event: &str, ts_ms: i64, mut payload: Value) {
+async fn send(socket: &Path, event: &str, ts_ms: i64, payload: Value) {
+    send_with_flush_mode(socket, event, ts_ms, payload, FlushMode::default()).await;
+}
+
+async fn send_with_flush_mode(
+    socket: &Path,
+    event: &str,
+    ts_ms: i64,
+    mut payload: Value,
+    flush_mode: FlushMode,
+) {
     payload["conversation_id"] = json!("cursor-recovery");
     payload["hook_event_name"] = json!(event);
     let env = Envelope {
@@ -90,6 +113,7 @@ async fn send(socket: &Path, event: &str, ts_ms: i64, mut payload: Value) {
         capture: None,
         payload,
         route: Some(SessionRoute {
+            flush_mode,
             destination: Some(TraceDestination::ProjectLogs {
                 project_id: None,
                 project_name: Some("cursor-tests".into()),
@@ -133,6 +157,108 @@ fn insert_ids(rows: &[Value]) -> BTreeSet<String> {
         .filter_map(|row| row.pointer("/Insert/span_id").and_then(Value::as_str))
         .map(str::to_owned)
         .collect()
+}
+
+#[derive(Default)]
+struct BufferedRows {
+    pending: Vec<SpanOp>,
+    delivered: Vec<SpanOp>,
+}
+
+struct BufferedSink(Arc<Mutex<BufferedRows>>);
+
+#[async_trait]
+impl Sink for BufferedSink {
+    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        self.0.lock().unwrap().pending.extend_from_slice(ops);
+        Ok(ops.len() as u64)
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        let mut rows = self.0.lock().unwrap();
+        let pending = std::mem::take(&mut rows.pending);
+        rows.delivered.extend(pending);
+        Ok(())
+    }
+
+    fn has_pending_delivery(&self) -> bool {
+        !self.0.lock().unwrap().pending.is_empty()
+    }
+}
+
+impl SinkFactory for BufferedSink {
+    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+        Ok(Box::new(Self(self.0.clone())))
+    }
+}
+
+#[tokio::test]
+async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let socket = endpoint(tmp.path());
+    let buffered = Arc::new(Mutex::new(BufferedRows::default()));
+    let daemon = start_with_sink(
+        &data,
+        &socket,
+        Some(Arc::new(BufferedSink(buffered.clone()))),
+    )
+    .await;
+    for (event, ts_ms, payload) in [
+        (
+            "beforeSubmitPrompt",
+            1000,
+            json!({"generation_id":"g1","prompt":"hello"}),
+        ),
+        (
+            "stop",
+            2000,
+            json!({"generation_id":"g1","status":"completed"}),
+        ),
+        (
+            "afterAgentResponse",
+            2100,
+            json!({"generation_id":"g1","text":"late final answer"}),
+        ),
+    ] {
+        send_with_flush_mode(&socket, event, ts_ms, payload, FlushMode::FlushOnTurnEnd).await;
+    }
+    let journal = source_journal_path(&data, "cursor", "cursor-recovery");
+    // Ingress acknowledges capture before the out-of-band sink flush finishes.
+    // Wait for delivery and its checkpoint without requesting an explicit flush.
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let delivered = buffered.lock().unwrap().delivered.iter().any(|op| {
+                matches!(op, SpanOp::Merge(row) if row.output == Some(json!("late final answer")))
+            });
+            let text = std::fs::read_to_string(&journal).unwrap_or_default();
+            let mut position = 0;
+            let mut response_through = None;
+            let mut checkpoint_through = 0;
+            for line in text.split_inclusive('\n') {
+                position += line.len() as u64;
+                let Ok(row) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if row["event"] == "afterAgentResponse" {
+                    response_through = Some(position);
+                }
+                if row.get("_bt_record_type").is_some() {
+                    checkpoint_through =
+                        checkpoint_through.max(row["through"].as_u64().unwrap_or(0));
+                }
+            }
+            if delivered && response_through.is_some_and(|offset| checkpoint_through >= offset) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+    completed
+        .expect("late response was not delivered and checkpointed while the session stayed open");
 }
 
 #[tokio::test]

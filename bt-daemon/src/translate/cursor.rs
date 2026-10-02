@@ -610,13 +610,24 @@ impl CursorTranslator {
                 e.ts_ms,
                 ops,
             );
+            self.close_model(e.ts_ms, ops);
             return;
         }
         let current = self.turn.as_ref().is_some_and(|t| {
             self.tools.get(&key).is_some_and(|tool| t.id == tool.turn) && t.end.is_none()
         });
         if current {
-            self.close_model(e.ts_ms, ops);
+            let tool = self.tools.get(&key).unwrap();
+            if tool.row.metadata.as_ref().is_some_and(|metadata| {
+                metadata
+                    .get("start_time_estimated")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            }) {
+                // Without preToolUse, the duration is the only available
+                // tool-request boundary. Tool execution is not model latency.
+                self.close_model(tool.row.start_ms.unwrap_or(e.ts_ms), ops);
+            }
         }
         let mut tool = self.tools.remove(&key).unwrap();
         tool.ended = true;

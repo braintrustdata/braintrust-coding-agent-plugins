@@ -356,6 +356,8 @@ pub(crate) fn should_flush_hook_event(event: &str, flush_on_turn_end: bool) -> b
                     | "SubagentStop"
                     | "subagent_stop"
                     | "subagentStop"
+                    // Cursor can emit its final answer after `stop`.
+                    | "afterAgentResponse"
             ))
 }
 
@@ -1777,6 +1779,7 @@ mod tests {
             "subagent_stop",
             "SubagentStop",
             "subagentStop",
+            "afterAgentResponse",
         ] {
             assert!(!should_flush_hook_event(event, false));
             assert!(should_flush_hook_event(event, true));

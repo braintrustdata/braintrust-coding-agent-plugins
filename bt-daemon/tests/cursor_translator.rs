@@ -209,6 +209,10 @@ fn synthetic_success_is_parented_and_duplicate_response_stop_usage_is_not_summed
         json!({"generation_id":"request-a","text":"thinking"}),
     ));
     h.handle(&event("preToolUse",120,json!({"generation_id":"unrelated","tool_name":"Read","tool_use_id":"r1","tool_input":{"file_path":"/tmp/a"}})));
+    let completions = h.inserted(SpanType::Llm);
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].start_ms, Some(100));
+    assert_eq!(completions[0].end_ms, Some(120));
     h.handle(&event(
         "postToolUse",
         130,
@@ -236,6 +240,8 @@ fn synthetic_success_is_parented_and_duplicate_response_stop_usage_is_not_summed
     assert_eq!(turn["metrics"]["completion_tokens"], 4);
     assert_eq!(turn["metrics"]["tokens"], 24);
     let llms = h.inserted(SpanType::Llm);
+    assert_eq!(llms[0].end_ms, Some(120));
+    assert_eq!(llms[1].start_ms, Some(130));
     let first = llms[0].output.as_ref().unwrap();
     assert_eq!(first[0]["finish_reason"], "tool_calls");
     assert_eq!(first[0]["message"]["role"], "assistant");
@@ -277,6 +283,59 @@ fn synthetic_success_is_parented_and_duplicate_response_stop_usage_is_not_summed
         .iter()
         .all(|r| r.metadata.as_ref().unwrap()["input_reconstructed"] == true));
 }
+#[test]
+fn terminal_tool_hook_does_not_close_a_later_completion() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        100,
+        json!({"prompt":"run tools"}),
+    ));
+    h.handle(&event(
+        "preToolUse",
+        120,
+        json!({"tool_name":"Shell","tool_use_id":"slow","tool_input":{"command":"sleep 1"}}),
+    ));
+    h.handle(&event(
+        "afterAgentThought",
+        130,
+        json!({"text":"working while the tool runs"}),
+    ));
+    h.handle(&event(
+        "postToolUse",
+        150,
+        json!({"tool_name":"Shell","tool_use_id":"slow","tool_output":"done","duration":30}),
+    ));
+    assert_eq!(h.inserted(SpanType::Llm).len(), 1);
+    h.handle(&event("stop", 160, json!({"status":"completed"})));
+    let llms = h.inserted(SpanType::Llm);
+    assert_eq!(llms.len(), 2);
+    assert_eq!(llms[0].end_ms, Some(120));
+    assert_eq!(llms[1].end_ms, Some(160));
+}
+
+#[test]
+fn missing_pre_tool_hook_uses_duration_to_end_completion_before_execution() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        100,
+        json!({"prompt":"run a tool"}),
+    ));
+    h.handle(&event(
+        "afterAgentThought",
+        110,
+        json!({"text":"running the command"}),
+    ));
+    h.handle(&event(
+        "postToolUse",
+        150,
+        json!({"tool_name":"Shell","tool_use_id":"missing-pre","tool_output":"done","duration":30}),
+    ));
+    assert_eq!(h.inserted(SpanType::Llm)[0].end_ms, Some(120));
+    assert_eq!(h.inserted(SpanType::Tool)[0].start_ms, Some(120));
+}
+
 #[test]
 fn synthetic_denial_and_missing_tool_end_preserve_native_outcome() {
     let mut h = Harness::new("test-session");

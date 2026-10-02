@@ -500,7 +500,7 @@ impl SessionActor {
     async fn run(self, mut rx: mpsc::Receiver<SessionMsg>) {
         let mut translator = match self
             .translators
-            .create_checked_with_session_key(&self.source, &self.translator_session_id)
+            .create_checked_with_session_namespace(&self.source, &self.translator_session_id)
         {
             Ok(translator) => translator,
             Err(error) => {

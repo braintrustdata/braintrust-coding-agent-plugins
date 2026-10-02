@@ -218,20 +218,20 @@ impl Registry {
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
         let namespace = crate::ids::session_namespace(canonical, session_id);
-        self.create_checked_with_session_key(canonical, &namespace)
+        self.create_checked_with_session_namespace(canonical, &namespace)
     }
 
-    pub(crate) fn create_checked_with_session_key(
+    pub(crate) fn create_checked_with_session_namespace(
         &self,
         source: &str,
-        session_key: &str,
+        session_namespace: &str,
     ) -> anyhow::Result<Box<dyn AgentTranslator>> {
         let canonical = self
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
         let factory = self.factories.get(canonical);
         let factory = factory.expect("canonical source must have a factory");
-        Ok(factory.create(session_key))
+        Ok(factory.create(session_namespace))
     }
 
     /// Create a known translator. Production ingress uses
