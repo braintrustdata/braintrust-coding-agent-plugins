@@ -334,6 +334,21 @@ async fn opencode_session_emits_traces() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the Pi CLI and built extension"]
 async fn pi_session_emits_traces() {
+    assert_pi_session_emits_traces(None).await;
+}
+
+/// Pi keys sessions by their session-file path. A deep `--session-dir` must
+/// not push the daemon's per-session journal past the file-name limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the Pi CLI and built extension"]
+async fn pi_session_in_a_deep_session_dir_emits_traces() {
+    assert_pi_session_emits_traces(Some(170)).await;
+}
+
+/// `session_dir_len` pads the session directory to at least that many bytes,
+/// enough to overflow a 255-byte journal name while staying inside Windows'
+/// 260-character path limit once Pi appends its session file name.
+async fn assert_pi_session_emits_traces(session_dir_len: Option<usize>) {
     let inference = OpenAiMock::new(|_context, request| {
         assert!(request.model().is_some());
         if request.has_function_output("call_pi_1") {
@@ -347,7 +362,14 @@ async fn pi_session_emits_traces() {
     });
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
-    let pi = PiAgent::new(&world);
+    let mut pi = PiAgent::new(&world);
+    if let Some(len) = session_dir_len {
+        let mut session_dir = world.temp_path("pi-deep-sessions");
+        while session_dir.as_os_str().len() < len {
+            session_dir.push("nested-session-directory");
+        }
+        pi = pi.with_session_dir(session_dir);
+    }
     let plugin_version = pi.plugin_version();
 
     let output = pi

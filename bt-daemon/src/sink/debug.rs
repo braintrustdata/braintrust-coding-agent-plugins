@@ -1,6 +1,7 @@
 //! Debug sink: appends each emitted [`SpanOp`] as one NDJSON line to
-//! `<data_dir>/spans/<session_id>.ndjson`. Lets tests assert on exactly what
-//! the pipeline produced without touching Braintrust.
+//! `<data_dir>/spans/<session_id>.ndjson` (a digest for overlong ids). Lets
+//! tests assert on exactly what the pipeline produced without touching
+//! Braintrust.
 
 use super::{Sink, SinkFactory};
 use crate::translate::SpanOp;
@@ -16,11 +17,19 @@ impl SinkFactory for DebugSinkFactory {
     fn create(
         &self,
         session_id: &str,
-        _source: &str,
+        source: &str,
         _plugin_version: Option<&str>,
     ) -> anyhow::Result<Box<dyn Sink>> {
         std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(format!("{}.ndjson", sanitize(session_id)));
+        let mut name = format!("{}.ndjson", sanitize(session_id));
+        // Fall back to a stable digest when the id cannot be one file name.
+        if name.len() > 255 {
+            name = format!(
+                "{}.ndjson",
+                crate::ids::session_storage_id(source, session_id)
+            );
+        }
+        let path = self.dir.join(name);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Box::new(DebugSink {
             writer: BufWriter::new(file),

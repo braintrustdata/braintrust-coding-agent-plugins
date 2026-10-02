@@ -31,19 +31,28 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Longest single path component, in bytes, that common filesystems accept.
+const MAX_FILE_NAME_BYTES: usize = 255;
+
 pub fn journal_path(data_dir: &Path, session_id: &str) -> PathBuf {
     journal_dir(data_dir).join(format!("{}.ndjson", sanitize(session_id)))
 }
 
 /// Source-qualified journal path. The stable suffix prevents sanitized native
-/// ids such as `a/b` and `a_b` from aliasing the same file.
+/// ids such as `a/b` and `a_b` from aliasing the same file, so a session id
+/// too long for one file name keeps only its tail (Pi ids embed the session
+/// file path). Names that fit are unchanged, so existing journals still match.
 pub fn source_journal_path(data_dir: &Path, source: &str, session_id: &str) -> PathBuf {
-    journal_dir(data_dir).join(format!(
-        "{}--{}--{}.ndjson",
-        sanitize(source),
-        sanitize(session_id),
+    let prefix = format!("{}--", sanitize(source));
+    let suffix = format!(
+        "--{}.ndjson",
         crate::ids::session_storage_id(source, session_id)
-    ))
+    );
+    let session = sanitize(session_id);
+    let budget = MAX_FILE_NAME_BYTES.saturating_sub(prefix.len() + suffix.len());
+    // `sanitize` emits ASCII only, so any byte offset is a char boundary.
+    let session = &session[session.len().saturating_sub(budget)..];
+    journal_dir(data_dir).join(format!("{prefix}{session}{suffix}"))
 }
 
 /// Return the source-qualified journal, copying the legacy session-only file
@@ -59,6 +68,10 @@ pub async fn ensure_source_journal(
         return Ok(path);
     }
     let legacy = journal_path(data_dir, session_id);
+    // A legacy name too long for the filesystem was never written.
+    if legacy.file_name().map_or(0, |name| name.len()) > MAX_FILE_NAME_BYTES {
+        return Ok(path);
+    }
     match tokio::fs::metadata(&legacy).await {
         Ok(_) => {
             tokio::fs::create_dir_all(journal_dir(data_dir)).await?;
@@ -727,6 +740,32 @@ mod tests {
         assert_eq!(tokio::fs::read(&codex).await.unwrap(), b"legacy\n");
         assert_eq!(tokio::fs::read(&claude).await.unwrap(), b"legacy\n");
         assert_eq!(tokio::fs::read(&legacy).await.unwrap(), b"legacy\n");
+    }
+
+    #[tokio::test]
+    async fn long_session_ids_get_distinct_bounded_journals() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = "x".repeat(400);
+        let first = ensure_source_journal(temp.path(), "pi", &format!("a{shared}"))
+            .await
+            .unwrap();
+        let second = ensure_source_journal(temp.path(), "pi", &format!("b{shared}"))
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        for path in [&first, &second] {
+            assert!(path.file_name().unwrap().len() <= MAX_FILE_NAME_BYTES);
+            JournalWriter::open_path(path).await.unwrap();
+        }
+        // Names that already fit keep their original layout so existing
+        // journals are still found after an upgrade.
+        assert_eq!(
+            source_journal_path(temp.path(), "pi", "short/id"),
+            journal_dir(temp.path()).join(format!(
+                "pi--short_id--{}.ndjson",
+                crate::ids::session_storage_id("pi", "short/id")
+            ))
+        );
     }
 
     #[tokio::test]

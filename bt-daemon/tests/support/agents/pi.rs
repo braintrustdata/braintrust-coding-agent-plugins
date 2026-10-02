@@ -68,6 +68,13 @@ impl PiAgent {
         }
     }
 
+    /// Store sessions under `session_dir` instead of the default test directory.
+    pub fn with_session_dir(mut self, session_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&session_dir).expect("create Pi session directory");
+        self.session_dir = session_dir;
+        self
+    }
+
     /// The version the extension under test reports in trace metadata.
     pub fn plugin_version(&self) -> String {
         package_version(&self.extension)
