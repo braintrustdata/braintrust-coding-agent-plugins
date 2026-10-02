@@ -24,6 +24,17 @@ fn event(name: &str, ts_ms: i64, native: serde_json::Value) -> Envelope {
     }
 }
 
+/// A row's metadata without the git keys enriched from the test's cwd or
+/// the given translator-owned keys.
+fn metadata_without(row: &SpanRow, keys: &[&str]) -> serde_json::Value {
+    let mut metadata = row.metadata.clone().unwrap();
+    metadata
+        .as_object_mut()
+        .unwrap()
+        .retain(|key, _| !key.starts_with("git_") && !keys.contains(&key.as_str()));
+    metadata
+}
+
 fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
     assert_merges_preserve_insert_identity(&ops);
     let mut rows = HashMap::new();
@@ -79,7 +90,14 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
         event(
             "before_provider_request",
             3,
-            json!({"payload":{"model":"gpt-5","messages":[{"role":"user","content":"inspect"}]}}),
+            json!({"payload":{
+                "model":"gpt-5",
+                "instructions":"system prompt",
+                "messages":[{"role":"user","content":"inspect"}],
+                "tools":[{"type":"function","name":"read"}],
+                "max_output_tokens":4096,
+                "temperature":0.2
+            }}),
         ),
         event(
             "message_update",
@@ -89,7 +107,7 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
         event(
             "message_end",
             5,
-            json!({"message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"thinking","thinking":"reason"},{"type":"text","text":"done"}],"usage":{"input":5,"output":2,"cacheRead":3,"reasoning":1,"totalTokens":11}}}),
+            json!({"message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"thinking","thinking":"reason"},{"type":"text","text":"done"}],"usage":{"input":5,"output":2,"cacheRead":3,"cacheWrite":4,"cacheWrite1h":1,"reasoning":1,"totalTokens":14,"cost":{"input":0.1,"output":0.2,"total":0.3}}}}),
         ),
         event(
             "tool_execution_start",
@@ -184,23 +202,65 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
                     .is_some_and(|input| input[0]["content"] == "inspect")
         })
         .unwrap();
-    assert_eq!(first_llm.metrics.as_ref().unwrap()["prompt_tokens"], 8);
+    // Cache reads and writes are part of the prompt; the 1h write and the
+    // reasoning tokens are subsets that Pi has already counted.
     assert_eq!(
-        first_llm.metrics.as_ref().unwrap()["time_to_first_token"],
-        0.001
+        first_llm.metrics.as_ref().unwrap(),
+        &json!({
+            "prompt_tokens": 12,
+            "completion_tokens": 2,
+            "completion_reasoning_tokens": 1,
+            "tokens": 14,
+            "prompt_cached_tokens": 3,
+            "prompt_cache_creation_tokens": 4,
+            "prompt_cache_creation_5m_tokens": 3,
+            "prompt_cache_creation_1h_tokens": 1,
+            "time_to_first_token": 0.001,
+            "estimated_cost": 0.3,
+        })
     );
+    // Only allowlisted request configuration reaches metadata, never the
+    // provider payload's instructions or tool schemas.
     assert_eq!(
-        first_llm.metadata.as_ref().unwrap()["provider_request"]["payload"]["model"],
-        "gpt-5"
+        metadata_without(first_llm, &[]),
+        json!({
+            "model": "gpt-5",
+            "provider": "openai",
+            "temperature": 0.2,
+            "max_tokens": 4096,
+        })
     );
-    assert!(
-        first_llm.metadata.as_ref().unwrap()["provider_request"]["payload"]
-            .get("messages")
-            .is_none()
+    let continued_llm = rows
+        .values()
+        .find(|r| r.span_type == SpanType::Llm && r.span_id != first_llm.span_id)
+        .unwrap();
+    let continued_metrics = continued_llm.metrics.as_ref().unwrap();
+    for unreported in [
+        "completion_reasoning_tokens",
+        "prompt_cache_creation_1h_tokens",
+        "time_to_first_token",
+        "estimated_cost",
+    ] {
+        assert!(continued_metrics.get(unreported).is_none(), "{unreported}");
+    }
+    let turn = rows.values().find(|r| r.name == "Turn 1").unwrap();
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["loaded_skills"],
+        json!([{"name": "review"}])
     );
     let tool = rows.values().find(|r| r.name == "skill: review").unwrap();
-    assert_eq!(tool.name, "skill: review");
-    assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
+    assert_eq!(
+        metadata_without(tool, &[]),
+        json!({
+            "tool_name": "read",
+            "tool_call_id": "call-1",
+            "tool_kind": "skill",
+            "skill_name": "review",
+            "skill_path": "skills/review/SKILL.md",
+            "skill_load_trigger": "explicit",
+            "tool_approval": "approved",
+        })
+    );
     let failed_tool = rows.values().find(|r| r.name == "write").unwrap();
     assert_eq!(failed_tool.error.as_deref(), Some("permission denied"));
     assert!(rows.values().any(|r| r.name == "Compaction"));
@@ -743,7 +803,12 @@ fn pi_nests_tool_calls_made_by_other_tools() {
     let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
     let codemode = tool("cm");
     assert_eq!(codemode.parent_span_ids, vec![turn.span_id.clone()]);
-    assert!(codemode.metadata.as_ref().unwrap()["parent_tool_call_id"].is_null());
+    assert!(codemode
+        .metadata
+        .as_ref()
+        .unwrap()
+        .get("parent_tool_call_id")
+        .is_none());
 
     let bash = tool("cm/1");
     assert_eq!(bash.parent_span_ids, vec![codemode.span_id.clone()]);
@@ -801,7 +866,54 @@ fn pi_llm_spans_record_the_physical_dispatch_of_a_virtual_model() {
     assert_eq!(routed["provider_thinking_level"], "max");
 
     let direct = llm(5);
-    assert!(direct["selected_model"].is_null());
+    assert!(direct.get("selected_model").is_none());
+    assert!(direct.get("provider_thinking_level").is_none());
     // Pi releases before 1.0 do not record a dispatched level.
     assert_eq!(direct["thinking_level"], "low");
+}
+
+#[test]
+fn pi_llm_metadata_selects_request_configuration_across_provider_payloads() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let payloads = [
+        json!({"model":"claude","system":"secret","max_tokens":1024,"stop_sequences":["END"],"tools":[]}),
+        json!({"model":"gemini","contents":[],"config":{"temperature":0.5,"maxOutputTokens":2048,"systemInstruction":"secret"}}),
+        json!({"modelId":"nova","inferenceConfig":{"maxTokens":512,"topP":0.9},"system":[{"text":"secret"}]}),
+    ];
+    let mut ops = translator
+        .handle(
+            &event("before_agent_start", 1, json!({"prompt":"go"})),
+            &ctx,
+        )
+        .unwrap();
+    for (index, payload) in payloads.iter().enumerate() {
+        let ts = 10 * (index as i64 + 1);
+        for envelope in [
+            event("context", ts, json!({"messages":[]})),
+            event("before_provider_request", ts, json!({"payload":payload})),
+            event(
+                "message_end",
+                ts + 1,
+                json!({"message":{"role":"assistant","provider":"p","model":"m","content":[],"usage":{}}}),
+            ),
+        ] {
+            ops.extend(translator.handle(&envelope, &ctx).unwrap());
+        }
+    }
+    let rows = reduce(ops);
+    let config = |start: i64| {
+        let row = rows
+            .values()
+            .find(|row| row.span_type == SpanType::Llm && row.start_ms == Some(start))
+            .unwrap();
+        metadata_without(row, &["model", "provider"])
+    };
+    assert_eq!(config(10), json!({"max_tokens":1024,"stop":["END"]}));
+    assert_eq!(config(20), json!({"temperature":0.5,"max_tokens":2048}));
+    assert_eq!(config(30), json!({"max_tokens":512,"top_p":0.9}));
 }

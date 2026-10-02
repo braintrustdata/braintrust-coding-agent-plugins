@@ -8,7 +8,7 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
-use super::tool::{add_tool_approval, nonempty_error_text, ToolApproval};
+use super::tool::{add_tool_approval, explicit_skill_metadata, nonempty_error_text, ToolApproval};
 use super::{
     local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
@@ -2359,15 +2359,6 @@ fn skill_listing_contains(path: &str, name: &str) -> bool {
                         .any(|candidate| candidate.as_str() == Some(name))
                 })
         })
-}
-
-fn explicit_skill_metadata(names: &[String]) -> Option<Value> {
-    (!names.is_empty()).then(|| {
-        json!({
-            "loaded_skill_names": names,
-            "loaded_skills": names.iter().map(|name| json!({ "name": name })).collect::<Vec<_>>()
-        })
-    })
 }
 
 fn hostname() -> String {

@@ -461,11 +461,10 @@ fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_jso
             *previous = messages;
         }
         "before_provider_request" => {
-            if let Some(payload) = native
-                .get_mut("payload")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                payload.remove("messages");
+            // The translator records only the allowlisted request
+            // configuration, never the prompt, messages, or tool schemas.
+            if let Some(payload) = native.get_mut("payload") {
+                *payload = serde_json::Value::Object(crate::translate::pi_request_config(payload));
             }
         }
         "agent_end" => {
@@ -705,6 +704,52 @@ mod tests {
                 .payload
                 .pointer("/event/assistantMessageEvent/type"),
             Some(&serde_json::json!("text_delta"))
+        );
+    }
+
+    #[tokio::test]
+    async fn pi_provider_requests_persist_only_request_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pi.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let event = Envelope {
+            source: "pi".into(),
+            source_version: None,
+            plugin_version: None,
+            session_id: "pi-session".into(),
+            event: "before_provider_request".into(),
+            ts_ms: 1,
+            managed_run_id: None,
+            capture: None,
+            payload: serde_json::json!({
+                "event": {
+                    "type": "before_provider_request",
+                    "payload": {
+                        "system": "system-prompt-marker",
+                        "tools": [{"name": "tool-schema-marker"}],
+                        "max_tokens": 1024,
+                    },
+                }
+            }),
+            route: None,
+            config: None,
+        };
+        writer.append(&event).await.unwrap();
+        drop(writer);
+
+        let stored = tokio::fs::read(&path).await.unwrap();
+        let stored_text = String::from_utf8_lossy(&stored);
+        assert!(!stored_text.contains("system-prompt-marker"));
+        assert!(!stored_text.contains("tool-schema-marker"));
+
+        let mut reader = JournalReader::open(&path, stored.len() as u64)
+            .await
+            .unwrap()
+            .unwrap();
+        let replayed = reader.next_entry().await.unwrap().unwrap();
+        assert_eq!(
+            replayed.payload.pointer("/event/payload"),
+            Some(&serde_json::json!({"max_tokens": 1024}))
         );
     }
 

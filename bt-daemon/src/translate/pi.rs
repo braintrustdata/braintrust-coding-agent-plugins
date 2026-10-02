@@ -2,7 +2,9 @@
 //! state machine owns all span construction and recovery.
 
 use super::git::GitMetadataCache;
-use super::tool::{error_text, with_tool_approval, ToolApproval};
+use super::tool::{
+    error_text, explicit_skill_metadata, with_tool_approval, without_nulls, ToolApproval,
+};
 use super::{
     local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
@@ -79,13 +81,6 @@ struct ContextEvent {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProviderRequest {
-    #[serde(flatten)]
-    fields: Map<String, Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct MessageUpdate {
     #[serde(default)]
     assistant_message_event: Option<MessageDelta>,
@@ -153,18 +148,27 @@ struct Usage {
     input: i64,
     #[serde(default)]
     output: i64,
+    // Pi reports `reasoning` as a subset of `output`, and only for providers
+    // that expose the breakdown.
     #[serde(default)]
-    reasoning: i64,
+    reasoning: Option<i64>,
     #[serde(default)]
     cache_read: i64,
+    // `cacheWrite1h` is the subset of `cacheWrite` written with 1h retention.
     #[serde(default)]
     cache_write: i64,
     #[serde(default)]
-    cache_write1h: i64,
+    cache_write1h: Option<i64>,
     #[serde(default)]
     total_tokens: Option<i64>,
     #[serde(default)]
-    cost: Option<Value>,
+    cost: Option<Cost>,
+}
+
+#[derive(Default, Deserialize)]
+struct Cost {
+    #[serde(default)]
+    total: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -315,7 +319,7 @@ struct PendingLlm {
     start_ms: i64,
     input: Value,
     first_token_ms: Option<i64>,
-    provider: Option<Value>,
+    request_config: Map<String, Value>,
     selected_model: Option<SelectedModel>,
 }
 #[derive(Clone)]
@@ -335,7 +339,8 @@ struct PiTranslator {
     // are initialization input only. Later reopen/replay events must retain
     // the daemon's accumulated counters and deterministic turn sequence.
     legacy_root_adopted: bool,
-    turn: Option<(String, Value)>,
+    /// The open turn's span id and the skills its prompt explicitly requested.
+    turn: Option<(String, Vec<String>)>,
     turn_seq: u32,
     llm_seq: u32,
     total_tools: u32,
@@ -367,8 +372,9 @@ impl AgentTranslator for PiTranslator {
                 }
             }
             "before_provider_request" => {
-                if let Some(event) = decode(event) {
-                    self.provider_request(event);
+                if let Some(call) = self.pending_llms.last_mut() {
+                    call.request_config =
+                        request_config(event.get("payload").unwrap_or(&Value::Null));
                 }
             }
             "message_update" => {
@@ -486,7 +492,8 @@ impl PiTranslator {
                 start_ms: Some(pending.start_ms),
                 end_ms: Some(ts),
                 input: Some(pending.input),
-                metadata: pending.provider,
+                metadata: (!pending.request_config.is_empty())
+                    .then_some(Value::Object(pending.request_config)),
                 error: Some(error.into()),
                 ..Default::default()
             }));
@@ -502,13 +509,11 @@ impl PiTranslator {
                 start_ms: Some(tool.start_ms),
                 end_ms: Some(ts),
                 input: Some(tool.args),
-                metadata: Some(with_tool_approval(
-                    json!({
-                        "tool_name": tool.name,
-                        "tool_call_id": call,
-                        "parent_tool_call_id": tool.parent_call,
-                    }),
-                    Some(ToolApproval::Approved),
+                metadata: Some(tool_metadata(
+                    &tool.name,
+                    &call,
+                    tool.parent_call.as_deref(),
+                    json!({}),
                 )),
                 error: Some(error.into()),
                 ..Default::default()
@@ -605,7 +610,14 @@ impl PiTranslator {
         let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_seq));
         let input = event.prompt.unwrap_or(Value::Null);
         let skills = input.as_str().map(explicit_skills).unwrap_or_default();
-        self.turn = Some((id.clone(), input.clone()));
+        let mut metadata = without_nulls(json!({
+            "turn_number": self.turn_seq,
+            "thinking_level": self.thinking_level,
+        }));
+        if let Some(Value::Object(fields)) = explicit_skill_metadata(&skills) {
+            metadata.as_object_mut().unwrap().extend(fields);
+        }
+        self.turn = Some((id.clone(), skills));
         ops.push(SpanOp::Insert(SpanRow {
             span_id: id,
             root_span_id: self.effective_root_span_id.clone(),
@@ -614,11 +626,7 @@ impl PiTranslator {
             span_type: SpanType::Task,
             start_ms: Some(ts),
             input: Some(input),
-            metadata: Some(json!({
-                "turn_number": self.turn_seq,
-                "loaded_skill_names": skills,
-                "thinking_level": self.thinking_level,
-            })),
+            metadata: Some(metadata),
             ..Default::default()
         }));
         ops
@@ -651,20 +659,9 @@ impl PiTranslator {
             start_ms: ts,
             input,
             first_token_ms: None,
-            provider: None,
+            request_config: Map::new(),
             selected_model,
         });
-    }
-    fn provider_request(&mut self, event: ProviderRequest) {
-        if let Some(call) = self.pending_llms.last_mut() {
-            let mut provider = event.fields;
-            if let Some(payload) = provider.get_mut("payload").and_then(Value::as_object_mut) {
-                // The authoritative provider-visible messages are already the
-                // LLM span input captured by the preceding context event.
-                payload.remove("messages");
-            }
-            call.provider = Some(Value::Object(provider))
-        }
     }
     fn streaming_update(&mut self, event: MessageUpdate, ts: i64) {
         if let Some(call) = self.pending_llms.last_mut() {
@@ -697,23 +694,17 @@ impl PiTranslator {
                 start_ms: ts,
                 input: json!([]),
                 first_token_ms: None,
-                provider: None,
+                request_config: Map::new(),
                 selected_model: None,
             }
         } else {
             self.pending_llms.remove(0)
         };
         let model = response_model(&message);
-        let prompt = message.usage.input
-            + message.usage.cache_read
-            + message.usage.cache_write
-            + message.usage.cache_write1h;
-        let completion = message.usage.output;
-        let reasoning = message.usage.reasoning;
-        let total = message
-            .usage
-            .total_tokens
-            .unwrap_or(prompt + completion + reasoning);
+        let usage = &message.usage;
+        let prompt = usage.input + usage.cache_read + usage.cache_write;
+        let completion = usage.output;
+        let total = usage.total_tokens.unwrap_or(prompt + completion);
         let output = normalize_assistant(&message);
         let error = message
             .error_message
@@ -730,6 +721,26 @@ impl PiTranslator {
                     || message.model.as_deref() != Some(&selected.id)
             })
             .map(|selected| format!("{}/{}", selected.provider, selected.id));
+        let mut metadata = pending.request_config;
+        if let Value::Object(fields) = without_nulls(json!({
+            "model": model,
+            "provider": message.provider,
+            "api": message.api,
+            "stop_reason": message.stop_reason,
+            "thinking_level": message.thinking_level.as_ref().or(self.thinking_level.as_ref()),
+            "provider_thinking_level": message.provider_thinking_level,
+            "selected_model": selected_model,
+            "response_id": message.response_id,
+        })) {
+            metadata.extend(fields);
+        }
+        // Pi prices unknown models at zero, which would override the backend's
+        // registry pricing, so only a positive Pi estimate is recorded.
+        let cost = usage
+            .cost
+            .as_ref()
+            .and_then(|cost| cost.total)
+            .filter(|total| total.is_finite() && *total > 0.0);
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(
                 &self.session_id,
@@ -743,28 +754,21 @@ impl PiTranslator {
             end_ms: Some(ts),
             input: Some(pending.input),
             output: Some(json!([output])),
-            metadata: Some(json!({
-                "model": model,
-                "provider": message.provider,
-                "api": message.api,
-                "stop_reason": message.stop_reason,
-                "thinking_level": message.thinking_level.as_ref().or(self.thinking_level.as_ref()),
-                "provider_thinking_level": message.provider_thinking_level,
-                "selected_model": selected_model,
-                "provider_request": pending.provider,
-                "response_id": message.response_id,
-            })),
-            metrics: Some(json!({
+            metadata: Some(Value::Object(metadata)),
+            metrics: Some(without_nulls(json!({
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
-                "reasoning_tokens": reasoning,
+                "completion_reasoning_tokens": usage.reasoning,
                 "tokens": total,
-                "prompt_cached_tokens": message.usage.cache_read,
-                "prompt_cache_creation_tokens": message.usage.cache_write
-                    + message.usage.cache_write1h,
+                "prompt_cached_tokens": usage.cache_read,
+                "prompt_cache_creation_tokens": usage.cache_write,
+                "prompt_cache_creation_5m_tokens": usage
+                    .cache_write1h
+                    .map(|long| (usage.cache_write - long).max(0)),
+                "prompt_cache_creation_1h_tokens": usage.cache_write1h,
                 "time_to_first_token": ttft,
-                "cost": message.usage.cost,
-            })),
+                "estimated_cost": cost,
+            }))),
             error,
             ..Default::default()
         })]
@@ -805,19 +809,17 @@ impl PiTranslator {
             span_type: SpanType::Tool,
             start_ms: Some(ts),
             input: Some(args),
-            metadata: Some(with_tool_approval(
-                json!({
-                    "tool_name": name,
-                    "tool_call_id": id,
-                    "parent_tool_call_id": event.parent_tool_call_id,
-                }),
-                Some(ToolApproval::Approved),
+            metadata: Some(tool_metadata(
+                &name,
+                &id,
+                event.parent_tool_call_id.as_deref(),
+                json!({}),
             )),
             ..Default::default()
         })]
     }
     fn tool_end(&mut self, event: ToolExecutionEnd, ts: i64) -> Vec<SpanOp> {
-        let Some((turn, _)) = &self.turn else {
+        let Some((turn, requested_skills)) = &self.turn else {
             return vec![];
         };
         let call = event.tool_call_id.unwrap_or_default();
@@ -833,8 +835,11 @@ impl PiTranslator {
         let skill = skill_from_read(&tracked.name, &tracked.args);
         let name = skill
             .as_ref()
-            .map(|s| format!("skill: {s}"))
+            .map(|skill| format!("skill: {}", skill.name))
             .unwrap_or_else(|| tracked.name.clone());
+        let explicit = skill
+            .as_ref()
+            .is_some_and(|skill| requested_skills.contains(&skill.name));
         let row = SpanRow {
             span_id: self.tool_span_id(&call),
             root_span_id: self.effective_root_span_id.clone(),
@@ -845,15 +850,16 @@ impl PiTranslator {
             end_ms: Some(ts),
             input: pending.is_none().then_some(tracked.args),
             output: event.result.clone(),
-            metadata: Some(with_tool_approval(
+            metadata: Some(tool_metadata(
+                &tracked.name,
+                &call,
+                tracked.parent_call.as_deref(),
                 json!({
-                    "tool_name": if skill.is_some() { "skill" } else { &tracked.name },
-                    "original_tool_name": tracked.name,
-                    "tool_call_id": call,
-                    "parent_tool_call_id": tracked.parent_call,
-                    "skill_name": skill,
+                    "tool_kind": skill.as_ref().map(|_| "skill"),
+                    "skill_name": skill.as_ref().map(|skill| &skill.name),
+                    "skill_path": skill.as_ref().map(|skill| &skill.path),
+                    "skill_load_trigger": explicit.then_some("explicit"),
                 }),
-                Some(ToolApproval::Approved),
             )),
             error: failed.then(|| format_error(&tracked.name, event.result.as_ref())),
             ..Default::default()
@@ -1036,6 +1042,62 @@ fn response_model(message: &AssistantMessage) -> Option<String> {
     .next()
     .cloned()
 }
+/// The request configuration fields the instrumentation spec allows on LLM
+/// spans, read individually from the provider-native payload. Pi's API
+/// adapters name them per provider and nest them for Google and Bedrock.
+pub(crate) fn request_config(payload: &Value) -> Map<String, Value> {
+    const FIELDS: &[(&str, &[&str])] = &[
+        ("temperature", &["temperature"]),
+        ("top_p", &["top_p", "topP"]),
+        (
+            "max_tokens",
+            &[
+                "max_tokens",
+                "max_completion_tokens",
+                "max_output_tokens",
+                "maxOutputTokens",
+                "maxTokens",
+            ],
+        ),
+        (
+            "frequency_penalty",
+            &["frequency_penalty", "frequencyPenalty"],
+        ),
+        ("presence_penalty", &["presence_penalty", "presencePenalty"]),
+        ("stop", &["stop", "stop_sequences", "stopSequences"]),
+        ("response_format", &["response_format"]),
+    ];
+    let scopes = [
+        Some(payload),
+        payload.get("config"),
+        payload.get("generationConfig"),
+        payload.get("inferenceConfig"),
+    ];
+    let mut config = Map::new();
+    for (field, aliases) in FIELDS {
+        let value = scopes.iter().flatten().find_map(|scope| {
+            aliases
+                .iter()
+                .find_map(|alias| scope.get(alias).filter(|value| !value.is_null()))
+        });
+        if let Some(value) = value {
+            config.insert((*field).into(), value.clone());
+        }
+    }
+    config
+}
+/// Pi runs every tool it reports, so tool spans are always approved.
+fn tool_metadata(name: &str, call: &str, parent_call: Option<&str>, extra: Value) -> Value {
+    let mut metadata = json!({
+        "tool_name": name,
+        "tool_call_id": call,
+        "parent_tool_call_id": parent_call,
+    });
+    if let (Some(metadata), Value::Object(extra)) = (metadata.as_object_mut(), extra) {
+        metadata.extend(extra);
+    }
+    with_tool_approval(without_nulls(metadata), Some(ToolApproval::Approved))
+}
 fn normalize_assistant(message: &AssistantMessage) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
@@ -1075,7 +1137,11 @@ fn normalize_assistant(message: &AssistantMessage) -> Value {
     }
     out
 }
-fn skill_from_read(tool: &str, args: &Value) -> Option<String> {
+struct SkillLoad {
+    name: String,
+    path: String,
+}
+fn skill_from_read(tool: &str, args: &Value) -> Option<SkillLoad> {
     if tool != "read" {
         return None;
     }
@@ -1087,7 +1153,11 @@ fn skill_from_read(tool: &str, args: &Value) -> Option<String> {
     if !path.to_ascii_lowercase().ends_with("/skill.md") {
         return None;
     }
-    path.rsplit('/').nth(1).map(str::to_owned)
+    let name = path.rsplit('/').nth(1)?.to_owned();
+    Some(SkillLoad {
+        name,
+        path: path.to_owned(),
+    })
 }
 fn explicit_skills(input: &str) -> Vec<String> {
     input

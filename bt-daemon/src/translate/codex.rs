@@ -19,7 +19,9 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
-use super::tool::{error_text, nonempty_error_text, tool_approval_metadata, ToolApproval};
+use super::tool::{
+    error_text, explicit_skill_metadata, nonempty_error_text, tool_approval_metadata, ToolApproval,
+};
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
@@ -1823,15 +1825,6 @@ fn explicit_skill_names(text: &str) -> Vec<String> {
         }
     }
     names
-}
-
-fn explicit_skill_metadata(names: &[String]) -> Option<Value> {
-    (!names.is_empty()).then(|| {
-        json!({
-            "loaded_skill_names": names,
-            "loaded_skills": names.iter().map(|name| json!({ "name": name })).collect::<Vec<_>>(),
-        })
-    })
 }
 
 fn compaction_output(replacement: Option<&Vec<Value>>) -> Value {

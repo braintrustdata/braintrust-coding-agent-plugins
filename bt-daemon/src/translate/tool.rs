@@ -34,6 +34,24 @@ pub fn tool_approval_metadata(approval: Option<ToolApproval>) -> Value {
     Value::Object(metadata)
 }
 
+/// Explicit `/skill`-style requests on the message or turn that made them.
+pub fn explicit_skill_metadata(names: &[String]) -> Option<Value> {
+    (!names.is_empty()).then(|| {
+        json!({
+            "loaded_skill_names": names,
+            "loaded_skills": names.iter().map(|name| json!({ "name": name })).collect::<Vec<_>>(),
+        })
+    })
+}
+
+/// Omits fields the source did not report instead of recording them as null.
+pub fn without_nulls(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    value
+}
+
 pub fn with_tool_approval(mut metadata: Value, approval: Option<ToolApproval>) -> Value {
     if let Some(object) = metadata.as_object_mut() {
         add_tool_approval(object, approval);

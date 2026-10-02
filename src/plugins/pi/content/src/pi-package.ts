@@ -19,17 +19,6 @@ export interface PiPackageMetadata {
   configDir: string;
 }
 
-export interface PiPackageLookup {
-  /** Pi's `PI_PACKAGE_DIR` override, used by Nix and Guix packages. */
-  packageDir?: string;
-  /** The script Node is running; for the pi CLI, a file inside Pi's package. */
-  entryScript?: string;
-  /** A Bun-compiled Pi binary ships its package.json beside the executable. */
-  executable?: string;
-  /** Resolve Pi's package entry from this extension's location. */
-  resolvePackage?: () => string | undefined;
-}
-
 /**
  * Read Pi's package metadata without importing its root runtime barrel. New Pi
  * releases may add optional entrypoints to that barrel whose dependencies are
@@ -41,17 +30,12 @@ export interface PiPackageLookup {
  * Module resolution covers SDK hosts, where the entry script belongs to the
  * embedding application.
  */
-export function loadPiPackageMetadata({
-  packageDir = process.env.PI_PACKAGE_DIR,
-  entryScript = process.argv[1],
-  executable = process.execPath,
-  resolvePackage = resolvePiPackage,
-}: PiPackageLookup = {}): PiPackageMetadata {
-  const manifest =
-    findPiManifest(packageDir && join(packageDir, "package.json")) ??
-    findPiManifest(entryScript && realPath(entryScript)) ??
-    findPiManifest(executable) ??
-    findPiManifest(tryResolve(resolvePackage));
+export function loadPiPackageMetadata(candidates: (string | undefined)[]): PiPackageMetadata {
+  let manifest: PiPackageManifest | undefined;
+  for (const candidate of candidates) {
+    manifest = findPiManifest(candidate);
+    if (manifest) break;
+  }
   return {
     version: typeof manifest?.version === "string" ? manifest.version : undefined,
     configDir:
@@ -61,7 +45,7 @@ export function loadPiPackageMetadata({
 
 function findPiManifest(entry: string | undefined): PiPackageManifest | undefined {
   if (!entry) return undefined;
-  let directory = dirname(entry);
+  let directory = dirname(realPath(entry));
   while (true) {
     const manifest = readManifest(join(directory, "package.json"));
     if (
@@ -97,13 +81,15 @@ function tryResolve(resolve: () => string | undefined): string | undefined {
   try {
     return resolve();
   } catch {
-    // Pi supplies the extension API at runtime. Metadata discovery is useful
-    // for diagnostics but must not prevent the extension from loading.
     return undefined;
   }
 }
 
-function resolvePiPackage(): string | undefined {
+/**
+ * Resolve Pi's package entry from this extension's location. Pi supplies the
+ * extension API at runtime, so a failed lookup must not prevent loading.
+ */
+export function resolvePiPackage(): string | undefined {
   // Pi's package exports only an `import` condition, which CommonJS
   // resolution rejects; keep it as a fallback for older or forked releases.
   return (
@@ -116,5 +102,14 @@ let runningPi: PiPackageMetadata | undefined;
 
 /** The running Pi's metadata, read once per process. */
 export function runningPiPackage(): PiPackageMetadata {
-  return (runningPi ??= loadPiPackageMetadata());
+  const packageDir = process.env.PI_PACKAGE_DIR;
+  return (runningPi ??= loadPiPackageMetadata([
+    // Nix and Guix packages set PI_PACKAGE_DIR.
+    packageDir && join(packageDir, "package.json"),
+    // For the pi CLI, the script Node is running is a file inside Pi's package.
+    process.argv[1],
+    // A Bun-compiled Pi binary ships its package.json beside the executable.
+    process.execPath,
+    resolvePiPackage(),
+  ]));
 }

@@ -15,6 +15,7 @@ mod git;
 mod grok;
 mod opencode;
 mod pi;
+pub(crate) use pi::request_config as pi_request_config;
 mod recent;
 mod tool;
 
