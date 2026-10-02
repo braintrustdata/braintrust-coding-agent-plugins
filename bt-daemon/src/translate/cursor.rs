@@ -114,6 +114,7 @@ struct Turn {
 struct ModelStep {
     row: SpanRow,
     content: Vec<Value>,
+    text: String,
     bytes: usize,
     truncated: bool,
 }
@@ -124,17 +125,12 @@ impl ModelStep {
             .and_then(Value::as_str)
             .filter(|_| value.get("type").and_then(Value::as_str) == Some("text"))
         {
-            let observed = self
-                .content
-                .iter()
-                .filter(|v| v.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|v| v.get("text").and_then(Value::as_str))
-                .collect::<String>();
             // afterAgentResponse repeats the concatenation of transcript text
             // fragments. Retain one authoritative copy of that exact content.
-            if !observed.is_empty() && observed == text {
+            if !self.text.is_empty() && self.text == text {
                 self.content
                     .retain(|v| v.get("type").and_then(Value::as_str) != Some("text"));
+                self.text.clear();
                 self.bytes = self.content.iter().map(|v| v.to_string().len()).sum();
             }
         }
@@ -147,6 +143,11 @@ impl ModelStep {
             return;
         }
         self.bytes += size;
+        if value.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(text) = value.get("text").and_then(Value::as_str) {
+                self.text.push_str(text);
+            }
+        }
         self.content.push(value);
     }
 }
@@ -165,6 +166,44 @@ struct TranscriptCursor {
     oversize: bool,
     assistant_records: u64,
 }
+impl TranscriptCursor {
+    fn read_batch(&mut self, path: &str, through: u64) -> anyhow::Result<(Vec<Value>, bool, bool)> {
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return Ok((Vec::new(), false, true));
+        };
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut bytes = Vec::new();
+        file.take((through - self.offset).min(BYTE_BUDGET))
+            .read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Ok((Vec::new(), false, true));
+        }
+        self.offset += bytes.len() as u64;
+        let mut records = Vec::new();
+        let mut truncated = false;
+        for byte in bytes {
+            if byte == b'\n' {
+                if !self.oversize {
+                    match serde_json::from_slice::<Value>(&self.partial) {
+                        Ok(record) => records.push(record),
+                        Err(_) => truncated = true,
+                    }
+                }
+                self.partial.clear();
+                self.oversize = false;
+            } else if !self.oversize {
+                if self.partial.len() >= MAX_RECORD_BYTES {
+                    self.partial.clear();
+                    self.oversize = true;
+                    truncated = true;
+                } else {
+                    self.partial.push(byte);
+                }
+            }
+        }
+        Ok((records, truncated, self.offset >= through))
+    }
+}
 
 struct CursorTranslator {
     namespace: String,
@@ -182,6 +221,7 @@ struct CursorTranslator {
     model_step: Option<ModelStep>,
     history: History,
     tools: BTreeMap<String, Tool>,
+    open_tool_order: VecDeque<String>,
     completed: RecentMap<String, Tool>,
     seen: RecentSet<String>,
     prompt_generations: RecentMap<String, Turn>,
@@ -212,6 +252,7 @@ impl CursorTranslator {
             model_step: None,
             history: History::default(),
             tools: BTreeMap::new(),
+            open_tool_order: VecDeque::new(),
             completed: RecentMap::default(),
             seen: RecentSet::default(),
             prompt_generations: RecentMap::default(),
@@ -420,6 +461,7 @@ impl CursorTranslator {
         self.model_step = Some(ModelStep {
             row,
             content: Vec::new(),
+            text: String::new(),
             bytes: 0,
             truncated: false,
         });
@@ -538,7 +580,7 @@ impl CursorTranslator {
             .map(|(id, _)| id.clone())
             .collect();
         for id in stranded {
-            if let Some(tool) = self.tools.remove(&id) {
+            if let Some(tool) = self.remove_open_tool(&id) {
                 self.incomplete_tool(tool, ts, ops);
             }
         }
@@ -566,7 +608,7 @@ impl CursorTranslator {
         }
         if let Some(tool) = late_incomplete {
             self.completed.remove(&key);
-            self.tools.insert(key.clone(), tool);
+            self.insert_open_tool(key.clone(), tool, e.ts_ms, ops);
         }
 
         if !self.tools.contains_key(&key) {
@@ -607,19 +649,8 @@ impl CursorTranslator {
                 json!({"tool_use_id":call_id,"generation_id":e.payload.get("generation_id"),"turn_attribution":"active_prompt_boundary",
                 "start_time_estimated":terminal,"result_completeness":"unknown","parent_tool_call_id":e.payload.get("parent_tool_call_id")}),
             );
-            if self.tools.len() >= MAX_OPEN_TOOLS {
-                if let Some(old) = self
-                    .tools
-                    .keys()
-                    .next()
-                    .cloned()
-                    .and_then(|k| self.tools.remove(&k))
-                {
-                    self.incomplete_tool(old, e.ts_ms, ops);
-                }
-            }
             ops.push(SpanOp::Insert(row.clone()));
-            self.tools.insert(
+            self.insert_open_tool(
                 key.clone(),
                 Tool {
                     row,
@@ -627,6 +658,8 @@ impl CursorTranslator {
                     call_id: call_id.into(),
                     ended: false,
                 },
+                e.ts_ms,
+                ops,
             );
         }
         if !terminal {
@@ -662,7 +695,7 @@ impl CursorTranslator {
                 self.close_model(tool.row.start_ms.unwrap_or(e.ts_ms), ops);
             }
         }
-        let mut tool = self.tools.remove(&key).unwrap();
+        let mut tool = self.remove_open_tool(&key).unwrap();
         tool.ended = true;
         tool.row.end_ms = Some(e.ts_ms.max(tool.row.start_ms.unwrap_or(e.ts_ms)));
         if tool
@@ -738,6 +771,25 @@ impl CursorTranslator {
         ops.push(SpanOp::Merge(tool.row.clone()));
         self.completed.insert(tool.call_id.clone(), tool);
     }
+    fn insert_open_tool(&mut self, key: String, tool: Tool, ts: i64, ops: &mut Vec<SpanOp>) {
+        if self.tools.contains_key(&key) {
+            self.open_tool_order.retain(|candidate| candidate != &key);
+        }
+        while self.tools.len() >= MAX_OPEN_TOOLS {
+            let Some(oldest) = self.open_tool_order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.tools.remove(&oldest) {
+                self.incomplete_tool(old, ts, ops);
+            }
+        }
+        self.open_tool_order.push_back(key.clone());
+        self.tools.insert(key, tool);
+    }
+    fn remove_open_tool(&mut self, key: &str) -> Option<Tool> {
+        self.open_tool_order.retain(|candidate| candidate != key);
+        self.tools.remove(key)
+    }
     fn specialized(&mut self, e: &Envelope, ops: &mut Vec<SpanOp>) {
         if !matches!(
             e.event.as_str(),
@@ -751,6 +803,22 @@ impl CursorTranslator {
             .iter()
             .chain(self.completed.iter())
             .filter_map(|(id, tool)| {
+                let compatible = match e.event.as_str() {
+                    "afterShellExecution" => tool.row.name == "Shell",
+                    "afterMCPExecution" => {
+                        tool.row.name.strip_prefix("MCP:").unwrap_or(&tool.row.name)
+                            == e.payload
+                                .get("tool_name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                    }
+                    "beforeReadFile" => tool.row.name == "Read",
+                    "afterFileEdit" => tool.row.name == "Write",
+                    _ => false,
+                };
+                if !compatible {
+                    return None;
+                }
                 if let Some(native) = explicit_id {
                     return (native == id).then(|| id.clone());
                 }
@@ -760,8 +828,7 @@ impl CursorTranslator {
                 let input = tool.row.input.as_ref()?;
                 let matches = match e.event.as_str() {
                     "afterShellExecution" => {
-                        tool.row.name == "Shell"
-                            && input.get("command") == e.payload.get("command")
+                        input.get("command") == e.payload.get("command")
                             && e.payload.get("command").is_some()
                     }
                     "afterMCPExecution" => {
@@ -775,16 +842,9 @@ impl CursorTranslator {
                                     e.payload.get("tool_input").cloned().unwrap_or(Value::Null),
                                 )
                     }
-                    "beforeReadFile" => {
-                        tool.row.name == "Read"
-                            && input.get("file_path").or_else(|| input.get("path"))
-                                == e.payload.get("file_path")
-                            && e.payload.get("file_path").is_some()
-                    }
-                    "afterFileEdit" => {
-                        tool.row.name == "Write"
-                            && input.get("file_path").or_else(|| input.get("path"))
-                                == e.payload.get("file_path")
+                    "beforeReadFile" | "afterFileEdit" => {
+                        input.get("file_path").or_else(|| input.get("path"))
+                            == e.payload.get("file_path")
                             && e.payload.get("file_path").is_some()
                     }
                     _ => false,
@@ -877,59 +937,32 @@ impl CursorTranslator {
         if self.transcript.offset >= through {
             return Ok(true);
         }
-        let Ok(mut file) = std::fs::File::open(path) else {
-            return Ok(true);
-        };
-        file.seek(SeekFrom::Start(self.transcript.offset))?;
-        let mut bytes = Vec::new();
-        file.take((through - self.transcript.offset).min(BYTE_BUDGET))
-            .read_to_end(&mut bytes)?;
-        if bytes.is_empty() {
-            return Ok(true);
-        }
-        self.transcript.offset += bytes.len() as u64;
-        for byte in bytes {
-            if byte == b'\n' {
-                if !self.transcript.oversize {
-                    if let Ok(record) = serde_json::from_slice::<Value>(&self.transcript.partial) {
-                        let role = record.get("role").and_then(Value::as_str);
-                        if role == Some("user") {
-                            self.transcript.assistant_records = 0;
-                            // User ownership must be resolved again after a rewrite:
-                            // a truncated view may put a later native turn at line 1.
-                            self.transcript_record(&record, e.ts_ms, ops);
-                        } else {
-                            if role == Some("assistant") {
-                                self.transcript.assistant_records += 1;
-                            }
-                            let key = format!(
-                                "transcript:{:?}:{}:{}:{}",
-                                role,
-                                self.transcript_owner.as_deref().unwrap_or("unattributed"),
-                                self.transcript.assistant_records,
-                                ids::span_id(&self.namespace, &record.to_string())
-                            );
-                            if self.seen.insert(key) {
-                                self.transcript_record(&record, e.ts_ms, ops);
-                            }
-                        }
-                    } else {
-                        self.history.truncated = true;
-                    }
+        let (records, truncated, complete) = self.transcript.read_batch(path, through)?;
+        self.history.truncated |= truncated;
+        for record in records {
+            let role = record.get("role").and_then(Value::as_str);
+            if role == Some("user") {
+                self.transcript.assistant_records = 0;
+                // User ownership must be resolved again after a rewrite:
+                // a truncated view may put a later native turn at line 1.
+                self.transcript_record(&record, e.ts_ms, ops);
+            } else {
+                if role == Some("assistant") {
+                    self.transcript.assistant_records += 1;
                 }
-                self.transcript.partial.clear();
-                self.transcript.oversize = false;
-            } else if !self.transcript.oversize {
-                if self.transcript.partial.len() >= MAX_RECORD_BYTES {
-                    self.transcript.partial.clear();
-                    self.transcript.oversize = true;
-                    self.history.truncated = true;
-                } else {
-                    self.transcript.partial.push(byte);
+                let key = format!(
+                    "transcript:{:?}:{}:{}:{}",
+                    role,
+                    self.transcript_owner.as_deref().unwrap_or("unattributed"),
+                    self.transcript.assistant_records,
+                    ids::span_id(&self.namespace, &record.to_string())
+                );
+                if self.seen.insert(key) {
+                    self.transcript_record(&record, e.ts_ms, ops);
                 }
             }
         }
-        Ok(self.transcript.offset >= through)
+        Ok(complete)
     }
     fn transcript_record(&mut self, record: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
         let role = record.get("role").and_then(Value::as_str).unwrap_or("");
@@ -1442,6 +1475,7 @@ impl AgentTranslator for CursorTranslator {
         let mut ops = Vec::new();
         self.close_turn(self.last_ms, Some("capture_ended"), &mut ops);
         let tools = std::mem::take(&mut self.tools);
+        self.open_tool_order.clear();
         for (_, tool) in tools {
             self.incomplete_tool(tool, self.last_ms, &mut ops);
         }

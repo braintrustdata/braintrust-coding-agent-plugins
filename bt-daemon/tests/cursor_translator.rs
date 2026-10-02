@@ -840,6 +840,61 @@ fn synthetic_specialized_native_call_id_wins_over_ambiguous_arguments() {
     );
 }
 #[test]
+fn synthetic_specialized_event_cannot_enrich_an_incompatible_tool_type() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        100,
+        json!({"generation_id":"t","prompt":"read a file"}),
+    ));
+    h.handle(&event(
+        "preToolUse",
+        110,
+        json!({"tool_name":"Read","tool_use_id":"read-1","tool_input":{"file_path":"/tmp/a"}}),
+    ));
+    h.handle(&event(
+        "afterShellExecution",
+        120,
+        json!({"tool_use_id":"read-1","command":"pwd","output":"wrong tool result"}),
+    ));
+    h.finish();
+    let read = h
+        .inserted(SpanType::Tool)
+        .into_iter()
+        .find(|r| r.name == "Read")
+        .unwrap();
+    assert_eq!(h.rows()[&read.span_id].get("output"), None);
+}
+#[test]
+fn open_tool_limit_evicts_the_oldest_tool_not_the_smallest_id() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        100,
+        json!({"generation_id":"t","prompt":"many tools"}),
+    ));
+    for index in (0..=256).rev() {
+        let id = format!("tool-{index:03}");
+        h.handle(&event(
+            "preToolUse",
+            110 + (256 - index),
+            json!({"tool_name":"Shell","tool_use_id":id,"tool_input":{"command":id}}),
+        ));
+    }
+    let rows = h.rows();
+    let tools = h.inserted(SpanType::Tool);
+    let oldest = tools
+        .iter()
+        .find(|r| r.name == "Shell" && r.start_ms == Some(110))
+        .unwrap();
+    let newest = tools
+        .iter()
+        .find(|r| r.input == Some(json!({"command":"tool-000"})))
+        .unwrap();
+    assert_eq!(rows[&oldest.span_id]["metadata"]["status"], "incomplete");
+    assert_eq!(rows[&newest.span_id]["metadata"].get("status"), None);
+}
+#[test]
 fn synthetic_usage_without_verified_prompt_generation_stays_unavailable() {
     let mut h = Harness::new("test-session");
     h.handle(&event(
