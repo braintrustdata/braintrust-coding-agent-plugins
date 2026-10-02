@@ -3,7 +3,8 @@
 //! rebuild session state by replaying the journal through the translator.
 //!
 //! Format: one [`RedactedEnvelope`] JSON value per line in
-//! `<data_dir>/journal/<source>-<session>-<stable-id>.ndjson`.
+//! `<data_dir>/journal/<source>--<session>--<stable-id>.ndjson`, where an
+//! overlong sanitized session id keeps only its tail to fit one file name.
 //!
 //! Managed-run acceptance records live alongside the journals so a flush can
 //! still tell which delivery pipelines a managed child produced after the
@@ -19,7 +20,7 @@ pub fn journal_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("journal")
 }
 
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -32,7 +33,7 @@ fn sanitize(s: &str) -> String {
 }
 
 /// Longest single path component, in bytes, that common filesystems accept.
-const MAX_FILE_NAME_BYTES: usize = 255;
+pub(crate) const MAX_FILE_NAME_BYTES: usize = 255;
 
 pub fn journal_path(data_dir: &Path, session_id: &str) -> PathBuf {
     journal_dir(data_dir).join(format!("{}.ndjson", sanitize(session_id)))
