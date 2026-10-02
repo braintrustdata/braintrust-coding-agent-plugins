@@ -173,7 +173,6 @@ impl SinkFactory for BraintrustSinkFactory {
             default_api_url: self.default_api_url.clone(),
             default_app_url: self.default_app_url.clone(),
             version: plugin_version.unwrap_or(&self.version).to_string(),
-            daemon_version: self.version.clone(),
             source: source.to_string(),
             creds: None,
             urls: None,
@@ -207,7 +206,6 @@ struct BraintrustSink {
     default_api_url: Option<String>,
     default_app_url: Option<String>,
     version: String,
-    daemon_version: String,
     source: String,
     creds: Option<Creds>,
     /// Resolved `(api_url, app_url)` for this session, from its config.
@@ -308,7 +306,7 @@ impl BraintrustSink {
     fn update_open(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         self.ensure_handle(client, row)?;
         let handle = self.open.get(&row.span_id).expect("just inserted");
-        handle.log(build_log(row, &self.daemon_version, self.span_origin())?);
+        handle.log(build_log(row, self.span_origin())?);
         if let Some(end) = row.end_ms {
             handle.end_with_time(ms_to_secs(end));
             // SpanHandle retains the complete accumulated input/output. Once a
@@ -331,7 +329,7 @@ impl BraintrustSink {
                 creds.token.clone(),
                 creds.org_id.clone(),
                 &components,
-                build_log(row, &self.daemon_version, self.span_origin())?,
+                build_log(row, self.span_origin())?,
             )
             .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))
     }
@@ -629,7 +627,7 @@ fn ms_to_secs(ms: i64) -> f64 {
     ms as f64 / 1000.0
 }
 
-fn build_log(row: &SpanRow, daemon_version: &str, origin: SpanOrigin) -> anyhow::Result<SpanLog> {
+fn build_log(row: &SpanRow, origin: SpanOrigin) -> anyhow::Result<SpanLog> {
     // Repeat the plugin origin so stateless merges cannot use SDK defaults.
     let mut builder = SpanLog::builder().span_origin(origin);
 
@@ -653,12 +651,6 @@ fn build_log(row: &SpanRow, daemon_version: &str, origin: SpanOrigin) -> anyhow:
         .cloned()
         .unwrap_or_default();
     metadata.remove("_bt_defer_root");
-    // The plugin version remains in span_origin for backwards compatibility;
-    // this records the daemon build that actually translated the event.
-    metadata.insert(
-        "bt_daemon_version".into(),
-        Value::String(daemon_version.to_string()),
-    );
     builder = builder.metadata(metadata);
     let mut metrics = row
         .metrics

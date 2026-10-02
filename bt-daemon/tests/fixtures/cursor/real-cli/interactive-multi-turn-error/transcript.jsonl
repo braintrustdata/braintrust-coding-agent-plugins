@@ -1,0 +1,12 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Friday, Oct 2, 2026, 10:15 AM (UTC-4)</timestamp>\n<user_query>\nReply exactly AUDIT_OK. Do not use tools.\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Reply exactly as requested:\n\nAUDIT_OK\n\n[REDACTED]"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"[redacted non-audit model text]"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"[redacted non-audit model text]"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"[redacted non-audit model text]"}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Friday, Oct 2, 2026, 10:17 AM (UTC-4)</timestamp>\n<user_query>\nRead sample.txt and reply exactly AUDIT_TWO.\n\nReply exactly AUDIT_TWO.\n\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"[redacted non-audit model text]"},{"type":"tool_use","name":"Read","input":{"path":"/audit/workspace/sample.txt"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"AUDIT_TWO\n\n[REDACTED]"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"The response is exactly **AUDIT_TWO**, as requested.\n\n[REDACTED]"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"The response is exactly **AUDIT_TWO**, as requested.\n\n[REDACTED]"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"AUDIT_TWO\n\n[REDACTED]"}]}}
+{"type":"turn_ended","status":"error","error":"WritableIterable is closed"}

@@ -10,6 +10,7 @@
 mod antigravity;
 mod claude;
 mod codex;
+mod cursor;
 mod debug;
 mod git;
 mod grok;
@@ -22,6 +23,7 @@ mod tool;
 pub use antigravity::AntigravityTranslatorFactory;
 pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;
+pub use cursor::CursorTranslatorFactory;
 pub use debug::DebugTranslatorFactory;
 pub use grok::GrokTranslatorFactory;
 pub use opencode::OpenCodeTranslatorFactory;
@@ -180,6 +182,7 @@ impl Registry {
         r.register(Box::new(AntigravityTranslatorFactory::new(git.clone())));
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
         r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
+        r.register(Box::new(CursorTranslatorFactory::new(git.clone())));
         r.register(Box::new(GrokTranslatorFactory::new(git.clone())));
         r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));
         r.register(Box::new(PiTranslatorFactory::new(git)));
@@ -200,8 +203,8 @@ impl Registry {
     /// Resolve daemon source aliases to one stable identity.
     pub fn canonical_source<'a>(&'a self, source: &'a str) -> Option<&'a str> {
         let canonical = match canonical_source_name(source) {
-            canonical @ ("claude-code" | "opencode" | "antigravity" | "codex" | "grok" | "pi"
-            | "debug") => canonical,
+            canonical @ ("claude-code" | "opencode" | "antigravity" | "codex" | "cursor"
+            | "grok" | "pi" | "debug") => canonical,
             _ => return None,
         };
         self.factories.contains_key(canonical).then_some(canonical)
@@ -216,20 +219,20 @@ impl Registry {
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
         let namespace = crate::ids::session_namespace(canonical, session_id);
-        self.create_checked_with_session_key(canonical, &namespace)
+        self.create_checked_with_session_namespace(canonical, &namespace)
     }
 
-    pub(crate) fn create_checked_with_session_key(
+    pub(crate) fn create_checked_with_session_namespace(
         &self,
         source: &str,
-        session_key: &str,
+        session_namespace: &str,
     ) -> anyhow::Result<Box<dyn AgentTranslator>> {
         let canonical = self
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
         let factory = self.factories.get(canonical);
         let factory = factory.expect("canonical source must have a factory");
-        Ok(factory.create(session_key))
+        Ok(factory.create(session_namespace))
     }
 
     /// Create a known translator. Production ingress uses

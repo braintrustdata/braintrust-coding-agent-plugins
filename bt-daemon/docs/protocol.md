@@ -247,14 +247,14 @@ downgrade it.
 }
 ```
 
+The Braintrust sink records the capture package version in
+`context.span_origin.version`.
+
 Field notes:
 
 - **`source`** selects the daemon-side translator. `debug` is a built-in
   pass-through translator used by the prototype and tests.
 
-The Braintrust sink keeps the capture package version in
-`context.span_origin.version` and adds `metadata.bt_daemon_version` to every
-span so the daemon build that performed translation can be queried separately.
 - **`session_id`** identifies the source agent session. Combined with `route`
   it forms the queue + state key (see "Multiple routes per session" below).
   The shim extracts it from the payload (default JSON field `session_id`,

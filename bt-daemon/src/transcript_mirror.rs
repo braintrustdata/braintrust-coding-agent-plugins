@@ -8,14 +8,16 @@
 //! transcript produced a 1.6 GB journal that replay then had to hold in
 //! memory all at once.
 //!
-//! Mirroring stores each transcript byte exactly once. The journal carries
+//! Append-only mirroring stores each transcript byte exactly once. Cursor
+//! rewrites use separate immutable generation snapshots so older observations
+//! remain replayable. The journal carries
 //! only a reference — the mirror path plus the high-water offset that existed
 //! when the event was accepted — so replay reads the same bytes the live run
 //! saw, straight off disk, without the daemon ever holding a transcript in
 //! memory.
 
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 /// Namespace for mirror file names (distinct from the span-id namespace).
@@ -82,6 +84,80 @@ pub async fn capture(
     Ok((path, from + copied))
 }
 
+/// Capture a hook-bounded observation while preserving every previously
+/// journaled generation. Cursor can rewrite its JSONL transcript, including
+/// replacements with the same length, so length alone cannot identify an
+/// append. Compare the existing prefix in fixed-size buffers before extending
+/// it; replacements get a separate file and never invalidate older references.
+pub async fn capture_generation(
+    data_dir: &Path,
+    session_id: &str,
+    source: &str,
+    observed_bytes: Option<u64>,
+) -> anyhow::Result<(PathBuf, u64)> {
+    tokio::fs::create_dir_all(mirror_dir(data_dir)).await?;
+    let base = mirror_path(data_dir, session_id, source);
+    let current = base.with_extension("current");
+    // The pointer is private daemon state, never a path supplied by a hook.
+    let mut path = tokio::fs::read_to_string(&current)
+        .await
+        .ok()
+        .map(|name| mirror_dir(data_dir).join(name.trim()))
+        .filter(|path| path.parent() == Some(mirror_dir(data_dir).as_path()))
+        .unwrap_or_else(|| base.clone());
+    let mut input = tokio::fs::File::open(source).await?;
+    let source_len = input.metadata().await?.len();
+    let through = observed_bytes.unwrap_or(source_len).min(source_len);
+    let mirrored = tokio::fs::metadata(&path)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let mut changed = source_len < mirrored;
+    if !changed && mirrored > 0 {
+        let mut prior = tokio::fs::File::open(&path).await?;
+        let mut source_buffer = [0; 16 * 1024];
+        let mut mirror_buffer = [0; 16 * 1024];
+        let mut remaining = mirrored.min(through);
+        while remaining > 0 {
+            let len = remaining.min(source_buffer.len() as u64) as usize;
+            input.read_exact(&mut source_buffer[..len]).await?;
+            prior.read_exact(&mut mirror_buffer[..len]).await?;
+            if source_buffer[..len] != mirror_buffer[..len] {
+                changed = true;
+                break;
+            }
+            remaining -= len as u64;
+        }
+    }
+    let from = if changed {
+        path = base.with_file_name(format!(
+            "{}-{}.jsonl",
+            base.file_stem().unwrap().to_string_lossy(),
+            Uuid::new_v4().simple()
+        ));
+        0
+    } else {
+        mirrored.min(through)
+    };
+    input.seek(std::io::SeekFrom::Start(from)).await?;
+    let mut mirror = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    // `take` freezes the hook's observation: bytes appended by a later native
+    // event while this copy runs belong to that later journal envelope.
+    let copied = tokio::io::copy(&mut input.take(through - from), &mut mirror).await?;
+    mirror.flush().await?;
+    mirror.sync_data().await?;
+    tokio::fs::write(
+        &current,
+        path.file_name().unwrap().to_string_lossy().as_bytes(),
+    )
+    .await?;
+    Ok((path, from + copied))
+}
+
 /// Best-effort age-based collection, mirroring journal GC. Mirrors are only
 /// useful for as long as their journal survives.
 pub async fn gc_old_mirrors(data_dir: &Path, max_age: std::time::Duration) {
@@ -92,7 +168,10 @@ pub async fn gc_old_mirrors(data_dir: &Path, max_age: std::time::Duration) {
     let now = std::time::SystemTime::now();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("jsonl" | "current")
+        ) {
             continue;
         }
         let old = entry
@@ -159,5 +238,91 @@ mod tests {
             mirror_path(tmp.path(), "s1", "/a.jsonl"),
             mirror_path(tmp.path(), "s1", "/b.jsonl")
         );
+    }
+
+    #[tokio::test]
+    async fn generation_capture_preserves_replaced_and_truncated_observations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("t.jsonl");
+        tokio::fs::write(&source, b"first\n").await.unwrap();
+        let (first, first_len) =
+            capture_generation(tmp.path(), "s1", source.to_str().unwrap(), None)
+                .await
+                .unwrap();
+        // A same-length replacement must be detectable, not treated as an append.
+        tokio::fs::write(&source, b"other\n").await.unwrap();
+        let (second, second_len) =
+            capture_generation(tmp.path(), "s1", source.to_str().unwrap(), None)
+                .await
+                .unwrap();
+        tokio::fs::write(&source, b"ok\n").await.unwrap();
+        let (third, third_len) =
+            capture_generation(tmp.path(), "s1", source.to_str().unwrap(), None)
+                .await
+                .unwrap();
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_eq!((first_len, second_len, third_len), (6, 6, 3));
+        tokio::fs::remove_file(&source).await.unwrap();
+        assert_eq!(tokio::fs::read(first).await.unwrap(), b"first\n");
+        assert_eq!(tokio::fs::read(second).await.unwrap(), b"other\n");
+        assert_eq!(tokio::fs::read(third).await.unwrap(), b"ok\n");
+    }
+
+    #[tokio::test]
+    async fn generation_capture_respects_hook_bounds_and_partial_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("t.jsonl");
+        tokio::fs::write(&source, b"one\npartial\nfuture\n")
+            .await
+            .unwrap();
+        let (mirror, first) =
+            capture_generation(tmp.path(), "s1", source.to_str().unwrap(), Some(7))
+                .await
+                .unwrap();
+        assert_eq!(first, 7);
+        assert_eq!(tokio::fs::read(&mirror).await.unwrap(), b"one\npar");
+        let (second_mirror, second) =
+            capture_generation(tmp.path(), "s1", source.to_str().unwrap(), Some(12))
+                .await
+                .unwrap();
+        assert_eq!(second_mirror, mirror);
+        assert_eq!(second, 12);
+        assert_eq!(tokio::fs::read(&mirror).await.unwrap(), b"one\npartial\n");
+        // A queued older hook is still bounded even after a newer observation.
+        let (older_mirror, older) =
+            capture_generation(tmp.path(), "s1", source.to_str().unwrap(), Some(4))
+                .await
+                .unwrap();
+        assert_eq!(older_mirror, mirror);
+        assert_eq!(older, 4);
+        assert_eq!(tokio::fs::metadata(&mirror).await.unwrap().len(), 12);
+    }
+
+    #[tokio::test]
+    async fn generation_capture_resumes_the_current_generation_and_creates_empty_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("t.jsonl");
+        tokio::fs::write(&source, b"older\n").await.unwrap();
+        capture_generation(tmp.path(), "s1", source.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        tokio::fs::write(&source, b"new\n").await.unwrap();
+        let (mirror, _) = capture_generation(tmp.path(), "s1", source.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        tokio::fs::write(&source, b"new\nnext\n").await.unwrap();
+        let (resumed, len) = capture_generation(tmp.path(), "s1", source.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(resumed, mirror);
+        assert_eq!(len, 9);
+        assert_eq!(tokio::fs::read(resumed).await.unwrap(), b"new\nnext\n");
+        tokio::fs::write(&source, b"").await.unwrap();
+        let (empty, len) = capture_generation(tmp.path(), "s1", source.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(len, 0);
+        assert!(empty.is_file());
     }
 }

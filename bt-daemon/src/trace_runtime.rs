@@ -719,11 +719,14 @@ async fn run_hook_command(
     if !settings.tracing_enabled() {
         return Ok(());
     }
-    let route = match settings.route {
-        Some(route) => route,
-        None => resolve_host_route(host, RouteRequirements::default()).await?,
-    };
-    crate::run_hook_with_route(hook_args, route, host_info(host)).await
+    crate::with_hook_capture_timeout(hook_args.capture_timeout_ms, async {
+        let route = match settings.route {
+            Some(route) => route,
+            None => resolve_host_route(host, RouteRequirements::default()).await?,
+        };
+        crate::run_hook_with_route(hook_args, route, host_info(host)).await
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1049,6 +1052,7 @@ mod tests {
             event: None,
             transcript_path_field: None,
             no_spawn: false,
+            capture_timeout_ms: None,
             flush_on_turn_end: false,
             flush_timeout_ms: 10_000,
             additional_metadata: None,
@@ -1072,6 +1076,43 @@ mod tests {
             *services.route_requests.lock().unwrap(),
             [RouteRequirements::default()]
         );
+    }
+
+    #[tokio::test]
+    async fn hook_capture_timeout_includes_host_route_resolution() {
+        struct StalledHost;
+
+        #[async_trait]
+        impl TraceHostServices for StalledHost {
+            async fn resolve_route(
+                &self,
+                _: RouteRequirements,
+            ) -> anyhow::Result<HostRouteSelection> {
+                std::future::pending().await
+            }
+
+            async fn resolve_auth(
+                &self,
+                _: &AuthSelection,
+                _: AuthResolveReason,
+            ) -> anyhow::Result<AuthLease> {
+                panic!("capture timeout should precede auth resolution")
+            }
+        }
+
+        let mut args = hook_args();
+        args.capture_timeout_ms = Some(25);
+        let settings = crate::settings::AgentSettings {
+            trace_to_braintrust: Some(true),
+            route: None,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_hook_command(args, &test_host(Arc::new(StalledHost)), settings),
+        )
+        .await
+        .expect("host route resolution escaped the hook deadline");
+        assert_eq!(result.unwrap_err().to_string(), "hook capture timed out");
     }
 
     #[tokio::test]

@@ -30,6 +30,11 @@ and shipping work to the corresponding repo-local skills. Use a component skill
 directly for focused work. Every integration uses one source identity and daemon
 translator; hooks and plugins remain thin, fail-open, credential-free forwarders.
 
+Follow the [Braintrust instrumentation specification](https://github.com/braintrustdata/braintrust-spec/blob/main/skills/instrumentation-spec/SKILL.md)
+for trace hierarchy, message/tool-call formats, metadata allowlists, and token
+metrics. When native hooks cannot expose required per-call data, document the
+limitation and preserve known parent totals rather than inventing attribution.
+
 ## Local development
 
 ```bash

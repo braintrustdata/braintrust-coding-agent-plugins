@@ -1,0 +1,16 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "duration_ms": 6284,
+  "duration_api_ms": 6284,
+  "is_error": false,
+  "result": "I'll read `sample.txt` and run the printf command.**File:** `sample.txt` contains `audit fixture hello`.\n\n**Shell:** `printf` printed `audit-shell-ok`.",
+  "session_id": "session-headless-success",
+  "request_id": "request-success",
+  "usage": {
+    "inputTokens": 20848,
+    "outputTokens": 180,
+    "cacheReadTokens": 6528,
+    "cacheWriteTokens": 0
+  }
+}

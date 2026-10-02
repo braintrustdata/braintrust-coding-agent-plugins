@@ -127,6 +127,10 @@ pub struct HookArgs {
     /// Fail instead of spawning a daemon if none is running.
     #[arg(long)]
     pub no_spawn: bool,
+    /// Maximum time to resolve routing, connect or start the daemon, and
+    /// receive durable capture acknowledgement.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub capture_timeout_ms: Option<u64>,
     /// Ask the daemon to flush the session after a turn-ending event. The
     /// flush is scheduled out-of-band; hook capture still returns immediately
     /// after the durable journal write.
@@ -343,7 +347,7 @@ fn build_hook_envelope(
 }
 
 pub(crate) fn should_flush_hook_event(event: &str, flush_on_turn_end: bool) -> bool {
-    matches!(event, "SessionEnd" | "session_end")
+    matches!(event, "SessionEnd" | "session_end" | "sessionEnd")
         || (flush_on_turn_end
             && matches!(
                 event,
@@ -355,6 +359,9 @@ pub(crate) fn should_flush_hook_event(event: &str, flush_on_turn_end: bool) -> b
                     | "stop_cancelled"
                     | "SubagentStop"
                     | "subagent_stop"
+                    | "subagentStop"
+                    // Cursor can emit its final answer after `stop`.
+                    | "afterAgentResponse"
             ))
 }
 
@@ -409,6 +416,28 @@ pub(crate) fn suppress_inherited_hook(args: &HookArgs) -> bool {
 }
 
 pub(crate) async fn run_hook_with_route(
+    args: HookArgs,
+    route: SessionRoute,
+    host: HostInfo,
+) -> anyhow::Result<()> {
+    with_hook_capture_timeout(args.capture_timeout_ms, capture_hook(args, route, host)).await
+}
+
+pub(crate) async fn with_hook_capture_timeout<T>(
+    timeout_ms: Option<u64>,
+    capture: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match timeout_ms {
+        Some(timeout_ms) => {
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), capture)
+                .await
+                .context("hook capture timed out")?
+        }
+        None => capture.await,
+    }
+}
+
+async fn capture_hook(
     mut args: HookArgs,
     mut route: SessionRoute,
     host: HostInfo,
@@ -458,6 +487,7 @@ fn source_version_from_env(source: &str) -> Option<String> {
     let key = match source {
         "claude-code" => "CLAUDE_CODE_VERSION",
         "codex" => "CODEX_VERSION",
+        "cursor" => "CURSOR_VERSION",
         "grok" => "GROK_VERSION",
         "antigravity" => "AGY_VERSION",
         _ => return None,
@@ -470,6 +500,8 @@ fn source_version_from_env(source: &str) -> Option<String> {
 fn source_version_from_payload(source: &str, payload: &serde_json::Value) -> Option<String> {
     let fields: &[&str] = match source {
         "codex" => &["cli_version", "version"],
+        // Hook schema `version` is numeric; the agent version is separate.
+        "cursor" => &["cursor_version"],
         "claude-code" | "grok" | "antigravity" => &["version", "cli_version"],
         _ => &[],
     };
@@ -482,6 +514,7 @@ fn plugin_version_from_plugin_root(source: &str) -> Option<String> {
     let root = match source {
         "claude-code" => std::env::var_os("CLAUDE_PLUGIN_ROOT"),
         "codex" => std::env::var_os("PLUGIN_ROOT"),
+        "cursor" => std::env::var_os("CURSOR_PLUGIN_ROOT"),
         "grok" => std::env::var_os("GROK_PLUGIN_ROOT"),
         // Antigravity runs plugin hooks with the plugin root as cwd.
         "antigravity" => std::env::current_dir()
@@ -492,6 +525,7 @@ fn plugin_version_from_plugin_root(source: &str) -> Option<String> {
     let manifest = match source {
         "claude-code" => ".claude-plugin/plugin.json",
         "codex" => ".codex-plugin/plugin.json",
+        "cursor" => ".cursor-plugin/plugin.json",
         "grok" => ".grok-plugin/plugin.json",
         "antigravity" => "plugin.json",
         _ => return None,
@@ -1737,6 +1771,15 @@ mod tests {
             source_version_from_payload("codex", &payload).as_deref(),
             Some("2.3.4")
         );
+        assert_eq!(
+            source_version_from_payload("cursor", &json!({"version":1,"cursor_version":"2.5.0"}))
+                .as_deref(),
+            Some("2.5.0")
+        );
+        assert_eq!(
+            source_version_from_payload("cursor", &json!({"version":1})),
+            None
+        );
 
         let temp = tempfile::tempdir().unwrap();
         let manifest = temp.path().join("plugin.json");
@@ -1749,7 +1792,7 @@ mod tests {
 
     #[test]
     fn hook_flush_recognizes_native_and_documented_terminal_events() {
-        for event in ["session_end", "SessionEnd"] {
+        for event in ["session_end", "SessionEnd", "sessionEnd"] {
             assert!(should_flush_hook_event(event, false));
         }
         for event in [
@@ -1761,6 +1804,8 @@ mod tests {
             "StopCancelled",
             "subagent_stop",
             "SubagentStop",
+            "subagentStop",
+            "afterAgentResponse",
         ] {
             assert!(!should_flush_hook_event(event, false));
             assert!(should_flush_hook_event(event, true));

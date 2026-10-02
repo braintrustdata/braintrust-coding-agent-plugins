@@ -95,6 +95,10 @@ impl<K: Eq + Hash + Clone, V> RecentMap<K, V> {
         previous
     }
 
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.values.iter()
+    }
+
     pub(super) fn remove(&mut self, key: &K) -> Option<V> {
         let removed = self.values.remove(key);
         if removed.is_some() {
