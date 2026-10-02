@@ -318,11 +318,5 @@ named pipes. Translators exist for Antigravity, Claude Code, Codex, Cursor, Grok
 OpenCode, and Pi. CI runs packaged Claude Code, Codex, OpenCode, and Pi against
 mock inference and mock Braintrust ingest on all three platforms.
 
-Cursor currently supports local hook capture and reconstructed traces. Its
-real CLI evidence was collected on macOS; desktop/cloud and recursive subagents
-remain unverified. See the [Cursor audit](../docs/cursor-tracing-audit.md) and
-[local plugin guide](../src/plugins/cursor/content/README.md). Persistent Cursor
-setup, managed runs, import, and release wiring are separate follow-up work.
-
 The Rust SDK is pinned to an exact Git revision in [Cargo.toml](Cargo.toml).
 Use `--locked` for reproducible builds.
