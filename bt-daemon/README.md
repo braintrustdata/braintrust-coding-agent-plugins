@@ -296,7 +296,9 @@ workers handle authentication, translation, and delivery. Restart recovery
 replays journaled events with deterministic span IDs, so repeated delivery
 updates the same spans.
 
-Claude and Codex events reference daemon-owned transcript mirrors. Grok uses
+Claude, Codex, and Cursor events reference daemon-owned transcript mirrors. Cursor
+preserves separate immutable generations when its native transcript is rewritten.
+Grok uses
 separate updates and events mirrors. Replay does not depend on the original
 transcript staying at its old path.
 
@@ -312,9 +314,15 @@ currently fixed in `src/server.rs`.
 ## Platform and integration coverage
 
 The daemon supports Linux, macOS, and Windows, using Unix sockets or Windows
-named pipes. Translators exist for Antigravity, Claude Code, Codex, Grok,
+named pipes. Translators exist for Antigravity, Claude Code, Codex, Cursor, Grok,
 OpenCode, and Pi. CI runs packaged Claude Code, Codex, OpenCode, and Pi against
 mock inference and mock Braintrust ingest on all three platforms.
+
+Cursor currently supports local hook capture and reconstructed traces. Its
+real CLI evidence was collected on macOS; desktop/cloud and recursive subagents
+remain unverified. See the [Cursor audit](../docs/cursor-tracing-audit.md) and
+[local plugin guide](../src/plugins/cursor/content/README.md). Persistent Cursor
+setup, managed runs, import, and release wiring are separate follow-up work.
 
 The Rust SDK is pinned to an exact Git revision in [Cargo.toml](Cargo.toml).
 Use `--locked` for reproducible builds.

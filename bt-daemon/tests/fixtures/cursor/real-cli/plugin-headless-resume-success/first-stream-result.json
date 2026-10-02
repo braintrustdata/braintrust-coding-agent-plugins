@@ -1,0 +1,16 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "duration_ms": 7451,
+  "duration_api_ms": 7451,
+  "is_error": false,
+  "result": "I'll read `sample.txt` and run the printf command.**sample.txt:** Contains one line: `audit fixture hello`\n\n**printf output:** `audit-shell-ok`",
+  "session_id": "session-plugin-resume",
+  "request_id": "request-first-stream-result.json",
+  "usage": {
+    "inputTokens": 10993,
+    "outputTokens": 177,
+    "cacheReadTokens": 16384,
+    "cacheWriteTokens": 0
+  }
+}

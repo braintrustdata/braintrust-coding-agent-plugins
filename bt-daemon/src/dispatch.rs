@@ -228,6 +228,10 @@ impl Session {
 /// observed instead of depending on mutable external paths or copying a full
 /// transcript into every event. Capture failures remain fail-open.
 pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env: &mut Envelope) {
+    if env.source == "cursor" {
+        hydrate_cursor_transcript_reference(data_dir, env).await;
+        return;
+    }
     if env.source == "grok" {
         hydrate_grok_transcript_references(data_dir, env).await;
         return;
@@ -270,6 +274,49 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
                 "through": through,
             }),
         );
+    }
+}
+
+async fn hydrate_cursor_transcript_reference(data_dir: &std::path::Path, env: &mut Envelope) {
+    if env.payload.get("_bt_transcript_mirror").is_some() {
+        return;
+    }
+    let path = env
+        .payload
+        .get("transcript_path")
+        .and_then(serde_json::Value::as_str);
+    let mut observation = serde_json::json!({});
+    if let Some(path) = path.filter(|path| !path.is_empty()) {
+        let observed_bytes = env
+            .payload
+            .get("_bt_transcript_observation")
+            .filter(|observation| {
+                observation.get("path").and_then(serde_json::Value::as_str) == Some(path)
+            })
+            .and_then(|observation| observation.get("observed_bytes"))
+            .and_then(serde_json::Value::as_u64);
+        let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
+        match crate::transcript_mirror::capture_generation(
+            data_dir,
+            &mirror_session,
+            path,
+            observed_bytes,
+        )
+        .await
+        {
+            Ok((mirror, through)) => {
+                observation =
+                    serde_json::json!({"path": path, "mirror": mirror, "through": through});
+            }
+            Err(error) => {
+                tracing::debug!(session_id = %env.session_id, %error, "Cursor transcript mirror skipped");
+            }
+        }
+    }
+    if let Some(payload) = env.payload.as_object_mut() {
+        // An empty observation is also durable: no transcript was available
+        // at this boundary, even if the external path appears during replay.
+        payload.insert("_bt_transcript_mirror".to_string(), observation);
     }
 }
 
@@ -948,6 +995,9 @@ pub(crate) fn is_tool_lifecycle_event(event: &str) -> bool {
         "PreToolUse"
             | "PostToolUse"
             | "PostToolUseFailure"
+            | "preToolUse"
+            | "postToolUse"
+            | "postToolUseFailure"
             | "tool_execution_start"
             | "tool_execution_end"
             | "tool.execute.before"
@@ -958,6 +1008,38 @@ pub(crate) fn is_tool_lifecycle_event(event: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cursor_hydration_freezes_hook_bytes_and_missing_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("cursor.jsonl");
+        std::fs::write(&transcript, b"first\nfuture\n").unwrap();
+        let mut env: Envelope = serde_json::from_value(serde_json::json!({
+            "source":"cursor", "session_id":"cursor-boundary", "event":"stop", "ts_ms":1,
+            "payload": {
+                "transcript_path":transcript,
+                "_bt_transcript_observation":{"path":transcript,"observed_bytes":6}
+            }
+        }))
+        .unwrap();
+        hydrate_transcript_reference(tmp.path(), &mut env).await;
+        let observation = env.payload["_bt_transcript_mirror"].clone();
+        assert_eq!(observation["through"], 6);
+        assert_eq!(
+            std::fs::read(observation["mirror"].as_str().unwrap()).unwrap(),
+            b"first\n"
+        );
+        std::fs::write(&transcript, b"replacement\n").unwrap();
+        hydrate_transcript_reference(tmp.path(), &mut env).await;
+        assert_eq!(env.payload["_bt_transcript_mirror"], observation);
+
+        env.payload = serde_json::json!({"transcript_path":null});
+        hydrate_transcript_reference(tmp.path(), &mut env).await;
+        assert_eq!(env.payload["_bt_transcript_mirror"], serde_json::json!({}));
+        env.payload["transcript_path"] = serde_json::json!(transcript);
+        hydrate_transcript_reference(tmp.path(), &mut env).await;
+        assert_eq!(env.payload["_bt_transcript_mirror"], serde_json::json!({}));
+    }
 
     #[tokio::test]
     async fn enqueue_flush_preserves_boundary_without_waiting_for_delivery() {

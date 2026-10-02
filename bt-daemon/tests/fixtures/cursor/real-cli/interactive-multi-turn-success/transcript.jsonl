@@ -1,0 +1,7 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Friday, Oct 2, 2026, 10:24 AM (UTC-4)</timestamp>\n<user_query>\nRead sample.txt and run printf \"audit-shell-ok\\\\n\", then summarize file contents and output.\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"I'll read `sample.txt` and run the printf command."},{"type":"tool_use","name":"Read","input":{"path":"/audit/workspace/sample.txt"}},{"type":"tool_use","name":"Shell","input":{"command":"printf \"audit-shell-ok\\n\"","description":"Print audit-shell-ok status line"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"**`sample.txt`:** `audit fixture hello`\n\n**Shell output:** `audit-shell-ok`"}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Friday, Oct 2, 2026, 10:25 AM (UTC-4)</timestamp>\n<user_query>\nRead sample.txt again and reply exactly AUDIT_RESUMED.\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"/audit/workspace/sample.txt"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"AUDIT_RESUMED"}]}}
+{"type":"turn_ended","status":"success"}

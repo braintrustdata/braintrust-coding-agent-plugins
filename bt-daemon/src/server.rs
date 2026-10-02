@@ -2159,6 +2159,7 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Res
 
 fn is_session_start(source: &str, event: &str) -> bool {
     matches!(event, "SessionStart" | "session_start" | "session.created")
+        || (source == "cursor" && event == "sessionStart")
         // Antigravity has no dedicated session-start or resume hook. Its
         // PreInvocation is the earliest hook in each invocation and is the
         // only opportunity to refresh a resumed conversation's process.

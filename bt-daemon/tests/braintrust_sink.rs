@@ -482,7 +482,7 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
             assert_eq!(origin["name"], format!("braintrust.plugin.{source}"));
             assert_eq!(origin["version"], plugin_version.unwrap_or("test"));
             assert_eq!(origin["instrumentation"]["name"], "braintrust-plugin");
-            assert_eq!(row["metadata"]["bt_daemon_version"], "test");
+            assert!(row["metadata"].get("bt_daemon_version").is_none());
         }
     }
 }
@@ -718,8 +718,8 @@ async fn braintrust_sink_delivers_spans_to_collector() {
         "plugin version missing from shared span origin"
     );
     assert!(
-        bodies.contains("bt_daemon_version"),
-        "daemon version metadata missing from spans: {bodies}"
+        !bodies.contains("bt_daemon_version"),
+        "daemon version should not clutter span metadata: {bodies}"
     );
 
     // Project registration happened (org_name path, no login).

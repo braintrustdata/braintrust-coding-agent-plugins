@@ -1,0 +1,16 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "duration_ms": 5886,
+  "duration_api_ms": 5886,
+  "is_error": false,
+  "result": "AUDIT_RESUMED",
+  "session_id": "session-plugin-resume",
+  "request_id": "request-resume-stream-result.json",
+  "usage": {
+    "inputTokens": 339,
+    "outputTokens": 104,
+    "cacheReadTokens": 27520,
+    "cacheWriteTokens": 0
+  }
+}

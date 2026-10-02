@@ -10,6 +10,7 @@
 mod antigravity;
 mod claude;
 mod codex;
+mod cursor;
 mod debug;
 mod git;
 mod grok;
@@ -21,6 +22,7 @@ mod tool;
 pub use antigravity::AntigravityTranslatorFactory;
 pub use claude::ClaudeTranslatorFactory;
 pub use codex::CodexTranslatorFactory;
+pub use cursor::CursorTranslatorFactory;
 pub use debug::DebugTranslatorFactory;
 pub use grok::GrokTranslatorFactory;
 pub use opencode::OpenCodeTranslatorFactory;
@@ -179,6 +181,7 @@ impl Registry {
         r.register(Box::new(AntigravityTranslatorFactory::new(git.clone())));
         r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
         r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
+        r.register(Box::new(CursorTranslatorFactory::new(git.clone())));
         r.register(Box::new(GrokTranslatorFactory::new(git.clone())));
         r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));
         r.register(Box::new(PiTranslatorFactory::new(git)));
@@ -199,8 +202,8 @@ impl Registry {
     /// Resolve daemon source aliases to one stable identity.
     pub fn canonical_source<'a>(&'a self, source: &'a str) -> Option<&'a str> {
         let canonical = match canonical_source_name(source) {
-            canonical @ ("claude-code" | "opencode" | "antigravity" | "codex" | "grok" | "pi"
-            | "debug") => canonical,
+            canonical @ ("claude-code" | "opencode" | "antigravity" | "codex" | "cursor"
+            | "grok" | "pi" | "debug") => canonical,
             _ => return None,
         };
         self.factories.contains_key(canonical).then_some(canonical)

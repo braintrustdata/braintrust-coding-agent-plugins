@@ -43,6 +43,12 @@ bt trace import claude SESSION_ID --attach
 
 See the agent guides for limitations.
 
+[Cursor tracing](src/plugins/cursor/content/README.md) is available for local
+development through native plugin hooks and the shared daemon. Persistent CLI
+setup and distribution are follow-up work. See the
+[Cursor evidence audit](docs/cursor-tracing-audit.md) for tested surfaces and
+native data limitations.
+
 ## Manage tracing
 
 ```bash
