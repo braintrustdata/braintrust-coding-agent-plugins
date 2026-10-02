@@ -44,7 +44,14 @@ impl PiRun {
 impl PiAgent {
     pub fn new(world: &AgentTestWorld) -> Self {
         let config_dir = world.temp_path("pi-config");
-        let session_dir = world.temp_path("pi-sessions");
+        // Pi keys sessions by their session-file path, so a deep directory
+        // checks that the daemon's journal name stays within 255 bytes. The
+        // padding stays short of Windows' 260-character path limit once Pi
+        // appends its ~68-byte session file name.
+        let mut session_dir = world.temp_path("pi-sessions");
+        while session_dir.as_os_str().len() < 160 {
+            session_dir.push("nested");
+        }
         for directory in [&config_dir, &session_dir] {
             std::fs::create_dir_all(directory).expect("create Pi test directory");
         }
@@ -66,13 +73,6 @@ impl PiAgent {
             session_dir,
             extension,
         }
-    }
-
-    /// Store sessions under `session_dir` instead of the default test directory.
-    pub fn with_session_dir(mut self, session_dir: PathBuf) -> Self {
-        std::fs::create_dir_all(&session_dir).expect("create Pi session directory");
-        self.session_dir = session_dir;
-        self
     }
 
     /// The version the extension under test reports in trace metadata.

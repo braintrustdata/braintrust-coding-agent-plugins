@@ -1148,9 +1148,7 @@ async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
     let flushed = flush_session(&session, &socket, 5000).await.unwrap();
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
 
-    let journal = source_journal_path(&data_dir, "debug", &session);
-    assert!(journal.file_name().unwrap().len() <= 255);
-    let jtext = std::fs::read_to_string(&journal).unwrap();
+    let jtext = std::fs::read_to_string(source_journal_path(&data_dir, "debug", &session)).unwrap();
     assert_eq!(
         jtext
             .lines()

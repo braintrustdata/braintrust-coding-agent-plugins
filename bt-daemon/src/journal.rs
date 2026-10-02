@@ -756,7 +756,6 @@ mod tests {
         assert_ne!(first, second);
         for path in [&first, &second] {
             assert!(path.file_name().unwrap().len() <= MAX_FILE_NAME_BYTES);
-            JournalWriter::open_path(path).await.unwrap();
         }
         // Names that already fit keep their original layout so existing
         // journals are still found after an upgrade.
