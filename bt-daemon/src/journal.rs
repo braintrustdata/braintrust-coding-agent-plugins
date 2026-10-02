@@ -475,11 +475,10 @@ fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_jso
             *previous = messages;
         }
         "before_provider_request" => {
-            if let Some(payload) = native
-                .get_mut("payload")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                payload.remove("messages");
+            // The translator records only the allowlisted request
+            // configuration and tool definitions, never the prompt or messages.
+            if let Some(payload) = native.get_mut("payload") {
+                *payload = serde_json::Value::Object(crate::translate::pi_request_config(payload));
             }
         }
         "agent_end" => {
@@ -720,6 +719,90 @@ mod tests {
                 .pointer("/event/assistantMessageEvent/type"),
             Some(&serde_json::json!("text_delta"))
         );
+    }
+
+    #[tokio::test]
+    async fn pi_provider_requests_persist_only_request_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pi.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let event = Envelope {
+            source: "pi".into(),
+            source_version: None,
+            plugin_version: None,
+            session_id: "pi-session".into(),
+            event: "before_provider_request".into(),
+            ts_ms: 1,
+            managed_run_id: None,
+            capture: None,
+            payload: serde_json::json!({
+                "event": {
+                    "type": "before_provider_request",
+                    "payload": {
+                        "system": "system-prompt-marker",
+                        "messages": [{"role": "user", "content": "message-marker"}],
+                        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+                        "max_tokens": 1024,
+                    },
+                }
+            }),
+            route: None,
+            config: None,
+        };
+        writer.append(&event).await.unwrap();
+        drop(writer);
+
+        let stored = tokio::fs::read(&path).await.unwrap();
+        let stored_text = String::from_utf8_lossy(&stored);
+        assert!(!stored_text.contains("system-prompt-marker"));
+        assert!(!stored_text.contains("message-marker"));
+
+        let mut reader = JournalReader::open(&path, stored.len() as u64)
+            .await
+            .unwrap()
+            .unwrap();
+        let replayed = reader.next_entry().await.unwrap().unwrap();
+        assert_eq!(
+            replayed.payload.pointer("/event/payload"),
+            Some(&serde_json::json!({
+                "max_tokens": 1024,
+                "tools": [{"type": "function", "function": {
+                    "name": "read",
+                    "parameters": {"type": "object"},
+                }}],
+            }))
+        );
+    }
+
+    #[test]
+    fn pi_journaled_request_configuration_replays_unchanged() {
+        let schema = serde_json::json!({"type": "object"});
+        for payload in [
+            serde_json::json!({
+                "max_tokens": 1024,
+                "tools": [
+                    {"name": "read", "input_schema": schema, "strict": true},
+                    {"type": "web_search_20250305", "name": "web_search"},
+                ],
+                "tool_choice": {"type": "tool", "name": "read", "disable_parallel_tool_use": true},
+            }),
+            serde_json::json!({"config": {
+                "temperature": 0.5,
+                "tools": [{"functionDeclarations": [{"name": "read", "parameters": schema}]}, {"googleSearch": {}}],
+                "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+            }}),
+            serde_json::json!({
+                "toolConfig": {"tools": [{"toolSpec": {"name": "read", "inputSchema": {"json": schema}}}]},
+                "inferenceConfig": {"maxTokens": 512},
+            }),
+        ] {
+            let journaled =
+                serde_json::Value::Object(crate::translate::pi_request_config(&payload));
+            assert_eq!(
+                serde_json::Value::Object(crate::translate::pi_request_config(&journaled)),
+                journaled
+            );
+        }
     }
 
     #[tokio::test]

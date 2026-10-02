@@ -10,8 +10,8 @@ and uploads traces. Pi keeps running if tracing fails.
 
 - **Session spans**: one root span per Pi session with at least one turn
 - **Turn spans**: one span per user prompt / agent run
-- **LLM spans**: one span per model response inside a turn, with token usage, cache usage, reasoning tokens, estimated cost, and time to first token
-- **Tool spans**: one span per tool execution, including dynamically loaded tools
+- **LLM spans**: one span per model response inside a turn, with token usage, cache usage, reasoning tokens, estimated cost, time to first token, and the tool definitions available to that request. With a virtual model, the span names the physical model and thinking level that answered and records the selected virtual model as `selected_model`
+- **Tool spans**: one span per tool execution, including dynamically loaded tools. Tool calls that another tool makes, such as a codemode script's `tools.<name>()` calls, are nested under the calling tool's span
 - **Compaction spans**: one span per session compaction, including trigger/retry metadata when available
 - **Branch summary spans**: one span per summarized `/tree` navigation branch
 

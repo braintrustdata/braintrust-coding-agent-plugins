@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type DaemonSessionRoute, resolveDaemonTraceSettings } from "./runtime/daemon-client.ts";
-import { loadPiPackageMetadata } from "./pi-package.ts";
+import { runningPiPackage } from "./pi-package.ts";
 
 export interface PiConfig {
   enabled: boolean;
@@ -17,7 +17,7 @@ export interface PiConfig {
 
 type ConfigRecord = Record<string, unknown>;
 
-const PROJECT_CONFIG_DIR_NAME = loadPiPackageMetadata().configDir;
+const PROJECT_CONFIG_DIR_NAME = runningPiPackage().configDir;
 
 function record(value: unknown): ConfigRecord | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)

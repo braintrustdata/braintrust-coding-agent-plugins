@@ -382,6 +382,11 @@ async fn pi_session_emits_traces() {
                 .any(|row| row_contains(row, &["braintrust.plugin.pi", &plugin_version])),
             "Pi trace origin metadata was not emitted"
         );
+        assert!(
+            rows.iter().any(|row| row["span_attributes"]["name"] == "Pi"
+                && row["metadata"]["pi_version"].is_string()),
+            "Pi root span did not report the running Pi version"
+        );
     }
     if world.uses_mock_inference() && world.uses_mock_ingest() {
         let scenario = IngestScenario::new()
@@ -393,6 +398,76 @@ async fn pi_session_emits_traces() {
             });
         world.wait_for_mock_ingest_scenario(&scenario).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Pi 1.0+ and the packed Pi extension"]
+async fn pi_codemode_nests_tool_spans() {
+    let inference = OpenAiMock::new(|_context, request| {
+        if request.has_function_output("call_pi_cm") {
+            return MockReply::response(OpenAiTurn::text("PI_MOCK_OK"));
+        }
+        assert!(
+            request.tool_names().contains(&"codemode"),
+            "Pi did not offer codemode: {:?}",
+            request.tool_names()
+        );
+        let script = format!(
+            "const r = await tools.bash({{command: {:?}}}); text(r.output);",
+            tool_command("PI_NESTED_OK")
+        );
+        MockReply::response(OpenAiTurn::tool_call(
+            "call_pi_cm",
+            "codemode",
+            json!({"code": script}),
+        ))
+    });
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let pi = PiAgent::new(&world);
+
+    let output = pi
+        .run(
+            &world,
+            PiRun::new("Use codemode to print PI_NESTED_OK, then reply with PI_MOCK_OK.")
+                .mock_inference(inference_server.uri())
+                .arg("-e")
+                .arg("builtin:codemode")
+                .arg("--tools")
+                .arg("bash,codemode"),
+        )
+        .await;
+    output.assert_success();
+    if !world.uses_mock_inference() || !world.uses_mock_ingest() {
+        return;
+    }
+    output.assert_contains("PI_MOCK_OK");
+
+    // Codemode runs `tools.bash` through `ctx.executeTool()`, which reports
+    // the nested call with `parentToolCallId`. Its span belongs under the
+    // codemode span that made it, not beside it under the turn.
+    let scenario = IngestScenario::new()
+        .expect("Pi codemode span", |row| {
+            row_contains(row, &[r#""type":"tool""#, r#""name":"codemode""#])
+        })
+        .expect("Pi nested bash span", |row| {
+            row_contains(row, &[r#""type":"tool""#, "PI_NESTED_OK"])
+        });
+    let rows = world.wait_for_mock_ingest_scenario(&scenario).await;
+    let span_named = |name: &str| {
+        rows.iter()
+            .find(|row| {
+                row["span_attributes"]["type"] == "tool" && row["span_attributes"]["name"] == name
+            })
+            .unwrap_or_else(|| panic!("no {name} tool span in {rows:#?}"))
+    };
+    let codemode = span_named("codemode");
+    let bash = span_named("bash");
+    assert_eq!(
+        bash["span_parents"],
+        json!([codemode["span_id"]]),
+        "nested bash span is not a child of the codemode span"
+    );
 }
 
 #[test]

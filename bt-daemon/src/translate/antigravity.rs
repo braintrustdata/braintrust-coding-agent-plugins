@@ -6,7 +6,7 @@
 //! so replay observes exactly the records that existed when each hook fired.
 
 use super::git::GitMetadataCache;
-use super::tool::{with_tool_approval, ToolApproval};
+use super::tool::{with_tool_approval, without_nulls, ToolApproval};
 use super::{
     local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
@@ -280,7 +280,7 @@ impl AntigravityTranslator {
             "turn_number": turn_number,
             "model": model
         });
-        remove_null_fields(&mut metadata);
+        metadata = without_nulls(metadata);
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
@@ -890,11 +890,5 @@ fn nonempty_value(value: Value) -> Option<Value> {
         Value::Array(values) if values.is_empty() => None,
         Value::Object(object) if object.is_empty() => None,
         _ => Some(value),
-    }
-}
-
-fn remove_null_fields(value: &mut Value) {
-    if let Some(object) = value.as_object_mut() {
-        object.retain(|_, value| !value.is_null());
     }
 }

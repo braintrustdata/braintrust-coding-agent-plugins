@@ -2,7 +2,9 @@
 //! state machine owns all span construction and recovery.
 
 use super::git::GitMetadataCache;
-use super::tool::{error_text, with_tool_approval, ToolApproval};
+use super::tool::{
+    error_text, explicit_skill_metadata, with_tool_approval, without_nulls, ToolApproval,
+};
 use super::{
     local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
@@ -63,17 +65,18 @@ struct BeforeAgentStart {
     prompt: Option<Value>,
 }
 
+/// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
+/// routes each request to a physical model.
+#[derive(Deserialize)]
+struct SelectedModel {
+    provider: String,
+    id: String,
+}
+
 #[derive(Deserialize)]
 struct ContextEvent {
     #[serde(default)]
     messages: Vec<Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProviderRequest {
-    #[serde(flatten)]
-    fields: Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +133,12 @@ struct AssistantMessage {
     stop_reason: Option<String>,
     #[serde(default)]
     response_id: Option<String>,
+    // Pi 1.0 records the level dispatched for this response, which a virtual
+    // model's router may choose independently of the selected level.
+    #[serde(default)]
+    thinking_level: Option<String>,
+    #[serde(default)]
+    provider_thinking_level: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -139,18 +148,27 @@ struct Usage {
     input: i64,
     #[serde(default)]
     output: i64,
+    // Pi reports `reasoning` as a subset of `output`, and only for providers
+    // that expose the breakdown.
     #[serde(default)]
-    reasoning: i64,
+    reasoning: Option<i64>,
     #[serde(default)]
     cache_read: i64,
+    // `cacheWrite1h` is the subset of `cacheWrite` written with 1h retention.
     #[serde(default)]
     cache_write: i64,
     #[serde(default)]
-    cache_write1h: i64,
+    cache_write1h: Option<i64>,
     #[serde(default)]
     total_tokens: Option<i64>,
     #[serde(default)]
-    cost: Option<Value>,
+    cost: Option<Cost>,
+}
+
+#[derive(Default, Deserialize)]
+struct Cost {
+    #[serde(default)]
+    total: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +205,10 @@ struct ToolExecutionStart {
     tool_name: Option<String>,
     #[serde(default)]
     args: Value,
+    // Pi 1.0 sets this on calls another tool made through
+    // `ctx.executeTool()`, such as codemode's `tools.<name>()`.
+    #[serde(default)]
+    parent_tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +222,8 @@ struct ToolExecutionEnd {
     result: Option<Value>,
     #[serde(default)]
     is_error: bool,
+    #[serde(default)]
+    parent_tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -295,13 +319,15 @@ struct PendingLlm {
     start_ms: i64,
     input: Value,
     first_token_ms: Option<i64>,
-    provider: Option<Value>,
+    request_config: Map<String, Value>,
+    selected_model: Option<SelectedModel>,
 }
 #[derive(Clone)]
 struct ToolStart {
     start_ms: i64,
     name: String,
     args: Value,
+    parent_call: Option<String>,
 }
 struct PiTranslator {
     session_id: String,
@@ -313,7 +339,8 @@ struct PiTranslator {
     // are initialization input only. Later reopen/replay events must retain
     // the daemon's accumulated counters and deterministic turn sequence.
     legacy_root_adopted: bool,
-    turn: Option<(String, Value)>,
+    /// The open turn's span id and the skills its prompt explicitly requested.
+    turn: Option<(String, Vec<String>)>,
     turn_seq: u32,
     llm_seq: u32,
     total_tools: u32,
@@ -340,12 +367,14 @@ impl AgentTranslator for PiTranslator {
             }
             "context" => {
                 if let Some(event) = decode(event) {
-                    self.capture_context(event, envelope.ts_ms);
+                    let selected = envelope.payload.get("model").and_then(decode);
+                    self.capture_context(event, selected, envelope.ts_ms);
                 }
             }
             "before_provider_request" => {
-                if let Some(event) = decode(event) {
-                    self.provider_request(event);
+                if let Some(call) = self.pending_llms.last_mut() {
+                    call.request_config =
+                        request_config(event.get("payload").unwrap_or(&Value::Null));
                 }
             }
             "message_update" => {
@@ -463,28 +492,28 @@ impl PiTranslator {
                 start_ms: Some(pending.start_ms),
                 end_ms: Some(ts),
                 input: Some(pending.input),
-                metadata: pending.provider,
+                metadata: (!pending.request_config.is_empty())
+                    .then_some(Value::Object(pending.request_config)),
                 error: Some(error.into()),
                 ..Default::default()
             }));
         }
-        for (call, tool) in self.tools.drain() {
+        for (call, tool) in std::mem::take(&mut self.tools) {
             self.total_tools += 1;
             ops.push(SpanOp::Insert(SpanRow {
-                span_id: ids::span_id(&self.session_id, &format!("tool:{}:{call}", self.turn_seq)),
+                span_id: self.tool_span_id(&call),
                 root_span_id: self.effective_root_span_id.clone(),
-                parent_span_ids: vec![turn.clone()],
+                parent_span_ids: vec![self.tool_parent(turn, tool.parent_call.as_deref())],
                 name: tool.name.clone(),
                 span_type: SpanType::Tool,
                 start_ms: Some(tool.start_ms),
                 end_ms: Some(ts),
                 input: Some(tool.args),
-                metadata: Some(with_tool_approval(
-                    json!({
-                        "tool_name": tool.name,
-                        "tool_call_id": call,
-                    }),
-                    Some(ToolApproval::Approved),
+                metadata: Some(tool_metadata(
+                    &tool.name,
+                    &call,
+                    tool.parent_call.as_deref(),
+                    json!({}),
                 )),
                 error: Some(error.into()),
                 ..Default::default()
@@ -581,7 +610,14 @@ impl PiTranslator {
         let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_seq));
         let input = event.prompt.unwrap_or(Value::Null);
         let skills = input.as_str().map(explicit_skills).unwrap_or_default();
-        self.turn = Some((id.clone(), input.clone()));
+        let mut metadata = without_nulls(json!({
+            "turn_number": self.turn_seq,
+            "thinking_level": self.thinking_level,
+        }));
+        if let Some(Value::Object(fields)) = explicit_skill_metadata(&skills) {
+            metadata.as_object_mut().unwrap().extend(fields);
+        }
+        self.turn = Some((id.clone(), skills));
         ops.push(SpanOp::Insert(SpanRow {
             span_id: id,
             root_span_id: self.effective_root_span_id.clone(),
@@ -590,16 +626,17 @@ impl PiTranslator {
             span_type: SpanType::Task,
             start_ms: Some(ts),
             input: Some(input),
-            metadata: Some(json!({
-                "turn_number": self.turn_seq,
-                "loaded_skill_names": skills,
-                "thinking_level": self.thinking_level,
-            })),
+            metadata: Some(metadata),
             ..Default::default()
         }));
         ops
     }
-    fn capture_context(&mut self, event: ContextEvent, ts: i64) {
+    fn capture_context(
+        &mut self,
+        event: ContextEvent,
+        selected_model: Option<SelectedModel>,
+        ts: i64,
+    ) {
         let mut messages = event.messages;
         let native_compaction = messages.iter().position(|message| {
             message.get("role").and_then(Value::as_str) == Some("compactionSummary")
@@ -622,19 +659,9 @@ impl PiTranslator {
             start_ms: ts,
             input,
             first_token_ms: None,
-            provider: None,
+            request_config: Map::new(),
+            selected_model,
         });
-    }
-    fn provider_request(&mut self, event: ProviderRequest) {
-        if let Some(call) = self.pending_llms.last_mut() {
-            let mut provider = event.fields;
-            if let Some(payload) = provider.get_mut("payload").and_then(Value::as_object_mut) {
-                // The authoritative provider-visible messages are already the
-                // LLM span input captured by the preceding context event.
-                payload.remove("messages");
-            }
-            call.provider = Some(Value::Object(provider))
-        }
     }
     fn streaming_update(&mut self, event: MessageUpdate, ts: i64) {
         if let Some(call) = self.pending_llms.last_mut() {
@@ -667,22 +694,17 @@ impl PiTranslator {
                 start_ms: ts,
                 input: json!([]),
                 first_token_ms: None,
-                provider: None,
+                request_config: Map::new(),
+                selected_model: None,
             }
         } else {
             self.pending_llms.remove(0)
         };
         let model = response_model(&message);
-        let prompt = message.usage.input
-            + message.usage.cache_read
-            + message.usage.cache_write
-            + message.usage.cache_write1h;
-        let completion = message.usage.output;
-        let reasoning = message.usage.reasoning;
-        let total = message
-            .usage
-            .total_tokens
-            .unwrap_or(prompt + completion + reasoning);
+        let usage = &message.usage;
+        let prompt = usage.input + usage.cache_read + usage.cache_write;
+        let completion = usage.output;
+        let total = usage.total_tokens.unwrap_or(prompt + completion);
         let output = normalize_assistant(&message);
         let error = message
             .error_message
@@ -691,6 +713,34 @@ impl PiTranslator {
         let ttft = pending
             .first_token_ms
             .map(|first| (first - pending.start_ms) as f64 / 1000.0);
+        // Only a virtual selection differs from the physical model that answered.
+        let selected_model = pending
+            .selected_model
+            .filter(|selected| {
+                message.provider.as_deref() != Some(&selected.provider)
+                    || message.model.as_deref() != Some(&selected.id)
+            })
+            .map(|selected| format!("{}/{}", selected.provider, selected.id));
+        let mut metadata = pending.request_config;
+        if let Value::Object(fields) = without_nulls(json!({
+            "model": model,
+            "provider": message.provider,
+            "api": message.api,
+            "stop_reason": message.stop_reason,
+            "thinking_level": message.thinking_level.as_ref().or(self.thinking_level.as_ref()),
+            "provider_thinking_level": message.provider_thinking_level,
+            "selected_model": selected_model,
+            "response_id": message.response_id,
+        })) {
+            metadata.extend(fields);
+        }
+        // Pi prices unknown models at zero, which would override the backend's
+        // registry pricing, so only a positive Pi estimate is recorded.
+        let cost = usage
+            .cost
+            .as_ref()
+            .and_then(|cost| cost.total)
+            .filter(|total| total.is_finite() && *total > 0.0);
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(
                 &self.session_id,
@@ -704,29 +754,32 @@ impl PiTranslator {
             end_ms: Some(ts),
             input: Some(pending.input),
             output: Some(json!([output])),
-            metadata: Some(json!({
-                "model": model,
-                "provider": message.provider,
-                "api": message.api,
-                "stop_reason": message.stop_reason,
-                "thinking_level": self.thinking_level,
-                "provider_request": pending.provider,
-                "response_id": message.response_id,
-            })),
-            metrics: Some(json!({
+            metadata: Some(Value::Object(metadata)),
+            metrics: Some(without_nulls(json!({
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
-                "reasoning_tokens": reasoning,
+                "completion_reasoning_tokens": usage.reasoning,
                 "tokens": total,
-                "prompt_cached_tokens": message.usage.cache_read,
-                "prompt_cache_creation_tokens": message.usage.cache_write
-                    + message.usage.cache_write1h,
+                "prompt_cached_tokens": usage.cache_read,
+                "prompt_cache_creation_tokens": usage.cache_write,
+                "prompt_cache_creation_5m_tokens": usage
+                    .cache_write1h
+                    .map(|long| (usage.cache_write - long).max(0)),
+                "prompt_cache_creation_1h_tokens": usage.cache_write1h,
                 "time_to_first_token": ttft,
-                "cost": message.usage.cost,
-            })),
+                "estimated_cost": cost,
+            }))),
             error,
             ..Default::default()
         })]
+    }
+    /// Tool span ids are deterministic per turn, so a nested call can name its
+    /// calling tool's span without the translator retaining it.
+    fn tool_span_id(&self, call: &str) -> String {
+        ids::span_id(&self.session_id, &format!("tool:{}:{call}", self.turn_seq))
+    }
+    fn tool_parent(&self, turn: &str, parent_call: Option<&str>) -> String {
+        parent_call.map_or_else(|| turn.to_owned(), |call| self.tool_span_id(call))
     }
     fn tool_start(&mut self, event: ToolExecutionStart, ts: i64) -> Vec<SpanOp> {
         let id = event.tool_call_id;
@@ -738,34 +791,35 @@ impl PiTranslator {
         if self.tools.contains_key(&id) {
             return vec![];
         }
+        let parent = self.tool_parent(turn, event.parent_tool_call_id.as_deref());
         self.tools.insert(
             id.clone(),
             ToolStart {
                 start_ms: ts,
                 name: name.clone(),
                 args: args.clone(),
+                parent_call: event.parent_tool_call_id.clone(),
             },
         );
         vec![SpanOp::Insert(SpanRow {
-            span_id: ids::span_id(&self.session_id, &format!("tool:{}:{id}", self.turn_seq)),
+            span_id: self.tool_span_id(&id),
             root_span_id: self.effective_root_span_id.clone(),
-            parent_span_ids: vec![turn.clone()],
+            parent_span_ids: vec![parent],
             name: name.clone(),
             span_type: SpanType::Tool,
             start_ms: Some(ts),
             input: Some(args),
-            metadata: Some(with_tool_approval(
-                json!({
-                    "tool_name": name,
-                    "tool_call_id": id,
-                }),
-                Some(ToolApproval::Approved),
+            metadata: Some(tool_metadata(
+                &name,
+                &id,
+                event.parent_tool_call_id.as_deref(),
+                json!({}),
             )),
             ..Default::default()
         })]
     }
     fn tool_end(&mut self, event: ToolExecutionEnd, ts: i64) -> Vec<SpanOp> {
-        let Some((turn, _)) = &self.turn else {
+        let Some((turn, requested_skills)) = &self.turn else {
             return vec![];
         };
         let call = event.tool_call_id.unwrap_or_default();
@@ -774,32 +828,38 @@ impl PiTranslator {
             start_ms: ts,
             name: event.tool_name.unwrap_or_else(|| "tool".into()),
             args: Value::Null,
+            parent_call: event.parent_tool_call_id,
         });
         self.total_tools += 1;
         let failed = event.is_error;
         let skill = skill_from_read(&tracked.name, &tracked.args);
         let name = skill
             .as_ref()
-            .map(|s| format!("skill: {s}"))
+            .map(|skill| format!("skill: {}", skill.name))
             .unwrap_or_else(|| tracked.name.clone());
+        let explicit = skill
+            .as_ref()
+            .is_some_and(|skill| requested_skills.contains(&skill.name));
         let row = SpanRow {
-            span_id: ids::span_id(&self.session_id, &format!("tool:{}:{call}", self.turn_seq)),
+            span_id: self.tool_span_id(&call),
             root_span_id: self.effective_root_span_id.clone(),
-            parent_span_ids: vec![turn.clone()],
+            parent_span_ids: vec![self.tool_parent(turn, tracked.parent_call.as_deref())],
             name,
             span_type: SpanType::Tool,
             start_ms: pending.is_none().then_some(tracked.start_ms),
             end_ms: Some(ts),
             input: pending.is_none().then_some(tracked.args),
             output: event.result.clone(),
-            metadata: Some(with_tool_approval(
+            metadata: Some(tool_metadata(
+                &tracked.name,
+                &call,
+                tracked.parent_call.as_deref(),
                 json!({
-                    "tool_name": if skill.is_some() { "skill" } else { &tracked.name },
-                    "original_tool_name": tracked.name,
-                    "tool_call_id": call,
-                    "skill_name": skill,
+                    "tool_kind": skill.as_ref().map(|_| "skill"),
+                    "skill_name": skill.as_ref().map(|skill| &skill.name),
+                    "skill_path": skill.as_ref().map(|skill| &skill.path),
+                    "skill_load_trigger": explicit.then_some("explicit"),
                 }),
-                Some(ToolApproval::Approved),
             )),
             error: failed.then(|| format_error(&tracked.name, event.result.as_ref())),
             ..Default::default()
@@ -982,6 +1042,215 @@ fn response_model(message: &AssistantMessage) -> Option<String> {
     .next()
     .cloned()
 }
+/// The request configuration the instrumentation spec allows on LLM spans,
+/// read individually from the provider-native payload: sampling settings plus
+/// the available tool definitions and controls. Pi's API adapters name these
+/// per provider and nest them for Google, Bedrock, and Pi's own API.
+///
+/// The output is itself a valid payload for this function, because the
+/// journal stores it in place of the provider payload.
+pub(crate) fn request_config(payload: &Value) -> Map<String, Value> {
+    const FIELDS: &[(&str, &[&str])] = &[
+        ("temperature", &["temperature"]),
+        ("top_p", &["top_p", "topP"]),
+        (
+            "max_tokens",
+            &[
+                "max_tokens",
+                "max_completion_tokens",
+                "max_output_tokens",
+                "maxOutputTokens",
+                "maxTokens",
+            ],
+        ),
+        (
+            "frequency_penalty",
+            &["frequency_penalty", "frequencyPenalty"],
+        ),
+        ("presence_penalty", &["presence_penalty", "presencePenalty"]),
+        ("stop", &["stop", "stop_sequences", "stopSequences"]),
+        ("response_format", &["response_format"]),
+    ];
+    let scopes = [
+        Some(payload),
+        payload.get("config"),
+        payload.get("generationConfig"),
+        payload.get("inferenceConfig"),
+        payload.get("options"),
+    ];
+    let mut config = tool_config(payload);
+    for (field, aliases) in FIELDS {
+        let value = scopes.iter().flatten().find_map(|scope| {
+            aliases
+                .iter()
+                .find_map(|alias| scope.get(alias).filter(|value| !value.is_null()))
+        });
+        if let Some(value) = value {
+            config.insert((*field).into(), value.clone());
+        }
+    }
+    config
+}
+/// `metadata.tools`, `tool_choice`, and `parallel_tool_calls` in the spec's
+/// OpenAI shape. Built-in provider tools keep their native definition.
+fn tool_config(payload: &Value) -> Map<String, Value> {
+    let google = payload.get("config");
+    let bedrock = payload.get("toolConfig");
+    let tools: Vec<Value> = [
+        payload.get("tools"),
+        payload.pointer("/context/tools"),
+        google.and_then(|config| config.get("tools")),
+        bedrock.and_then(|config| config.get("tools")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_array)
+    .into_iter()
+    .flatten()
+    .flat_map(tool_definitions)
+    .collect();
+    let choice = [
+        payload.get("tool_choice"),
+        payload.get("toolChoice"),
+        payload.pointer("/options/toolChoice"),
+        google.and_then(|config| config.pointer("/toolConfig/functionCallingConfig")),
+        bedrock.and_then(|config| config.get("toolChoice")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|choice| !choice.is_null());
+    // Anthropic expresses parallelism inside its tool_choice object.
+    let parallel = payload
+        .get("parallel_tool_calls")
+        .or_else(|| payload.get("parallelToolCalls"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            choice
+                .and_then(|choice| choice.get("disable_parallel_tool_use"))
+                .and_then(Value::as_bool)
+                .map(|disabled| !disabled)
+        });
+    let mut config = Map::new();
+    if !tools.is_empty() {
+        config.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(choice) = choice.and_then(tool_choice) {
+        config.insert("tool_choice".into(), choice);
+    }
+    if let Some(parallel) = parallel {
+        config.insert("parallel_tool_calls".into(), json!(parallel));
+    }
+    if let Some(max) = payload.get("max_tool_calls").filter(|max| max.is_u64()) {
+        config.insert("max_tool_calls".into(), max.clone());
+    }
+    config
+}
+fn tool_definitions(tool: &Value) -> Vec<Value> {
+    let function = |definition: &Value, parameters: Option<&Value>| {
+        json!({
+            "type": "function",
+            "function": without_nulls(json!({
+                "name": definition.get("name"),
+                "description": definition.get("description"),
+                "parameters": parameters,
+                "strict": definition.get("strict").filter(|strict| strict.is_boolean()),
+            })),
+        })
+    };
+    if let Some(declarations) = tool.get("functionDeclarations").and_then(Value::as_array) {
+        return declarations
+            .iter()
+            .map(|declaration| {
+                let parameters = declaration
+                    .get("parametersJsonSchema")
+                    .or_else(|| declaration.get("parameters"));
+                function(declaration, parameters)
+            })
+            .collect();
+    }
+    if let Some(spec) = tool.get("toolSpec") {
+        return vec![function(spec, spec.pointer("/inputSchema/json"))];
+    }
+    if tool.get("cachePoint").is_some() {
+        return vec![];
+    }
+    let native_type = tool.get("type").and_then(Value::as_str);
+    let definition = match (native_type, tool.get("function")) {
+        // OpenAI Chat Completions and Mistral, including this function's output.
+        (Some("function"), Some(chat)) => function(chat, chat.get("parameters")),
+        // OpenAI Responses.
+        (Some("function"), None) => function(tool, tool.get("parameters")),
+        // Anthropic, or Pi's own API, whose function tools carry no type.
+        (None, _) if tool.get("name").is_some() => {
+            let parameters = tool.get("input_schema").or_else(|| tool.get("parameters"));
+            function(tool, parameters)
+        }
+        // Built-in provider tools such as web search.
+        _ => tool.clone(),
+    };
+    vec![definition]
+}
+/// Normalizes a provider's tool choice to `auto`, `none`, `required`, or a
+/// named function. Unrecognized choices are omitted rather than guessed.
+fn tool_choice(choice: &Value) -> Option<Value> {
+    let named = |name: Option<&Value>| {
+        let name = name.and_then(Value::as_str)?;
+        Some(json!({"type": "function", "function": {"name": name}}))
+    };
+    let mode = |mode: &str| match mode.to_ascii_lowercase().as_str() {
+        // Google's VALIDATED mode lets the model choose, with schema checks.
+        "auto" | "validated" => Some(json!("auto")),
+        "none" => Some(json!("none")),
+        "any" | "required" => Some(json!("required")),
+        _ => None,
+    };
+    if let Some(choice) = choice.as_str() {
+        return mode(choice);
+    }
+    // Google `functionCallingConfig`.
+    if let Some(google) = choice.get("mode").and_then(Value::as_str) {
+        let allowed = choice
+            .get("allowedFunctionNames")
+            .and_then(Value::as_array)
+            .filter(|names| names.len() == 1);
+        return match (google.eq_ignore_ascii_case("any"), allowed) {
+            (true, Some(names)) => named(names.first()),
+            _ => mode(google),
+        };
+    }
+    // Bedrock `toolChoice`.
+    if let Some(tool) = choice.get("tool") {
+        return named(tool.get("name"));
+    }
+    if choice.get("auto").is_some() {
+        return mode("auto");
+    }
+    if choice.get("any").is_some() {
+        return mode("any");
+    }
+    match choice.get("type").and_then(Value::as_str)? {
+        "function" => named(
+            choice
+                .pointer("/function/name")
+                .or_else(|| choice.get("name")),
+        ),
+        // Anthropic.
+        "tool" => named(choice.get("name")),
+        other => mode(other),
+    }
+}
+/// Pi runs every tool it reports, so tool spans are always approved.
+fn tool_metadata(name: &str, call: &str, parent_call: Option<&str>, extra: Value) -> Value {
+    let mut metadata = json!({
+        "tool_name": name,
+        "tool_call_id": call,
+        "parent_tool_call_id": parent_call,
+    });
+    if let (Some(metadata), Value::Object(extra)) = (metadata.as_object_mut(), extra) {
+        metadata.extend(extra);
+    }
+    with_tool_approval(without_nulls(metadata), Some(ToolApproval::Approved))
+}
 fn normalize_assistant(message: &AssistantMessage) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
@@ -1021,7 +1290,11 @@ fn normalize_assistant(message: &AssistantMessage) -> Value {
     }
     out
 }
-fn skill_from_read(tool: &str, args: &Value) -> Option<String> {
+struct SkillLoad {
+    name: String,
+    path: String,
+}
+fn skill_from_read(tool: &str, args: &Value) -> Option<SkillLoad> {
     if tool != "read" {
         return None;
     }
@@ -1033,7 +1306,11 @@ fn skill_from_read(tool: &str, args: &Value) -> Option<String> {
     if !path.to_ascii_lowercase().ends_with("/skill.md") {
         return None;
     }
-    path.rsplit('/').nth(1).map(str::to_owned)
+    let name = path.rsplit('/').nth(1)?.to_owned();
+    Some(SkillLoad {
+        name,
+        path: path.to_owned(),
+    })
 }
 fn explicit_skills(input: &str) -> Vec<String> {
     input
