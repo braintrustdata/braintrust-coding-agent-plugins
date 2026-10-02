@@ -386,6 +386,75 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
 }
 
 #[tokio::test]
+async fn repeated_transcript_prompt_is_delivered_as_a_second_turn_after_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let socket = endpoint(tmp.path());
+    let native = tmp.path().join("native.jsonl");
+    let daemon = start(&data, &socket).await;
+    let first = transcript("continue", "first answer");
+    std::fs::write(&native, &first).unwrap();
+    send(
+        &socket,
+        "stop",
+        1000,
+        json!({"status":"completed","transcript_path":native}),
+    )
+    .await;
+    assert!(
+        flush_session("cursor-recovery", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    let second = transcript("continue", "second answer");
+    std::fs::write(&native, format!("{first}{second}")).unwrap();
+    send(
+        &socket,
+        "stop",
+        2000,
+        json!({"status":"completed","transcript_path":native}),
+    )
+    .await;
+    assert!(
+        flush_session("cursor-recovery", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    shutdown_daemon(&socket).await.unwrap();
+    daemon.await.unwrap();
+
+    let delivered = rows(&data.join("spans/cursor-recovery.ndjson"));
+    let turns: Vec<_> = delivered
+        .iter()
+        .filter_map(|op| op.get("Insert"))
+        .filter(|row| {
+            row["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("Turn "))
+        })
+        .collect();
+    assert_eq!(
+        turns.len(),
+        2,
+        "the delivery ledger must accept a distinct second turn"
+    );
+    assert_ne!(turns[0]["span_id"], turns[1]["span_id"]);
+    for (turn, answer) in turns.iter().zip(["first answer", "second answer"]) {
+        assert_eq!(turn["input"], "continue");
+        let output = delivered
+            .iter()
+            .filter_map(|op| op.get("Merge"))
+            .filter(|row| row["span_id"] == turn["span_id"])
+            .filter_map(|row| row.get("output"))
+            .next_back()
+            .unwrap();
+        assert_eq!(output, answer);
+    }
+}
+
+#[tokio::test]
 async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_recovery() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");

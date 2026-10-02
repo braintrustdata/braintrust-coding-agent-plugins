@@ -474,6 +474,59 @@ fn synthetic_transcript_partial_records_and_large_batches_are_bounded_and_option
     assert_eq!(h.turns().len(), 1);
 }
 #[test]
+fn repeated_transcript_prompt_after_stop_creates_a_new_turn_without_a_prompt_hook() {
+    for first_prompt_hook in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("repeated-prompts.jsonl");
+        let first =
+            transcript_record("user", "continue") + &transcript_record("assistant", "first answer");
+        let second = transcript_record("user", "continue")
+            + &transcript_record("assistant", "second answer");
+        std::fs::write(&path, format!("{first}{second}")).unwrap();
+        let mut h = Harness::new("test-session");
+        if first_prompt_hook {
+            h.handle(&event(
+                "beforeSubmitPrompt",
+                100,
+                json!({"generation_id":"t1","prompt":"continue"}),
+            ));
+        }
+        h.handle(&mirrored(
+            "stop",
+            200,
+            &path,
+            first.len() as u64,
+            json!({"status":"completed"}),
+        ));
+        h.handle(&mirrored(
+            "stop",
+            300,
+            &path,
+            (first.len() + second.len()) as u64,
+            json!({"status":"completed"}),
+        ));
+        h.finish();
+        let turns = h.turns();
+        assert_eq!(turns.len(), 2);
+        assert_ne!(turns[0].span_id, turns[1].span_id);
+        let rows = h.rows();
+        for (turn, answer, end) in [
+            (turns[0], "first answer", 200),
+            (turns[1], "second answer", 300),
+        ] {
+            assert_eq!(rows[&turn.span_id]["input"], "continue");
+            assert_eq!(rows[&turn.span_id]["output"], answer);
+            assert_eq!(rows[&turn.span_id]["end_ms"], end);
+        }
+        let llms = h.inserted(SpanType::Llm);
+        assert_eq!(llms.len(), 2);
+        for (llm, turn) in llms.into_iter().zip(turns) {
+            assert_eq!(llm.parent_span_ids, vec![turn.span_id.clone()]);
+        }
+    }
+}
+
+#[test]
 fn synthetic_delayed_transcript_after_closed_native_turn_does_not_create_phantom_turn() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("transcript.jsonl");

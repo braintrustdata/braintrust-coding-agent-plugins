@@ -967,10 +967,11 @@ impl CursorTranslator {
                 return;
             }
             let matching = self.turn.as_ref().is_some_and(|t| {
-                t.prompt.is_none()
-                    || t.prompt
-                        .as_deref()
-                        .is_some_and(|p| p.trim() == prompt.trim())
+                t.end.is_none()
+                    && (t.prompt.is_none()
+                        || t.prompt
+                            .as_deref()
+                            .is_some_and(|p| p.trim() == prompt.trim()))
             });
             if matching {
                 let turn = self.turn.as_mut().unwrap();
