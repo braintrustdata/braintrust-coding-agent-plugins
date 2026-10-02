@@ -1445,27 +1445,21 @@ fn transcript_record(role: &str, text: &str) -> String {
     )
 }
 #[test]
-fn synthetic_truncated_mirror_generation_maps_its_first_user_record_to_second_native_turn() {
+fn synthetic_truncated_mirror_after_stop_maps_its_first_user_record_to_native_turn() {
     let temporary = tempfile::tempdir().unwrap();
-    let first_mirror = temporary.path().join("generation-1.jsonl");
-    let second_mirror = temporary.path().join("generation-2.jsonl");
-    let first =
-        transcript_record("user", "first prompt") + &transcript_record("assistant", "first answer");
+    let mirror = temporary.path().join("generation-2.jsonl");
     let second = transcript_record("user", "second prompt")
         + &transcript_record("assistant", "second answer");
-    std::fs::write(&first_mirror, &first).unwrap();
-    std::fs::write(&second_mirror, &second).unwrap();
+    std::fs::write(&mirror, &second).unwrap();
     let mut h = Harness::new("test-session");
     h.handle(&event(
         "beforeSubmitPrompt",
         100,
         json!({"generation_id":"t1","prompt":"first prompt"}),
     ));
-    h.handle(&mirrored(
+    h.handle(&event(
         "stop",
         110,
-        &first_mirror,
-        first.len() as u64,
         json!({"generation_id":"t1","status":"completed"}),
     ));
     h.handle(&event(
@@ -1473,12 +1467,19 @@ fn synthetic_truncated_mirror_generation_maps_its_first_user_record_to_second_na
         120,
         json!({"generation_id":"t2","prompt":"second prompt"}),
     ));
-    h.handle(&mirrored(
+    h.handle(&event(
         "stop",
         130,
-        &second_mirror,
-        second.len() as u64,
         json!({"generation_id":"t2","status":"completed"}),
+    ));
+    // The truncated mirror is first observed after the owning native turn has
+    // already stopped; its physical first-user ordinal is not native ordinal 1.
+    h.handle(&mirrored(
+        "sessionEnd",
+        140,
+        &mirror,
+        second.len() as u64,
+        json!({"reason":"completed"}),
     ));
     h.finish();
     assert_eq!(
@@ -1487,12 +1488,48 @@ fn synthetic_truncated_mirror_generation_maps_its_first_user_record_to_second_na
         "physical user ordinal one is not a stable native turn identity after truncation"
     );
     let rows = h.rows();
-    assert_eq!(rows[&h.turns()[0].span_id]["output"], "first answer");
+    assert!(rows[&h.turns()[0].span_id].get("output").is_none());
     assert_eq!(rows[&h.turns()[1].span_id]["output"], "second answer");
-    assert_eq!(h.inserted(SpanType::Llm).len(), 2);
-    for (llm, turn) in h.inserted(SpanType::Llm).into_iter().zip(h.turns()) {
-        assert_eq!(llm.parent_span_ids, vec![turn.span_id.clone()]);
+    assert!(h.inserted(SpanType::Llm).is_empty());
+}
+#[test]
+fn ambiguous_rewritten_prompt_does_not_overwrite_either_identical_native_turn() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mirror = temporary.path().join("rewritten.jsonl");
+    let transcript = transcript_record("user", "try again")
+        + &transcript_record("assistant", "rewritten answer");
+    std::fs::write(&mirror, &transcript).unwrap();
+    let mut h = Harness::new("test-session");
+    for (generation, start, answer) in [("t1", 100, "answer one"), ("t2", 200, "answer two")] {
+        h.handle(&event(
+            "beforeSubmitPrompt",
+            start,
+            json!({"generation_id":generation,"prompt":"try again"}),
+        ));
+        h.handle(&event(
+            "afterAgentResponse",
+            start + 10,
+            json!({"generation_id":generation,"text":answer}),
+        ));
+        h.handle(&event(
+            "stop",
+            start + 20,
+            json!({"generation_id":generation,"status":"completed"}),
+        ));
     }
+    h.handle(&mirrored(
+        "sessionEnd",
+        300,
+        &mirror,
+        transcript.len() as u64,
+        json!({"reason":"completed"}),
+    ));
+    h.finish();
+    let rows = h.rows();
+    let turns = h.turns();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(rows[&turns[0].span_id]["output"], "answer one");
+    assert_eq!(rows[&turns[1].span_id]["output"], "answer two");
 }
 #[test]
 fn synthetic_rewrite_removing_terminal_marker_does_not_reemit_shifted_assistant_records() {

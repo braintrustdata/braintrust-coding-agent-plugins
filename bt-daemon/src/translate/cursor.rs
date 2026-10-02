@@ -165,6 +165,7 @@ struct TranscriptCursor {
     partial: Vec<u8>,
     oversize: bool,
     assistant_records: u64,
+    prompt_owners: RecentMap<u64, (String, String)>,
 }
 impl TranscriptCursor {
     fn read_batch(&mut self, path: &str, through: u64) -> anyhow::Result<(Vec<Value>, bool, bool)> {
@@ -228,7 +229,7 @@ struct CursorTranslator {
     transcript: TranscriptCursor,
     transcript_users: u64,
     transcript_owner: Option<String>,
-    transcript_prompts: RecentMap<u64, (String, String)>,
+    transcript_unattributed: bool,
     pending: Option<Envelope>,
     subagents: BTreeMap<String, SpanRow>,
     compact_seq: u64,
@@ -259,7 +260,7 @@ impl CursorTranslator {
             transcript: TranscriptCursor::default(),
             transcript_users: 0,
             transcript_owner: None,
-            transcript_prompts: RecentMap::default(),
+            transcript_unattributed: false,
             pending: None,
             subagents: BTreeMap::new(),
             compact_seq: 0,
@@ -956,6 +957,7 @@ impl CursorTranslator {
             };
             self.transcript_users = 0;
             self.transcript_owner = None;
+            self.transcript_unattributed = false;
         }
         if self.transcript.offset >= through {
             return Ok(true);
@@ -996,30 +998,52 @@ impl CursorTranslator {
                 return;
             }
             self.transcript_users += 1;
+            self.transcript_unattributed = false;
             let full_prompt = content.map(text_content).unwrap_or_default();
             let prompt = transcript_prompt(&full_prompt).to_string();
-            if let Some((known_prompt, id)) =
-                self.transcript_prompts.get(&self.transcript_users).cloned()
+            if let Some((known_prompt, id)) = self
+                .transcript
+                .prompt_owners
+                .get(&self.transcript_users)
+                .cloned()
             {
                 if known_prompt.trim() == prompt.trim() {
                     self.transcript_owner = Some(id);
                     return;
                 }
             }
-            let native_match = self
+            let native_matches = self
                 .prompt_generations
                 .iter()
-                .find(|(_, t)| {
-                    t.ordinal == self.transcript_users
-                        && t.prompt
-                            .as_deref()
-                            .is_some_and(|p| p.trim() == prompt.trim())
+                .filter(|(_, t)| {
+                    t.prompt
+                        .as_deref()
+                        .is_some_and(|p| p.trim() == prompt.trim())
                 })
-                .map(|(_, t)| t.id.clone());
-            if let Some(id) = native_match {
-                self.transcript_prompts
+                .map(|(_, t)| t.id.clone())
+                .filter(|id| {
+                    !self
+                        .transcript
+                        .prompt_owners
+                        .iter()
+                        .any(|(_, (_, owner))| owner == id)
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            if native_matches.len() == 1 {
+                let id = native_matches.into_iter().next().unwrap();
+                self.transcript
+                    .prompt_owners
                     .insert(self.transcript_users, (prompt.clone(), id.clone()));
                 self.transcript_owner = Some(id);
+                return;
+            }
+            if native_matches.len() > 1 {
+                // A rewritten mirror has a generation-local ordinal. If its
+                // prompt matches several native turns, do not guess which one
+                // owns the following assistant records.
+                self.transcript_owner = None;
+                self.transcript_unattributed = true;
+                self.history.truncated = true;
                 return;
             }
             let matching = self.turn.as_ref().is_some_and(|t| {
@@ -1045,12 +1069,13 @@ impl CursorTranslator {
                 if add {
                     self.history.push(json!({"role":"user","content":prompt}));
                 }
-                self.transcript_prompts
+                self.transcript
+                    .prompt_owners
                     .insert(self.transcript_users, (prompt.clone(), id));
             } else {
                 self.close_turn(ts, Some("transcript_boundary"), ops);
                 self.ensure_turn(ts, Some(prompt), None, "transcript_user_message", ops);
-                self.transcript_prompts.insert(
+                self.transcript.prompt_owners.insert(
                     self.transcript_users,
                     (
                         self.turn
@@ -1063,11 +1088,17 @@ impl CursorTranslator {
                     ),
                 );
             }
+            self.transcript_unattributed = false;
             self.transcript_owner = self
-                .transcript_prompts
+                .transcript
+                .prompt_owners
                 .get(&self.transcript_users)
                 .map(|(_, id)| id.clone());
         } else if role == "assistant" {
+            if self.transcript_unattributed {
+                self.history.truncated = true;
+                return;
+            }
             if let Some(content) = content {
                 let text = text_content(content);
                 if text.is_empty() {
