@@ -25,7 +25,14 @@ const ANTIGRAVITY_PLUGIN: &str = "braintrust-antigravity-tracing";
 const LEGACY_CLAUDE_TRACING_ENV_KEYS: [&str; 2] = ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"];
 const ANTIGRAVITY_PLUGIN_SOURCE: &str =
     "https://github.com/braintrustdata/braintrust-antigravity-plugin";
-
+const CURSOR_PLUGIN_SOURCE: &str = "braintrustdata/braintrust-cursor-plugin";
+const CURSOR_PLUGIN_MANIFEST: &str =
+    include_str!("../../src/plugins/cursor/content/.cursor-plugin/plugin.json");
+const CURSOR_HOOKS_MANIFEST: &str =
+    include_str!("../../src/plugins/cursor/content/hooks/hooks.json");
+const CURSOR_HOOK_LAUNCHER: &str = include_str!("../../src/plugins/cursor/content/hooks/trace.sh");
+const CURSOR_README: &str = include_str!("../../src/plugins/cursor/content/README.md");
+const CURSOR_LICENSE: &str = include_str!("../../src/plugins/cursor/content/LICENSE");
 fn package_version(manifest: &str) -> anyhow::Result<String> {
     let manifest = serde_json::from_str::<Value>(manifest)?;
     manifest
@@ -78,9 +85,329 @@ pub(crate) fn update_warning(source: &str) -> Option<String> {
         }, &package_version(include_str!("../../src/plugins/claude/content/plugins/trace-claude-code/.claude-plugin/plugin.json")).ok()?),
         "opencode" => opencode_update_required(),
         "pi" => pi_update_required(),
+        "cursor" => cursor_update_required(),
         _ => false,
     };
     stale.then(|| format!("tracing plugin is out of date; run `bt trace update {source}`"))
+}
+
+fn cursor_installed_manifest_at(plugin: &Path) -> Option<Value> {
+    let raw = std::fs::read(plugin.join(".cursor-plugin/plugin.json")).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+pub(crate) fn cursor_plugin_is_installed_at(plugin: &Path) -> bool {
+    cursor_installed_manifest_at(plugin).is_some_and(|manifest| cursor_plugin_is_ours(&manifest))
+}
+
+fn cursor_update_required() -> bool {
+    let plugin = paths::cursor_plugin_dir();
+    let Some(installed_manifest) = cursor_installed_manifest_at(&plugin) else {
+        return false;
+    };
+    if !cursor_plugin_is_ours(&installed_manifest) {
+        return false;
+    }
+    let expected = package_version(CURSOR_PLUGIN_MANIFEST).ok();
+    let installed = installed_manifest.get("version").and_then(Value::as_str);
+    installed
+        .zip(expected.as_deref())
+        .is_some_and(|(installed, expected)| version_is_older(installed, expected))
+}
+
+fn cursor_plugin_is_ours(manifest: &Value) -> bool {
+    manifest.get("name").and_then(Value::as_str) == Some("trace-cursor")
+        && manifest
+            .get("repository")
+            .and_then(Value::as_str)
+            .is_some_and(|repo| {
+                github_repo_matches(repo, "braintrustdata/braintrust-coding-agent-plugins")
+                    || github_repo_matches(repo, CURSOR_PLUGIN_SOURCE)
+            })
+}
+
+fn install_cursor_plugin_at(plugin_dir: &Path) -> anyhow::Result<()> {
+    let parent = plugin_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!("Cursor plugin path has no parent: {}", plugin_dir.display())
+    })?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create Cursor plugin directory: {}",
+            parent.display()
+        )
+    })?;
+
+    if plugin_dir.exists() {
+        let manifest_path = plugin_dir.join(".cursor-plugin/plugin.json");
+        let installed: Value = std::fs::read(&manifest_path)
+            .with_context(|| {
+                format!(
+                    "refusing to replace unrecognized Cursor plugin at {}",
+                    plugin_dir.display()
+                )
+            })
+            .and_then(|raw| {
+                serde_json::from_slice(&raw).context("installed plugin manifest is invalid")
+            })?;
+        if !cursor_plugin_is_ours(&installed) {
+            bail!(
+                "refusing to replace a different Cursor plugin at {}; remove it manually first",
+                plugin_dir.display()
+            );
+        }
+    }
+
+    let stage = tempfile::Builder::new()
+        .prefix(".trace-cursor-")
+        .tempdir_in(parent)
+        .with_context(|| format!("failed to stage Cursor plugin in {}", parent.display()))?;
+    let staged_plugin = stage.path().join("trace-cursor");
+    std::fs::create_dir_all(staged_plugin.join(".cursor-plugin"))?;
+    std::fs::create_dir_all(staged_plugin.join("hooks"))?;
+    for (relative, contents) in [
+        (".cursor-plugin/plugin.json", CURSOR_PLUGIN_MANIFEST),
+        ("hooks/hooks.json", CURSOR_HOOKS_MANIFEST),
+        ("hooks/trace.sh", CURSOR_HOOK_LAUNCHER),
+        ("README.md", CURSOR_README),
+        ("LICENSE", CURSOR_LICENSE),
+    ] {
+        std::fs::write(staged_plugin.join(relative), contents)
+            .with_context(|| format!("failed to write Cursor plugin file {relative}"))?;
+        if relative == "hooks/trace.sh" {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    staged_plugin.join(relative),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .with_context(|| format!("failed to make Cursor hook executable: {relative}"))?;
+            }
+        }
+    }
+
+    let backup = stage.path().join("previous");
+    let had_previous = plugin_dir.exists();
+    if had_previous {
+        std::fs::rename(plugin_dir, &backup).with_context(|| {
+            format!(
+                "failed to stage existing Cursor plugin at {}",
+                plugin_dir.display()
+            )
+        })?;
+    }
+    if let Err(error) = std::fs::rename(&staged_plugin, plugin_dir) {
+        if had_previous {
+            let _ = std::fs::rename(&backup, plugin_dir);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed to install Cursor plugin at {}",
+                plugin_dir.display()
+            )
+        });
+    }
+    if had_previous {
+        std::fs::remove_dir_all(backup).with_context(|| {
+            format!(
+                "failed to remove previous Cursor plugin backup for {}",
+                plugin_dir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn setup_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
+    install_cursor_plugin_at(plugin_dir)
+}
+
+fn cursor_discovery_hook_specs(marker: &str) -> Vec<(String, String)> {
+    [
+        ("beforeSubmitPrompt", r#"'{"continue":true}'"#),
+        ("afterAgentResponse", "'{}'"),
+        ("stop", "'{}'"),
+    ]
+    .into_iter()
+    .map(|(event, response)| {
+        (
+            event.to_owned(),
+            format!("printf '%s\\n' {response} # {marker}"),
+        )
+    })
+    .collect()
+}
+
+fn apply_cursor_hook_specs(
+    config: &mut Map<String, Value>,
+    path: &Path,
+    specs: &[(String, String)],
+    enable: bool,
+) -> anyhow::Result<()> {
+    if enable {
+        config
+            .entry("version")
+            .or_insert_with(|| Value::Number(1.into()));
+    }
+
+    if enable || config.contains_key("hooks") {
+        let hooks = config
+            .entry("hooks")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cursor hooks must be a JSON object: {}", path.display())
+            })?;
+
+        for (event, command) in specs {
+            let Some(entries) = hooks.get_mut(event) else {
+                if enable {
+                    hooks.insert(
+                        event.clone(),
+                        Value::Array(vec![cursor_discovery_hook(command)]),
+                    );
+                }
+                continue;
+            };
+            let entries = entries.as_array_mut().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cursor hook event `{event}` must be an array: {}",
+                    path.display()
+                )
+            })?;
+            entries.retain(|entry| {
+                entry.get("command").and_then(Value::as_str) != Some(command.as_str())
+            });
+            if enable {
+                entries.push(cursor_discovery_hook(command));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_cursor_hooks_at(
+    config_dir: &Path,
+    specs: &[(String, String)],
+    enable: bool,
+) -> anyhow::Result<()> {
+    let path = config_dir.join("hooks.json");
+    let mut config = load_object(&path)?;
+    apply_cursor_hook_specs(&mut config, &path, specs, enable)
+}
+
+fn update_cursor_hooks_at(
+    config_dir: &Path,
+    specs: &[(String, String)],
+    enable: bool,
+) -> anyhow::Result<()> {
+    let path = config_dir.join("hooks.json");
+    crate::settings::with_settings_lock(&path, || {
+        let mut config = load_object(&path)?;
+        let original = config.clone();
+        apply_cursor_hook_specs(&mut config, &path, specs, enable)?;
+        if config != original {
+            write_object_atomic_unlocked(&path, config, FileAccess::Inherited)?;
+        }
+        Ok(())
+    })
+}
+
+fn cursor_discovery_hook(command: &str) -> Value {
+    serde_json::json!({
+        "command": command,
+        "timeout": 10,
+        "failClosed": false
+    })
+}
+
+fn setup_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    validate_cursor_hooks_at(config_dir, &hooks, true)?;
+    setup_cursor_at(plugin_dir)?;
+    update_cursor_hooks_at(config_dir, &hooks, true)
+}
+
+pub(crate) struct CursorManagedHooks {
+    config_dir: PathBuf,
+    specs: Vec<(String, String)>,
+}
+
+impl CursorManagedHooks {
+    pub(crate) fn install(config_dir: &Path, run_id: &str) -> anyhow::Result<Self> {
+        let specs = cursor_discovery_hook_specs(&format!("braintrust-cursor-managed-{run_id}"));
+        update_cursor_hooks_at(config_dir, &specs, true)?;
+        Ok(Self {
+            config_dir: config_dir.to_path_buf(),
+            specs,
+        })
+    }
+}
+
+impl Drop for CursorManagedHooks {
+    fn drop(&mut self) {
+        if let Err(error) = update_cursor_hooks_at(&self.config_dir, &self.specs, false) {
+            tracing::warn!(%error, "failed to remove managed Cursor hook discovery entries");
+        }
+    }
+}
+
+fn disable_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
+    if !plugin_dir.exists() {
+        return Ok(());
+    }
+    let manifest_path = plugin_dir.join(".cursor-plugin/plugin.json");
+    let installed: Value = std::fs::read(&manifest_path)
+        .with_context(|| {
+            format!(
+                "refusing to remove unrecognized Cursor plugin at {}",
+                plugin_dir.display()
+            )
+        })
+        .and_then(|raw| {
+            serde_json::from_slice(&raw).context("installed plugin manifest is invalid")
+        })?;
+    if !cursor_plugin_is_ours(&installed) {
+        bail!(
+            "refusing to remove a different Cursor plugin at {}",
+            plugin_dir.display()
+        );
+    }
+    std::fs::remove_dir_all(plugin_dir)
+        .with_context(|| format!("failed to remove Cursor plugin at {}", plugin_dir.display()))
+}
+
+fn disable_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    validate_cursor_hooks_at(config_dir, &hooks, false)?;
+    disable_cursor_at(plugin_dir)?;
+    update_cursor_hooks_at(config_dir, &hooks, false)
+}
+
+fn update_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
+    if !plugin_dir.exists() {
+        bail!("Cursor tracing plugin is not installed; run `bt trace enable cursor`");
+    }
+    let manifest_path = plugin_dir.join(".cursor-plugin/plugin.json");
+    let installed: Value = std::fs::read(&manifest_path)
+        .with_context(|| {
+            format!("Cursor tracing plugin is not installed; run `bt trace enable cursor`")
+        })
+        .and_then(|raw| {
+            serde_json::from_slice(&raw).context("installed plugin manifest is invalid")
+        })?;
+    if !cursor_plugin_is_ours(&installed) {
+        bail!("Cursor tracing plugin is not the Braintrust plugin; run `bt trace enable cursor`");
+    }
+    install_cursor_plugin_at(plugin_dir)
+}
+
+fn update_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    validate_cursor_hooks_at(config_dir, &hooks, true)?;
+    update_cursor_at(plugin_dir)?;
+    update_cursor_hooks_at(config_dir, &hooks, true)
 }
 
 fn installed_json_version(
@@ -293,7 +620,9 @@ fn update_codex(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
         anyhow::anyhow!("Codex tracing marketplace is not installed; run `bt trace enable codex`")
     })?;
     if !codex_marketplace_is_published(marketplace) {
-        bail!("Codex tracing marketplace is not the published Braintrust marketplace; run `bt trace enable codex`");
+        bail!(
+            "Codex tracing marketplace is not the published Braintrust marketplace; run `bt trace enable codex`"
+        );
     }
     runner.run(
         "codex",
@@ -379,7 +708,7 @@ fn legacy_claude_tracing_env_keys(path: &Path) -> anyhow::Result<Vec<&'static st
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("failed to inspect Claude settings: {}", path.display()))
+                .with_context(|| format!("failed to inspect Claude settings: {}", path.display()));
         }
     };
     let value: Value = serde_json::from_slice(&raw)
@@ -467,7 +796,9 @@ fn update_grok(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
         anyhow::anyhow!("Grok tracing plugin is not installed; run `bt trace enable grok`")
     })?;
     if !grok_plugin_is_published(plugin) {
-        bail!("Grok tracing plugin is not the published Braintrust plugin; run `bt trace enable grok`");
+        bail!(
+            "Grok tracing plugin is not the published Braintrust plugin; run `bt trace enable grok`"
+        );
     }
     runner.run("grok", &["plugin", "update", GROK_PLUGIN])
 }
@@ -484,7 +815,9 @@ fn update_claude(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
         )
     })?;
     if !claude_marketplace_is_published(marketplace) {
-        bail!("Claude Code tracing marketplace is not the published Braintrust marketplace; run `bt trace enable claude`");
+        bail!(
+            "Claude Code tracing marketplace is not the published Braintrust marketplace; run `bt trace enable claude`"
+        );
     }
     runner.run(
         "claude",
@@ -611,7 +944,7 @@ fn update_opencode_at(path: &Path) -> anyhow::Result<()> {
         }
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("failed to read configuration: {}", path.display()))
+                .with_context(|| format!("failed to read configuration: {}", path.display()));
         }
     };
     let plugins = config
@@ -660,7 +993,7 @@ fn remove_opencode_plugin_at(path: &Path) -> anyhow::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("failed to read configuration: {}", path.display()))
+                .with_context(|| format!("failed to read configuration: {}", path.display()));
         }
     };
     let Some(plugins) = config.get_mut("plugin") else {
@@ -892,6 +1225,10 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => disable_opencode(),
         SetupAgent::Pi => disable_pi(&mut runner),
         SetupAgent::Grok => disable_grok(&mut runner),
+        SetupAgent::Cursor => disable_cursor_with_hooks_at(
+            &paths::cursor_plugin_dir(),
+            &paths::cursor_config_dir(),
+        ),
         SetupAgent::Antigravity => disable_antigravity(&mut runner),
     };
     let settings_path = paths::agent_settings_path(source, None);
@@ -914,6 +1251,10 @@ pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => update_opencode()?,
         SetupAgent::Pi => update_pi(&mut runner)?,
         SetupAgent::Grok => update_grok(&mut runner)?,
+        SetupAgent::Cursor => update_cursor_with_hooks_at(
+            &paths::cursor_plugin_dir(),
+            &paths::cursor_config_dir(),
+        )?,
         SetupAgent::Antigravity => update_antigravity(&mut runner)?,
     }
     Ok(TraceCommandOutput::update(source, display_name))
@@ -926,6 +1267,7 @@ fn agent_details(agent: SetupAgent) -> (&'static str, &'static str) {
         SetupAgent::OpenCode => ("opencode", "OpenCode"),
         SetupAgent::Pi => ("pi", "Pi"),
         SetupAgent::Grok => ("grok", "Grok"),
+        SetupAgent::Cursor => ("cursor", "Cursor"),
         SetupAgent::Antigravity => ("antigravity", "Google Antigravity"),
     }
 }
@@ -956,6 +1298,13 @@ pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<Trace
             setup_grok(&mut runner)?;
             ("grok", "Grok")
         }
+        SetupAgent::Cursor => {
+            setup_cursor_with_hooks_at(
+                &paths::cursor_plugin_dir(),
+                &paths::cursor_config_dir(),
+            )?;
+            ("cursor", "Cursor")
+        }
         SetupAgent::Antigravity => {
             setup_antigravity(&mut runner)?;
             ("antigravity", "Google Antigravity")
@@ -979,6 +1328,77 @@ mod tests {
     use super::*;
     use crate::wire::{AuthSelection, TraceDestination};
     use std::collections::VecDeque;
+
+    #[test]
+    fn cursor_install_is_repeatable_and_preserves_neighbor_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins/local");
+        let plugin = root.join("trace-cursor");
+        let neighbor = root.join("my-plugin/keep.txt");
+        std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
+        std::fs::write(&neighbor, "leave me").unwrap();
+
+        setup_cursor_at(&plugin).unwrap();
+        setup_cursor_at(&plugin).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&neighbor).unwrap(), "leave me");
+        assert_eq!(
+            std::fs::read_to_string(plugin.join("hooks/hooks.json")).unwrap(),
+            CURSOR_HOOKS_MANIFEST
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(plugin.join("hooks/trace.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(plugin.join(".cursor-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(cursor_plugin_is_installed_at(&plugin));
+        assert!(cursor_plugin_is_ours(&manifest));
+    }
+
+    #[test]
+    fn cursor_setup_refuses_to_replace_or_remove_an_unrelated_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("trace-cursor");
+        std::fs::create_dir_all(plugin.join(".cursor-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".cursor-plugin/plugin.json"),
+            r#"{"name":"trace-cursor","version":"1.0.0","repository":"https://example.com/custom"}"#,
+        )
+        .unwrap();
+
+        assert!(setup_cursor_at(&plugin).is_err());
+        assert!(disable_cursor_at(&plugin).is_err());
+        assert!(!cursor_plugin_is_installed_at(&plugin));
+        assert!(plugin.join(".cursor-plugin/plugin.json").exists());
+    }
+
+    #[test]
+    fn cursor_disable_removes_only_its_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins/local");
+        let plugin = root.join("trace-cursor");
+        let neighbor = root.join("other-plugin/file");
+        std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
+        std::fs::write(&neighbor, "preserve").unwrap();
+
+        setup_cursor_at(&plugin).unwrap();
+        disable_cursor_at(&plugin).unwrap();
+        disable_cursor_at(&plugin).unwrap();
+
+        assert!(!plugin.exists());
+        assert_eq!(std::fs::read_to_string(neighbor).unwrap(), "preserve");
+    }
 
     struct FakeRunner {
         responses: VecDeque<Value>,

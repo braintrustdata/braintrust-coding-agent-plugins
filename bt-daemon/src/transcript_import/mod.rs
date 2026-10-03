@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 mod antigravity;
 mod claude;
 mod codex;
+mod cursor;
 
 pub(crate) fn resolve_transcripts(
     session_ids: &[String],
@@ -41,6 +42,7 @@ fn transcript_roots(source: ImportSource) -> Vec<PathBuf> {
         .unwrap_or_else(|| PathBuf::from("."));
     match source {
         ImportSource::Codex => codex::roots(&home),
+        ImportSource::Cursor => cursor::roots(&home),
         ImportSource::Claude => claude::roots(&home),
         ImportSource::Antigravity => antigravity::roots(&home),
     }
@@ -124,6 +126,7 @@ fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
 fn transcript_session_id(path: &Path, source: ImportSource) -> Option<String> {
     match source {
         ImportSource::Codex => codex::transcript_session_id(path),
+        ImportSource::Cursor => cursor::transcript_session_id(path),
         ImportSource::Claude => claude::transcript_session_id(path),
         ImportSource::Antigravity => antigravity::transcript_session_id(path),
     }
@@ -141,6 +144,7 @@ fn resolve_transcript_in(
         find_jsonl_files(root, &mut candidates);
         matches.extend(candidates.into_iter().filter(|path| match source {
             ImportSource::Codex => codex::filename_matches(path, session_id),
+            ImportSource::Cursor => cursor::filename_matches(path, session_id),
             ImportSource::Claude => claude::filename_matches(path, session_id),
             ImportSource::Antigravity => antigravity::filename_matches(path, session_id),
         }));
@@ -188,6 +192,7 @@ fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
 fn source_name(source: ImportSource) -> &'static str {
     match source {
         ImportSource::Codex => "Codex",
+        ImportSource::Cursor => "Cursor",
         ImportSource::Claude => "Claude Code",
         ImportSource::Antigravity => "Google Antigravity",
     }
@@ -210,6 +215,7 @@ fn envelopes_from_records(
 ) -> anyhow::Result<Vec<Envelope>> {
     match source {
         ImportSource::Codex => codex::envelopes(path, &records.values),
+        ImportSource::Cursor => cursor::envelopes(path, records.read_offset, &records.values),
         ImportSource::Claude => claude::envelopes(
             path,
             &records.values,
@@ -353,6 +359,7 @@ pub(crate) struct TranscriptTail {
 
 enum TailState {
     Codex(codex::Tail),
+    Cursor(cursor::Tail),
     Claude(claude::Tail),
     Antigravity(antigravity::Tail),
 }
@@ -372,6 +379,7 @@ impl TranscriptTail {
     fn new_state(source: ImportSource) -> TailState {
         match source {
             ImportSource::Codex => TailState::Codex(codex::Tail::default()),
+            ImportSource::Cursor => TailState::Cursor(cursor::Tail::default()),
             ImportSource::Claude => TailState::Claude(claude::Tail::default()),
             ImportSource::Antigravity => TailState::Antigravity(antigravity::Tail::default()),
         }
@@ -404,6 +412,7 @@ impl TranscriptTail {
             .len();
         match &mut self.state {
             TailState::Codex(state) => state.poll(events, len, finalize),
+            TailState::Cursor(state) => state.poll(events, len, finalize),
             TailState::Claude(state) => state.poll(events, len, finalize),
             TailState::Antigravity(state) => state.poll(events, len, finalize),
         }
@@ -556,6 +565,115 @@ mod tests {
         assert_eq!(
             resolve_transcript_in("conversation-123", ImportSource::Antigravity, &[root]).unwrap(),
             transcript
+        );
+    }
+
+    #[test]
+    fn finds_cursor_transcripts_by_nested_session_identity_and_ignores_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        let transcript = root
+            .join("workspace")
+            .join("agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, r#"{"role":"user","message":{"content":"hi"}}"#).unwrap();
+        let subagent = root
+            .join("workspace")
+            .join("agent-transcripts/agent-session-123/agent-session-123.jsonl");
+        std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
+        std::fs::write(&subagent, "{}\n").unwrap();
+
+        assert_eq!(
+            resolve_transcript_in("session-123", ImportSource::Cursor, &[root.clone()]).unwrap(),
+            transcript
+        );
+        assert_eq!(
+            discover_transcripts_in(ImportSource::Cursor, &[root]).unwrap(),
+            vec![transcript]
+        );
+    }
+
+    #[test]
+    fn cursor_import_emits_only_supported_transcript_enrichment_and_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let contents = concat!(
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"question\"}]}}\n",
+            "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"a.txt\"}}]}}\n",
+            "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]}}\n",
+            "{\"type\":\"turn_ended\",\"status\":\"success\"}\n"
+        );
+        std::fs::write(&transcript, contents).unwrap();
+        let events = transcript_envelopes(&transcript, ImportSource::Cursor).unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sessionStart", "ImportCheckpoint", "stop"]
+        );
+        assert!(events.iter().all(|event| event.source == "cursor"));
+        assert_eq!(
+            events[1].payload["_bt_transcript_mirror"]["through"],
+            contents.len() as u64
+        );
+        assert_eq!(
+            events[1].payload["historical_fidelity"],
+            "user_and_assistant_text_and_terminal_status"
+        );
+        assert_eq!(events[2].payload["status"], "success");
+        assert_eq!(events[1].payload["start_time_estimated"], true);
+    }
+
+    #[test]
+    fn cursor_attach_tails_growth_without_repeating_boundaries_or_checkpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"one\"}}\n",
+        )
+        .unwrap();
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        let first = tail.poll(false).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sessionStart", "ImportCheckpoint"]
+        );
+        assert!(tail.poll(false).unwrap().is_empty());
+
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"role\":\"assistant\",\"message\":{\"content\":\"two\"}}\n")
+            .unwrap();
+        let grown = tail.poll(false).unwrap();
+        assert_eq!(
+            grown
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ImportCheckpoint"]
+        );
+        assert_eq!(
+            tail.poll(true)
+                .unwrap()
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stop"]
         );
     }
 
