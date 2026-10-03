@@ -41,6 +41,16 @@ pub(super) fn filename_matches(path: &Path, session_id: &str) -> bool {
             == Some("agent-transcripts")
 }
 
+fn is_conversation_record(record: &Value) -> bool {
+    matches!(
+        record.get("role").and_then(Value::as_str),
+        Some("user" | "assistant")
+    ) && record
+        .get("message")
+        .and_then(Value::as_object)
+        .is_some_and(|message| message.get("content").is_some())
+}
+
 #[derive(Default)]
 pub(super) struct Tail {
     started: bool,
@@ -86,13 +96,7 @@ pub(super) fn envelopes(
         bail!("Cursor transcript {} is empty", path.display());
     }
     for (index, record) in records.iter().enumerate() {
-        let supported = matches!(
-            record.get("role").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) && record
-            .get("message")
-            .and_then(Value::as_object)
-            .is_some_and(|message| message.get("content").is_some());
+        let supported = is_conversation_record(record);
         let terminal = record.get("type").and_then(Value::as_str) == Some("turn_ended");
         if !supported && !terminal {
             bail!(
@@ -113,11 +117,14 @@ pub(super) fn envelopes(
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
     let path_text = path.to_string_lossy().into_owned();
+    // A previous turn's marker can remain at the end of the file while a
+    // resumed turn is being appended. Do not use that status to close the new
+    // turn unless no conversation records follow the latest marker.
     let final_status = records
         .iter()
-        .rev()
-        .find(|record| record.get("type").and_then(Value::as_str) == Some("turn_ended"))
-        .and_then(|record| record.get("status"))
+        .rposition(|record| record.get("type").and_then(Value::as_str) == Some("turn_ended"))
+        .filter(|marker| !records[*marker + 1..].iter().any(is_conversation_record))
+        .and_then(|marker| records[marker].get("status"))
         .cloned();
     let boundary = |event: &str, through: Option<u64>| {
         let mut payload = json!({
