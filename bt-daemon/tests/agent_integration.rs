@@ -401,8 +401,8 @@ async fn pi_session_emits_traces() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Pi 1.0+ and the packed Pi extension"]
-async fn pi_codemode_nests_tool_spans() {
+#[ignore = "requires Pi 1.0.4+ and the packed Pi extension"]
+async fn pi_codemode_traces_nested_tools_and_images() {
     let inference = OpenAiMock::new(|_context, request| {
         if request.has_function_output("call_pi_cm") {
             return MockReply::response(OpenAiTurn::text("PI_MOCK_OK"));
@@ -413,7 +413,7 @@ async fn pi_codemode_nests_tool_spans() {
             request.tool_names()
         );
         let script = format!(
-            "const r = await tools.bash({{command: {:?}}}); text(r.output);",
+            "const [r, b] = await Promise.all([tools.read({{path: 'tiny.png'}}), tools.bash({{command: {:?}}})]); image(r); text(b.output);",
             tool_command("PI_NESTED_OK")
         );
         MockReply::response(OpenAiTurn::tool_call(
@@ -424,17 +424,21 @@ async fn pi_codemode_nests_tool_spans() {
     });
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
+    let image_path = world.workspace().join("tiny.png");
+    std::fs::write(&image_path, include_bytes!("fixtures/images/tiny.png"))
+        .expect("write Pi image fixture");
     let pi = PiAgent::new(&world);
 
     let output = pi
         .run(
             &world,
-            PiRun::new("Use codemode to print PI_NESTED_OK, then reply with PI_MOCK_OK.")
+            PiRun::new("Use codemode to read and show tiny.png, print PI_NESTED_OK, then reply with PI_MOCK_OK.")
                 .mock_inference(inference_server.uri())
+                .supports_images()
                 .arg("-e")
                 .arg("builtin:codemode")
                 .arg("--tools")
-                .arg("bash,codemode"),
+                .arg("read,bash,codemode"),
         )
         .await;
     output.assert_success();
@@ -443,15 +447,26 @@ async fn pi_codemode_nests_tool_spans() {
     }
     output.assert_contains("PI_MOCK_OK");
 
-    // Codemode runs `tools.bash` through `ctx.executeTool()`, which reports
-    // the nested call with `parentToolCallId`. Its span belongs under the
-    // codemode span that made it, not beside it under the turn.
+    // Codemode runs nested tools through ctx.executeTool(). Both calls should
+    // have child spans under the codemode span, and image blocks should remain
+    // available on the nested read span and the following LLM input.
     let scenario = IngestScenario::new()
         .expect("Pi codemode span", |row| {
             row_contains(row, &[r#""type":"tool""#, r#""name":"codemode""#])
         })
         .expect("Pi nested bash span", |row| {
             row_contains(row, &[r#""type":"tool""#, "PI_NESTED_OK"])
+        })
+        .expect("Pi nested image read span", |row| {
+            row_contains(
+                row,
+                &[
+                    r#""type":"tool""#,
+                    r#""name":"read""#,
+                    r#""type":"image""#,
+                    "image/png",
+                ],
+            )
         });
     let rows = world.wait_for_mock_ingest_scenario(&scenario).await;
     let span_named = |name: &str| {
@@ -467,6 +482,25 @@ async fn pi_codemode_nests_tool_spans() {
         bash["span_parents"],
         json!([codemode["span_id"]]),
         "nested bash span is not a child of the codemode span"
+    );
+    let image_read = rows
+        .iter()
+        .find(|row| {
+            row["span_attributes"]["type"] == "tool"
+                && row["span_attributes"]["name"] == "read"
+                && row.to_string().contains(r#""type":"image""#)
+        })
+        .expect("read span should preserve Pi's image block");
+    assert_eq!(image_read["span_parents"], json!([codemode["span_id"]]));
+    assert!(image_read.to_string().contains("image/png"));
+    assert!(image_read.to_string().contains("iVBORw0KGgo"));
+    assert!(
+        rows.iter().any(|row| {
+            row["span_attributes"]["type"] == "llm"
+                && row.to_string().contains(r#""type":"image""#)
+                && row.to_string().contains("image/png")
+        }),
+        "the following LLM span should retain the image attached by codemode"
     );
 }
 
