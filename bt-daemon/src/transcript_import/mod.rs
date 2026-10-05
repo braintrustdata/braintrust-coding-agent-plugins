@@ -697,11 +697,8 @@ mod tests {
             .path()
             .join("workspace/agent-transcripts/session-123/session-123.jsonl");
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        std::fs::write(
-            &transcript,
-            "{\"role\":\"user\",\"message\":{\"content\":\"one\"}}\n",
-        )
-        .unwrap();
+        let first_record = b"{\"role\":\"user\",\"message\":{\"content\":\"one\"}}\n";
+        std::fs::write(&transcript, first_record).unwrap();
         let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
         let first = tail.poll(false).unwrap();
         assert_eq!(
@@ -715,6 +712,11 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        assert_ne!(PathBuf::from(&snapshot), transcript);
+        assert_eq!(
+            first[1].payload["_bt_transcript_mirror"]["through"],
+            first_record.len() as u64
+        );
         assert!(tail.poll(false).unwrap().is_empty());
 
         use std::io::Write;
@@ -737,7 +739,7 @@ mod tests {
             snapshot
         );
         assert_eq!(
-            std::fs::read_to_string(snapshot).unwrap().lines().count(),
+            std::fs::read_to_string(&snapshot).unwrap().lines().count(),
             2
         );
         assert_eq!(
@@ -748,30 +750,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["stop"]
         );
-    }
-
-    #[test]
-    fn cursor_attach_checkpoints_reference_an_immutable_snapshot() {
-        let temp = tempfile::tempdir().unwrap();
-        let transcript = temp
-            .path()
-            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
-        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        let original = b"{\"role\":\"user\",\"message\":{\"content\":\"original\"}}\n";
-        std::fs::write(&transcript, original).unwrap();
-
-        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
-        let events = tail.poll(false).unwrap();
-        let reference = &events[1].payload["_bt_transcript_mirror"];
-        let snapshot = PathBuf::from(reference["mirror"].as_str().unwrap());
-        assert_ne!(snapshot, transcript);
-        assert_eq!(reference["through"], original.len() as u64);
-
         std::fs::write(&transcript, b"replacement transcript\n").unwrap();
-        let snapshot_record: Value =
-            serde_json::from_slice(std::fs::read(snapshot).unwrap().trim_ascii()).unwrap();
-        let original_record: Value = serde_json::from_slice(original.trim_ascii()).unwrap();
-        assert_eq!(snapshot_record, original_record);
+        let snapshot_contents = std::fs::read_to_string(&snapshot).unwrap();
+        assert!(snapshot_contents.contains("\"content\":\"one\""));
+        assert!(snapshot_contents.contains("\"content\":\"two\""));
     }
 
     #[test]
