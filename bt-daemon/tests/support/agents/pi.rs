@@ -13,6 +13,7 @@ pub struct PiAgent {
 pub struct PiRun {
     prompt: OsString,
     mock_inference: Option<String>,
+    supports_images: bool,
     options: ProcessOptions,
 }
 
@@ -21,12 +22,18 @@ impl PiRun {
         Self {
             prompt: prompt.into(),
             mock_inference: None,
+            supports_images: false,
             options: ProcessOptions::default(),
         }
     }
 
     pub fn mock_inference(mut self, base_url: impl Into<String>) -> Self {
         self.mock_inference = Some(base_url.into());
+        self
+    }
+
+    pub fn supports_images(mut self) -> Self {
+        self.supports_images = true;
         self
     }
 
@@ -95,7 +102,15 @@ impl PiAgent {
                             "baseUrl": format!("{base_url}/v1"),
                             "api": "openai-responses",
                             "apiKey": "test-key",
-                            "models": [{"id": "mock-model", "name": "Mock Model"}]
+                            "models": [{
+                                "id": "mock-model",
+                                "name": "Mock Model",
+                                "input": if run.supports_images {
+                                    vec!["text", "image"]
+                                } else {
+                                    vec!["text"]
+                                }
+                            }]
                         }
                     }
                 }))
