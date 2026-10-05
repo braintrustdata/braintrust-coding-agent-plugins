@@ -52,12 +52,12 @@
     "typecheck": "pnpm run check"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.1.14",
-    "@opencode-ai/sdk": "^1.1.14",
-    "@types/node": "^26.0.0",
-    "typescript": "^6.0.2",
-    "vite-plus": "^0.2.1",
-    "vitest": "^4.1.4"
+    "@opencode-ai/plugin": "^1.18.34",
+    "@opencode-ai/sdk": "^1.18.34",
+    "@types/node": "^26.6.4",
+    "typescript": "^6.0.3",
+    "vite-plus": "^0.2.9",
+    "vitest": "4.1.11"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.2.25",
