@@ -643,9 +643,11 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::write(&path, b"event\n").await.unwrap();
-        std::fs::File::open(&path)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
-            .set_modified(std::time::UNIX_EPOCH)
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
             .unwrap();
         let plugin = temp.path().join("redact.mjs");
         tokio::fs::write(&plugin, b"export default span => span")
