@@ -322,9 +322,12 @@ impl CursorTranslator {
             .unwrap_or_default();
         self.trace_root = root.unwrap_or_else(|| self.root.clone());
         self.root_parents = parent.into_iter().collect();
-        let metadata = json!({"source":"cursor", "session_id":ctx.session_id,
+        let mut metadata = json!({"source":"cursor", "session_id":ctx.session_id,
             "username":local_username(), "os":std::env::consts::OS, "workspace":self.cwd,
             "trace_cursor_version":e.source_version, "trace_plugin_version":e.plugin_version});
+        if let Some(estimated) = e.payload.get("start_time_estimated") {
+            metadata["start_time_estimated"] = estimated.clone();
+        }
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.root.clone(),
             root_span_id: self.trace_root.clone(),

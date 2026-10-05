@@ -451,6 +451,26 @@ fn synthetic_attached_session_preserves_external_identity_across_all_merges() {
         .unwrap()
         .contains("private-token"));
 }
+
+#[test]
+fn imported_session_root_marks_its_start_timestamp_as_estimated() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "sessionStart",
+        100,
+        json!({"start_time_estimated":true}),
+    ));
+    let root = h
+        .inserted(SpanType::Task)
+        .into_iter()
+        .find(|row| row.name == "Cursor session")
+        .unwrap();
+    assert_eq!(
+        root.metadata.as_ref().unwrap()["start_time_estimated"],
+        true
+    );
+}
+
 fn mirrored(kind: &str, ts: i64, path: &Path, through: u64, payload: Value) -> Envelope {
     let mut e = event(kind, ts, payload);
     e.payload["_bt_transcript_mirror"] = json!({"mirror":path,"through":through});

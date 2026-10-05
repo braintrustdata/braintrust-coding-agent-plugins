@@ -222,7 +222,7 @@ fn setup_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
     install_cursor_plugin_at(plugin_dir)
 }
 
-fn cursor_discovery_hook_specs(marker: &str) -> Vec<(String, String)> {
+fn cursor_discovery_hook_specs(marker: &str, windows: bool) -> Vec<(String, String)> {
     [
         ("beforeSubmitPrompt", r#"'{"continue":true}'"#),
         ("afterAgentResponse", "'{}'"),
@@ -230,12 +230,120 @@ fn cursor_discovery_hook_specs(marker: &str) -> Vec<(String, String)> {
     ]
     .into_iter()
     .map(|(event, response)| {
-        (
-            event.to_owned(),
-            format!("printf '%s\\n' {response} # {marker}"),
-        )
+        let command = if windows {
+            let response = if event == "beforeSubmitPrompt" {
+                r#"{"continue":true}"#
+            } else {
+                "{}"
+            };
+            powershell_encoded_command(&format!(
+                "[Console]::Out.WriteLine('{}') # {marker}",
+                response.replace('\'', "''")
+            ))
+        } else {
+            format!("printf '%s\\n' {response} # {marker}")
+        };
+        (event.to_owned(), command)
     })
     .collect()
+}
+
+fn cursor_managed_process_identity(command: &str) -> Option<crate::wire::ProcessIdentity> {
+    let decoded = command
+        .strip_prefix("powershell.exe -NoProfile -EncodedCommand ")
+        .and_then(|encoded| {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            let (chunks, remainder) = bytes.as_chunks::<2>();
+            if !remainder.is_empty() {
+                return None;
+            }
+            let words = chunks
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect::<Vec<_>>();
+            String::from_utf16(&words).ok()
+        });
+    let command = decoded.as_deref().unwrap_or(command);
+    let marker = command.split("braintrust-cursor-managed-").nth(1)?;
+    let mut parts = marker.splitn(3, '-');
+    Some(crate::wire::ProcessIdentity {
+        pid: parts.next()?.parse().ok()?,
+        start_time_secs: parts.next()?.parse().ok()?,
+    })
+}
+
+fn remove_stale_cursor_managed_hooks(
+    config: &mut Map<String, Value>,
+    mut process_is_alive: impl FnMut(&crate::wire::ProcessIdentity) -> bool,
+) {
+    let Some(hooks) = config.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
+        entries.retain(|entry| {
+            cursor_managed_process_identity(
+                entry
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            .is_none_or(|identity| process_is_alive(&identity))
+        });
+    }
+}
+
+fn update_cursor_managed_hooks_at(
+    config_dir: &Path,
+    specs: &[(String, String)],
+) -> anyhow::Result<()> {
+    let path = config_dir.join("hooks.json");
+    crate::settings::with_settings_lock(&path, || {
+        let mut config = load_object(&path)?;
+        let original = config.clone();
+        remove_stale_cursor_managed_hooks(&mut config, crate::process::process_is_alive);
+        apply_cursor_hook_specs(&mut config, &path, specs, true)?;
+        if config != original {
+            write_object_atomic_unlocked(&path, config, FileAccess::Inherited)?;
+        }
+        Ok(())
+    })
+}
+
+fn powershell_encoded_command(script: &str) -> String {
+    use base64::Engine;
+    let utf16 = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    format!(
+        "powershell.exe -NoProfile -EncodedCommand {}",
+        base64::engine::general_purpose::STANDARD.encode(utf16)
+    )
+}
+
+pub(crate) fn cursor_discovery_hooks_are_installed_at(config_dir: &Path) -> bool {
+    let path = config_dir.join("hooks.json");
+    let Ok(config) = load_object(&path) else {
+        return false;
+    };
+    let Some(hooks) = config.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    cursor_discovery_hook_specs("braintrust-cursor-discovery", cfg!(windows))
+        .iter()
+        .all(|(event, command)| {
+            hooks
+                .get(event)
+                .and_then(Value::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("command").and_then(Value::as_str) == Some(command.as_str())
+                    })
+                })
+        })
 }
 
 fn apply_cursor_hook_specs(
@@ -323,7 +431,7 @@ fn cursor_discovery_hook(command: &str) -> Value {
 }
 
 fn setup_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
-    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery", cfg!(windows));
     validate_cursor_hooks_at(config_dir, &hooks, true)?;
     setup_cursor_at(plugin_dir)?;
     update_cursor_hooks_at(config_dir, &hooks, true)
@@ -336,8 +444,21 @@ pub(crate) struct CursorManagedHooks {
 
 impl CursorManagedHooks {
     pub(crate) fn install(config_dir: &Path, run_id: &str) -> anyhow::Result<Self> {
-        let specs = cursor_discovery_hook_specs(&format!("braintrust-cursor-managed-{run_id}"));
-        update_cursor_hooks_at(config_dir, &specs, true)?;
+        let context = crate::process::capture_process_context(std::process::id());
+        let identity = context
+            .process_chain
+            .first()
+            .filter(|identity| identity.start_time_secs > 0);
+        let marker = identity
+            .map(|identity| {
+                format!(
+                    "braintrust-cursor-managed-{}-{}-{run_id}",
+                    identity.pid, identity.start_time_secs
+                )
+            })
+            .unwrap_or_else(|| format!("braintrust-cursor-managed-{run_id}"));
+        let specs = cursor_discovery_hook_specs(&marker, cfg!(windows));
+        update_cursor_managed_hooks_at(config_dir, &specs)?;
         Ok(Self {
             config_dir: config_dir.to_path_buf(),
             specs,
@@ -379,7 +500,7 @@ fn disable_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn disable_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
-    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery", cfg!(windows));
     validate_cursor_hooks_at(config_dir, &hooks, false)?;
     disable_cursor_at(plugin_dir)?;
     update_cursor_hooks_at(config_dir, &hooks, false)
@@ -404,7 +525,7 @@ fn update_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn update_cursor_with_hooks_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
-    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery");
+    let hooks = cursor_discovery_hook_specs("braintrust-cursor-discovery", cfg!(windows));
     validate_cursor_hooks_at(config_dir, &hooks, true)?;
     update_cursor_at(plugin_dir)?;
     update_cursor_hooks_at(config_dir, &hooks, true)
@@ -1359,6 +1480,105 @@ mod tests {
         .unwrap();
         assert!(cursor_plugin_is_installed_at(&plugin));
         assert!(cursor_plugin_is_ours(&manifest));
+    }
+
+    #[test]
+    fn cursor_discovery_health_requires_each_lifecycle_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".cursor");
+        setup_cursor_with_hooks_at(&temp.path().join("trace-cursor"), &config_dir).unwrap();
+        assert!(cursor_discovery_hooks_are_installed_at(&config_dir));
+
+        let hooks_path = config_dir.join("hooks.json");
+        let mut config = load_object(&hooks_path).unwrap();
+        config["hooks"].as_object_mut().unwrap().remove("stop");
+        write_object_atomic(&hooks_path, config).unwrap();
+
+        assert!(!cursor_discovery_hooks_are_installed_at(&config_dir));
+    }
+
+    #[test]
+    fn cursor_discovery_hooks_generate_shell_independent_windows_commands() {
+        use base64::Engine;
+        let specs = cursor_discovery_hook_specs("braintrust-cursor-managed-1234-42-run", true);
+        assert_eq!(specs.len(), 3);
+        for (event, command) in &specs {
+            let encoded = command
+                .strip_prefix("powershell.exe -NoProfile -EncodedCommand ")
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            let (chunks, remainder) = bytes.as_chunks::<2>();
+            assert!(remainder.is_empty());
+            let words = chunks
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect::<Vec<_>>();
+            let script = String::from_utf16(&words).unwrap();
+            assert!(script.contains("braintrust-cursor-managed-1234-42-run"));
+            assert_eq!(
+                cursor_managed_process_identity(command),
+                Some(crate::wire::ProcessIdentity {
+                    pid: 1234,
+                    start_time_secs: 42,
+                })
+            );
+            if event == "beforeSubmitPrompt" {
+                assert!(script.contains(r#"'{"continue":true}'"#));
+            } else {
+                assert!(script.contains("'{}'"));
+            }
+        }
+    }
+
+    #[test]
+    fn managed_cursor_setup_removes_only_hooks_from_exited_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".cursor");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let context = crate::process::capture_process_context(std::process::id());
+        let current = context.process_chain.first().unwrap();
+        let stale =
+            cursor_discovery_hook_specs("braintrust-cursor-managed-4294967295-1-stale", false);
+        let active = cursor_discovery_hook_specs(
+            &format!(
+                "braintrust-cursor-managed-{}-{}-active",
+                current.pid, current.start_time_secs
+            ),
+            false,
+        );
+        let mut config = Map::new();
+        config.insert("version".into(), serde_json::json!(1));
+        let mut hooks = Map::new();
+        for ((stale_event, stale_command), (active_event, active_command)) in
+            stale.into_iter().zip(active)
+        {
+            assert_eq!(stale_event, active_event);
+            hooks.insert(
+                stale_event,
+                serde_json::json!([
+                    cursor_discovery_hook(&stale_command),
+                    cursor_discovery_hook(&active_command)
+                ]),
+            );
+        }
+        config.insert("hooks".into(), Value::Object(hooks));
+        write_object_atomic(&config_dir.join("hooks.json"), config).unwrap();
+
+        let _managed = CursorManagedHooks::install(&config_dir, "new-run").unwrap();
+        let config = load_object(&config_dir.join("hooks.json")).unwrap();
+
+        for event in ["beforeSubmitPrompt", "afterAgentResponse", "stop"] {
+            let commands = config["hooks"][event].as_array().unwrap();
+            assert_eq!(commands.len(), 2);
+            assert!(commands
+                .iter()
+                .any(|entry| entry["command"].as_str().unwrap().contains("-active")));
+            assert!(commands
+                .iter()
+                .all(|entry| !entry["command"].as_str().unwrap().contains("-stale")));
+        }
     }
 
     #[test]

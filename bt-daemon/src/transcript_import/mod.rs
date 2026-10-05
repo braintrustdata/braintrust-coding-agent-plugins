@@ -3,7 +3,7 @@ use crate::ImportSource;
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read, Seek};
+use std::io::{BufRead, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 mod antigravity;
@@ -204,7 +204,7 @@ pub(crate) fn transcript_envelopes(
     source: ImportSource,
 ) -> anyhow::Result<Vec<Envelope>> {
     let mut records = IncrementalRecords::default();
-    records.refresh(path, true)?;
+    records.refresh_with_final_partial(path, true, false)?;
     envelopes_from_records(path, source, &records)
 }
 
@@ -246,7 +246,12 @@ enum Refresh {
 }
 
 impl IncrementalRecords {
-    fn refresh(&mut self, path: &Path, finalize: bool) -> anyhow::Result<Refresh> {
+    fn refresh_with_final_partial(
+        &mut self,
+        path: &Path,
+        finalize: bool,
+        allow_incomplete_final_record: bool,
+    ) -> anyhow::Result<Refresh> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("read transcript metadata {}", path.display()))?;
         let len = metadata.len();
@@ -298,7 +303,13 @@ impl IncrementalRecords {
                         values.push(value);
                         end_offsets.push(offset);
                     }
-                    Err(_) if !finalize && offset == len && !line.ends_with('\n') => break,
+                    Err(_)
+                        if (allow_incomplete_final_record || !finalize)
+                            && offset == len
+                            && !line.ends_with('\n') =>
+                    {
+                        break
+                    }
                     Err(error) => {
                         return Err(error).with_context(|| {
                             format!("parse transcript {} line {}", path.display(), line_count)
@@ -355,6 +366,8 @@ pub(crate) struct TranscriptTail {
     records: IncrementalRecords,
     retry_envelopes: bool,
     translator_reset: bool,
+    cursor_snapshot: Option<tempfile::TempDir>,
+    cursor_snapshot_records: usize,
 }
 
 enum TailState {
@@ -373,6 +386,8 @@ impl TranscriptTail {
             records: IncrementalRecords::default(),
             retry_envelopes: false,
             translator_reset: false,
+            cursor_snapshot: None,
+            cursor_snapshot_records: 0,
         }
     }
 
@@ -386,7 +401,11 @@ impl TranscriptTail {
     }
 
     pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
-        let refresh = match self.records.refresh(&self.path, finalize) {
+        let refresh = match self.records.refresh_with_final_partial(
+            &self.path,
+            finalize,
+            self.source == ImportSource::Cursor,
+        ) {
             Ok(refresh) => refresh,
             Err(_) if !finalize => return Ok(Vec::new()),
             Err(error) => return Err(error),
@@ -397,8 +416,9 @@ impl TranscriptTail {
         if refresh == Refresh::Reset {
             self.state = Self::new_state(self.source);
             self.translator_reset = true;
+            self.cursor_snapshot_records = 0;
         }
-        let events = match envelopes_from_records(&self.path, self.source, &self.records) {
+        let events = match self.envelopes_from_current_records(refresh == Refresh::Reset) {
             Ok(events) => events,
             Err(_) if !finalize => {
                 self.retry_envelopes = true;
@@ -420,6 +440,42 @@ impl TranscriptTail {
 
     pub(crate) fn take_translator_reset(&mut self) -> bool {
         std::mem::take(&mut self.translator_reset)
+    }
+
+    fn envelopes_from_current_records(
+        &mut self,
+        reset_snapshot: bool,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        if self.source != ImportSource::Cursor {
+            return envelopes_from_records(&self.path, self.source, &self.records);
+        }
+        if self.cursor_snapshot.is_none() {
+            self.cursor_snapshot = Some(
+                tempfile::Builder::new()
+                    .prefix("bt-cursor-import-")
+                    .tempdir()?,
+            );
+        }
+        let snapshot = self
+            .cursor_snapshot
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("transcript.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(!reset_snapshot)
+            .truncate(reset_snapshot)
+            .open(&snapshot)?;
+        for record in &self.records.values[self.cursor_snapshot_records..] {
+            serde_json::to_writer(&mut file, record)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        let through = file.metadata()?.len();
+        self.cursor_snapshot_records = self.records.values.len();
+        cursor::envelopes_with_snapshot(&self.path, &snapshot, through, &self.records.values)
     }
 }
 
@@ -655,6 +711,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["sessionStart", "ImportCheckpoint"]
         );
+        let snapshot = first[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         assert!(tail.poll(false).unwrap().is_empty());
 
         use std::io::Write;
@@ -673,6 +733,14 @@ mod tests {
             vec!["ImportCheckpoint"]
         );
         assert_eq!(
+            grown[0].payload["_bt_transcript_mirror"]["mirror"],
+            snapshot
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot).unwrap().lines().count(),
+            2
+        );
+        assert_eq!(
             tail.poll(true)
                 .unwrap()
                 .iter()
@@ -680,6 +748,78 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["stop"]
         );
+    }
+
+    #[test]
+    fn cursor_attach_checkpoints_reference_an_immutable_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let original = b"{\"role\":\"user\",\"message\":{\"content\":\"original\"}}\n";
+        std::fs::write(&transcript, original).unwrap();
+
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        let events = tail.poll(false).unwrap();
+        let reference = &events[1].payload["_bt_transcript_mirror"];
+        let snapshot = PathBuf::from(reference["mirror"].as_str().unwrap());
+        assert_ne!(snapshot, transcript);
+        assert_eq!(reference["through"], original.len() as u64);
+
+        std::fs::write(&transcript, b"replacement transcript\n").unwrap();
+        let snapshot_record: Value =
+            serde_json::from_slice(std::fs::read(snapshot).unwrap().trim_ascii()).unwrap();
+        let original_record: Value = serde_json::from_slice(original.trim_ascii()).unwrap();
+        assert_eq!(snapshot_record, original_record);
+    }
+
+    #[test]
+    fn cursor_attach_finalizes_after_an_incomplete_trailing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"complete\"}}\n",
+        )
+        .unwrap();
+
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        assert_eq!(
+            tail.poll(false).unwrap().last().unwrap().event,
+            "ImportCheckpoint"
+        );
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"role\":\"assistant\",\"message\":")
+            .unwrap();
+
+        let final_events = tail.poll(true).unwrap();
+        assert_eq!(
+            final_events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ImportCheckpoint", "stop"]
+        );
+    }
+
+    #[test]
+    fn completed_import_still_rejects_an_incomplete_trailing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"complete\"}\n{\"partial\"").unwrap();
+
+        let error = IncrementalRecords::default()
+            .refresh_with_final_partial(&transcript, true, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("parse transcript"));
     }
 
     #[test]
@@ -1159,7 +1299,12 @@ mod tests {
         let path = temp.path().join("session.jsonl");
         std::fs::write(&path, "{\"type\":\"session_meta\"").unwrap();
         let mut records = IncrementalRecords::default();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Unchanged);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Unchanged
+        );
         assert!(records.values.is_empty());
 
         std::fs::write(
@@ -1167,11 +1312,21 @@ mod tests {
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
         )
         .unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Appended);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Appended
+        );
         assert_eq!(records.values.len(), 1);
 
         std::fs::write(&path, "{\"type\":\"event_msg\"}\n").unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Reset);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Reset
+        );
         assert_eq!(records.values, vec![json!({"type":"event_msg"})]);
 
         std::fs::write(
@@ -1179,7 +1334,12 @@ mod tests {
             "{\"type\":\"replacement_with_a_longer_prefix\"}\n{\"type\":\"second\"}\n",
         )
         .unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Reset);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Reset
+        );
         assert_eq!(
             records.values,
             vec![

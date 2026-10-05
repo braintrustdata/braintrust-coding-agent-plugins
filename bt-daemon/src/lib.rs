@@ -1183,6 +1183,14 @@ fn write_cursor_managed_plugin(
     directory: &std::path::Path,
     hook_command: &RunHookCommand,
 ) -> anyhow::Result<()> {
+    write_cursor_managed_plugin_for_platform(directory, hook_command, cfg!(windows))
+}
+
+fn write_cursor_managed_plugin_for_platform(
+    directory: &std::path::Path,
+    hook_command: &RunHookCommand,
+    windows: bool,
+) -> anyhow::Result<()> {
     let hook_dir = directory.join("hooks");
     std::fs::create_dir_all(directory.join(".cursor-plugin"))?;
     std::fs::create_dir_all(&hook_dir)?;
@@ -1195,13 +1203,22 @@ fn write_cursor_managed_plugin(
             "hooks": "hooks/hooks.json"
         }))?,
     )?;
+    let script_path = hook_dir.join(if windows { "trace.ps1" } else { "trace.sh" });
     let hooks = cursor_hook_events()?
         .iter()
         .map(|event| {
+            let command = if windows {
+                format!(
+                    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File {} {event}",
+                    quote_windows_command_arg(&script_path.to_string_lossy())
+                )
+            } else {
+                format!("\"${{CURSOR_PLUGIN_ROOT}}/hooks/trace.sh\" {event}")
+            };
             (
                 event.clone(),
                 serde_json::json!([{
-                    "command": format!("\"${{CURSOR_PLUGIN_ROOT}}/hooks/trace.sh\" {event}"),
+                    "command": command,
                     "timeout": 10,
                     "failClosed": false
                 }]),
@@ -1213,8 +1230,57 @@ fn write_cursor_managed_plugin(
         serde_json::to_vec(&serde_json::json!({ "version": 1, "hooks": hooks }))?,
     )?;
 
-    let mut command = managed_hook_shell_command(hook_command, "cursor", false)?;
-    for arg in [
+    if windows {
+        std::fs::write(
+            &script_path,
+            cursor_managed_powershell_script(hook_command)?,
+        )?;
+    } else {
+        let mut command = managed_hook_shell_command(hook_command, "cursor", false)?;
+        for arg in [
+            "--session-id-field",
+            "conversation_id",
+            "--event-field",
+            "hook_event_name",
+            "--transcript-path-field",
+            "transcript_path",
+            "--flush-on-turn-end",
+            "--capture-timeout-ms",
+            "8000",
+        ] {
+            command.push(' ');
+            command.push_str(&quote_unix_shell_arg(arg));
+        }
+        let script = format!(
+            "#!/bin/sh\n# Keep Cursor's prompt response valid even when tracing fails.\nif ! {command} >/dev/null 2>/dev/null; then\n  :\nfi\ncase \"${{1-}}\" in\n  beforeSubmitPrompt) printf '%s\\n' '{{\"continue\":true}}' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\nexit 0\n"
+        );
+        std::fs::write(&script_path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+fn cursor_managed_powershell_script(hook_command: &RunHookCommand) -> anyhow::Result<String> {
+    let executable = hook_command
+        .program
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("managed hook command contains non-Unicode argv"))?;
+    let mut args = hook_command
+        .args
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .ok_or_else(|| anyhow::anyhow!("managed hook command contains non-Unicode argv"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    args.extend([
+        "--source",
+        "cursor",
+        "--managed-run-hook",
         "--session-id-field",
         "conversation_id",
         "--event-field",
@@ -1224,21 +1290,18 @@ fn write_cursor_managed_plugin(
         "--flush-on-turn-end",
         "--capture-timeout-ms",
         "8000",
-    ] {
-        command.push(' ');
-        command.push_str(&quote_unix_shell_arg(arg));
-    }
-    let script = format!(
-        "#!/bin/sh\n# Keep Cursor's prompt response valid even when tracing fails.\nif ! {command} >/dev/null 2>/dev/null; then\n  :\nfi\ncase \"${{1-}}\" in\n  beforeSubmitPrompt) printf '%s\\n' '{{\"continue\":true}}' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\nexit 0\n"
-    );
-    let script_path = hook_dir.join("trace.sh");
-    std::fs::write(&script_path, script)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    ]);
+    let powershell_literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let rendered_args = args
+        .iter()
+        .map(|arg| powershell_literal(arg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "$bt = {}\n$hookArgs = @({})\ntry {{ & $bt @hookArgs *> $null }} catch {{}}\nif ($args.Count -gt 0 -and $args[0] -eq 'beforeSubmitPrompt') {{\n  [Console]::Out.WriteLine('{{\"continue\":true}}')\n}} else {{\n  [Console]::Out.WriteLine('{{}}')\n}}\nexit 0\n",
+        powershell_literal(executable),
+        rendered_args
+    ))
 }
 
 fn opencode_managed_config(existing: Option<&str>) -> anyhow::Result<String> {
@@ -2537,6 +2600,36 @@ mod tests {
         assert!(!script.contains("\"permission\":\"allow\""));
         assert!(script.contains("\"continue\":true"));
         assert!(!script.contains("--dangerously-bypass"));
+    }
+
+    #[test]
+    fn cursor_managed_run_generates_a_windows_native_hook_launcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("plugin with spaces");
+        std::fs::create_dir(&plugin).unwrap();
+        let hook = RunHookCommand {
+            program: OsString::from("C:\\Program Files\\Braintrust\\bt.exe"),
+            args: vec![OsString::from("trace"), OsString::from("hook")],
+        };
+        write_cursor_managed_plugin_for_platform(&plugin, &hook, true).unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(plugin.join("hooks/hooks.json")).unwrap())
+                .unwrap();
+        let command = manifest["hooks"]["postToolUse"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.starts_with("powershell.exe -NoProfile -ExecutionPolicy Bypass -File "));
+        assert!(command.contains("trace.ps1"));
+        assert!(command.ends_with(" postToolUse"));
+
+        let script = std::fs::read_to_string(plugin.join("hooks/trace.ps1")).unwrap();
+        assert!(script.contains("C:\\Program Files\\Braintrust\\bt.exe"));
+        assert!(script.contains("--session-id-field"));
+        assert!(script.contains("[Console]::Out.WriteLine('{}')"));
+        assert!(script.contains("{\"continue\":true}"));
+        assert!(!script.contains("permission\":\"allow"));
+        assert!(!script.contains("/bin/sh"));
     }
 
     #[test]

@@ -40,7 +40,7 @@ Use `run` to trace one invocation, `import` to trace a saved session, or
 bt trace run --project my-coding-agent claude -- -p "summarize this repository"
 bt trace import claude SESSION_ID
 bt trace import claude SESSION_ID --attach
-bt trace run --project my-coding-agent cursor -- -p "summarize this repository"
+bt trace run --project my-coding-agent cursor
 bt trace import cursor SESSION_ID --attach
 ```
 

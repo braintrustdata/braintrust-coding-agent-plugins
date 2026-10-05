@@ -90,6 +90,15 @@ pub(super) fn envelopes(
     through: u64,
     records: &[Value],
 ) -> anyhow::Result<Vec<Envelope>> {
+    envelopes_with_snapshot(path, path, through, records)
+}
+
+pub(super) fn envelopes_with_snapshot(
+    path: &Path,
+    snapshot: &Path,
+    through: u64,
+    records: &[Value],
+) -> anyhow::Result<Vec<Envelope>> {
     let session_id = transcript_session_id(path)
         .ok_or_else(|| anyhow::anyhow!("invalid Cursor transcript path {}", path.display()))?;
     if records.is_empty() {
@@ -117,6 +126,7 @@ pub(super) fn envelopes(
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
     let path_text = path.to_string_lossy().into_owned();
+    let snapshot_text = snapshot.to_string_lossy().into_owned();
     // A previous turn's marker can remain at the end of the file while a
     // resumed turn is being appended. Do not use that status to close the new
     // turn unless no conversation records follow the latest marker.
@@ -142,7 +152,7 @@ pub(super) fn envelopes(
         }
         if let Some(through) = through {
             payload["_bt_transcript_mirror"] = json!({
-                "mirror": path_text,
+                "mirror": snapshot_text,
                 "through": through
             });
         }
