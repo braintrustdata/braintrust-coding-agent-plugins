@@ -115,6 +115,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --manifest-path bt-daemon/Cargo.toml --features cli
+          mkdir -p "${RUNNER_TEMP}/cursor-bin"
+          install -m 755 "$BT_BIN" "${RUNNER_TEMP}/cursor-bin/bt"
+          export PATH="${RUNNER_TEMP}/cursor-bin:$PATH"
           printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"trace-cursor-smoke"},"flush_mode":"flush_on_turn_end"}}' > "$BT_DAEMON_CONFIG"
           python3 .github/scripts/mock-braintrust.py > "${RUNNER_TEMP}/mock-collector.log" 2>&1 &
           collector_pid=$!
