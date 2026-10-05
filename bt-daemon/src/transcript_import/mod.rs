@@ -853,6 +853,7 @@ mod tests {
         .unwrap();
 
         let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        tail.allow_incomplete_final_record_on_shutdown();
         assert_eq!(
             tail.poll(false).unwrap().last().unwrap().event,
             "ImportCheckpoint"
