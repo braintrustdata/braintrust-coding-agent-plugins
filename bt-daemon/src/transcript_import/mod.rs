@@ -407,6 +407,11 @@ impl TranscriptTail {
     }
 
     pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
+        let previous_cursor_records = if self.source == ImportSource::Cursor {
+            self.records.values.clone()
+        } else {
+            Vec::new()
+        };
         let refresh = match self.records.refresh_with_final_partial(
             &self.path,
             finalize,
@@ -426,10 +431,22 @@ impl TranscriptTail {
                 // ordinal continue across native transcript replacement.
                 // A fresh snapshot path makes it rewind only transcript input.
                 self.cursor_snapshot = None;
+                // Cursor can rewrite a transcript while retaining earlier
+                // turns. Keep those records out of the rotated snapshot so
+                // the live translator does not claim their prompts twice.
+                self.cursor_snapshot_records = self
+                    .records
+                    .values
+                    .iter()
+                    .zip(&previous_cursor_records)
+                    .take_while(|(current, previous)| current == previous)
+                    .count();
             } else {
                 self.translator_reset = true;
             }
-            self.cursor_snapshot_records = 0;
+            if self.source != ImportSource::Cursor {
+                self.cursor_snapshot_records = 0;
+            }
         }
         let events = match self.envelopes_from_current_records(refresh == Refresh::Reset) {
             Ok(events) => events,
