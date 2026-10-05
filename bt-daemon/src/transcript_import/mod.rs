@@ -584,7 +584,12 @@ mod tests {
         std::fs::write(&subagent, "{}\n").unwrap();
 
         assert_eq!(
-            resolve_transcript_in("session-123", ImportSource::Cursor, &[root.clone()]).unwrap(),
+            resolve_transcript_in(
+                "session-123",
+                ImportSource::Cursor,
+                std::slice::from_ref(&root)
+            )
+            .unwrap(),
             transcript
         );
         assert_eq!(

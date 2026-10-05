@@ -26,10 +26,9 @@ assert 'mcpServers' not in manifest and not (root / 'mcp.json').exists()
 config = json.loads((root / manifest['hooks']).read_text())
 assert config['version'] == 1
 expected = {
-    'sessionStart', 'sessionEnd', 'beforeSubmitPrompt', 'preToolUse',
-    'postToolUse', 'postToolUseFailure', 'subagentStart', 'subagentStop',
-    'beforeShellExecution', 'afterShellExecution', 'beforeMCPExecution',
-    'afterMCPExecution', 'beforeReadFile', 'afterFileEdit', 'preCompact',
+    'sessionStart', 'sessionEnd', 'beforeSubmitPrompt',
+    'postToolUse', 'postToolUseFailure', 'subagentStop',
+    'afterShellExecution', 'afterMCPExecution', 'afterFileEdit', 'preCompact',
     'stop', 'afterAgentResponse',
 }
 assert set(config['hooks']) == expected

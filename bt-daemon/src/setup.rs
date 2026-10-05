@@ -392,7 +392,7 @@ fn update_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
     let manifest_path = plugin_dir.join(".cursor-plugin/plugin.json");
     let installed: Value = std::fs::read(&manifest_path)
         .with_context(|| {
-            format!("Cursor tracing plugin is not installed; run `bt trace enable cursor`")
+            "Cursor tracing plugin is not installed; run `bt trace enable cursor`".to_owned()
         })
         .and_then(|raw| {
             serde_json::from_slice(&raw).context("installed plugin manifest is invalid")
@@ -1225,10 +1225,9 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => disable_opencode(),
         SetupAgent::Pi => disable_pi(&mut runner),
         SetupAgent::Grok => disable_grok(&mut runner),
-        SetupAgent::Cursor => disable_cursor_with_hooks_at(
-            &paths::cursor_plugin_dir(),
-            &paths::cursor_config_dir(),
-        ),
+        SetupAgent::Cursor => {
+            disable_cursor_with_hooks_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())
+        }
         SetupAgent::Antigravity => disable_antigravity(&mut runner),
     };
     let settings_path = paths::agent_settings_path(source, None);
@@ -1251,10 +1250,9 @@ pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
         SetupAgent::OpenCode => update_opencode()?,
         SetupAgent::Pi => update_pi(&mut runner)?,
         SetupAgent::Grok => update_grok(&mut runner)?,
-        SetupAgent::Cursor => update_cursor_with_hooks_at(
-            &paths::cursor_plugin_dir(),
-            &paths::cursor_config_dir(),
-        )?,
+        SetupAgent::Cursor => {
+            update_cursor_with_hooks_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())?
+        }
         SetupAgent::Antigravity => update_antigravity(&mut runner)?,
     }
     Ok(TraceCommandOutput::update(source, display_name))
@@ -1299,10 +1297,7 @@ pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<Trace
             ("grok", "Grok")
         }
         SetupAgent::Cursor => {
-            setup_cursor_with_hooks_at(
-                &paths::cursor_plugin_dir(),
-                &paths::cursor_config_dir(),
-            )?;
+            setup_cursor_with_hooks_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())?;
             ("cursor", "Cursor")
         }
         SetupAgent::Antigravity => {

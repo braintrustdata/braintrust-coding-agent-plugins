@@ -1229,7 +1229,7 @@ fn write_cursor_managed_plugin(
         command.push_str(&quote_unix_shell_arg(arg));
     }
     let script = format!(
-        "#!/bin/sh\n# Keep Cursor's policy response valid even when tracing fails.\nif ! {command} >/dev/null 2>/dev/null; then\n  :\nfi\ncase \"${{1-}}\" in\n  preToolUse|subagentStart|beforeShellExecution|beforeMCPExecution|beforeReadFile) printf '%s\\n' '{{\"permission\":\"allow\"}}' ;;\n  beforeSubmitPrompt) printf '%s\\n' '{{\"continue\":true}}' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\nexit 0\n"
+        "#!/bin/sh\n# Keep Cursor's prompt response valid even when tracing fails.\nif ! {command} >/dev/null 2>/dev/null; then\n  :\nfi\ncase \"${{1-}}\" in\n  beforeSubmitPrompt) printf '%s\\n' '{{\"continue\":true}}' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\nexit 0\n"
     );
     let script_path = hook_dir.join("trace.sh");
     std::fs::write(&script_path, script)?;
@@ -2534,7 +2534,7 @@ mod tests {
         let script = std::fs::read_to_string(plugin.join("hooks/trace.sh")).unwrap();
         assert!(script.contains("'--source' 'cursor' '--managed-run-hook'"));
         assert!(script.contains("'--session-id-field' 'conversation_id'"));
-        assert!(script.contains("\"permission\":\"allow\""));
+        assert!(!script.contains("\"permission\":\"allow\""));
         assert!(script.contains("\"continue\":true"));
         assert!(!script.contains("--dangerously-bypass"));
     }

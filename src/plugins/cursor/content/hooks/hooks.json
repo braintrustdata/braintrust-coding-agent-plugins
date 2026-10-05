@@ -22,13 +22,6 @@
         "failClosed": false
       }
     ],
-    "preToolUse": [
-      {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" preToolUse",
-        "timeout": 10,
-        "failClosed": false
-      }
-    ],
     "postToolUse": [
       {
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" postToolUse",
@@ -43,23 +36,9 @@
         "failClosed": false
       }
     ],
-    "subagentStart": [
-      {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" subagentStart",
-        "timeout": 10,
-        "failClosed": false
-      }
-    ],
     "subagentStop": [
       {
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" subagentStop",
-        "timeout": 10,
-        "failClosed": false
-      }
-    ],
-    "beforeShellExecution": [
-      {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" beforeShellExecution",
         "timeout": 10,
         "failClosed": false
       }
@@ -71,23 +50,9 @@
         "failClosed": false
       }
     ],
-    "beforeMCPExecution": [
-      {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" beforeMCPExecution",
-        "timeout": 10,
-        "failClosed": false
-      }
-    ],
     "afterMCPExecution": [
       {
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" afterMCPExecution",
-        "timeout": 10,
-        "failClosed": false
-      }
-    ],
-    "beforeReadFile": [
-      {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" beforeReadFile",
         "timeout": 10,
         "failClosed": false
       }

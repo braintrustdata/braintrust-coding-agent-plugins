@@ -32,9 +32,7 @@ exit "${BT_EXIT_CODE:-0}"
     environment = dict(os.environ, CURSOR_PLUGIN_ROOT=str(plugin),
                        CAPTURE_DIR=str(root), PATH=str(fake_bin))
     environment.pop('BT_BIN', None)
-    payload = b'{"conversation_id":"session-a","hook_event_name":"preToolUse","transcript_path":null,"tool_input":{"command":"echo $HOME; `pwd`"},"additive_field":42}\n'
-    permission = {'preToolUse', 'subagentStart', 'beforeShellExecution',
-                  'beforeMCPExecution', 'beforeReadFile'}
+    payload = b'{"conversation_id":"session-a","hook_event_name":"postToolUse","transcript_path":null,"tool_input":{"command":"echo $HOME; `pwd`"},"additive_field":42}\n'
     # One successful and one failed invocation cover the wrapper's two paths.
     for exit_code in ('0', '1'):
         environment['BT_EXIT_CODE'] = exit_code
@@ -43,8 +41,7 @@ exit "${BT_EXIT_CODE:-0}"
             result = subprocess.run(['/bin/sh', '-c', registration['command']],
                                     input=payload, env=environment,
                                     capture_output=True, check=True)
-            expected = {'permission': 'allow'} if event in permission else (
-                {'continue': True} if event == 'beforeSubmitPrompt' else {})
+            expected = {'continue': True} if event == 'beforeSubmitPrompt' else {}
             assert json.loads(result.stdout) == expected, (event, result.stdout)
             assert (root / 'payload').read_bytes() == payload
             assert b'private diagnostic' not in result.stderr
@@ -63,9 +60,9 @@ exit "${BT_EXIT_CODE:-0}"
     override.chmod(0o755)
     environment['BT_BIN'] = str(override)
     environment['BT_EXIT_CODE'] = '0'
-    result = subprocess.run(['/bin/sh', '-c', config['hooks']['preToolUse'][0]['command']],
+    result = subprocess.run(['/bin/sh', '-c', config['hooks']['postToolUse'][0]['command']],
                             input=payload, env=environment, capture_output=True, check=True)
-    assert json.loads(result.stdout) == {'permission': 'allow'}
+    assert json.loads(result.stdout) == {}
     assert (root / 'payload').read_bytes() == payload
     del environment['BT_BIN']
     # Missing bt must still yield valid responses for every registered hook.
@@ -74,8 +71,7 @@ exit "${BT_EXIT_CODE:-0}"
         result = subprocess.run(['/bin/sh', '-c', registrations[0]['command']],
                                 input=payload, env=environment,
                                 capture_output=True, check=True)
-        expected = {'permission': 'allow'} if event in permission else (
-            {'continue': True} if event == 'beforeSubmitPrompt' else {})
+        expected = {'continue': True} if event == 'beforeSubmitPrompt' else {}
         assert json.loads(result.stdout) == expected
         assert result.stderr == b''
 print('cursor capture: raw forwarding, quoted paths, and fail-open responses OK')

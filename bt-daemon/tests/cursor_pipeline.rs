@@ -118,7 +118,7 @@ async fn assert_stalled_daemon_preserves_policy_response(
     let expected = if event == "beforeSubmitPrompt" {
         json!({"continue":true})
     } else {
-        json!({"permission":"allow"})
+        json!({})
     };
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
@@ -132,8 +132,8 @@ async fn assert_stalled_daemon_preserves_policy_response(
 
 #[cfg(all(feature = "cli", unix))]
 #[tokio::test]
-async fn stalled_initialize_still_allows_cursor_tool_execution() {
-    assert_stalled_daemon_preserves_policy_response("preToolUse", false).await;
+async fn stalled_initialize_keeps_cursor_tool_observation_fail_open() {
+    assert_stalled_daemon_preserves_policy_response("postToolUse", false).await;
 }
 
 #[cfg(all(feature = "cli", unix))]
