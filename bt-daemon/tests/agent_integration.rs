@@ -413,7 +413,7 @@ async fn pi_codemode_traces_nested_tools_and_images() {
             request.tool_names()
         );
         let script = format!(
-            "const [r, b] = await Promise.all([tools.read({{path: 'tiny.png'}}), tools.bash({{command: {:?}}})]); image(r); text(b.output);",
+            "const b = await tools.bash({{command: {:?}}}); const r = await tools.read({{path: 'tiny.png'}}); image(r); text(b.output);",
             tool_command("PI_NESTED_OK")
         );
         MockReply::response(OpenAiTurn::tool_call(
