@@ -492,6 +492,42 @@ fn imported_terminal_error_message_is_preserved_on_the_turn_span() {
     );
 }
 
+#[test]
+fn transcript_replacement_keeps_turn_span_ids_monotonic() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_path = temp.path().join("first-snapshot.jsonl");
+    let next_path = temp.path().join("replacement-snapshot.jsonl");
+    let first = "{\"role\":\"user\",\"message\":{\"content\":\"first prompt\"}}\n{\"role\":\"assistant\",\"message\":{\"content\":\"first answer\"}}\n";
+    let next = "{\"role\":\"user\",\"message\":{\"content\":\"second prompt\"}}\n{\"role\":\"assistant\",\"message\":{\"content\":\"second answer\"}}\n";
+    std::fs::write(&first_path, first).unwrap();
+    std::fs::write(&next_path, next).unwrap();
+
+    let mut h = Harness::new("test-session");
+    h.handle(&event("sessionStart", 100, json!({})));
+    h.handle(&mirrored(
+        "ImportCheckpoint",
+        110,
+        &first_path,
+        first.len() as u64,
+        json!({}),
+    ));
+    let first_turn = h.turns().into_iter().next().unwrap().span_id.clone();
+    h.handle(&mirrored(
+        "ImportCheckpoint",
+        120,
+        &next_path,
+        next.len() as u64,
+        json!({}),
+    ));
+
+    let turns = h.turns();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].name, "Turn 1");
+    assert_eq!(turns[0].span_id, first_turn);
+    assert_eq!(turns[1].name, "Turn 2");
+    assert_ne!(turns[0].span_id, turns[1].span_id);
+}
+
 fn mirrored(kind: &str, ts: i64, path: &Path, through: u64, payload: Value) -> Envelope {
     let mut e = event(kind, ts, payload);
     e.payload["_bt_transcript_mirror"] = json!({"mirror":path,"through":through});

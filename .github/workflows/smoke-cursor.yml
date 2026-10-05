@@ -136,7 +136,7 @@ jobs:
           rows = summary["rows"]
           assert any(
               (row.get("span_attributes") or {}).get("type") == "task"
-              and (row.get("span_attributes") or {}).get("name", "").startswith("Turn ")
+              and ((row.get("span_attributes") or {}).get("name") or "").startswith("Turn ")
               for row in rows
           ), summary
           assert any(

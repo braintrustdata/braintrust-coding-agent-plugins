@@ -10,6 +10,8 @@
 //! The `cli` feature only gates the standalone binary and its logging
 //! subscriber.
 
+use std::io::IsTerminal;
+
 pub mod paths;
 
 mod client;
@@ -945,9 +947,15 @@ pub async fn run_traced(
     mut route: SessionRoute,
 ) -> anyhow::Result<std::process::ExitStatus> {
     apply_run_span_plugins(&mut route, &args.plugin)?;
-    if args.source == RunSource::Cursor && cursor_run_requires_interactive(&args.agent_args) {
+    if args.source == RunSource::Cursor
+        && cursor_run_requires_interactive(
+            &args.agent_args,
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        )
+    {
         anyhow::bail!(
-            "bt trace run cursor requires interactive mode for complete lifecycle tracing; Cursor `--print` / `-p` mode does not emit the required prompt, response, and stop hooks"
+            "bt trace run cursor requires an interactive terminal for complete lifecycle tracing; Cursor print mode is inferred for non-terminal stdio and does not emit the required prompt, response, and stop hooks"
         );
     }
     if route.destination.is_none() {
@@ -1158,11 +1166,17 @@ fn managed_run_args(
     }
 }
 
-fn cursor_run_requires_interactive(args: &[OsString]) -> bool {
-    args.iter().any(|arg| {
-        let arg = arg.to_string_lossy();
-        arg == "-p" || arg == "--print" || arg.starts_with("--print=")
-    })
+fn cursor_run_requires_interactive(
+    args: &[OsString],
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    !stdin_is_terminal
+        || !stdout_is_terminal
+        || args.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg == "-p" || arg == "--print" || arg.starts_with("--print=")
+        })
 }
 
 const CURSOR_HOOKS_MANIFEST: &str =
@@ -2617,6 +2631,33 @@ mod tests {
             assert!(script.contains("\"continue\":true"));
             assert!(!script.contains("--dangerously-bypass"));
         }
+    }
+
+    #[test]
+    fn cursor_managed_run_rejects_explicit_and_inferred_print_modes() {
+        let args = [OsString::from("answer this")];
+        assert!(!cursor_run_requires_interactive(&args, true, true));
+        assert!(cursor_run_requires_interactive(&args, false, true));
+        assert!(cursor_run_requires_interactive(&args, true, false));
+        assert!(cursor_run_requires_interactive(
+            &[OsString::from("-p")],
+            true,
+            true
+        ));
+        assert!(cursor_run_requires_interactive(
+            &[OsString::from("--print")],
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn cursor_managed_run_rejects_redirected_stdin_or_stdout() {
+        let args = [OsString::from("answer this")];
+        assert!(!cursor_run_requires_interactive(&args, true, true));
+        assert!(cursor_run_requires_interactive(&args, false, true));
+        assert!(cursor_run_requires_interactive(&args, true, false));
+        assert!(cursor_run_requires_interactive(&args, false, false));
     }
 
     #[test]

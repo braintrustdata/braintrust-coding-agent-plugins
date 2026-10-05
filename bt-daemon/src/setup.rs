@@ -107,7 +107,53 @@ fn cursor_installed_manifest_at(plugin: &Path) -> Option<Value> {
 }
 
 pub(crate) fn cursor_plugin_is_installed_at(plugin: &Path) -> bool {
-    cursor_installed_manifest_at(plugin).is_some_and(|manifest| cursor_plugin_is_ours(&manifest))
+    cursor_plugin_is_installed_for_platform_at(plugin, cfg!(windows))
+}
+
+fn cursor_plugin_is_installed_for_platform_at(plugin: &Path, windows: bool) -> bool {
+    if !cursor_installed_manifest_at(plugin)
+        .is_some_and(|manifest| cursor_plugin_is_ours(&manifest))
+    {
+        return false;
+    }
+    let Ok(actual) = std::fs::read(plugin.join("hooks/hooks.json")) else {
+        return false;
+    };
+    let Ok(actual) = serde_json::from_slice::<Value>(&actual) else {
+        return false;
+    };
+    let Ok(expected) = cursor_hooks_manifest_for_platform(plugin, windows) else {
+        return false;
+    };
+    let Ok(expected) = serde_json::from_str::<Value>(&expected) else {
+        return false;
+    };
+    if actual != expected {
+        return false;
+    }
+    let launcher = if windows {
+        "hooks/trace.ps1"
+    } else {
+        "hooks/trace.sh"
+    };
+    let Ok(contents) = std::fs::read_to_string(plugin.join(launcher)) else {
+        return false;
+    };
+    let expected_contents = if windows {
+        CURSOR_POWERSHELL_LAUNCHER
+    } else {
+        CURSOR_HOOK_LAUNCHER
+    };
+    if contents != expected_contents {
+        return false;
+    }
+    #[cfg(unix)]
+    if !windows {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(plugin.join(launcher))
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0);
+    }
+    true
 }
 
 fn cursor_update_required() -> bool {
@@ -1566,6 +1612,25 @@ mod tests {
         write_object_atomic(&hooks_path, config).unwrap();
 
         assert!(!cursor_discovery_hooks_are_installed_at(&config_dir));
+    }
+
+    #[test]
+    fn cursor_plugin_health_requires_valid_platform_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("trace-cursor");
+        install_cursor_plugin_at_for_platform(&plugin, false).unwrap();
+        assert!(cursor_plugin_is_installed_for_platform_at(&plugin, false));
+
+        std::fs::write(plugin.join("hooks/hooks.json"), "{}").unwrap();
+        assert!(!cursor_plugin_is_installed_for_platform_at(&plugin, false));
+        install_cursor_plugin_at_for_platform(&plugin, false).unwrap();
+        std::fs::write(plugin.join("hooks/trace.sh"), "broken launcher").unwrap();
+        assert!(!cursor_plugin_is_installed_for_platform_at(&plugin, false));
+
+        install_cursor_plugin_at_for_platform(&plugin, true).unwrap();
+        assert!(cursor_plugin_is_installed_for_platform_at(&plugin, true));
+        std::fs::write(plugin.join("hooks/trace.ps1"), "broken launcher").unwrap();
+        assert!(!cursor_plugin_is_installed_for_platform_at(&plugin, true));
     }
 
     #[test]

@@ -415,7 +415,14 @@ impl TranscriptTail {
         }
         if refresh == Refresh::Reset {
             self.state = Self::new_state(self.source);
-            self.translator_reset = true;
+            if self.source == ImportSource::Cursor {
+                // Keep Cursor's translator alive so its session root and turn
+                // ordinal continue across native transcript replacement.
+                // A fresh snapshot path makes it rewind only transcript input.
+                self.cursor_snapshot = None;
+            } else {
+                self.translator_reset = true;
+            }
             self.cursor_snapshot_records = 0;
         }
         let events = match self.envelopes_from_current_records(refresh == Refresh::Reset) {
@@ -773,6 +780,40 @@ mod tests {
         let snapshot_contents = std::fs::read_to_string(&snapshot).unwrap();
         assert!(snapshot_contents.contains("\"content\":\"one\""));
         assert!(snapshot_contents.contains("\"content\":\"two\""));
+    }
+
+    #[test]
+    fn cursor_transcript_replacement_rotates_snapshot_without_resetting_translator() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"the original longer prompt\"}}\n",
+        )
+        .unwrap();
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        let first = tail.poll(false).unwrap();
+        let first_snapshot = first[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"latest\"}}\n",
+        )
+        .unwrap();
+        let replacement = tail.poll(false).unwrap();
+        assert_eq!(replacement[0].event, "sessionStart");
+        assert_eq!(replacement[1].event, "ImportCheckpoint");
+        let replacement_snapshot = replacement[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap();
+        assert_ne!(first_snapshot, replacement_snapshot);
+        assert!(!tail.take_translator_reset());
     }
 
     #[test]
