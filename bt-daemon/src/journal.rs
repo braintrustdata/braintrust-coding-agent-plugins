@@ -667,6 +667,44 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[tokio::test]
+    async fn collection_keeps_a_journal_with_a_translation_incident() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = source_journal_path(temp.path(), "pi", "held-session");
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, b"event\n").await.unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .unwrap();
+        let scope = crate::recovery::WorkScope::SourceSession {
+            source: "pi".into(),
+            session_id: "held-session".into(),
+        };
+        crate::recovery::pause(
+            temp.path(),
+            scope.clone(),
+            0,
+            0,
+            crate::recovery::FailureCause::InputShape {
+                event: "tool_execution_start".into(),
+                translator_revision: "old".into(),
+            },
+            "missing toolCallId".into(),
+            None,
+        )
+        .unwrap();
+        gc_old_journals(temp.path(), std::time::Duration::from_secs(1)).await;
+        assert!(path.exists());
+        crate::recovery::resolve(temp.path(), &scope).unwrap();
+        gc_old_journals(temp.path(), std::time::Duration::from_secs(1)).await;
+        assert!(!path.exists());
+    }
+
     fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
         Envelope {
             source: "pi".into(),
