@@ -20,6 +20,10 @@ use std::time::Duration;
 /// command shell. This checks executable lookup and stdin forwarding, which
 /// the POSIX-only launcher cannot exercise on a Windows runner.
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Exercises a foreground command exactly as Cursor invokes Windows hooks."
+)]
 #[test]
 fn cursor_direct_hook_command_receives_native_stdin_on_windows() {
     use std::io::Write;

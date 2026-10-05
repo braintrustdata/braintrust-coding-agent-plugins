@@ -5,11 +5,9 @@ TARGET_DIR="${1:?usage: validate.sh <TARGET_DIR>}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fail() { echo "validate: $*" >&2; exit 1; }
 
-for file in .cursor-plugin/plugin.json hooks/hooks.json hooks/trace.sh README.md LICENSE; do
+for file in .cursor-plugin/plugin.json hooks/hooks.json README.md LICENSE; do
   [[ -f "$TARGET_DIR/$file" ]] || fail "missing $file"
 done
-[[ -x "$TARGET_DIR/hooks/trace.sh" ]] || fail "trace.sh is not executable"
-sh -n "$TARGET_DIR/hooks/trace.sh" || fail "invalid hook shell syntax"
 
 python3 - "$TARGET_DIR" <<'PY' || fail "invalid Cursor plugin"
 import json
@@ -34,7 +32,7 @@ expected = {
 assert set(config['hooks']) == expected
 for event, registrations in config['hooks'].items():
     assert registrations == [{
-        'command': '"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh" ' + event,
+        'command': 'bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000',
         'timeout': 10,
         'failClosed': False,
     }]

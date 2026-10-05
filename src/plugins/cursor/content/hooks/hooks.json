@@ -3,84 +3,84 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" sessionStart",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "sessionEnd": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" sessionEnd",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "beforeSubmitPrompt": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" beforeSubmitPrompt",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "postToolUse": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" postToolUse",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "postToolUseFailure": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" postToolUseFailure",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "subagentStop": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" subagentStop",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "afterShellExecution": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" afterShellExecution",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "afterMCPExecution": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" afterMCPExecution",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "afterFileEdit": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" afterFileEdit",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "preCompact": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" preCompact",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "stop": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" stop",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }
     ],
     "afterAgentResponse": [
       {
-        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/trace.sh\" afterAgentResponse",
+        "command": "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
         "timeout": 10,
         "failClosed": false
       }

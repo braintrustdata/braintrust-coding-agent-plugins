@@ -15,6 +15,8 @@ Trace Cursor sessions to [Braintrust](https://braintrust.dev) with the `trace-cu
 ## Supported Cursor surfaces
 
 The plugin works with Cursor CLI and desktop.
+Its hooks invoke `bt trace hook` directly, so the Braintrust CLI must be on
+Cursor's `PATH` when hooks run.
 
 ## Quickstart
 
