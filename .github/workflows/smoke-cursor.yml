@@ -68,6 +68,7 @@ jobs:
         run: |
           curl https://cursor.com/install -fsS | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
           agent --version
 
       - name: Generate distribution-repo token
