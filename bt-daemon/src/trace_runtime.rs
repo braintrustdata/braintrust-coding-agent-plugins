@@ -300,9 +300,23 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
 }
 
 fn plugin_activation_warning(agent: DoctorAgent, enabled: bool) -> Option<&'static str> {
-    (agent == DoctorAgent::Grok && enabled).then_some(
-        "Grok 1.0.13 requires `/reload-plugins` in each active session after plugin installation or update before its hooks become active",
-    )
+    if !enabled {
+        return None;
+    }
+    match agent {
+        DoctorAgent::Grok => Some(
+            "Grok 1.0.13 requires `/reload-plugins` in each active session after plugin installation or update before its hooks become active",
+        ),
+        DoctorAgent::Cursor
+            if !crate::setup::cursor_plugin_is_installed_at(&crate::paths::cursor_plugin_dir())
+                || !crate::setup::cursor_discovery_hooks_are_installed_at(
+                    &crate::paths::cursor_config_dir(),
+                ) =>
+        {
+            Some("Cursor tracing plugin or lifecycle hooks are missing; run `bt trace enable cursor`")
+        }
+        _ => None,
+    }
 }
 
 /// Bounds `doctor`'s status query to the running daemon.
@@ -1502,7 +1516,9 @@ mod tests {
         );
         assert_eq!(
             daemon_warnings(DoctorAgent::Codex, &shell, &offline, false),
-            ["the running tracing daemon cannot authenticate, so it rejects Codex events: failed to call login endpoint"]
+            [
+                "the running tracing daemon cannot authenticate, so it rejects Codex events: failed to call login endpoint"
+            ]
         );
     }
 

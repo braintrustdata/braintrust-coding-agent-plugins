@@ -451,6 +451,83 @@ fn synthetic_attached_session_preserves_external_identity_across_all_merges() {
         .unwrap()
         .contains("private-token"));
 }
+
+#[test]
+fn imported_session_root_marks_its_start_timestamp_as_estimated() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "sessionStart",
+        100,
+        json!({"start_time_estimated":true}),
+    ));
+    let root = h
+        .inserted(SpanType::Task)
+        .into_iter()
+        .find(|row| row.name == "Cursor session")
+        .unwrap();
+    assert_eq!(
+        root.metadata.as_ref().unwrap()["start_time_estimated"],
+        true
+    );
+}
+
+#[test]
+fn imported_terminal_error_message_is_preserved_on_the_turn_span() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event("sessionStart", 100, json!({})));
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        110,
+        json!({"generation_id":"turn-1","prompt":"hello"}),
+    ));
+    h.handle(&event(
+        "stop",
+        120,
+        json!({"generation_id":"turn-1","status":"error","error_message":"WritableIterable is closed"}),
+    ));
+    let turn = h.turns().into_iter().next().unwrap();
+    assert_eq!(
+        h.rows()[&turn.span_id]["error"],
+        "WritableIterable is closed"
+    );
+}
+
+#[test]
+fn transcript_replacement_keeps_turn_span_ids_monotonic() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_path = temp.path().join("first-snapshot.jsonl");
+    let next_path = temp.path().join("replacement-snapshot.jsonl");
+    let first = "{\"role\":\"user\",\"message\":{\"content\":\"first prompt\"}}\n{\"role\":\"assistant\",\"message\":{\"content\":\"first answer\"}}\n";
+    let next = "{\"role\":\"user\",\"message\":{\"content\":\"second prompt\"}}\n{\"role\":\"assistant\",\"message\":{\"content\":\"second answer\"}}\n";
+    std::fs::write(&first_path, first).unwrap();
+    std::fs::write(&next_path, next).unwrap();
+
+    let mut h = Harness::new("test-session");
+    h.handle(&event("sessionStart", 100, json!({})));
+    h.handle(&mirrored(
+        "ImportCheckpoint",
+        110,
+        &first_path,
+        first.len() as u64,
+        json!({}),
+    ));
+    let first_turn = h.turns().into_iter().next().unwrap().span_id.clone();
+    h.handle(&mirrored(
+        "ImportCheckpoint",
+        120,
+        &next_path,
+        next.len() as u64,
+        json!({}),
+    ));
+
+    let turns = h.turns();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].name, "Turn 1");
+    assert_eq!(turns[0].span_id, first_turn);
+    assert_eq!(turns[1].name, "Turn 2");
+    assert_ne!(turns[0].span_id, turns[1].span_id);
+}
+
 fn mirrored(kind: &str, ts: i64, path: &Path, through: u64, payload: Value) -> Envelope {
     let mut e = event(kind, ts, payload);
     e.payload["_bt_transcript_mirror"] = json!({"mirror":path,"through":through});
@@ -990,6 +1067,44 @@ fn synthetic_subagents_parent_to_spawning_turn_and_unmatched_stop_stays_incomple
         rows[&h.inserted(SpanType::Tool)[0].span_id]["metadata"]["status"],
         "incomplete"
     );
+}
+
+#[test]
+fn terminal_only_subagent_stop_synthesizes_estimated_span() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        100,
+        json!({"generation_id":"t","prompt":"delegate"}),
+    ));
+    h.handle(&event(
+        "subagentStop",
+        140,
+        json!({
+            "subagent_id":"child-terminal-only",
+            "status":"completed",
+            "summary":"finished work",
+            "subagent_type":"explore",
+            "subagent_model":"auto"
+        }),
+    ));
+    h.finish();
+
+    let child = h
+        .inserted(SpanType::Task)
+        .into_iter()
+        .find(|row| row.name == "Cursor subagent")
+        .unwrap();
+    assert_eq!(child.start_ms, Some(140));
+    assert_eq!(child.end_ms, Some(140));
+    assert_eq!(child.output, Some(json!("finished work")));
+    let metadata = child.metadata.as_ref().unwrap();
+    assert_eq!(metadata["start_time_estimated"], true);
+    assert_eq!(metadata["result_completeness"], "terminal_observation_only");
+    assert_eq!(metadata["status"], "completed");
+    assert_eq!(metadata["subagent_type"], "explore");
+    assert_eq!(metadata["model"], "auto");
+    assert_eq!(child.parent_span_ids, vec![h.turns()[0].span_id.clone()]);
 }
 #[test]
 fn synthetic_compaction_is_observation_only_and_clears_unavailable_context() {

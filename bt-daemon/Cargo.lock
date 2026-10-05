@@ -271,6 +271,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "braintrust-sdk-rust",
  "bytes",
  "chrono",

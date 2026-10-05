@@ -52,10 +52,10 @@ work. Clippy and Oxlint enforce use of these helpers in CI.
 
 ## Versioning and distribution
 
-Versioning is per distribution. Claude, Codex, and Grok plugins carry their version in
-their plugin manifests, and `scripts/set-plugin-version.py` updates those
-manifests for a release. Antigravity's schema does not expose a version field,
-so its distribution is versioned by repository tags and GitHub Releases.
+Versioning is per distribution. Claude, Codex, Cursor, and Grok plugins carry
+their version in their plugin manifests. `scripts/set-plugin-version.py`
+updates those manifests for a release. Antigravity's schema does not expose a
+version field, so its distribution is versioned by repository tags and GitHub Releases.
 Claude's marketplace manifest carries a separate catalog version; bump it
 independently for breaking marketplace changes. The Codex marketplace manifest
 is unversioned.
@@ -65,6 +65,7 @@ is unversioned.
 | antigravity | `braintrustdata/braintrust-antigravity-plugin` |
 | claude | `braintrustdata/braintrust-claude-plugin` |
 | codex | `braintrustdata/braintrust-codex-plugin` |
+| cursor | `braintrustdata/braintrust-cursor-plugin` |
 | grok | `braintrustdata/braintrust-grok-plugin` |
 
 A distribution repository is a generated artifact. Each deploy clones it,
@@ -111,9 +112,10 @@ distribution repository** without committing source changes or creating tags
 or releases. It does not require a PR. Pi and OpenCode retain their separate
 npm workflows, dispatched against an already-merged version-bump SHA.
 
-A Codex deployment can run `smoke-codex.yml`, which installs the deployed
-plugin and runs a real Codex session through the daemon when
-`OPENAI_API_KEY` is available.
+Codex and Cursor deployments can run their installed-plugin smoke workflows,
+which trace a real CLI session through the daemon when `OPENAI_API_KEY` or
+`CURSOR_API_KEY` is available. Cursor's generated distribution is separate from
+the existing Braintrust MCP extension; users may install either or both.
 
 CI builds and validates the plugin packages on Linux. It runs the JavaScript
 daemon client and the Pi and OpenCode unit tests, and builds, tests, and lints

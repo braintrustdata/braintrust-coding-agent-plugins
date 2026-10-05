@@ -13,6 +13,10 @@ pub const SETTINGS_ENV: &str = "BT_DAEMON_CONFIG";
 /// Env override for Antigravity's native configuration directory. Primarily
 /// useful for isolated validation and managed environments.
 pub const ANTIGRAVITY_CONFIG_DIR_ENV: &str = "BT_ANTIGRAVITY_CONFIG_DIR";
+/// Env override for Cursor's per-user local plugin directory.
+pub const CURSOR_PLUGIN_DIR_ENV: &str = "BT_CURSOR_PLUGIN_DIR";
+/// Env override for Cursor's per-user configuration directory.
+pub const CURSOR_CONFIG_DIR_ENV: &str = "BT_CURSOR_CONFIG_DIR";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -112,6 +116,7 @@ pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
             .join(".gemini")
             .join("config")
             .join("braintrust.json"),
+        "cursor" => home().join(".cursor").join("braintrust.json"),
         other => data_dir(None).join("agents").join(format!("{other}.json")),
     }
 }
@@ -142,6 +147,24 @@ pub(crate) fn antigravity_config_dir() -> PathBuf {
         }
     }
     home().join(".gemini").join("config")
+}
+
+/// Resolve Cursor's per-user local plugin directory for the tracing plugin.
+pub(crate) fn cursor_plugin_dir() -> PathBuf {
+    std::env::var_os(CURSOR_PLUGIN_DIR_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".cursor").join("plugins").join("local"))
+        .join("trace-cursor")
+}
+
+/// Resolve Cursor's per-user configuration directory.
+pub(crate) fn cursor_config_dir() -> PathBuf {
+    std::env::var_os(CURSOR_CONFIG_DIR_ENV)
+        .or_else(|| std::env::var_os("CURSOR_CONFIG_DIR"))
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".cursor"))
 }
 
 /// Create `dir` (and parents) accessible only to the current user: mode 0700

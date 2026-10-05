@@ -13,11 +13,8 @@ if command -v "$BT_BIN" >/dev/null 2>&1; then
   fi
 fi
 
-# These schemas are required even when bt is absent or capture fails. An empty
-# or malformed permission-hook response can block Cursor despite failClosed=false.
+# beforeSubmitPrompt is a continuation hook, not a permission decision.
 case "${1-}" in
-  preToolUse|subagentStart|beforeShellExecution|beforeMCPExecution|beforeReadFile)
-    printf '%s\n' '{"permission":"allow"}' ;;
   beforeSubmitPrompt)
     printf '%s\n' '{"continue":true}' ;;
   *)

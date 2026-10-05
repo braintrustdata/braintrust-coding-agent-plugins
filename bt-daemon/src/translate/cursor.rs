@@ -322,9 +322,12 @@ impl CursorTranslator {
             .unwrap_or_default();
         self.trace_root = root.unwrap_or_else(|| self.root.clone());
         self.root_parents = parent.into_iter().collect();
-        let metadata = json!({"source":"cursor", "session_id":ctx.session_id,
+        let mut metadata = json!({"source":"cursor", "session_id":ctx.session_id,
             "username":local_username(), "os":std::env::consts::OS, "workspace":self.cwd,
             "trace_cursor_version":e.source_version, "trace_plugin_version":e.plugin_version});
+        if let Some(estimated) = e.payload.get("start_time_estimated") {
+            metadata["start_time_estimated"] = estimated.clone();
+        }
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.root.clone(),
             root_span_id: self.trace_root.clone(),
@@ -426,7 +429,7 @@ impl CursorTranslator {
             }
             return;
         }
-        self.close_turn(e.ts_ms, Some("superseded"), ops);
+        self.close_turn(e.ts_ms, Some("superseded"), None, ops);
         self.ensure_turn(
             e.ts_ms,
             Some(prompt.into()),
@@ -553,7 +556,13 @@ impl CursorTranslator {
             turn.boundary = ts.max(turn.boundary);
         }
     }
-    fn close_turn(&mut self, ts: i64, status: Option<&str>, ops: &mut Vec<SpanOp>) {
+    fn close_turn(
+        &mut self,
+        ts: i64,
+        status: Option<&str>,
+        error_message: Option<&str>,
+        ops: &mut Vec<SpanOp>,
+    ) {
         self.close_model(ts, ops);
         let Some(turn) = self.turn.as_mut().filter(|t| t.end.is_none()) else {
             return;
@@ -570,7 +579,7 @@ impl CursorTranslator {
         row.output = copy.output.map(|s| json!(s));
         row.metadata = Some(json!({"status":status}));
         if matches!(status, Some("error" | "aborted")) {
-            row.error = Some(status.unwrap().into());
+            row.error = Some(error_message.unwrap_or(status.unwrap()).into());
         }
         let turn_id = row.span_id.clone();
         ops.push(SpanOp::Merge(row));
@@ -1073,7 +1082,7 @@ impl CursorTranslator {
                     .prompt_owners
                     .insert(self.transcript_users, (prompt.clone(), id));
             } else {
-                self.close_turn(ts, Some("transcript_boundary"), ops);
+                self.close_turn(ts, Some("transcript_boundary"), None, ops);
                 self.ensure_turn(ts, Some(prompt), None, "transcript_user_message", ops);
                 self.transcript.prompt_owners.insert(
                     self.transcript_users,
@@ -1214,6 +1223,42 @@ impl CursorTranslator {
                 row.error = Some(e.payload["status"].as_str().unwrap().into());
             }
             ops.push(SpanOp::Merge(row));
+        } else {
+            // Cursor only supports a stop hook in the shipped integration.
+            // Keep the terminal observation as a useful, zero-duration span
+            // and mark the unavailable start time explicitly.
+            self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
+            let spawn = e.payload.get("tool_call_id").and_then(Value::as_str);
+            let parent = spawn
+                .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
+                .map(|t| t.turn.clone())
+                .unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
+            let mut row = self.row(
+                ids::span_id(&self.namespace, &format!("subagent:{id}")),
+                parent,
+                "Cursor subagent",
+                SpanType::Task,
+            );
+            row.start_ms = Some(e.ts_ms);
+            row.end_ms = Some(e.ts_ms);
+            row.output = e.payload.get("summary").cloned();
+            row.metadata = Some(json!({
+                "subagent_id": id,
+                "spawning_tool_call_id": spawn,
+                "model": e.payload.get("subagent_model"),
+                "subagent_type": e.payload.get("subagent_type"),
+                "recursive_activity_verified": false,
+                "start_time_estimated": true,
+                "result_completeness": "terminal_observation_only",
+                "status": e.payload.get("status"),
+            }));
+            if matches!(
+                e.payload.get("status").and_then(Value::as_str),
+                Some("error" | "aborted")
+            ) {
+                row.error = e.payload["status"].as_str().map(str::to_owned);
+            }
+            ops.push(SpanOp::Insert(row));
         }
     }
     fn turn_usage(&mut self, e: &Envelope, ops: &mut Vec<SpanOp>) {
@@ -1392,6 +1437,7 @@ impl CursorTranslator {
                     self.close_turn(
                         e.ts_ms,
                         e.payload.get("status").and_then(Value::as_str),
+                        e.payload.get("error_message").and_then(Value::as_str),
                         ops,
                     );
                 }
@@ -1400,6 +1446,7 @@ impl CursorTranslator {
                 self.close_turn(
                     e.ts_ms,
                     e.payload.get("reason").and_then(Value::as_str),
+                    e.payload.get("error_message").and_then(Value::as_str),
                     ops,
                 );
                 let mut row = self.row(
@@ -1527,7 +1574,7 @@ impl AgentTranslator for CursorTranslator {
     }
     fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let mut ops = Vec::new();
-        self.close_turn(self.last_ms, Some("capture_ended"), &mut ops);
+        self.close_turn(self.last_ms, Some("capture_ended"), None, &mut ops);
         let tools = std::mem::take(&mut self.tools);
         self.open_tool_order.clear();
         for (_, tool) in tools {

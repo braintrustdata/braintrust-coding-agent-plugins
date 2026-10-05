@@ -70,6 +70,7 @@ pub enum DoctorAgent {
     Pi,
     Antigravity,
     Grok,
+    Cursor,
 }
 
 impl DoctorAgent {
@@ -81,6 +82,7 @@ impl DoctorAgent {
             Self::Pi => "pi",
             Self::Antigravity => "antigravity",
             Self::Grok => "grok",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -92,6 +94,7 @@ impl DoctorAgent {
             Self::Pi => "Pi",
             Self::Antigravity => "Google Antigravity",
             Self::Grok => "Grok",
+            Self::Cursor => "Cursor",
         }
     }
 }
@@ -145,6 +148,8 @@ pub enum SetupAgent {
     Pi,
     /// Install the published Grok tracing plugin.
     Grok,
+    /// Install the published Cursor tracing plugin.
+    Cursor,
     /// Install the Google Antigravity tracing hooks.
     Antigravity,
 }
@@ -237,6 +242,16 @@ mod tests {
                 ..
             }) if value == r#"{"import":true}"#
         ));
+
+        let cursor_import = Cli::try_parse_from(["bt", "import", "cursor", "session-id"]).unwrap();
+        assert!(matches!(
+            cursor_import.trace.command,
+            TraceCommand::Import(ImportArgs {
+                source: crate::ImportSource::Cursor,
+                ref session_ids,
+                ..
+            }) if session_ids == &["session-id"]
+        ));
     }
 
     #[test]
@@ -271,6 +286,23 @@ mod tests {
     }
 
     #[test]
+    fn run_accepts_cursor_and_forwards_agent_arguments() {
+        let parsed = Cli::try_parse_from([
+            "bt", "run", "cursor", "--tag", "ci", "--", "--print", "hello",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Run(RunArgs {
+                source: crate::RunSource::Cursor,
+                ref agent_args,
+                ref tags,
+                ..
+            }) if agent_args == &["--print", "hello"] && tags == &["ci"]
+        ));
+    }
+
+    #[test]
     fn doctor_accepts_every_supported_agent_alias() {
         for (agent, expected, source, display_name) in [
             ("codex", DoctorAgent::Codex, "codex", "Codex"),
@@ -284,6 +316,7 @@ mod tests {
                 "Google Antigravity",
             ),
             ("grok", DoctorAgent::Grok, "grok", "Grok"),
+            ("cursor", DoctorAgent::Cursor, "cursor", "Cursor"),
         ] {
             let cli = Cli::try_parse_from(["bt", "doctor", agent]).unwrap();
             assert!(matches!(
@@ -343,7 +376,15 @@ mod tests {
 
     #[test]
     fn update_accepts_every_setup_agent() {
-        for agent in ["codex", "claude", "opencode", "pi", "grok", "antigravity"] {
+        for agent in [
+            "codex",
+            "claude",
+            "opencode",
+            "pi",
+            "grok",
+            "cursor",
+            "antigravity",
+        ] {
             assert!(matches!(
                 Cli::try_parse_from(["bt", "update", agent])
                     .unwrap()

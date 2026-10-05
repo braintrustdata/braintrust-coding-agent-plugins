@@ -3,12 +3,13 @@ use crate::ImportSource;
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read, Seek};
+use std::io::{BufRead, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 mod antigravity;
 mod claude;
 mod codex;
+mod cursor;
 
 pub(crate) fn resolve_transcripts(
     session_ids: &[String],
@@ -41,6 +42,7 @@ fn transcript_roots(source: ImportSource) -> Vec<PathBuf> {
         .unwrap_or_else(|| PathBuf::from("."));
     match source {
         ImportSource::Codex => codex::roots(&home),
+        ImportSource::Cursor => cursor::roots(&home),
         ImportSource::Claude => claude::roots(&home),
         ImportSource::Antigravity => antigravity::roots(&home),
     }
@@ -124,6 +126,7 @@ fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
 fn transcript_session_id(path: &Path, source: ImportSource) -> Option<String> {
     match source {
         ImportSource::Codex => codex::transcript_session_id(path),
+        ImportSource::Cursor => cursor::transcript_session_id(path),
         ImportSource::Claude => claude::transcript_session_id(path),
         ImportSource::Antigravity => antigravity::transcript_session_id(path),
     }
@@ -141,6 +144,7 @@ fn resolve_transcript_in(
         find_jsonl_files(root, &mut candidates);
         matches.extend(candidates.into_iter().filter(|path| match source {
             ImportSource::Codex => codex::filename_matches(path, session_id),
+            ImportSource::Cursor => cursor::filename_matches(path, session_id),
             ImportSource::Claude => claude::filename_matches(path, session_id),
             ImportSource::Antigravity => antigravity::filename_matches(path, session_id),
         }));
@@ -188,6 +192,7 @@ fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
 fn source_name(source: ImportSource) -> &'static str {
     match source {
         ImportSource::Codex => "Codex",
+        ImportSource::Cursor => "Cursor",
         ImportSource::Claude => "Claude Code",
         ImportSource::Antigravity => "Google Antigravity",
     }
@@ -199,7 +204,7 @@ pub(crate) fn transcript_envelopes(
     source: ImportSource,
 ) -> anyhow::Result<Vec<Envelope>> {
     let mut records = IncrementalRecords::default();
-    records.refresh(path, true)?;
+    records.refresh_with_final_partial(path, true, false)?;
     envelopes_from_records(path, source, &records)
 }
 
@@ -210,6 +215,7 @@ fn envelopes_from_records(
 ) -> anyhow::Result<Vec<Envelope>> {
     match source {
         ImportSource::Codex => codex::envelopes(path, &records.values),
+        ImportSource::Cursor => cursor::envelopes(path, records.read_offset, &records.values),
         ImportSource::Claude => claude::envelopes(
             path,
             &records.values,
@@ -240,7 +246,12 @@ enum Refresh {
 }
 
 impl IncrementalRecords {
-    fn refresh(&mut self, path: &Path, finalize: bool) -> anyhow::Result<Refresh> {
+    fn refresh_with_final_partial(
+        &mut self,
+        path: &Path,
+        finalize: bool,
+        allow_incomplete_final_record: bool,
+    ) -> anyhow::Result<Refresh> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("read transcript metadata {}", path.display()))?;
         let len = metadata.len();
@@ -292,7 +303,13 @@ impl IncrementalRecords {
                         values.push(value);
                         end_offsets.push(offset);
                     }
-                    Err(_) if !finalize && offset == len && !line.ends_with('\n') => break,
+                    Err(_)
+                        if (allow_incomplete_final_record || !finalize)
+                            && offset == len
+                            && !line.ends_with('\n') =>
+                    {
+                        break
+                    }
                     Err(error) => {
                         return Err(error).with_context(|| {
                             format!("parse transcript {} line {}", path.display(), line_count)
@@ -349,10 +366,14 @@ pub(crate) struct TranscriptTail {
     records: IncrementalRecords,
     retry_envelopes: bool,
     translator_reset: bool,
+    cursor_snapshot: Option<tempfile::TempDir>,
+    cursor_snapshot_records: usize,
+    allow_incomplete_final_record: bool,
 }
 
 enum TailState {
     Codex(codex::Tail),
+    Cursor(cursor::Tail),
     Claude(claude::Tail),
     Antigravity(antigravity::Tail),
 }
@@ -366,19 +387,36 @@ impl TranscriptTail {
             records: IncrementalRecords::default(),
             retry_envelopes: false,
             translator_reset: false,
+            cursor_snapshot: None,
+            cursor_snapshot_records: 0,
+            allow_incomplete_final_record: false,
         }
+    }
+
+    pub(crate) fn allow_incomplete_final_record_on_shutdown(&mut self) {
+        self.allow_incomplete_final_record = true;
     }
 
     fn new_state(source: ImportSource) -> TailState {
         match source {
             ImportSource::Codex => TailState::Codex(codex::Tail::default()),
+            ImportSource::Cursor => TailState::Cursor(cursor::Tail::default()),
             ImportSource::Claude => TailState::Claude(claude::Tail::default()),
             ImportSource::Antigravity => TailState::Antigravity(antigravity::Tail::default()),
         }
     }
 
     pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
-        let refresh = match self.records.refresh(&self.path, finalize) {
+        let previous_cursor_records = if self.source == ImportSource::Cursor {
+            self.records.values.clone()
+        } else {
+            Vec::new()
+        };
+        let refresh = match self.records.refresh_with_final_partial(
+            &self.path,
+            finalize,
+            self.source == ImportSource::Cursor && self.allow_incomplete_final_record,
+        ) {
             Ok(refresh) => refresh,
             Err(_) if !finalize => return Ok(Vec::new()),
             Err(error) => return Err(error),
@@ -388,9 +426,29 @@ impl TranscriptTail {
         }
         if refresh == Refresh::Reset {
             self.state = Self::new_state(self.source);
-            self.translator_reset = true;
+            if self.source == ImportSource::Cursor {
+                // Keep Cursor's translator alive so its session root and turn
+                // ordinal continue across native transcript replacement.
+                // A fresh snapshot path makes it rewind only transcript input.
+                self.cursor_snapshot = None;
+                // Cursor can rewrite a transcript while retaining earlier
+                // turns. Keep those records out of the rotated snapshot so
+                // the live translator does not claim their prompts twice.
+                self.cursor_snapshot_records = self
+                    .records
+                    .values
+                    .iter()
+                    .zip(&previous_cursor_records)
+                    .take_while(|(current, previous)| current == previous)
+                    .count();
+            } else {
+                self.translator_reset = true;
+            }
+            if self.source != ImportSource::Cursor {
+                self.cursor_snapshot_records = 0;
+            }
         }
-        let events = match envelopes_from_records(&self.path, self.source, &self.records) {
+        let events = match self.envelopes_from_current_records(refresh == Refresh::Reset) {
             Ok(events) => events,
             Err(_) if !finalize => {
                 self.retry_envelopes = true;
@@ -404,6 +462,7 @@ impl TranscriptTail {
             .len();
         match &mut self.state {
             TailState::Codex(state) => state.poll(events, len, finalize),
+            TailState::Cursor(state) => state.poll(events, len, finalize),
             TailState::Claude(state) => state.poll(events, len, finalize),
             TailState::Antigravity(state) => state.poll(events, len, finalize),
         }
@@ -411,6 +470,42 @@ impl TranscriptTail {
 
     pub(crate) fn take_translator_reset(&mut self) -> bool {
         std::mem::take(&mut self.translator_reset)
+    }
+
+    fn envelopes_from_current_records(
+        &mut self,
+        reset_snapshot: bool,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        if self.source != ImportSource::Cursor {
+            return envelopes_from_records(&self.path, self.source, &self.records);
+        }
+        if self.cursor_snapshot.is_none() {
+            self.cursor_snapshot = Some(
+                tempfile::Builder::new()
+                    .prefix("bt-cursor-import-")
+                    .tempdir()?,
+            );
+        }
+        let snapshot = self
+            .cursor_snapshot
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("transcript.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(!reset_snapshot)
+            .truncate(reset_snapshot)
+            .open(&snapshot)?;
+        for record in &self.records.values[self.cursor_snapshot_records..] {
+            serde_json::to_writer(&mut file, record)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        let through = file.metadata()?.len();
+        self.cursor_snapshot_records = self.records.values.len();
+        cursor::envelopes_with_snapshot(&self.path, &snapshot, through, &self.records.values)
     }
 }
 
@@ -557,6 +652,240 @@ mod tests {
             resolve_transcript_in("conversation-123", ImportSource::Antigravity, &[root]).unwrap(),
             transcript
         );
+    }
+
+    #[test]
+    fn finds_cursor_transcripts_by_nested_session_identity_and_ignores_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        let transcript = root
+            .join("workspace")
+            .join("agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, r#"{"role":"user","message":{"content":"hi"}}"#).unwrap();
+        let subagent = root
+            .join("workspace")
+            .join("agent-transcripts/agent-session-123/agent-session-123.jsonl");
+        std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
+        std::fs::write(&subagent, "{}\n").unwrap();
+
+        assert_eq!(
+            resolve_transcript_in(
+                "session-123",
+                ImportSource::Cursor,
+                std::slice::from_ref(&root)
+            )
+            .unwrap(),
+            transcript
+        );
+        assert_eq!(
+            discover_transcripts_in(ImportSource::Cursor, &[root]).unwrap(),
+            vec![transcript]
+        );
+    }
+
+    #[test]
+    fn cursor_import_emits_only_supported_transcript_enrichment_and_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let contents = concat!(
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"question\"}]}}\n",
+            "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"a.txt\"}}]}}\n",
+            "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]}}\n",
+            "{\"type\":\"turn_ended\",\"status\":\"success\"}\n"
+        );
+        std::fs::write(&transcript, contents).unwrap();
+        let events = transcript_envelopes(&transcript, ImportSource::Cursor).unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sessionStart", "ImportCheckpoint", "stop"]
+        );
+        assert!(events.iter().all(|event| event.source == "cursor"));
+        assert_eq!(
+            events[1].payload["_bt_transcript_mirror"]["through"],
+            contents.len() as u64
+        );
+        assert_eq!(
+            events[1].payload["historical_fidelity"],
+            "user_and_assistant_text_and_terminal_status"
+        );
+        assert_eq!(events[2].payload["status"], "success");
+        assert_eq!(events[1].payload["start_time_estimated"], true);
+    }
+
+    #[test]
+    fn cursor_import_preserves_terminal_error_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"question\"}}\n{\"type\":\"turn_ended\",\"status\":\"error\",\"error\":\"WritableIterable is closed\"}\n",
+        )
+        .unwrap();
+
+        let events = transcript_envelopes(&transcript, ImportSource::Cursor).unwrap();
+        let stop = events.iter().find(|event| event.event == "stop").unwrap();
+        assert_eq!(stop.payload["status"], "error");
+        assert_eq!(stop.payload["error_message"], "WritableIterable is closed");
+    }
+
+    #[test]
+    fn cursor_attach_tails_growth_without_repeating_boundaries_or_checkpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let first_record = b"{\"role\":\"user\",\"message\":{\"content\":\"one\"}}\n";
+        std::fs::write(&transcript, first_record).unwrap();
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        let first = tail.poll(false).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sessionStart", "ImportCheckpoint"]
+        );
+        let snapshot = first[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(PathBuf::from(&snapshot), transcript);
+        assert_eq!(
+            first[1].payload["_bt_transcript_mirror"]["through"],
+            first_record.len() as u64
+        );
+        assert!(tail.poll(false).unwrap().is_empty());
+
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"role\":\"assistant\",\"message\":{\"content\":\"two\"}}\n")
+            .unwrap();
+        let grown = tail.poll(false).unwrap();
+        assert_eq!(
+            grown
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ImportCheckpoint"]
+        );
+        assert_eq!(
+            grown[0].payload["_bt_transcript_mirror"]["mirror"],
+            snapshot
+        );
+        assert_eq!(
+            std::fs::read_to_string(&snapshot).unwrap().lines().count(),
+            2
+        );
+        assert_eq!(
+            tail.poll(true)
+                .unwrap()
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stop"]
+        );
+        std::fs::write(&transcript, b"replacement transcript\n").unwrap();
+        let snapshot_contents = std::fs::read_to_string(&snapshot).unwrap();
+        assert!(snapshot_contents.contains("\"content\":\"one\""));
+        assert!(snapshot_contents.contains("\"content\":\"two\""));
+    }
+
+    #[test]
+    fn cursor_transcript_replacement_rotates_snapshot_without_resetting_translator() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"the original longer prompt\"}}\n",
+        )
+        .unwrap();
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        let first = tail.poll(false).unwrap();
+        let first_snapshot = first[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"latest\"}}\n",
+        )
+        .unwrap();
+        let replacement = tail.poll(false).unwrap();
+        assert_eq!(replacement[0].event, "sessionStart");
+        assert_eq!(replacement[1].event, "ImportCheckpoint");
+        let replacement_snapshot = replacement[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap();
+        assert_ne!(first_snapshot, replacement_snapshot);
+        assert!(!tail.take_translator_reset());
+    }
+
+    #[test]
+    fn cursor_attach_finalizes_after_an_incomplete_trailing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"complete\"}}\n",
+        )
+        .unwrap();
+
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        tail.allow_incomplete_final_record_on_shutdown();
+        assert_eq!(
+            tail.poll(false).unwrap().last().unwrap().event,
+            "ImportCheckpoint"
+        );
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"role\":\"assistant\",\"message\":")
+            .unwrap();
+
+        let final_events = tail.poll(true).unwrap();
+        assert_eq!(
+            final_events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ImportCheckpoint", "stop"]
+        );
+    }
+
+    #[test]
+    fn completed_import_still_rejects_an_incomplete_trailing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"complete\"}\n{\"partial\"").unwrap();
+
+        let error = IncrementalRecords::default()
+            .refresh_with_final_partial(&transcript, true, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("parse transcript"));
     }
 
     #[test]
@@ -1036,7 +1365,12 @@ mod tests {
         let path = temp.path().join("session.jsonl");
         std::fs::write(&path, "{\"type\":\"session_meta\"").unwrap();
         let mut records = IncrementalRecords::default();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Unchanged);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Unchanged
+        );
         assert!(records.values.is_empty());
 
         std::fs::write(
@@ -1044,11 +1378,21 @@ mod tests {
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
         )
         .unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Appended);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Appended
+        );
         assert_eq!(records.values.len(), 1);
 
         std::fs::write(&path, "{\"type\":\"event_msg\"}\n").unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Reset);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Reset
+        );
         assert_eq!(records.values, vec![json!({"type":"event_msg"})]);
 
         std::fs::write(
@@ -1056,7 +1400,12 @@ mod tests {
             "{\"type\":\"replacement_with_a_longer_prefix\"}\n{\"type\":\"second\"}\n",
         )
         .unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Reset);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Reset
+        );
         assert_eq!(
             records.values,
             vec![
