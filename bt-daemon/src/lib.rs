@@ -2592,14 +2592,31 @@ mod tests {
         for event in cursor_hook_events().unwrap() {
             let entry = &manifest["hooks"][event][0];
             assert_eq!(entry["failClosed"], false);
-            assert!(entry["command"].as_str().unwrap().contains("trace.sh"));
+            let launcher = if cfg!(windows) {
+                "trace.ps1"
+            } else {
+                "trace.sh"
+            };
+            assert!(entry["command"].as_str().unwrap().contains(launcher));
         }
-        let script = std::fs::read_to_string(plugin.join("hooks/trace.sh")).unwrap();
-        assert!(script.contains("'--source' 'cursor' '--managed-run-hook'"));
-        assert!(script.contains("'--session-id-field' 'conversation_id'"));
-        assert!(!script.contains("\"permission\":\"allow\""));
-        assert!(script.contains("\"continue\":true"));
-        assert!(!script.contains("--dangerously-bypass"));
+        if cfg!(windows) {
+            let script = std::fs::read_to_string(plugin.join("hooks/trace.ps1")).unwrap();
+            assert!(script.contains("'--source'"));
+            assert!(script.contains("'cursor'"));
+            assert!(script.contains("'--managed-run-hook'"));
+            assert!(script.contains("'--session-id-field'"));
+            assert!(script.contains("'conversation_id'"));
+            assert!(!script.contains("permission\":\"allow"));
+            assert!(script.contains("{\"continue\":true}"));
+            assert!(!script.contains("--dangerously-bypass"));
+        } else {
+            let script = std::fs::read_to_string(plugin.join("hooks/trace.sh")).unwrap();
+            assert!(script.contains("'--source' 'cursor' '--managed-run-hook'"));
+            assert!(script.contains("'--session-id-field' 'conversation_id'"));
+            assert!(!script.contains("\"permission\":\"allow\""));
+            assert!(script.contains("\"continue\":true"));
+            assert!(!script.contains("--dangerously-bypass"));
+        }
     }
 
     #[test]
