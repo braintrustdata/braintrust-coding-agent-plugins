@@ -1551,7 +1551,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&neighbor).unwrap(), "leave me");
         assert_eq!(
             std::fs::read_to_string(plugin.join("hooks/hooks.json")).unwrap(),
-            CURSOR_HOOKS_MANIFEST
+            cursor_hooks_manifest_for_platform(&plugin, cfg!(windows)).unwrap()
         );
         #[cfg(unix)]
         {

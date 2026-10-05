@@ -1068,6 +1068,44 @@ fn synthetic_subagents_parent_to_spawning_turn_and_unmatched_stop_stays_incomple
         "incomplete"
     );
 }
+
+#[test]
+fn terminal_only_subagent_stop_synthesizes_estimated_span() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        100,
+        json!({"generation_id":"t","prompt":"delegate"}),
+    ));
+    h.handle(&event(
+        "subagentStop",
+        140,
+        json!({
+            "subagent_id":"child-terminal-only",
+            "status":"completed",
+            "summary":"finished work",
+            "subagent_type":"explore",
+            "subagent_model":"auto"
+        }),
+    ));
+    h.finish();
+
+    let child = h
+        .inserted(SpanType::Task)
+        .into_iter()
+        .find(|row| row.name == "Cursor subagent")
+        .unwrap();
+    assert_eq!(child.start_ms, Some(140));
+    assert_eq!(child.end_ms, Some(140));
+    assert_eq!(child.output, Some(json!("finished work")));
+    let metadata = child.metadata.as_ref().unwrap();
+    assert_eq!(metadata["start_time_estimated"], true);
+    assert_eq!(metadata["result_completeness"], "terminal_observation_only");
+    assert_eq!(metadata["status"], "completed");
+    assert_eq!(metadata["subagent_type"], "explore");
+    assert_eq!(metadata["model"], "auto");
+    assert_eq!(child.parent_span_ids, vec![h.turns()[0].span_id.clone()]);
+}
 #[test]
 fn synthetic_compaction_is_observation_only_and_clears_unavailable_context() {
     let mut h = Harness::new("test-session");

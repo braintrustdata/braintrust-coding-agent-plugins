@@ -1223,6 +1223,42 @@ impl CursorTranslator {
                 row.error = Some(e.payload["status"].as_str().unwrap().into());
             }
             ops.push(SpanOp::Merge(row));
+        } else {
+            // Cursor only supports a stop hook in the shipped integration.
+            // Keep the terminal observation as a useful, zero-duration span
+            // and mark the unavailable start time explicitly.
+            self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
+            let spawn = e.payload.get("tool_call_id").and_then(Value::as_str);
+            let parent = spawn
+                .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
+                .map(|t| t.turn.clone())
+                .unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
+            let mut row = self.row(
+                ids::span_id(&self.namespace, &format!("subagent:{id}")),
+                parent,
+                "Cursor subagent",
+                SpanType::Task,
+            );
+            row.start_ms = Some(e.ts_ms);
+            row.end_ms = Some(e.ts_ms);
+            row.output = e.payload.get("summary").cloned();
+            row.metadata = Some(json!({
+                "subagent_id": id,
+                "spawning_tool_call_id": spawn,
+                "model": e.payload.get("subagent_model"),
+                "subagent_type": e.payload.get("subagent_type"),
+                "recursive_activity_verified": false,
+                "start_time_estimated": true,
+                "result_completeness": "terminal_observation_only",
+                "status": e.payload.get("status"),
+            }));
+            if matches!(
+                e.payload.get("status").and_then(Value::as_str),
+                Some("error" | "aborted")
+            ) {
+                row.error = e.payload["status"].as_str().map(str::to_owned);
+            }
+            ops.push(SpanOp::Insert(row));
         }
     }
     fn turn_usage(&mut self, e: &Envelope, ops: &mut Vec<SpanOp>) {
