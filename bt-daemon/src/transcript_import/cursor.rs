@@ -130,12 +130,11 @@ pub(super) fn envelopes_with_snapshot(
     // A previous turn's marker can remain at the end of the file while a
     // resumed turn is being appended. Do not use that status to close the new
     // turn unless no conversation records follow the latest marker.
-    let final_status = records
+    let final_terminal = records
         .iter()
         .rposition(|record| record.get("type").and_then(Value::as_str) == Some("turn_ended"))
         .filter(|marker| !records[*marker + 1..].iter().any(is_conversation_record))
-        .and_then(|marker| records[marker].get("status"))
-        .cloned();
+        .map(|marker| &records[marker]);
     let boundary = |event: &str, through: Option<u64>| {
         let mut payload = json!({
             "session_id": session_id,
@@ -146,8 +145,14 @@ pub(super) fn envelopes_with_snapshot(
             "historical_fidelity": "user_and_assistant_text_and_terminal_status"
         });
         if event == "stop" {
-            if let Some(status) = &final_status {
+            if let Some(status) = final_terminal.and_then(|record| record.get("status")) {
                 payload["status"] = status.clone();
+            }
+            if let Some(error) = final_terminal
+                .and_then(|record| record.get("error"))
+                .filter(|error| error.is_string())
+            {
+                payload["error_message"] = error.clone();
             }
         }
         if let Some(through) = through {

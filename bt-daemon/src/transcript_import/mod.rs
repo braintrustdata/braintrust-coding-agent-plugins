@@ -691,6 +691,25 @@ mod tests {
     }
 
     #[test]
+    fn cursor_import_preserves_terminal_error_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"question\"}}\n{\"type\":\"turn_ended\",\"status\":\"error\",\"error\":\"WritableIterable is closed\"}\n",
+        )
+        .unwrap();
+
+        let events = transcript_envelopes(&transcript, ImportSource::Cursor).unwrap();
+        let stop = events.iter().find(|event| event.event == "stop").unwrap();
+        assert_eq!(stop.payload["status"], "error");
+        assert_eq!(stop.payload["error_message"], "WritableIterable is closed");
+    }
+
+    #[test]
     fn cursor_attach_tails_growth_without_repeating_boundaries_or_checkpoints() {
         let temp = tempfile::tempdir().unwrap();
         let transcript = temp

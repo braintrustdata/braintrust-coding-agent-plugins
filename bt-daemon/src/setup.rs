@@ -31,6 +31,16 @@ const CURSOR_PLUGIN_MANIFEST: &str =
 const CURSOR_HOOKS_MANIFEST: &str =
     include_str!("../../src/plugins/cursor/content/hooks/hooks.json");
 const CURSOR_HOOK_LAUNCHER: &str = include_str!("../../src/plugins/cursor/content/hooks/trace.sh");
+const CURSOR_POWERSHELL_LAUNCHER: &str = r#"$bt = if ($env:BT_BIN) { $env:BT_BIN } else { 'bt' }
+$hookArgs = @('trace', 'hook', '--source', 'cursor', '--session-id-field', 'conversation_id', '--event-field', 'hook_event_name', '--transcript-path-field', 'transcript_path', '--flush-on-turn-end', '--capture-timeout-ms', '8000')
+try { & $bt @hookArgs *> $null } catch {}
+if ($args.Count -gt 0 -and $args[0] -eq 'beforeSubmitPrompt') {
+  [Console]::Out.WriteLine('{"continue":true}')
+} else {
+  [Console]::Out.WriteLine('{}')
+}
+exit 0
+"#;
 const CURSOR_README: &str = include_str!("../../src/plugins/cursor/content/README.md");
 const CURSOR_LICENSE: &str = include_str!("../../src/plugins/cursor/content/LICENSE");
 fn package_version(manifest: &str) -> anyhow::Result<String> {
@@ -127,6 +137,10 @@ fn cursor_plugin_is_ours(manifest: &Value) -> bool {
 }
 
 fn install_cursor_plugin_at(plugin_dir: &Path) -> anyhow::Result<()> {
+    install_cursor_plugin_at_for_platform(plugin_dir, cfg!(windows))
+}
+
+fn install_cursor_plugin_at_for_platform(plugin_dir: &Path, windows: bool) -> anyhow::Result<()> {
     let parent = plugin_dir.parent().ok_or_else(|| {
         anyhow::anyhow!("Cursor plugin path has no parent: {}", plugin_dir.display())
     })?;
@@ -164,16 +178,24 @@ fn install_cursor_plugin_at(plugin_dir: &Path) -> anyhow::Result<()> {
     let staged_plugin = stage.path().join("trace-cursor");
     std::fs::create_dir_all(staged_plugin.join(".cursor-plugin"))?;
     std::fs::create_dir_all(staged_plugin.join("hooks"))?;
-    for (relative, contents) in [
-        (".cursor-plugin/plugin.json", CURSOR_PLUGIN_MANIFEST),
-        ("hooks/hooks.json", CURSOR_HOOKS_MANIFEST),
-        ("hooks/trace.sh", CURSOR_HOOK_LAUNCHER),
-        ("README.md", CURSOR_README),
-        ("LICENSE", CURSOR_LICENSE),
-    ] {
+    let hooks_manifest = cursor_hooks_manifest_for_platform(plugin_dir, windows)?;
+    let mut files = vec![
+        (
+            ".cursor-plugin/plugin.json",
+            CURSOR_PLUGIN_MANIFEST.to_owned(),
+        ),
+        ("hooks/hooks.json", hooks_manifest),
+        ("hooks/trace.sh", CURSOR_HOOK_LAUNCHER.to_owned()),
+        ("README.md", CURSOR_README.to_owned()),
+        ("LICENSE", CURSOR_LICENSE.to_owned()),
+    ];
+    if windows {
+        files.push(("hooks/trace.ps1", CURSOR_POWERSHELL_LAUNCHER.to_owned()));
+    }
+    for (relative, contents) in files {
         std::fs::write(staged_plugin.join(relative), contents)
             .with_context(|| format!("failed to write Cursor plugin file {relative}"))?;
-        if relative == "hooks/trace.sh" {
+        if relative == "hooks/trace.sh" && !windows {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -216,6 +238,29 @@ fn install_cursor_plugin_at(plugin_dir: &Path) -> anyhow::Result<()> {
         })?;
     }
     Ok(())
+}
+
+fn cursor_hooks_manifest_for_platform(plugin_dir: &Path, windows: bool) -> anyhow::Result<String> {
+    if !windows {
+        return Ok(CURSOR_HOOKS_MANIFEST.to_owned());
+    }
+    let mut manifest: Value = serde_json::from_str(CURSOR_HOOKS_MANIFEST)?;
+    let script = plugin_dir.join("hooks/trace.ps1");
+    let script = script.to_string_lossy().replace('\\', "/");
+    let script = format!("\"{}\"", script.replace('"', "\"\""));
+    for (event, entries) in manifest["hooks"]
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Cursor hook manifest has no hooks object"))?
+    {
+        let command =
+            format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File {script} {event}");
+        let first = entries
+            .as_array_mut()
+            .and_then(|entries| entries.first_mut())
+            .ok_or_else(|| anyhow::anyhow!("Cursor hook {event} has no registrations"))?;
+        first["command"] = Value::String(command);
+    }
+    Ok(serde_json::to_string_pretty(&manifest)?)
 }
 
 fn setup_cursor_at(plugin_dir: &Path) -> anyhow::Result<()> {
@@ -1480,6 +1525,32 @@ mod tests {
         .unwrap();
         assert!(cursor_plugin_is_installed_at(&plugin));
         assert!(cursor_plugin_is_ours(&manifest));
+    }
+
+    #[test]
+    fn cursor_persistent_install_generates_a_windows_native_launcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("Cursor Plugins/trace-cursor");
+        install_cursor_plugin_at_for_platform(&plugin, true).unwrap();
+
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(plugin.join("hooks/hooks.json")).unwrap())
+                .unwrap();
+        for (event, entries) in manifest["hooks"].as_object().unwrap() {
+            let command = entries[0]["command"].as_str().unwrap();
+            assert!(
+                command.starts_with("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"")
+            );
+            assert!(command.contains("Cursor Plugins/trace-cursor/hooks/trace.ps1\""));
+            assert!(command.ends_with(&format!(" {event}")));
+            assert!(!command.contains("trace.sh"));
+        }
+        let script = std::fs::read_to_string(plugin.join("hooks/trace.ps1")).unwrap();
+        assert!(script.contains("$env:BT_BIN"));
+        assert!(script.contains("'--source', 'cursor'"));
+        assert!(script.contains("'--event-field', 'hook_event_name'"));
+        assert!(script.contains("'{\"continue\":true}'") || script.contains("\"continue\":true"));
+        assert!(script.contains("[Console]::Out.WriteLine('{}')"));
     }
 
     #[test]

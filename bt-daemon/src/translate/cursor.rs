@@ -429,7 +429,7 @@ impl CursorTranslator {
             }
             return;
         }
-        self.close_turn(e.ts_ms, Some("superseded"), ops);
+        self.close_turn(e.ts_ms, Some("superseded"), None, ops);
         self.ensure_turn(
             e.ts_ms,
             Some(prompt.into()),
@@ -556,7 +556,13 @@ impl CursorTranslator {
             turn.boundary = ts.max(turn.boundary);
         }
     }
-    fn close_turn(&mut self, ts: i64, status: Option<&str>, ops: &mut Vec<SpanOp>) {
+    fn close_turn(
+        &mut self,
+        ts: i64,
+        status: Option<&str>,
+        error_message: Option<&str>,
+        ops: &mut Vec<SpanOp>,
+    ) {
         self.close_model(ts, ops);
         let Some(turn) = self.turn.as_mut().filter(|t| t.end.is_none()) else {
             return;
@@ -573,7 +579,7 @@ impl CursorTranslator {
         row.output = copy.output.map(|s| json!(s));
         row.metadata = Some(json!({"status":status}));
         if matches!(status, Some("error" | "aborted")) {
-            row.error = Some(status.unwrap().into());
+            row.error = Some(error_message.unwrap_or(status.unwrap()).into());
         }
         let turn_id = row.span_id.clone();
         ops.push(SpanOp::Merge(row));
@@ -1076,7 +1082,7 @@ impl CursorTranslator {
                     .prompt_owners
                     .insert(self.transcript_users, (prompt.clone(), id));
             } else {
-                self.close_turn(ts, Some("transcript_boundary"), ops);
+                self.close_turn(ts, Some("transcript_boundary"), None, ops);
                 self.ensure_turn(ts, Some(prompt), None, "transcript_user_message", ops);
                 self.transcript.prompt_owners.insert(
                     self.transcript_users,
@@ -1395,6 +1401,7 @@ impl CursorTranslator {
                     self.close_turn(
                         e.ts_ms,
                         e.payload.get("status").and_then(Value::as_str),
+                        e.payload.get("error_message").and_then(Value::as_str),
                         ops,
                     );
                 }
@@ -1403,6 +1410,7 @@ impl CursorTranslator {
                 self.close_turn(
                     e.ts_ms,
                     e.payload.get("reason").and_then(Value::as_str),
+                    e.payload.get("error_message").and_then(Value::as_str),
                     ops,
                 );
                 let mut row = self.row(
@@ -1530,7 +1538,7 @@ impl AgentTranslator for CursorTranslator {
     }
     fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let mut ops = Vec::new();
-        self.close_turn(self.last_ms, Some("capture_ended"), &mut ops);
+        self.close_turn(self.last_ms, Some("capture_ended"), None, &mut ops);
         let tools = std::mem::take(&mut self.tools);
         self.open_tool_order.clear();
         for (_, tool) in tools {

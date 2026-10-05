@@ -127,5 +127,22 @@ jobs:
           done
           curl -fsS http://127.0.0.1:53999/version >/dev/null
           cd "${RUNNER_TEMP}/cursor-smoke"
-          agent --plugin-dir "$HOME/.cursor/plugins/local/trace-cursor" -p "Say exactly: Cursor tracing smoke test passed."
-          python3 -c 'import json, os; s=json.load(open(os.environ["MOCK_COLLECTOR_OUT"])); assert s["totalRows"] >= 1, s; print(s)'
+          export CURSOR_PLUGIN_DIR="$HOME/.cursor/plugins/local/trace-cursor"
+          python3 "${GITHUB_WORKSPACE}/.github/scripts/run-cursor-interactive-smoke.py"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          summary = json.loads(Path(os.environ["MOCK_COLLECTOR_OUT"]).read_text())
+          rows = summary["rows"]
+          assert any(
+              (row.get("span_attributes") or {}).get("type") == "task"
+              and (row.get("span_attributes") or {}).get("name", "").startswith("Turn ")
+              for row in rows
+          ), summary
+          assert any(
+              (row.get("span_attributes") or {}).get("type") == "llm"
+              and "cursor tracing smoke test passed" in json.dumps(row.get("output")).lower()
+              for row in rows
+          ), summary
+          print({"logs3Requests": summary["logs3Requests"], "totalRows": summary["totalRows"]})
+          PY

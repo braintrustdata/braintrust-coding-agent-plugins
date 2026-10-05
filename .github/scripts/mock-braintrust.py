@@ -9,7 +9,7 @@ from pathlib import Path
 
 port = int(os.environ.get("MOCK_COLLECTOR_PORT", "53999"))
 summary_path = Path(os.environ["MOCK_COLLECTOR_OUT"])
-summary = {"logs3Requests": 0, "totalRows": 0}
+summary = {"logs3Requests": 0, "totalRows": 0, "rows": []}
 
 
 def save_summary() -> None:
@@ -72,6 +72,7 @@ class Handler(BaseHTTPRequestHandler):
                 rows = []
             summary["logs3Requests"] += 1
             summary["totalRows"] += len(rows)
+            summary["rows"].extend(rows)
             save_summary()
             print(
                 f"mock-braintrust: received {len(rows)} row(s), "

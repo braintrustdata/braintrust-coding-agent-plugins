@@ -471,6 +471,27 @@ fn imported_session_root_marks_its_start_timestamp_as_estimated() {
     );
 }
 
+#[test]
+fn imported_terminal_error_message_is_preserved_on_the_turn_span() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event("sessionStart", 100, json!({})));
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        110,
+        json!({"generation_id":"turn-1","prompt":"hello"}),
+    ));
+    h.handle(&event(
+        "stop",
+        120,
+        json!({"generation_id":"turn-1","status":"error","error_message":"WritableIterable is closed"}),
+    ));
+    let turn = h.turns().into_iter().next().unwrap();
+    assert_eq!(
+        h.rows()[&turn.span_id]["error"],
+        "WritableIterable is closed"
+    );
+}
+
 fn mirrored(kind: &str, ts: i64, path: &Path, through: u64, payload: Value) -> Envelope {
     let mut e = event(kind, ts, payload);
     e.payload["_bt_transcript_mirror"] = json!({"mirror":path,"through":through});
