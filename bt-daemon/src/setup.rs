@@ -540,14 +540,13 @@ impl CursorManagedHooks {
             .process_chain
             .first()
             .filter(|identity| identity.start_time_secs > 0);
-        let marker = identity
-            .map(|identity| {
-                format!(
-                    "braintrust-cursor-managed-{}-{}-{run_id}",
-                    identity.pid, identity.start_time_secs
-                )
-            })
-            .unwrap_or_else(|| format!("braintrust-cursor-managed-{run_id}"));
+        let identity = identity.ok_or_else(|| {
+            anyhow::anyhow!("cannot safely install invocation-local Cursor hooks: process identity is unavailable")
+        })?;
+        let marker = format!(
+            "braintrust-cursor-managed-{}-{}-{run_id}",
+            identity.pid, identity.start_time_secs
+        );
         let specs = cursor_discovery_hook_specs(&marker, cfg!(windows));
         update_cursor_managed_hooks_at(config_dir, &specs)?;
         Ok(Self {
