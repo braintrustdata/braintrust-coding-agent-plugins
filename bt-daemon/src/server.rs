@@ -655,6 +655,7 @@ impl Daemon {
             .filter(|(_, session)| {
                 session.idle_for() >= idle_timeout
                     && session.counters.queued.load(Ordering::Relaxed) == 0
+                    && !session.has_paused_plugin()
             })
             .filter(|(key, _)| !self.correlation.has_active_tools(&key.correlation_key()))
             .map(|(key, _)| key.clone())
@@ -2563,6 +2564,12 @@ fn spawn_idle_watchdog(daemon: Arc<Daemon>, idle_timeout: Duration) {
             let idle_for = daemon.last_activity.lock().unwrap().elapsed();
             if idle_for >= idle_timeout
                 && daemon.total_queued() == 0
+                && !daemon
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|session| session.has_paused_plugin())
                 && !daemon.correlation.has_any_active_tools()
             {
                 tracing::info!("idle for {:?}; shutting down", idle_for);

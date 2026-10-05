@@ -1499,6 +1499,7 @@ impl ImportProcessor {
                         op,
                         &live.source,
                         &live.ctx.session_id,
+                        &format!("import:{}:{}", live.source, live.ctx.session_id),
                     ) {
                         Ok(result) => {
                             if let Some(failure) = result.failure {

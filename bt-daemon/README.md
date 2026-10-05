@@ -168,12 +168,15 @@ The environment map is captured from the daemon process when each worker-local
 span processor is constructed. Plugins execute in bounded, thread-local
 QuickJS runtimes with no filesystem or network host APIs. Modules must be
 self-contained and transforms must be stateless: module globals belong to a
-worker thread, not a session. Every configured plugin is mandatory. If any
-plugin fails, the daemon discards that span operation instead of delivering
-untransformed data, and that worker continues discarding operations that would
-use the failed plugin. Modifying the plugin file causes workers to retry it. The
-raw event remains journaled, so restarting the daemon after fixing the plugin
-replays the withheld data through the current chain.
+worker thread, not a session. Every configured plugin is mandatory. If one
+fails, the affected source session and route pause delivery; other sessions
+continue. The daemon sends a payload-free failure marker on the affected span
+with `plugin failure: <path>`, then keeps new events in that session's journal.
+It checks the failed plugin's content digest once a second. When that file
+changes, it reprocesses the paused session through the current plugin chain,
+replaces the marker with the recovered span, and resumes delivery after the
+replay reaches a durable checkpoint. A still failing edit leaves that session
+paused. No daemon restart or new agent event is needed.
 
 Plugin failures are deduplicated in the daemon's private local state, including
 the raw QuickJS exception and stack. Inspect them with:
@@ -182,9 +185,11 @@ the raw QuickJS exception and stack. Inspect them with:
 bt trace doctor codex
 ```
 
-The doctor output reports the plugin path, exception, occurrence count, and
-timestamps. Managed-run diagnostics are copied out of their temporary daemon
-directory before it is removed.
+The doctor output reports the plugin path, full local exception, session and
+span IDs, journal position, pending bytes, and recovery state. Raw exception
+details remain local; the Braintrust marker only includes the plugin path.
+Managed-run diagnostics are copied out of their temporary daemon directory
+before it is removed.
 Plugins are trusted local code: although they have no host APIs, they can copy
 environment values into spans that are delivered to Braintrust. Read only the
 specific variables needed by the transform; never attach `context.env` itself.

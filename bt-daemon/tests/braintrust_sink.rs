@@ -256,6 +256,62 @@ async fn merge_with_empty_name_does_not_clobber_the_original_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovered_plugin_span_clears_the_failure_error() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+        api_url: Some(base.clone()),
+        app_url: Some(base.clone()),
+        version: "test".into(),
+    });
+    let mut sink = factory.create("session", "claude", None).unwrap();
+    sink.configure(&session_config(&base));
+    let mut marker = row(
+        "failed",
+        "failed",
+        &[],
+        "Plugin failure",
+        SpanType::Task,
+        1,
+        None,
+    );
+    marker.error = Some("plugin failure: /tmp/redact.mjs".into());
+    sink.emit_plugin_marker(&SpanOp::Merge(marker))
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+
+    let recovered = row(
+        "failed",
+        "failed",
+        &[],
+        "Claude",
+        SpanType::Task,
+        1,
+        Some(2),
+    );
+    sink.replace_plugin_marker(&SpanOp::Insert(recovered))
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+
+    let rows = logs3_rows(&server).await;
+    assert!(rows
+        .iter()
+        .any(|row| row["error"] == "plugin failure: /tmp/redact.mjs"));
+    assert!(
+        rows.iter()
+            .any(|row| row["span_id"] == "failed" && row["span_attributes"]["name"] == "Claude"),
+        "replayed row should have its original name: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["span_id"] == "failed" && row.get("error") == Some(&Value::Null)),
+        "replayed row should clear the failure error: {rows:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provisional_lifecycle_root_is_not_exported_without_work() {
     let server = mock_backend().await;
     let base = server.uri();
