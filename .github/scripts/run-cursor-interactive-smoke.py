@@ -14,7 +14,10 @@ import time
 from pathlib import Path
 
 
-PROMPT = "Say exactly: Cursor tracing smoke test passed."
+PROMPT = (
+    "Use the terminal to run `printf 'Cursor tracing smoke test passed.\\n'`, "
+    "then say exactly: Cursor tracing smoke test passed."
+)
 EXPECTED = "cursor tracing smoke test passed"
 TIMEOUT_SECS = 600
 KILL_GRACE_SECS = 30
