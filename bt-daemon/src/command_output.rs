@@ -157,6 +157,8 @@ pub struct DoctorCommandOutput {
     pub auth: AuthDiagnostic,
     pub daemon: DaemonDiagnostic,
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recovery_incidents: Vec<crate::RecoveryIncident>,
     pub plugin_diagnostics: Vec<crate::PluginDiagnostic>,
 }
 
@@ -273,6 +275,20 @@ impl TraceCommandOutput {
                 }
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
+                }
+                for incident in &doctor.recovery_incidents {
+                    let (source, session_id) = incident.scope.source_session();
+                    rendered.push_str(&format!(
+                        "\nRecovery: {:?}\nSource: {}\nSession: {}\nFirst blocked journal offset: {}\nOperation index: {}\nCause: {:?}\nDetail: {}\nAttempts: {}",
+                        incident.state,
+                        source,
+                        session_id,
+                        incident.first_unprocessed,
+                        incident.operation_index,
+                        incident.cause,
+                        incident.local_error,
+                        incident.attempts,
+                    ));
                 }
                 for diagnostic in &doctor.plugin_diagnostics {
                     let state = match diagnostic.state {
@@ -554,6 +570,25 @@ mod tests {
                 error: None,
             },
             warnings: Vec::new(),
+            recovery_incidents: vec![crate::RecoveryIncident {
+                scope: crate::WorkScope::SourceSession {
+                    source: "pi".into(),
+                    session_id: "pi-session".into(),
+                },
+                state: crate::WorkState::Paused,
+                first_unprocessed: 42,
+                operation_index: 0,
+                cause: crate::FailureCause::InputShape {
+                    event: "tool_execution_start".into(),
+                    translator_revision: "revision-a".into(),
+                },
+                local_error: "missing toolCallId".into(),
+                marker_span_id: None,
+                first_seen_ms: 1,
+                last_seen_ms: 2,
+                attempts: 0,
+                resolved_at_ms: None,
+            }],
             plugin_diagnostics: vec![crate::PluginDiagnostic {
                 source: "codex".into(),
                 plugin_path: PathBuf::from("/tmp/redact.mjs"),
@@ -576,6 +611,14 @@ mod tests {
         assert_eq!(value["auth"]["source"], "saved_profile");
         assert_eq!(value["daemon"]["status"], "running");
         assert_eq!(value["daemon"]["auth"]["status"], "error");
+        assert_eq!(
+            value["recovery_incidents"][0]["scope"]["session_id"],
+            "pi-session"
+        );
+        assert_eq!(
+            value["recovery_incidents"][0]["cause"]["kind"],
+            "input_shape"
+        );
         assert_eq!(
             value["daemon"]["session_errors"][0],
             "could not resolve Braintrust auth for codex"

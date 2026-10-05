@@ -1859,6 +1859,54 @@ async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment()
 }
 
 #[tokio::test]
+async fn known_bad_pi_shape_pauses_its_session_while_unknown_events_are_journaled() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let mut unknown = envelope("pi-unknown", "future_native_event", 1);
+    unknown.source = "pi".into();
+    unknown.payload = serde_json::json!({"event": {"type": "future_native_event", "new": 1}});
+    forward_envelope(&unknown, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+
+    let mut malformed = envelope("pi-bad-shape", "tool_execution_start", 2);
+    malformed.source = "pi".into();
+    malformed.payload = serde_json::json!({
+        "event": {"type": "tool_execution_start", "toolName": "read"}
+    });
+    forward_envelope(&malformed, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    let mut later = envelope("pi-bad-shape", "session_shutdown", 3);
+    later.source = "pi".into();
+    later.payload = serde_json::json!({"event": {"type": "session_shutdown"}});
+    forward_envelope(&later, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if std::fs::read_to_string(data_dir.join("diagnostics/recovery.json"))
+            .is_ok_and(|value| value.contains("\"kind\": \"input_shape\""))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let incident = std::fs::read_to_string(data_dir.join("diagnostics/recovery.json")).unwrap();
+    assert!(incident.contains("\"kind\": \"input_shape\""), "{incident}");
+    assert!(incident.contains("tool_execution_start"), "{incident}");
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "pi", "pi-bad-shape")).unwrap();
+    assert!(journal.contains("tool_execution_start"));
+    assert!(journal.contains("session_shutdown"));
+    let unknown_journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "pi", "pi-unknown")).unwrap();
+    assert!(unknown_journal.contains("future_native_event"));
+    assert!(!incident.contains("pi-unknown"), "{incident}");
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
     let (data_dir, socket, handle, tmp) = start_daemon_with_session_ttl(1).await;
     let plugin = tmp.path().join("bad.mjs");

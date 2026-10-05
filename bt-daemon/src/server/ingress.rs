@@ -281,6 +281,9 @@ impl Daemon {
         if self.quiescing.load(Ordering::SeqCst) {
             return Ok(false);
         }
+        if env.source.trim().is_empty() || env.session_id.trim().is_empty() {
+            return Err("event source and session_id must be nonempty".into());
+        }
         env.source = self
             .translators
             .canonical_source(&env.source)

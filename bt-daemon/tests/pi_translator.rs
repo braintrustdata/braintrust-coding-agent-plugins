@@ -636,7 +636,7 @@ fn pi_ignores_unknown_native_fields_at_typed_event_boundaries() {
 }
 
 #[test]
-fn pi_ignores_malformed_typed_events_without_failing_the_session() {
+fn pi_reports_malformed_required_tool_identity() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("pi", "pi-session");
     let ctx = SessionCtx {
@@ -650,9 +650,9 @@ fn pi_ignores_malformed_typed_events_without_failing_the_session() {
         )
         .unwrap();
 
-    // A future Pi version could change this identifier's representation. The
-    // raw event remains journaled, but a typed reducer must not fail the actor.
-    let ops = translator
+    // A changed identifier shape must pause translation so a newer daemon can
+    // reinterpret the journaled event instead of silently losing a tool.
+    let error = translator
         .handle(
             &event(
                 "tool_execution_start",
@@ -661,16 +661,10 @@ fn pi_ignores_malformed_typed_events_without_failing_the_session() {
             ),
             &ctx,
         )
-        .unwrap();
-    assert!(ops
-        .iter()
-        .all(|op| !matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Tool)));
-
-    assert!(translator
-        .handle(&event("agent_end", 3, json!({})), &ctx)
-        .unwrap()
-        .iter()
-        .any(|op| matches!(op, SpanOp::Merge(row) if row.end_ms == Some(3))));
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unsupported shape for tool_execution_start"));
 }
 
 #[test]

@@ -75,18 +75,34 @@ pub struct Session {
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
     pub permalink: Arc<Mutex<Option<String>>>,
-    pause: Arc<Mutex<Option<PluginPause>>>,
+    pause: Arc<Mutex<Option<RecoveryPause>>>,
     last_activity: Mutex<Instant>,
 }
 
 #[derive(Clone)]
-struct PluginPause {
-    path: PathBuf,
-    digest: Option<String>,
-    span_id: String,
-    journal_start: u64,
-    marker_emitted: bool,
-    marker_cleared: bool,
+enum RecoveryPause {
+    Plugin {
+        path: PathBuf,
+        span_id: String,
+        journal_start: u64,
+        marker_emitted: bool,
+        marker_cleared: bool,
+    },
+    Translation {
+        translator_revision: String,
+    },
+}
+
+impl RecoveryPause {
+    fn marker_cleared(&self) -> bool {
+        matches!(
+            self,
+            Self::Plugin {
+                marker_cleared: true,
+                ..
+            }
+        )
+    }
 }
 
 impl Session {
@@ -180,7 +196,7 @@ impl Session {
         self.last_activity.lock().unwrap().elapsed()
     }
 
-    pub fn has_paused_plugin(&self) -> bool {
+    pub fn has_paused_work(&self) -> bool {
         self.pause.lock().unwrap().is_some()
     }
 
@@ -478,7 +494,7 @@ struct SessionActor {
     counters: Arc<Counters>,
     last_error: Arc<Mutex<Option<String>>>,
     permalink: Arc<Mutex<Option<String>>>,
-    pause: Arc<Mutex<Option<PluginPause>>>,
+    pause: Arc<Mutex<Option<RecoveryPause>>>,
     replay: Option<ReplayPlan>,
     config: crate::wire::SessionConfig,
     correlation_key: String,
@@ -583,20 +599,73 @@ impl SessionActor {
         };
         sink.configure(&self.config);
         self.refresh_permalink(sink.as_ref());
-        if let Ok(Some(active)) = crate::plugin_diagnostics::active_pipeline(
+        let recovery_scope =
+            crate::recovery::WorkScope::delivery(&self.source, &self.session_id, &self.route).ok();
+        if let Some(incident) = recovery_scope.as_ref().and_then(|scope| {
+            crate::recovery::active(&self.data_dir, scope)
+                .ok()
+                .flatten()
+        }) {
+            if let crate::recovery::FailureCause::PluginFile { path, .. } = incident.cause {
+                *self.pause.lock().unwrap() = Some(RecoveryPause::Plugin {
+                    path,
+                    span_id: incident.marker_span_id.clone().unwrap_or_default(),
+                    journal_start: incident.first_unprocessed,
+                    marker_emitted: incident.marker_span_id.is_some(),
+                    marker_cleared: false,
+                });
+            }
+        } else if let Ok(Some(active)) = crate::plugin_diagnostics::active_pipeline(
             &self.data_dir,
             &self.source,
             &self.session_id,
             &self.route,
         ) {
             if let Some(span_id) = active.span_id {
-                *self.pause.lock().unwrap() = Some(PluginPause {
+                if let Some(scope) = &recovery_scope {
+                    let _ = crate::recovery::pause(
+                        &self.data_dir,
+                        scope.clone(),
+                        active.journal_start.unwrap_or(0),
+                        0,
+                        crate::recovery::FailureCause::PluginFile {
+                            path: active.plugin_path.clone(),
+                            digest: active.plugin_digest.clone(),
+                            plugin_index: self
+                                .route
+                                .span_plugins
+                                .iter()
+                                .position(|path| path == &active.plugin_path)
+                                .unwrap_or(0),
+                        },
+                        active.exception.clone(),
+                        Some(span_id.clone()),
+                    );
+                }
+                *self.pause.lock().unwrap() = Some(RecoveryPause::Plugin {
                     path: active.plugin_path,
-                    digest: active.plugin_digest,
                     span_id,
                     journal_start: active.journal_start.unwrap_or(0),
                     marker_emitted: true,
                     marker_cleared: false,
+                });
+            }
+        }
+        let source_scope = crate::recovery::WorkScope::SourceSession {
+            source: self.source.clone(),
+            session_id: self.session_id.clone(),
+        };
+        if let Ok(Some(incident)) = crate::recovery::active(&self.data_dir, &source_scope) {
+            if let crate::recovery::FailureCause::InputShape {
+                translator_revision,
+                ..
+            }
+            | crate::recovery::FailureCause::TranslatorFault {
+                translator_revision,
+            } = incident.cause
+            {
+                *self.pause.lock().unwrap() = Some(RecoveryPause::Translation {
+                    translator_revision,
                 });
             }
         }
@@ -621,11 +690,14 @@ impl SessionActor {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .is_some_and(|pause| pause.marker_cleared);
+                .is_some_and(RecoveryPause::marker_cleared);
             if marker_cleared && self.flush_sink(&mut sink).await {
                 self.record_delivery_checkpoint(&mut sink, tip, &mut acknowledged_through)
                     .await;
                 if acknowledged_through >= tip {
+                    if let Some(scope) = &recovery_scope {
+                        let _ = crate::recovery::resolve(&self.data_dir, scope);
+                    }
                     let _ = crate::plugin_diagnostics::update_pipeline(
                         &self.data_dir,
                         &self.source,
@@ -649,16 +721,38 @@ impl SessionActor {
                 msg = rx.recv() => match msg { Some(msg) => msg, None => break },
                 _ = retry_tick.tick(), if self.pause.lock().unwrap().is_some() => {
                     let paused = self.pause.lock().unwrap().clone().expect("paused");
-                    let changed = crate::plugin_diagnostics::plugin_digest(&paused.path);
-                    if changed.is_none() || changed == paused.digest {
+                    let scope = match &paused {
+                        RecoveryPause::Plugin { .. } => recovery_scope.as_ref(),
+                        RecoveryPause::Translation { .. } => Some(&source_scope),
+                    };
+                    let eligible = scope.and_then(|scope| {
+                        crate::recovery::active(&self.data_dir, scope).ok().flatten()
+                    }).is_some_and(|incident| incident.cause.check_local(
+                        crate::recovery::translator_revision(),
+                        crate::recovery::now_ms(),
+                    )
+                        == crate::recovery::CheckResult::RetryCandidate);
+                    if !eligible {
                         continue;
                     }
-                    if let Err(error) = crate::plugin_diagnostics::update_pipeline(
-                        &self.data_dir, &self.source, &self.session_id, &self.route,
-                        crate::plugin_diagnostics::PluginRecoveryState::Reprocessing,
-                        last_event_through,
-                    ) {
-                        self.set_error(format!("failed to record plugin recovery: {error}"));
+                    let changed = match &paused {
+                        RecoveryPause::Plugin { path, .. } => crate::recovery::plugin_digest(path),
+                        RecoveryPause::Translation { .. } => None,
+                    };
+                    if let Some(scope) = scope {
+                        if let Err(error) = crate::recovery::begin_retry(&self.data_dir, scope) {
+                            self.set_error(format!("failed to record recovery attempt: {error}"));
+                            continue;
+                        }
+                    }
+                    if matches!(paused, RecoveryPause::Plugin { .. }) {
+                        if let Err(error) = crate::plugin_diagnostics::update_pipeline(
+                            &self.data_dir, &self.source, &self.session_id, &self.route,
+                            crate::plugin_diagnostics::PluginRecoveryState::Reprocessing,
+                            last_event_through,
+                        ) {
+                            self.set_error(format!("failed to record plugin recovery: {error}"));
+                        }
                     }
                     let Ok(next_translator) = self.translators.create_checked_with_session_namespace(
                         &self.source, &self.translator_session_id,
@@ -693,16 +787,30 @@ impl SessionActor {
                         &mut next_translator, &mut next_sink, &ctx,
                         Some((acknowledged_through, tip)),
                     ).await;
-                    let stable = crate::plugin_diagnostics::plugin_digest(&paused.path) == changed;
+                    let stable = match &paused {
+                        RecoveryPause::Plugin { path, .. } =>
+                            crate::recovery::plugin_digest(path) == changed,
+                        RecoveryPause::Translation { translator_revision, .. } =>
+                            translator_revision != crate::recovery::translator_revision(),
+                    };
                     let marker_cleared = self.pause.lock().unwrap().as_ref()
-                        .is_some_and(|current| !current.marker_emitted || current.marker_cleared);
+                        .is_some_and(|current| match current {
+                            RecoveryPause::Plugin { marker_emitted, marker_cleared, .. } =>
+                                !marker_emitted || *marker_cleared,
+                            RecoveryPause::Translation { .. } => true,
+                        });
                     if flushed && stable && marker_cleared {
                         self.record_delivery_checkpoint(&mut next_sink, tip, &mut acknowledged_through).await;
                         if acknowledged_through >= tip {
-                            let _ = crate::plugin_diagnostics::update_pipeline(
-                                &self.data_dir, &self.source, &self.session_id, &self.route,
-                                crate::plugin_diagnostics::PluginRecoveryState::Recovered, tip,
-                            );
+                            if let Some(scope) = scope {
+                                let _ = crate::recovery::resolve(&self.data_dir, scope);
+                            }
+                            if matches!(paused, RecoveryPause::Plugin { .. }) {
+                                let _ = crate::plugin_diagnostics::update_pipeline(
+                                    &self.data_dir, &self.source, &self.session_id, &self.route,
+                                    crate::plugin_diagnostics::PluginRecoveryState::Recovered, tip,
+                                );
+                            }
                             *self.pause.lock().unwrap() = None;
                             *self.last_error.lock().unwrap() = None;
                             translator = next_translator;
@@ -716,10 +824,12 @@ impl SessionActor {
                     }
                     // A new plugin failure records its new digest. A sink
                     // failure retains the old one so a later tick can retry.
-                    let _ = crate::plugin_diagnostics::update_pipeline(
-                        &self.data_dir, &self.source, &self.session_id, &self.route,
-                        crate::plugin_diagnostics::PluginRecoveryState::Paused, tip,
-                    );
+                    if matches!(paused, RecoveryPause::Plugin { .. }) {
+                        let _ = crate::plugin_diagnostics::update_pipeline(
+                            &self.data_dir, &self.source, &self.session_id, &self.route,
+                            crate::plugin_diagnostics::PluginRecoveryState::Paused, tip,
+                        );
+                    }
                     continue;
                 }
             };
@@ -892,6 +1002,7 @@ impl SessionActor {
         let mut next = match first {
             Ok(ops) => Some(ops),
             Err(e) => {
+                self.record_translation_failure(&e, event_window);
                 self.set_error(format!("{translate_error}: {e}"));
                 return (false, false);
             }
@@ -964,10 +1075,15 @@ impl SessionActor {
                 }
                 if delivered && !processed.is_empty() {
                     let paused = self.pause.lock().unwrap().clone();
-                    let recovery_span = paused.and_then(|pause| {
-                        event_window
-                            .filter(|(start, _)| *start >= pause.journal_start)
-                            .map(|_| pause.span_id)
+                    let recovery_span = paused.and_then(|pause| match pause {
+                        RecoveryPause::Plugin {
+                            journal_start,
+                            span_id,
+                            ..
+                        } => event_window
+                            .filter(|(start, _)| *start >= journal_start)
+                            .map(|_| span_id),
+                        RecoveryPause::Translation { .. } => None,
                     });
                     let result = if let Some(recovery_span) = recovery_span {
                         let mut emitted = 0;
@@ -987,8 +1103,11 @@ impl SessionActor {
                                 Ok(n) => {
                                     emitted += n;
                                     if replacing {
-                                        if let Some(paused) = self.pause.lock().unwrap().as_mut() {
-                                            paused.marker_cleared = true;
+                                        if let Some(RecoveryPause::Plugin {
+                                            marker_cleared, ..
+                                        }) = self.pause.lock().unwrap().as_mut()
+                                        {
+                                            *marker_cleared = true;
                                         }
                                     }
                                 }
@@ -1019,6 +1138,7 @@ impl SessionActor {
             next = match translator.drain_pending(ctx) {
                 Ok(next) => next,
                 Err(e) => {
+                    self.record_translation_failure(&e, event_window);
                     self.set_error(format!("{translate_error}: {e}"));
                     delivered = false;
                     None
@@ -1064,14 +1184,39 @@ impl SessionActor {
                 false
             }
         };
-        *self.pause.lock().unwrap() = Some(PluginPause {
+        *self.pause.lock().unwrap() = Some(RecoveryPause::Plugin {
             path: plugin.to_path_buf(),
-            digest: crate::plugin_diagnostics::plugin_digest(plugin),
             span_id: row.span_id.clone(),
             journal_start: start,
             marker_emitted,
             marker_cleared: false,
         });
+        match crate::recovery::WorkScope::delivery(&self.source, &self.session_id, &self.route) {
+            Ok(scope) => {
+                let plugin_index = self
+                    .route
+                    .span_plugins
+                    .iter()
+                    .position(|candidate| candidate == plugin)
+                    .unwrap_or(0);
+                if let Err(error) = crate::recovery::pause(
+                    &self.data_dir,
+                    scope,
+                    start,
+                    0,
+                    crate::recovery::FailureCause::PluginFile {
+                        path: plugin.to_path_buf(),
+                        digest: crate::recovery::plugin_digest(plugin),
+                        plugin_index,
+                    },
+                    message.to_owned(),
+                    marker_emitted.then(|| row.span_id.clone()),
+                ) {
+                    self.set_error(format!("failed to persist recovery incident: {error}"));
+                }
+            }
+            Err(error) => self.set_error(format!("failed to identify recovery route: {error}")),
+        }
         if let Err(error) = crate::plugin_diagnostics::record_pipeline_failure(
             &self.data_dir,
             crate::plugin_diagnostics::PipelineFailure {
@@ -1094,6 +1239,43 @@ impl SessionActor {
             row.span_id,
             message,
         ));
+    }
+
+    fn record_translation_failure(&self, error: &anyhow::Error, event_window: Option<(u64, u64)>) {
+        let Some((start, _)) = event_window else {
+            return;
+        };
+        let revision = crate::recovery::translator_revision().to_owned();
+        let cause = if let Some(shape) = error.downcast_ref::<crate::translate::InputShapeError>() {
+            crate::recovery::FailureCause::InputShape {
+                event: shape.event.clone(),
+                translator_revision: revision.clone(),
+            }
+        } else {
+            crate::recovery::FailureCause::TranslatorFault {
+                translator_revision: revision.clone(),
+            }
+        };
+        let scope = crate::recovery::WorkScope::SourceSession {
+            source: self.source.clone(),
+            session_id: self.session_id.clone(),
+        };
+        if let Err(persist_error) = crate::recovery::pause(
+            &self.data_dir,
+            scope,
+            start,
+            0,
+            cause,
+            error.to_string(),
+            None,
+        ) {
+            self.set_error(format!(
+                "failed to persist translation incident: {persist_error}"
+            ));
+        }
+        *self.pause.lock().unwrap() = Some(RecoveryPause::Translation {
+            translator_revision: revision,
+        });
     }
 
     /// Stream the journal through the translator, emitting each entry's spans
@@ -1154,8 +1336,13 @@ impl SessionActor {
             }
             let translated = translator.handle(&env, ctx);
             if entry_through <= plan.acknowledged_through {
-                self.replay_without_delivery(translator, ctx, translated)
-                    .await;
+                if !self
+                    .replay_without_delivery(translator, ctx, translated, (before, entry_through))
+                    .await
+                {
+                    delivered = false;
+                    break;
+                }
             } else {
                 let (_, replayed) = self
                     .emit_translator_batches(
@@ -1186,12 +1373,14 @@ impl SessionActor {
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         ctx: &SessionCtx,
         first: anyhow::Result<Vec<crate::translate::SpanOp>>,
-    ) {
+        event_window: (u64, u64),
+    ) -> bool {
         let mut next = match first {
             Ok(ops) => Some(ops),
             Err(error) => {
+                self.record_translation_failure(&error, Some(event_window));
                 self.set_error(format!("journal replay failed: {error}"));
-                return;
+                return false;
             }
         };
         while let Some(ops) = next {
@@ -1206,11 +1395,13 @@ impl SessionActor {
             next = match translator.drain_pending(ctx) {
                 Ok(next) => next,
                 Err(error) => {
+                    self.record_translation_failure(&error, Some(event_window));
                     self.set_error(format!("journal replay failed: {error}"));
-                    None
+                    return false;
                 }
             };
         }
+        true
     }
 
     async fn checkpoint_and_flush(

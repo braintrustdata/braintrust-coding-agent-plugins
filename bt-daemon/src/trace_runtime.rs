@@ -618,6 +618,17 @@ async fn doctor_output_at(
         }
     };
 
+    let recovery_incidents = match crate::recovery::all_active(&paths::data_dir(None)) {
+        Ok(incidents) => incidents
+            .into_iter()
+            .filter(|incident| is_same_agent(source, incident.scope.source_session().0))
+            .collect(),
+        Err(error) => {
+            warnings.push(format!("recovery state could not be read: {error}"));
+            Vec::new()
+        }
+    };
+
     DoctorCommandOutput {
         source: source.into(),
         display_name: args.agent.display_name().into(),
@@ -629,6 +640,7 @@ async fn doctor_output_at(
         auth,
         daemon,
         warnings,
+        recovery_incidents,
         plugin_diagnostics,
     }
 }

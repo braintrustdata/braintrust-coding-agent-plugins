@@ -144,6 +144,7 @@ async fn capture_hook(
 
     let session_id = json_str_field(&payload, &args.session_id_field)
         .ok_or_else(|| anyhow::anyhow!("no `{}` field in hook payload", args.session_id_field))?;
+    anyhow::ensure!(!session_id.trim().is_empty(), "hook session id is empty");
     let event = args
         .event
         .clone()

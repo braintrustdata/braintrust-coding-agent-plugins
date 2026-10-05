@@ -315,6 +315,16 @@ fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
 
+fn decode_required<T: DeserializeOwned>(event: &str, value: &Value) -> anyhow::Result<T> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        crate::translate::InputShapeError {
+            event: event.to_owned(),
+            detail: error.to_string(),
+        }
+        .into()
+    })
+}
+
 struct PendingLlm {
     start_ms: i64,
     input: Value,
@@ -356,6 +366,26 @@ struct PiTranslator {
 
 impl AgentTranslator for PiTranslator {
     fn handle(&mut self, envelope: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        if !matches!(
+            envelope.event.as_str(),
+            "session_start"
+                | "before_agent_start"
+                | "context"
+                | "before_provider_request"
+                | "message_update"
+                | "thinking_level_select"
+                | "message_end"
+                | "tool_execution_start"
+                | "tool_execution_end"
+                | "agent_end"
+                | "session_before_compact"
+                | "session_compact"
+                | "session_before_tree"
+                | "session_tree"
+                | "session_shutdown"
+        ) {
+            return Ok(Vec::new());
+        }
         self.last_ts = self.last_ts.max(envelope.ts_ms);
         let event = envelope.payload.get("event").unwrap_or(&envelope.payload);
         let mut ops = self.ensure_root(envelope, ctx);
@@ -389,9 +419,8 @@ impl AgentTranslator for PiTranslator {
             }
             "message_end" => ops.extend(self.message_end(event, envelope.ts_ms)),
             "tool_execution_start" => {
-                if let Some(event) = decode(event) {
-                    ops.extend(self.tool_start(event, envelope.ts_ms));
-                }
+                let event = decode_required("tool_execution_start", event)?;
+                ops.extend(self.tool_start(event, envelope.ts_ms));
             }
             "tool_execution_end" => {
                 if let Some(event) = decode(event) {

@@ -452,54 +452,26 @@ fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_jso
     else {
         return;
     };
-    match event.event.as_str() {
-        "context" => {
-            let Some(messages) = native
-                .remove("messages")
-                .and_then(|messages| messages.as_array().cloned())
-            else {
-                return;
-            };
-            let common_prefix = previous
-                .iter()
-                .zip(&messages)
-                .take_while(|(left, right)| left == right)
-                .count();
-            native.insert(
-                PI_MESSAGES_DELTA.into(),
-                serde_json::json!({
-                    "common_prefix": common_prefix,
-                    "suffix": messages[common_prefix..],
-                }),
-            );
-            *previous = messages;
-        }
-        "before_provider_request" => {
-            // The translator records only the allowlisted request
-            // configuration and tool definitions, never the prompt or messages.
-            if let Some(payload) = native.get_mut("payload") {
-                *payload = serde_json::Value::Object(crate::translate::pi_request_config(payload));
-            }
-        }
-        "agent_end" => {
-            // The translator only consumes willRetry from this lifecycle event.
-            native.remove("messages");
-        }
-        "message_update" => {
-            // Pi repeats the progressively growing assistant message on every
-            // streaming update. Translation only needs the update type to mark
-            // time-to-first-token; the completed message arrives separately in
-            // message_end.
-            native.remove("message");
-            if let Some(update) = native
-                .get_mut("assistantMessageEvent")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                update.retain(|key, _| key == "type");
-            }
-            native.retain(|key, _| key == "type" || key == "assistantMessageEvent");
-        }
-        _ => {}
+    if event.event == "context" {
+        let Some(messages) = native
+            .remove("messages")
+            .and_then(|messages| messages.as_array().cloned())
+        else {
+            return;
+        };
+        let common_prefix = previous
+            .iter()
+            .zip(&messages)
+            .take_while(|(left, right)| left == right)
+            .count();
+        native.insert(
+            PI_MESSAGES_DELTA.into(),
+            serde_json::json!({
+                "common_prefix": common_prefix,
+                "suffix": messages[common_prefix..],
+            }),
+        );
+        *previous = messages;
     }
 }
 
@@ -556,7 +528,7 @@ pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
             return;
         }
     };
-    let protected: HashSet<PathBuf> = diagnostics
+    let mut protected: HashSet<PathBuf> = diagnostics
         .into_iter()
         .filter(|entry| {
             matches!(
@@ -573,6 +545,18 @@ pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
                 .map(|session_id| source_journal_path(data_dir, &entry.source, &session_id))
         })
         .collect();
+    match crate::recovery::all_active(data_dir) {
+        Ok(incidents) => {
+            protected.extend(incidents.into_iter().map(|incident| {
+                let (source, session_id) = incident.scope.source_session();
+                source_journal_path(data_dir, source, session_id)
+            }));
+        }
+        Err(error) => {
+            tracing::warn!(%error, "journal collection skipped because recovery state is unreadable");
+            return;
+        }
+    }
     let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
         return;
     };
@@ -751,7 +735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pi_streaming_updates_do_not_persist_growing_partial_messages() {
+    async fn pi_streaming_updates_replay_complete_native_payload() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pi.ndjson");
         let mut writer = JournalWriter::open_path(&path).await.unwrap();
@@ -782,23 +766,18 @@ mod tests {
         drop(writer);
 
         let stored = tokio::fs::read(&path).await.unwrap();
-        assert!(!String::from_utf8_lossy(&stored).contains("growing-partial-marker"));
+        assert!(String::from_utf8_lossy(&stored).contains("growing-partial-marker"));
 
         let mut reader = JournalReader::open(&path, stored.len() as u64)
             .await
             .unwrap()
             .unwrap();
         let replayed = reader.next_entry().await.unwrap().unwrap();
-        assert_eq!(
-            replayed
-                .payload
-                .pointer("/event/assistantMessageEvent/type"),
-            Some(&serde_json::json!("text_delta"))
-        );
+        assert_eq!(replayed.payload, event.payload);
     }
 
     #[tokio::test]
-    async fn pi_provider_requests_persist_only_request_configuration() {
+    async fn pi_provider_requests_replay_complete_native_payload() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pi.ndjson");
         let mut writer = JournalWriter::open_path(&path).await.unwrap();
@@ -830,55 +809,15 @@ mod tests {
 
         let stored = tokio::fs::read(&path).await.unwrap();
         let stored_text = String::from_utf8_lossy(&stored);
-        assert!(!stored_text.contains("system-prompt-marker"));
-        assert!(!stored_text.contains("message-marker"));
+        assert!(stored_text.contains("system-prompt-marker"));
+        assert!(stored_text.contains("message-marker"));
 
         let mut reader = JournalReader::open(&path, stored.len() as u64)
             .await
             .unwrap()
             .unwrap();
         let replayed = reader.next_entry().await.unwrap().unwrap();
-        assert_eq!(
-            replayed.payload.pointer("/event/payload"),
-            Some(&serde_json::json!({
-                "max_tokens": 1024,
-                "tools": [{"type": "function", "function": {
-                    "name": "read",
-                    "parameters": {"type": "object"},
-                }}],
-            }))
-        );
-    }
-
-    #[test]
-    fn pi_journaled_request_configuration_replays_unchanged() {
-        let schema = serde_json::json!({"type": "object"});
-        for payload in [
-            serde_json::json!({
-                "max_tokens": 1024,
-                "tools": [
-                    {"name": "read", "input_schema": schema, "strict": true},
-                    {"type": "web_search_20250305", "name": "web_search"},
-                ],
-                "tool_choice": {"type": "tool", "name": "read", "disable_parallel_tool_use": true},
-            }),
-            serde_json::json!({"config": {
-                "temperature": 0.5,
-                "tools": [{"functionDeclarations": [{"name": "read", "parameters": schema}]}, {"googleSearch": {}}],
-                "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
-            }}),
-            serde_json::json!({
-                "toolConfig": {"tools": [{"toolSpec": {"name": "read", "inputSchema": {"json": schema}}}]},
-                "inferenceConfig": {"maxTokens": 512},
-            }),
-        ] {
-            let journaled =
-                serde_json::Value::Object(crate::translate::pi_request_config(&payload));
-            assert_eq!(
-                serde_json::Value::Object(crate::translate::pi_request_config(&journaled)),
-                journaled
-            );
-        }
+        assert_eq!(replayed.payload, event.payload);
     }
 
     #[tokio::test]

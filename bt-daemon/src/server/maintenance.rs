@@ -96,7 +96,7 @@ pub(super) fn spawn_idle_watchdog(daemon: Arc<Daemon>, idle_timeout: Duration) {
                     .lock()
                     .unwrap()
                     .values()
-                    .any(|session| session.has_paused_plugin())
+                    .any(|session| session.has_paused_work())
                 && !daemon.correlation.has_any_active_tools()
             {
                 tracing::info!("idle for {:?}; shutting down", idle_for);

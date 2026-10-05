@@ -17,7 +17,6 @@ mod git;
 mod grok;
 mod opencode;
 mod pi;
-pub(crate) use pi::request_config as pi_request_config;
 mod recent;
 mod tool;
 
@@ -34,6 +33,13 @@ use crate::wire::{Envelope, SessionConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported shape for {event}: {detail}")]
+pub struct InputShapeError {
+    pub event: String,
+    pub detail: String,
+}
 
 /// The local account name supplied by the shell environment. Translators add
 /// this to the agent session root, which is the only place that can identify
