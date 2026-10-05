@@ -368,6 +368,7 @@ pub(crate) struct TranscriptTail {
     translator_reset: bool,
     cursor_snapshot: Option<tempfile::TempDir>,
     cursor_snapshot_records: usize,
+    allow_incomplete_final_record: bool,
 }
 
 enum TailState {
@@ -388,7 +389,12 @@ impl TranscriptTail {
             translator_reset: false,
             cursor_snapshot: None,
             cursor_snapshot_records: 0,
+            allow_incomplete_final_record: false,
         }
+    }
+
+    pub(crate) fn allow_incomplete_final_record_on_shutdown(&mut self) {
+        self.allow_incomplete_final_record = true;
     }
 
     fn new_state(source: ImportSource) -> TailState {
@@ -404,7 +410,7 @@ impl TranscriptTail {
         let refresh = match self.records.refresh_with_final_partial(
             &self.path,
             finalize,
-            self.source == ImportSource::Cursor,
+            self.source == ImportSource::Cursor && self.allow_incomplete_final_record,
         ) {
             Ok(refresh) => refresh,
             Err(_) if !finalize => return Ok(Vec::new()),

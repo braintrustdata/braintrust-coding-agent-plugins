@@ -1497,6 +1497,9 @@ async fn import_transcript_with_ledger(
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
+    if attach {
+        tail.allow_incomplete_final_record_on_shutdown();
+    }
     let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
