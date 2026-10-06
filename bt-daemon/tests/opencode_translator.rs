@@ -127,6 +127,27 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
 }
 
 #[test]
+fn opencode_accepts_summary_diff_metadata_on_message_updates() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let ops = translator
+        .handle(
+            &event(
+                "message.updated",
+                1,
+                json!({"properties":{"info":{"id":"m1","sessionID":"native","role":"user","summary":{"diffs":[]}}}}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    assert!(ops.is_empty());
+}
+
+#[test]
 fn opencode_idle_updates_a_resumable_session_root() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("opencode", "root-session");

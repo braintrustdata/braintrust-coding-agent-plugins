@@ -301,10 +301,18 @@ struct MessageInfo {
     time: Option<MessageTime>,
     #[serde(default)]
     tokens: Option<MessageTokens>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_summary")]
     summary: bool,
     #[serde(default)]
     error: Option<Value>,
+}
+
+fn deserialize_summary<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_bool().unwrap_or(false))
 }
 
 #[derive(Deserialize)]
