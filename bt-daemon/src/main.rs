@@ -251,11 +251,7 @@ async fn main() {
             let mut opts = if debug_sink {
                 debug_serve_options(VERSION, &data_dir)
             } else {
-                let cfg = BraintrustSinkConfig {
-                    api_url,
-                    app_url,
-                    version: VERSION.to_string(),
-                };
+                let cfg = BraintrustSinkConfig { api_url, app_url };
                 braintrust_serve_options(VERSION, cfg, Arc::new(Registry::default_agents()))
             };
             opts.auth_provider = Some(Arc::new(EnvironmentAuthProvider {

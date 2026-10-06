@@ -182,7 +182,6 @@ fn serve_options(host: &TraceHostContext) -> ServeOptions {
     let cfg = BraintrustSinkConfig {
         api_url: None,
         app_url: None,
-        version: host.version.clone(),
     };
     let mut options =
         braintrust_serve_options(&host.version, cfg, Arc::new(Registry::default_agents()));

@@ -5,7 +5,8 @@
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig, TraceDestination};
 use bt_daemon::{
-    BraintrustSinkConfig, BraintrustSinkFactory, SinkFactory, SpanOp, SpanRow, SpanType,
+    BraintrustSinkConfig, BraintrustSinkFactory, OriginSnapshot, SinkFactory, SpanOp, SpanRow,
+    SpanType,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -55,6 +56,12 @@ fn row(
         error: None,
         late_merge_key: None,
         tags: None,
+        origin: parents.is_empty().then(|| OriginSnapshot {
+            plugin_version: None,
+            bt_version: "test".into(),
+            source_version: None,
+        }),
+        is_turn: false,
     }
 }
 
@@ -132,9 +139,8 @@ async fn explicit_project_id_does_not_register_a_project_name() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("sess-id", "antigravity", None).unwrap();
+    let mut sink = factory.create("sess-id", "antigravity").unwrap();
     let mut config = session_config(&base);
     config.destination = Some(TraceDestination::ProjectLogs {
         project_id: Some("proj-existing".into()),
@@ -181,10 +187,9 @@ async fn multi_profile_sessions_route_to_their_own_backend() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: None,
         app_url: None,
-        version: "test".into(),
     });
 
-    let mut sink_a = factory.create("sess-a", "codex", None).unwrap();
+    let mut sink_a = factory.create("sess-a", "codex").unwrap();
     sink_a.configure(&session_config(&base_a));
     sink_a
         .emit(&[SpanOp::Insert(row(
@@ -200,7 +205,7 @@ async fn multi_profile_sessions_route_to_their_own_backend() {
         .unwrap();
     sink_a.flush().await.unwrap();
 
-    let mut sink_b = factory.create("sess-b", "codex", None).unwrap();
+    let mut sink_b = factory.create("sess-b", "codex").unwrap();
     sink_b.configure(&session_config(&base_b));
     sink_b
         .emit(&[SpanOp::Insert(row(
@@ -234,9 +239,8 @@ async fn merge_with_empty_name_does_not_clobber_the_original_name() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("sess-1", "codex", None).unwrap();
+    let mut sink = factory.create("sess-1", "codex").unwrap();
     sink.configure(&session_config(&base));
 
     let named = row("s1", "s1", &[], "codex: myapp", SpanType::Task, 1, None);
@@ -262,9 +266,8 @@ async fn provisional_lifecycle_root_is_not_exported_without_work() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("empty", "codex", None).unwrap();
+    let mut sink = factory.create("empty", "codex").unwrap();
     sink.configure(&session_config(&base));
 
     let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
@@ -292,9 +295,8 @@ async fn provisional_root_survives_a_nonterminal_flush_until_work_arrives() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("flush", "codex", None).unwrap();
+    let mut sink = factory.create("flush", "codex").unwrap();
     sink.configure(&session_config(&base));
 
     let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
@@ -317,6 +319,12 @@ async fn provisional_root_survives_a_nonterminal_flush_until_work_arrives() {
     let bodies = logs3_bodies(&server).await;
     assert!(bodies.contains("codex"));
     assert!(bodies.contains("Turn 1"));
+    let rows = logs3_rows(&server).await;
+    let root = rows.iter().find(|row| row["span_id"] == "root").unwrap();
+    let origin = &root["context"]["span_origin"];
+    assert_eq!(origin["name"], "braintrust.plugin.codex");
+    assert_eq!(origin.get("version"), Some(&Value::Null));
+    assert_eq!(origin["bt"]["version"], "test");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -326,9 +334,8 @@ async fn work_releases_only_its_direct_provisional_root() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("multi-root", "opencode", None).unwrap();
+    let mut sink = factory.create("multi-root", "opencode").unwrap();
     sink.configure(&session_config(&base));
 
     let mut root_a = row("root-a", "root-a", &[], "root A", SpanType::Task, 1, None);
@@ -368,9 +375,8 @@ async fn provisional_root_is_exported_before_its_first_work_row() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("work", "codex", None).unwrap();
+    let mut sink = factory.create("work", "codex").unwrap();
     sink.configure(&session_config(&base));
 
     let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
@@ -408,21 +414,20 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    // The same cached SDK client serves every source. Provenance must stay
-    // session-specific, including when the plugin version falls back to bt's.
-    for (source, plugin_version) in [
-        ("codex", Some("1.2.3")),
-        ("claude", Some("2.3.4")),
-        ("grok", Some("3.4.5")),
-        ("opencode", Some("4.5.6")),
-        ("pi", Some("5.6.7")),
-        ("antigravity", None),
+    // Stateless child merges must retain linkage without adding root provenance.
+    for source in [
+        "codex",
+        "claude-code",
+        "grok",
+        "opencode",
+        "pi",
+        "cursor",
+        "antigravity",
     ] {
         let session_id = format!("sess-late-{source}");
-        let span_id = format!("finished-{source}");
-        let mut sink = factory.create(&session_id, source, plugin_version).unwrap();
+        let span_id = format!("finished-{session_id}");
+        let mut sink = factory.create(&session_id, source).unwrap();
         sink.configure(&session_config(&base));
 
         sink.emit(&[SpanOp::Insert(row(
@@ -448,8 +453,12 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
         sink.flush().await.unwrap();
 
         // Recovery also starts without an open handle for an existing span.
+        let recovery_factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
+            api_url: Some(base.clone()),
+            app_url: Some(base.clone()),
+        });
         drop(sink);
-        let mut recovered = factory.create(&session_id, source, plugin_version).unwrap();
+        let mut recovered = recovery_factory.create(&session_id, source).unwrap();
         recovered.configure(&session_config(&base));
         recovered
             .emit(&[SpanOp::Merge(SpanRow {
@@ -477,13 +486,6 @@ async fn late_merge_updates_a_completed_span_without_an_open_handle() {
             assert_eq!(update["root_span_id"], "trace-root");
             assert_eq!(update["span_parents"], json!(["turn-parent"]));
         }
-        for row in rows {
-            let origin = &row["context"]["span_origin"];
-            assert_eq!(origin["name"], format!("braintrust.plugin.{source}"));
-            assert_eq!(origin["version"], plugin_version.unwrap_or("test"));
-            assert_eq!(origin["instrumentation"]["name"], "braintrust-plugin");
-            assert!(row["metadata"].get("bt_daemon_version").is_none());
-        }
     }
 }
 
@@ -494,9 +496,8 @@ async fn a_resumed_session_can_extend_an_already_ended_root() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("sess-resumed", "antigravity", None).unwrap();
+    let mut sink = factory.create("sess-resumed", "antigravity").unwrap();
     sink.configure(&session_config(&base));
 
     let root = row(
@@ -549,9 +550,8 @@ async fn attached_trace_children_keep_the_external_root() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("sess-1", "codex", None).unwrap();
+    let mut sink = factory.create("sess-1", "codex").unwrap();
     let mut config = session_config(&base);
     let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
     components.object_id = Some("proj-parent".into());
@@ -586,9 +586,8 @@ async fn exported_parent_preserves_object_root_and_propagated_event() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("sess-parent", "codex", None).unwrap();
+    let mut sink = factory.create("sess-parent", "codex").unwrap();
     let mut config = session_config(&base);
     let mut components = SpanComponents::new(SpanObjectType::Experiment);
     components.object_id = Some("exp-parent".into());
@@ -600,7 +599,7 @@ async fn exported_parent_preserves_object_root_and_propagated_event() {
     )]));
     config.destination = Some(TraceDestination::ParentSpan { components });
     sink.configure(&config);
-    sink.emit(&[SpanOp::Insert(row(
+    let mut root = row(
         "session-root",
         "daemon-internal-root",
         &["external-parent"],
@@ -608,9 +607,13 @@ async fn exported_parent_preserves_object_root_and_propagated_event() {
         SpanType::Task,
         1,
         Some(2),
-    ))])
-    .await
-    .unwrap();
+    );
+    root.origin = Some(OriginSnapshot {
+        plugin_version: Some("attached-plugin".into()),
+        bt_version: "attached-bt".into(),
+        source_version: Some("attached-codex".into()),
+    });
+    sink.emit(&[SpanOp::Insert(root)]).await.unwrap();
     sink.flush().await.unwrap();
 
     let bodies = logs3_bodies(&server).await;
@@ -623,6 +626,67 @@ async fn exported_parent_preserves_object_root_and_propagated_event() {
     ] {
         assert!(bodies.contains(expected), "{expected} absent: {bodies}");
     }
+    let rows = logs3_rows(&server).await;
+    let root = rows
+        .iter()
+        .find(|row| row["span_id"] == "session-root")
+        .unwrap();
+    let origin = &root["context"]["span_origin"];
+    assert_eq!(origin["name"], "braintrust.plugin.codex");
+    assert_eq!(origin["version"], "attached-plugin");
+    assert_eq!(origin["bt"]["version"], "attached-bt");
+    assert_eq!(origin["codex"]["version"], "attached-codex");
+    assert!(origin.get("agent").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_merge_preserves_origin_without_losing_attached_context() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut sink = factory.create("legacy-session", "codex").unwrap();
+    let mut config = session_config(&base);
+    let mut components = SpanComponents::new(SpanObjectType::Experiment);
+    components.object_id = Some("exp-parent".into());
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    components.propagated_event = Some(serde_json::Map::from_iter([
+        ("tenant".into(), json!("acme")),
+        (
+            "context".into(),
+            json!({
+                "request_id": "request-1",
+                "span_origin": {"name": "parent-instrumentation", "version": "parent-version"}
+            }),
+        ),
+    ]));
+    config.destination = Some(TraceDestination::ParentSpan { components });
+    sink.configure(&config);
+    sink.emit(&[SpanOp::Merge(SpanRow {
+        span_id: "legacy-root".into(),
+        root_span_id: "internal-root".into(),
+        parent_span_ids: vec!["external-parent".into()],
+        output: Some(json!("late output")),
+        end_ms: Some(2_000),
+        ..Default::default()
+    })])
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+
+    let rows = logs3_rows(&server).await;
+    let update = rows
+        .iter()
+        .find(|row| row["span_id"] == "legacy-root")
+        .unwrap();
+    assert_eq!(update["_is_merge"], true);
+    assert_eq!(update["output"], "late output");
+    assert_eq!(update["metrics"]["end"], 2.0);
+    assert_eq!(update["experiment_id"], "exp-parent");
+    assert_eq!(update["root_span_id"], "external-root");
+    assert_eq!(update["span_parents"], json!(["external-parent"]));
+    assert_eq!(update["tenant"], "acme");
+    assert_eq!(update["context"], json!({"request_id": "request-1"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -650,14 +714,13 @@ async fn braintrust_sink_delivers_spans_to_collector() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
 
-    let mut sink = factory.create("sess-1", "codex", Some("0.9.0")).unwrap();
+    let mut sink = factory.create("sess-1", "codex").unwrap();
     sink.configure(&session_config(&base));
 
     // A session root (task) and a child tool span under it.
-    let root = row(
+    let mut root = row(
         "rootspan1",
         "rootspan1",
         &[],
@@ -666,6 +729,7 @@ async fn braintrust_sink_delivers_spans_to_collector() {
         1000,
         None,
     );
+    root.origin.as_mut().unwrap().plugin_version = Some("0.9.0".into());
     let tool = row(
         "toolspan1",
         "rootspan1",
@@ -709,18 +773,31 @@ async fn braintrust_sink_delivers_spans_to_collector() {
     );
     assert!(bodies.contains("codex: sess-1"), "root span name missing");
     assert!(bodies.contains("\"command\""), "tool input missing");
-    assert!(
-        bodies.contains("braintrust.plugin.codex"),
-        "shared span origin name missing"
-    );
-    assert!(
-        bodies.contains("0.9.0"),
-        "plugin version missing from shared span origin"
-    );
-    assert!(
-        !bodies.contains("bt_daemon_version"),
-        "daemon version should not clutter span metadata: {bodies}"
-    );
+    for span_id in ["rootspan1", "toolspan1"] {
+        let rows: Vec<_> = logs3_rows(&server)
+            .await
+            .into_iter()
+            .filter(|row| row["span_id"] == span_id)
+            .collect();
+        assert!(!rows.is_empty(), "{span_id}: no exported rows");
+        for row in rows {
+            let origin = &row["context"]["span_origin"];
+            if span_id == "rootspan1" {
+                assert_eq!(origin["name"], "braintrust.plugin.codex");
+                assert_eq!(origin.get("version"), Some(&json!("0.9.0")));
+                assert_eq!(origin["bt"]["version"], "test");
+                assert_eq!(origin["codex"].get("version"), Some(&Value::Null));
+                assert!(origin.get("agent").is_none());
+                assert_eq!(origin["instrumentation"]["name"], "braintrust-plugin");
+            } else {
+                assert_eq!(origin["name"], "braintrust.sdk.rust");
+                assert_ne!(origin.get("version"), Some(&json!("0.9.0")));
+                assert!(origin.get("bt").is_none());
+                assert_eq!(origin["instrumentation"]["name"], "braintrust-rust-sdk");
+            }
+            assert!(row["metadata"].get("bt_daemon_version").is_none());
+        }
+    }
 
     // Project registration happened (org_name path, no login).
     assert!(
@@ -743,9 +820,8 @@ async fn experiment_sessions_use_experiment_object_type_and_id() {
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig {
         api_url: Some(base.clone()),
         app_url: Some(base.clone()),
-        version: "test".into(),
     });
-    let mut sink = factory.create("sess-exp", "claude-code", None).unwrap();
+    let mut sink = factory.create("sess-exp", "claude-code").unwrap();
     let mut config = session_config(&base);
     config.destination = Some(TraceDestination::Experiment {
         experiment_id: "exp-42".into(),
@@ -786,4 +862,92 @@ async fn experiment_sessions_use_experiment_object_type_and_id() {
         !bodies.contains("\"project_id\""),
         "experiment spans were routed as project logs: {bodies}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_origin_survives_open_closed_and_recovered_merges() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    for (source, plugin_version) in [
+        ("codex", Some("1.2.3")),
+        ("claude-code", Some("2.3.4")),
+        ("grok", Some("3.4.5")),
+        ("opencode", Some("4.5.6")),
+        ("pi", Some("5.6.7")),
+        ("cursor", Some("6.7.8")),
+        ("antigravity", None),
+        ("codex", None),
+    ] {
+        let session_id = format!("root-{source}-{}", plugin_version.unwrap_or("unknown"));
+        let source_version = plugin_version.map(|_| "native-version");
+        let origin = OriginSnapshot {
+            plugin_version: plugin_version.map(str::to_string),
+            bt_version: "birth-bt".into(),
+            source_version: source_version.map(str::to_string),
+        };
+        let mut root = row(
+            &session_id,
+            &session_id,
+            &[],
+            "session root",
+            SpanType::Task,
+            1,
+            None,
+        );
+        root.origin = Some(origin.clone());
+        let mut sink = factory.create(&session_id, source).unwrap();
+        sink.configure(&session_config(&base));
+        sink.emit(&[SpanOp::Insert(root)]).await.unwrap();
+        sink.flush().await.unwrap();
+        for (status, end_ms) in [("open", None), ("closed", Some(2)), ("late", None)] {
+            sink.emit(&[SpanOp::Merge(SpanRow {
+                span_id: session_id.clone(),
+                root_span_id: session_id.clone(),
+                origin: Some(origin.clone()),
+                output: Some(json!({"status": status})),
+                end_ms,
+                ..Default::default()
+            })])
+            .await
+            .unwrap();
+            sink.flush().await.unwrap();
+        }
+        drop(sink);
+        let recovery_factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+        let mut recovered = recovery_factory.create(&session_id, source).unwrap();
+        recovered.configure(&session_config(&base));
+        recovered
+            .emit(&[SpanOp::Merge(SpanRow {
+                span_id: session_id.clone(),
+                root_span_id: session_id.clone(),
+                origin: Some(origin),
+                output: Some(json!({"status": "recovered"})),
+                ..Default::default()
+            })])
+            .await
+            .unwrap();
+        recovered.flush().await.unwrap();
+
+        let rows: Vec<_> = logs3_rows(&server)
+            .await
+            .into_iter()
+            .filter(|row| row["span_id"] == session_id)
+            .collect();
+        for status in ["open", "closed", "late", "recovered"] {
+            assert!(
+                rows.iter().any(|row| row["output"]["status"] == status),
+                "{session_id}: missing {status} update: {rows:?}"
+            );
+        }
+        for row in rows {
+            let origin = &row["context"]["span_origin"];
+            assert_eq!(origin["name"], format!("braintrust.plugin.{source}"));
+            assert_eq!(origin.get("version"), Some(&json!(plugin_version)));
+            assert_eq!(origin["bt"]["version"], "birth-bt");
+            assert_eq!(origin[source].get("version"), Some(&json!(source_version)));
+            assert!(origin.get("agent").is_none());
+            assert_eq!(origin["instrumentation"]["name"], "braintrust-plugin");
+        }
+    }
 }

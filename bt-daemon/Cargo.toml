@@ -18,7 +18,7 @@ required-features = ["cli"]
 
 [dependencies]
 # Keep this pinned exactly, matching the dependency policy used by `bt`.
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "019e428ab80d0da4c00dab383d4b0d1fdf4486fd" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "ac70efca9d2e72e8d5446d73601312e08f1c6148" }
 base64 = "0.22"
 anyhow = "1"
 async-trait = "0.1"
@@ -46,6 +46,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [dev-dependencies]
 axum = "0.8"
 bytes = "1"
+parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 wiremock = "0.6"
 zstd = "0.13"

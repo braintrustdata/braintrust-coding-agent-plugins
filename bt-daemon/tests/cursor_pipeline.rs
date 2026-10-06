@@ -381,7 +381,7 @@ impl Sink for BufferedSink {
 }
 
 impl SinkFactory for BufferedSink {
-    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(Self(self.0.clone())))
     }
 }

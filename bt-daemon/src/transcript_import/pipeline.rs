@@ -309,24 +309,18 @@ impl ImportProcessor {
                 Some(live) => live,
                 None => {
                     let translator = self.opts.translators.create(&env.source, &sid);
-                    let sink = self.opts.sink_factory.create(
-                        &sid,
-                        &env.source,
-                        env.plugin_version.as_deref(),
-                    )?;
-                    let sink: Box<dyn Sink> = match &self.ledger_dir {
-                        Some(ledger_dir) => Box::new(
-                            delivery_ledger::LedgerSink::new(
-                                sink,
-                                ledger_dir,
-                                &env.source,
-                                &sid,
-                                env.config.as_ref(),
-                            )
-                            .await,
-                        ),
-                        None => sink,
-                    };
+                    let sink = self.opts.sink_factory.create(&sid, &env.source)?;
+                    let sink: Box<dyn Sink> = Box::new(
+                        delivery_ledger::LedgerSink::new(
+                            sink,
+                            self.ledger_dir.as_deref(),
+                            &env.source,
+                            &sid,
+                            env.config.as_ref(),
+                            &self.opts.version,
+                        )
+                        .await,
+                    );
                     self.sessions.insert(
                         sid.clone(),
                         ImportLive {
@@ -357,6 +351,8 @@ impl ImportProcessor {
                 live.sink.configure(cfg);
                 live.ctx.config = Some(cfg.clone());
             }
+            live.sink
+                .set_capture_versions(env.plugin_version.as_deref(), env.source_version.as_deref());
             let ops = live.translator.handle(&env, &live.ctx)?;
             Self::emit_translator_batches(live, ops).await?;
         }

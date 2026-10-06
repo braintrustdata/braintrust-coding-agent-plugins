@@ -356,6 +356,7 @@ impl CursorTranslator {
             &format!("Turn {}", self.turn_seq),
             SpanType::Task,
         );
+        row.is_turn = true;
         row.start_ms = Some(ts);
         row.input = prompt.as_ref().map(|p| json!(p));
         row.metadata = Some(

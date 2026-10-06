@@ -16,12 +16,7 @@ pub struct DebugSinkFactory {
 }
 
 impl SinkFactory for DebugSinkFactory {
-    fn create(
-        &self,
-        session_id: &str,
-        source: &str,
-        _plugin_version: Option<&str>,
-    ) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>> {
         std::fs::create_dir_all(&self.dir)?;
         let name = format!("{}.ndjson", sanitize(session_id));
         // Fall back to a stable digest when the id cannot be one file name.

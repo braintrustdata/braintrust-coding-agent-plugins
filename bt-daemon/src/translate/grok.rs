@@ -485,6 +485,7 @@ impl GrokTranslator {
                     parent_span_ids: vec![self.session_span_id.clone()],
                     name: format!("Turn {}", self.turn_seq),
                     span_type: SpanType::Task,
+                    is_turn: true,
                     start_ms: Some(ts_ms),
                     input,
                     metadata: Some(json!({"transcript_turn_key": turn_key})),

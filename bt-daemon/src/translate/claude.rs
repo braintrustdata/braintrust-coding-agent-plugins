@@ -521,6 +521,7 @@ impl ClaudeTranslator {
             parent_span_ids: vec![parent_id.clone()],
             name,
             span_type: SpanType::Task,
+            is_turn: true,
             start_ms: Some(event.ts_ms),
             input: event.payload.get("prompt").cloned(),
             metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),

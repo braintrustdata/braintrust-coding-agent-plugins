@@ -750,6 +750,7 @@ impl OpenCodeTranslator {
             parent_span_ids: vec![state.root_span_id.clone()],
             name: format!("Turn {}", state.turn_number),
             span_type: SpanType::Task,
+            is_turn: true,
             start_ms: Some(event.ts_ms),
             input: (!input.is_empty()).then_some(Value::String(input)),
             metadata: Some(
