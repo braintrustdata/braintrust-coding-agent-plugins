@@ -19,6 +19,7 @@ impl Agent for Antigravity {
 impl Register for Antigravity {
     fn register(self: Arc<Self>, registrar: &mut Registrar) {
         registrar.setup.insert(self.clone());
-        registrar.translate.insert(self);
+        registrar.translate.insert(self.clone());
+        registrar.import.insert(self);
     }
 }

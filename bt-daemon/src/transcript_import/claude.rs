@@ -1,6 +1,7 @@
 use super::{
     envelope, file_session_id, find_jsonl_files, read_complete_jsonl_records, read_jsonl_records,
-    string_at, timestamp_bounds, timestamp_ms, validate_session_id,
+    string_at, timestamp_bounds, timestamp_ms, validate_session_id, IncrementalRecords,
+    TailSession, TranscriptImport, TranscriptLayout,
 };
 use crate::wire::Envelope;
 use anyhow::bail;
@@ -8,6 +9,20 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+
+impl TranscriptImport for crate::agents::Claude {
+    fn discover(&self, home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        layout(roots(home)).discover()
+    }
+
+    fn find(&self, home: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
+        layout(roots(home)).find(session_id)
+    }
+
+    fn tail(&self) -> Box<dyn TailSession> {
+        Box::new(Tail::default())
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Tail {
@@ -17,8 +32,21 @@ pub(super) struct Tail {
     last_len: u64,
 }
 
-impl Tail {
-    pub(super) fn poll(
+impl TailSession for Tail {
+    fn envelopes(
+        &mut self,
+        path: &Path,
+        records: &IncrementalRecords,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        envelopes(
+            path,
+            &records.values,
+            &records.end_offsets,
+            records.read_offset,
+        )
+    }
+
+    fn poll(
         &mut self,
         events: Vec<Envelope>,
         len: u64,
@@ -76,7 +104,7 @@ impl Tail {
     }
 }
 
-pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
+fn transcript_session_id(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
@@ -93,14 +121,24 @@ pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
     None
 }
 
-pub(super) fn roots(home: &Path) -> Vec<PathBuf> {
+/// The transcript layout under these roots.
+pub(super) fn layout(roots: Vec<PathBuf>) -> TranscriptLayout {
+    TranscriptLayout {
+        display_name: crate::agents::Agent::identity(&crate::agents::Claude).display_name,
+        roots,
+        session_id: transcript_session_id,
+        filename_matches,
+    }
+}
+
+fn roots(home: &Path) -> Vec<PathBuf> {
     let claude_home = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".claude"));
     vec![claude_home.join("projects")]
 }
 
-pub(super) fn filename_matches(path: &Path, session_id: &str) -> bool {
+fn filename_matches(path: &Path, session_id: &str) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some(&format!("{session_id}.jsonl"))
 }
 

@@ -1,4 +1,7 @@
-use super::{envelope, validate_session_id};
+use super::{
+    envelope, validate_session_id, IncrementalRecords, TailSession, TranscriptImport,
+    TranscriptLayout,
+};
 use crate::wire::Envelope;
 use anyhow::bail;
 use serde_json::{json, Value};
@@ -7,14 +10,36 @@ use std::path::{Path, PathBuf};
 
 const TRANSCRIPT_NAME: &str = "transcript_full.jsonl";
 
+impl TranscriptImport for crate::agents::Antigravity {
+    fn discover(&self, home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        layout(roots(home)).discover()
+    }
+
+    fn find(&self, home: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
+        layout(roots(home)).find(session_id)
+    }
+
+    fn tail(&self) -> Box<dyn TailSession> {
+        Box::new(Tail::default())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Tail {
     emitted: usize,
     stopped: bool,
 }
 
-impl Tail {
-    pub(super) fn poll(
+impl TailSession for Tail {
+    fn envelopes(
+        &mut self,
+        path: &Path,
+        records: &IncrementalRecords,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        envelopes(path, &records.values, &records.end_offsets)
+    }
+
+    fn poll(
         &mut self,
         events: Vec<Envelope>,
         _len: u64,
@@ -36,11 +61,21 @@ impl Tail {
     }
 }
 
-pub(super) fn roots(home: &Path) -> Vec<PathBuf> {
+/// The transcript layout under these roots.
+pub(super) fn layout(roots: Vec<PathBuf>) -> TranscriptLayout {
+    TranscriptLayout {
+        display_name: crate::agents::Agent::identity(&crate::agents::Antigravity).display_name,
+        roots,
+        session_id: transcript_session_id,
+        filename_matches,
+    }
+}
+
+fn roots(home: &Path) -> Vec<PathBuf> {
     vec![home.join(".gemini/antigravity-cli/brain")]
 }
 
-pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
+fn transcript_session_id(path: &Path) -> Option<String> {
     if path.file_name().and_then(|name| name.to_str()) != Some(TRANSCRIPT_NAME) {
         return None;
     }
@@ -54,7 +89,7 @@ pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
     is_transcript_path(path, session_id).then(|| session_id.to_owned())
 }
 
-pub(super) fn filename_matches(path: &Path, session_id: &str) -> bool {
+fn filename_matches(path: &Path, session_id: &str) -> bool {
     validate_session_id(session_id).is_ok() && is_transcript_path(path, session_id)
 }
 
