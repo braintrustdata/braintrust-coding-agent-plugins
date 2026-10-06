@@ -21,15 +21,9 @@ pub(crate) use pi::request_config as pi_request_config;
 mod recent;
 mod tool;
 
-pub use antigravity::AntigravityTranslatorFactory;
-pub use claude::ClaudeTranslatorFactory;
-pub use codex::CodexTranslatorFactory;
-pub use cursor::CursorTranslatorFactory;
-pub use debug::DebugTranslatorFactory;
-pub use grok::GrokTranslatorFactory;
-pub use opencode::OpenCodeTranslatorFactory;
-pub use pi::PiTranslatorFactory;
+use debug::DebugTranslatorFactory;
 
+use crate::agents::{registrar, Agent};
 use crate::wire::{Envelope, SessionConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -152,24 +146,27 @@ pub trait AgentTranslator: Send {
     }
 }
 
-/// Builds translator instances for a given `source`.
-pub trait TranslatorFactory: Send + Sync {
-    fn source(&self) -> &str;
+/// Builds translator instances for an agent's hook source. Each agent type
+/// implements this in its translator module and registers itself in
+/// [`crate::agents`]; the source is the agent's [`Identity::source`].
+///
+/// [`Identity::source`]: crate::agents::Identity::source
+pub(crate) trait TranslatorFactory: Agent {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator>;
 }
 
 /// Maps canonical and supported alias source strings to translator factories.
 pub struct Registry {
-    factories: HashMap<String, Box<dyn TranslatorFactory>>,
+    factories: HashMap<String, Arc<dyn TranslatorFactory>>,
 }
 
-/// Map a source alias to its canonical name. Unknown sources pass through.
+/// Map an agent name or alias to the source its hooks report. Unknown
+/// sources pass through.
 pub(crate) fn canonical_source_name(source: &str) -> &str {
-    match source {
-        "claude" => "claude-code",
-        "open-code" => "opencode",
-        other => other,
-    }
+    registrar()
+        .translate
+        .get(source)
+        .map_or(source, |agent| agent.identity().source)
 }
 
 impl Registry {
@@ -178,20 +175,16 @@ impl Registry {
         let mut r = Registry {
             factories: HashMap::new(),
         };
-        r.register(Box::new(DebugTranslatorFactory));
-        let git = Arc::new(git::GitMetadataCache::default());
-        r.register(Box::new(AntigravityTranslatorFactory::new(git.clone())));
-        r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
-        r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
-        r.register(Box::new(CursorTranslatorFactory::new(git.clone())));
-        r.register(Box::new(GrokTranslatorFactory::new(git.clone())));
-        r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));
-        r.register(Box::new(PiTranslatorFactory::new(git)));
+        r.insert(Arc::new(DebugTranslatorFactory));
+        for agent in registrar().translate.shared() {
+            r.insert(agent.clone());
+        }
         r
     }
 
-    pub fn register(&mut self, factory: Box<dyn TranslatorFactory>) {
-        self.factories.insert(factory.source().to_string(), factory);
+    fn insert(&mut self, factory: Arc<dyn TranslatorFactory>) {
+        self.factories
+            .insert(factory.identity().source.to_string(), factory);
     }
 
     /// Known sources, for the `initialize` capabilities list.
@@ -203,10 +196,11 @@ impl Registry {
 
     /// Resolve daemon source aliases to one stable identity.
     pub fn canonical_source<'a>(&'a self, source: &'a str) -> Option<&'a str> {
-        let canonical = match canonical_source_name(source) {
-            canonical @ ("claude-code" | "opencode" | "antigravity" | "codex" | "cursor"
-            | "grok" | "pi" | "debug") => canonical,
-            _ => return None,
+        // Only agent sources and the debug translator are accepted.
+        let canonical = match registrar().translate.get(source) {
+            Some(agent) => agent.identity().source,
+            None if source == "debug" => "debug",
+            None => return None,
         };
         self.factories.contains_key(canonical).then_some(canonical)
     }
@@ -242,5 +236,45 @@ impl Registry {
     pub fn create(&self, source: &str, session_id: &str) -> Box<dyn AgentTranslator> {
         self.create_checked(source, session_id)
             .unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_agent_source_has_a_translator() {
+        assert_eq!(
+            Registry::default_agents().sources(),
+            [
+                "antigravity",
+                "claude-code",
+                "codex",
+                "cursor",
+                "debug",
+                "grok",
+                "opencode",
+                "pi"
+            ]
+        );
+    }
+
+    #[test]
+    fn source_aliases_resolve_to_hook_sources() {
+        let registry = Registry::default_agents();
+        for (alias, source) in [
+            ("claude", "claude-code"),
+            ("claude-code", "claude-code"),
+            ("open-code", "opencode"),
+            ("opencode", "opencode"),
+            ("codex", "codex"),
+            ("debug", "debug"),
+        ] {
+            assert_eq!(registry.canonical_source(alias), Some(source));
+        }
+        assert_eq!(registry.canonical_source("agy"), None);
+        assert_eq!(canonical_source_name("claude"), "claude-code");
+        assert_eq!(canonical_source_name("unknown"), "unknown");
     }
 }

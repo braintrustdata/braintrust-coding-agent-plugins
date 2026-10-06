@@ -26,23 +26,9 @@ const MAX_OUTPUT_CHUNKS: usize = 2_048;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: u64 = 2 * 1024 * 1024;
 
-pub struct GrokTranslatorFactory {
-    git: Arc<GitMetadataCache>,
-}
-
-impl GrokTranslatorFactory {
-    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
-        Self { git }
-    }
-}
-
-impl TranslatorFactory for GrokTranslatorFactory {
-    fn source(&self) -> &str {
-        "grok"
-    }
-
+impl TranslatorFactory for crate::agents::Grok {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(GrokTranslator::new(session_id, self.git.clone()))
+        Box::new(GrokTranslator::new(session_id, GitMetadataCache::shared()))
     }
 }
 

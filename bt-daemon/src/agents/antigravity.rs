@@ -6,7 +6,7 @@ pub(crate) struct Antigravity;
 pub(crate) const IDENTITY: Identity = Identity {
     id: "antigravity",
     source: "antigravity",
-    aliases: &["agy"],
+    aliases: &[],
     display_name: "Google Antigravity",
 };
 
@@ -18,6 +18,7 @@ impl Agent for Antigravity {
 
 impl Register for Antigravity {
     fn register(self: Arc<Self>, registrar: &mut Registrar) {
-        registrar.setup.insert(self);
+        registrar.setup.insert(self.clone());
+        registrar.translate.insert(self);
     }
 }

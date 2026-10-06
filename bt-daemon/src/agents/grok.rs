@@ -18,6 +18,7 @@ impl Agent for Grok {
 
 impl Register for Grok {
     fn register(self: Arc<Self>, registrar: &mut Registrar) {
-        registrar.setup.insert(self);
+        registrar.setup.insert(self.clone());
+        registrar.translate.insert(self);
     }
 }

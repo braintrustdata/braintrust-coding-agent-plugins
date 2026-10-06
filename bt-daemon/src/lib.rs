@@ -72,6 +72,4 @@ pub use trace_runtime::{
     run_trace, HostRouteSelection, RouteRequirements, TraceHostContext, TraceHostServices,
 };
 pub use transcript_import::{import_transcript, import_transcripts, run_import};
-pub use translate::{
-    AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
-};
+pub use translate::{AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType};

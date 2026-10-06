@@ -19,6 +19,7 @@ impl Agent for Pi {
 impl Register for Pi {
     fn register(self: Arc<Self>, registrar: &mut Registrar) {
         registrar.setup.insert(self.clone());
-        registrar.run.insert(self);
+        registrar.run.insert(self.clone());
+        registrar.translate.insert(self);
     }
 }

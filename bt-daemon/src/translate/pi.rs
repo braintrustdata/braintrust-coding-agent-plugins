@@ -17,18 +17,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub struct PiTranslatorFactory {
-    git: Arc<GitMetadataCache>,
-}
-impl PiTranslatorFactory {
-    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
-        Self { git }
-    }
-}
-impl TranslatorFactory for PiTranslatorFactory {
-    fn source(&self) -> &str {
-        "pi"
-    }
+impl TranslatorFactory for crate::agents::Pi {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(PiTranslator {
             session_id: session_id.into(),
@@ -48,7 +37,7 @@ impl TranslatorFactory for PiTranslatorFactory {
             branch_summary: None,
             last_ts: 0,
             thinking_level: None,
-            git: self.git.clone(),
+            git: GitMetadataCache::shared(),
         })
     }
 }

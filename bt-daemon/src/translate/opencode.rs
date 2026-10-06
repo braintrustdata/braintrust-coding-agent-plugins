@@ -16,27 +16,13 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub struct OpenCodeTranslatorFactory {
-    git: Arc<GitMetadataCache>,
-}
-
-impl OpenCodeTranslatorFactory {
-    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
-        Self { git }
-    }
-}
-
-impl TranslatorFactory for OpenCodeTranslatorFactory {
-    fn source(&self) -> &str {
-        "opencode"
-    }
-
+impl TranslatorFactory for crate::agents::OpenCode {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(OpenCodeTranslator {
             daemon_session_id: session_id.to_string(),
             sessions: HashMap::new(),
             permission_requests: HashMap::new(),
-            git: self.git.clone(),
+            git: GitMetadataCache::shared(),
             last_ts_ms: 0,
         })
     }

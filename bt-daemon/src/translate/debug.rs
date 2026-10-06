@@ -5,15 +5,28 @@
 //! exists.
 
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory};
+use crate::agents::{Agent, Identity};
 use crate::ids;
 use crate::wire::Envelope;
 
-pub struct DebugTranslatorFactory;
+/// Not a coding agent, so it is never registered in [`crate::agents`]; the
+/// translator registry adds it directly.
+pub(crate) struct DebugTranslatorFactory;
+
+const IDENTITY: Identity = Identity {
+    id: "debug",
+    source: "debug",
+    aliases: &[],
+    display_name: "Debug",
+};
+
+impl Agent for DebugTranslatorFactory {
+    fn identity(&self) -> &'static Identity {
+        &IDENTITY
+    }
+}
 
 impl TranslatorFactory for DebugTranslatorFactory {
-    fn source(&self) -> &str {
-        "debug"
-    }
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(DebugTranslator {
             root_span_id: ids::span_id(session_id, "root"),

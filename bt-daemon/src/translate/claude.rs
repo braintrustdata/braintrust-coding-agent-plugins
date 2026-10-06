@@ -119,23 +119,12 @@ fn value_as_nonempty_string(value: &Value) -> Option<String> {
     }
 }
 
-pub struct ClaudeTranslatorFactory {
-    git: Arc<GitMetadataCache>,
-}
-
-impl ClaudeTranslatorFactory {
-    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
-        Self { git }
-    }
-}
-
-impl TranslatorFactory for ClaudeTranslatorFactory {
-    fn source(&self) -> &str {
-        "claude-code"
-    }
-
+impl TranslatorFactory for crate::agents::Claude {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(ClaudeTranslator::new(session_id, self.git.clone()))
+        Box::new(ClaudeTranslator::new(
+            session_id,
+            GitMetadataCache::shared(),
+        ))
     }
 }
 
