@@ -51,7 +51,7 @@ pub async fn capture(
     source: &str,
 ) -> anyhow::Result<(PathBuf, u64)> {
     let path = mirror_path(data_dir, session_id, source);
-    tokio::fs::create_dir_all(mirror_dir(data_dir)).await?;
+    crate::paths::ensure_private_dir(&mirror_dir(data_dir))?;
 
     let mirrored = tokio::fs::metadata(&path)
         .await
@@ -95,7 +95,7 @@ pub async fn capture_generation(
     source: &str,
     observed_bytes: Option<u64>,
 ) -> anyhow::Result<(PathBuf, u64)> {
-    tokio::fs::create_dir_all(mirror_dir(data_dir)).await?;
+    crate::paths::ensure_private_dir(&mirror_dir(data_dir))?;
     let base = mirror_path(data_dir, session_id, source);
     let current = base.with_extension("current");
     // The pointer is private daemon state, never a path supplied by a hook.
@@ -158,33 +158,10 @@ pub async fn capture_generation(
     Ok((path, from + copied))
 }
 
-/// Best-effort age-based collection, mirroring journal GC. Mirrors are only
-/// useful for as long as their journal survives.
+/// Transcript mirrors are referenced by retained native WAL records and are
+/// therefore retained for the lifetime of the data directory.
 pub async fn gc_old_mirrors(data_dir: &Path, max_age: std::time::Duration) {
-    let dir = mirror_dir(data_dir);
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if !matches!(
-            path.extension().and_then(|value| value.to_str()),
-            Some("jsonl" | "current")
-        ) {
-            continue;
-        }
-        let old = entry
-            .metadata()
-            .await
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > max_age);
-        if old {
-            let _ = tokio::fs::remove_file(&path).await;
-        }
-    }
+    let _ = (data_dir, max_age);
 }
 
 #[cfg(test)]

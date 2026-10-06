@@ -1492,6 +1492,41 @@ impl AgentTranslator for CursorTranslator {
         // Decode before touching any state, so a payload in an unexpected
         // format leaves the translator where it was.
         let hook = Hook::decode(&e.event, &e.payload)?;
+        match e.event.as_str() {
+            "beforeSubmitPrompt" if e.payload.get("prompt").and_then(Value::as_str).is_none() => {
+                return Err(crate::translate::InputShapeError {
+                    event: e.event.clone(),
+                    detail: "expected a string prompt".into(),
+                }
+                .into());
+            }
+            "preToolUse" | "postToolUse" | "postToolUseFailure" => {
+                if e.payload
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(crate::translate::InputShapeError {
+                        event: e.event.clone(),
+                        detail: "expected a string tool_use_id".into(),
+                    }
+                    .into());
+                }
+                if e.event == "preToolUse"
+                    && e.payload
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    return Err(crate::translate::InputShapeError {
+                        event: e.event.clone(),
+                        detail: "expected a string tool_name".into(),
+                    }
+                    .into());
+                }
+            }
+            _ => {}
+        }
         let mut ops = Vec::new();
         self.root(e, &hook, ctx, &mut ops);
         if self.transcript_batch(e, &hook, &mut ops)? {

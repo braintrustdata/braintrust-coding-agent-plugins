@@ -437,7 +437,12 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
                 if row["event"] == "afterAgentResponse" {
                     response_through = Some(position);
                 }
-                if row.get("_bt_record_type").is_some() {
+            }
+            let control = data
+                .join("journal-control")
+                .join(journal.file_name().unwrap());
+            for line in std::fs::read_to_string(control).unwrap_or_default().lines() {
+                if let Ok(row) = serde_json::from_str::<Value>(line) {
                     checkpoint_through =
                         checkpoint_through.max(row["through"].as_u64().unwrap_or(0));
                 }
@@ -671,9 +676,27 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
     let pending = persisted
         .iter()
         .filter(|row| row.get("_bt_record_type").is_none())
-        .map(|row| format!("{row}\n"))
+        .map(|row| {
+            // This test deliberately rewrites the journal to simulate lost
+            // delivery receipts. Strip the framing fields as well, yielding
+            // a valid legacy event journal after the byte offsets change.
+            let mut row = row.clone();
+            for field in [
+                "_bt_wal_version",
+                "_bt_wal_offset",
+                "_bt_wal_length",
+                "_bt_wal_sha256",
+            ] {
+                row.as_object_mut().unwrap().remove(field);
+            }
+            format!("{row}\n")
+        })
         .collect::<String>();
     std::fs::write(&journal, pending).unwrap();
+    let control = data
+        .join("journal-control")
+        .join(journal.file_name().unwrap());
+    std::fs::remove_file(control).unwrap();
     std::fs::remove_dir_all(data.join("delivery-ledger")).unwrap();
     std::fs::remove_file(&native).unwrap();
     std::fs::remove_file(&output).unwrap();

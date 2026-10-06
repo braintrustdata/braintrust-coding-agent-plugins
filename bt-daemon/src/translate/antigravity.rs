@@ -517,6 +517,31 @@ impl AntigravityTranslator {
 
 impl AgentTranslator for AntigravityTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        let required_integer = match event.event.as_str() {
+            "PreInvocation" | "PostInvocation" => Some("invocationNum"),
+            "PreToolUse" | "PostToolUse" => Some("stepIdx"),
+            _ => None,
+        };
+        if let Some(field) = required_integer {
+            if integer_field(&event.payload, field).is_none() {
+                return Err(crate::translate::InputShapeError {
+                    event: event.event.clone(),
+                    detail: format!("missing required integer `{field}`"),
+                }
+                .into());
+            }
+        }
+        if matches!(
+            event.event.as_str(),
+            "PreInvocation" | "PostInvocation" | "PreToolUse" | "PostToolUse" | "Stop"
+        ) && !event.payload.is_object()
+        {
+            return Err(crate::translate::InputShapeError {
+                event: event.event.clone(),
+                detail: "expected an event object".into(),
+            }
+            .into());
+        }
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut ops = Vec::new();
         // A later Antigravity process can resume the same conversation after a

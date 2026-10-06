@@ -125,6 +125,10 @@ pub(crate) fn root_tags(ctx: &SessionCtx) -> Option<Vec<String>> {
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
 pub trait AgentTranslator: Send {
+    /// Route readers select a committed logical revision before requesting its
+    /// batches. Native translators ignore this hook.
+    fn set_revision_path(&mut self, _path: &std::path::Path) {}
+
     /// Handle one event, returning span ops to emit.
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>>;
 

@@ -73,6 +73,11 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             }
             before = through;
         }
+        for (route, through) in journal::read_checkpoint_state(&path).await {
+            let key = serde_json::to_string(&route).unwrap_or_default();
+            let acknowledged = acknowledged_by_route.entry(key).or_default();
+            *acknowledged = (*acknowledged).max(through);
+        }
         for event in latest_by_route.into_values() {
             if pending.contains(&(
                 event.env.source.clone(),

@@ -224,6 +224,64 @@ async fn multi_profile_sessions_route_to_their_own_backend() {
     assert!(!b.contains("span-A"), "server B leaked session A's span");
 }
 
+#[tokio::test]
+async fn a_rejected_batch_fails_only_its_routes_checked_flush() {
+    let bad = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&bad)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/project/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"project":{"id":"p"}})))
+        .mount(&bad)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+        .mount(&bad)
+        .await;
+    let good = mock_backend().await;
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut rejected = factory.create("rejected", "codex", None).unwrap();
+    rejected.configure(&session_config(&bad.uri()));
+    rejected
+        .emit(&[SpanOp::Insert(row(
+            "bad",
+            "bad",
+            &[],
+            "Bad",
+            SpanType::Task,
+            1,
+            Some(2),
+        ))])
+        .await
+        .unwrap();
+    let error = rejected.flush().await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<braintrust_sdk_rust::BraintrustError>(),
+        Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. })
+    ));
+
+    let mut accepted = factory.create("accepted", "codex", None).unwrap();
+    accepted.configure(&session_config(&good.uri()));
+    accepted
+        .emit(&[SpanOp::Insert(row(
+            "good",
+            "good",
+            &[],
+            "Good",
+            SpanType::Task,
+            1,
+            Some(2),
+        ))])
+        .await
+        .unwrap();
+    accepted.flush().await.unwrap();
+    assert!(logs3_bodies(&good).await.contains("good"));
+}
+
 /// Regression: an `Insert` that names a span, followed by a `Merge` that
 /// doesn't (the common "close/annotate" pattern, which builds `SpanRow` with
 /// `..Default::default()` and an empty `name`), must not clobber the name.

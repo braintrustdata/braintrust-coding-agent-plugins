@@ -267,6 +267,32 @@ impl AgentTranslator for CodexTranslator {
             "Codex translator has pending catch-up work; drain it before handling another event"
         );
         let payload = &event.payload;
+        match event.event.as_str() {
+            "SessionStart" if !payload.is_object() => {
+                return Err(crate::translate::InputShapeError {
+                    event: event.event.clone(),
+                    detail: "expected an object payload".into(),
+                }
+                .into());
+            }
+            "SubagentStart" => {
+                let _ = decode::<SubagentStartHook>(payload)
+                    .filter(|hook| !hook.agent_id.trim().is_empty())
+                    .ok_or_else(|| crate::translate::InputShapeError {
+                        event: event.event.clone(),
+                        detail: "expected a non-empty agent_id".into(),
+                    })?;
+            }
+            "PreCompact" | "PostCompact" => {
+                let _ = decode::<CompactHook>(payload)
+                    .filter(|hook| !hook.turn_id.trim().is_empty())
+                    .ok_or_else(|| crate::translate::InputShapeError {
+                        event: event.event.clone(),
+                        detail: "expected a non-empty turn_id".into(),
+                    })?;
+            }
+            _ => {}
+        }
         let mut ops = Vec::new();
 
         if let Some(config) = &ctx.config {

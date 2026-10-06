@@ -1,17 +1,16 @@
-//! Destination-scoped completed-span delivery ledger.
+//! Destination-scoped checked-delivery and visible-span projection ledger.
 //!
 //! Hook journals prevent a daemon recovery from re-emitting already flushed
 //! observations. Imports are a second ingress, though: they synthesize the
-//! same source session without using that journal. This ledger records which
-//! completed span rows a destination has already accepted, so every ingress can
-//! avoid re-reporting any later partial merge for a completed span while a new
-//! destination still receives the full trace.
+//! same source session without using that journal. This ledger records accepted
+//! span images and completed spans, so retries can skip unchanged merges while
+//! a new destination still receives the full trace.
 
 use crate::sink::Sink;
 use crate::translate::{SpanOp, SpanRow};
 use crate::wire::SessionConfig;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -20,6 +19,8 @@ struct LedgerFile {
     completed_span_ids: HashSet<String>,
     #[serde(default, alias = "late_merge_span_ids")]
     late_merge_ids: HashSet<String>,
+    #[serde(default)]
+    span_images: HashMap<String, serde_json::Value>,
 }
 
 struct DeliveryLedger {
@@ -28,6 +29,8 @@ struct DeliveryLedger {
     pending: HashSet<String>,
     known_late_merges: HashSet<String>,
     pending_late_merges: HashSet<String>,
+    known_images: HashMap<String, serde_json::Value>,
+    pending_images: HashMap<String, serde_json::Value>,
 }
 
 impl DeliveryLedger {
@@ -50,6 +53,10 @@ impl DeliveryLedger {
             crate::ids::session_storage_id(source, session_id),
             &fingerprint_id[..32]
         ));
+        crate::paths::ensure_private_dir(path.parent().expect("ledger path has a parent"))?;
+        if tokio::fs::metadata(&path).await.is_ok() {
+            crate::paths::restrict_file_to_owner(&path)?;
+        }
         let persisted = match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice::<LedgerFile>(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => LedgerFile::default(),
@@ -61,24 +68,42 @@ impl DeliveryLedger {
             pending: HashSet::new(),
             known_late_merges: persisted.late_merge_ids,
             pending_late_merges: HashSet::new(),
+            known_images: persisted.span_images,
+            pending_images: HashMap::new(),
         })
     }
 
     fn filter(&self, ops: &[SpanOp]) -> Vec<SpanOp> {
-        ops.iter()
-            .filter(|op| {
-                let row = match op {
-                    SpanOp::Insert(row) | SpanOp::Merge(row) => row,
-                };
-                if let Some(key) = &row.late_merge_key {
-                    let id = late_merge_id(row, key);
-                    !self.known_late_merges.contains(&id) && !self.pending_late_merges.contains(&id)
-                } else {
-                    !self.known.contains(&row.span_id) && !self.pending.contains(&row.span_id)
+        let mut images = self.known_images.clone();
+        images.extend(self.pending_images.clone());
+        let mut terminal = self.known.clone();
+        terminal.extend(self.pending.clone());
+        let mut late = self.known_late_merges.clone();
+        late.extend(self.pending_late_merges.clone());
+        let mut filtered = Vec::new();
+        for op in ops {
+            let row = match op {
+                SpanOp::Insert(row) | SpanOp::Merge(row) => row,
+            };
+            if let Some(key) = &row.late_merge_key {
+                let id = late_merge_id(row, key);
+                if !late.insert(id) {
+                    continue;
                 }
-            })
-            .cloned()
-            .collect()
+            } else if terminal.contains(&row.span_id) {
+                continue;
+            }
+            let next = next_image(images.get(&row.span_id), op);
+            if images.get(&row.span_id) == Some(&next) {
+                continue;
+            }
+            images.insert(row.span_id.clone(), next);
+            if row.end_ms.is_some() {
+                terminal.insert(row.span_id.clone());
+            }
+            filtered.push(op.clone());
+        }
+        filtered
     }
 
     fn record_emitted(&mut self, ops: &[SpanOp]) {
@@ -92,29 +117,46 @@ impl DeliveryLedger {
             if let Some(key) = &row.late_merge_key {
                 self.pending_late_merges.insert(late_merge_id(row, key));
             }
+            let current = self
+                .pending_images
+                .get(&row.span_id)
+                .or_else(|| self.known_images.get(&row.span_id));
+            self.pending_images
+                .insert(row.span_id.clone(), next_image(current, op));
         }
     }
 
     async fn commit(&mut self) -> anyhow::Result<()> {
-        if self.pending.is_empty() && self.pending_late_merges.is_empty() {
+        if self.pending.is_empty()
+            && self.pending_late_merges.is_empty()
+            && self.pending_images.is_empty()
+        {
             return Ok(());
         }
         self.known.extend(self.pending.drain());
         self.known_late_merges
             .extend(self.pending_late_merges.drain());
+        self.known_images.extend(self.pending_images.drain());
         let parent = self.path.parent().expect("ledger path has a parent");
-        tokio::fs::create_dir_all(parent).await?;
+        crate::paths::ensure_private_dir(parent)?;
         let temp = self
             .path
             .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(
-            &temp,
-            serde_json::to_vec(&LedgerFile {
-                completed_span_ids: self.known.clone(),
-                late_merge_ids: self.known_late_merges.clone(),
-            })?,
-        )
-        .await?;
+        let bytes = serde_json::to_vec(&LedgerFile {
+            completed_span_ids: self.known.clone(),
+            late_merge_ids: self.known_late_merges.clone(),
+            span_images: self.known_images.clone(),
+        })?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp).await?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_data().await?;
+        drop(file);
         if let Err(first_error) = tokio::fs::rename(&temp, &self.path).await {
             let _ = tokio::fs::remove_file(&self.path).await;
             tokio::fs::rename(&temp, &self.path)
@@ -125,8 +167,29 @@ impl DeliveryLedger {
                     )
                 })?;
         }
+        crate::paths::restrict_file_to_owner(&self.path)?;
         Ok(())
     }
+}
+
+/// Project a row operation using the SDK's merge behavior: an insert replaces
+/// the prior image, while a merge overwrites only fields present in the row.
+fn next_image(previous: Option<&serde_json::Value>, op: &SpanOp) -> serde_json::Value {
+    let row = match op {
+        SpanOp::Insert(row) | SpanOp::Merge(row) => row,
+    };
+    let next = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+    if matches!(op, SpanOp::Insert(_)) {
+        return next;
+    }
+    let mut merged = previous
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(changes) = next.as_object() {
+        merged.extend(changes.clone());
+    }
+    serde_json::Value::Object(merged)
 }
 
 fn late_merge_id(row: &SpanRow, key: &str) -> String {
@@ -342,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_completed_span_receives_each_distinct_late_merge_once() {
+    async fn identical_late_merges_are_suppressed_even_with_distinct_internal_keys() {
         let temp = tempfile::tempdir().unwrap();
         let first = RecordingSink::default();
         let mut first = LedgerSink::new(
@@ -370,11 +433,11 @@ mod tests {
                 .emit(&[late_merge("span-1", "output")])
                 .await
                 .unwrap(),
-            1
+            0
         );
         assert_eq!(
             second.emit(&[late_merge("span-1", "usage")]).await.unwrap(),
-            1
+            0
         );
         assert_eq!(
             second

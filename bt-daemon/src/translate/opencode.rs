@@ -50,7 +50,11 @@ impl TranslatorFactory for OpenCodeTranslatorFactory {
 struct ToolInput {
     #[serde(rename = "sessionID")]
     session_id: String,
-    #[serde(default, rename = "callID")]
+    #[serde(
+        default,
+        rename = "callID",
+        deserialize_with = "deserialize_optional_string"
+    )]
     call_id: Option<String>,
     #[serde(default)]
     tool: Option<String>,
@@ -335,12 +339,44 @@ fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
 
-fn properties<T: DeserializeOwned>(payload: &Value, field: &str) -> Option<T> {
-    payload
+fn decode_required<T: DeserializeOwned>(event: &str, value: &Value) -> anyhow::Result<T> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        crate::translate::InputShapeError {
+            event: event.to_owned(),
+            detail: error.to_string(),
+        }
+        .into()
+    })
+}
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(ToOwned::to_owned))
+}
+
+fn properties_required<T: DeserializeOwned>(
+    event: &str,
+    payload: &Value,
+    field: &str,
+) -> anyhow::Result<T> {
+    let value = payload
         .get("properties")
         .and_then(|properties| properties.get(field))
         .or_else(|| payload.get(field))
-        .and_then(decode)
+        .ok_or_else(|| crate::translate::InputShapeError {
+            event: event.to_owned(),
+            detail: format!("missing required `{field}` object"),
+        })?;
+    serde_json::from_value(value.clone()).map_err(|error| {
+        crate::translate::InputShapeError {
+            event: event.to_owned(),
+            detail: error.to_string(),
+        }
+        .into()
+    })
 }
 
 #[derive(Default)]
@@ -500,24 +536,53 @@ struct OpenCodeTranslator {
 impl AgentTranslator for OpenCodeTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
+        if matches!(
+            event.event.as_str(),
+            "session.created"
+                | "chat.message"
+                | "experimental.chat.system.transform"
+                | "message.part.updated"
+                | "message.updated"
+                | "tool.execute.before"
+                | "tool.execute.after"
+                | "session.idle"
+                | "session.deleted"
+                | "session.error"
+        ) && native_session_id(&event.payload).is_none()
+        {
+            return Err(crate::translate::InputShapeError {
+                event: event.event.clone(),
+                detail: "missing required native session ID".into(),
+            }
+            .into());
+        }
         let mut ops = match event.event.as_str() {
             "session.created" => self.session_created(event, ctx),
             "chat.message" => self.chat_message(event, ctx),
             "experimental.chat.system.transform" => self.system_prompt(event),
-            "message.part.updated" => properties::<PartEvent>(&event.payload, "part")
-                .map(|part| self.part_updated(part, event.ts_ms))
-                .unwrap_or_default(),
-            "message.updated" => properties::<MessageInfo>(&event.payload, "info")
-                .map(|info| self.message_updated(info, event.ts_ms))
-                .unwrap_or_default(),
-            "tool.execute.before" => decode::<ToolBeforePayload>(&event.payload)
-                .map(ToolBefore::from)
-                .map(|tool| self.tool_before(tool, event.ts_ms, ctx))
-                .unwrap_or_default(),
-            "tool.execute.after" => decode::<ToolAfterPayload>(&event.payload)
-                .map(ToolAfter::from)
-                .map(|tool| self.tool_after(tool, event.ts_ms))
-                .unwrap_or_default(),
+            "message.part.updated" => self.part_updated(
+                properties_required("message.part.updated", &event.payload, "part")?,
+                event.ts_ms,
+            ),
+            "message.updated" => self.message_updated(
+                properties_required("message.updated", &event.payload, "info")?,
+                event.ts_ms,
+            ),
+            "tool.execute.before" => self.tool_before(
+                ToolBefore::from(decode_required::<ToolBeforePayload>(
+                    "tool.execute.before",
+                    &event.payload,
+                )?),
+                event.ts_ms,
+                ctx,
+            ),
+            "tool.execute.after" => self.tool_after(
+                ToolAfter::from(decode_required::<ToolAfterPayload>(
+                    "tool.execute.after",
+                    &event.payload,
+                )?),
+                event.ts_ms,
+            ),
             "permission.asked" => permission_properties(&event.payload)
                 .map(|permission| self.permission_asked(permission))
                 .unwrap_or_default(),
@@ -1329,6 +1394,8 @@ fn native_session_id(v: &Value) -> Option<String> {
     v.pointer("/input/sessionID")
         .or_else(|| v.get("sessionID"))
         .or_else(|| v.pointer("/properties/sessionID"))
+        .or_else(|| v.pointer("/properties/part/sessionID"))
+        .or_else(|| v.pointer("/properties/info/sessionID"))
         .or_else(|| v.pointer("/properties/info/id"))
         .or_else(|| v.pointer("/part/sessionID"))
         .and_then(Value::as_str)

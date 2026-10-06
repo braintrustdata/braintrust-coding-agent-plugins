@@ -386,8 +386,39 @@ impl AgentTranslator for PiTranslator {
         ) {
             return Ok(Vec::new());
         }
-        self.last_ts = self.last_ts.max(envelope.ts_ms);
         let event = envelope.payload.get("event").unwrap_or(&envelope.payload);
+        if !event.is_object() {
+            return Err(crate::translate::InputShapeError {
+                event: envelope.event.clone(),
+                detail: "expected an event object".into(),
+            }
+            .into());
+        }
+        match envelope.event.as_str() {
+            "message_end" => {
+                let message = event.get("message").unwrap_or(event);
+                if !message.get("role").is_some_and(Value::is_string) {
+                    return Err(crate::translate::InputShapeError {
+                        event: envelope.event.clone(),
+                        detail: "missing required message role".into(),
+                    }
+                    .into());
+                }
+                decode_required::<AssistantMessage>(&envelope.event, message)?;
+            }
+            "tool_execution_end" => {
+                let end = decode_required::<ToolExecutionEnd>(&envelope.event, event)?;
+                if end.tool_call_id.as_deref().is_none_or(str::is_empty) {
+                    return Err(crate::translate::InputShapeError {
+                        event: envelope.event.clone(),
+                        detail: "missing required toolCallId".into(),
+                    }
+                    .into());
+                }
+            }
+            _ => {}
+        }
+        self.last_ts = self.last_ts.max(envelope.ts_ms);
         let mut ops = self.ensure_root(envelope, ctx);
         match envelope.event.as_str() {
             "before_agent_start" => {
@@ -423,9 +454,8 @@ impl AgentTranslator for PiTranslator {
                 ops.extend(self.tool_start(event, envelope.ts_ms));
             }
             "tool_execution_end" => {
-                if let Some(event) = decode(event) {
-                    ops.extend(self.tool_end(event, envelope.ts_ms));
-                }
+                let event = decode_required("tool_execution_end", event)?;
+                ops.extend(self.tool_end(event, envelope.ts_ms));
             }
             "agent_end" if decode::<AgentEnd>(event).is_none_or(|event| !event.will_retry) => {
                 ops.extend(self.close_turn(envelope.ts_ms, None));

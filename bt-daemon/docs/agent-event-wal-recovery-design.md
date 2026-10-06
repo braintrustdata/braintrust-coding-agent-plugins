@@ -63,8 +63,8 @@ boundaries while replacing several constraints:
 | The journal serializes `RedactedEnvelope.payload` as `serde_json::Value`. Pi journal compaction drops some native fields from provider, streaming, and terminal events. | Preserve the complete native payload. Replace lossy Pi compaction with lossless compression or storage of the original payload. |
 | `configure_event` resolves auth before `session_for` creates an actor. `SessionConfig` combines routing and credentials. | Create source-session and route work from non-secret routing information. Give translators route-neutral context and resolve credentials only for delivery. |
 | Some known-event typed decoders return `None` and their callers silently emit no operations. | Distinguish unknown or unused events from known events whose required fields fail decoding. |
-| `PluginRecoveryState`, `PluginPause`, and plugin diagnostics each hold part of the recovery state. | Persist one mode-neutral work state and a separate typed failure cause. Derive doctor output from them. |
-| A journal file is flushed to the OS but not synced for each acknowledged event; recovery files are collected by age. | Define and implement the WAL durability and retention guarantees explicitly. Do not collect records needed by paused work or active failure history. |
+| `PluginRecoveryState`, `PluginPause`, and plugin diagnostics each hold part of the recovery state. | Persist one mode-neutral work state and a separate typed failure cause. Derive doctor output from incidents; retain plugin diagnostics only as bounded history and for migration. |
+| Journal events are synced before acknowledgement, but native records are collected by age. | Keep accepted native WAL records for the lifetime of the data directory. Do not collect records needed by paused work or active failure history. |
 
 Old journals remain readable during migration. Native fields that an old lossy
 journal omitted cannot be reconstructed; the migration must not label those
@@ -95,10 +95,9 @@ cursor, and marker state. This avoids translating the same native session
 independently for multiple destinations and confines plugin and backend
 failures to their route.
 
-The first implementation may use WAL replay to rebuild translator state rather
-than durable translator snapshots. Replay must be streaming and bounded in
-memory. Snapshots can accelerate long sessions later, but they are versioned
-and disposable: a newer translator can always rebuild from native events.
+The implementation rebuilds translator state by streaming the native WAL.
+Replay is bounded in memory. Durable translator snapshots remain an optional
+performance improvement; they are not required for correctness.
 
 ### Capture and session partitioning
 
@@ -229,11 +228,7 @@ enum WorkScope {
     DeliveryRoute { source: String, session_id: String, route_id: RouteId },
 }
 
-enum WorkState {
-    Active,
-    Paused { incident: Incident },
-    Reprocessing { incident: Incident, attempt: Attempt },
-}
+enum WorkState { Paused, Reprocessing }
 
 struct Incident {
     id: IncidentId,
@@ -244,7 +239,7 @@ struct Incident {
     first_seen_ms: i64,
     last_seen_ms: i64,
     attempts: u64,
-    marker: Option<MarkerState>,
+    marker_span_id: Option<String>,
 }
 ```
 
@@ -371,20 +366,17 @@ different authorities:
   event records, so the latter remain a faithful agent stream. A control write
   that lags an accepted backend write causes conservative replay, not loss.
 
-The existing writer calls `flush()` but not `sync_data()` before acknowledging
-the hook. If the promised WAL durability includes machine or OS crashes, use
-`sync_data()`/an equivalent durable commit before acknowledgement, possibly
-with bounded group commit. This is a performance and contract decision to
-benchmark explicitly. A torn final record must never cause earlier records to
-be discarded.
+The writer calls `sync_data()` before acknowledging each hook. A torn final
+record is truncated on the next open and never causes earlier records to be
+discarded. Native WAL records are retained indefinitely until a lossless
+archive or explicit retention policy is implemented; derived revisions may be
+rebuilt from the WAL and may be collected after every route has advanced.
 
-Do not collect a paused source session's native events or a route's required
-derived revisions while its incident remains active. Once every dependent
-cursor passes a segment, retention may remove it
-only under the chosen history policy. The current seven-day age rule is not a
-definition of "complete historical record"; decide whether the product keeps
-all native history, a configurable window, or an archive before implementing
-new garbage collection.
+Do not collect native WAL events. Their retention is indefinite until a
+lossless archive policy is designed. A paused source session's native events
+and a route's required derived revisions are always protected while its
+incident remains active. Derived revisions may be removed once every route
+cursor has advanced because they can be rebuilt from the WAL.
 
 Native payloads can contain conversation content and secrets that a later
 span plugin would remove before upload. WAL files and any archives need local
@@ -406,59 +398,32 @@ does not claim that a translator recognized it or that the backend accepted
 its spans. A journal append or sync failure remains a capture error returned
 to the hook, because no recovery record exists for that event.
 
-## Implementation sequence
+## Implementation status and limits
 
-1. **Specify the capture contract and WAL format.** Add tests for unknown
-   fields/events, required session identity, large payloads, torn tails,
-   lossless Pi round trips, and captured-byte equivalence. Introduce a
-   versioned reader that handles existing journals and reports legacy lossy
-   records accurately. Keep the current runtime behavior until this reader
-   and writer are proven.
-2. **Separate input, translation, and route state.** Split non-secret
-   translation context from credential leases. Add a source translator cursor
-   for each session partition and a durable logical revision stream with
-   independent route cursors. Preserve deterministic IDs and current parent
-   attachment behavior in the route overlay.
-3. **Make translation outcomes explicit.** Audit each translator's recognized
-   event set and required fields. Turn only genuine required-shape mismatches
-   into typed `InputShape` failures. Verify unknown and intentionally unused
-   events remain no-ops, and failures cannot leave partially committed
-   translator state.
-4. **Install generic persisted recovery state.** Replace
-   `PluginRecoveryState`/`PluginPause` with `WorkState`, `FailureCause`, and
-   cursor-based incidents. Migrate active plugin incidents from draft PR #130
-   without losing their held journal position or marker ID. Implement
-   condition checks and bounded scheduling, starting with plugin digest and
-   translator revision.
-5. **Move auth to delivery and classify sink failures.** Let a route actor
-   exist without a credential lease; resolve and refresh through the host at
-   submission time. Add typed credential, destination, rate-limit, and
-   transport failures plus checked sink acknowledgements. Verify unrelated
-   routes remain live while one is paused.
-6. **Unify markers, doctor, and retention.** Keep optional same-ID markers
-   safe and clear them on success. Derive doctor state from persisted
-   incidents, protect every dependent WAL segment from collection, and
-   exercise crash recovery at each state transition.
-7. **Validate end to end.** Run cross-platform tests, large native-event
-   fixtures, multi-route and long-session replay, restart/version-handover
-   cases, and a real Braintrust trace check before replacing the draft PR's
-   recovery implementation.
+The daemon now appends session-scoped native records before translation,
+translates each source session once into durable route-neutral revisions, and
+lets each route apply its own overlay, plugin chain, acknowledgement ledger,
+and sink. Missing route credentials no longer prevent actor creation or WAL
+capture. Recognized malformed shapes create source-scoped incidents; unknown
+and intentionally unused events remain in the WAL without blocking progress.
 
-The implementation should be reviewable in small commits, but the replacement
-must not be considered complete while an event can be acknowledged and then
-silently skipped because a recognized native shape changed.
+Persisted incidents cover source translation and route delivery scopes. The
+actor's in-memory pause cache contains only marker/progress state; the cause,
+retry check, and first-unprocessed position come from the persisted incident.
+Plugin retries compare the digest of the exact failing path. Marker replacement
+uses the original span ID and clears marker-only fields from the current span.
+Resolved incidents move to bounded local history; no recovered label remains
+on successful spans. Native WAL and required transcript mirrors are retained
+indefinitely because they are the source for future replay.
 
-## Questions to resolve before implementation
+Backend acceptance is checked through the opt-in SDK API in the stacked SDK
+dependency. A crash after backend acceptance and before local acknowledgement
+can still cause a retry; the destination-visible projection ledger suppresses
+identical writes. This does not promise exactly-once external side effects.
+The translator revision is the running daemon binary digest, so an upgrade
+replays translation failures after the daemon starts with the new binary.
 
-1. **Retention:** Does "complete historical record" mean indefinite local
-   retention, a configurable window, or lossless archival after a window?
-   Active incidents cannot be collected under any choice.
-2. **WAL durability:** Is acknowledgement required to survive an OS crash?
-   If so, benchmark per-event sync and bounded group commit on all supported
-   platforms.
-3. **Translator version scope:** Should a source-specific translator revision
-   be separate from the daemon build version? This would avoid replaying a
-   held event after an unrelated daemon update.
-4. **Backend acceptance:** Which SDK API will provide a reliable success or
-   failure receipt for each submitted operation, and what idempotency support
-   exists for retries across a crash?
+The automated suite exercises WAL recovery, generic incidents, replay cursors,
+per-route delivery, doctor output, and translator fixtures. Live remote span
+replacement remains a manual integration check requiring a valid Braintrust
+login and an endpoint reachable by the test daemon.

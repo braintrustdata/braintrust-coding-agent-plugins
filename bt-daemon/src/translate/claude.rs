@@ -1236,6 +1236,37 @@ impl ClaudeTranslator {
 
 impl AgentTranslator for ClaudeTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        let known_event = matches!(
+            event.event.as_str(),
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "UserPromptExpansion"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "PermissionDenied"
+                | "PostCompact"
+                | "SubagentStart"
+                | "SubagentStop"
+                | "TranscriptUpdate"
+                | "Stop"
+                | "StopFailure"
+                | "SessionEnd"
+        );
+        if known_event && !event.payload.is_object() {
+            return Err(crate::translate::InputShapeError {
+                event: event.event.clone(),
+                detail: "expected a hook object".into(),
+            }
+            .into());
+        }
+        if event.event == "PreToolUse" && tool_name(&event.payload).is_none() {
+            return Err(crate::translate::InputShapeError {
+                event: event.event.clone(),
+                detail: "missing required tool name".into(),
+            }
+            .into());
+        }
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         anyhow::ensure!(
             self.pending_emission.is_none(),

@@ -10,14 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_DIAGNOSTICS: usize = 128;
 const FILE_NAME: &str = "span-plugin-errors.json";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginRecoveryState {
-    Paused,
-    Reprocessing,
-    Recovered,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginDiagnostic {
     pub source: String,
@@ -39,13 +31,9 @@ pub struct PluginDiagnostic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<PluginRecoveryState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_start: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_changed_ms: Option<i64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -88,10 +76,8 @@ pub fn record(
                 span_id: None,
                 operation: None,
                 pipeline_id: None,
-                state: None,
                 journal_start: None,
                 pending_bytes: None,
-                state_changed_ms: None,
             });
         }
         trim(&mut store);
@@ -130,7 +116,6 @@ pub fn record_pipeline_failure(
             entry.source == failure.source
                 && entry.session_id.as_deref() == Some(failure.session_id)
                 && entry.pipeline_id.as_deref() == Some(id.as_str())
-                && entry.state != Some(PluginRecoveryState::Recovered)
         });
         if let Some(entry) = existing {
             entry.plugin_path = failure.plugin_path.to_path_buf();
@@ -146,8 +131,6 @@ pub fn record_pipeline_failure(
             );
             entry.last_seen_ms = now;
             entry.occurrences = entry.occurrences.saturating_add(1);
-            entry.state = Some(PluginRecoveryState::Paused);
-            entry.state_changed_ms = Some(now);
         } else {
             store.entries.push(PluginDiagnostic {
                 source: failure.source.to_owned(),
@@ -161,14 +144,12 @@ pub fn record_pipeline_failure(
                 span_id: Some(failure.span_id.to_owned()),
                 operation: Some(failure.operation.to_owned()),
                 pipeline_id: Some(id),
-                state: Some(PluginRecoveryState::Paused),
                 journal_start: Some(failure.journal_start),
                 pending_bytes: Some(
                     failure
                         .journal_through
                         .saturating_sub(failure.journal_start),
                 ),
-                state_changed_ms: Some(now),
             });
         }
         trim(&mut store);
@@ -176,53 +157,12 @@ pub fn record_pipeline_failure(
     })
 }
 
-pub fn update_pipeline(
-    data_dir: &Path,
-    source: &str,
-    session_id: &str,
-    route: &SessionRoute,
-    state: PluginRecoveryState,
-    journal_through: u64,
-) -> anyhow::Result<()> {
-    let path = diagnostics_path(data_dir);
-    ensure_diagnostics_dir(&path)?;
-    let id = pipeline_id(route)?;
-    crate::settings::with_settings_lock(&path, || {
-        let mut store = read_unlocked(&path)?;
-        if let Some(entry) = store.entries.iter_mut().find(|entry| {
-            entry.source == source
-                && entry.session_id.as_deref() == Some(session_id)
-                && entry.pipeline_id.as_deref() == Some(id.as_str())
-                && entry.state != Some(PluginRecoveryState::Recovered)
-        }) {
-            entry.state = Some(state);
-            entry.state_changed_ms = Some(now_ms());
-            entry.pending_bytes = (state != PluginRecoveryState::Recovered)
-                .then(|| journal_through.saturating_sub(entry.journal_start.unwrap_or(0)));
-            write_unlocked(&path, &store)?;
-        }
-        Ok(())
-    })
-}
-
 fn trim(store: &mut DiagnosticStore) {
     store
         .entries
         .sort_by_key(|diagnostic| diagnostic.last_seen_ms);
-    let mut excess = store.entries.len().saturating_sub(MAX_DIAGNOSTICS);
-    store.entries.retain(|diagnostic| {
-        if excess > 0
-            && !matches!(
-                diagnostic.state,
-                Some(PluginRecoveryState::Paused | PluginRecoveryState::Reprocessing)
-            )
-        {
-            excess -= 1;
-            false
-        } else {
-            true
-        }
-    });
+    let excess = store.entries.len().saturating_sub(MAX_DIAGNOSTICS);
+    store.entries.drain(..excess);
 }
 
 pub fn read(data_dir: &Path) -> anyhow::Result<Vec<PluginDiagnostic>> {
@@ -237,16 +177,65 @@ pub fn active_pipeline(
     session_id: &str,
     route: &SessionRoute,
 ) -> anyhow::Result<Option<PluginDiagnostic>> {
+    // Read the old plugin-specific store only to migrate an incident written
+    // by PR #130. New recovery state is stored exclusively in recovery.json.
+    #[derive(Deserialize)]
+    struct LegacyEntry {
+        source: String,
+        session_id: Option<String>,
+        pipeline_id: Option<String>,
+        plugin_path: PathBuf,
+        plugin_digest: Option<String>,
+        exception: String,
+        span_id: Option<String>,
+        operation: Option<String>,
+        journal_start: Option<u64>,
+        pending_bytes: Option<u64>,
+        first_seen_ms: i64,
+        last_seen_ms: i64,
+        occurrences: u64,
+        state: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct LegacyStore {
+        entries: Vec<LegacyEntry>,
+    }
+    let path = diagnostics_path(data_dir);
+    ensure_diagnostics_dir(&path)?;
     let id = pipeline_id(route)?;
-    Ok(read(data_dir)?.into_iter().rev().find(|entry| {
-        entry.source == source
-            && entry.session_id.as_deref() == Some(session_id)
-            && entry.pipeline_id.as_deref() == Some(id.as_str())
-            && matches!(
-                entry.state,
-                Some(PluginRecoveryState::Paused | PluginRecoveryState::Reprocessing)
-            )
-    }))
+    crate::settings::with_settings_lock(&path, || {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let store: LegacyStore = serde_json::from_slice(&bytes)?;
+        Ok(store
+            .entries
+            .into_iter()
+            .rev()
+            .find(|entry| {
+                entry.source == source
+                    && entry.session_id.as_deref() == Some(session_id)
+                    && entry.pipeline_id.as_deref() == Some(id.as_str())
+                    && matches!(entry.state.as_deref(), Some("paused" | "reprocessing"))
+            })
+            .map(|entry| PluginDiagnostic {
+                source: entry.source,
+                plugin_path: entry.plugin_path,
+                plugin_digest: entry.plugin_digest,
+                exception: entry.exception,
+                first_seen_ms: entry.first_seen_ms,
+                last_seen_ms: entry.last_seen_ms,
+                occurrences: entry.occurrences,
+                session_id: entry.session_id,
+                span_id: entry.span_id,
+                operation: entry.operation,
+                pipeline_id: entry.pipeline_id,
+                journal_start: entry.journal_start,
+                pending_bytes: entry.pending_bytes,
+            }))
+    })
 }
 
 pub fn merge(from_data_dir: &Path, into_data_dir: &Path) -> anyhow::Result<()> {

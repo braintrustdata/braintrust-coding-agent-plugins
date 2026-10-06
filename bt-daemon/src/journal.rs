@@ -12,12 +12,23 @@
 
 use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub fn journal_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("journal")
+}
+
+fn checkpoint_path(journal_path: &Path) -> PathBuf {
+    journal_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."))
+        .join("journal-control")
+        .join(journal_path.file_name().unwrap_or_default())
 }
 
 pub(crate) fn sanitize(s: &str) -> String {
@@ -220,25 +231,27 @@ pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) 
 /// Append-only journal writer for one session.
 pub struct JournalWriter {
     file: tokio::fs::File,
+    path: PathBuf,
     position: u64,
-    pi_context: Vec<serde_json::Value>,
 }
 
 impl JournalWriter {
     pub async fn open_path(path: &Path) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
+            crate::paths::ensure_private_dir(dir)?;
         }
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
+        truncate_incomplete_tail(path)?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path).await?;
+        crate::paths::restrict_file_to_owner(path)?;
         let position = file.metadata().await?.len();
         Ok(Self {
             file,
+            path: path.to_path_buf(),
             position,
-            pi_context: Vec::new(),
         })
     }
 
@@ -246,29 +259,39 @@ impl JournalWriter {
         self.position
     }
 
-    /// Append one event in redacted form and flush to the OS. Not fsync'd per
-    /// event (that would dominate hook latency); an OS crash can lose the last
-    /// few lines, which replay tolerates.
+    /// Append one event and durably commit it before acknowledging capture.
     ///
     /// The journal is a durability record and is never capped or truncated:
-    /// dropping entries would silently cost recovery fidelity. Its size is
-    /// bounded instead by writing each transcript byte once (see
-    /// [`crate::transcript_mirror`]) and by age-based GC, and replay reads it
+    /// dropping entries would silently cost recovery fidelity. Replay reads it
     /// as a stream so a large journal never becomes a large allocation.
     pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<u64> {
-        let mut redacted = env.redacted();
-        compact_pi_payload(&mut redacted, &mut self.pi_context);
-        let mut line = serde_json::to_vec(&redacted)?;
+        let redacted = env.redacted();
+        // Native observations are the WAL's source of truth. In particular,
+        // Pi context snapshots must stay intact even when a previous snapshot
+        // contains the same prefix: a record should stand on its own.
+        let mut value = serde_json::to_value(&redacted)?;
+        let payload = serde_json::to_vec(&value)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("journal envelope is not an object"))?;
+        object.insert("_bt_wal_version".into(), serde_json::json!(1));
+        object.insert("_bt_wal_offset".into(), serde_json::json!(self.position));
+        object.insert("_bt_wal_length".into(), serde_json::json!(payload.len()));
+        object.insert(
+            "_bt_wal_sha256".into(),
+            serde_json::json!(format!("{:x}", Sha256::digest(&payload))),
+        );
+        let mut line = serde_json::to_vec(&value)?;
         line.push(b'\n');
         self.file.write_all(&line).await?;
         self.file.flush().await?;
+        self.file.sync_data().await?;
         self.position += line.len() as u64;
         Ok(self.position)
     }
 
-    /// Record that the sink durably accepted every event through this byte
-    /// offset for one route. It lives in the event journal so a cold worker
-    /// restores delivery knowledge together with translator state.
+    /// Record route delivery progress in a separate control stream. Native
+    /// event records remain a faithful WAL independent of sink activity.
     pub async fn append_delivery_checkpoint(
         &mut self,
         route: &SessionRoute,
@@ -280,11 +303,56 @@ impl JournalWriter {
             through,
         })?;
         line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.flush().await?;
-        self.position += line.len() as u64;
+        let path = checkpoint_path(&self.path);
+        crate::paths::ensure_private_dir(path.parent().expect("checkpoint path has parent"))?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path).await?;
+        crate::paths::restrict_file_to_owner(&path)?;
+        file.write_all(&line).await?;
+        file.flush().await?;
+        file.sync_data().await?;
         Ok(())
     }
+}
+
+/// Keep the last complete record after a crash so the next append starts at
+/// a fresh frame boundary. A legacy newline journal has the same framing.
+fn truncate_incomplete_tail(path: &Path) -> anyhow::Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut end = file.metadata()?.len();
+    if end == 0 {
+        return Ok(());
+    }
+    let mut chunk = [0u8; 4096];
+    while end > 0 {
+        let start = end.saturating_sub(chunk.len() as u64);
+        let count = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk[..count])?;
+        if let Some(index) = chunk[..count].iter().rposition(|byte| *byte == b'\n') {
+            let complete = start + index as u64 + 1;
+            if complete < file.metadata()?.len() {
+                file.set_len(complete)?;
+                file.sync_data()?;
+            }
+            return Ok(());
+        }
+        end = start;
+    }
+    file.set_len(0)?;
+    file.sync_data()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,16 +400,21 @@ impl JournalReader {
     /// already recovered state, never the live event still on its way to the
     /// queue. `Ok(None)` means the session has no journal yet.
     pub async fn open(path: &Path, through: u64) -> anyhow::Result<Option<Self>> {
-        let file = match tokio::fs::File::open(path).await {
+        Self::open_from(path, 0, through).await
+    }
+
+    pub async fn open_from(path: &Path, start: u64, through: u64) -> anyhow::Result<Option<Self>> {
+        let mut file = match tokio::fs::File::open(path).await {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        file.seek(std::io::SeekFrom::Start(start)).await?;
         Ok(Some(Self {
-            reader: tokio::io::BufReader::new(file.take(through)),
+            reader: tokio::io::BufReader::new(file.take(through.saturating_sub(start))),
             path: path.to_path_buf(),
             line_no: 0,
-            position: 0,
+            position: start,
             pi_context: Vec::new(),
         }))
     }
@@ -375,6 +448,11 @@ impl JournalReader {
                 return Ok(None);
             }
             self.position += read as u64;
+            // An interrupted append can leave an unterminated final record.
+            // Earlier complete records remain valid and replayable.
+            if bytes.last() != Some(&b'\n') {
+                return Ok(None);
+            }
             self.line_no += 1;
             let line = std::str::from_utf8(&bytes)
                 .map_err(|error| {
@@ -384,9 +462,29 @@ impl JournalReader {
             if line.is_empty() {
                 continue;
             }
-            let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+            let mut value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
                 anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
             })?;
+            if let Some(object) = value.as_object_mut() {
+                if let Some(version) = object.remove("_bt_wal_version") {
+                    anyhow::ensure!(version == 1, "unsupported journal record version {version}");
+                    let offset = object.remove("_bt_wal_offset").and_then(|v| v.as_u64());
+                    let length = object.remove("_bt_wal_length").and_then(|v| v.as_u64());
+                    let checksum = object
+                        .remove("_bt_wal_sha256")
+                        .and_then(|v| v.as_str().map(str::to_owned));
+                    let payload = serde_json::to_vec(object)?;
+                    anyhow::ensure!(
+                        offset == Some(self.position - read as u64)
+                            && length == Some(payload.len() as u64)
+                            && checksum.as_deref()
+                                == Some(&format!("{:x}", Sha256::digest(&payload))),
+                        "journal {}:{}: record checksum or position mismatch",
+                        self.path.display(),
+                        self.line_no,
+                    );
+                }
+            }
             let record = if value
                 .get("_bt_record_type")
                 .and_then(serde_json::Value::as_str)
@@ -435,46 +533,32 @@ impl JournalReader {
                 }
             }
         }
+        for (candidate, offset) in read_checkpoint_state(path).await {
+            if candidate.same_route(route) {
+                acknowledged = acknowledged.max(offset);
+            }
+        }
         acknowledged
     }
 }
 
-const PI_MESSAGES_DELTA: &str = "_bt_messages_delta";
-
-fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_json::Value>) {
-    if event.source != "pi" {
-        return;
-    }
-    let Some(native) = event
-        .payload
-        .get_mut("event")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
+/// Control records live beside, rather than inside, the native event WAL.
+/// Legacy inline checkpoints remain readable through JournalReader.
+pub async fn read_checkpoint_state(path: &Path) -> Vec<(SessionRoute, u64)> {
+    let data = match tokio::fs::read(checkpoint_path(path)).await {
+        Ok(data) => data,
+        Err(_) => return Vec::new(),
     };
-    if event.event == "context" {
-        let Some(messages) = native
-            .remove("messages")
-            .and_then(|messages| messages.as_array().cloned())
-        else {
-            return;
-        };
-        let common_prefix = previous
-            .iter()
-            .zip(&messages)
-            .take_while(|(left, right)| left == right)
-            .count();
-        native.insert(
-            PI_MESSAGES_DELTA.into(),
-            serde_json::json!({
-                "common_prefix": common_prefix,
-                "suffix": messages[common_prefix..],
-            }),
-        );
-        *previous = messages;
-    }
+    data.split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<DeliveryCheckpointRecord>(line).ok())
+        .map(|record| (record.route, record.through))
+        .collect()
 }
 
+const PI_MESSAGES_DELTA: &str = "_bt_messages_delta";
+
+// Older journals used Pi context deltas. Keep decoding those records while
+// all new captures retain the complete native observation.
 fn expand_pi_payload(
     event: &mut RedactedEnvelope,
     previous: &mut Vec<serde_json::Value>,
@@ -517,71 +601,13 @@ fn expand_pi_payload(
     Ok(())
 }
 
-/// Best-effort age-based journal collection. A failed stat/remove is logged
-/// and ignored; stale state must never prevent the daemon from serving hooks.
+/// Native events remain the complete historical record. Collection is inert
+/// until a lossless archive policy is implemented.
 pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
-    let dir = journal_dir(data_dir);
-    let diagnostics = match crate::plugin_diagnostics::read(data_dir) {
-        Ok(diagnostics) => diagnostics,
-        Err(error) => {
-            tracing::warn!(%error, "journal collection skipped because plugin recovery state is unreadable");
-            return;
-        }
-    };
-    let mut protected: HashSet<PathBuf> = diagnostics
-        .into_iter()
-        .filter(|entry| {
-            matches!(
-                entry.state,
-                Some(
-                    crate::plugin_diagnostics::PluginRecoveryState::Paused
-                        | crate::plugin_diagnostics::PluginRecoveryState::Reprocessing
-                )
-            )
-        })
-        .filter_map(|entry| {
-            entry
-                .session_id
-                .map(|session_id| source_journal_path(data_dir, &entry.source, &session_id))
-        })
-        .collect();
-    match crate::recovery::all_active(data_dir) {
-        Ok(incidents) => {
-            protected.extend(incidents.into_iter().map(|incident| {
-                let (source, session_id) = incident.scope.source_session();
-                source_journal_path(data_dir, source, session_id)
-            }));
-        }
-        Err(error) => {
-            tracing::warn!(%error, "journal collection skipped because recovery state is unreadable");
-            return;
-        }
-    }
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if protected.contains(&path) {
-            continue;
-        }
-        if path.extension().and_then(|v| v.to_str()) != Some("ndjson") {
-            continue;
-        }
-        let old = entry
-            .metadata()
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > max_age);
-        if old {
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                tracing::warn!(path = %path.display(), "failed to remove stale journal: {e}");
-            }
-        }
-    }
+    // Accepted native events are the historical WAL. Retain them for the
+    // lifetime of the data directory. This scheduled maintenance hook is
+    // intentionally inert until a lossless archive policy is implemented.
+    let _ = (data_dir, max_age);
 }
 
 /// Reconstruct a translator-usable [`Envelope`] from a redacted journal entry.
@@ -619,9 +645,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn collection_keeps_a_journal_with_a_paused_plugin_pipeline() {
+    async fn accepted_wal_is_retained_as_the_historical_event_record() {
         let temp = tempfile::tempdir().unwrap();
-        let route = SessionRoute::default();
         let path = source_journal_path(temp.path(), "claude", "session");
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
@@ -633,42 +658,12 @@ mod tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
             .unwrap();
-        let plugin = temp.path().join("redact.mjs");
-        tokio::fs::write(&plugin, b"export default span => span")
-            .await
-            .unwrap();
-        crate::plugin_diagnostics::record_pipeline_failure(
-            temp.path(),
-            crate::plugin_diagnostics::PipelineFailure {
-                source: "claude",
-                session_id: "session",
-                route: &route,
-                span_id: "span",
-                operation: "insert",
-                plugin_path: &plugin,
-                exception: "interrupted",
-                journal_start: 0,
-                journal_through: 6,
-            },
-        )
-        .unwrap();
         gc_old_journals(temp.path(), std::time::Duration::from_secs(1)).await;
         assert!(path.exists());
-        crate::plugin_diagnostics::update_pipeline(
-            temp.path(),
-            "claude",
-            "session",
-            &route,
-            crate::plugin_diagnostics::PluginRecoveryState::Recovered,
-            6,
-        )
-        .unwrap();
-        gc_old_journals(temp.path(), std::time::Duration::from_secs(1)).await;
-        assert!(!path.exists());
     }
 
     #[tokio::test]
-    async fn collection_keeps_a_journal_with_a_translation_incident() {
+    async fn wal_is_retained_after_an_incident_is_resolved() {
         let temp = tempfile::tempdir().unwrap();
         let path = source_journal_path(temp.path(), "pi", "held-session");
         tokio::fs::create_dir_all(path.parent().unwrap())
@@ -702,7 +697,7 @@ mod tests {
         assert!(path.exists());
         crate::recovery::resolve(temp.path(), &scope).unwrap();
         gc_old_journals(temp.path(), std::time::Duration::from_secs(1)).await;
-        assert!(!path.exists());
+        assert!(path.exists());
     }
 
     fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
@@ -722,7 +717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pi_context_history_is_delta_encoded_and_replayed() {
+    async fn pi_context_history_is_preserved_and_replayed() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pi.ndjson");
         let mut writer = JournalWriter::open_path(&path).await.unwrap();
@@ -747,12 +742,8 @@ mod tests {
         drop(writer);
 
         let stored = tokio::fs::read(&path).await.unwrap();
-        assert!(
-            stored.len() < naive_bytes / 3,
-            "Pi journal did not eliminate cumulative context copies: stored={} naive={naive_bytes}",
-            stored.len()
-        );
-        assert!(!String::from_utf8_lossy(&stored).contains("\"messages\""));
+        assert!(stored.len() >= naive_bytes);
+        assert!(String::from_utf8_lossy(&stored).contains("\"messages\""));
 
         let through = stored.len() as u64;
         let mut reader = JournalReader::open(&path, through).await.unwrap().unwrap();
@@ -770,6 +761,38 @@ mod tests {
         assert_eq!(contexts.len(), 21);
         assert_eq!(contexts[19].len(), 20);
         assert_eq!(contexts[20], compacted);
+    }
+
+    #[tokio::test]
+    async fn wal_recovers_torn_tail_and_detects_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        writer.append(&pi_context(vec![], 1)).await.unwrap();
+        let first = writer.position();
+        drop(writer);
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.write_all(b"{\"partial\":true").await.unwrap();
+        drop(file);
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        assert_eq!(writer.position(), first);
+        writer.append(&pi_context(vec![], 2)).await.unwrap();
+        drop(writer);
+        let mut reader = JournalReader::open(&path, u64::MAX).await.unwrap().unwrap();
+        assert_eq!(reader.next_entry().await.unwrap().unwrap().ts_ms, 1);
+        assert_eq!(reader.next_entry().await.unwrap().unwrap().ts_ms, 2);
+        assert!(reader.next_entry().await.unwrap().is_none());
+
+        let mut bytes = tokio::fs::read(&path).await.unwrap();
+        let changed = bytes.iter().position(|byte| *byte == b'1').unwrap();
+        bytes[changed] = b'9';
+        tokio::fs::write(&path, bytes).await.unwrap();
+        let mut reader = JournalReader::open(&path, u64::MAX).await.unwrap().unwrap();
+        assert!(reader.next_entry().await.is_err());
     }
 
     #[tokio::test]

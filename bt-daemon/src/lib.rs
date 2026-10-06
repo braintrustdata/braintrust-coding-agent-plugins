@@ -17,6 +17,7 @@ mod client;
 mod command_output;
 mod correlation;
 mod delivery_ledger;
+mod derived;
 mod dispatch;
 mod hook;
 mod ids;

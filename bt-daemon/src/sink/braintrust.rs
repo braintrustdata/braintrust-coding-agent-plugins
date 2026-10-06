@@ -1,11 +1,8 @@
 //! The Braintrust sink: maps sink-neutral [`SpanOp`]s onto `braintrust-sdk-rust`.
 //!
 //! Multi-profile: a session's backend URLs come from its own config (bt
-//! resolves them per profile), so clients are built lazily and cached by
-//! `(api_url, app_url)` — sessions on the same instance share a client,
-//! sessions on different instances get their own. Within a client, each
-//! session's token/org travel per span (`span_builder_with_credentials`) and
-//! never leak across sessions. Span ids are the translator's deterministic
+//! resolves them per profile). Each delivery route owns its own checked
+//! client so a flush receipt applies only to that route. Span ids are the translator's deterministic
 //! UUIDv5 strings, reused as the SDK `row_id` merge key so journal replay
 //! re-emits idempotently.
 
@@ -59,20 +56,14 @@ impl CachedClient {
         if *queued_bytes < QUEUE_FLUSH_BYTE_BUDGET {
             return Ok(());
         }
-        self.client
-            .flush()
-            .await
-            .map_err(|error| anyhow::anyhow!("braintrust flush failed: {error}"))?;
+        self.client.flush().await.map_err(anyhow::Error::new)?;
         *queued_bytes = 0;
         Ok(())
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
         let mut queued_bytes = self.queued_bytes.lock().await;
-        self.client
-            .flush()
-            .await
-            .map_err(|error| anyhow::anyhow!("braintrust flush failed: {error}"))?;
+        self.client.flush().await.map_err(anyhow::Error::new)?;
         *queued_bytes = 0;
         Ok(())
     }
@@ -125,6 +116,7 @@ impl ClientCache {
         }
         let client = BraintrustClient::builder()
             .skip_login(true)
+            .checked_delivery(true)
             .span_origin(SpanOrigin::new().version(self.version.clone()))
             .api_url(api_url.to_string())
             .app_url(app_url.to_string())
@@ -142,9 +134,8 @@ impl ClientCache {
     }
 }
 
-/// Hands out a per-session sink over the shared client pool.
+/// Hands out a per-route sink with an isolated checked client queue.
 pub struct BraintrustSinkFactory {
-    cache: Arc<ClientCache>,
     default_api_url: Option<String>,
     default_app_url: Option<String>,
     version: String,
@@ -153,7 +144,6 @@ pub struct BraintrustSinkFactory {
 impl BraintrustSinkFactory {
     pub fn new(cfg: BraintrustSinkConfig) -> Self {
         Self {
-            cache: Arc::new(ClientCache::new(cfg.version.clone())),
             default_api_url: cfg.api_url,
             default_app_url: cfg.app_url,
             version: cfg.version,
@@ -169,7 +159,7 @@ impl SinkFactory for BraintrustSinkFactory {
         plugin_version: Option<&str>,
     ) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(BraintrustSink {
-            cache: self.cache.clone(),
+            cache: Arc::new(ClientCache::new(self.version.clone())),
             default_api_url: self.default_api_url.clone(),
             default_app_url: self.default_app_url.clone(),
             version: plugin_version.unwrap_or(&self.version).to_string(),

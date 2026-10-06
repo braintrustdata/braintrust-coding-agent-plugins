@@ -214,10 +214,21 @@ pub(super) async fn accept_resolved_event(
     let _session_guard = session_lock.lock().await;
 
     let result = async {
-        let delivery_key = daemon
-            .configure_event(&mut env)
-            .await
-            .map_err(|error| format!("session auth failed: {error}"))?;
+        let requested_route = env
+            .route
+            .as_ref()
+            .ok_or_else(|| "event is missing its session route".to_string())?;
+        let delivery_key = DeliveryKey::new(&env.source, &env.session_id, requested_route)
+            .map_err(|error| format!("invalid session route: {error}"))?;
+        // The route creates a session before credentials are available. Auth is
+        // needed only when the translated spans are ready for delivery.
+        env.config = Some(requested_route.with_auth(crate::wire::BackendAuth {
+            token: String::new(),
+            api_url: None,
+            app_url: None,
+            org_name: requested_route.auth.org_name.clone(),
+            org_id: None,
+        }));
         if crate::dispatch::is_tool_lifecycle_event(&env.event) {
             if let Err(error) = mark_active_parent_snapshot_dirty(
                 &daemon.data_dir,
@@ -233,14 +244,48 @@ pub(super) async fn accept_resolved_event(
             .session_for(&env, &delivery_key, replay_through)
             .await
             .map_err(|error| format!("session init failed: {error}"))?;
+        match daemon.configure_event(&mut env).await {
+            Ok(_) => {
+                if let Some(config) = &env.config {
+                    session
+                        .configure(config.clone())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            Err(error) => {
+                session
+                    .auth_failure(error.to_string(), replay_through)
+                    .await
+                    .map_err(|send_error| send_error.to_string())?;
+            }
+        }
         daemon
             .correlation
             .observe_session(&delivery_key.correlation_key(), &env.source, env.capture.as_ref(),
                 is_session_start(&env.source, &env.event));
+        let mut shared_event = env.clone();
+        shared_event.config = None;
+        let other_routes: Vec<_> = daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| {
+                key.source == source && key.session_id == session_id && *key != &delivery_key
+            })
+            .map(|(_, session)| session.clone())
+            .collect();
         session
             .enqueue(env, journal_through)
             .await
             .map_err(|error| format!("enqueue failed: {error}"))?;
+        for route_session in other_routes {
+            route_session
+                .enqueue(shared_event.clone(), journal_through)
+                .await
+                .map_err(|error| format!("enqueue shared event failed: {error}"))?;
+        }
         Ok(delivery_key)
     }
     .await;

@@ -69,12 +69,18 @@ pub enum FailureCause {
     },
     Credentials {
         selection: crate::wire::AuthSelection,
+        #[serde(default)]
+        retry_after_ms: i64,
     },
     Destination {
         destination: String,
+        #[serde(default)]
+        retry_after_ms: i64,
     },
     Permission {
         destination: String,
+        #[serde(default)]
+        retry_after_ms: i64,
     },
     RateLimited {
         retry_after_ms: i64,
@@ -139,13 +145,12 @@ impl FailureCause {
                 translator_revision: failed,
             } => failed != translator_revision,
             Self::PluginFile { path, digest, .. } => &plugin_digest(path) != digest,
-            Self::RateLimited { retry_after_ms } | Self::Transport { retry_after_ms, .. } => {
-                now_ms >= *retry_after_ms
-            }
-            Self::Credentials { .. }
-            | Self::Destination { .. }
-            | Self::Permission { .. }
-            | Self::PermanentDelivery { .. } => false,
+            Self::RateLimited { retry_after_ms }
+            | Self::Transport { retry_after_ms, .. }
+            | Self::Destination { retry_after_ms, .. }
+            | Self::Permission { retry_after_ms, .. } => now_ms >= *retry_after_ms,
+            Self::Credentials { .. } => false,
+            Self::PermanentDelivery { sink_revision } => sink_revision != translator_revision,
         };
         if ready {
             CheckResult::RetryCandidate
@@ -169,6 +174,65 @@ pub fn translator_revision() -> &'static str {
             .and_then(|path| plugin_digest(&path));
         digest.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
     })
+}
+
+pub fn classify_delivery_error(
+    error: &anyhow::Error,
+    route: &SessionRoute,
+    api_url: Option<&str>,
+    attempts: u64,
+) -> FailureCause {
+    let now = now_ms();
+    let delay_ms = (1_000i64.saturating_mul(1i64 << attempts.min(6))).min(60_000);
+    let destination = route
+        .destination
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "missing destination".into());
+    match error.downcast_ref::<braintrust_sdk_rust::BraintrustError>() {
+        Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. }) => {
+            FailureCause::Credentials {
+                selection: route.auth.clone(),
+                retry_after_ms: now + delay_ms,
+            }
+        }
+        Some(braintrust_sdk_rust::BraintrustError::Api { status: 403, .. }) => {
+            FailureCause::Permission {
+                destination,
+                retry_after_ms: now + delay_ms.max(30_000),
+            }
+        }
+        Some(braintrust_sdk_rust::BraintrustError::Api { status: 404, .. }) => {
+            FailureCause::Destination {
+                destination,
+                retry_after_ms: now + delay_ms.max(30_000),
+            }
+        }
+        Some(braintrust_sdk_rust::BraintrustError::Api { status: 429, .. }) => {
+            FailureCause::RateLimited {
+                retry_after_ms: now + delay_ms,
+            }
+        }
+        Some(braintrust_sdk_rust::BraintrustError::Api { status, .. }) if *status >= 500 => {
+            FailureCause::Transport {
+                endpoint: api_url.unwrap_or_default().into(),
+                retry_after_ms: now + delay_ms,
+            }
+        }
+        Some(braintrust_sdk_rust::BraintrustError::Api { .. }) => FailureCause::PermanentDelivery {
+            sink_revision: translator_revision().into(),
+        },
+        Some(braintrust_sdk_rust::BraintrustError::Http(_))
+        | Some(braintrust_sdk_rust::BraintrustError::Network(_))
+        | Some(braintrust_sdk_rust::BraintrustError::Background(_))
+        | None => FailureCause::Transport {
+            endpoint: api_url.unwrap_or_default().into(),
+            retry_after_ms: now + delay_ms,
+        },
+        Some(_) => FailureCause::PermanentDelivery {
+            sink_revision: translator_revision().into(),
+        },
+    }
 }
 
 pub fn active(data_dir: &Path, scope: &WorkScope) -> anyhow::Result<Option<Incident>> {

@@ -78,6 +78,23 @@ impl Daemon {
             through: replay_through,
             journal_path,
         };
+        let source_key = crate::ids::session_namespace(&env.source, &env.session_id);
+        let derived = {
+            let mut map = self.derived.lock().unwrap();
+            if let Some(existing) = map.get(&source_key) {
+                existing.clone()
+            } else {
+                let created = crate::derived::SourceTranslation::new(
+                    &env.source,
+                    &env.session_id,
+                    &translator_session_id,
+                    &self.data_dir,
+                    &self.translators,
+                )?;
+                map.insert(source_key, created.clone());
+                created
+            }
+        };
         let journal = self
             .journal_writer_for(&env.source, &env.session_id)
             .await?;
@@ -88,7 +105,6 @@ impl Daemon {
         let session = Session::spawn(
             SessionOptions {
                 session_id: env.session_id.clone(),
-                translator_session_id,
                 source: env.source.clone(),
                 plugin_version: env.plugin_version.clone(),
                 replay: Some(replay),
@@ -99,6 +115,8 @@ impl Daemon {
                 data_dir: self.data_dir.clone(),
                 journal,
                 correlation_changed: self.correlation_changed.clone(),
+                auth_provider: self.auth_provider.clone(),
+                derived,
             },
             self.translators.clone(),
             self.sink_factory.clone(),

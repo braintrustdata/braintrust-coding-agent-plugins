@@ -169,14 +169,16 @@ span processor is constructed. Plugins execute in bounded, thread-local
 QuickJS runtimes with no filesystem or network host APIs. Modules must be
 self-contained and transforms must be stateless: module globals belong to a
 worker thread, not a session. Every configured plugin is mandatory. If one
-fails, the affected source session and route pause delivery; other sessions
-continue. The daemon sends a payload-free failure marker on the affected span
+fails, delivery pauses only for that route and source session; other routes
+and sessions continue. The daemon sends a failure marker on the affected span
 with `plugin failure: <path>`, then keeps new events in that session's journal.
 It checks the failed plugin's content digest once a second. When that file
-changes, it reprocesses the paused session through the current plugin chain,
-replaces the marker with the recovered span, and resumes delivery after the
-replay reaches a durable checkpoint. A still failing edit leaves that session
-paused. No daemon restart or new agent event is needed.
+changes, it reprocesses the paused route from the failed operation through the
+current plugin chain, replaces the marker with the ordinary translated span,
+and resumes delivery after the replay reaches a durable checkpoint. The
+successful span has no recovery label or marker-only error. A still failing
+edit leaves that route paused. No daemon lifecycle command or new agent event
+is needed.
 
 Plugin failures are deduplicated in the daemon's private local state, including
 the raw QuickJS exception and stack. Inspect them with:
@@ -186,8 +188,9 @@ bt trace doctor codex
 ```
 
 The doctor output reports the plugin path, full local exception, session and
-span IDs, journal position, pending bytes, and recovery state. Raw exception
-details remain local; the Braintrust marker only includes the plugin path.
+span IDs, first unprocessed journal position, and active recovery state. Raw
+exception details remain local; the Braintrust marker only includes the
+plugin path.
 Managed-run diagnostics are copied out of their temporary daemon directory
 before it is removed.
 Plugins are trusted local code: although they have no host APIs, they can copy
@@ -312,9 +315,11 @@ retires idle sessions. Retired sessions are rebuilt from their journals when
 another event arrives. Journals and mirrors preserve conversation content;
 credentials are excluded from journaled routing data.
 
-Recovery files are removed after seven days without modification. Cleanup runs
-at startup and hourly while the daemon is running. This retention period is
-currently fixed in `src/server.rs`.
+Native session WALs and transcript mirrors are retained indefinitely because
+they are required to reconstruct translation state. Active and resolved
+recovery incidents are stored separately from native events; resolved local
+incident history is bounded. No age-based cleanup currently removes the
+authoritative event record.
 
 ## Platform and integration coverage
 
