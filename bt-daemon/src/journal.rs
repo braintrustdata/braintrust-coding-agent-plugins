@@ -237,14 +237,19 @@ pub struct JournalWriter {
 impl JournalWriter {
     pub async fn open_path(path: &Path) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
-            crate::paths::ensure_private_dir(dir)?;
+            crate::paths::ensure_private_dir(dir).map_err(|error| {
+                anyhow::anyhow!("create journal directory {}: {error}", dir.display())
+            })?;
         }
         truncate_incomplete_tail(path)?;
         let mut options = tokio::fs::OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
         options.mode(0o600);
-        let file = options.open(path).await?;
+        let file = options
+            .open(path)
+            .await
+            .map_err(|error| anyhow::anyhow!("open journal {}: {error}", path.display()))?;
         crate::paths::restrict_file_to_owner(path)?;
         let position = file.metadata().await?.len();
         Ok(Self {
