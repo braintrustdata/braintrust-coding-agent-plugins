@@ -21,6 +21,7 @@ pub(crate) use grok::Grok;
 pub(crate) use opencode::OpenCode;
 pub(crate) use pi::Pi;
 
+use crate::managed_run::ManagedRun;
 use crate::setup::Setup;
 use std::sync::{Arc, OnceLock};
 
@@ -77,6 +78,7 @@ impl<T: ?Sized + Agent> Agents<T> {
 #[derive(Default)]
 pub(crate) struct Registrar {
     pub setup: Agents<dyn Setup>,
+    pub run: Agents<dyn ManagedRun>,
 }
 
 pub(crate) trait Register {

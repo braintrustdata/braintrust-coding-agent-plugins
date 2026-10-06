@@ -2,10 +2,59 @@
 
 use std::ffi::OsString;
 
-use super::{managed_hook_shell_command, quote_unix_shell_arg, quote_windows_command_arg};
+use super::{
+    managed_hook_shell_command, quote_unix_shell_arg, quote_windows_command_arg, Injection,
+    ManagedRun, Terminal,
+};
+use crate::agents::Cursor;
 use crate::args::RunHookCommand;
+use crate::paths;
+use crate::setup::cursor::CursorManagedHooks;
 
-pub(super) fn cursor_run_requires_interactive(
+impl ManagedRun for Cursor {
+    fn executable(&self) -> (&'static str, &'static str) {
+        ("CURSOR_BIN", "agent")
+    }
+
+    fn check(&self, agent_args: &[OsString], terminal: Terminal) -> anyhow::Result<()> {
+        if cursor_run_requires_interactive(agent_args, terminal.stdin, terminal.stdout) {
+            anyhow::bail!(
+                "bt trace run cursor requires an interactive terminal for complete lifecycle tracing; Cursor print mode is inferred for non-terminal stdio and does not emit the required prompt, response, and stop hooks"
+            );
+        }
+        Ok(())
+    }
+
+    fn inject(
+        &self,
+        hook_command: &RunHookCommand,
+        managed_run_id: &str,
+    ) -> anyhow::Result<Injection> {
+        let directory = tempfile::Builder::new()
+            .prefix("bt-trace-cursor-plugin-")
+            .tempdir()?;
+        write_cursor_managed_plugin(directory.path(), hook_command)?;
+        // Cursor's CLI only discovers the plugin lifecycle callbacks when these
+        // events exist in user/project hook configuration. Keep temporary no-op
+        // discovery entries for this process and remove only our own entries when
+        // the managed run exits.
+        let hooks = CursorManagedHooks::install(&paths::cursor_config_dir(), managed_run_id)?;
+        Ok(Injection {
+            args: plugin_dir_args(directory.path()),
+            env: Vec::new(),
+            guards: vec![Box::new(hooks), Box::new(directory)],
+        })
+    }
+}
+
+fn plugin_dir_args(directory: &std::path::Path) -> Vec<OsString> {
+    vec![
+        OsString::from("--plugin-dir"),
+        directory.as_os_str().to_owned(),
+    ]
+}
+
+fn cursor_run_requires_interactive(
     args: &[OsString],
     stdin_is_terminal: bool,
     stdout_is_terminal: bool,
@@ -34,7 +83,7 @@ pub(super) fn cursor_hook_events() -> anyhow::Result<Vec<String>> {
 /// Build a private plugin that Cursor loads only for the managed invocation.
 /// The plugin's hooks call this bt front-end directly, so inherited tracing
 /// plugins are suppressed while these injected hooks remain active.
-pub(super) fn write_cursor_managed_plugin(
+fn write_cursor_managed_plugin(
     directory: &std::path::Path,
     hook_command: &RunHookCommand,
 ) -> anyhow::Result<()> {
@@ -162,6 +211,60 @@ fn cursor_managed_powershell_script(hook_command: &RunHookCommand) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_managed_run_injects_an_invocation_local_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("plugin with spaces – ü");
+        std::fs::create_dir(&plugin).unwrap();
+        let hook = RunHookCommand {
+            program: OsString::from("/opt/Braintrust CLI/日本語/bt"),
+            args: vec![OsString::from("trace"), OsString::from("hook")],
+        };
+        write_cursor_managed_plugin(&plugin, &hook).unwrap();
+        let args = plugin_dir_args(&plugin);
+        assert_eq!(
+            args,
+            [OsString::from("--plugin-dir"), plugin.as_os_str().into()]
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(plugin.join("hooks/hooks.json")).unwrap())
+                .unwrap();
+        let plugin_manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(plugin.join(".cursor-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plugin_manifest["hooks"], "hooks/hooks.json");
+        for event in cursor_hook_events().unwrap() {
+            let entry = &manifest["hooks"][event][0];
+            assert_eq!(entry["failClosed"], false);
+            let launcher = if cfg!(windows) {
+                "trace.ps1"
+            } else {
+                "trace.sh"
+            };
+            assert!(entry["command"].as_str().unwrap().contains(launcher));
+        }
+        if cfg!(windows) {
+            let script = std::fs::read_to_string(plugin.join("hooks/trace.ps1")).unwrap();
+            assert!(script.contains("'--source'"));
+            assert!(script.contains("'cursor'"));
+            assert!(script.contains("'--managed-run-hook'"));
+            assert!(script.contains("'--session-id-field'"));
+            assert!(script.contains("'conversation_id'"));
+            assert!(!script.contains("permission\":\"allow"));
+            assert!(script.contains("{\"continue\":true}"));
+            assert!(!script.contains("--dangerously-bypass"));
+        } else {
+            let script = std::fs::read_to_string(plugin.join("hooks/trace.sh")).unwrap();
+            assert!(script.contains("'--source' 'cursor' '--managed-run-hook'"));
+            assert!(script.contains("'--session-id-field' 'conversation_id'"));
+            assert!(!script.contains("\"permission\":\"allow\""));
+            assert!(script.contains("\"continue\":true"));
+            assert!(!script.contains("--dangerously-bypass"));
+        }
+    }
 
     #[test]
     fn cursor_managed_run_rejects_explicit_and_inferred_print_modes() {

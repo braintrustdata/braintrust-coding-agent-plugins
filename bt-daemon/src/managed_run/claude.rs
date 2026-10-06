@@ -2,6 +2,8 @@
 
 use std::ffi::OsString;
 
+use super::{Injection, ManagedRun};
+use crate::agents::Claude;
 use crate::args::RunHookCommand;
 
 const CLAUDE_RUN_HOOK_EVENTS: &[&str] = &[
@@ -28,9 +30,7 @@ const CLAUDE_RUN_HOOK_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
-pub(super) fn claude_managed_run_args(
-    hook_command: &RunHookCommand,
-) -> anyhow::Result<Vec<OsString>> {
+fn claude_managed_run_args(hook_command: &RunHookCommand) -> anyhow::Result<Vec<OsString>> {
     let command = hook_command
         .program
         .to_str()
@@ -62,4 +62,21 @@ pub(super) fn claude_managed_run_args(
             &serde_json::json!({ "hooks": hooks }),
         )?),
     ])
+}
+
+impl ManagedRun for Claude {
+    fn executable(&self) -> (&'static str, &'static str) {
+        ("CLAUDE_BIN", "claude")
+    }
+
+    fn inject(
+        &self,
+        hook_command: &RunHookCommand,
+        _managed_run_id: &str,
+    ) -> anyhow::Result<Injection> {
+        Ok(Injection {
+            args: claude_managed_run_args(hook_command)?,
+            ..Injection::default()
+        })
+    }
 }
