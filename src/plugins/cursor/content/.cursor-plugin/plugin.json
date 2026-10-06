@@ -1,6 +1,6 @@
 {
   "name": "trace-cursor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Trace Cursor agent sessions, model output, and tool operations to Braintrust through the shared bt daemon.",
   "author": { "name": "Braintrust" },
   "homepage": "https://www.braintrust.dev",
