@@ -238,7 +238,7 @@ fn wide(value: &OsStr) -> Vec<u16> {
 fn wide_path(path: &Path) -> Vec<u16> {
     let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
     let prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
-    if path.is_absolute() && !value.starts_with(&prefix) {
+    if path.is_absolute() && value.len() > 240 && !value.starts_with(&prefix) {
         if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
             value.drain(..2);
             value.splice(0..0, "\\\\?\\UNC\\".encode_utf16());
