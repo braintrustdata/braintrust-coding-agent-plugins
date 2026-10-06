@@ -1,4 +1,5 @@
 use super::{envelope, validate_session_id};
+use crate::translate::cursor::{IMPORT_CHECKPOINT, IMPORT_START, IMPORT_STOP};
 use crate::wire::Envelope;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
@@ -144,7 +145,7 @@ pub(super) fn envelopes_with_snapshot(
             "start_time_estimated": true,
             "historical_fidelity": "user_and_assistant_text_and_terminal_status"
         });
-        if event == "stop" {
+        if event == IMPORT_STOP {
             if let Some(status) = final_terminal.and_then(|record| record.get("status")) {
                 payload["status"] = status.clone();
             }
@@ -164,8 +165,8 @@ pub(super) fn envelopes_with_snapshot(
         envelope("cursor", None, &session_id, event, ts_ms, payload)
     };
     Ok(vec![
-        boundary("sessionStart", None),
-        boundary("ImportCheckpoint", Some(through)),
-        boundary("stop", Some(through)),
+        boundary(IMPORT_START, None),
+        boundary(IMPORT_CHECKPOINT, Some(through)),
+        boundary(IMPORT_STOP, Some(through)),
     ])
 }

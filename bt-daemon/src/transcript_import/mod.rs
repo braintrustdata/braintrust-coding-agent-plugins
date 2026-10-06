@@ -705,7 +705,7 @@ mod tests {
                 .iter()
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
-            vec!["sessionStart", "ImportCheckpoint", "stop"]
+            vec!["importStart", "importCheckpoint", "importStop"]
         );
         assert!(events.iter().all(|event| event.source == "cursor"));
         assert_eq!(
@@ -734,7 +734,10 @@ mod tests {
         .unwrap();
 
         let events = transcript_envelopes(&transcript, ImportSource::Cursor).unwrap();
-        let stop = events.iter().find(|event| event.event == "stop").unwrap();
+        let stop = events
+            .iter()
+            .find(|event| event.event == "importStop")
+            .unwrap();
         assert_eq!(stop.payload["status"], "error");
         assert_eq!(stop.payload["error_message"], "WritableIterable is closed");
     }
@@ -755,7 +758,7 @@ mod tests {
                 .iter()
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
-            vec!["sessionStart", "ImportCheckpoint"]
+            vec!["importStart", "importCheckpoint"]
         );
         let snapshot = first[1].payload["_bt_transcript_mirror"]["mirror"]
             .as_str()
@@ -781,7 +784,7 @@ mod tests {
                 .iter()
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ImportCheckpoint"]
+            vec!["importCheckpoint"]
         );
         assert_eq!(
             grown[0].payload["_bt_transcript_mirror"]["mirror"],
@@ -797,7 +800,7 @@ mod tests {
                 .iter()
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
-            vec!["stop"]
+            vec!["importStop"]
         );
         std::fs::write(&transcript, b"replacement transcript\n").unwrap();
         let snapshot_contents = std::fs::read_to_string(&snapshot).unwrap();
@@ -830,8 +833,8 @@ mod tests {
         )
         .unwrap();
         let replacement = tail.poll(false).unwrap();
-        assert_eq!(replacement[0].event, "sessionStart");
-        assert_eq!(replacement[1].event, "ImportCheckpoint");
+        assert_eq!(replacement[0].event, "importStart");
+        assert_eq!(replacement[1].event, "importCheckpoint");
         let replacement_snapshot = replacement[1].payload["_bt_transcript_mirror"]["mirror"]
             .as_str()
             .unwrap();
@@ -856,7 +859,7 @@ mod tests {
         tail.allow_incomplete_final_record_on_shutdown();
         assert_eq!(
             tail.poll(false).unwrap().last().unwrap().event,
-            "ImportCheckpoint"
+            "importCheckpoint"
         );
         use std::io::Write;
         std::fs::OpenOptions::new()
@@ -872,7 +875,7 @@ mod tests {
                 .iter()
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ImportCheckpoint", "stop"]
+            vec!["importCheckpoint", "importStop"]
         );
     }
 

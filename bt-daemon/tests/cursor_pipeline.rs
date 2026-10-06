@@ -287,6 +287,15 @@ async fn send_with_flush_mode(
 ) {
     payload["conversation_id"] = json!("cursor-recovery");
     payload["hook_event_name"] = json!(event);
+    // Fields the Cursor CLI sends with every agent hook.
+    let object = payload.as_object_mut().unwrap();
+    object
+        .entry("generation_id")
+        .or_insert_with(|| json!(format!("generation-{event}-{ts_ms}")));
+    object.entry("model").or_insert_with(|| json!("default"));
+    object
+        .entry("workspace_roots")
+        .or_insert_with(|| json!(["/cursor-project"]));
     let env = Envelope {
         source: "cursor".into(),
         source_version: Some("2.5.0".into()),
@@ -552,7 +561,7 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
         2400,
         json!({
             "generation_id":"g1", "tool_use_id":"shell-1", "tool_name":"Shell",
-            "tool_input":{"command":"printf cursor"}, "tool_output":{"stdout":"cursor"},
+            "tool_input":{"command":"printf cursor"}, "tool_output":"cursor",
             "duration":200
         }),
     )
@@ -695,7 +704,7 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
         &socket,
         "sessionEnd",
         6000,
-        json!({"transcript_path":native,"reason":"completed"}),
+        json!({"transcript_path":native,"reason":"completed","final_status":"completed"}),
     )
     .await;
     assert!(

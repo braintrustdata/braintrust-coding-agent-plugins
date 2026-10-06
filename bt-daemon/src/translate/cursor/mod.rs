@@ -13,10 +13,11 @@ use super::{
 };
 use crate::{ids, wire::Envelope};
 use hooks::{
-    CursorHook, HookCommon, MessageContent, PromptHook, ResponseHook, SessionEndHook,
-    SpecializedHook, SpecializedKind, StopHook, SubagentHook, SubagentPhase, ToolHook, ToolPhase,
+    CursorHook, Hook, ImportStopHook, PromptHook, ResponseHook, Role, SessionEndHook, Specialized,
+    StopHook, SubagentStartHook, SubagentStopHook, ToolHook, ToolPhase, TranscriptMirror,
     TranscriptRecord, TurnUsage,
 };
+pub(crate) use hooks::{IMPORT_CHECKPOINT, IMPORT_START, IMPORT_STOP};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
@@ -283,34 +284,22 @@ impl CursorTranslator {
             ..Default::default()
         }
     }
-    fn root(
-        &mut self,
-        e: &Envelope,
-        common: &HookCommon,
-        hook: &CursorHook,
-        ctx: &SessionCtx,
-        ops: &mut Vec<SpanOp>,
-    ) {
+    fn root(&mut self, e: &Envelope, hook: &Hook, ctx: &SessionCtx, ops: &mut Vec<SpanOp>) {
         self.last_ms = self.last_ms.max(e.ts_ms);
         let previous_cwd = self.cwd.clone();
-        if let Some(cwd) = common
-            .cwd
-            .as_deref()
-            .filter(|cwd| !cwd.is_empty())
-            .or(common.workspace_root())
-        {
+        if let Some(cwd) = hook.cwd() {
             self.cwd = Some(cwd.into());
         }
-        if let Some(model) = common.model_id.as_ref().or(common.model.as_ref()) {
-            if self.model.as_ref() != Some(model) {
+        if let Some(model) = hook.model() {
+            if self.model.as_deref() != Some(model) {
                 self.model_params = None;
             }
-            self.model = Some(model.clone());
+            self.model = Some(model.to_owned());
         }
-        if matches!(hook, CursorHook::BeforeSubmitPrompt(_)) {
+        if matches!(hook.kind, CursorHook::BeforeSubmitPrompt(_)) {
             self.model_params = None;
         }
-        if let Some(params) = &common.model_params {
+        if let Some(params) = hook.model_params() {
             self.model_params = Some(params.clone());
         }
         if self.started {
@@ -338,8 +327,8 @@ impl CursorTranslator {
         let mut metadata = json!({"source":"cursor", "session_id":ctx.session_id,
             "username":local_username(), "os":std::env::consts::OS, "workspace":self.cwd,
             "trace_cursor_version":e.source_version, "trace_plugin_version":e.plugin_version});
-        if let Some(estimated) = common.start_time_estimated {
-            metadata["start_time_estimated"] = json!(estimated);
+        if let CursorHook::ImportStart(start) = &hook.kind {
+            metadata["start_time_estimated"] = json!(start.start_time_estimated);
         }
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.root.clone(),
@@ -401,17 +390,9 @@ impl CursorTranslator {
             self.history.push(json!({"role":"user","content":p}));
         }
     }
-    fn prompt(
-        &mut self,
-        e: &Envelope,
-        common: &HookCommon,
-        hook: &PromptHook,
-        ops: &mut Vec<SpanOp>,
-    ) {
-        let Some(prompt) = hook.prompt.as_deref() else {
-            return;
-        };
-        let generation = common.generation_id.as_deref();
+    fn prompt(&mut self, e: &Envelope, hook: &Hook, prompt: &PromptHook, ops: &mut Vec<SpanOp>) {
+        let prompt = prompt.prompt.as_str();
+        let generation = hook.generation_id();
         if generation.is_some_and(|g| self.prompt_generations.get(g).is_some()) {
             return;
         }
@@ -617,16 +598,14 @@ impl CursorTranslator {
     fn tool(
         &mut self,
         e: &Envelope,
-        phase: ToolPhase,
-        common: &HookCommon,
-        hook: &ToolHook,
+        hook: &Hook,
+        phase: &ToolPhase,
+        tool_hook: &ToolHook,
         ops: &mut Vec<SpanOp>,
     ) {
-        let Some(call_id) = common.tool_use_id.as_deref() else {
-            return;
-        };
+        let call_id = tool_hook.tool_use_id.as_str();
         let key = call_id.to_string();
-        let terminal = phase != ToolPhase::Pre;
+        let terminal = !matches!(phase, ToolPhase::Pre);
         let late_incomplete = self
             .completed
             .get(&key)
@@ -648,33 +627,32 @@ impl CursorTranslator {
         }
 
         if !self.tools.contains_key(&key) {
-            let native_turn = common
-                .generation_id
-                .as_deref()
+            let native_turn = hook
+                .generation_id()
                 .and_then(|g| self.prompt_generations.get(g))
                 .map(|t| t.id.clone());
             if native_turn.is_none() {
                 self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
             }
             let turn = native_turn.unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
-            let name = hook.tool_name.as_deref().unwrap_or("Cursor tool");
+            let name = tool_hook.tool_name.as_str();
             let mut row = self.row(
                 ids::span_id(&self.namespace, &format!("tool:{call_id}")),
                 turn.clone(),
                 name,
                 SpanType::Tool,
             );
-            let duration = hook.duration.filter(|n| n.is_finite() && *n >= 0.0);
+            let duration = phase.duration().filter(|n| n.is_finite() && *n >= 0.0);
             row.start_ms = Some(if terminal {
                 e.ts_ms
                     .saturating_sub(duration.unwrap_or(0.0).min(i64::MAX as f64) as i64)
             } else {
                 e.ts_ms
             });
-            row.input = hook.tool_input.clone();
+            row.input = Some(Value::Object(tool_hook.tool_input.clone()));
             row.metadata = Some(
-                json!({"tool_use_id":call_id,"generation_id":common.generation_id,"turn_attribution":"active_prompt_boundary",
-                "start_time_estimated":terminal,"result_completeness":"unknown","parent_tool_call_id":hook.parent_tool_call_id}),
+                json!({"tool_use_id":call_id,"generation_id":hook.generation_id(),"turn_attribution":"active_prompt_boundary",
+                "start_time_estimated":terminal,"result_completeness":"unknown","parent_tool_call_id":tool_hook.parent_tool_call_id}),
             );
             ops.push(SpanOp::Insert(row.clone()));
             self.insert_open_tool(
@@ -748,6 +726,10 @@ impl CursorTranslator {
         let mut tool = self.remove_open_tool(&key).unwrap();
         tool.ended = true;
         tool.row.end_ms = Some(e.ts_ms.max(tool.row.start_ms.unwrap_or(e.ts_ms)));
+        let output = match phase {
+            ToolPhase::Post(result) => Some(json!(result.tool_output)),
+            _ => None,
+        };
         if tool
             .row
             .metadata
@@ -755,26 +737,24 @@ impl CursorTranslator {
             .is_some_and(|m| m.get("result_source").is_some())
         {
             tool.row.metadata.as_mut().unwrap()["native_tool_result"] =
-                hook.tool_output.clone().unwrap_or(Value::Null);
+                output.unwrap_or(Value::Null);
         } else {
-            tool.row.output = hook.tool_output.clone();
+            tool.row.output = output;
         }
-        let failed = phase == ToolPhase::Failure;
         let mut metadata = tool.row.metadata.take().unwrap_or(json!({}));
-        metadata["status"] = json!(if failed { "error" } else { "completed" });
-        if let Some(duration) = hook.duration.filter(|n| n.is_finite() && *n >= 0.0) {
+        metadata["status"] = json!(if matches!(phase, ToolPhase::Failure(_)) {
+            "error"
+        } else {
+            "completed"
+        });
+        if let Some(duration) = phase.duration().filter(|n| n.is_finite() && *n >= 0.0) {
             metadata["native_duration_ms"] = json!(duration);
         }
-        if failed {
-            tool.row.error = Some(
-                hook.error_message
-                    .as_deref()
-                    .unwrap_or("Cursor tool failed")
-                    .into(),
-            );
-            metadata["failure_type"] = json!(hook.failure_type);
-            metadata["is_interrupt"] = json!(hook.is_interrupt);
-            if hook.failure_type.as_deref() == Some("permission_denied") {
+        if let ToolPhase::Failure(failure) = phase {
+            tool.row.error = Some(failure.error_message.clone());
+            metadata["failure_type"] = json!(failure.failure_type);
+            metadata["is_interrupt"] = json!(failure.is_interrupt);
+            if failure.failure_type == "permission_denied" {
                 metadata["tool_approval"] = json!("denied");
             }
         }
@@ -826,21 +806,14 @@ impl CursorTranslator {
         self.open_tool_order.retain(|candidate| candidate != key);
         self.tools.remove(key)
     }
-    fn specialized(
-        &mut self,
-        e: &Envelope,
-        kind: SpecializedKind,
-        common: &HookCommon,
-        hook: &SpecializedHook,
-        ops: &mut Vec<SpanOp>,
-    ) {
-        let explicit_id = common.tool_use_id.as_deref();
+    fn specialized(&mut self, e: &Envelope, hook: &Specialized, ops: &mut Vec<SpanOp>) {
+        let explicit_id = hook.tool_use_id();
         let candidates: Vec<String> = self
             .tools
             .iter()
             .chain(self.completed.iter())
             .filter_map(|(id, tool)| {
-                if !kind.accepts(&tool.row.name, hook) {
+                if !hook.accepts(&tool.row.name) {
                     return None;
                 }
                 if let Some(native) = explicit_id {
@@ -850,24 +823,7 @@ impl CursorTranslator {
                     return None;
                 }
                 let input = tool.row.input.as_ref()?;
-                let matches = match kind {
-                    SpecializedKind::Shell => hook.command.as_deref().is_some_and(|command| {
-                        input.get("command").and_then(Value::as_str) == Some(command)
-                    }),
-                    SpecializedKind::Mcp => {
-                        input == &parse_json_string(hook.tool_input.clone().unwrap_or(Value::Null))
-                    }
-                    SpecializedKind::ReadFile | SpecializedKind::FileEdit => {
-                        hook.file_path.as_deref().is_some_and(|path| {
-                            input
-                                .get("file_path")
-                                .or_else(|| input.get("path"))
-                                .and_then(Value::as_str)
-                                == Some(path)
-                        })
-                    }
-                };
-                matches.then(|| id.clone())
+                hook.matches_input(input).then(|| id.clone())
             })
             .collect();
         if candidates.len() != 1 {
@@ -880,21 +836,20 @@ impl CursorTranslator {
             .cloned()
             .or_else(|| self.completed.get(id).cloned())
             .unwrap();
-        if kind == SpecializedKind::ReadFile {
-            if let Some(content) = &hook.content {
-                copy.row.metadata.as_mut().unwrap()["pre_read_content"] = json!(content);
-                copy.row.metadata.as_mut().unwrap()["pre_read_content_source"] =
-                    json!("beforeReadFile");
-                ops.push(SpanOp::Merge(copy.row.clone()));
-                if copy.ended {
-                    self.completed.insert(id.clone(), copy);
-                } else {
-                    self.tools.insert(id.clone(), copy);
-                }
+        if let Specialized::ReadFile(read) = hook {
+            copy.row.metadata.as_mut().unwrap()["pre_read_content"] = json!(read.content);
+            copy.row.metadata.as_mut().unwrap()["pre_read_content_source"] =
+                json!("beforeReadFile");
+            ops.push(SpanOp::Merge(copy.row.clone()));
+            if copy.ended {
+                self.completed.insert(id.clone(), copy);
+            } else {
+                self.tools.insert(id.clone(), copy);
             }
             return;
         }
         if let Some(output) = hook.result() {
+            let output = &output;
             copy.row.output = Some(output.clone());
             copy.row.metadata.as_mut().unwrap()["result_source"] = json!(e.event);
             copy.row.metadata.as_mut().unwrap()["result_completeness"] =
@@ -932,15 +887,17 @@ impl CursorTranslator {
     fn transcript_batch(
         &mut self,
         e: &Envelope,
-        common: &HookCommon,
+        hook: &Hook,
         ops: &mut Vec<SpanOp>,
     ) -> anyhow::Result<bool> {
-        let Some(reference) = &common.transcript_mirror else {
+        let Some(TranscriptMirror::Captured {
+            mirror: path,
+            through,
+        }) = &hook.transcript_mirror
+        else {
             return Ok(true);
         };
-        let (Some(path), Some(through)) = (reference.mirror.as_deref(), reference.through) else {
-            return Ok(true);
-        };
+        let (path, through) = (path.as_str(), *through);
         if self.transcript.path != path {
             self.transcript = TranscriptCursor {
                 path: path.into(),
@@ -957,19 +914,19 @@ impl CursorTranslator {
         self.history.truncated |= truncated;
         for raw in records {
             let record = TranscriptRecord::decode(&raw)?;
-            let role = record.role.as_deref();
-            if role == Some("user") {
+            let role = record.role();
+            if role == Some(Role::User) {
                 self.transcript.assistant_records = 0;
                 // User ownership must be resolved again after a rewrite:
                 // a truncated view may put a later native turn at line 1.
                 self.transcript_record(&raw, &record, e.ts_ms, ops);
             } else {
-                if role == Some("assistant") {
+                if role == Some(Role::Assistant) {
                     self.transcript.assistant_records += 1;
                 }
                 let key = format!(
                     "transcript:{:?}:{}:{}:{}",
-                    role,
+                    role.map(Role::as_str),
                     self.transcript_owner.as_deref().unwrap_or("unattributed"),
                     self.transcript.assistant_records,
                     ids::span_id(&self.namespace, &raw.to_string())
@@ -989,15 +946,10 @@ impl CursorTranslator {
         ts: i64,
         ops: &mut Vec<SpanOp>,
     ) {
-        let role = record.role.as_deref().unwrap_or("");
-        let content = record
-            .message
-            .as_ref()
-            .and_then(|message| message.content.as_ref())
-            .map(MessageContent::text);
-        if role == "user" {
+        let role = record.role();
+        let content = record.text();
+        if role == Some(Role::User) {
             let Some(full_prompt) = content else {
-                self.history.truncated = true;
                 return;
             };
             self.transcript_users += 1;
@@ -1096,7 +1048,7 @@ impl CursorTranslator {
                 .prompt_owners
                 .get(&self.transcript_users)
                 .map(|(_, id)| id.clone());
-        } else if role == "assistant" {
+        } else if role == Some(Role::Assistant) {
             if self.transcript_unattributed {
                 self.history.truncated = true;
                 return;
@@ -1173,85 +1125,70 @@ impl CursorTranslator {
         ));
         ops.push(SpanOp::Merge(row));
     }
-    fn subagent(
-        &mut self,
-        e: &Envelope,
-        phase: SubagentPhase,
-        hook: &SubagentHook,
-        ops: &mut Vec<SpanOp>,
-    ) {
-        let Some(id) = hook.subagent_id.as_deref() else {
+    fn subagent_start(&mut self, e: &Envelope, hook: &SubagentStartHook, ops: &mut Vec<SpanOp>) {
+        let id = hook.subagent_id.as_str();
+        if self.subagents.contains_key(id) {
             return;
-        };
-        let failed = matches!(hook.status.as_deref(), Some("error" | "aborted"));
-        if phase == SubagentPhase::Start {
-            if self.subagents.contains_key(id) {
-                return;
-            }
-            self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
-            let spawn = hook.tool_call_id.as_deref();
-            let parent = spawn
-                .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
-                .map(|t| t.turn.clone())
-                .unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
-            let mut row = self.row(
-                ids::span_id(&self.namespace, &format!("subagent:{id}")),
-                parent,
-                "Cursor subagent",
-                SpanType::Task,
-            );
-            row.start_ms = Some(e.ts_ms);
-            row.input = hook.task.as_ref().map(|task| json!(task));
-            row.metadata = Some(
-                json!({"subagent_id":id,"spawning_tool_call_id":spawn,"model":hook.subagent_model,"subagent_type":hook.subagent_type,"recursive_activity_verified":false}),
-            );
-            if self.subagents.len() >= MAX_OPEN_TOOLS {
-                return;
-            }
-            self.subagents.insert(id.into(), row.clone());
-            ops.push(SpanOp::Insert(row));
-        } else if let Some(mut row) = self.subagents.remove(id) {
+        }
+        self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
+        let spawn = hook.tool_call_id.as_deref();
+        let parent = spawn
+            .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
+            .map(|t| t.turn.clone())
+            .unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
+        let mut row = self.row(
+            ids::span_id(&self.namespace, &format!("subagent:{id}")),
+            parent,
+            "Cursor subagent",
+            SpanType::Task,
+        );
+        row.start_ms = Some(e.ts_ms);
+        row.input = Some(json!(hook.task));
+        row.metadata = Some(
+            json!({"subagent_id":id,"spawning_tool_call_id":spawn,"model":hook.subagent_model,"subagent_type":hook.subagent_type,"recursive_activity_verified":false}),
+        );
+        if self.subagents.len() >= MAX_OPEN_TOOLS {
+            return;
+        }
+        self.subagents.insert(id.into(), row.clone());
+        ops.push(SpanOp::Insert(row));
+    }
+    fn subagent_stop(&mut self, e: &Envelope, hook: &SubagentStopHook, ops: &mut Vec<SpanOp>) {
+        let id = hook.subagent_id.as_str();
+        let error =
+            matches!(hook.status.as_str(), "error" | "aborted").then(|| hook.status.clone());
+        if let Some(mut row) = self.subagents.remove(id) {
             row.end_ms = Some(e.ts_ms.max(row.start_ms.unwrap_or(e.ts_ms)));
             row.output = hook.summary.as_ref().map(|summary| json!(summary));
             row.metadata.as_mut().unwrap()["status"] = json!(hook.status);
-            if failed {
-                row.error = hook.status.clone();
-            }
+            row.error = error;
             ops.push(SpanOp::Merge(row));
-        } else {
-            // Cursor only supports a stop hook in the shipped integration.
-            // Keep the terminal observation as a useful, zero-duration span
-            // and mark the unavailable start time explicitly.
-            self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
-            let spawn = hook.tool_call_id.as_deref();
-            let parent = spawn
-                .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
-                .map(|t| t.turn.clone())
-                .unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
-            let mut row = self.row(
-                ids::span_id(&self.namespace, &format!("subagent:{id}")),
-                parent,
-                "Cursor subagent",
-                SpanType::Task,
-            );
-            row.start_ms = Some(e.ts_ms);
-            row.end_ms = Some(e.ts_ms);
-            row.output = hook.summary.as_ref().map(|summary| json!(summary));
-            row.metadata = Some(json!({
-                "subagent_id": id,
-                "spawning_tool_call_id": spawn,
-                "model": hook.subagent_model,
-                "subagent_type": hook.subagent_type,
-                "recursive_activity_verified": false,
-                "start_time_estimated": true,
-                "result_completeness": "terminal_observation_only",
-                "status": hook.status,
-            }));
-            if failed {
-                row.error = hook.status.clone();
-            }
-            ops.push(SpanOp::Insert(row));
+            return;
         }
+        // The shipped plugin registers only the stop hook. Keep the terminal
+        // observation as a useful, zero-duration span and mark the
+        // unavailable start time explicitly.
+        self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
+        let parent = self.turn.as_ref().unwrap().id.clone();
+        let mut row = self.row(
+            ids::span_id(&self.namespace, &format!("subagent:{id}")),
+            parent,
+            "Cursor subagent",
+            SpanType::Task,
+        );
+        row.start_ms = Some(e.ts_ms);
+        row.end_ms = Some(e.ts_ms);
+        row.output = hook.summary.as_ref().map(|summary| json!(summary));
+        row.metadata = Some(json!({
+            "subagent_id": id,
+            "subagent_type": hook.subagent_type,
+            "recursive_activity_verified": false,
+            "start_time_estimated": true,
+            "result_completeness": "terminal_observation_only",
+            "status": hook.status,
+        }));
+        row.error = error;
+        ops.push(SpanOp::Insert(row));
     }
     fn turn_usage(&mut self, generation: Option<&str>, usage: &TurnUsage, ops: &mut Vec<SpanOp>) {
         // Verified interactive CLI/desktop emissions are totals for one user
@@ -1305,33 +1242,31 @@ impl CursorTranslator {
         ));
         ops.push(SpanOp::Merge(row));
     }
-    fn reduce_hook(
-        &mut self,
-        e: &Envelope,
-        common: &HookCommon,
-        hook: &CursorHook,
-        ops: &mut Vec<SpanOp>,
-    ) {
+    fn reduce_hook(&mut self, e: &Envelope, hook: &Hook, ops: &mut Vec<SpanOp>) {
         // Deduplicate on the native payload as received, without daemon fields.
         let mut native = e.payload.clone();
         if let Some(map) = native.as_object_mut() {
             map.retain(|k, _| !k.starts_with("_bt_"));
         }
-        let generation = common.generation_id.as_deref();
-        let scope = if common.tool_use_id.is_some() {
+        let generation = hook.generation_id();
+        let scope = if hook.tool_use_id().is_some() {
             "native_tool".to_string()
         } else if matches!(
-            hook,
+            hook.kind,
             CursorHook::BeforeSubmitPrompt(_)
                 | CursorHook::AfterAgentResponse(_)
                 | CursorHook::Stop(_)
+                | CursorHook::ImportStop(_)
         ) {
             generation
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("capture:{}", e.ts_ms))
         } else if matches!(
-            hook,
-            CursorHook::SessionStart | CursorHook::SessionEnd(_) | CursorHook::Specialized(..)
+            hook.kind,
+            CursorHook::SessionStart
+                | CursorHook::ImportStart(_)
+                | CursorHook::SessionEnd(_)
+                | CursorHook::Specialized(_)
         ) {
             format!("capture:{}", e.ts_ms)
         } else {
@@ -1345,25 +1280,26 @@ impl CursorTranslator {
         if !self.seen.insert(fingerprint) {
             return;
         }
-        match hook {
-            CursorHook::BeforeSubmitPrompt(prompt) => self.prompt(e, common, prompt, ops),
-            CursorHook::Tool(phase, tool) => self.tool(e, *phase, common, tool, ops),
+        match &hook.kind {
+            CursorHook::BeforeSubmitPrompt(prompt) => self.prompt(e, hook, prompt, ops),
+            CursorHook::Tool(phase, tool) => self.tool(e, hook, phase, tool, ops),
             CursorHook::AfterAgentThought(thought) => {
-                if let Some(text) = &thought.text {
-                    self.model_content(json!({"type":"thinking","text":text}), e.ts_ms, ops);
-                }
+                self.model_content(json!({"type":"thinking","text":thought.text}), e.ts_ms, ops);
             }
             CursorHook::AfterAgentResponse(response) => {
                 self.response(e, generation, response, &native, ops)
             }
             CursorHook::Stop(stop) => self.stop(e, generation, stop, &native, ops),
+            CursorHook::ImportStop(stop) => self.import_stop(e, stop, ops),
             CursorHook::SessionEnd(end) => self.session_end(e, end, ops),
-            CursorHook::Subagent(phase, subagent) => self.subagent(e, *phase, subagent, ops),
+            CursorHook::SubagentStart(start) => self.subagent_start(e, start, ops),
+            CursorHook::SubagentStop(stop) => self.subagent_stop(e, stop, ops),
             CursorHook::PreCompact => self.compact(e, native, ops),
-            CursorHook::Specialized(kind, specialized) => {
-                self.specialized(e, *kind, common, specialized, ops)
-            }
-            CursorHook::SessionStart | CursorHook::Other => {}
+            CursorHook::Specialized(specialized) => self.specialized(e, specialized, ops),
+            CursorHook::SessionStart
+            | CursorHook::ImportStart(_)
+            | CursorHook::ImportCheckpoint
+            | CursorHook::Other => {}
         }
     }
     fn response(
@@ -1379,7 +1315,7 @@ impl CursorTranslator {
             .map(|t| t.id.clone());
         if let Some(owner) = owner.filter(|id| self.turn.as_ref().is_none_or(|t| &t.id != id)) {
             let mut row = self.row(owner, self.root.clone(), "", SpanType::Task);
-            row.output = response.text.as_ref().map(|text| json!(text));
+            row.output = Some(json!(response.text));
             row.metadata = Some(
                 json!({"late_output_enrichment":true,"historical_model_grouping_available":false}),
             );
@@ -1392,23 +1328,22 @@ impl CursorTranslator {
             self.turn_usage(generation, &response.usage, ops);
             return;
         }
-        if let Some(text) = response.text.as_deref() {
-            if self
+        let text = response.text.as_str();
+        if self
+            .turn
+            .as_ref()
+            .is_none_or(|t| t.output.as_deref() != Some(text))
+        {
+            let unseen = self
                 .turn
                 .as_ref()
-                .is_none_or(|t| t.output.as_deref() != Some(text))
-            {
-                let unseen = self
-                    .turn
-                    .as_ref()
-                    .and_then(|t| text.strip_prefix(&t.emitted_text))
-                    .unwrap_or(text);
-                if !unseen.is_empty() {
-                    self.model_content(json!({"type":"text","text":unseen}), e.ts_ms, ops);
-                }
-                if let Some(t) = &mut self.turn {
-                    t.output = Some(text.into());
-                }
+                .and_then(|t| text.strip_prefix(&t.emitted_text))
+                .unwrap_or(text);
+            if !unseen.is_empty() {
+                self.model_content(json!({"type":"text","text":unseen}), e.ts_ms, ops);
+            }
+            if let Some(t) = &mut self.turn {
+                t.output = Some(text.into());
             }
         }
         self.turn_usage(generation, &response.usage, ops);
@@ -1429,19 +1364,14 @@ impl CursorTranslator {
             .filter(|t| self.turn.as_ref().is_none_or(|current| current.id != t.id))
             .cloned();
         let Some(prior) = prior else {
-            self.close_turn(
-                e.ts_ms,
-                stop.status.as_deref(),
-                stop.error_message.as_deref(),
-                ops,
-            );
+            self.close_turn(e.ts_ms, Some(&stop.status), None, ops);
             return;
         };
         let mut row = self.row(prior.id, self.root.clone(), "", SpanType::Task);
         row.end_ms = Some(e.ts_ms.max(prior.start));
         row.metadata = Some(json!({"status":stop.status}));
-        if matches!(stop.status.as_deref(), Some("error" | "aborted")) {
-            row.error = stop.status.clone();
+        if matches!(stop.status.as_str(), "error" | "aborted") {
+            row.error = Some(stop.status.clone());
         }
         row.late_merge_key = Some(format!(
             "cursor-stop:{}",
@@ -1449,10 +1379,20 @@ impl CursorTranslator {
         ));
         ops.push(SpanOp::Merge(row));
     }
+    /// An imported transcript has no generation ids, so its end closes the
+    /// active turn with the transcript's final status.
+    fn import_stop(&mut self, e: &Envelope, stop: &ImportStopHook, ops: &mut Vec<SpanOp>) {
+        self.close_turn(
+            e.ts_ms,
+            stop.status.as_deref(),
+            stop.error_message.as_deref(),
+            ops,
+        );
+    }
     fn session_end(&mut self, e: &Envelope, end: &SessionEndHook, ops: &mut Vec<SpanOp>) {
         self.close_turn(
             e.ts_ms,
-            end.reason.as_deref(),
+            Some(&end.reason),
             end.error_message.as_deref(),
             ops,
         );
@@ -1470,7 +1410,7 @@ impl CursorTranslator {
             .as_ref()
             .and_then(|t| t.output.as_ref())
             .map(|s| json!(s));
-        if end.reason.as_deref() == Some("error") {
+        if end.reason == "error" {
             row.error = Some(
                 end.error_message
                     .as_deref()
@@ -1551,12 +1491,11 @@ impl AgentTranslator for CursorTranslator {
         );
         // Decode before touching any state, so a payload in an unexpected
         // format leaves the translator where it was.
-        let common = HookCommon::decode(&e.event, &e.payload)?;
-        let hook = CursorHook::decode(&e.event, &e.payload)?;
+        let hook = Hook::decode(&e.event, &e.payload)?;
         let mut ops = Vec::new();
-        self.root(e, &common, &hook, ctx, &mut ops);
-        if self.transcript_batch(e, &common, &mut ops)? {
-            self.reduce_hook(e, &common, &hook, &mut ops);
+        self.root(e, &hook, ctx, &mut ops);
+        if self.transcript_batch(e, &hook, &mut ops)? {
+            self.reduce_hook(e, &hook, &mut ops);
         } else {
             self.pending = Some(e.clone());
         }
@@ -1568,11 +1507,10 @@ impl AgentTranslator for CursorTranslator {
             return Ok(None);
         };
         // `handle` already decoded this payload; decoding again is cheap.
-        let common = HookCommon::decode(&e.event, &e.payload)?;
-        let hook = CursorHook::decode(&e.event, &e.payload)?;
+        let hook = Hook::decode(&e.event, &e.payload)?;
         let mut ops = Vec::new();
-        if self.transcript_batch(&e, &common, &mut ops)? {
-            self.reduce_hook(&e, &common, &hook, &mut ops);
+        if self.transcript_batch(&e, &hook, &mut ops)? {
+            self.reduce_hook(&e, &hook, &mut ops);
         } else {
             self.pending = Some(e);
         }
@@ -1650,13 +1588,6 @@ fn tool_result_content(value: Option<&Value>) -> String {
         Some(value) => value.to_string(),
         None => String::new(),
     }
-}
-
-fn parse_json_string(value: Value) -> Value {
-    value
-        .as_str()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(value)
 }
 
 /// CLI saved messages wrap the submitted prompt in native timestamp/query tags.
