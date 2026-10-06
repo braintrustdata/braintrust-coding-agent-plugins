@@ -1,9 +1,10 @@
+use crate::agents::{registrar, Agent};
 use crate::wire::Envelope;
 use crate::ImportSource;
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read, Seek, Write};
+use std::io::{BufRead, Read, Seek};
 use std::path::{Path, PathBuf};
 
 mod antigravity;
@@ -13,6 +14,63 @@ mod cursor;
 mod pipeline;
 
 pub use pipeline::{import_transcript, import_transcripts, run_import};
+
+/// Importing one agent's native transcripts. Implemented in each agent's
+/// module here and registered in [`crate::agents`].
+pub(crate) trait TranscriptImport: Agent {
+    /// Directories searched for the agent's transcripts under `home`.
+    fn roots(&self, home: &Path) -> Vec<PathBuf>;
+    /// The session a transcript belongs to, if `path` is one.
+    fn transcript_session_id(&self, path: &Path) -> Option<String>;
+    /// Whether `path` is named for `session_id`.
+    fn filename_matches(&self, path: &Path, session_id: &str) -> bool;
+    /// State for following one growing transcript.
+    fn tail(&self) -> Box<dyn TailSession>;
+}
+
+/// Follows one growing transcript, turning the records read so far into
+/// synthetic hook events and emitting only those not emitted before.
+pub(crate) trait TailSession: Send {
+    /// Synthetic hook events for every record read so far.
+    fn envelopes(
+        &mut self,
+        path: &Path,
+        records: &IncrementalRecords,
+    ) -> anyhow::Result<Vec<Envelope>>;
+
+    /// The events from `events` to emit now. `finalize` ends the session.
+    fn poll(
+        &mut self,
+        events: Vec<Envelope>,
+        len: u64,
+        finalize: bool,
+    ) -> anyhow::Result<Vec<Envelope>>;
+
+    /// Whether a rewritten transcript continues with the same translator
+    /// instead of starting a new one. If so, the fresh tail that replaces this
+    /// one receives [`Self::rewritten`].
+    fn keeps_translator_on_rewrite(&self) -> bool {
+        false
+    }
+
+    /// Called on a fresh tail after a rewrite, with the records from before
+    /// and after it, when [`Self::keeps_translator_on_rewrite`] is true.
+    fn rewritten(&mut self, _previous: &[Value], _current: &[Value]) {}
+
+    /// Whether an attached import may stop at a final record that is still
+    /// being written when it shuts down.
+    fn tolerates_incomplete_final_record(&self) -> bool {
+        false
+    }
+}
+
+fn importer(source: ImportSource) -> &'static dyn TranscriptImport {
+    let name = source.identity().id;
+    registrar()
+        .import
+        .get(name)
+        .unwrap_or_else(|| panic!("no transcript import is registered for {name}"))
+}
 
 pub(crate) fn resolve_transcripts(
     session_ids: &[String],
@@ -43,12 +101,7 @@ fn transcript_roots(source: ImportSource) -> Vec<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    match source {
-        ImportSource::Codex => codex::roots(&home),
-        ImportSource::Cursor => cursor::roots(&home),
-        ImportSource::Claude => claude::roots(&home),
-        ImportSource::Antigravity => antigravity::roots(&home),
-    }
+    importer(source).roots(&home)
 }
 
 fn discover_transcripts(source: ImportSource) -> anyhow::Result<Vec<PathBuf>> {
@@ -127,12 +180,7 @@ fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
 }
 
 fn transcript_session_id(path: &Path, source: ImportSource) -> Option<String> {
-    match source {
-        ImportSource::Codex => codex::transcript_session_id(path),
-        ImportSource::Cursor => cursor::transcript_session_id(path),
-        ImportSource::Claude => claude::transcript_session_id(path),
-        ImportSource::Antigravity => antigravity::transcript_session_id(path),
-    }
+    importer(source).transcript_session_id(path)
 }
 
 fn resolve_transcript_in(
@@ -145,12 +193,11 @@ fn resolve_transcript_in(
     for root in roots {
         let mut candidates = Vec::new();
         find_jsonl_files(root, &mut candidates);
-        matches.extend(candidates.into_iter().filter(|path| match source {
-            ImportSource::Codex => codex::filename_matches(path, session_id),
-            ImportSource::Cursor => cursor::filename_matches(path, session_id),
-            ImportSource::Claude => claude::filename_matches(path, session_id),
-            ImportSource::Antigravity => antigravity::filename_matches(path, session_id),
-        }));
+        matches.extend(
+            candidates
+                .into_iter()
+                .filter(|path| importer(source).filename_matches(path, session_id)),
+        );
     }
     matches.sort();
     matches.dedup();
@@ -203,31 +250,13 @@ pub(crate) fn transcript_envelopes(
 ) -> anyhow::Result<Vec<Envelope>> {
     let mut records = IncrementalRecords::default();
     records.refresh_with_final_partial(path, true, false)?;
-    envelopes_from_records(path, source, &records)
+    importer(source).tail().envelopes(path, &records)
 }
 
-fn envelopes_from_records(
-    path: &Path,
-    source: ImportSource,
-    records: &IncrementalRecords,
-) -> anyhow::Result<Vec<Envelope>> {
-    match source {
-        ImportSource::Codex => codex::envelopes(path, &records.values),
-        ImportSource::Cursor => cursor::envelopes(path, records.read_offset, &records.values),
-        ImportSource::Claude => claude::envelopes(
-            path,
-            &records.values,
-            &records.end_offsets,
-            records.read_offset,
-        ),
-        ImportSource::Antigravity => {
-            antigravity::envelopes(path, &records.values, &records.end_offsets)
-        }
-    }
-}
-
+/// The records of a transcript read so far, re-read incrementally as it
+/// grows.
 #[derive(Default)]
-struct IncrementalRecords {
+pub(crate) struct IncrementalRecords {
     values: Vec<Value>,
     end_offsets: Vec<u64>,
     read_offset: u64,
@@ -359,34 +388,24 @@ fn read_anchor(path: &Path, through: u64, max_len: usize) -> anyhow::Result<Vec<
 /// turn/session; ordinary polls keep the newest turn open.
 pub(crate) struct TranscriptTail {
     path: PathBuf,
-    source: ImportSource,
-    state: TailState,
+    importer: &'static dyn TranscriptImport,
+    session: Box<dyn TailSession>,
     records: IncrementalRecords,
     retry_envelopes: bool,
     translator_reset: bool,
-    cursor_snapshot: Option<tempfile::TempDir>,
-    cursor_snapshot_records: usize,
     allow_incomplete_final_record: bool,
-}
-
-enum TailState {
-    Codex(codex::Tail),
-    Cursor(cursor::Tail),
-    Claude(claude::Tail),
-    Antigravity(antigravity::Tail),
 }
 
 impl TranscriptTail {
     pub(crate) fn new(path: PathBuf, source: ImportSource) -> Self {
+        let importer = importer(source);
         Self {
             path,
-            source,
-            state: Self::new_state(source),
+            importer,
+            session: importer.tail(),
             records: IncrementalRecords::default(),
             retry_envelopes: false,
             translator_reset: false,
-            cursor_snapshot: None,
-            cursor_snapshot_records: 0,
             allow_incomplete_final_record: false,
         }
     }
@@ -395,17 +414,9 @@ impl TranscriptTail {
         self.allow_incomplete_final_record = true;
     }
 
-    fn new_state(source: ImportSource) -> TailState {
-        match source {
-            ImportSource::Codex => TailState::Codex(codex::Tail::default()),
-            ImportSource::Cursor => TailState::Cursor(cursor::Tail::default()),
-            ImportSource::Claude => TailState::Claude(claude::Tail::default()),
-            ImportSource::Antigravity => TailState::Antigravity(antigravity::Tail::default()),
-        }
-    }
-
     pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
-        let previous_cursor_records = if self.source == ImportSource::Cursor {
+        let keeps_translator = self.session.keeps_translator_on_rewrite();
+        let previous_records = if keeps_translator {
             self.records.values.clone()
         } else {
             Vec::new()
@@ -413,7 +424,7 @@ impl TranscriptTail {
         let refresh = match self.records.refresh_with_final_partial(
             &self.path,
             finalize,
-            self.source == ImportSource::Cursor && self.allow_incomplete_final_record,
+            self.session.tolerates_incomplete_final_record() && self.allow_incomplete_final_record,
         ) {
             Ok(refresh) => refresh,
             Err(_) if !finalize => return Ok(Vec::new()),
@@ -423,30 +434,15 @@ impl TranscriptTail {
             return Ok(Vec::new());
         }
         if refresh == Refresh::Reset {
-            self.state = Self::new_state(self.source);
-            if self.source == ImportSource::Cursor {
-                // Keep Cursor's translator alive so its session root and turn
-                // ordinal continue across native transcript replacement.
-                // A fresh snapshot path makes it rewind only transcript input.
-                self.cursor_snapshot = None;
-                // Cursor can rewrite a transcript while retaining earlier
-                // turns. Keep those records out of the rotated snapshot so
-                // the live translator does not claim their prompts twice.
-                self.cursor_snapshot_records = self
-                    .records
-                    .values
-                    .iter()
-                    .zip(&previous_cursor_records)
-                    .take_while(|(current, previous)| current == previous)
-                    .count();
+            self.session = self.importer.tail();
+            if keeps_translator {
+                self.session
+                    .rewritten(&previous_records, &self.records.values);
             } else {
                 self.translator_reset = true;
             }
-            if self.source != ImportSource::Cursor {
-                self.cursor_snapshot_records = 0;
-            }
         }
-        let events = match self.envelopes_from_current_records(refresh == Refresh::Reset) {
+        let events = match self.session.envelopes(&self.path, &self.records) {
             Ok(events) => events,
             Err(_) if !finalize => {
                 self.retry_envelopes = true;
@@ -458,52 +454,11 @@ impl TranscriptTail {
         let len = std::fs::metadata(&self.path)
             .with_context(|| format!("read transcript metadata {}", self.path.display()))?
             .len();
-        match &mut self.state {
-            TailState::Codex(state) => state.poll(events, len, finalize),
-            TailState::Cursor(state) => state.poll(events, len, finalize),
-            TailState::Claude(state) => state.poll(events, len, finalize),
-            TailState::Antigravity(state) => state.poll(events, len, finalize),
-        }
+        self.session.poll(events, len, finalize)
     }
 
     pub(crate) fn take_translator_reset(&mut self) -> bool {
         std::mem::take(&mut self.translator_reset)
-    }
-
-    fn envelopes_from_current_records(
-        &mut self,
-        reset_snapshot: bool,
-    ) -> anyhow::Result<Vec<Envelope>> {
-        if self.source != ImportSource::Cursor {
-            return envelopes_from_records(&self.path, self.source, &self.records);
-        }
-        if self.cursor_snapshot.is_none() {
-            self.cursor_snapshot = Some(
-                tempfile::Builder::new()
-                    .prefix("bt-cursor-import-")
-                    .tempdir()?,
-            );
-        }
-        let snapshot = self
-            .cursor_snapshot
-            .as_ref()
-            .unwrap()
-            .path()
-            .join("transcript.jsonl");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(!reset_snapshot)
-            .truncate(reset_snapshot)
-            .open(&snapshot)?;
-        for record in &self.records.values[self.cursor_snapshot_records..] {
-            serde_json::to_writer(&mut file, record)?;
-            file.write_all(b"\n")?;
-        }
-        file.flush()?;
-        let through = file.metadata()?.len();
-        self.cursor_snapshot_records = self.records.values.len();
-        cursor::envelopes_with_snapshot(&self.path, &snapshot, through, &self.records.values)
     }
 }
 

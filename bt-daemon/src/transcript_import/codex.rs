@@ -1,6 +1,6 @@
 use super::{
     envelope, file_session_id, find_jsonl_files, read_jsonl_records, string_at, timestamp_bounds,
-    timestamp_ms, validate_session_id,
+    timestamp_ms, validate_session_id, IncrementalRecords, TailSession, TranscriptImport,
 };
 use crate::wire::Envelope;
 use anyhow::bail;
@@ -9,6 +9,24 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
+impl TranscriptImport for crate::agents::Codex {
+    fn roots(&self, home: &Path) -> Vec<PathBuf> {
+        roots(home)
+    }
+
+    fn transcript_session_id(&self, path: &Path) -> Option<String> {
+        transcript_session_id(path)
+    }
+
+    fn filename_matches(&self, path: &Path, session_id: &str) -> bool {
+        filename_matches(path, session_id)
+    }
+
+    fn tail(&self) -> Box<dyn TailSession> {
+        Box::new(Tail::default())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Tail {
     started: bool,
@@ -16,8 +34,16 @@ pub(super) struct Tail {
     last_len: u64,
 }
 
-impl Tail {
-    pub(super) fn poll(
+impl TailSession for Tail {
+    fn envelopes(
+        &mut self,
+        path: &Path,
+        records: &IncrementalRecords,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        envelopes(path, &records.values)
+    }
+
+    fn poll(
         &mut self,
         events: Vec<Envelope>,
         len: u64,

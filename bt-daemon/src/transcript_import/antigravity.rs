@@ -1,4 +1,4 @@
-use super::{envelope, validate_session_id};
+use super::{envelope, validate_session_id, IncrementalRecords, TailSession, TranscriptImport};
 use crate::wire::Envelope;
 use anyhow::bail;
 use serde_json::{json, Value};
@@ -7,14 +7,40 @@ use std::path::{Path, PathBuf};
 
 const TRANSCRIPT_NAME: &str = "transcript_full.jsonl";
 
+impl TranscriptImport for crate::agents::Antigravity {
+    fn roots(&self, home: &Path) -> Vec<PathBuf> {
+        roots(home)
+    }
+
+    fn transcript_session_id(&self, path: &Path) -> Option<String> {
+        transcript_session_id(path)
+    }
+
+    fn filename_matches(&self, path: &Path, session_id: &str) -> bool {
+        filename_matches(path, session_id)
+    }
+
+    fn tail(&self) -> Box<dyn TailSession> {
+        Box::new(Tail::default())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Tail {
     emitted: usize,
     stopped: bool,
 }
 
-impl Tail {
-    pub(super) fn poll(
+impl TailSession for Tail {
+    fn envelopes(
+        &mut self,
+        path: &Path,
+        records: &IncrementalRecords,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        envelopes(path, &records.values, &records.end_offsets)
+    }
+
+    fn poll(
         &mut self,
         events: Vec<Envelope>,
         _len: u64,

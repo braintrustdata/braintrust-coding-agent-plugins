@@ -1,8 +1,9 @@
-use super::{envelope, validate_session_id};
+use super::{envelope, validate_session_id, IncrementalRecords, TailSession, TranscriptImport};
 use crate::translate::cursor::{IMPORT_CHECKPOINT, IMPORT_START, IMPORT_STOP};
 use crate::wire::Envelope;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Cursor stores transcript conversations under
@@ -52,15 +53,92 @@ fn is_conversation_record(record: &Value) -> bool {
         .is_some_and(|message| message.get("content").is_some())
 }
 
+impl TranscriptImport for crate::agents::Cursor {
+    fn roots(&self, home: &Path) -> Vec<PathBuf> {
+        roots(home)
+    }
+
+    fn transcript_session_id(&self, path: &Path) -> Option<String> {
+        transcript_session_id(path)
+    }
+
+    fn filename_matches(&self, path: &Path, session_id: &str) -> bool {
+        filename_matches(path, session_id)
+    }
+
+    fn tail(&self) -> Box<dyn TailSession> {
+        Box::new(Tail::default())
+    }
+}
+
+/// Cursor rewrites its transcript between turns. The import keeps one
+/// translator across rewrites, so it reads a private snapshot that only ever
+/// grows: records that survive a rewrite are not appended again.
 #[derive(Default)]
 pub(super) struct Tail {
     started: bool,
     last_len: u64,
     stopped: bool,
+    snapshot: Option<tempfile::TempDir>,
+    snapshot_records: usize,
 }
 
-impl Tail {
-    pub(super) fn poll(
+impl TailSession for Tail {
+    fn envelopes(
+        &mut self,
+        path: &Path,
+        records: &IncrementalRecords,
+    ) -> anyhow::Result<Vec<Envelope>> {
+        if self.snapshot.is_none() {
+            self.snapshot = Some(
+                tempfile::Builder::new()
+                    .prefix("bt-cursor-import-")
+                    .tempdir()?,
+            );
+        }
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("transcript.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&snapshot)?;
+        for record in &records.values[self.snapshot_records..] {
+            serde_json::to_writer(&mut file, record)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        let through = file.metadata()?.len();
+        self.snapshot_records = records.values.len();
+        envelopes_with_snapshot(path, &snapshot, through, &records.values)
+    }
+
+    // Keep Cursor's translator alive so its session root and turn ordinal
+    // continue across native transcript replacement. A fresh snapshot path
+    // makes it rewind only transcript input.
+    fn keeps_translator_on_rewrite(&self) -> bool {
+        true
+    }
+
+    // Cursor can rewrite a transcript while retaining earlier turns. Keep
+    // those records out of the rotated snapshot so the live translator does
+    // not claim their prompts twice.
+    fn rewritten(&mut self, previous: &[Value], current: &[Value]) {
+        self.snapshot_records = current
+            .iter()
+            .zip(previous)
+            .take_while(|(current, previous)| current == previous)
+            .count();
+    }
+
+    fn tolerates_incomplete_final_record(&self) -> bool {
+        true
+    }
+
+    fn poll(
         &mut self,
         events: Vec<Envelope>,
         len: u64,
@@ -86,15 +164,7 @@ impl Tail {
     }
 }
 
-pub(super) fn envelopes(
-    path: &Path,
-    through: u64,
-    records: &[Value],
-) -> anyhow::Result<Vec<Envelope>> {
-    envelopes_with_snapshot(path, path, through, records)
-}
-
-pub(super) fn envelopes_with_snapshot(
+fn envelopes_with_snapshot(
     path: &Path,
     snapshot: &Path,
     through: u64,
