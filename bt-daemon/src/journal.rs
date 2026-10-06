@@ -288,9 +288,18 @@ impl JournalWriter {
         );
         let mut line = serde_json::to_vec(&value)?;
         line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.flush().await?;
-        self.file.sync_data().await?;
+        self.file
+            .write_all(&line)
+            .await
+            .map_err(|error| anyhow::anyhow!("write journal {}: {error}", self.path.display()))?;
+        self.file
+            .flush()
+            .await
+            .map_err(|error| anyhow::anyhow!("flush journal {}: {error}", self.path.display()))?;
+        self.file
+            .sync_data()
+            .await
+            .map_err(|error| anyhow::anyhow!("sync journal {}: {error}", self.path.display()))?;
         self.position += line.len() as u64;
         Ok(self.position)
     }
