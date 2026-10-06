@@ -19,6 +19,7 @@ required-features = ["cli"]
 [dependencies]
 # Keep this pinned exactly, matching the dependency policy used by `bt`.
 braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "019e428ab80d0da4c00dab383d4b0d1fdf4486fd" }
+base64 = "0.22"
 anyhow = "1"
 async-trait = "0.1"
 chrono = "0.4"

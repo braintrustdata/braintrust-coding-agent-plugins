@@ -19,7 +19,7 @@ on:
         description: "Plugin bundle to release. Overwrites braintrustdata/test-coding-agent-dist"
         required: true
         type: choice
-        options: [antigravity, claude, codex, grok]
+        options: [antigravity, claude, codex, cursor, grok]
 
 permissions:
   contents: write

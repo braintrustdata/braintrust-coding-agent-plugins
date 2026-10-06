@@ -3,6 +3,12 @@ allowBuilds:
   esbuild: true
   koffi: true
   protobufjs: true
+overrides:
+  "@vitest/mocker": 4.1.11
+  esbuild: 0.28.2
+  postcss: 8.5.23
+  vite: 8.0.16
+  vitest: 4.1.11
 minimumReleaseAgeExclude:
   - "@earendil-works/chord@1.0.0"
   - "@earendil-works/pi-agent-core@1.0.0"

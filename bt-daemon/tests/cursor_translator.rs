@@ -11,9 +11,22 @@ use span_identity::IdentityLedger;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// A Cursor hook envelope. Fields the CLI sends with every agent hook are
+/// filled in when the test does not set them; a test that needs a hook to
+/// share a generation with an earlier one sets `generation_id` explicitly.
 fn event(kind: &str, ts: i64, mut payload: Value) -> Envelope {
     payload["hook_event_name"] = json!(kind);
     payload["conversation_id"] = json!("test-session");
+    if !kind.starts_with("_bt_") {
+        let object = payload.as_object_mut().unwrap();
+        object
+            .entry("generation_id")
+            .or_insert_with(|| json!(format!("generation-{kind}-{ts}")));
+        object.entry("model").or_insert_with(|| json!("default"));
+        object
+            .entry("workspace_roots")
+            .or_insert_with(|| json!(["/workspace"]));
+    }
     Envelope {
         source: "cursor".into(),
         source_version: Some("2026.10.01-14929f9".into()),
@@ -216,7 +229,7 @@ fn synthetic_success_is_parented_and_duplicate_response_stop_usage_is_not_summed
     h.handle(&event(
         "postToolUse",
         130,
-        json!({"tool_name":"Read","tool_use_id":"r1","tool_output":"metadata only","duration":10}),
+        json!({"tool_name":"Read","tool_use_id":"r1","tool_input":{"file_path":"/tmp/a"},"tool_output":"metadata only","duration":10}),
     ));
     let response = event(
         "afterAgentResponse",
@@ -304,7 +317,7 @@ fn terminal_tool_hook_does_not_close_a_later_completion() {
     h.handle(&event(
         "postToolUse",
         150,
-        json!({"tool_name":"Shell","tool_use_id":"slow","tool_output":"done","duration":30}),
+        json!({"tool_name":"Shell","tool_use_id":"slow","tool_input":{"command":"sleep 1"},"tool_output":"done","duration":30}),
     ));
     assert_eq!(h.inserted(SpanType::Llm).len(), 1);
     h.handle(&event("stop", 160, json!({"status":"completed"})));
@@ -370,7 +383,7 @@ fn synthetic_denial_and_missing_tool_end_preserve_native_outcome() {
         110,
         json!({"tool_name":"Shell","tool_use_id":"denied","tool_input":{"command":"rm x"}}),
     ));
-    h.handle(&event("postToolUseFailure",120,json!({"tool_name":"Shell","tool_use_id":"denied","failure_type":"permission_denied","error_message":"Denied by policy","is_interrupt":false})));
+    h.handle(&event("postToolUseFailure",120,json!({"tool_name":"Shell","tool_use_id":"denied","tool_input":{"command":"rm x"},"failure_type":"permission_denied","error_message":"Denied by policy","is_interrupt":false,"duration":0})));
     h.handle(&event(
         "preToolUse",
         130,
@@ -418,9 +431,13 @@ fn synthetic_attached_session_preserves_external_identity_across_all_merges() {
     h.handle(&event(
         "afterAgentResponse",
         110,
-        json!({"generation_id":"t","text":"hi","cwd":"","workspace_roots":["/audit/second-workspace"]}),
+        json!({"generation_id":"t","text":"hi","model":"audit-model","workspace_roots":["/audit/second-workspace"]}),
     ));
-    h.handle(&event("sessionEnd", 120, json!({"reason":"completed"})));
+    h.handle(&event(
+        "sessionEnd",
+        120,
+        json!({"reason":"completed","final_status":"completed","model":"audit-model","workspace_roots":["/audit/second-workspace"]}),
+    ));
     h.finish();
     let root = h
         .inserted(SpanType::Task)
@@ -451,6 +468,102 @@ fn synthetic_attached_session_preserves_external_identity_across_all_merges() {
         .unwrap()
         .contains("private-token"));
 }
+
+#[test]
+fn imported_session_root_marks_its_start_timestamp_as_estimated() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "_bt_importStart",
+        100,
+        json!({"start_time_estimated":true}),
+    ));
+    let root = h
+        .inserted(SpanType::Task)
+        .into_iter()
+        .find(|row| row.name == "Cursor session")
+        .unwrap();
+    assert_eq!(
+        root.metadata.as_ref().unwrap()["start_time_estimated"],
+        true
+    );
+}
+
+#[test]
+fn imported_terminal_error_message_is_preserved_on_the_turn_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            json!({"role":"user","message":{"content":[{"type":"text","text":"hello"}]}})
+        ),
+    )
+    .unwrap();
+    let through = std::fs::metadata(&transcript).unwrap().len();
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "_bt_importStart",
+        100,
+        json!({"start_time_estimated":true}),
+    ));
+    h.handle(&mirrored(
+        "_bt_importCheckpoint",
+        110,
+        &transcript,
+        through,
+        json!({}),
+    ));
+    h.handle(&mirrored(
+        "_bt_importStop",
+        120,
+        &transcript,
+        through,
+        json!({"status":"error","error_message":"WritableIterable is closed"}),
+    ));
+    let turn = h.turns().into_iter().next().unwrap();
+    assert_eq!(
+        h.rows()[&turn.span_id]["error"],
+        "WritableIterable is closed"
+    );
+}
+
+#[test]
+fn transcript_replacement_keeps_turn_span_ids_monotonic() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_path = temp.path().join("first-snapshot.jsonl");
+    let next_path = temp.path().join("replacement-snapshot.jsonl");
+    let first = "{\"role\":\"user\",\"message\":{\"content\":\"first prompt\"}}\n{\"role\":\"assistant\",\"message\":{\"content\":\"first answer\"}}\n";
+    let next = "{\"role\":\"user\",\"message\":{\"content\":\"second prompt\"}}\n{\"role\":\"assistant\",\"message\":{\"content\":\"second answer\"}}\n";
+    std::fs::write(&first_path, first).unwrap();
+    std::fs::write(&next_path, next).unwrap();
+
+    let mut h = Harness::new("test-session");
+    h.handle(&event("sessionStart", 100, json!({})));
+    h.handle(&mirrored(
+        "ImportCheckpoint",
+        110,
+        &first_path,
+        first.len() as u64,
+        json!({}),
+    ));
+    let first_turn = h.turns().into_iter().next().unwrap().span_id.clone();
+    h.handle(&mirrored(
+        "ImportCheckpoint",
+        120,
+        &next_path,
+        next.len() as u64,
+        json!({}),
+    ));
+
+    let turns = h.turns();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].name, "Turn 1");
+    assert_eq!(turns[0].span_id, first_turn);
+    assert_eq!(turns[1].name, "Turn 2");
+    assert_ne!(turns[0].span_id, turns[1].span_id);
+}
+
 fn mirrored(kind: &str, ts: i64, path: &Path, through: u64, payload: Value) -> Envelope {
     let mut e = event(kind, ts, payload);
     e.payload["_bt_transcript_mirror"] = json!({"mirror":path,"through":through});
@@ -489,7 +602,7 @@ fn synthetic_transcript_partial_records_and_large_batches_are_bounded_and_option
     h.handle(&event(
         "sessionEnd",
         120,
-        json!({"reason":"completed","transcript_path":"/unavailable"}),
+        json!({"reason":"completed","final_status":"completed","transcript_path":"/unavailable"}),
     ));
     h.finish();
     assert_eq!(h.turns().len(), 1);
@@ -581,7 +694,7 @@ fn synthetic_delayed_transcript_after_closed_native_turn_does_not_create_phantom
         130,
         &path,
         std::fs::metadata(&path).unwrap().len(),
-        json!({"reason":"completed"}),
+        json!({"reason":"completed","final_status":"completed"}),
     ));
     h.finish();
     assert_eq!(
@@ -626,7 +739,7 @@ fn synthetic_late_tool_completion_retains_old_turn_and_does_not_split_new_model(
     h.handle(&event(
         "postToolUse",
         150,
-        json!({"tool_name":"Shell","tool_use_id":"late","tool_output":"old result"}),
+        json!({"tool_name":"Shell","tool_use_id":"late","tool_input":{"command":"slow"},"tool_output":"old result","duration":0}),
     ));
     h.handle(&event(
         "afterAgentResponse",
@@ -846,7 +959,7 @@ fn synthetic_specialized_native_call_id_wins_over_ambiguous_arguments() {
     h.handle(&event(
         "postToolUse",
         140,
-        json!({"tool_name":"Shell","tool_use_id":"shell-1","tool_output":"generic metadata"}),
+        json!({"tool_name":"Shell","tool_use_id":"shell-1","tool_input":{"command":"pwd"},"tool_output":"generic metadata","duration":0}),
     ));
     h.finish();
     let target = h
@@ -949,14 +1062,13 @@ fn synthetic_subagents_parent_to_spawning_turn_and_unmatched_stop_stays_incomple
     h.handle(&event(
         "subagentStop",
         140,
-        json!({"subagent_id":"child-a","status":"completed","summary":"available summary"}),
+        json!({"subagent_id":"child-a","subagent_type":"explore","status":"completed","summary":"available summary"}),
     ));
     h.handle(&event(
-        "subagentStop",
-        150,
-        json!({"status":"completed","summary":"unmatched summary"}),
+        "sessionEnd",
+        160,
+        json!({"reason":"completed","final_status":"completed"}),
     ));
-    h.handle(&event("sessionEnd", 160, json!({"reason":"completed"})));
     h.finish();
     let children: Vec<_> = h
         .inserted(SpanType::Task)
@@ -990,6 +1102,44 @@ fn synthetic_subagents_parent_to_spawning_turn_and_unmatched_stop_stays_incomple
         rows[&h.inserted(SpanType::Tool)[0].span_id]["metadata"]["status"],
         "incomplete"
     );
+}
+
+#[test]
+fn terminal_only_subagent_stop_synthesizes_estimated_span() {
+    let mut h = Harness::new("test-session");
+    h.handle(&event(
+        "beforeSubmitPrompt",
+        100,
+        json!({"generation_id":"t","prompt":"delegate"}),
+    ));
+    h.handle(&event(
+        "subagentStop",
+        140,
+        json!({
+            "subagent_id":"child-terminal-only",
+            "status":"completed",
+            "summary":"finished work",
+            "subagent_type":"explore"
+        }),
+    ));
+    h.finish();
+
+    let child = h
+        .inserted(SpanType::Task)
+        .into_iter()
+        .find(|row| row.name == "Cursor subagent")
+        .unwrap();
+    assert_eq!(child.start_ms, Some(140));
+    assert_eq!(child.end_ms, Some(140));
+    assert_eq!(child.output, Some(json!("finished work")));
+    let metadata = child.metadata.as_ref().unwrap();
+    assert_eq!(metadata["start_time_estimated"], true);
+    assert_eq!(metadata["result_completeness"], "terminal_observation_only");
+    assert_eq!(metadata["status"], "completed");
+    assert_eq!(metadata["subagent_type"], "explore");
+    // subagentStop does not report the subagent's model.
+    assert!(metadata.get("model").is_none());
+    assert_eq!(child.parent_span_ids, vec![h.turns()[0].span_id.clone()]);
 }
 #[test]
 fn synthetic_compaction_is_observation_only_and_clears_unavailable_context() {
@@ -1112,7 +1262,7 @@ fn synthetic_late_old_turn_response_cannot_end_current_turn_model() {
     h.handle(&event(
         "postToolUse",
         146,
-        json!({"generation_id":"t2","tool_name":"Read","tool_use_id":"r1","tool_output":"file content"}),
+        json!({"generation_id":"t2","tool_name":"Read","tool_use_id":"r1","tool_input":{"file_path":"/tmp/a"},"tool_output":"file content","duration":0}),
     ));
     h.handle(&event(
         "afterAgentResponse",
@@ -1479,7 +1629,7 @@ fn synthetic_truncated_mirror_after_stop_maps_its_first_user_record_to_native_tu
         140,
         &mirror,
         second.len() as u64,
-        json!({"reason":"completed"}),
+        json!({"reason":"completed","final_status":"completed"}),
     ));
     h.finish();
     assert_eq!(
@@ -1522,7 +1672,7 @@ fn ambiguous_rewritten_prompt_does_not_overwrite_either_identical_native_turn() 
         300,
         &mirror,
         transcript.len() as u64,
-        json!({"reason":"completed"}),
+        json!({"reason":"completed","final_status":"completed"}),
     ));
     h.finish();
     let rows = h.rows();
@@ -1575,7 +1725,7 @@ fn synthetic_rewrite_removing_terminal_marker_does_not_reemit_shifted_assistant_
         140,
         &rewritten_mirror,
         rewritten.len() as u64,
-        json!({"reason":"completed"}),
+        json!({"reason":"completed","final_status":"completed"}),
     ));
     h.finish();
     assert_eq!(h.turns().len(), 2);
@@ -1610,7 +1760,7 @@ fn synthetic_partial_usage_merges_known_counts_without_inventing_missing_values(
         110,
         json!({
             "generation_id":"t", "text":"hello", "input_tokens":20,
-            "cache_read_tokens":7, "cache_write_tokens":-1
+            "cache_read_tokens":7, "model":"composer-2.5"
         }),
     ));
     let id = h.turns()[0].span_id.clone();
@@ -1624,8 +1774,8 @@ fn synthetic_partial_usage_merges_known_counts_without_inventing_missing_values(
         "stop",
         120,
         json!({
-            "generation_id":"t", "status":"completed", "input_tokens":-2,
-            "output_tokens":4
+            "generation_id":"t", "status":"completed", "output_tokens":4,
+            "model":"composer-2.5"
         }),
     );
     h.handle(&stop);
@@ -1645,7 +1795,7 @@ fn synthetic_partial_usage_merges_known_counts_without_inventing_missing_values(
 }
 
 #[test]
-fn synthetic_missing_tool_result_does_not_invent_an_empty_model_input_message() {
+fn synthetic_failed_tool_without_result_does_not_invent_an_empty_model_input_message() {
     let mut h = Harness::new("test-session");
     h.handle(&event(
         "beforeSubmitPrompt",
@@ -1662,9 +1812,13 @@ fn synthetic_missing_tool_result_does_not_invent_an_empty_model_input_message() 
         }),
     ));
     h.handle(&event(
-        "postToolUse",
+        "postToolUseFailure",
         120,
-        json!({"tool_use_id":"r", "tool_name":"Read"}),
+        json!({
+            "tool_use_id":"r", "tool_name":"Read", "tool_input":{"file_path":"/tmp/a"},
+            "error_message":"read failed", "failure_type":"error", "is_interrupt":false,
+            "duration":5
+        }),
     ));
     h.handle(&event(
         "afterAgentResponse",
@@ -1679,5 +1833,77 @@ fn synthetic_missing_tool_result_does_not_invent_an_empty_model_input_message() 
     assert_eq!(
         llms[1].metadata.as_ref().unwrap()["history_truncated"],
         true
+    );
+}
+
+#[test]
+fn malformed_hooks_fail_the_event_instead_of_dropping_fields() {
+    let ctx = SessionCtx {
+        session_id: "test-session".into(),
+        config: None,
+    };
+    for (kind, payload) in [
+        (
+            "afterAgentResponse",
+            json!({"generation_id":"t", "text":"hello", "input_tokens":-1}),
+        ),
+        (
+            "preToolUse",
+            json!({"tool_name":5, "tool_use_id":"call-1", "tool_input":{}}),
+        ),
+        ("stop", json!({"status":{"code":"completed"}})),
+        ("sessionStart", json!({"workspace_roots":"/not/a/list"})),
+        // Fields the CLI always sends are required.
+        ("beforeSubmitPrompt", json!({})),
+        ("preToolUse", json!({"tool_name":"Shell", "tool_input":{}})),
+        ("sessionEnd", json!({"reason":"completed"})),
+        (
+            "subagentStop",
+            json!({"subagent_type":"explore", "status":"completed"}),
+        ),
+    ] {
+        let mut translator = Registry::default_agents().create("cursor", "test-session");
+        let error = translator
+            .handle(&event(kind, 100, payload), &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!("unexpected cursor {kind} hook format")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn unexpected_transcript_record_types_fail_the_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        format!("{}\n", json!({"role":"user","message":{"content":42}})),
+    )
+    .unwrap();
+    let through = std::fs::metadata(&transcript).unwrap().len();
+    let ctx = SessionCtx {
+        session_id: "test-session".into(),
+        config: None,
+    };
+    let mut translator = Registry::default_agents().create("cursor", "test-session");
+    let error = translator
+        .handle(
+            &mirrored(
+                "beforeSubmitPrompt",
+                100,
+                &transcript,
+                through,
+                json!({"prompt":"hi"}),
+            ),
+            &ctx,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("unexpected cursor transcript record format"),
+        "{error}"
     );
 }

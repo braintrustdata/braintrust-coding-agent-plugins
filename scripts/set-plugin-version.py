@@ -19,6 +19,7 @@ MANIFEST_GLOBS = {
     "claude": "src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json",
     "codex": "src/plugins/codex/content/plugins/*/.codex-plugin/plugin.json",
     "grok": "src/plugins/grok/content/.grok-plugin/plugin.json",
+    "cursor": "src/plugins/cursor/content/.cursor-plugin/plugin.json",
 }
 
 VERSION_RE = re.compile(r'("version"\s*:\s*")[^"]*(")')

@@ -5,14 +5,15 @@
 //! behavior, setup, managed runs, imports, and output contracts stay here with
 //! the coding-agent integrations.
 
+use crate::route::{apply_additional_metadata, apply_tags, resolve_span_plugin_paths};
 use crate::trace_command::{DoctorAgent, DoctorArgs, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
-    apply_additional_metadata, apply_tags, braintrust_serve_options, paths, run_disable,
-    run_enable, run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthDiagnostic,
-    AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, DaemonDiagnostic,
-    DaemonStatus, DoctorCommandOutput, HostInfo, OutputFormat, Registry, RunHookCommand,
-    ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
+    braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
+    run_traced, shutdown_daemon, AuthDiagnostic, AuthLease, AuthProvider, AuthResolveReason,
+    BraintrustSinkConfig, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, HostInfo,
+    OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
+    TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -300,9 +301,23 @@ fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Res
 }
 
 fn plugin_activation_warning(agent: DoctorAgent, enabled: bool) -> Option<&'static str> {
-    (agent == DoctorAgent::Grok && enabled).then_some(
-        "Grok 1.0.13 requires `/reload-plugins` in each active session after plugin installation or update before its hooks become active",
-    )
+    if !enabled {
+        return None;
+    }
+    match agent {
+        DoctorAgent::Grok => Some(
+            "Grok 1.0.13 requires `/reload-plugins` in each active session after plugin installation or update before its hooks become active",
+        ),
+        DoctorAgent::Cursor
+            if !crate::setup::cursor::plugin_is_installed_at(&crate::paths::cursor_plugin_dir())
+                || !crate::setup::cursor::discovery_hooks_are_installed_at(
+                    &crate::paths::cursor_config_dir(),
+                ) =>
+        {
+            Some("Cursor tracing plugin or lifecycle hooks are missing; run `bt trace enable cursor`")
+        }
+        _ => None,
+    }
 }
 
 /// Bounds `doctor`'s status query to the running daemon.
@@ -333,7 +348,10 @@ async fn diagnose_daemon(
         Err(error) if crate::client::daemon_absent(&error) => return DaemonDiagnostic::default(),
         Err(error) => return unreachable(format!("{}: {error}", socket.display())),
     };
-    let status = tokio::time::timeout(DAEMON_PROBE_TIMEOUT, crate::status_over(stream, None));
+    let status = tokio::time::timeout(
+        DAEMON_PROBE_TIMEOUT,
+        crate::client::status_over(stream, None),
+    );
     let auth = async {
         match selection {
             Some(selection) => Some(diagnose_daemon_auth(socket, selection).await),
@@ -631,7 +649,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             apply_additional_metadata(&mut route, enable_args.additional_metadata.as_deref())?;
             apply_tags(&mut route, &enable_args.tags)?;
             if !enable_args.plugin.is_empty() {
-                route.span_plugins = crate::resolve_span_plugin_paths(&enable_args.plugin)?;
+                route.span_plugins = resolve_span_plugin_paths(&enable_args.plugin)?;
             }
             print_output(run_enable(enable_args, route)?, host.output_format)
         }
@@ -646,7 +664,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             run_serve(serve_args, serve_options(&host)).await
         }
         TraceCommand::Hook(hook_args) => {
-            if crate::suppress_inherited_hook(&hook_args) {
+            if crate::hook::suppress_inherited_hook(&hook_args) {
                 return Ok(());
             }
             let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
@@ -719,12 +737,12 @@ async fn run_hook_command(
     if !settings.tracing_enabled() {
         return Ok(());
     }
-    crate::with_hook_capture_timeout(hook_args.capture_timeout_ms, async {
+    crate::hook::with_hook_capture_timeout(hook_args.capture_timeout_ms, async {
         let route = match settings.route {
             Some(route) => route,
             None => resolve_host_route(host, RouteRequirements::default()).await?,
         };
-        crate::run_hook_with_route(hook_args, route, host_info(host)).await
+        crate::hook::run_hook_with_route(hook_args, route, host_info(host)).await
     })
     .await
 }
@@ -1502,7 +1520,9 @@ mod tests {
         );
         assert_eq!(
             daemon_warnings(DoctorAgent::Codex, &shell, &offline, false),
-            ["the running tracing daemon cannot authenticate, so it rejects Codex events: failed to call login endpoint"]
+            [
+                "the running tracing daemon cannot authenticate, so it rejects Codex events: failed to call login endpoint"
+            ]
         );
     }
 
