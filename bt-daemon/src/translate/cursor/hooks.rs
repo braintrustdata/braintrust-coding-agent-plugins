@@ -7,8 +7,10 @@
 //! fails the event with a [`DecodeError`]. Only fields Cursor omits in some
 //! cases are optional. Fields the translator does not read are not modelled.
 //!
-//! Transcript import synthesizes its own `importStart`, `importCheckpoint`
-//! and `importStop` events, which carry only what a saved transcript records.
+//! Transcript import synthesizes its own `_bt_importStart`,
+//! `_bt_importCheckpoint` and `_bt_importStop` events, which carry only what a
+//! saved transcript records. The `_bt_` prefix is the daemon's reserved
+//! namespace, so these names cannot collide with a native Cursor hook.
 
 use crate::translate::decode::{decode, DecodeError};
 use serde::{Deserialize, Serialize};
@@ -178,9 +180,9 @@ impl CursorHook {
     }
 }
 
-pub(crate) const IMPORT_START: &str = "importStart";
-pub(crate) const IMPORT_CHECKPOINT: &str = "importCheckpoint";
-pub(crate) const IMPORT_STOP: &str = "importStop";
+pub(crate) const IMPORT_START: &str = "_bt_importStart";
+pub(crate) const IMPORT_CHECKPOINT: &str = "_bt_importCheckpoint";
+pub(crate) const IMPORT_STOP: &str = "_bt_importStop";
 
 #[derive(Deserialize)]
 pub(super) struct PromptHook {

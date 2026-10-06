@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 fn event(kind: &str, ts: i64, mut payload: Value) -> Envelope {
     payload["hook_event_name"] = json!(kind);
     payload["conversation_id"] = json!("test-session");
-    if !kind.starts_with("import") {
+    if !kind.starts_with("_bt_") {
         let object = payload.as_object_mut().unwrap();
         object
             .entry("generation_id")
@@ -473,7 +473,7 @@ fn synthetic_attached_session_preserves_external_identity_across_all_merges() {
 fn imported_session_root_marks_its_start_timestamp_as_estimated() {
     let mut h = Harness::new("test-session");
     h.handle(&event(
-        "importStart",
+        "_bt_importStart",
         100,
         json!({"start_time_estimated":true}),
     ));
@@ -503,19 +503,19 @@ fn imported_terminal_error_message_is_preserved_on_the_turn_span() {
     let through = std::fs::metadata(&transcript).unwrap().len();
     let mut h = Harness::new("test-session");
     h.handle(&event(
-        "importStart",
+        "_bt_importStart",
         100,
         json!({"start_time_estimated":true}),
     ));
     h.handle(&mirrored(
-        "importCheckpoint",
+        "_bt_importCheckpoint",
         110,
         &transcript,
         through,
         json!({}),
     ));
     h.handle(&mirrored(
-        "importStop",
+        "_bt_importStop",
         120,
         &transcript,
         through,
