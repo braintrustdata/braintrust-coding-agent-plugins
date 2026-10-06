@@ -13,7 +13,7 @@ the Braintrust VS Code extension for Cursor.
 - A [Braintrust account](https://braintrust.dev)
 - Cursor with the CLI or desktop app
 - The [Braintrust CLI](https://www.braintrust.dev/docs/reference/cli/quickstart)
-- `BRAINTRUST_API_KEY` in Cursor's environment to use the MCP server
+- A Braintrust API key to use the MCP server
 
 ## Install from Cursor Marketplace
 
@@ -22,13 +22,13 @@ Use `/add-plugin` in Cursor and search for **Braintrust**, or install from the
 Braintrust MCP server and tracing hooks. For tracing, install and authenticate
 the `bt` CLI, then run `bt trace enable cursor --project my-coding-agent`.
 
-The Braintrust MCP server uses `https://api.braintrust.dev/mcp` and reads
-`BRAINTRUST_API_KEY` from Cursor's environment. Restart Cursor after setting
-the variable. MCP access and tracing use separate authentication: `bt login`
-authenticates the tracing CLI.
+The Braintrust MCP server uses `https://api.braintrust.dev/mcp`. Configure its
+`BRAINTRUST_API_KEY` variable in Cursor's plugin settings. MCP access and tracing
+use separate authentication: `bt login` authenticates the tracing CLI.
 
 The existing VS Code extension remains available from Cursor's extension
-panel. It registers the same MCP server through Cursor's extension API. If
+panel. It reads `BRAINTRUST_API_KEY` from Cursor's environment and registers
+the same MCP server through Cursor's extension API. If
 both the extension and plugin are installed, each attempts to register a
 server named `braintrust`; use one MCP installation to avoid duplicates.
 
@@ -54,7 +54,7 @@ Cursor must allow local plugin imports. Reload the Cursor window after setup so
 the plugin is active.
 
 Use `--profile` or `--org` to select a different Braintrust account or
-organization. To use MCP, set `BRAINTRUST_API_KEY` before starting Cursor.
+organization. To use MCP, configure `BRAINTRUST_API_KEY` in Cursor's plugin settings.
 
 ## Data handling
 

@@ -24,6 +24,8 @@ assert manifest['mcpServers'] == 'mcp.json'
 assert manifest['logo'] == 'logo.svg'
 assert manifest['repository'] == 'https://github.com/braintrustdata/braintrust-cursor-extension'
 assert manifest['license'] == 'MIT'
+assert manifest['variables']['properties']['BRAINTRUST_API_KEY']['type'] == 'string'
+assert manifest['variables']['required'] == ['BRAINTRUST_API_KEY']
 package = json.loads((root / 'package.json').read_text())
 lock = json.loads((root / 'package-lock.json').read_text())
 assert package['version'] == manifest['version']
@@ -35,7 +37,7 @@ assert package['repository']['url'] == manifest['repository']
 mcp = json.loads((root / 'mcp.json').read_text())
 assert mcp['mcpServers']['braintrust'] == {
     'url': 'https://api.braintrust.dev/mcp',
-    'headers': {'Authorization': 'Bearer ${env:BRAINTRUST_API_KEY}'},
+    'headers': {'Authorization': 'Bearer ${BRAINTRUST_API_KEY}'},
 }
 assert 'MIT License' in (root / 'LICENSE').read_text()
 config = json.loads((root / manifest['hooks']).read_text())

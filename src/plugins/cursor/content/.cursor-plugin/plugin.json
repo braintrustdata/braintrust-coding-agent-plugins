@@ -10,5 +10,16 @@
   "keywords": ["braintrust", "mcp", "ai", "evaluation", "experiments", "observability", "logs", "tracing"],
   "logo": "logo.svg",
   "hooks": "hooks/hooks.json",
-  "mcpServers": "mcp.json"
+  "mcpServers": "mcp.json",
+  "variables": {
+    "type": "object",
+    "properties": {
+      "BRAINTRUST_API_KEY": {
+        "type": "string",
+        "title": "Braintrust API key",
+        "description": "API key for the Braintrust MCP server"
+      }
+    },
+    "required": ["BRAINTRUST_API_KEY"]
+  }
 }
