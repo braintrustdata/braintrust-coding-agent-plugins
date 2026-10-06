@@ -18,6 +18,7 @@ impl Agent for OpenCode {
 
 impl Register for OpenCode {
     fn register(self: Arc<Self>, registrar: &mut Registrar) {
-        registrar.setup.insert(self);
+        registrar.setup.insert(self.clone());
+        registrar.run.insert(self);
     }
 }

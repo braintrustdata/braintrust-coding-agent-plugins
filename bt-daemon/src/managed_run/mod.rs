@@ -5,23 +5,58 @@ mod claude;
 mod codex;
 mod cursor;
 mod opencode;
+mod pi;
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::args::{RunArgs, RunHookCommand, RunSource};
+use crate::agents::{registrar, Agent};
+use crate::args::{RunArgs, RunHookCommand};
 use crate::client::{flush_managed_run_in, shutdown_daemon};
 use crate::hook::MANAGED_RUN_ID_ENV;
 use crate::route::resolve_span_plugin_paths;
 use crate::wire::{self, SessionRoute};
 use crate::{paths, settings, subprocess};
-use claude::claude_managed_run_args;
-use codex::codex_managed_run_args;
-use cursor::{cursor_run_requires_interactive, write_cursor_managed_plugin};
-use opencode::opencode_managed_config;
 
 const MANAGED_RUN_FLUSH_TIMEOUT_MS: u64 = 10_000;
+
+/// The agent-specific parts of a managed run. Implemented in each agent's
+/// module here and registered in [`crate::agents`].
+pub(crate) trait ManagedRun: Agent {
+    /// The environment variable that overrides the agent executable, and the
+    /// executable used otherwise.
+    fn executable(&self) -> (&'static str, &'static str);
+
+    /// Reject agent arguments or stdio that cannot produce a complete trace.
+    fn check(&self, _agent_args: &[OsString], _terminal: Terminal) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Inject hooks for this invocation that call `hook_command`.
+    fn inject(
+        &self,
+        hook_command: &RunHookCommand,
+        managed_run_id: &str,
+    ) -> anyhow::Result<Injection>;
+}
+
+/// Whether the managed run's stdin and stdout are terminals.
+#[derive(Clone, Copy)]
+pub(crate) struct Terminal {
+    pub stdin: bool,
+    pub stdout: bool,
+}
+
+/// What an agent adds to its managed invocation.
+#[derive(Default)]
+pub(crate) struct Injection {
+    /// Arguments placed before the user's agent arguments.
+    pub args: Vec<OsString>,
+    pub env: Vec<(&'static str, String)>,
+    /// Kept alive until the agent exits, then dropped in order to clean up.
+    pub guards: Vec<Box<dyn Send>>,
+}
 
 /// Launch a coding agent with inherited stdio and inject Braintrust hooks for
 /// this invocation, without requiring the tracing plugin to be installed or
@@ -32,57 +67,28 @@ pub async fn run_traced(
     mut route: SessionRoute,
 ) -> anyhow::Result<std::process::ExitStatus> {
     apply_run_span_plugins(&mut route, &args.plugin)?;
-    if args.source == RunSource::Cursor
-        && cursor_run_requires_interactive(
-            &args.agent_args,
-            std::io::stdin().is_terminal(),
-            std::io::stdout().is_terminal(),
-        )
-    {
-        anyhow::bail!(
-            "bt trace run cursor requires an interactive terminal for complete lifecycle tracing; Cursor print mode is inferred for non-terminal stdio and does not emit the required prompt, response, and stop hooks"
-        );
-    }
+    let name = args.source.identity().id;
+    let agent = registrar()
+        .run
+        .get(name)
+        .unwrap_or_else(|| panic!("no managed run is registered for {name}"));
+    agent.check(
+        &args.agent_args,
+        Terminal {
+            stdin: std::io::stdin().is_terminal(),
+            stdout: std::io::stdout().is_terminal(),
+        },
+    )?;
     if route.destination.is_none() {
         anyhow::bail!(
             "managed run requires a trace destination; select a project, object destination, or parent span"
         );
     }
-    if args.source == RunSource::Codex
-        && args.agent_args.iter().any(|arg| {
-            let arg = arg.to_string_lossy();
-            arg == "--dangerously-bypass-hook-trust"
-                || arg.starts_with("--dangerously-bypass-hook-trust=")
-        })
-    {
-        anyhow::bail!(
-            "bt trace run codex cannot be combined with --dangerously-bypass-hook-trust; managed tracing preserves Codex hook trust. Remove the flag, or run Codex directly"
-        );
-    }
-    let (executable_env, default_executable) = match args.source {
-        RunSource::Codex => ("CODEX_BIN", "codex"),
-        RunSource::Cursor => ("CURSOR_BIN", "agent"),
-        RunSource::Claude => ("CLAUDE_BIN", "claude"),
-        RunSource::OpenCode => ("OPENCODE_BIN", "opencode"),
-        RunSource::Pi => ("PI_BIN", "pi"),
-    };
+    let (executable_env, default_executable) = agent.executable();
     let executable =
         std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
-    let cursor_plugin = if args.source == RunSource::Cursor {
-        let directory = tempfile::Builder::new()
-            .prefix("bt-trace-cursor-plugin-")
-            .tempdir()?;
-        write_cursor_managed_plugin(directory.path(), &hook_command)?;
-        Some(directory)
-    } else {
-        None
-    };
-    let injected_args = managed_run_args(
-        args.source,
-        &hook_command,
-        cursor_plugin.as_ref().map(tempfile::TempDir::path),
-    )?;
     let managed_run_id = uuid::Uuid::new_v4().to_string();
+    let injection = agent.inject(&hook_command, &managed_run_id)?;
     // A caller-supplied socket is already an explicit daemon boundary (for
     // example an integration harness or a deliberately isolated runtime).
     // Only create our own boundary when environment auth would otherwise use
@@ -95,7 +101,7 @@ pub async fn run_traced(
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut command: tokio::process::Command = subprocess::interactive_command(&executable).into();
     command
-        .args(injected_args)
+        .args(injection.args)
         .args(args.agent_args)
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
@@ -105,24 +111,8 @@ pub async fn run_traced(
             .env(paths::SOCKET_ENV, &runtime.socket)
             .env(paths::DATA_DIR_ENV, runtime.temp_dir.path());
     }
-    if args.source == RunSource::OpenCode {
-        command.env(
-            "OPENCODE_CONFIG_CONTENT",
-            opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?,
-        );
-    }
-    // Cursor's CLI only discovers the plugin lifecycle callbacks when these
-    // events exist in user/project hook configuration. Keep temporary no-op
-    // discovery entries for this process and remove only our own entries when
-    // the managed run exits.
-    let _cursor_hooks = if args.source == RunSource::Cursor {
-        Some(crate::setup::cursor::CursorManagedHooks::install(
-            &paths::cursor_config_dir(),
-            &managed_run_id,
-        )?)
-    } else {
-        None
-    };
+    command.envs(injection.env);
+    let _guards = injection.guards;
     let mut child = command.spawn().map_err(|error| {
         anyhow::anyhow!("failed to launch {}: {error}", executable.to_string_lossy())
     })?;
@@ -206,38 +196,6 @@ fn apply_run_span_plugins(route: &mut SessionRoute, plugins: &[PathBuf]) -> anyh
     Ok(())
 }
 
-fn managed_run_args(
-    source: RunSource,
-    hook_command: &RunHookCommand,
-    cursor_plugin_dir: Option<&std::path::Path>,
-) -> anyhow::Result<Vec<OsString>> {
-    match source {
-        RunSource::Codex => {
-            let unix_command = managed_hook_shell_command(hook_command, "codex", false)?;
-            let windows_command = managed_hook_shell_command(hook_command, "codex", true)?;
-            Ok(codex_managed_run_args(&unix_command, &windows_command))
-        }
-        RunSource::Claude => claude_managed_run_args(hook_command),
-        RunSource::Cursor => {
-            let directory = cursor_plugin_dir.ok_or_else(|| {
-                anyhow::anyhow!("managed Cursor run requires an invocation-local plugin directory")
-            })?;
-            Ok(vec![
-                OsString::from("--plugin-dir"),
-                directory.as_os_str().to_owned(),
-            ])
-        }
-        RunSource::OpenCode => Ok(Vec::new()),
-        RunSource::Pi => {
-            let extension = match std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC") {
-                Some(extension) => extension,
-                None => OsString::from(crate::setup::pi::plugin_spec()),
-            };
-            Ok(vec![OsString::from("-e"), extension])
-        }
-    }
-}
-
 pub(super) fn managed_hook_shell_command(
     hook_command: &RunHookCommand,
     source: &str,
@@ -274,8 +232,23 @@ pub(super) fn quote_windows_command_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::codex::CODEX_RUN_HOOK_EVENTS;
-    use super::cursor::cursor_hook_events;
     use super::*;
+    use crate::agents::{Codex, Pi};
+    use crate::args::RunSource;
+
+    #[test]
+    fn every_run_source_has_a_registered_managed_run() {
+        for source in [
+            RunSource::Codex,
+            RunSource::Cursor,
+            RunSource::Claude,
+            RunSource::OpenCode,
+            RunSource::Pi,
+        ] {
+            let agent = registrar().run.get(source.identity().id).unwrap();
+            assert_eq!(agent.identity().id, source.identity().id);
+        }
+    }
 
     #[test]
     fn managed_run_plugins_replace_inherited_plugins() {
@@ -349,7 +322,7 @@ mod tests {
 
     #[test]
     fn codex_managed_run_injects_live_hooks() {
-        let args = managed_run_args(RunSource::Codex, &test_run_hook_command(), None).unwrap();
+        let args = Codex.inject(&test_run_hook_command(), "run").unwrap().args;
         assert_eq!(args[0], "--enable");
         assert_eq!(args[1], "hooks");
         assert!(!args
@@ -375,80 +348,9 @@ mod tests {
     }
 
     #[test]
-    fn cursor_managed_run_injects_an_invocation_local_plugin() {
-        let temp = tempfile::tempdir().unwrap();
-        let plugin = temp.path().join("plugin with spaces – ü");
-        std::fs::create_dir(&plugin).unwrap();
-        let hook = RunHookCommand {
-            program: OsString::from("/opt/Braintrust CLI/日本語/bt"),
-            args: vec![OsString::from("trace"), OsString::from("hook")],
-        };
-        write_cursor_managed_plugin(&plugin, &hook).unwrap();
-        let args = managed_run_args(RunSource::Cursor, &hook, Some(&plugin)).unwrap();
-        assert_eq!(
-            args,
-            [OsString::from("--plugin-dir"), plugin.as_os_str().into()]
-        );
-
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(plugin.join("hooks/hooks.json")).unwrap())
-                .unwrap();
-        let plugin_manifest: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(plugin.join(".cursor-plugin/plugin.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(plugin_manifest["hooks"], "hooks/hooks.json");
-        for event in cursor_hook_events().unwrap() {
-            let entry = &manifest["hooks"][event][0];
-            assert_eq!(entry["failClosed"], false);
-            let launcher = if cfg!(windows) {
-                "trace.ps1"
-            } else {
-                "trace.sh"
-            };
-            assert!(entry["command"].as_str().unwrap().contains(launcher));
-        }
-        if cfg!(windows) {
-            let script = std::fs::read_to_string(plugin.join("hooks/trace.ps1")).unwrap();
-            assert!(script.contains("'--source'"));
-            assert!(script.contains("'cursor'"));
-            assert!(script.contains("'--managed-run-hook'"));
-            assert!(script.contains("'--session-id-field'"));
-            assert!(script.contains("'conversation_id'"));
-            assert!(!script.contains("permission\":\"allow"));
-            assert!(script.contains("{\"continue\":true}"));
-            assert!(!script.contains("--dangerously-bypass"));
-        } else {
-            let script = std::fs::read_to_string(plugin.join("hooks/trace.sh")).unwrap();
-            assert!(script.contains("'--source' 'cursor' '--managed-run-hook'"));
-            assert!(script.contains("'--session-id-field' 'conversation_id'"));
-            assert!(!script.contains("\"permission\":\"allow\""));
-            assert!(script.contains("\"continue\":true"));
-            assert!(!script.contains("--dangerously-bypass"));
-        }
-    }
-
-    #[test]
-    fn opencode_managed_run_preserves_inline_config_and_adds_plugin() {
-        let config =
-            opencode_managed_config(Some(r#"{"model":"test/model","plugin":["other"]}"#)).unwrap();
-        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
-        assert_eq!(config["model"], "test/model");
-        assert_eq!(
-            config["plugin"],
-            serde_json::json!(["other", "@braintrust/trace-opencode/tracing"])
-        );
-        assert!(
-            managed_run_args(RunSource::OpenCode, &test_run_hook_command(), None)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn pi_managed_run_loads_the_npm_extension() {
         assert_eq!(
-            managed_run_args(RunSource::Pi, &test_run_hook_command(), None).unwrap(),
+            Pi.inject(&test_run_hook_command(), "run").unwrap().args,
             vec![
                 OsString::from("-e"),
                 OsString::from(crate::setup::pi::plugin_spec()),

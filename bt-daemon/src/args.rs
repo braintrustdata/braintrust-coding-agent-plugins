@@ -206,6 +206,18 @@ impl ImportSource {
     }
 }
 
+impl RunSource {
+    pub(crate) fn identity(self) -> &'static Identity {
+        match self {
+            Self::Codex => agents::Codex.identity(),
+            Self::Cursor => agents::Cursor.identity(),
+            Self::Claude => agents::Claude.identity(),
+            Self::OpenCode => agents::OpenCode.identity(),
+            Self::Pi => agents::Pi.identity(),
+        }
+    }
+}
+
 impl From<ParentObjectType> for SpanObjectType {
     fn from(value: ParentObjectType) -> Self {
         match value {
