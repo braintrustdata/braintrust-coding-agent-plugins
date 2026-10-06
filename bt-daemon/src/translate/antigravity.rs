@@ -20,10 +20,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 impl TranslatorFactory for crate::agents::Antigravity {
-    fn source(&self) -> &str {
-        crate::agents::Agent::identity(self).source
-    }
-
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(AntigravityTranslator::new(
             session_id,

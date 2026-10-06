@@ -27,10 +27,6 @@ const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: u64 = 2 * 1024 * 1024;
 
 impl TranslatorFactory for crate::agents::Grok {
-    fn source(&self) -> &str {
-        crate::agents::Agent::identity(self).source
-    }
-
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(GrokTranslator::new(session_id, GitMetadataCache::shared()))
     }

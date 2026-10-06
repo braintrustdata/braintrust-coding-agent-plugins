@@ -18,9 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 impl TranslatorFactory for crate::agents::Pi {
-    fn source(&self) -> &str {
-        crate::agents::Agent::identity(self).source
-    }
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(PiTranslator {
             session_id: session_id.into(),

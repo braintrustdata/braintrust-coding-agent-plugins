@@ -109,9 +109,6 @@ fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
 }
 
 impl TranslatorFactory for crate::agents::Codex {
-    fn source(&self) -> &str {
-        crate::agents::Agent::identity(self).source
-    }
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         let root_span_id = ids::span_id(session_id, "root");
         Box::new(CodexTranslator {

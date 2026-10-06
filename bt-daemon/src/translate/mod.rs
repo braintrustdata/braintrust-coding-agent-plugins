@@ -21,7 +21,7 @@ pub(crate) use pi::request_config as pi_request_config;
 mod recent;
 mod tool;
 
-pub use debug::DebugTranslatorFactory;
+use debug::DebugTranslatorFactory;
 
 use crate::agents::{registrar, Agent};
 use crate::wire::{Envelope, SessionConfig};
@@ -146,17 +146,12 @@ pub trait AgentTranslator: Send {
     }
 }
 
-/// An agent that is its own [`TranslatorFactory`]. Each agent implements the
-/// factory in its translator module and registers itself in
-/// [`crate::agents`]; this only joins the two traits so the registry can look
-/// agents up by name.
-pub(crate) trait Translate: Agent + TranslatorFactory {}
-
-impl<T: Agent + TranslatorFactory> Translate for T {}
-
-/// Builds translator instances for a given `source`.
-pub trait TranslatorFactory: Send + Sync {
-    fn source(&self) -> &str;
+/// Builds translator instances for an agent's hook source. Each agent type
+/// implements this in its translator module and registers itself in
+/// [`crate::agents`]; the source is the agent's [`Identity::source`].
+///
+/// [`Identity::source`]: crate::agents::Identity::source
+pub(crate) trait TranslatorFactory: Agent {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator>;
 }
 
@@ -180,19 +175,16 @@ impl Registry {
         let mut r = Registry {
             factories: HashMap::new(),
         };
-        r.register(Box::new(DebugTranslatorFactory));
+        r.insert(Arc::new(DebugTranslatorFactory));
         for agent in registrar().translate.shared() {
             r.insert(agent.clone());
         }
         r
     }
 
-    pub fn register(&mut self, factory: Box<dyn TranslatorFactory>) {
-        self.insert(factory.into());
-    }
-
     fn insert(&mut self, factory: Arc<dyn TranslatorFactory>) {
-        self.factories.insert(factory.source().to_string(), factory);
+        self.factories
+            .insert(factory.identity().source.to_string(), factory);
     }
 
     /// Known sources, for the `initialize` capabilities list.
@@ -204,8 +196,7 @@ impl Registry {
 
     /// Resolve daemon source aliases to one stable identity.
     pub fn canonical_source<'a>(&'a self, source: &'a str) -> Option<&'a str> {
-        // Only agent sources and the debug translator are accepted, even if a
-        // host registered a factory under another name.
+        // Only agent sources and the debug translator are accepted.
         let canonical = match registrar().translate.get(source) {
             Some(agent) => agent.identity().source,
             None if source == "debug" => "debug",

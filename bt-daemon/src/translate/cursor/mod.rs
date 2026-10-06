@@ -63,9 +63,6 @@ const CURSOR_METADATA_FIELDS: &[&str] = &[
 ];
 
 impl TranslatorFactory for crate::agents::Cursor {
-    fn source(&self) -> &str {
-        crate::agents::Agent::identity(self).source
-    }
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(CursorTranslator::new(
             session_id,

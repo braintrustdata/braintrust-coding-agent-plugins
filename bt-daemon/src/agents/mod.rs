@@ -23,7 +23,7 @@ pub(crate) use pi::Pi;
 
 use crate::managed_run::ManagedRun;
 use crate::setup::Setup;
-use crate::translate::Translate;
+use crate::translate::TranslatorFactory;
 use std::sync::{Arc, OnceLock};
 
 /// The names an agent is known by.
@@ -84,7 +84,7 @@ impl<T: ?Sized + Agent> Agents<T> {
 pub(crate) struct Registrar {
     pub setup: Agents<dyn Setup>,
     pub run: Agents<dyn ManagedRun>,
-    pub translate: Agents<dyn Translate>,
+    pub translate: Agents<dyn TranslatorFactory>,
 }
 
 pub(crate) trait Register {

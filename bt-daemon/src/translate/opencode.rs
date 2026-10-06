@@ -17,10 +17,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 impl TranslatorFactory for crate::agents::OpenCode {
-    fn source(&self) -> &str {
-        crate::agents::Agent::identity(self).source
-    }
-
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(OpenCodeTranslator {
             daemon_session_id: session_id.to_string(),
