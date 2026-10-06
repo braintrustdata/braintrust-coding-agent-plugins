@@ -1,6 +1,7 @@
 use super::{
     envelope, file_session_id, find_jsonl_files, read_jsonl_records, string_at, timestamp_bounds,
     timestamp_ms, validate_session_id, IncrementalRecords, TailSession, TranscriptImport,
+    TranscriptLayout,
 };
 use crate::wire::Envelope;
 use anyhow::bail;
@@ -10,16 +11,12 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 impl TranscriptImport for crate::agents::Codex {
-    fn roots(&self, home: &Path) -> Vec<PathBuf> {
-        roots(home)
+    fn discover(&self, home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        layout(roots(home)).discover()
     }
 
-    fn transcript_session_id(&self, path: &Path) -> Option<String> {
-        transcript_session_id(path)
-    }
-
-    fn filename_matches(&self, path: &Path, session_id: &str) -> bool {
-        filename_matches(path, session_id)
+    fn find(&self, home: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
+        layout(roots(home)).find(session_id)
     }
 
     fn tail(&self) -> Box<dyn TailSession> {
@@ -90,7 +87,7 @@ impl TailSession for Tail {
     }
 }
 
-pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
+fn transcript_session_id(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
@@ -111,7 +108,17 @@ pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
     None
 }
 
-pub(super) fn roots(home: &Path) -> Vec<PathBuf> {
+/// The transcript layout under these roots.
+pub(super) fn layout(roots: Vec<PathBuf>) -> TranscriptLayout {
+    TranscriptLayout {
+        display_name: crate::agents::Agent::identity(&crate::agents::Codex).display_name,
+        roots,
+        session_id: transcript_session_id,
+        filename_matches,
+    }
+}
+
+fn roots(home: &Path) -> Vec<PathBuf> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
@@ -121,7 +128,7 @@ pub(super) fn roots(home: &Path) -> Vec<PathBuf> {
     ]
 }
 
-pub(super) fn filename_matches(path: &Path, session_id: &str) -> bool {
+fn filename_matches(path: &Path, session_id: &str) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))

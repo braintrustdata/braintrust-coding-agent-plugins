@@ -1,4 +1,7 @@
-use super::{envelope, validate_session_id, IncrementalRecords, TailSession, TranscriptImport};
+use super::{
+    envelope, validate_session_id, IncrementalRecords, TailSession, TranscriptImport,
+    TranscriptLayout,
+};
 use crate::translate::cursor::{IMPORT_CHECKPOINT, IMPORT_START, IMPORT_STOP};
 use crate::wire::Envelope;
 use anyhow::{bail, Context};
@@ -9,11 +12,21 @@ use std::path::{Path, PathBuf};
 /// Cursor stores transcript conversations under
 /// ~/.cursor/projects/<workspace>/agent-transcripts/<id>/<id>.jsonl.
 /// The directory and filename are the only session identity in this format.
-pub(super) fn roots(home: &Path) -> Vec<PathBuf> {
+/// The transcript layout under these roots.
+pub(super) fn layout(roots: Vec<PathBuf>) -> TranscriptLayout {
+    TranscriptLayout {
+        display_name: crate::agents::Agent::identity(&crate::agents::Cursor).display_name,
+        roots,
+        session_id: transcript_session_id,
+        filename_matches,
+    }
+}
+
+fn roots(home: &Path) -> Vec<PathBuf> {
     vec![home.join(".cursor/projects")]
 }
 
-pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
+fn transcript_session_id(path: &Path) -> Option<String> {
     let session_id = path.file_stem()?.to_str()?;
     // Cursor writes child agent transcripts with an `agent-` identifier.
     // They do not carry a recoverable parent tool-call link, so they are not
@@ -25,7 +38,7 @@ pub(super) fn transcript_session_id(path: &Path) -> Option<String> {
     filename_matches(path, session_id).then(|| session_id.to_owned())
 }
 
-pub(super) fn filename_matches(path: &Path, session_id: &str) -> bool {
+fn filename_matches(path: &Path, session_id: &str) -> bool {
     !session_id.starts_with("agent-")
         && validate_session_id(session_id).is_ok()
         && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
@@ -54,16 +67,12 @@ fn is_conversation_record(record: &Value) -> bool {
 }
 
 impl TranscriptImport for crate::agents::Cursor {
-    fn roots(&self, home: &Path) -> Vec<PathBuf> {
-        roots(home)
+    fn discover(&self, home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        layout(roots(home)).discover()
     }
 
-    fn transcript_session_id(&self, path: &Path) -> Option<String> {
-        transcript_session_id(path)
-    }
-
-    fn filename_matches(&self, path: &Path, session_id: &str) -> bool {
-        filename_matches(path, session_id)
+    fn find(&self, home: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
+        layout(roots(home)).find(session_id)
     }
 
     fn tail(&self) -> Box<dyn TailSession> {

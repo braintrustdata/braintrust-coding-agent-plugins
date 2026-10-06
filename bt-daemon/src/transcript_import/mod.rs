@@ -18,14 +18,24 @@ pub use pipeline::{import_transcript, import_transcripts, run_import};
 /// Importing one agent's native transcripts. Implemented in each agent's
 /// module here and registered in [`crate::agents`].
 pub(crate) trait TranscriptImport: Agent {
-    /// Directories searched for the agent's transcripts under `home`.
-    fn roots(&self, home: &Path) -> Vec<PathBuf>;
-    /// The session a transcript belongs to, if `path` is one.
-    fn transcript_session_id(&self, path: &Path) -> Option<String>;
-    /// Whether `path` is named for `session_id`.
-    fn filename_matches(&self, path: &Path, session_id: &str) -> bool;
+    /// Every session transcript the agent has saved under `home`.
+    fn discover(&self, home: &Path) -> anyhow::Result<Vec<PathBuf>>;
+    /// The saved transcript for one session under `home`.
+    fn find(&self, home: &Path, session_id: &str) -> anyhow::Result<PathBuf>;
     /// State for following one growing transcript.
     fn tail(&self) -> Box<dyn TailSession>;
+}
+
+/// Where an agent saves its transcripts and how they are named. Each agent
+/// builds one privately; this holds the search shared by all of them.
+pub(super) struct TranscriptLayout {
+    pub display_name: &'static str,
+    /// Directories searched recursively for `.jsonl` transcripts.
+    pub roots: Vec<PathBuf>,
+    /// The session a transcript belongs to, if the path is one.
+    pub session_id: fn(&Path) -> Option<String>,
+    /// Whether a path is named for a session id.
+    pub filename_matches: fn(&Path, &str) -> bool,
 }
 
 /// Follows one growing transcript, turning the records read so far into
@@ -77,86 +87,94 @@ pub(crate) fn resolve_transcripts(
     all: bool,
     source: ImportSource,
 ) -> anyhow::Result<Vec<PathBuf>> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let importer = importer(source);
     match (all, session_ids.is_empty()) {
-        (true, true) => discover_transcripts(source),
+        (true, true) => importer.discover(&home),
         (false, false) => session_ids
             .iter()
-            .map(|session_id| resolve_transcript(session_id, source))
+            .map(|session_id| importer.find(&home, session_id))
             .collect(),
         (true, false) => bail!("--all cannot be combined with explicit session ids"),
         (false, true) => bail!("provide at least one session id or use --all"),
     }
 }
 
-pub(crate) fn resolve_transcript(
-    session_id: &str,
-    source: ImportSource,
-) -> anyhow::Result<PathBuf> {
-    validate_session_id(session_id)?;
-    resolve_transcript_in(session_id, source, &transcript_roots(source))
-}
-
-fn transcript_roots(source: ImportSource) -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    importer(source).roots(&home)
-}
-
-fn discover_transcripts(source: ImportSource) -> anyhow::Result<Vec<PathBuf>> {
-    let roots = transcript_roots(source);
-    discover_transcripts_in(source, &roots)
-}
-
-fn discover_transcripts_in(
-    source: ImportSource,
-    roots: &[PathBuf],
-) -> anyhow::Result<Vec<PathBuf>> {
-    let mut candidates = Vec::new();
-    for root in roots {
-        find_jsonl_files(root, &mut candidates);
-    }
-    candidates.sort();
-    candidates.dedup();
-
-    let mut sessions = BTreeMap::<String, Vec<PathBuf>>::new();
-    for path in candidates {
-        let Some(session_id) = transcript_session_id(&path, source) else {
-            continue;
-        };
-        sessions.entry(session_id).or_default().push(path);
-    }
-    if sessions.is_empty() {
-        let locations = roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "no {} transcripts found; searched {locations}",
-            source_name(source)
-        );
+impl TranscriptLayout {
+    /// One transcript per session found under the roots, in path order.
+    pub fn discover(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut sessions = BTreeMap::<String, Vec<PathBuf>>::new();
+        for path in self.candidates() {
+            if let Some(session_id) = (self.session_id)(&path) {
+                sessions.entry(session_id).or_default().push(path);
+            }
+        }
+        if sessions.is_empty() {
+            bail!(
+                "no {} transcripts found; searched {}",
+                self.display_name,
+                self.locations()
+            );
+        }
+        sessions
+            .into_iter()
+            .map(|(session_id, paths)| self.single(&session_id, paths))
+            .collect()
     }
 
-    let mut resolved = Vec::with_capacity(sessions.len());
-    for (session_id, paths) in sessions {
-        match paths.as_slice() {
-            [path] => resolved.push(path.clone()),
-            paths => {
-                let locations = paths
+    /// The one transcript named for `session_id`.
+    pub fn find(&self, session_id: &str) -> anyhow::Result<PathBuf> {
+        validate_session_id(session_id)?;
+        let matches: Vec<_> = self
+            .candidates()
+            .into_iter()
+            .filter(|path| (self.filename_matches)(path, session_id))
+            .collect();
+        if matches.is_empty() {
+            bail!(
+                "no {} transcript found for session {session_id}; searched {}",
+                self.display_name,
+                self.locations()
+            );
+        }
+        self.single(session_id, matches)
+    }
+
+    fn candidates(&self) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        for root in &self.roots {
+            find_jsonl_files(root, &mut candidates);
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    fn single(&self, session_id: &str, paths: Vec<PathBuf>) -> anyhow::Result<PathBuf> {
+        match <[PathBuf; 1]>::try_from(paths) {
+            Ok([path]) => Ok(path),
+            Err(paths) => bail!(
+                "multiple {} transcripts found for session {session_id}: {}",
+                self.display_name,
+                paths
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
-                    .join(", ");
-                bail!(
-                    "multiple {} transcripts found for session {session_id}: {locations}",
-                    source_name(source)
-                );
-            }
+                    .join(", ")
+            ),
         }
     }
-    Ok(resolved)
+
+    fn locations(&self) -> String {
+        self.roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
@@ -179,55 +197,6 @@ fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
     }
 }
 
-fn transcript_session_id(path: &Path, source: ImportSource) -> Option<String> {
-    importer(source).transcript_session_id(path)
-}
-
-fn resolve_transcript_in(
-    session_id: &str,
-    source: ImportSource,
-    roots: &[PathBuf],
-) -> anyhow::Result<PathBuf> {
-    validate_session_id(session_id)?;
-    let mut matches = Vec::new();
-    for root in roots {
-        let mut candidates = Vec::new();
-        find_jsonl_files(root, &mut candidates);
-        matches.extend(
-            candidates
-                .into_iter()
-                .filter(|path| importer(source).filename_matches(path, session_id)),
-        );
-    }
-    matches.sort();
-    matches.dedup();
-    match matches.as_slice() {
-        [path] => Ok(path.clone()),
-        [] => {
-            let locations = roots
-                .iter()
-                .map(|root| root.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "no {} transcript found for session {session_id}; searched {locations}",
-                source_name(source)
-            )
-        }
-        paths => {
-            let locations = paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "multiple {} transcripts found for session {session_id}: {locations}",
-                source_name(source)
-            )
-        }
-    }
-}
-
 fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
     if session_id.is_empty()
         || !session_id
@@ -237,10 +206,6 @@ fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
         bail!("invalid session id {session_id:?}");
     }
     Ok(())
-}
-
-fn source_name(source: ImportSource) -> &'static str {
-    source.identity().display_name
 }
 
 #[cfg(test)]
@@ -565,7 +530,7 @@ mod tests {
         std::fs::write(&transcript, "{}\n").unwrap();
 
         assert_eq!(
-            resolve_transcript_in("session-123", ImportSource::Codex, &[root]).unwrap(),
+            codex::layout(vec![root]).find("session-123").unwrap(),
             transcript
         );
     }
@@ -581,7 +546,7 @@ mod tests {
         std::fs::write(&transcript, "{}\n").unwrap();
 
         assert_eq!(
-            resolve_transcript_in("session-123", ImportSource::Claude, &[root]).unwrap(),
+            claude::layout(vec![root]).find("session-123").unwrap(),
             transcript
         );
     }
@@ -602,7 +567,9 @@ mod tests {
         std::fs::write(unrelated, "{}\n").unwrap();
 
         assert_eq!(
-            resolve_transcript_in("conversation-123", ImportSource::Antigravity, &[root]).unwrap(),
+            antigravity::layout(vec![root])
+                .find("conversation-123")
+                .unwrap(),
             transcript
         );
     }
@@ -623,16 +590,13 @@ mod tests {
         std::fs::write(&subagent, "{}\n").unwrap();
 
         assert_eq!(
-            resolve_transcript_in(
-                "session-123",
-                ImportSource::Cursor,
-                std::slice::from_ref(&root)
-            )
-            .unwrap(),
+            cursor::layout(vec![root.clone()])
+                .find("session-123")
+                .unwrap(),
             transcript
         );
         assert_eq!(
-            discover_transcripts_in(ImportSource::Cursor, &[root]).unwrap(),
+            cursor::layout(vec![root]).discover().unwrap(),
             vec![transcript]
         );
     }
@@ -846,12 +810,9 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_session_ids() {
-        let error = resolve_transcript_in(
-            "../session",
-            ImportSource::Codex,
-            &[PathBuf::from("unused")],
-        )
-        .unwrap_err();
+        let error = codex::layout(vec![PathBuf::from("unused")])
+            .find("../session")
+            .unwrap_err();
         assert!(error.to_string().contains("invalid session id"));
     }
 
@@ -863,18 +824,16 @@ mod tests {
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
 
-        let missing = resolve_transcript_in(
-            "missing",
-            ImportSource::Claude,
-            &[first.clone(), second.clone()],
-        )
-        .unwrap_err();
+        let missing = claude::layout(vec![first.clone(), second.clone()])
+            .find("missing")
+            .unwrap_err();
         assert!(missing.to_string().contains("no Claude Code transcript"));
 
         std::fs::write(first.join("duplicate.jsonl"), "{}\n").unwrap();
         std::fs::write(second.join("duplicate.jsonl"), "{}\n").unwrap();
-        let ambiguous =
-            resolve_transcript_in("duplicate", ImportSource::Claude, &[first, second]).unwrap_err();
+        let ambiguous = claude::layout(vec![first, second])
+            .find("duplicate")
+            .unwrap_err();
         assert!(ambiguous
             .to_string()
             .contains("multiple Claude Code transcripts"));
@@ -907,7 +866,7 @@ mod tests {
         std::fs::write(root.join("not-a-transcript.jsonl"), "{}\n").unwrap();
 
         assert_eq!(
-            discover_transcripts_in(ImportSource::Codex, &[root]).unwrap(),
+            codex::layout(vec![root]).discover().unwrap(),
             vec![first, second]
         );
     }
@@ -933,7 +892,7 @@ mod tests {
         std::fs::write(project.join("notes.jsonl"), "{}\n").unwrap();
 
         assert_eq!(
-            discover_transcripts_in(ImportSource::Claude, &[root]).unwrap(),
+            claude::layout(vec![root]).discover().unwrap(),
             vec![transcript]
         );
     }
