@@ -168,6 +168,7 @@ jobs:
         if: ${{ inputs.record }}
         env:
           GH_TOKEN: ${{ github.token }}
+          PLUGIN: ${{ inputs.plugin }}
           TAG: ${{ steps.vars.outputs.tag }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
@@ -186,9 +187,18 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Monorepo release $TAG already exists; resuming."
           else
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --generate-notes
+            if notes_start_tag="$(git describe --tags --abbrev=0 --match "v[0-9]*-$PLUGIN" "$SOURCE_SHA^" 2>/dev/null)"; then
+              echo "Generating $TAG notes from the previous $PLUGIN release $notes_start_tag."
+              gh release create "$TAG" \
+                --title "$TAG" \
+                --generate-notes \
+                --notes-start-tag "$notes_start_tag"
+            else
+              echo "No previous $PLUGIN release tag found; recording this as the initial plugin release."
+              gh release create "$TAG" \
+                --title "$TAG" \
+                --notes "Initial release of the $PLUGIN plugin."
+            fi
           fi
 
       - name: Deploy to distribution repo
