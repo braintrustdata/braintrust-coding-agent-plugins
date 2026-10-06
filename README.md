@@ -28,7 +28,7 @@ All six support `bt trace enable`, `update`, `disable`, and `doctor`.
 | [Google Antigravity](src/plugins/antigravity/content/README.md) | `antigravity` | — | Yes | [GitHub](https://github.com/braintrustdata/braintrust-antigravity-plugin) |
 | [Claude Code](src/plugins/claude/content/README.md) | `claude` | Yes | Yes | [GitHub](https://github.com/braintrustdata/braintrust-claude-plugin) |
 | [Codex](src/plugins/codex/content/README.md) | `codex` | Yes | Yes | [GitHub](https://github.com/braintrustdata/braintrust-codex-plugin) |
-| [Cursor](src/plugins/cursor/content/README.md) | `cursor` | Yes | Yes, transcript-limited | [GitHub](https://github.com/braintrustdata/braintrust-cursor-plugin) |
+| [Cursor](src/plugins/cursor/content/README.md) | `cursor` | Yes | Yes, transcript-limited | [GitHub](https://github.com/braintrustdata/braintrust-cursor-extension) |
 | [Grok](src/plugins/grok/content/README.md) | `grok` | — | — | [GitHub](https://github.com/braintrustdata/braintrust-grok-plugin) |
 | [OpenCode](src/plugins/opencode/content/README.md) | `opencode` | Yes | — | [npm](https://www.npmjs.com/package/@braintrust/trace-opencode) |
 | [Pi](src/plugins/pi/content/README.md) | `pi` | Yes | — | [npm](https://www.npmjs.com/package/@braintrust/pi-extension) |

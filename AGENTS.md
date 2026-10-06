@@ -65,7 +65,7 @@ is unversioned.
 | antigravity | `braintrustdata/braintrust-antigravity-plugin` |
 | claude | `braintrustdata/braintrust-claude-plugin` |
 | codex | `braintrustdata/braintrust-codex-plugin` |
-| cursor | `braintrustdata/braintrust-cursor-plugin` |
+| cursor | `braintrustdata/braintrust-cursor-extension` |
 | grok | `braintrustdata/braintrust-grok-plugin` |
 
 A distribution repository is a generated artifact. Each deploy clones it,

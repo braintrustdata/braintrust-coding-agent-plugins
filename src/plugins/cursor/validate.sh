@@ -5,7 +5,7 @@ TARGET_DIR="${1:?usage: validate.sh <TARGET_DIR>}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fail() { echo "validate: $*" >&2; exit 1; }
 
-for file in .cursor-plugin/plugin.json hooks/hooks.json README.md LICENSE; do
+for file in .cursor-plugin/plugin.json hooks/hooks.json mcp.json logo.svg icon.png package.json package-lock.json tsconfig.json src/extension.ts README.md LICENSE; do
   [[ -f "$TARGET_DIR/$file" ]] || fail "missing $file"
 done
 
@@ -17,10 +17,27 @@ import sys
 
 root = Path(sys.argv[1])
 manifest = json.loads((root / '.cursor-plugin/plugin.json').read_text())
-assert manifest['name'] == 'trace-cursor'
+assert manifest['name'] == 'braintrust'
 assert re.fullmatch(r'\d+\.\d+\.\d+', manifest['version'])
 assert manifest['hooks'] == 'hooks/hooks.json'
-assert 'mcpServers' not in manifest and not (root / 'mcp.json').exists()
+assert manifest['mcpServers'] == 'mcp.json'
+assert manifest['logo'] == 'logo.svg'
+assert manifest['repository'] == 'https://github.com/braintrustdata/braintrust-cursor-extension'
+assert manifest['license'] == 'MIT'
+package = json.loads((root / 'package.json').read_text())
+lock = json.loads((root / 'package-lock.json').read_text())
+assert package['version'] == manifest['version']
+assert lock['version'] == manifest['version']
+assert lock['packages']['']['version'] == manifest['version']
+assert package['main'] == './out/extension.js'
+assert package['license'] == manifest['license']
+assert package['repository']['url'] == manifest['repository']
+mcp = json.loads((root / 'mcp.json').read_text())
+assert mcp['mcpServers']['braintrust'] == {
+    'url': 'https://api.braintrust.dev/mcp',
+    'headers': {'Authorization': 'Bearer ${env:BRAINTRUST_API_KEY}'},
+}
+assert 'MIT License' in (root / 'LICENSE').read_text()
 config = json.loads((root / manifest['hooks']).read_text())
 assert config['version'] == 1
 expected = {
@@ -36,7 +53,6 @@ for event, registrations in config['hooks'].items():
         'timeout': 10,
         'failClosed': False,
     }]
-assert 'Apache License' in (root / 'LICENSE').read_text()
 PY
 
 "$SRC_DIR/test/test_capture.sh" "$TARGET_DIR"

@@ -93,8 +93,9 @@ jobs:
           import json, pathlib, sys
           root = pathlib.Path(sys.argv[1])
           manifest = json.loads((root / '.cursor-plugin/plugin.json').read_text())
-          assert manifest['name'] == 'trace-cursor', manifest
+          assert manifest['name'] == 'braintrust', manifest
           assert (root / 'hooks/hooks.json').is_file()
+          assert (root / 'mcp.json').is_file()
           PY
           mkdir -p "${RUNNER_TEMP}/cursor-smoke/.cursor"
           cat > "${RUNNER_TEMP}/cursor-smoke/.cursor/hooks.json" <<'JSON'
