@@ -10,6 +10,9 @@ mod antigravity;
 mod claude;
 mod codex;
 mod cursor;
+mod pipeline;
+
+pub use pipeline::{import_transcript, import_transcripts, run_import};
 
 pub(crate) fn resolve_transcripts(
     session_ids: &[String],

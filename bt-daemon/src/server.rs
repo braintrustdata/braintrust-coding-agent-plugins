@@ -4,7 +4,7 @@
 
 use crate::dispatch::{hydrate_transcript_reference, ReplayPlan, Session, SessionOptions};
 use crate::journal::{self, JournalWriter};
-use crate::sink::SinkFactory;
+use crate::sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, SinkFactory};
 use crate::translate::Registry;
 use crate::transport::{self, Listener, ServerStream};
 use crate::wire::{
@@ -2093,7 +2093,7 @@ async fn accept_resolved_event(daemon: &Arc<Daemon>, event: PendingEvent) -> Res
             payload.insert("_bt_transcript_replay".to_string(), serde_json::json!(true));
         }
     }
-    let schedule_flush = crate::should_flush_ingress_event(&env)
+    let schedule_flush = crate::hook::should_flush_ingress_event(&env)
         || (env.source == "claude-code" && env.event == "TranscriptUpdate");
     let source = env.source.clone();
     let event = env.event.clone();
@@ -2382,7 +2382,7 @@ fn client_may_shutdown(client: Option<&ClientInfo>, daemon_version: &str) -> boo
     let Some(client_version) = client.daemon_version.as_deref() else {
         return false; // Legacy initialized hooks must not downgrade the daemon.
     };
-    crate::compare_daemon_versions(client_version, daemon_version)
+    crate::client::compare_daemon_versions(client_version, daemon_version)
         .is_none_or(|ordering| !ordering.is_lt())
 }
 
@@ -2619,6 +2619,41 @@ async fn probe_alive(endpoint: &std::path::Path) -> bool {
         tokio::time::timeout(Duration::from_secs(1), lines.next_line()).await,
         Ok(Ok(Some(_)))
     )
+}
+
+/// Run the daemon until shutdown.
+pub async fn run_serve(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
+    run(args, opts).await
+}
+
+/// Build debug [`ServeOptions`]: the production translator registry plus a
+/// debug sink writing NDJSON under `<data_dir>/spans/`.
+pub fn debug_serve_options(version: impl Into<String>, data_dir: &std::path::Path) -> ServeOptions {
+    ServeOptions {
+        version: version.into(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory: Arc::new(DebugSinkFactory {
+            dir: data_dir.join("spans"),
+        }),
+        auth_provider: None,
+    }
+}
+
+/// Build [`ServeOptions`] with the Braintrust sink. `translators` lets the
+/// caller choose the translator registry (debug-only until Phase 3 adds the
+/// Codex/Claude translators). Clients are built lazily per session URL, so this
+/// is cheap and infallible.
+pub fn braintrust_serve_options(
+    version: impl Into<String>,
+    sink_config: BraintrustSinkConfig,
+    translators: Arc<Registry>,
+) -> ServeOptions {
+    ServeOptions {
+        version: version.into(),
+        translators,
+        sink_factory: Arc::new(BraintrustSinkFactory::new(sink_config)),
+        auth_provider: None,
+    }
 }
 
 #[cfg(test)]
