@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bt trace hook --source antigravity --session-id-field conversationId --event PreToolUse --transcript-path-field transcriptPath --flush-on-turn-end"
+            "command": "bt trace hook --source antigravity --session-id-field conversationId --event PreToolUse --transcript-path-field transcriptPath --flush-on-turn-end || exit 0"
           }
         ]
       }
