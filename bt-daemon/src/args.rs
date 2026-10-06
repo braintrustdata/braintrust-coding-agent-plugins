@@ -6,6 +6,7 @@ use clap::{Args, ValueEnum};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::agents::{self, Agent, Identity};
 use crate::wire;
 
 /// Arguments for `serve`.
@@ -192,6 +193,17 @@ pub enum ParentObjectType {
     ProjectLogs,
     #[value(name = "playground_logs", alias = "playground-logs")]
     PlaygroundLogs,
+}
+
+impl ImportSource {
+    pub(crate) fn identity(self) -> &'static Identity {
+        match self {
+            Self::Codex => agents::Codex.identity(),
+            Self::Cursor => agents::Cursor.identity(),
+            Self::Claude => agents::Claude.identity(),
+            Self::Antigravity => agents::Antigravity.identity(),
+        }
+    }
 }
 
 impl From<ParentObjectType> for SpanObjectType {

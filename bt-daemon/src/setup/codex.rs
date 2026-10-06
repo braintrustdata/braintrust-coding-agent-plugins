@@ -3,6 +3,8 @@
 use super::common::{
     github_repo_matches, installed_json_version_is_older, plugin_source, CommandRunner, Marketplace,
 };
+use crate::agents::Codex;
+use crate::setup::Setup;
 use anyhow::bail;
 use serde_json::Value;
 
@@ -40,43 +42,45 @@ fn installed_plugin(value: &Value) -> Option<&Value> {
         .find(|item| item.get("pluginId").and_then(Value::as_str) == Some(PLUGIN))
 }
 
-fn list_plugins(runner: &mut impl CommandRunner) -> anyhow::Result<Value> {
+fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
     runner.json("codex", &["plugin", "list", "--json"])
 }
 
-pub(super) fn enable(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    MARKETPLACE.reconcile(runner)?;
-    // Adding is idempotent and reconciles the installed cache to the refreshed
-    // marketplace snapshot.
-    runner.run("codex", &["plugin", "add", PLUGIN])
-}
-
-pub(super) fn disable(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    if installed_plugin(&list_plugins(runner)?).is_some() {
-        runner.run("codex", &["plugin", "remove", PLUGIN, "--json"])?;
+impl Setup for Codex {
+    fn enable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        MARKETPLACE.reconcile(runner)?;
+        // Adding is idempotent and reconciles the installed cache to the refreshed
+        // marketplace snapshot.
+        runner.run("codex", &["plugin", "add", PLUGIN])
     }
-    Ok(())
-}
 
-pub(super) fn update(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    if installed_plugin(&list_plugins(runner)?).is_none() {
-        bail!("Codex tracing plugin is not installed; run `bt trace enable codex`");
+    fn disable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        if installed_plugin(&list_plugins(runner)?).is_some() {
+            runner.run("codex", &["plugin", "remove", PLUGIN, "--json"])?;
+        }
+        Ok(())
     }
-    MARKETPLACE.refresh_published(runner, "Codex", "codex")?;
-    runner.run("codex", &["plugin", "add", PLUGIN])
-}
 
-pub(super) fn stale() -> bool {
-    installed_json_version_is_older(
-        "codex",
-        &["plugin", "list", "--json"],
-        |value| {
-            installed_plugin(value)
-                .and_then(|plugin| plugin.get("version"))
-                .and_then(Value::as_str)
-        },
-        PLUGIN_MANIFEST,
-    )
+    fn update(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        if installed_plugin(&list_plugins(runner)?).is_none() {
+            bail!("Codex tracing plugin is not installed; run `bt trace enable codex`");
+        }
+        MARKETPLACE.refresh_published(runner, "Codex", "codex")?;
+        runner.run("codex", &["plugin", "add", PLUGIN])
+    }
+
+    fn stale(&self) -> bool {
+        installed_json_version_is_older(
+            "codex",
+            &["plugin", "list", "--json"],
+            |value| {
+                installed_plugin(value)
+                    .and_then(|plugin| plugin.get("version"))
+                    .and_then(Value::as_str)
+            },
+            PLUGIN_MANIFEST,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -88,7 +92,7 @@ mod tests {
     fn installs_from_the_published_marketplace_when_missing() {
         let mut runner = FakeRunner::new([serde_json::json!({"marketplaces": []})]);
 
-        enable(&mut runner).unwrap();
+        Codex.enable(&mut runner).unwrap();
 
         assert!(
             runner.called("codex plugin marketplace add braintrustdata/braintrust-codex-plugin")
@@ -108,7 +112,7 @@ mod tests {
             }]
         })]);
 
-        enable(&mut runner).unwrap();
+        Codex.enable(&mut runner).unwrap();
 
         assert!(runner.called("codex plugin marketplace upgrade braintrust-codex-plugins"));
         assert!(runner.called("codex plugin add trace-codex@braintrust-codex-plugins"));
@@ -124,7 +128,7 @@ mod tests {
             }]
         })]);
 
-        enable(&mut runner).unwrap();
+        Codex.enable(&mut runner).unwrap();
 
         assert!(runner.called("codex plugin marketplace remove braintrust-codex-plugins"));
         assert!(
@@ -137,7 +141,7 @@ mod tests {
     fn update_refuses_to_install_a_missing_plugin() {
         let mut runner = FakeRunner::new([serde_json::json!({"installed": []})]);
 
-        assert!(update(&mut runner).is_err());
+        assert!(Codex.update(&mut runner).is_err());
         assert!(!runner
             .calls
             .iter()
@@ -156,7 +160,7 @@ mod tests {
             }),
         ]);
 
-        update(&mut runner).unwrap();
+        Codex.update(&mut runner).unwrap();
 
         assert_eq!(
             runner.calls,
@@ -174,7 +178,7 @@ mod tests {
         let mut runner = FakeRunner::new([serde_json::json!({
             "installed": [{"pluginId": PLUGIN}]
         })]);
-        disable(&mut runner).unwrap();
+        Codex.disable(&mut runner).unwrap();
         assert!(runner.called("codex plugin remove trace-codex@braintrust-codex-plugins --json"));
     }
 }

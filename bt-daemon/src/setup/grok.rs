@@ -1,6 +1,8 @@
 //! Grok: the trace-grok plugin installed from its GitHub repository.
 
 use super::common::{github_repo_matches, CommandRunner};
+use crate::agents::Grok;
+use crate::setup::Setup;
 use anyhow::bail;
 use serde_json::Value;
 
@@ -20,45 +22,53 @@ fn is_published(item: &Value) -> bool {
         .is_some_and(|source| github_repo_matches(source, PLUGIN_SOURCE))
 }
 
-fn list_plugins(runner: &mut impl CommandRunner) -> anyhow::Result<Value> {
+fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
     runner.json("grok", &["plugin", "list", "--json"])
 }
 
-pub(super) fn enable(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    let plugins = list_plugins(runner)?;
-    // `bt trace enable grok` is the user's trust boundary. Grok's `--trust`
-    // applies to this plugin installation and does not change folder trust.
-    match installed_plugin(&plugins) {
-        Some(plugin) if is_published(plugin) => {
-            runner.run("grok", &["plugin", "update", PLUGIN])?;
+impl Setup for Grok {
+    fn enable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        let plugins = list_plugins(runner)?;
+        // `bt trace enable grok` is the user's trust boundary. Grok's `--trust`
+        // applies to this plugin installation and does not change folder trust.
+        match installed_plugin(&plugins) {
+            Some(plugin) if is_published(plugin) => {
+                runner.run("grok", &["plugin", "update", PLUGIN])?;
+            }
+            Some(_) => {
+                runner.run("grok", &["plugin", "uninstall", PLUGIN, "--confirm"])?;
+                runner.run("grok", &["plugin", "install", PLUGIN_SOURCE, "--trust"])?;
+            }
+            None => runner.run("grok", &["plugin", "install", PLUGIN_SOURCE, "--trust"])?,
         }
-        Some(_) => {
+        runner.run("grok", &["plugin", "enable", PLUGIN])
+    }
+
+    fn disable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        if installed_plugin(&list_plugins(runner)?).is_some_and(is_published) {
             runner.run("grok", &["plugin", "uninstall", PLUGIN, "--confirm"])?;
-            runner.run("grok", &["plugin", "install", PLUGIN_SOURCE, "--trust"])?;
         }
-        None => runner.run("grok", &["plugin", "install", PLUGIN_SOURCE, "--trust"])?,
+        Ok(())
     }
-    runner.run("grok", &["plugin", "enable", PLUGIN])
-}
 
-pub(super) fn disable(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    if installed_plugin(&list_plugins(runner)?).is_some_and(is_published) {
-        runner.run("grok", &["plugin", "uninstall", PLUGIN, "--confirm"])?;
+    fn update(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        let plugins = list_plugins(runner)?;
+        let plugin = installed_plugin(&plugins).ok_or_else(|| {
+            anyhow::anyhow!("Grok tracing plugin is not installed; run `bt trace enable grok`")
+        })?;
+        if !is_published(plugin) {
+            bail!(
+                "Grok tracing plugin is not the published Braintrust plugin; run `bt trace enable grok`"
+            );
+        }
+        runner.run("grok", &["plugin", "update", PLUGIN])
     }
-    Ok(())
-}
 
-pub(super) fn update(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    let plugins = list_plugins(runner)?;
-    let plugin = installed_plugin(&plugins).ok_or_else(|| {
-        anyhow::anyhow!("Grok tracing plugin is not installed; run `bt trace enable grok`")
-    })?;
-    if !is_published(plugin) {
-        bail!(
-            "Grok tracing plugin is not the published Braintrust plugin; run `bt trace enable grok`"
-        );
+    fn activation_warning(&self) -> Option<&'static str> {
+        Some(
+            "Grok 1.0.13 requires `/reload-plugins` in each active session after plugin installation or update before its hooks become active",
+        )
     }
-    runner.run("grok", &["plugin", "update", PLUGIN])
 }
 
 #[cfg(test)]
@@ -72,7 +82,7 @@ mod tests {
             {"name": "other-plugin", "source": "somebody/other-plugin"}
         ])]);
 
-        enable(&mut runner).unwrap();
+        Grok.enable(&mut runner).unwrap();
 
         assert_eq!(
             runner.calls,
@@ -95,7 +105,7 @@ mod tests {
             {"name": "other-plugin", "source": "somebody/other-plugin"}
         ])]);
 
-        enable(&mut runner).unwrap();
+        Grok.enable(&mut runner).unwrap();
 
         assert_eq!(
             runner.calls,
@@ -115,7 +125,7 @@ mod tests {
             "status": "installed"
         }])]);
 
-        update(&mut runner).unwrap();
+        Grok.update(&mut runner).unwrap();
 
         assert_eq!(
             runner.calls,
@@ -134,7 +144,7 @@ mod tests {
             {"name": "other-plugin", "source": "somebody/other-plugin"}
         ])]);
 
-        enable(&mut runner).unwrap();
+        Grok.enable(&mut runner).unwrap();
 
         assert_eq!(
             runner.calls,
@@ -158,7 +168,7 @@ mod tests {
             {"name": "other-plugin", "source": "somebody/other-plugin"}
         ])]);
 
-        disable(&mut runner).unwrap();
+        Grok.disable(&mut runner).unwrap();
 
         assert_eq!(
             runner.calls,
@@ -173,7 +183,7 @@ mod tests {
             "source": "/tmp/local-trace-grok",
             "status": "installed"
         }])]);
-        disable(&mut local).unwrap();
+        Grok.disable(&mut local).unwrap();
         assert_eq!(local.calls, ["grok plugin list --json"]);
     }
 }

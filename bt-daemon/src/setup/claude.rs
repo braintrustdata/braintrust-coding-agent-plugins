@@ -3,7 +3,9 @@
 use super::common::{
     github_repo_matches, installed_json_version_is_older, plugin_source, CommandRunner, Marketplace,
 };
+use crate::agents::Claude;
 use crate::paths;
+use crate::setup::Setup;
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::path::Path;
@@ -42,17 +44,47 @@ fn installed_plugin(value: &Value) -> Option<&Value> {
         .find(|item| item.get("id").and_then(Value::as_str) == Some(PLUGIN))
 }
 
-fn list_plugins(runner: &mut impl CommandRunner) -> anyhow::Result<Value> {
+fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
     runner.json("claude", &["plugin", "list", "--json"])
 }
 
-pub(super) fn enable(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    install(runner)?;
-    warn_legacy_tracing_env();
-    Ok(())
+impl Setup for Claude {
+    fn enable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        install(runner)?;
+        warn_legacy_tracing_env();
+        Ok(())
+    }
+
+    fn disable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        if installed_plugin(&list_plugins(runner)?).is_some() {
+            runner.run("claude", &["plugin", "uninstall", PLUGIN])?;
+        }
+        Ok(())
+    }
+
+    fn update(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        if installed_plugin(&list_plugins(runner)?).is_none() {
+            bail!("Claude Code tracing plugin is not installed; run `bt trace enable claude`");
+        }
+        MARKETPLACE.refresh_published(runner, "Claude Code", "claude")?;
+        runner.run("claude", &["plugin", "update", PLUGIN])
+    }
+
+    fn stale(&self) -> bool {
+        installed_json_version_is_older(
+            "claude",
+            &["plugin", "list", "--json"],
+            |value| {
+                installed_plugin(value)
+                    .and_then(|plugin| plugin.get("version"))
+                    .and_then(Value::as_str)
+            },
+            PLUGIN_MANIFEST,
+        )
+    }
 }
 
-fn install(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
+fn install(runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
     // Claude removes a marketplace's installed plugins when that marketplace
     // is removed, so replacing a stale source requires a fresh installation.
     if MARKETPLACE.reconcile(runner)? {
@@ -69,34 +101,6 @@ fn install(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-pub(super) fn disable(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    if installed_plugin(&list_plugins(runner)?).is_some() {
-        runner.run("claude", &["plugin", "uninstall", PLUGIN])?;
-    }
-    Ok(())
-}
-
-pub(super) fn update(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    if installed_plugin(&list_plugins(runner)?).is_none() {
-        bail!("Claude Code tracing plugin is not installed; run `bt trace enable claude`");
-    }
-    MARKETPLACE.refresh_published(runner, "Claude Code", "claude")?;
-    runner.run("claude", &["plugin", "update", PLUGIN])
-}
-
-pub(super) fn stale() -> bool {
-    installed_json_version_is_older(
-        "claude",
-        &["plugin", "list", "--json"],
-        |value| {
-            installed_plugin(value)
-                .and_then(|plugin| plugin.get("version"))
-                .and_then(Value::as_str)
-        },
-        PLUGIN_MANIFEST,
-    )
 }
 
 fn legacy_tracing_env_keys(path: &Path) -> anyhow::Result<Vec<&'static str>> {
@@ -232,7 +236,7 @@ mod tests {
             }]),
         ]);
 
-        update(&mut runner).unwrap();
+        Claude.update(&mut runner).unwrap();
 
         assert_eq!(
             runner.calls,
@@ -252,7 +256,7 @@ mod tests {
             serde_json::json!([{"name": MARKETPLACE_NAME, "source": "directory"}]),
         ]);
 
-        let error = update(&mut runner).unwrap_err().to_string();
+        let error = Claude.update(&mut runner).unwrap_err().to_string();
 
         assert_eq!(
             error,
@@ -264,7 +268,7 @@ mod tests {
     #[test]
     fn disable_uses_the_uninstall_command() {
         let mut runner = FakeRunner::new([serde_json::json!([{"id": PLUGIN}])]);
-        disable(&mut runner).unwrap();
+        Claude.disable(&mut runner).unwrap();
         assert!(runner.called("claude plugin uninstall trace-claude-code@braintrust-claude-plugin"));
     }
 

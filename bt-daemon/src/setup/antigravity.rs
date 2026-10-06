@@ -1,7 +1,9 @@
 //! Google Antigravity: the tracing plugin installed with the `agy` CLI.
 
 use super::common::{edit_object, CommandRunner, FileAccess};
+use crate::agents::Antigravity;
 use crate::paths;
+use crate::setup::Setup;
 use anyhow::bail;
 use serde_json::Value;
 use std::path::Path;
@@ -51,20 +53,20 @@ fn remove_legacy_registration(config_dir: &Path) -> anyhow::Result<()> {
     )
 }
 
-fn enable_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
+fn enable_at(runner: &mut dyn CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
     let home = home(config_dir)?;
     runner.run_in_home("agy", &["plugin", "install", PLUGIN_SOURCE], home)?;
     runner.run_in_home("agy", &["plugin", "enable", PLUGIN], home)?;
     remove_legacy_registration(config_dir)
 }
 
-fn disable_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
+fn disable_at(runner: &mut dyn CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
     // Antigravity's uninstall command is idempotent when the plugin is absent.
     runner.run_in_home("agy", &["plugin", "uninstall", PLUGIN], home(config_dir)?)?;
     remove_legacy_registration(config_dir)
 }
 
-fn update_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
+fn update_at(runner: &mut dyn CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
     let home = home(config_dir)?;
     let plugins = runner.json_in_home("agy", &["plugin", "list"], home)?;
     let installed = plugins
@@ -83,16 +85,18 @@ fn update_at(runner: &mut impl CommandRunner, config_dir: &Path) -> anyhow::Resu
     runner.run_in_home("agy", &["plugin", "install", PLUGIN_SOURCE], home)
 }
 
-pub(super) fn enable(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    enable_at(runner, &paths::antigravity_config_dir())
-}
+impl Setup for Antigravity {
+    fn enable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        enable_at(runner, &paths::antigravity_config_dir())
+    }
 
-pub(super) fn disable(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    disable_at(runner, &paths::antigravity_config_dir())
-}
+    fn disable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        disable_at(runner, &paths::antigravity_config_dir())
+    }
 
-pub(super) fn update(runner: &mut impl CommandRunner) -> anyhow::Result<()> {
-    update_at(runner, &paths::antigravity_config_dir())
+    fn update(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        update_at(runner, &paths::antigravity_config_dir())
+    }
 }
 
 #[cfg(test)]

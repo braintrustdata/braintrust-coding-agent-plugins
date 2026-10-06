@@ -5,8 +5,12 @@ mod hooks;
 
 pub(crate) use hooks::{discovery_hooks_are_installed_at, CursorManagedHooks};
 
+use crate::agents::Cursor;
 use crate::paths;
-use crate::setup::common::{github_repo_matches, package_version, plugin_source, version_is_older};
+use crate::setup::common::{
+    github_repo_matches, package_version, plugin_source, version_is_older, CommandRunner,
+};
+use crate::setup::Setup;
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::path::Path;
@@ -105,18 +109,40 @@ fn plugin_is_installed_for_platform_at(plugin: &Path, windows: bool) -> bool {
     true
 }
 
-pub(super) fn stale() -> bool {
-    let Some(installed_manifest) = installed_manifest_at(&paths::cursor_plugin_dir()) else {
-        return false;
-    };
-    if !is_ours(&installed_manifest) {
-        return false;
+impl Setup for Cursor {
+    fn enable(&self, _runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        enable_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())
     }
-    let expected = package_version(PLUGIN_MANIFEST).ok();
-    let installed = installed_manifest.get("version").and_then(Value::as_str);
-    installed
-        .zip(expected.as_deref())
-        .is_some_and(|(installed, expected)| version_is_older(installed, expected))
+
+    fn disable(&self, _runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        disable_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())
+    }
+
+    fn update(&self, _runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        update_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())
+    }
+
+    fn stale(&self) -> bool {
+        let Some(installed_manifest) = installed_manifest_at(&paths::cursor_plugin_dir()) else {
+            return false;
+        };
+        if !is_ours(&installed_manifest) {
+            return false;
+        }
+        let expected = package_version(PLUGIN_MANIFEST).ok();
+        let installed = installed_manifest.get("version").and_then(Value::as_str);
+        installed
+            .zip(expected.as_deref())
+            .is_some_and(|(installed, expected)| version_is_older(installed, expected))
+    }
+
+    fn activation_warning(&self) -> Option<&'static str> {
+        (!plugin_is_installed_at(&paths::cursor_plugin_dir())
+            || !discovery_hooks_are_installed_at(&paths::cursor_config_dir()))
+        .then_some(
+            "Cursor tracing plugin or lifecycle hooks are missing; run `bt trace enable cursor`",
+        )
+    }
 }
 
 /// The plugin's hook manifest. On Windows each hook runs the PowerShell
@@ -299,18 +325,6 @@ fn disable_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
 
 fn update_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
     with_discovery_hooks(plugin_dir, config_dir, true, update_plugin_at)
-}
-
-pub(super) fn enable() -> anyhow::Result<()> {
-    enable_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())
-}
-
-pub(super) fn disable() -> anyhow::Result<()> {
-    disable_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())
-}
-
-pub(super) fn update() -> anyhow::Result<()> {
-    update_at(&paths::cursor_plugin_dir(), &paths::cursor_config_dir())
 }
 
 #[cfg(test)]

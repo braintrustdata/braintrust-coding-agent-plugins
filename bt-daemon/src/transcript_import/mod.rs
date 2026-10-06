@@ -193,12 +193,7 @@ fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
 }
 
 fn source_name(source: ImportSource) -> &'static str {
-    match source {
-        ImportSource::Codex => "Codex",
-        ImportSource::Cursor => "Cursor",
-        ImportSource::Claude => "Claude Code",
-        ImportSource::Antigravity => "Google Antigravity",
-    }
+    source.identity().display_name
 }
 
 #[cfg(test)]
