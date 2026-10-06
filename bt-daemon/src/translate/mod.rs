@@ -146,11 +146,13 @@ pub trait AgentTranslator: Send {
     }
 }
 
-/// An agent whose hook events have a translator. Implemented in each
-/// agent's translator module and registered in [`crate::agents`].
-pub(crate) trait Translate: Agent {
-    fn translator_factory(&self, git: Arc<git::GitMetadataCache>) -> Box<dyn TranslatorFactory>;
-}
+/// An agent that is its own [`TranslatorFactory`]. Each agent implements the
+/// factory in its translator module and registers itself in
+/// [`crate::agents`]; this only joins the two traits so the registry can look
+/// agents up by name.
+pub(crate) trait Translate: Agent + TranslatorFactory {}
+
+impl<T: Agent + TranslatorFactory> Translate for T {}
 
 /// Builds translator instances for a given `source`.
 pub trait TranslatorFactory: Send + Sync {
@@ -160,7 +162,7 @@ pub trait TranslatorFactory: Send + Sync {
 
 /// Maps canonical and supported alias source strings to translator factories.
 pub struct Registry {
-    factories: HashMap<String, Box<dyn TranslatorFactory>>,
+    factories: HashMap<String, Arc<dyn TranslatorFactory>>,
 }
 
 /// Map an agent name or alias to the source its hooks report. Unknown
@@ -179,14 +181,17 @@ impl Registry {
             factories: HashMap::new(),
         };
         r.register(Box::new(DebugTranslatorFactory));
-        let git = Arc::new(git::GitMetadataCache::default());
-        for agent in registrar().translate.iter() {
-            r.register(agent.translator_factory(git.clone()));
+        for agent in registrar().translate.shared() {
+            r.insert(agent.clone());
         }
         r
     }
 
     pub fn register(&mut self, factory: Box<dyn TranslatorFactory>) {
+        self.insert(factory.into());
+    }
+
+    fn insert(&mut self, factory: Arc<dyn TranslatorFactory>) {
         self.factories.insert(factory.source().to_string(), factory);
     }
 

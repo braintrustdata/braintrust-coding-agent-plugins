@@ -74,8 +74,8 @@ impl<T: ?Sized + Agent> Agents<T> {
             .map(|agent| &**agent)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.agents.iter().map(|agent| &**agent)
+    pub fn shared(&self) -> impl Iterator<Item = &Arc<T>> {
+        self.agents.iter()
     }
 }
 

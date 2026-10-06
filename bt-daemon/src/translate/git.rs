@@ -2,7 +2,7 @@ use super::{SpanOp, SpanRow};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 const CACHE_CAPACITY: usize = 256;
@@ -76,7 +76,7 @@ impl CacheState {
 }
 
 /// Daemon-wide Git metadata cache shared by all production translators.
-pub(crate) struct GitMetadataCache {
+pub(super) struct GitMetadataCache {
     state: Mutex<CacheState>,
 }
 
@@ -89,6 +89,14 @@ impl Default for GitMetadataCache {
 }
 
 impl GitMetadataCache {
+    /// The process-wide cache shared by every translator. Repository entries
+    /// are revalidated against the git directory before reuse and "not a
+    /// repository" results expire, so sharing them across registries is safe.
+    pub(super) fn shared() -> Arc<Self> {
+        static SHARED: OnceLock<Arc<GitMetadataCache>> = OnceLock::new();
+        SHARED.get_or_init(Arc::default).clone()
+    }
+
     pub(super) fn metadata(&self, cwd: &str) -> Map<String, Value> {
         if cwd.is_empty() {
             return Map::new();

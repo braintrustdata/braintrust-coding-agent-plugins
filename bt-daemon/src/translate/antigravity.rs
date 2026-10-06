@@ -19,29 +19,16 @@ use std::io::{BufRead, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
-pub struct AntigravityTranslatorFactory {
-    git: Arc<GitMetadataCache>,
-}
-
-impl AntigravityTranslatorFactory {
-    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
-        Self { git }
-    }
-}
-
-impl super::Translate for crate::agents::Antigravity {
-    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
-        Box::new(AntigravityTranslatorFactory::new(git))
-    }
-}
-
-impl TranslatorFactory for AntigravityTranslatorFactory {
+impl TranslatorFactory for crate::agents::Antigravity {
     fn source(&self) -> &str {
-        "antigravity"
+        crate::agents::Agent::identity(self).source
     }
 
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(AntigravityTranslator::new(session_id, self.git.clone()))
+        Box::new(AntigravityTranslator::new(
+            session_id,
+            GitMetadataCache::shared(),
+        ))
     }
 }
 

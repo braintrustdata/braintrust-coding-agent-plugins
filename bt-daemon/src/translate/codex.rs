@@ -108,25 +108,9 @@ fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
 
-pub struct CodexTranslatorFactory {
-    git: Arc<GitMetadataCache>,
-}
-
-impl CodexTranslatorFactory {
-    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
-        Self { git }
-    }
-}
-
-impl super::Translate for crate::agents::Codex {
-    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
-        Box::new(CodexTranslatorFactory::new(git))
-    }
-}
-
-impl TranslatorFactory for CodexTranslatorFactory {
+impl TranslatorFactory for crate::agents::Codex {
     fn source(&self) -> &str {
-        "codex"
+        crate::agents::Agent::identity(self).source
     }
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         let root_span_id = ids::span_id(session_id, "root");
@@ -150,7 +134,7 @@ impl TranslatorFactory for CodexTranslatorFactory {
             compaction_trigger_by_turn: RecentMap::default(),
             compaction_spans: RecentSet::default(),
             pending: None,
-            git: self.git.clone(),
+            git: GitMetadataCache::shared(),
         })
     }
 }

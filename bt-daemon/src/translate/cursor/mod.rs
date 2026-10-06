@@ -62,26 +62,15 @@ const CURSOR_METADATA_FIELDS: &[&str] = &[
     "replacement_context_available",
 ];
 
-pub struct CursorTranslatorFactory {
-    git: Arc<GitMetadataCache>,
-}
-impl CursorTranslatorFactory {
-    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
-        Self { git }
-    }
-}
-impl super::Translate for crate::agents::Cursor {
-    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
-        Box::new(CursorTranslatorFactory::new(git))
-    }
-}
-
-impl TranslatorFactory for CursorTranslatorFactory {
+impl TranslatorFactory for crate::agents::Cursor {
     fn source(&self) -> &str {
-        "cursor"
+        crate::agents::Agent::identity(self).source
     }
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(CursorTranslator::new(session_id, self.git.clone()))
+        Box::new(CursorTranslator::new(
+            session_id,
+            GitMetadataCache::shared(),
+        ))
     }
 }
 
