@@ -1725,7 +1725,7 @@ fn synthetic_partial_usage_merges_known_counts_without_inventing_missing_values(
         110,
         json!({
             "generation_id":"t", "text":"hello", "input_tokens":20,
-            "cache_read_tokens":7, "cache_write_tokens":-1
+            "cache_read_tokens":7
         }),
     ));
     let id = h.turns()[0].span_id.clone();
@@ -1739,8 +1739,7 @@ fn synthetic_partial_usage_merges_known_counts_without_inventing_missing_values(
         "stop",
         120,
         json!({
-            "generation_id":"t", "status":"completed", "input_tokens":-2,
-            "output_tokens":4
+            "generation_id":"t", "status":"completed", "output_tokens":4
         }),
     );
     h.handle(&stop);
@@ -1794,5 +1793,69 @@ fn synthetic_missing_tool_result_does_not_invent_an_empty_model_input_message() 
     assert_eq!(
         llms[1].metadata.as_ref().unwrap()["history_truncated"],
         true
+    );
+}
+
+#[test]
+fn unexpected_field_types_fail_the_event_instead_of_being_dropped() {
+    let ctx = SessionCtx {
+        session_id: "test-session".into(),
+        config: None,
+    };
+    for (kind, payload) in [
+        (
+            "afterAgentResponse",
+            json!({"generation_id":"t", "text":"hello", "input_tokens":-1}),
+        ),
+        (
+            "preToolUse",
+            json!({"tool_name":5, "tool_use_id":"call-1", "tool_input":{}}),
+        ),
+        ("stop", json!({"status":{"code":"completed"}})),
+        ("sessionStart", json!({"workspace_roots":"/not/a/list"})),
+    ] {
+        let mut translator = Registry::default_agents().create("cursor", "test-session");
+        let error = translator
+            .handle(&event(kind, 100, payload), &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!("unexpected cursor {kind} hook format")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn unexpected_transcript_record_types_fail_the_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        format!("{}\n", json!({"role":"user","message":{"content":42}})),
+    )
+    .unwrap();
+    let through = std::fs::metadata(&transcript).unwrap().len();
+    let ctx = SessionCtx {
+        session_id: "test-session".into(),
+        config: None,
+    };
+    let mut translator = Registry::default_agents().create("cursor", "test-session");
+    let error = translator
+        .handle(
+            &mirrored(
+                "beforeSubmitPrompt",
+                100,
+                &transcript,
+                through,
+                json!({"prompt":"hi"}),
+            ),
+            &ctx,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.starts_with("unexpected cursor transcript record format"),
+        "{error}"
     );
 }

@@ -6,7 +6,6 @@
 mod hooks;
 
 use super::git::GitMetadataCache;
-use super::lenient;
 use super::recent::{RecentMap, RecentSet};
 use super::{
     local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
@@ -14,9 +13,9 @@ use super::{
 };
 use crate::{ids, wire::Envelope};
 use hooks::{
-    CursorHook, HookCommon, PromptHook, ResponseHook, SessionEndHook, SpecializedHook,
-    SpecializedKind, StopHook, SubagentHook, SubagentPhase, ToolHook, ToolPhase, TranscriptRecord,
-    TurnUsage,
+    CursorHook, HookCommon, MessageContent, PromptHook, ResponseHook, SessionEndHook,
+    SpecializedHook, SpecializedKind, StopHook, SubagentHook, SubagentPhase, ToolHook, ToolPhase,
+    TranscriptRecord, TurnUsage,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
@@ -298,7 +297,7 @@ impl CursorTranslator {
             .cwd
             .as_deref()
             .filter(|cwd| !cwd.is_empty())
-            .or(common.workspace_root.as_deref())
+            .or(common.workspace_root())
         {
             self.cwd = Some(cwd.into());
         }
@@ -957,7 +956,7 @@ impl CursorTranslator {
         let (records, truncated, complete) = self.transcript.read_batch(path, through)?;
         self.history.truncated |= truncated;
         for raw in records {
-            let record: TranscriptRecord = lenient::parse(&raw);
+            let record = TranscriptRecord::decode(&raw)?;
             let role = record.role.as_deref();
             if role == Some("user") {
                 self.transcript.assistant_records = 0;
@@ -991,7 +990,11 @@ impl CursorTranslator {
         ops: &mut Vec<SpanOp>,
     ) {
         let role = record.role.as_deref().unwrap_or("");
-        let content = record.message.as_ref().and_then(|m| m.text.as_deref());
+        let content = record
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref())
+            .map(MessageContent::text);
         if role == "user" {
             let Some(full_prompt) = content else {
                 self.history.truncated = true;
@@ -999,7 +1002,7 @@ impl CursorTranslator {
             };
             self.transcript_users += 1;
             self.transcript_unattributed = false;
-            let prompt = transcript_prompt(full_prompt).to_string();
+            let prompt = transcript_prompt(&full_prompt).to_string();
             if let Some((known_prompt, id)) = self
                 .transcript
                 .prompt_owners
@@ -1099,7 +1102,6 @@ impl CursorTranslator {
                 return;
             }
             if let Some(text) = content {
-                let text = text.to_string();
                 if text.is_empty() {
                     return;
                 }
@@ -1547,8 +1549,10 @@ impl AgentTranslator for CursorTranslator {
             self.pending.is_none(),
             "Cursor pending transcript work must be drained before the next hook"
         );
-        let common: HookCommon = lenient::parse(&e.payload);
-        let hook = CursorHook::parse(&e.event, &e.payload);
+        // Decode before touching any state, so a payload in an unexpected
+        // format leaves the translator where it was.
+        let common = HookCommon::decode(&e.event, &e.payload)?;
+        let hook = CursorHook::decode(&e.event, &e.payload)?;
         let mut ops = Vec::new();
         self.root(e, &common, &hook, ctx, &mut ops);
         if self.transcript_batch(e, &common, &mut ops)? {
@@ -1563,11 +1567,11 @@ impl AgentTranslator for CursorTranslator {
         let Some(e) = self.pending.take() else {
             return Ok(None);
         };
-        // The parsed hook is not retained; decoding again is cheap.
-        let common: HookCommon = lenient::parse(&e.payload);
+        // `handle` already decoded this payload; decoding again is cheap.
+        let common = HookCommon::decode(&e.event, &e.payload)?;
+        let hook = CursorHook::decode(&e.event, &e.payload)?;
         let mut ops = Vec::new();
         if self.transcript_batch(&e, &common, &mut ops)? {
-            let hook = CursorHook::parse(&e.event, &e.payload);
             self.reduce_hook(&e, &common, &hook, &mut ops);
         } else {
             self.pending = Some(e);
