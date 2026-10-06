@@ -29,6 +29,12 @@ impl AntigravityTranslatorFactory {
     }
 }
 
+impl super::Translate for crate::agents::Antigravity {
+    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
+        Box::new(AntigravityTranslatorFactory::new(git))
+    }
+}
+
 impl TranslatorFactory for AntigravityTranslatorFactory {
     fn source(&self) -> &str {
         "antigravity"

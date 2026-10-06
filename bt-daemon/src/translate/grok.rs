@@ -36,6 +36,12 @@ impl GrokTranslatorFactory {
     }
 }
 
+impl super::Translate for crate::agents::Grok {
+    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
+        Box::new(GrokTranslatorFactory::new(git))
+    }
+}
+
 impl TranslatorFactory for GrokTranslatorFactory {
     fn source(&self) -> &str {
         "grok"

@@ -129,6 +129,12 @@ impl ClaudeTranslatorFactory {
     }
 }
 
+impl super::Translate for crate::agents::Claude {
+    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
+        Box::new(ClaudeTranslatorFactory::new(git))
+    }
+}
+
 impl TranslatorFactory for ClaudeTranslatorFactory {
     fn source(&self) -> &str {
         "claude-code"

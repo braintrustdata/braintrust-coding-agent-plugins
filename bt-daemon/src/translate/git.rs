@@ -76,7 +76,7 @@ impl CacheState {
 }
 
 /// Daemon-wide Git metadata cache shared by all production translators.
-pub(super) struct GitMetadataCache {
+pub(crate) struct GitMetadataCache {
     state: Mutex<CacheState>,
 }
 

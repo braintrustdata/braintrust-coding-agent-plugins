@@ -26,6 +26,12 @@ impl OpenCodeTranslatorFactory {
     }
 }
 
+impl super::Translate for crate::agents::OpenCode {
+    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
+        Box::new(OpenCodeTranslatorFactory::new(git))
+    }
+}
+
 impl TranslatorFactory for OpenCodeTranslatorFactory {
     fn source(&self) -> &str {
         "opencode"

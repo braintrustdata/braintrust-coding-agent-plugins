@@ -25,6 +25,12 @@ impl PiTranslatorFactory {
         Self { git }
     }
 }
+impl super::Translate for crate::agents::Pi {
+    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
+        Box::new(PiTranslatorFactory::new(git))
+    }
+}
+
 impl TranslatorFactory for PiTranslatorFactory {
     fn source(&self) -> &str {
         "pi"

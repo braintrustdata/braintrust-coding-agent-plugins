@@ -70,6 +70,12 @@ impl CursorTranslatorFactory {
         Self { git }
     }
 }
+impl super::Translate for crate::agents::Cursor {
+    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
+        Box::new(CursorTranslatorFactory::new(git))
+    }
+}
+
 impl TranslatorFactory for CursorTranslatorFactory {
     fn source(&self) -> &str {
         "cursor"

@@ -118,6 +118,12 @@ impl CodexTranslatorFactory {
     }
 }
 
+impl super::Translate for crate::agents::Codex {
+    fn translator_factory(&self, git: Arc<GitMetadataCache>) -> Box<dyn TranslatorFactory> {
+        Box::new(CodexTranslatorFactory::new(git))
+    }
+}
+
 impl TranslatorFactory for CodexTranslatorFactory {
     fn source(&self) -> &str {
         "codex"
