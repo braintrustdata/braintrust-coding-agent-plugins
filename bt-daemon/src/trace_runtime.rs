@@ -5,14 +5,15 @@
 //! behavior, setup, managed runs, imports, and output contracts stay here with
 //! the coding-agent integrations.
 
+use crate::route::{apply_additional_metadata, apply_tags, resolve_span_plugin_paths};
 use crate::trace_command::{DoctorAgent, DoctorArgs, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
-    apply_additional_metadata, apply_tags, braintrust_serve_options, paths, run_disable,
-    run_enable, run_import, run_serve, run_status, run_traced, shutdown_daemon, AuthDiagnostic,
-    AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, DaemonDiagnostic,
-    DaemonStatus, DoctorCommandOutput, HostInfo, OutputFormat, Registry, RunHookCommand,
-    ServeOptions, StatusArgs, TraceArgs, TraceCommandOutput,
+    braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
+    run_traced, shutdown_daemon, AuthDiagnostic, AuthLease, AuthProvider, AuthResolveReason,
+    BraintrustSinkConfig, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, HostInfo,
+    OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
+    TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -347,7 +348,10 @@ async fn diagnose_daemon(
         Err(error) if crate::client::daemon_absent(&error) => return DaemonDiagnostic::default(),
         Err(error) => return unreachable(format!("{}: {error}", socket.display())),
     };
-    let status = tokio::time::timeout(DAEMON_PROBE_TIMEOUT, crate::status_over(stream, None));
+    let status = tokio::time::timeout(
+        DAEMON_PROBE_TIMEOUT,
+        crate::client::status_over(stream, None),
+    );
     let auth = async {
         match selection {
             Some(selection) => Some(diagnose_daemon_auth(socket, selection).await),
@@ -645,7 +649,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             apply_additional_metadata(&mut route, enable_args.additional_metadata.as_deref())?;
             apply_tags(&mut route, &enable_args.tags)?;
             if !enable_args.plugin.is_empty() {
-                route.span_plugins = crate::resolve_span_plugin_paths(&enable_args.plugin)?;
+                route.span_plugins = resolve_span_plugin_paths(&enable_args.plugin)?;
             }
             print_output(run_enable(enable_args, route)?, host.output_format)
         }
@@ -660,7 +664,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             run_serve(serve_args, serve_options(&host)).await
         }
         TraceCommand::Hook(hook_args) => {
-            if crate::suppress_inherited_hook(&hook_args) {
+            if crate::hook::suppress_inherited_hook(&hook_args) {
                 return Ok(());
             }
             let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
@@ -733,12 +737,12 @@ async fn run_hook_command(
     if !settings.tracing_enabled() {
         return Ok(());
     }
-    crate::with_hook_capture_timeout(hook_args.capture_timeout_ms, async {
+    crate::hook::with_hook_capture_timeout(hook_args.capture_timeout_ms, async {
         let route = match settings.route {
             Some(route) => route,
             None => resolve_host_route(host, RouteRequirements::default()).await?,
         };
-        crate::run_hook_with_route(hook_args, route, host_info(host)).await
+        crate::hook::run_hook_with_route(hook_args, route, host_info(host)).await
     })
     .await
 }
