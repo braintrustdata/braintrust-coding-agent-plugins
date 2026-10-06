@@ -14,6 +14,7 @@ mod cursor;
 mod debug;
 mod git;
 mod grok;
+mod lenient;
 mod opencode;
 mod pi;
 pub(crate) use pi::request_config as pi_request_config;
