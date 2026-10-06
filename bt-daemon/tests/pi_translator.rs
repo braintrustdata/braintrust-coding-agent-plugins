@@ -668,6 +668,32 @@ fn pi_reports_malformed_required_tool_identity() {
 }
 
 #[test]
+fn pi_ignores_non_assistant_message_end_shapes_but_rejects_malformed_assistant_messages() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let system = event(
+        "message_end",
+        1,
+        json!({"type":"message_end","message":{"role":"system","content":"system prompt"}}),
+    );
+    assert!(translator.handle(&system, &ctx).is_ok());
+
+    let malformed_assistant = event(
+        "message_end",
+        2,
+        json!({"type":"message_end","message":{"role":"assistant","content":"unexpected string"}}),
+    );
+    let error = translator.handle(&malformed_assistant, &ctx).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unsupported shape for message_end"));
+}
+
+#[test]
 fn pi_tool_errors_keep_the_native_failure_cause() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("pi", "pi-session");

@@ -397,14 +397,21 @@ impl AgentTranslator for PiTranslator {
         match envelope.event.as_str() {
             "message_end" => {
                 let message = event.get("message").unwrap_or(event);
-                if !message.get("role").is_some_and(Value::is_string) {
+                let role = message.get("role").and_then(Value::as_str);
+                if role.is_none_or(str::is_empty) {
                     return Err(crate::translate::InputShapeError {
                         event: envelope.event.clone(),
                         detail: "missing required message role".into(),
                     }
                     .into());
                 }
-                decode_required::<AssistantMessage>(&envelope.event, message)?;
+                // Pi emits system/user message_end notifications as well, but
+                // this translator only creates LLM spans from assistant
+                // messages. Preserve those unused message shapes without
+                // pausing the source session.
+                if role == Some("assistant") {
+                    decode_required::<AssistantMessage>(&envelope.event, message)?;
+                }
             }
             "tool_execution_end" => {
                 let end = decode_required::<ToolExecutionEnd>(&envelope.event, event)?;

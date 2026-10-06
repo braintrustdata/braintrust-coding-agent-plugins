@@ -771,13 +771,19 @@ mod tests {
         writer.append(&pi_context(vec![], 1)).await.unwrap();
         let first = writer.position();
         drop(writer);
+        // Tokio's Windows file wrapper closes through its blocking worker.
+        // Give that close a turn before simulating a process restart with a
+        // second handle to the same file.
+        tokio::task::yield_now().await;
         let mut file = tokio::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .await
             .unwrap();
         file.write_all(b"{\"partial\":true").await.unwrap();
+        file.sync_all().await.unwrap();
         drop(file);
+        tokio::task::yield_now().await;
         let mut writer = JournalWriter::open_path(&path).await.unwrap();
         assert_eq!(writer.position(), first);
         writer.append(&pi_context(vec![], 2)).await.unwrap();
