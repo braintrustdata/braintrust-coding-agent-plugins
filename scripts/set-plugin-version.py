@@ -36,17 +36,25 @@ def main() -> None:
         sys.exit(f"no plugin manifests found for '{agent}' ({pattern})")
 
     surfaces = [(path, VERSION_RE, "version") for path in manifests]
+    if agent == "cursor":
+        content = "src/plugins/cursor/content"
+        surfaces.extend([
+            (f"{content}/package.json", VERSION_RE, "extension version"),
+            (f"{content}/package-lock.json", VERSION_RE, "lockfile versions"),
+        ])
 
     changes = []
     for path, version_re, label in surfaces:
         with open(path) as f:
             text = f.read()
+        expected = 2 if label == "lockfile versions" else 1
         new_text, n = version_re.subn(
             lambda match: f"{match.group(1)}{version}{match.group(2)}",
             text,
+            count=expected,
         )
-        if n != 1:
-            sys.exit(f"expected one {label} field in {path}, found {n}")
+        if n != expected:
+            sys.exit(f"expected {expected} {label} field(s) in {path}, found {n}")
         changes.append((path, label, new_text))
 
     for path, label, new_text in changes:

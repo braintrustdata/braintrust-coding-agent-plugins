@@ -61,7 +61,7 @@ jobs:
             antigravity) dist_repo=braintrustdata/braintrust-antigravity-plugin ;;
             claude) dist_repo=braintrustdata/braintrust-claude-plugin ;;
             codex) dist_repo=braintrustdata/braintrust-codex-plugin ;;
-            cursor) dist_repo=braintrustdata/braintrust-cursor-plugin ;;
+            cursor) dist_repo=braintrustdata/braintrust-cursor-extension ;;
             grok) dist_repo=braintrustdata/braintrust-grok-plugin ;;
             *) echo "::error::Unsupported release plugin."; exit 1 ;;
           esac
@@ -73,7 +73,7 @@ jobs:
             case "$PLUGIN" in
               claude) printf '%s\n' 'src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json' ;;
               codex) printf '%s\n' 'src/plugins/codex/content/plugins/*/.codex-plugin/plugin.json' ;;
-              cursor) printf '%s\n' 'src/plugins/cursor/content/.cursor-plugin/plugin.json' ;;
+              cursor) printf '%s\n' 'src/plugins/cursor/content/.cursor-plugin/plugin.json' 'src/plugins/cursor/content/package.json' 'src/plugins/cursor/content/package-lock.json' ;;
               grok) printf '%s\n' 'src/plugins/grok/content/.grok-plugin/plugin.json' 'src/plugins/grok/content/hooks/hooks.json' ;;
             esac
             printf 'EOF\n'
@@ -204,7 +204,7 @@ jobs:
             antigravity) dist_repo=braintrustdata/braintrust-antigravity-plugin ;;
             claude) dist_repo=braintrustdata/braintrust-claude-plugin ;;
             codex) dist_repo=braintrustdata/braintrust-codex-plugin ;;
-            cursor) dist_repo=braintrustdata/braintrust-cursor-plugin ;;
+            cursor) dist_repo=braintrustdata/braintrust-cursor-extension ;;
             grok) dist_repo=braintrustdata/braintrust-grok-plugin ;;
           esac
           {

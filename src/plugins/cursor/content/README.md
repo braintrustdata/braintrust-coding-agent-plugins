@@ -4,13 +4,33 @@
 > [braintrustdata/braintrust-coding-agent-plugins](https://github.com/braintrustdata/braintrust-coding-agent-plugins).
 > Make changes there; releases publish the generated plugin to this repository.
 
-Trace Cursor sessions to [Braintrust](https://braintrust.dev) with the `trace-cursor` plugin.
+Connect Cursor to [Braintrust](https://braintrust.dev) through MCP and trace
+agent sessions with the `braintrust` plugin. The same repository also contains
+the Braintrust VS Code extension for Cursor.
 
 ## Prerequisites
 
 - A [Braintrust account](https://braintrust.dev)
 - Cursor with the CLI or desktop app
 - The [Braintrust CLI](https://www.braintrust.dev/docs/reference/cli/quickstart)
+- A Braintrust API key to use the MCP server
+
+## Install from Cursor Marketplace
+
+Use `/add-plugin` in Cursor and search for **Braintrust**, or install from the
+[Cursor Marketplace](https://cursor.com/marketplace). The plugin registers the
+Braintrust MCP server and tracing hooks. For tracing, install and authenticate
+the `bt` CLI, then run `bt trace enable cursor --project my-coding-agent`.
+
+The Braintrust MCP server uses `https://api.braintrust.dev/mcp`. Configure its
+`BRAINTRUST_API_KEY` variable in Cursor's plugin settings. MCP access and tracing
+use separate authentication: `bt login` authenticates the tracing CLI.
+
+The existing VS Code extension remains available from Cursor's extension
+panel. It reads `BRAINTRUST_API_KEY` from Cursor's environment and registers
+the same MCP server through Cursor's extension API. If
+both the extension and plugin are installed, each attempts to register a
+server named `braintrust`; use one MCP installation to avoid duplicates.
 
 ## Supported Cursor surfaces
 
@@ -27,14 +47,14 @@ bt login
 bt trace enable cursor --project my-coding-agent
 ```
 
-Setup installs or refreshes `trace-cursor`, configures the hooks needed to trace
-Cursor sessions, and saves the selected route in `~/.cursor/braintrust.json`.
+Setup installs or refreshes the local `braintrust` plugin, configures the hooks
+needed to trace Cursor sessions, and saves the selected route in
+`~/.cursor/braintrust.json`.
 Cursor must allow local plugin imports. Reload the Cursor window after setup so
 the plugin is active.
 
 Use `--profile` or `--org` to select a different Braintrust account or
-organization. This plugin only configures tracing; it does not install or
-configure the separate Braintrust MCP integration.
+organization. To use MCP, configure `BRAINTRUST_API_KEY` in Cursor's plugin settings.
 
 ## Data handling
 

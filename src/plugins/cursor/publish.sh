@@ -21,6 +21,7 @@ trap 'rm -rf "$(dirname "$WORKTREE")"' EXIT
 echo "==> Cloning $SLUG"
 git clone --depth 1 "$CLONE_URL" "$WORKTREE" 2>/dev/null \
   || git clone "$CLONE_URL" "$WORKTREE"
+
 git -C "$WORKTREE" config user.name "github-actions[bot]"
 git -C "$WORKTREE" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 

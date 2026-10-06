@@ -16,7 +16,8 @@ use serde_json::Value;
 use std::path::Path;
 
 const PLUGIN_NAME: &str = "trace-cursor";
-const PLUGIN_SOURCE: &str = "braintrustdata/braintrust-cursor-plugin";
+const PLUGIN_SOURCE: &str = "braintrustdata/braintrust-cursor-extension";
+const LEGACY_PLUGIN_SOURCE: &str = "braintrustdata/braintrust-cursor-plugin";
 const MONOREPO_SOURCE: &str = "braintrustdata/braintrust-coding-agent-plugins";
 const PLUGIN_MANIFEST: &str = plugin_source!("cursor/content/.cursor-plugin/plugin.json");
 const HOOKS_MANIFEST: &str = plugin_source!("cursor/content/hooks/hooks.json");
@@ -33,6 +34,8 @@ exit 0
 "#;
 const README: &str = plugin_source!("cursor/content/README.md");
 const LICENSE: &str = plugin_source!("cursor/content/LICENSE");
+const MCP_MANIFEST: &str = plugin_source!("cursor/content/mcp.json");
+const LOGO: &str = plugin_source!("cursor/content/logo.svg");
 
 fn installed_manifest_at(plugin: &Path) -> Option<Value> {
     let raw = std::fs::read(plugin.join(".cursor-plugin/plugin.json")).ok()?;
@@ -40,14 +43,17 @@ fn installed_manifest_at(plugin: &Path) -> Option<Value> {
 }
 
 fn is_ours(manifest: &Value) -> bool {
-    manifest.get("name").and_then(Value::as_str) == Some(PLUGIN_NAME)
-        && manifest
-            .get("repository")
-            .and_then(Value::as_str)
-            .is_some_and(|repo| {
-                github_repo_matches(repo, MONOREPO_SOURCE)
-                    || github_repo_matches(repo, PLUGIN_SOURCE)
-            })
+    matches!(
+        manifest.get("name").and_then(Value::as_str),
+        Some("braintrust" | PLUGIN_NAME)
+    ) && manifest
+        .get("repository")
+        .and_then(Value::as_str)
+        .is_some_and(|repo| {
+            github_repo_matches(repo, MONOREPO_SOURCE)
+                || github_repo_matches(repo, PLUGIN_SOURCE)
+                || github_repo_matches(repo, LEGACY_PLUGIN_SOURCE)
+        })
 }
 
 /// Fail unless the plugin at `plugin_dir` is the Braintrust plugin, so setup
@@ -98,6 +104,20 @@ fn plugin_is_installed_for_platform_at(plugin: &Path, windows: bool) -> bool {
         return false;
     };
     if contents != expected_contents {
+        return false;
+    }
+    if std::fs::read_to_string(plugin.join("mcp.json"))
+        .ok()
+        .as_deref()
+        != Some(MCP_MANIFEST)
+    {
+        return false;
+    }
+    if std::fs::read_to_string(plugin.join("logo.svg"))
+        .ok()
+        .as_deref()
+        != Some(LOGO)
+    {
         return false;
     }
     #[cfg(unix)]
@@ -213,6 +233,8 @@ fn install_plugin_at_for_platform(plugin_dir: &Path, windows: bool) -> anyhow::R
         (".cursor-plugin/plugin.json", PLUGIN_MANIFEST.to_owned()),
         ("hooks/hooks.json", hooks_manifest),
         ("hooks/trace.sh", HOOK_LAUNCHER.to_owned()),
+        ("mcp.json", MCP_MANIFEST.to_owned()),
+        ("logo.svg", LOGO.to_owned()),
         ("README.md", README.to_owned()),
         ("LICENSE", LICENSE.to_owned()),
     ];
@@ -366,6 +388,7 @@ mod tests {
         .unwrap();
         assert!(plugin_is_installed_at(&plugin));
         assert!(is_ours(&manifest));
+        assert!(plugin.join("mcp.json").is_file());
     }
 
     #[test]
