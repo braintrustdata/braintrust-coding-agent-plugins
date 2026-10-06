@@ -304,20 +304,10 @@ fn plugin_activation_warning(agent: DoctorAgent, enabled: bool) -> Option<&'stat
     if !enabled {
         return None;
     }
-    match agent {
-        DoctorAgent::Grok => Some(
-            "Grok 1.0.13 requires `/reload-plugins` in each active session after plugin installation or update before its hooks become active",
-        ),
-        DoctorAgent::Cursor
-            if !crate::setup::cursor::plugin_is_installed_at(&crate::paths::cursor_plugin_dir())
-                || !crate::setup::cursor::discovery_hooks_are_installed_at(
-                    &crate::paths::cursor_config_dir(),
-                ) =>
-        {
-            Some("Cursor tracing plugin or lifecycle hooks are missing; run `bt trace enable cursor`")
-        }
-        _ => None,
-    }
+    crate::agents::registrar()
+        .setup
+        .get(agent.identity().id)
+        .and_then(|setup| setup.activation_warning())
 }
 
 /// Bounds `doctor`'s status query to the running daemon.
@@ -441,7 +431,7 @@ fn daemon_warnings(
     daemon: &DaemonDiagnostic,
     resolves_locally: bool,
 ) -> Vec<String> {
-    let (source, display_name) = (agent.source(), agent.display_name());
+    let (source, display_name) = (agent.identity().id, agent.identity().display_name);
     if daemon.status == DaemonStatus::Unreachable {
         return vec![format!(
             "could not reach the tracing daemon: {}",
@@ -508,7 +498,7 @@ async fn doctor_output_at(
     args: DoctorArgs,
     socket: &Path,
 ) -> DoctorCommandOutput {
-    let source = args.agent.source();
+    let source = args.agent.identity().id;
     let settings_path = paths::agent_settings_path(source, None);
     let settings_present = settings_path.exists();
     let settings = crate::settings::AgentSettings::load(source);
@@ -620,7 +610,7 @@ async fn doctor_output_at(
 
     DoctorCommandOutput {
         source: source.into(),
-        display_name: args.agent.display_name().into(),
+        display_name: args.agent.identity().display_name.into(),
         settings_path,
         settings_present,
         enabled,

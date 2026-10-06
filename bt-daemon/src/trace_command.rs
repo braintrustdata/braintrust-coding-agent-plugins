@@ -4,6 +4,7 @@
 //! integrations they control. Hosts such as `bt` provide global auth flags and
 //! dispatch these commands without duplicating agent-specific CLI knowledge.
 
+use crate::agents::{self, Agent, Identity};
 use crate::{HookArgs, ImportArgs, RunArgs, ServeArgs, StatusArgs};
 use clap::{Args, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -74,27 +75,15 @@ pub enum DoctorAgent {
 }
 
 impl DoctorAgent {
-    pub(crate) fn source(self) -> &'static str {
+    pub(crate) fn identity(self) -> &'static Identity {
         match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::OpenCode => "opencode",
-            Self::Pi => "pi",
-            Self::Antigravity => "antigravity",
-            Self::Grok => "grok",
-            Self::Cursor => "cursor",
-        }
-    }
-
-    pub(crate) fn display_name(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex",
-            Self::Claude => "Claude Code",
-            Self::OpenCode => "OpenCode",
-            Self::Pi => "Pi",
-            Self::Antigravity => "Google Antigravity",
-            Self::Grok => "Grok",
-            Self::Cursor => "Cursor",
+            Self::Codex => agents::Codex.identity(),
+            Self::Claude => agents::Claude.identity(),
+            Self::OpenCode => agents::OpenCode.identity(),
+            Self::Pi => agents::Pi.identity(),
+            Self::Antigravity => agents::Antigravity.identity(),
+            Self::Grok => agents::Grok.identity(),
+            Self::Cursor => agents::Cursor.identity(),
         }
     }
 }
@@ -152,6 +141,20 @@ pub enum SetupAgent {
     Cursor,
     /// Install the Google Antigravity tracing hooks.
     Antigravity,
+}
+
+impl SetupAgent {
+    pub(crate) fn identity(self) -> &'static Identity {
+        match self {
+            Self::Codex => agents::Codex.identity(),
+            Self::Claude => agents::Claude.identity(),
+            Self::OpenCode => agents::OpenCode.identity(),
+            Self::Pi => agents::Pi.identity(),
+            Self::Grok => agents::Grok.identity(),
+            Self::Cursor => agents::Cursor.identity(),
+            Self::Antigravity => agents::Antigravity.identity(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -323,8 +326,8 @@ mod tests {
                 cli.trace.command,
                 TraceCommand::Doctor(DoctorArgs { agent }) if agent == expected
             ));
-            assert_eq!(expected.source(), source);
-            assert_eq!(expected.display_name(), display_name);
+            assert_eq!(expected.identity().id, source);
+            assert_eq!(expected.identity().display_name, display_name);
         }
     }
 

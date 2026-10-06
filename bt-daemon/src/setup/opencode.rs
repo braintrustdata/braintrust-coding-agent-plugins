@@ -1,8 +1,10 @@
 //! OpenCode: the npm plugin listed in `opencode.json`. OpenCode installs it
 //! from that entry, so no OpenCode CLI is involved.
 
-use super::common::{edit_object, npm_major_spec, plugin_source, FileAccess};
+use super::common::{edit_object, npm_major_spec, plugin_source, CommandRunner, FileAccess};
+use crate::agents::OpenCode;
 use crate::paths;
+use crate::setup::Setup;
 use anyhow::bail;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -86,33 +88,35 @@ fn disable_at(path: &Path) -> anyhow::Result<()> {
     })
 }
 
-pub(super) fn enable() -> anyhow::Result<()> {
-    enable_at(&config_path())
-}
+impl Setup for OpenCode {
+    fn enable(&self, _runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        enable_at(&config_path())
+    }
 
-pub(super) fn disable() -> anyhow::Result<()> {
-    disable_at(&config_path())
-}
+    fn disable(&self, _runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        disable_at(&config_path())
+    }
 
-pub(super) fn update() -> anyhow::Result<()> {
-    update_at(&config_path())
-}
+    fn update(&self, _runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
+        update_at(&config_path())
+    }
 
-/// Whether `opencode.json` pins a version other than the bundled one.
-pub(super) fn stale() -> bool {
-    let Ok(raw) = std::fs::read(config_path()) else {
-        return false;
-    };
-    let Ok(config) = serde_json::from_slice::<Value>(&raw) else {
-        return false;
-    };
-    let expected = plugin_spec().ok();
-    config
-        .get("plugin")
-        .and_then(Value::as_array)
-        .and_then(|plugins| plugins.iter().find(|plugin| is_ours(plugin)))
-        .and_then(Value::as_str)
-        .is_some_and(|plugin| Some(plugin) != expected.as_deref())
+    /// Whether `opencode.json` pins a version other than the bundled one.
+    fn stale(&self) -> bool {
+        let Ok(raw) = std::fs::read(config_path()) else {
+            return false;
+        };
+        let Ok(config) = serde_json::from_slice::<Value>(&raw) else {
+            return false;
+        };
+        let expected = plugin_spec().ok();
+        config
+            .get("plugin")
+            .and_then(Value::as_array)
+            .and_then(|plugins| plugins.iter().find(|plugin| is_ours(plugin)))
+            .and_then(Value::as_str)
+            .is_some_and(|plugin| Some(plugin) != expected.as_deref())
+    }
 }
 
 #[cfg(test)]

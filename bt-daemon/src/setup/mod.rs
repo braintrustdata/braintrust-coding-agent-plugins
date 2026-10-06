@@ -1,9 +1,8 @@
 //! Persistent installation and configuration for coding-agent tracing plugins.
 //!
-//! Each agent's adapter lives in its own module and exposes `enable`,
-//! `disable`, and `update`; agents that can detect an outdated installation
-//! also expose `stale`. This module dispatches to them and owns the
-//! Braintrust settings file every agent shares.
+//! Each agent implements [`Setup`] in its own module. This module dispatches
+//! to them through the agent registry and owns the Braintrust settings file
+//! every agent shares.
 
 mod antigravity;
 mod claude;
@@ -14,60 +13,64 @@ mod grok;
 mod opencode;
 pub(crate) mod pi;
 
+use crate::agents::{registrar, Agent};
 use crate::paths;
 use crate::trace_command::{EnableArgs, SetupAgent};
 use crate::wire::SessionRoute;
 use crate::TraceCommandOutput;
 use anyhow::Context;
+pub(crate) use common::CommandRunner;
 use common::{load_object, write_object_atomic_with, FileAccess, SystemCommandRunner};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-/// The settings source name and display name for an agent.
-fn agent_details(agent: SetupAgent) -> (&'static str, &'static str) {
-    match agent {
-        SetupAgent::Codex => ("codex", "Codex"),
-        SetupAgent::Claude => ("claude", "Claude Code"),
-        SetupAgent::OpenCode => ("opencode", "OpenCode"),
-        SetupAgent::Pi => ("pi", "Pi"),
-        SetupAgent::Grok => ("grok", "Grok"),
-        SetupAgent::Cursor => ("cursor", "Cursor"),
-        SetupAgent::Antigravity => ("antigravity", "Google Antigravity"),
+/// One agent's tracing adapter. Implemented in each agent's setup module and
+/// registered in [`crate::agents`].
+pub(crate) trait Setup: Agent {
+    /// Install or refresh the published adapter.
+    fn enable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()>;
+    /// Remove the adapter if it is the Braintrust one.
+    fn disable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()>;
+    /// Update an installed adapter. Must not install or enable it.
+    fn update(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()>;
+    /// Whether the installed adapter is older than the one this build installs.
+    fn stale(&self) -> bool {
+        false
     }
+    /// A problem that keeps an enabled adapter from tracing, for `doctor`.
+    fn activation_warning(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+fn adapter(agent: SetupAgent) -> &'static dyn Setup {
+    let name = agent.identity().id;
+    registrar()
+        .setup
+        .get(name)
+        .unwrap_or_else(|| panic!("no setup adapter is registered for {name}"))
 }
 
 /// A warning when the agent's installed tracing plugin is older than the one
 /// this build would install.
 pub(crate) fn update_warning(source: &str) -> Option<String> {
-    let stale = match source {
-        "codex" => codex::stale(),
-        "claude" => claude::stale(),
-        "opencode" => opencode::stale(),
-        "pi" => pi::stale(),
-        "cursor" => cursor::stale(),
-        _ => false,
-    };
+    let stale = registrar()
+        .setup
+        .get(source)
+        .is_some_and(|agent| agent.stale());
     stale.then(|| format!("tracing plugin is out of date; run `bt trace update {source}`"))
 }
 
 /// Install or refresh one agent's published tracing adapter and persist its
 /// non-secret route selection.
 pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<TraceCommandOutput> {
-    let mut runner = SystemCommandRunner;
-    match args.agent {
-        SetupAgent::Codex => codex::enable(&mut runner)?,
-        SetupAgent::Claude => claude::enable(&mut runner)?,
-        SetupAgent::OpenCode => opencode::enable()?,
-        SetupAgent::Pi => pi::enable(&mut runner)?,
-        SetupAgent::Grok => grok::enable(&mut runner)?,
-        SetupAgent::Cursor => cursor::enable()?,
-        SetupAgent::Antigravity => antigravity::enable(&mut runner)?,
-    }
-    let (source, display_name) = agent_details(args.agent);
-    let settings_path = enable_tracing(source, route)?;
+    let agent = adapter(args.agent);
+    agent.enable(&mut SystemCommandRunner)?;
+    let identity = agent.identity();
+    let settings_path = enable_tracing(identity.id, route)?;
     Ok(TraceCommandOutput::setup(
-        source,
-        display_name,
+        identity.id,
+        identity.display_name,
         settings_path,
     ))
 }
@@ -79,22 +82,14 @@ pub fn run_setup(args: EnableArgs, route: SessionRoute) -> anyhow::Result<TraceC
 
 /// Uninstall an agent's tracing adapter and remove its Braintrust-owned settings.
 pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
-    let mut runner = SystemCommandRunner;
-    let adapter_result = match agent {
-        SetupAgent::Codex => codex::disable(&mut runner),
-        SetupAgent::Claude => claude::disable(&mut runner),
-        SetupAgent::OpenCode => opencode::disable(),
-        SetupAgent::Pi => pi::disable(&mut runner),
-        SetupAgent::Grok => grok::disable(&mut runner),
-        SetupAgent::Cursor => cursor::disable(),
-        SetupAgent::Antigravity => antigravity::disable(&mut runner),
-    };
-    let (source, display_name) = agent_details(agent);
-    let settings_path = paths::agent_settings_path(source, None);
+    let agent = adapter(agent);
+    let adapter_result = agent.disable(&mut SystemCommandRunner);
+    let identity = agent.identity();
+    let settings_path = paths::agent_settings_path(identity.id, None);
     finish_disable(adapter_result, &settings_path)?;
     Ok(TraceCommandOutput::disable(
-        source,
-        display_name,
+        identity.id,
+        identity.display_name,
         settings_path,
     ))
 }
@@ -102,18 +97,13 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
 /// Update an already installed tracing adapter without writing tracing settings,
 /// enabling a disabled plugin, or creating an agent configuration file.
 pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
-    let mut runner = SystemCommandRunner;
-    match agent {
-        SetupAgent::Codex => codex::update(&mut runner)?,
-        SetupAgent::Claude => claude::update(&mut runner)?,
-        SetupAgent::OpenCode => opencode::update()?,
-        SetupAgent::Pi => pi::update(&mut runner)?,
-        SetupAgent::Grok => grok::update(&mut runner)?,
-        SetupAgent::Cursor => cursor::update()?,
-        SetupAgent::Antigravity => antigravity::update(&mut runner)?,
-    }
-    let (source, display_name) = agent_details(agent);
-    Ok(TraceCommandOutput::update(source, display_name))
+    let agent = adapter(agent);
+    agent.update(&mut SystemCommandRunner)?;
+    let identity = agent.identity();
+    Ok(TraceCommandOutput::update(
+        identity.id,
+        identity.display_name,
+    ))
 }
 
 fn enable_tracing(source: &str, route: SessionRoute) -> anyhow::Result<PathBuf> {
@@ -196,6 +186,21 @@ fn finish_disable(adapter_result: anyhow::Result<()>, settings_path: &Path) -> a
 mod tests {
     use super::*;
     use crate::wire::{AuthSelection, TraceDestination};
+
+    #[test]
+    fn every_setup_subcommand_has_a_registered_adapter() {
+        for agent in [
+            SetupAgent::Codex,
+            SetupAgent::Claude,
+            SetupAgent::OpenCode,
+            SetupAgent::Pi,
+            SetupAgent::Grok,
+            SetupAgent::Cursor,
+            SetupAgent::Antigravity,
+        ] {
+            assert_eq!(adapter(agent).identity().id, agent.identity().id);
+        }
+    }
 
     #[test]
     fn tracing_settings_preserve_unrelated_fields_and_remove_legacy_keys() {

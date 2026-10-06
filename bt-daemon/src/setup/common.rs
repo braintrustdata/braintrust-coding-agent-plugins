@@ -20,7 +20,7 @@ macro_rules! plugin_source {
 pub(super) use plugin_source;
 
 /// Runs agent CLIs. Tests substitute a recording fake.
-pub(super) trait CommandRunner {
+pub(crate) trait CommandRunner {
     fn json(&mut self, program: &str, args: &[&str]) -> anyhow::Result<Value>;
     fn json_in_home(&mut self, program: &str, args: &[&str], home: &Path) -> anyhow::Result<Value>;
     fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<()>;
@@ -98,14 +98,14 @@ pub(super) struct Marketplace {
 }
 
 impl Marketplace {
-    fn list(&self, runner: &mut impl CommandRunner) -> anyhow::Result<Value> {
+    fn list(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
         runner.json(self.program, &["plugin", "marketplace", "list", "--json"])
     }
 
     /// Configure the published marketplace, refreshing it when it is already
     /// present. A same-name marketplace from another source is replaced;
     /// returns whether that happened.
-    pub fn reconcile(&self, runner: &mut impl CommandRunner) -> anyhow::Result<bool> {
+    pub fn reconcile(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<bool> {
         let marketplaces = self.list(runner)?;
         let replaced = match (self.find)(&marketplaces) {
             Some(marketplace) if (self.is_published)(marketplace) => {
@@ -136,7 +136,7 @@ impl Marketplace {
     /// run `bt trace enable <agent>` instead.
     pub fn refresh_published(
         &self,
-        runner: &mut impl CommandRunner,
+        runner: &mut dyn CommandRunner,
         display_name: &str,
         agent: &str,
     ) -> anyhow::Result<()> {

@@ -12,6 +12,7 @@
 
 pub mod paths;
 
+mod agents;
 mod args;
 mod client;
 mod command_output;
