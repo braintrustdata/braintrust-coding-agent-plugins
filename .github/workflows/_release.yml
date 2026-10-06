@@ -138,6 +138,8 @@ jobs:
           if output="$(gh api "repos/$DIST_REPO/git/ref/tags/$DIST_TAG" 2>&1)"; then
             echo "::error::tag $DIST_TAG already exists in $DIST_REPO."
             exit 1
+          elif [[ "$output" == *"Git Repository is empty."* && "$output" == *"HTTP 409"* ]]; then
+            echo "::notice::$DIST_REPO is empty; no distribution release tag exists yet."
           elif [[ "$output" != *"HTTP 404"* ]]; then
             printf '%s\n' "$output" >&2
             exit 1
