@@ -10,8 +10,9 @@
 mod antigravity;
 mod claude;
 mod codex;
-mod cursor;
+pub(crate) mod cursor;
 mod debug;
+mod decode;
 mod git;
 mod grok;
 mod opencode;
