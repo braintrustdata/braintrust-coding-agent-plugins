@@ -241,7 +241,8 @@ impl JournalWriter {
                 anyhow::anyhow!("create journal directory {}: {error}", dir.display())
             })?;
         }
-        truncate_incomplete_tail(path)?;
+        truncate_incomplete_tail(path)
+            .map_err(|error| anyhow::anyhow!("prepare journal {}: {error}", path.display()))?;
         let mut options = tokio::fs::OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
