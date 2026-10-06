@@ -308,8 +308,8 @@ fn plugin_activation_warning(agent: DoctorAgent, enabled: bool) -> Option<&'stat
             "Grok 1.0.13 requires `/reload-plugins` in each active session after plugin installation or update before its hooks become active",
         ),
         DoctorAgent::Cursor
-            if !crate::setup::cursor_plugin_is_installed_at(&crate::paths::cursor_plugin_dir())
-                || !crate::setup::cursor_discovery_hooks_are_installed_at(
+            if !crate::setup::cursor::plugin_is_installed_at(&crate::paths::cursor_plugin_dir())
+                || !crate::setup::cursor::discovery_hooks_are_installed_at(
                     &crate::paths::cursor_config_dir(),
                 ) =>
         {

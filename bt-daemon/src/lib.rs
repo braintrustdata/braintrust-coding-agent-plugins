@@ -1031,7 +1031,7 @@ pub async fn run_traced(
     // discovery entries for this process and remove only our own entries when
     // the managed run exits.
     let _cursor_hooks = if args.source == RunSource::Cursor {
-        Some(crate::setup::CursorManagedHooks::install(
+        Some(crate::setup::cursor::CursorManagedHooks::install(
             &paths::cursor_config_dir(),
             &managed_run_id,
         )?)
@@ -1159,7 +1159,7 @@ fn managed_run_args(
         RunSource::Pi => {
             let extension = match std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC") {
                 Some(extension) => extension,
-                None => OsString::from(crate::setup::pi_plugin_spec()),
+                None => OsString::from(crate::setup::pi::plugin_spec()),
             };
             Ok(vec![OsString::from("-e"), extension])
         }
@@ -2716,7 +2716,7 @@ mod tests {
             managed_run_args(RunSource::Pi, &test_run_hook_command(), None).unwrap(),
             vec![
                 OsString::from("-e"),
-                OsString::from(crate::setup::pi_plugin_spec()),
+                OsString::from(crate::setup::pi::plugin_spec()),
             ]
         );
     }
