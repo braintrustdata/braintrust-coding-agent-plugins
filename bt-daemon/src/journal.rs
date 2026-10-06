@@ -43,7 +43,7 @@ pub(crate) fn sanitize(s: &str) -> String {
         .collect()
 }
 
-pub(crate) const MAX_FILE_NAME_BYTES: usize = 160;
+pub(crate) const MAX_FILE_NAME_BYTES: usize = 240;
 
 pub fn journal_path(data_dir: &Path, session_id: &str) -> PathBuf {
     journal_dir(data_dir).join(format!("{}.ndjson", sanitize(session_id)))
