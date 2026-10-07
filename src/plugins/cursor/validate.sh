@@ -51,7 +51,10 @@ expected = {
 assert set(config['hooks']) == expected
 for event, registrations in config['hooks'].items():
     assert registrations == [{
-        'command': 'bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000',
+        'command': ('bt trace hook --source cursor '
+                    f'--event {event} --session-id-field conversation_id '
+                    '--event-field hook_event_name --transcript-path-field transcript_path '
+                    '--flush-on-turn-end --capture-timeout-ms 8000'),
         'timeout': 10,
         'failClosed': False,
     }]
