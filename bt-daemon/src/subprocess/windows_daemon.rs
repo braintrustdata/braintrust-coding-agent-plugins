@@ -41,7 +41,7 @@ pub(crate) fn spawn_detached_daemon(
         stderr.as_raw_handle() as HANDLE,
     ];
 
-    let attributes = HandleList::new(&handles)?;
+    let mut attributes = HandleList::new(&handles)?;
     let application = wide_nul(program)?;
     let mut command_line = command_line(program, args)?;
     let mut startup = STARTUPINFOEXW::default();
@@ -50,7 +50,7 @@ pub(crate) fn spawn_detached_daemon(
     startup.StartupInfo.hStdInput = handles[0];
     startup.StartupInfo.hStdOutput = handles[1];
     startup.StartupInfo.hStdError = handles[2];
-    startup.lpAttributeList = attributes.as_ptr();
+    startup.lpAttributeList = attributes.as_mut_ptr();
     let mut process = PROCESS_INFORMATION::default();
 
     // SAFETY: All pointers refer to live, writable buffers. The allowlisted
@@ -121,14 +121,14 @@ impl HandleList {
             initialized: false,
         };
         // SAFETY: The allocated aligned buffer has the size requested above.
-        if unsafe { InitializeProcThreadAttributeList(list.as_ptr(), 1, 0, &mut bytes) } == 0 {
+        if unsafe { InitializeProcThreadAttributeList(list.as_mut_ptr(), 1, 0, &mut bytes) } == 0 {
             return Err(io::Error::last_os_error());
         }
         list.initialized = true;
         // SAFETY: The handle array stays alive until process creation returns.
         if unsafe {
             UpdateProcThreadAttribute(
-                list.as_ptr(),
+                list.as_mut_ptr(),
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                 handles.as_ptr().cast(),
@@ -143,8 +143,8 @@ impl HandleList {
         Ok(list)
     }
 
-    fn as_ptr(&self) -> *mut core::ffi::c_void {
-        self.storage.as_ptr().cast_mut().cast()
+    fn as_mut_ptr(&mut self) -> *mut core::ffi::c_void {
+        self.storage.as_mut_ptr().cast()
     }
 }
 
@@ -152,7 +152,7 @@ impl Drop for HandleList {
     fn drop(&mut self) {
         if self.initialized {
             // SAFETY: Initialization succeeded before this flag was set.
-            unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+            unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
         }
     }
 }
