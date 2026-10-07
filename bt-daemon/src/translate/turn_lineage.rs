@@ -5,39 +5,45 @@
 //! and on every descendant, including nested subagent activity, so a turn's
 //! cost can be aggregated with a flat filter instead of a tree walk.
 //!
-//! The outermost turn wins: a subagent's own turns roll up to the user turn
-//! that spawned them. A row whose ancestry is not yet known is remembered and
-//! re-emitted as a late merge once its parent resolves.
+//! A span's turn is always derived from what is known so far: its parent's
+//! turn if the parent has one, otherwise itself if it is a turn root. The
+//! outermost turn therefore wins, so a subagent's own turns roll up to the user
+//! turn that spawned them. Rows can arrive in any order; whenever a span's turn
+//! changes, its affected descendants are corrected with late merges.
 //!
 //! Translator state is rebuilt by journal replay, which also replays through
 //! this wrapper, so the lineage maps need no persistence of their own.
 
 use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const TURN_SPAN_ID_KEY: &str = "turn_span_id";
-const LATE_MERGE_KEY: &str = "turn_lineage";
+const LATE_MERGE_KEY_PREFIX: &str = "turn_lineage";
 
-struct Unresolved {
+struct Identity {
     root_span_id: String,
     parent_span_ids: Vec<String>,
 }
 
 pub(crate) struct TurnLineage {
     inner: Box<dyn AgentTranslator>,
-    turn_of: HashMap<String, String>,
+    identity: HashMap<String, Identity>,
     parent_of: HashMap<String, String>,
-    unresolved_children: HashMap<String, HashMap<String, Unresolved>>,
+    children: HashMap<String, Vec<String>>,
+    turn_roots: HashSet<String>,
+    turn_of: HashMap<String, String>,
 }
 
 impl TurnLineage {
     pub(crate) fn new(inner: Box<dyn AgentTranslator>) -> Self {
         Self {
             inner,
-            turn_of: HashMap::new(),
+            identity: HashMap::new(),
             parent_of: HashMap::new(),
-            unresolved_children: HashMap::new(),
+            children: HashMap::new(),
+            turn_roots: HashSet::new(),
+            turn_of: HashMap::new(),
         }
     }
 
@@ -47,70 +53,90 @@ impl TurnLineage {
             let is_insert = matches!(op, SpanOp::Insert(_));
             let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut op;
             let span_id = row.span_id.clone();
-            let already_stamped = self.turn_of.contains_key(&span_id);
-            let turn = self.resolve(row);
+            self.observe(row);
+            let previous = self.turn_of.get(&span_id).cloned();
+            let turn = self.derive(&span_id);
             // Merges keep earlier metadata, so only rows that create or replace
-            // a span, or the first row to resolve it, need the key.
-            if let Some(turn) = turn.as_ref().filter(|_| is_insert || !already_stamped) {
+            // a span, or that change its turn, need the key.
+            if let Some(turn) = turn
+                .as_ref()
+                .filter(|turn| is_insert || previous.as_ref() != Some(*turn))
+            {
                 set_turn(row, turn);
+                self.turn_of.insert(span_id.clone(), turn.clone());
             }
             out.push(op);
-            if let Some(turn) = turn {
-                self.release_children(&span_id, &turn, &mut out);
+            if turn.is_some() && turn != previous {
+                self.correct_descendants(&span_id, &mut out);
             }
         }
         out
     }
 
-    fn resolve(&mut self, row: &SpanRow) -> Option<String> {
+    fn observe(&mut self, row: &SpanRow) {
+        if row.turn_root {
+            self.turn_roots.insert(row.span_id.clone());
+        }
+        let identity = self
+            .identity
+            .entry(row.span_id.clone())
+            .or_insert_with(|| Identity {
+                root_span_id: row.root_span_id.clone(),
+                parent_span_ids: Vec::new(),
+            });
+        if identity.parent_span_ids.is_empty() {
+            identity.parent_span_ids = row.parent_span_ids.clone();
+        }
         if let Some(parent) = row.parent_span_ids.first() {
-            self.parent_of
-                .entry(row.span_id.clone())
-                .or_insert_with(|| parent.clone());
-        }
-        if let Some(turn) = self.turn_of.get(&row.span_id) {
-            return Some(turn.clone());
-        }
-        let parent = self.parent_of.get(&row.span_id).cloned();
-        let inherited = parent
-            .as_ref()
-            .and_then(|parent| self.turn_of.get(parent))
-            .cloned();
-        let Some(turn) = inherited.or_else(|| row.turn_root.then(|| row.span_id.clone())) else {
-            if let Some(parent) = parent {
-                self.unresolved_children
-                    .entry(parent)
+            if !self.parent_of.contains_key(&row.span_id) {
+                self.parent_of.insert(row.span_id.clone(), parent.clone());
+                self.children
+                    .entry(parent.clone())
                     .or_default()
-                    .entry(row.span_id.clone())
-                    .or_insert_with(|| Unresolved {
-                        root_span_id: row.root_span_id.clone(),
-                        parent_span_ids: row.parent_span_ids.clone(),
-                    });
+                    .push(row.span_id.clone());
             }
-            return None;
-        };
-        self.turn_of.insert(row.span_id.clone(), turn.clone());
-        Some(turn)
+        }
     }
 
-    fn release_children(&mut self, span_id: &str, turn: &str, out: &mut Vec<SpanOp>) {
-        let mut resolved = vec![span_id.to_owned()];
-        while let Some(parent) = resolved.pop() {
-            let Some(children) = self.unresolved_children.remove(&parent) else {
+    fn derive(&self, span_id: &str) -> Option<String> {
+        let inherited = self
+            .parent_of
+            .get(span_id)
+            .and_then(|parent| self.turn_of.get(parent));
+        inherited.cloned().or_else(|| {
+            self.turn_roots
+                .contains(span_id)
+                .then(|| span_id.to_owned())
+        })
+    }
+
+    fn correct_descendants(&mut self, span_id: &str, out: &mut Vec<SpanOp>) {
+        let mut changed = vec![span_id.to_owned()];
+        while let Some(parent) = changed.pop() {
+            let Some(children) = self.children.get(&parent).cloned() else {
                 continue;
             };
-            for (child, unresolved) in children {
-                self.turn_of.insert(child.clone(), turn.to_owned());
+            for child in children {
+                let Some(turn) = self.derive(&child) else {
+                    continue;
+                };
+                if self.turn_of.get(&child) == Some(&turn) {
+                    continue;
+                }
+                self.turn_of.insert(child.clone(), turn.clone());
+                let Some(identity) = self.identity.get(&child) else {
+                    continue;
+                };
                 let mut row = SpanRow {
                     span_id: child.clone(),
-                    root_span_id: unresolved.root_span_id,
-                    parent_span_ids: unresolved.parent_span_ids,
-                    late_merge_key: Some(LATE_MERGE_KEY.into()),
+                    root_span_id: identity.root_span_id.clone(),
+                    parent_span_ids: identity.parent_span_ids.clone(),
+                    late_merge_key: Some(format!("{LATE_MERGE_KEY_PREFIX}:{turn}")),
                     ..Default::default()
                 };
-                set_turn(&mut row, turn);
+                set_turn(&mut row, &turn);
                 out.push(SpanOp::Merge(row));
-                resolved.push(child);
+                changed.push(child);
             }
         }
     }
@@ -221,6 +247,15 @@ mod tests {
             .collect()
     }
 
+    fn late_merge_keys(ops: &[SpanOp]) -> Vec<&str> {
+        ops.iter()
+            .filter_map(|op| match op {
+                SpanOp::Merge(row) => row.late_merge_key.as_deref(),
+                SpanOp::Insert(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn stamps_turn_and_all_descendants() {
         let ops = run(vec![vec![
@@ -264,14 +299,59 @@ mod tests {
         ]);
         assert_eq!(turn_of(&ops, "llm"), [None, Some("turn".into())]);
         assert_eq!(turn_of(&ops, "child"), [None, Some("turn".into())]);
-        let late: Vec<_> = ops
-            .iter()
-            .filter_map(|op| match op {
-                SpanOp::Merge(row) => row.late_merge_key.as_deref(),
-                SpanOp::Insert(_) => None,
-            })
-            .collect();
-        assert_eq!(late, [LATE_MERGE_KEY, LATE_MERGE_KEY]);
+        assert_eq!(
+            late_merge_keys(&ops),
+            ["turn_lineage:turn", "turn_lineage:turn"]
+        );
+    }
+
+    #[test]
+    fn subagent_turn_emitted_before_its_spawn_span_is_corrected_to_the_user_turn() {
+        let ops = run(vec![
+            vec![SpanOp::Insert(turn("user-turn", "root"))],
+            vec![
+                SpanOp::Insert(turn("subagent-turn", "spawn")),
+                SpanOp::Insert(row("subagent-llm", Some("subagent-turn"), SpanType::Llm)),
+            ],
+            vec![SpanOp::Insert(row(
+                "spawn",
+                Some("user-turn"),
+                SpanType::Tool,
+            ))],
+        ]);
+        assert_eq!(
+            turn_of(&ops, "subagent-turn"),
+            [Some("subagent-turn".into()), Some("user-turn".into())]
+        );
+        assert_eq!(
+            turn_of(&ops, "subagent-llm"),
+            [Some("subagent-turn".into()), Some("user-turn".into())]
+        );
+    }
+
+    #[test]
+    fn each_correction_of_a_span_gets_its_own_late_merge_key() {
+        let ops = run(vec![
+            vec![SpanOp::Insert(turn("inner", "middle"))],
+            vec![SpanOp::Insert(turn("middle", "outer"))],
+            vec![SpanOp::Insert(turn("outer", "root"))],
+        ]);
+        assert_eq!(
+            turn_of(&ops, "inner"),
+            [
+                Some("inner".into()),
+                Some("middle".into()),
+                Some("outer".into())
+            ]
+        );
+        assert_eq!(
+            late_merge_keys(&ops),
+            [
+                "turn_lineage:middle",
+                "turn_lineage:outer",
+                "turn_lineage:outer"
+            ]
+        );
     }
 
     #[test]

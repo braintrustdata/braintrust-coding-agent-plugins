@@ -5,7 +5,7 @@ use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::json;
-use span_identity::assert_merges_preserve_insert_identity;
+use span_identity::{assert_merges_preserve_insert_identity, assert_turn_lineage};
 use std::collections::HashMap;
 
 fn event(name: &str, ts_ms: i64, payload: serde_json::Value) -> Envelope {
@@ -102,6 +102,7 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
     for event in events {
         ops.extend(translator.handle(&event, &ctx).unwrap());
     }
+    assert!(assert_turn_lineage(&ops, |row| row.name.starts_with("Turn ")) >= 3);
     let rows = reduce(ops);
     assert_eq!(
         rows.values()
@@ -359,6 +360,7 @@ fn opencode_child_sessions_share_the_parent_trace_root() {
             )
             .unwrap(),
     );
+    assert!(assert_turn_lineage(&ops, |row| row.name.starts_with("Turn ")) >= 2);
     let rows = reduce(ops);
     let parent = rows.values().find(|r| r.name == "OpenCode").unwrap();
     let child = rows

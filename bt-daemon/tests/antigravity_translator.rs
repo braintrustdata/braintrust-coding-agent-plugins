@@ -5,7 +5,7 @@ use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
-use span_identity::assert_merges_preserve_insert_identity;
+use span_identity::{assert_merges_preserve_insert_identity, assert_turn_lineage};
 use std::collections::HashMap;
 
 fn jsonl(records: &[Value]) -> (String, Vec<u64>) {
@@ -282,6 +282,7 @@ fn hooks_and_full_transcript_build_model_and_tool_spans() {
             .unwrap(),
     );
 
+    assert!(assert_turn_lineage(&ops, |row| row.name.starts_with("Turn ")) >= 3);
     let rows = reduce(ops);
     let root = rows
         .values()

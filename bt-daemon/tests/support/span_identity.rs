@@ -48,9 +48,11 @@ pub(crate) fn assert_merges_preserve_insert_identity(ops: &[SpanOp]) {
     IdentityLedger::default().check(ops);
 }
 
-/// Every span with a turn ancestor (or that is a turn) carries the outermost
-/// such turn's id, and spans outside any turn carry none. Returns how many
-/// spans were stamped so callers can assert the fixture exercised lineage.
+/// Every span with a turn ancestor (or that is a turn) ends up carrying the
+/// outermost such turn's id, and spans outside any turn carry none. A later
+/// row may correct an earlier stamp, so the last value written wins. Returns
+/// how many spans were stamped so callers can assert the fixture exercised
+/// lineage.
 #[allow(dead_code)]
 pub(crate) fn assert_turn_lineage(ops: &[SpanOp], is_turn: impl Fn(&SpanRow) -> bool) -> usize {
     let mut parent_of = HashMap::<String, String>::new();
@@ -74,12 +76,7 @@ pub(crate) fn assert_turn_lineage(ops: &[SpanOp], is_turn: impl Fn(&SpanRow) -> 
             .and_then(|metadata| metadata.get(TURN_SPAN_ID_KEY))
             .and_then(Value::as_str);
         if let Some(turn) = turn {
-            let previous = stamped.insert(row.span_id.clone(), turn.to_owned());
-            assert!(
-                previous.as_deref().is_none_or(|previous| previous == turn),
-                "span {} moved between turns",
-                row.span_id
-            );
+            stamped.insert(row.span_id.clone(), turn.to_owned());
         }
     }
     for span in &spans {
