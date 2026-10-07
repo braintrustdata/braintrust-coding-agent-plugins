@@ -755,6 +755,7 @@ impl OpenCodeTranslator {
             metadata: Some(
                 json!({"turn_number":state.turn_number,"model":model,"loaded_skill_names":skills}),
             ),
+            turn_root: true,
             ..Default::default()
         }));
         ops

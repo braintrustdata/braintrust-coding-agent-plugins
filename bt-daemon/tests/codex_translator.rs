@@ -14,7 +14,7 @@ use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, FlushMode, SessionConfig, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
-use span_identity::assert_merges_preserve_insert_identity;
+use span_identity::{assert_merges_preserve_insert_identity, assert_turn_lineage};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -1536,6 +1536,8 @@ fn codex_subagent_with_malformed_optional_type_nests_under_spawning_turn() {
     );
 
     assert_merges_preserve_insert_identity(&ops);
+    // The subagent's own turn and model call roll up to the spawning user turn.
+    assert!(assert_turn_lineage(&ops, |row| row.name.starts_with("turn: ")) >= 5);
     let rows = reduce(ops);
 
     let root = find(&rows, SpanType::Task, "codex: app");

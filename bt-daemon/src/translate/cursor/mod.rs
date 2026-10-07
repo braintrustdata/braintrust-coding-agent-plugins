@@ -361,6 +361,7 @@ impl CursorTranslator {
         row.metadata = Some(
             json!({"turn_boundary_source":origin, "start_time_estimated":origin != "beforeSubmitPrompt", "generation_id":generation}),
         );
+        row.turn_root = true;
         ops.push(SpanOp::Insert(row));
         let turn = Turn {
             ordinal: self.turn_seq,

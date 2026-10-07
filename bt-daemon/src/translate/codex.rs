@@ -830,6 +830,7 @@ impl CodexTranslator {
             span_type: SpanType::Task,
             start_ms: Some(ts),
             metadata: Some(json!({ "turn_id": turn_id, "model": scope.model })),
+            turn_root: true,
             ..Default::default()
         }));
         scope.open_turns.push(OpenTurn {

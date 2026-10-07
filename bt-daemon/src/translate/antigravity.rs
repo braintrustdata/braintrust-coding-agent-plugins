@@ -224,6 +224,7 @@ impl AntigravityTranslator {
             start_ms: Some(ts_ms),
             input: nonempty_value(input),
             metadata: Some(json!({"turn_number": self.turn_count})),
+            turn_root: true,
             ..Default::default()
         }));
         self.turn = Some(Turn {

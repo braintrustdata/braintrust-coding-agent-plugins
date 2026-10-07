@@ -616,6 +616,7 @@ impl PiTranslator {
             start_ms: Some(ts),
             input: Some(input),
             metadata: Some(metadata),
+            turn_root: true,
             ..Default::default()
         }));
         ops

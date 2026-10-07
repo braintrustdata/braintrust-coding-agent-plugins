@@ -488,6 +488,7 @@ impl GrokTranslator {
                     start_ms: Some(ts_ms),
                     input,
                     metadata: Some(json!({"transcript_turn_key": turn_key})),
+                    turn_root: true,
                     ..Default::default()
                 }));
                 self.current_turn = Some(OpenTurn {

@@ -524,6 +524,7 @@ impl ClaudeTranslator {
             start_ms: Some(event.ts_ms),
             input: event.payload.get("prompt").cloned(),
             metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
+            turn_root: true,
             ..Default::default()
         }));
         let turn_id = Arc::new(id.clone());

@@ -3,7 +3,7 @@ mod span_identity;
 
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
-use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
+use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType, TURN_SPAN_ID_KEY};
 use serde_json::json;
 use span_identity::assert_merges_preserve_insert_identity;
 use std::collections::HashMap;
@@ -226,7 +226,7 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
     // Only allowlisted request configuration and the available tools reach
     // metadata, never the provider payload's instructions or messages.
     assert_eq!(
-        metadata_without(first_llm, &[]),
+        metadata_without(first_llm, &[TURN_SPAN_ID_KEY]),
         json!({
             "model": "gpt-5",
             "provider": "openai",
@@ -950,7 +950,7 @@ fn pi_llm_metadata_selects_request_configuration_across_provider_payloads() {
             .values()
             .find(|row| row.span_type == SpanType::Llm && row.start_ms == Some(start))
             .unwrap();
-        metadata_without(row, &["model", "provider"])
+        metadata_without(row, &["model", "provider", TURN_SPAN_ID_KEY])
     };
     let read = |strict: Option<bool>| {
         let mut function = json!({"name":"read","description":"Read","parameters":schema});

@@ -62,6 +62,7 @@ impl AgentTranslator for DebugTranslator {
                 metrics: None,
                 error: None,
                 late_merge_key: None,
+                turn_root: false,
                 tags: None,
             }));
         }
@@ -83,6 +84,7 @@ impl AgentTranslator for DebugTranslator {
             metrics: None,
             error: None,
             late_merge_key: None,
+            turn_root: false,
             tags: None,
         }));
 
