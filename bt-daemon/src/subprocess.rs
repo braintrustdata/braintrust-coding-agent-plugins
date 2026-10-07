@@ -11,6 +11,11 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
+#[cfg(windows)]
+mod windows_daemon;
+#[cfg(windows)]
+pub(crate) use windows_daemon::spawn_detached_daemon;
+
 pub(crate) fn background_command(program: impl AsRef<OsStr>) -> Command {
     let command = Command::new(program);
     #[cfg(windows)]
@@ -30,30 +35,22 @@ pub(crate) fn interactive_command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
 
-/// Only daemon startup may detach; ordinary background children must use
-/// `background_command` so redirected pipes keep their normal semantics.
+/// Unix daemon startup detaches from the hook's process group. Windows daemon
+/// startup uses `spawn_detached_daemon` to constrain inherited handles.
+#[cfg(unix)]
 pub(crate) fn detached_daemon_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
     command
 }
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{background_command, detached_daemon_command, interactive_command};
+    use super::{background_command, interactive_command};
     use std::io::{Read, Write};
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
     use std::process::Stdio;
 
     fn has_console() -> bool {
@@ -117,7 +114,11 @@ mod tests {
                 assert!(String::from_utf8_lossy(&output.stderr).contains("metadata diagnostic"));
             }
             _ => {
-                let output = detached_daemon_command(std::env::current_exe().unwrap())
+                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                let mut detached = Command::new(std::env::current_exe().unwrap());
+                detached.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+                let output = detached
                     .args(["--exact", TEST, "--nocapture"])
                     .env(ROLE, "detached")
                     .output()

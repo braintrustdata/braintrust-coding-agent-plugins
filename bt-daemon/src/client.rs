@@ -173,8 +173,6 @@ pub async fn ensure_daemon(
 }
 
 fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
-    use std::process::Stdio;
-
     let (exe, rest) = host
         .serve_argv
         .split_first()
@@ -188,22 +186,38 @@ fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
         .open(data_dir.join("serve.log"))
         .ok();
 
-    let mut cmd = crate::subprocess::detached_daemon_command(exe);
-    cmd.args(rest);
-    cmd.arg("--socket").arg(socket);
-    cmd.stdin(Stdio::null());
-    match log {
-        Some(f) => {
-            let f2 = f.try_clone()?;
-            cmd.stdout(Stdio::from(f));
-            cmd.stderr(Stdio::from(f2));
-        }
-        None => {
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
-        }
+    #[cfg(windows)]
+    {
+        let mut args = rest.to_vec();
+        args.push("--socket".into());
+        args.push(socket.as_os_str().to_owned());
+        // A hook's stdout/stderr are pipes owned by the agent. Windows normally
+        // inherits every inheritable handle, even when the daemon's standard
+        // streams are redirected to serve.log. The daemon must not keep those
+        // hook pipes open after the short-lived hook process exits.
+        crate::subprocess::spawn_detached_daemon(exe, &args, log)?;
     }
-    cmd.spawn()?;
+    #[cfg(not(windows))]
+    {
+        use std::process::Stdio;
+
+        let mut cmd = crate::subprocess::detached_daemon_command(exe);
+        cmd.args(rest);
+        cmd.arg("--socket").arg(socket);
+        cmd.stdin(Stdio::null());
+        match log {
+            Some(f) => {
+                let f2 = f.try_clone()?;
+                cmd.stdout(Stdio::from(f));
+                cmd.stderr(Stdio::from(f2));
+            }
+            None => {
+                cmd.stdout(Stdio::null());
+                cmd.stderr(Stdio::null());
+            }
+        }
+        cmd.spawn()?;
+    }
     Ok(())
 }
 
