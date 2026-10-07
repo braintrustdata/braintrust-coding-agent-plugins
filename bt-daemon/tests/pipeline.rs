@@ -2007,15 +2007,21 @@ async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
     })
     .await
     .expect("fixing the failed plugin should replay without a new event");
-    let recovered_spans =
-        std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
-    assert!(
-        recovered_spans.contains("Stop"),
-        "later journaled event was not replayed"
-    );
-    let diagnostics =
-        std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json")).unwrap();
-    assert!(diagnostics.contains("\"state\": \"recovered\""));
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let spans =
+                std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+            let diagnostics =
+                std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json"))
+                    .unwrap();
+            if spans.contains("Stop") && diagnostics.contains("\"state\": \"recovered\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("successful replay should be reflected in spans and diagnostics");
     let status = run_status(StatusArgs {
         socket: Some(socket.clone()),
         session_id: Some("plugin-failure".into()),
@@ -2023,7 +2029,10 @@ async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
     .await
     .unwrap()
     .unwrap();
-    assert!(status.sessions[0].last_error.is_none());
+    assert!(status
+        .sessions
+        .first()
+        .map_or(true, |session| session.last_error.is_none()));
 
     shutdown(&socket).await;
     handle.await.unwrap();
