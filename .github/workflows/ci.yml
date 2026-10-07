@@ -62,7 +62,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-26, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
@@ -237,17 +237,37 @@ jobs:
           PI_EXTENSION_PATH: ${{ runner.temp }}/pi-install-test/node_modules/@braintrust/pi-extension/dist/index.mjs
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration pi_session_emits_traces -- --ignored --nocapture --exact
 
+  resolve-coding-agent-versions:
+    name: Resolve coding-agent versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      codex: ${{ steps.versions.outputs.codex }}
+      claude: ${{ steps.versions.outputs.claude }}
+      opencode: ${{ steps.versions.outputs.opencode }}
+      pi: ${{ steps.versions.outputs.pi }}
+    steps:
+      - id: versions
+        name: Resolve latest coding-agent versions
+        run: |
+          set -euo pipefail
+          echo "codex=$(npm view @openai/codex version)" >> "$GITHUB_OUTPUT"
+          echo "claude=$(npm view @anthropic-ai/claude-code version)" >> "$GITHUB_OUTPUT"
+          echo "opencode=$(npm view opencode-ai version)" >> "$GITHUB_OUTPUT"
+          echo "pi=$(npm view @earendil-works/pi-coding-agent version)" >> "$GITHUB_OUTPUT"
+
   daemon:
     name: Daemon (${{ matrix.os }})
+    needs: resolve-coding-agent-versions
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
             agent_suffix: ""
-          - os: macos-latest
+          - os: macos-26
             agent_suffix: ""
-          - os: windows-latest
+          - os: windows-2025
             agent_suffix: ".cmd"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -281,8 +301,15 @@ jobs:
         with:
           workspaces: ${{ runner.os == 'Windows' && 'bt-daemon -> ../.devdrive/target' || 'bt-daemon -> target' }}
           save-if: ${{ github.event_name != 'pull_request' }}
-      - name: Install latest coding agents
-        run: npm install --prefix "${{ runner.temp }}/coding-agents" --no-save --no-package-lock --no-audit --no-fund --cache "${{ runner.temp }}/npm-cache" @openai/codex@latest @anthropic-ai/claude-code@latest opencode-ai@latest @earendil-works/pi-coding-agent@latest
+      - name: Install resolved coding agents
+        run: |
+          npm install --prefix "${{ runner.temp }}/coding-agents" \
+            --no-save --no-package-lock --no-audit --no-fund \
+            --cache "${{ runner.temp }}/npm-cache" \
+            "@openai/codex@${{ needs.resolve-coding-agent-versions.outputs.codex }}" \
+            "@anthropic-ai/claude-code@${{ needs.resolve-coding-agent-versions.outputs.claude }}" \
+            "opencode-ai@${{ needs.resolve-coding-agent-versions.outputs.opencode }}" \
+            "@earendil-works/pi-coding-agent@${{ needs.resolve-coding-agent-versions.outputs.pi }}"
       - name: Ensure Codex platform binary is available
         shell: bash
         run: |
@@ -299,8 +326,9 @@ jobs:
             if npm install --prefix "$agent_dir" --no-save --no-package-lock --no-audit --no-fund \
               --cache "${{ runner.temp }}/npm-cache" \
               "@openai/codex@$codex_version" "$platform_spec" \
-              @anthropic-ai/claude-code@latest opencode-ai@latest \
-              @earendil-works/pi-coding-agent@latest; then
+              "@anthropic-ai/claude-code@${{ needs.resolve-coding-agent-versions.outputs.claude }}" \
+              "opencode-ai@${{ needs.resolve-coding-agent-versions.outputs.opencode }}" \
+              "@earendil-works/pi-coding-agent@${{ needs.resolve-coding-agent-versions.outputs.pi }}"; then
               exit 0
             fi
             if test "$attempt" = 6; then
@@ -374,3 +402,36 @@ jobs:
       - name: Lint daemon
         if: runner.os != 'macOS'
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings
+
+  checks-passed:
+    name: checks-passed
+    needs:
+      - plugins
+      - js-packages
+      - opencode-compatibility
+      - resolve-pi-compatibility
+      - pi-compatibility
+      - resolve-coding-agent-versions
+      - daemon
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    steps:
+      - name: Verify all required checks passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=0
+          while IFS=$'\t' read -r job result; do
+            if [ "$result" != "success" ]; then
+              echo "Job '$job' finished with result: $result"
+              failed=1
+            fi
+          done < <(jq -r 'to_entries[] | [.key, .value.result] | @tsv' <<< "$NEEDS")
+
+          if [ "$failed" -ne 0 ]; then
+            echo "One or more required checks failed or were skipped"
+            exit 1
+          fi
+
+          echo "All required checks passed"
