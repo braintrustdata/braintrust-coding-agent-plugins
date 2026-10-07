@@ -80,11 +80,12 @@ pub struct SpanRow {
     #[serde(skip)]
     #[doc(hidden)]
     pub late_merge_key: Option<String>,
-    /// Translator-only marker for the span that opens a user turn.
-    /// [`turn_lineage`] stamps its id onto the turn and every descendant.
+    /// Span id of the user turn that owns this row, recorded by the translator
+    /// from its native turn tracking. [`turn_lineage`] publishes it as
+    /// `metadata.turn_span_id`.
     #[serde(skip)]
     #[doc(hidden)]
-    pub turn_root: bool,
+    pub turn_span_id: Option<String>,
     /// Labels for filtering in Braintrust (e.g. `compaction`, `permission-request`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,

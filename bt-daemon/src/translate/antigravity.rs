@@ -224,7 +224,7 @@ impl AntigravityTranslator {
             start_ms: Some(ts_ms),
             input: nonempty_value(input),
             metadata: Some(json!({"turn_number": self.turn_count})),
-            turn_root: true,
+            turn_span_id: Some(span_id.clone()),
             ..Default::default()
         }));
         self.turn = Some(Turn {
@@ -275,6 +275,7 @@ impl AntigravityTranslator {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: vec![parent.clone()],
+            turn_span_id: Some(parent.clone()),
             name: model,
             span_type: SpanType::Llm,
             start_ms: Some(event.ts_ms),
@@ -334,6 +335,7 @@ impl AntigravityTranslator {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: vec![parent.clone()],
+            turn_span_id: Some(parent.clone()),
             name: name.clone(),
             span_type: SpanType::Tool,
             start_ms: Some(event.ts_ms),
@@ -394,6 +396,7 @@ impl AntigravityTranslator {
                 span_id: span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
                 parent_span_ids: vec![parent.clone()],
+                turn_span_id: Some(parent.clone()),
                 name: name.clone(),
                 span_type: SpanType::Tool,
                 start_ms: Some(recovered_start_ms.unwrap_or(event.ts_ms)),

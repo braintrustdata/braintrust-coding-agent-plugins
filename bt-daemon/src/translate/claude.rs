@@ -264,6 +264,8 @@ struct ClaudeTranslator {
     continuation_count: u32,
     last_user_turn_id: Option<String>,
     agent_origins: RecentMap<String, AgentOrigin>,
+    /// User turn owning each turn or subagent span that can parent other spans.
+    span_owners: RecentMap<String, String>,
     user_turn_ends: RecentMap<String, i64>,
     prompt_turns: RecentMap<String, Arc<String>>,
     pending_prompts: VecDeque<PendingPrompt>,
@@ -309,6 +311,7 @@ impl ClaudeTranslator {
             continuation_count: 0,
             last_user_turn_id: None,
             agent_origins: RecentMap::default(),
+            span_owners: RecentMap::default(),
             user_turn_ends: RecentMap::default(),
             tool_seq: 0,
             prompt_turns: RecentMap::default(),
@@ -515,6 +518,7 @@ impl ClaudeTranslator {
             metadata.insert("turn_trigger".into(), json!(trigger));
             metadata.insert("task_id".into(), json!(task_id));
         }
+        let owner = user_turn_id.clone().unwrap_or_else(|| id.clone());
         ops.push(SpanOp::Insert(SpanRow {
             span_id: id.clone(),
             root_span_id: self.root_span_id.clone(),
@@ -524,9 +528,10 @@ impl ClaudeTranslator {
             start_ms: Some(event.ts_ms),
             input: event.payload.get("prompt").cloned(),
             metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
-            turn_root: true,
+            turn_span_id: Some(owner.clone()),
             ..Default::default()
         }));
+        self.span_owners.insert(id.clone(), owner);
         let turn_id = Arc::new(id.clone());
         if let Some(prompt_id) = event.payload.get("prompt_id").and_then(Value::as_str) {
             self.prompt_turns
@@ -643,6 +648,10 @@ impl ClaudeTranslator {
         self.turn.as_ref().map(|turn| turn.id.clone())
     }
 
+    fn owner_of(&self, parent: &str) -> Option<String> {
+        self.span_owners.get(parent).cloned()
+    }
+
     fn ensure_subagent(
         &mut self,
         hook: &SubagentHook,
@@ -670,6 +679,10 @@ impl ClaudeTranslator {
                     .unwrap_or_else(|| self.last_user_turn_id.clone()),
             });
         let parent_id = origin.parent_id.clone();
+        let owner = origin
+            .user_turn_id
+            .clone()
+            .or_else(|| self.owner_of(&parent_id));
         self.agent_origins.insert(hook.agent_id.clone(), origin);
         let agent_type = hook.agent_type.clone().unwrap_or_else(|| "agent".into());
         let span_id = ids::span_id(&self.session_id, &format!("subagent:{}", hook.agent_id));
@@ -681,8 +694,12 @@ impl ClaudeTranslator {
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
             metadata: Some(json!({ "agent_id": hook.agent_id, "agent_type": agent_type })),
+            turn_span_id: owner.clone(),
             ..Default::default()
         }));
+        if let Some(owner) = owner {
+            self.span_owners.insert(span_id.clone(), owner);
+        }
         self.subagents.insert(
             hook.agent_id.clone(),
             Subagent {
@@ -720,6 +737,7 @@ impl ClaudeTranslator {
             start_ms: Some(event.ts_ms),
             input: Some(input.clone()),
             metadata: Some(metadata.clone()),
+            turn_span_id: self.owner_of(&parent_id),
             ..Default::default()
         }));
         self.pending_tools.insert(
@@ -772,6 +790,7 @@ impl ClaudeTranslator {
             ops.push(SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.session_id, &format!("tool:{call_id}")),
                 root_span_id: self.root_span_id.clone(),
+                turn_span_id: self.owner_of(&parent_id),
                 parent_span_ids: vec![parent_id],
                 name: tool_span_name(&tool_name, &input),
                 span_type: SpanType::Tool,
@@ -1039,11 +1058,13 @@ impl ClaudeTranslator {
                 } else {
                     parent
                 };
-                ops.push(SpanOp::Insert(call.into_row(
+                let mut row = call.into_row(
                     ids::span_id(&self.session_id, &span_key),
                     self.root_span_id.clone(),
                     parent.to_string(),
-                )));
+                );
+                row.turn_span_id = self.owner_of(parent);
+                ops.push(SpanOp::Insert(row));
             }
         }
         for tool in tools {
@@ -1072,11 +1093,13 @@ impl ClaudeTranslator {
                 } else {
                     parent
                 };
-                ops.push(SpanOp::Insert(tool.into_row(
+                let mut row = tool.into_row(
                     ids::span_id(&self.session_id, &span_key),
                     self.root_span_id.clone(),
                     parent.to_string(),
-                )));
+                );
+                row.turn_span_id = self.owner_of(parent);
+                ops.push(SpanOp::Insert(row));
             }
         }
     }

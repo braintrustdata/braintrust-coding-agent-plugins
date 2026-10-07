@@ -127,6 +127,7 @@ impl TranslatorFactory for crate::agents::Codex {
             // The main scope is created lazily once we learn its transcript path.
             scopes: HashMap::new(),
             spawn_turn_by_call_id: RecentMap::default(),
+            turn_owners: RecentMap::default(),
             spawn_turn_by_agent_id: RecentMap::default(),
             compaction_trigger_by_turn: RecentMap::default(),
             compaction_spans: RecentSet::default(),
@@ -187,7 +188,17 @@ struct Scope {
     agent_id: Option<String>,
     agent_type: Option<String>,
     spawning_turn_span_id: Option<String>,
+    /// User turn that owns this subagent's work; `None` for the main scope.
+    owner_turn_span_id: Option<String>,
     subagent_ended: bool,
+}
+
+impl Scope {
+    fn turn_owner(&self, turn_span_id: &str) -> String {
+        self.owner_turn_span_id
+            .clone()
+            .unwrap_or_else(|| turn_span_id.to_owned())
+    }
 }
 
 enum DeferredHook {
@@ -241,6 +252,7 @@ struct CodexTranslator {
     scopes: HashMap<String, Scope>,
     spawn_turn_by_call_id: RecentMap<String, String>,
     spawn_turn_by_agent_id: RecentMap<String, String>,
+    turn_owners: RecentMap<String, String>,
     compaction_trigger_by_turn: RecentMap<String, String>,
     compaction_spans: RecentSet<String>,
     pending: Option<PendingWork>,
@@ -541,6 +553,12 @@ impl CodexTranslator {
             .as_ref()
             .and_then(Value::as_str)
             .map(str::to_owned);
+        scope.owner_turn_span_id = (parent != self.root_span_id).then(|| {
+            self.turn_owners
+                .get(&parent)
+                .cloned()
+                .unwrap_or_else(|| parent.clone())
+        });
         scope.spawning_turn_span_id = Some(parent);
         self.scopes.insert(path, scope);
     }
@@ -798,6 +816,7 @@ impl CodexTranslator {
                     span_id: scope.turn_parent_span_id.clone(),
                     root_span_id: self.effective_root_span_id.clone(),
                     parent_span_ids: vec![parent],
+                    turn_span_id: scope.owner_turn_span_id.clone(),
                     name: format!("subagent: {agent_id}"),
                     span_type: SpanType::Task,
                     start_ms: Some(ts),
@@ -822,6 +841,8 @@ impl CodexTranslator {
             return;
         }
         let span_id = ids::span_id(&self.session_id, &format!("turn:{turn_id}"));
+        let owner = scope.turn_owner(&span_id);
+        self.turn_owners.insert(span_id.clone(), owner.clone());
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
@@ -830,7 +851,7 @@ impl CodexTranslator {
             span_type: SpanType::Task,
             start_ms: Some(ts),
             metadata: Some(json!({ "turn_id": turn_id, "model": scope.model })),
-            turn_root: true,
+            turn_span_id: Some(owner),
             ..Default::default()
         }));
         scope.open_turns.push(OpenTurn {
@@ -927,6 +948,7 @@ impl CodexTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
+            turn_span_id: Some(scope.turn_owner(&turn_span)),
             parent_span_ids: vec![turn_span],
             name,
             span_type: SpanType::Llm,
@@ -1090,6 +1112,7 @@ impl CodexTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
+            turn_span_id: Some(scope.turn_owner(&turn_span)),
             parent_span_ids: vec![turn_span],
             name,
             span_type: SpanType::Tool,
@@ -1335,6 +1358,7 @@ impl CodexTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
+            turn_span_id: Some(scope.turn_owner(&turn_span)),
             parent_span_ids: vec![turn_span.clone()],
             name: name.clone(),
             span_type: SpanType::Llm,
@@ -1520,6 +1544,7 @@ impl Scope {
             agent_id: None,
             agent_type: None,
             spawning_turn_span_id: None,
+            owner_turn_span_id: None,
             subagent_ended: false,
         }
     }

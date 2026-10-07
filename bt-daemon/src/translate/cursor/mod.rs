@@ -267,10 +267,13 @@ impl CursorTranslator {
         }
     }
     fn row(&self, id: String, parent: String, name: &str, kind: SpanType) -> SpanRow {
+        // Every non-root Cursor span is parented directly to its turn.
+        let turn_span_id = (parent != self.root).then(|| parent.clone());
         SpanRow {
             span_id: id,
             root_span_id: self.trace_root.clone(),
             parent_span_ids: vec![parent],
+            turn_span_id,
             name: name.into(),
             span_type: kind,
             ..Default::default()
@@ -361,7 +364,7 @@ impl CursorTranslator {
         row.metadata = Some(
             json!({"turn_boundary_source":origin, "start_time_estimated":origin != "beforeSubmitPrompt", "generation_id":generation}),
         );
-        row.turn_root = true;
+        row.turn_span_id = Some(id.clone());
         ops.push(SpanOp::Insert(row));
         let turn = Turn {
             ordinal: self.turn_seq,

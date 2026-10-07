@@ -476,6 +476,7 @@ impl PiTranslator {
                 ),
                 root_span_id: self.effective_root_span_id.clone(),
                 parent_span_ids: vec![turn.clone()],
+                turn_span_id: Some(turn.clone()),
                 name: "llm".into(),
                 span_type: SpanType::Llm,
                 start_ms: Some(pending.start_ms),
@@ -493,6 +494,7 @@ impl PiTranslator {
                 span_id: self.tool_span_id(&call),
                 root_span_id: self.effective_root_span_id.clone(),
                 parent_span_ids: vec![self.tool_parent(turn, tool.parent_call.as_deref())],
+                turn_span_id: Some(turn.clone()),
                 name: tool.name.clone(),
                 span_type: SpanType::Tool,
                 start_ms: Some(tool.start_ms),
@@ -608,7 +610,7 @@ impl PiTranslator {
         }
         self.turn = Some((id.clone(), skills));
         ops.push(SpanOp::Insert(SpanRow {
-            span_id: id,
+            span_id: id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![self.root_span_id.clone()],
             name: format!("Turn {}", self.turn_seq),
@@ -616,7 +618,7 @@ impl PiTranslator {
             start_ms: Some(ts),
             input: Some(input),
             metadata: Some(metadata),
-            turn_root: true,
+            turn_span_id: Some(id),
             ..Default::default()
         }));
         ops
@@ -738,6 +740,7 @@ impl PiTranslator {
             ),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![turn.clone()],
+            turn_span_id: Some(turn.clone()),
             name: model.clone().unwrap_or_else(|| "llm".into()),
             span_type: SpanType::Llm,
             start_ms: Some(pending.start_ms),
@@ -795,6 +798,7 @@ impl PiTranslator {
             span_id: self.tool_span_id(&id),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![parent],
+            turn_span_id: Some(turn.clone()),
             name: name.clone(),
             span_type: SpanType::Tool,
             start_ms: Some(ts),
@@ -834,6 +838,7 @@ impl PiTranslator {
             span_id: self.tool_span_id(&call),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![self.tool_parent(turn, tracked.parent_call.as_deref())],
+            turn_span_id: pending.is_none().then(|| turn.clone()),
             name,
             span_type: SpanType::Tool,
             start_ms: pending.is_none().then_some(tracked.start_ms),
