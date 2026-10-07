@@ -47,12 +47,7 @@ impl RecordingSinkFactory {
 }
 
 impl SinkFactory for RecordingSinkFactory {
-    fn create(
-        &self,
-        session_id: &str,
-        source: &str,
-        _plugin_version: Option<&str>,
-    ) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>> {
         let record = Arc::new(RecordedSession {
             source: source.into(),
             ..RecordedSession::default()

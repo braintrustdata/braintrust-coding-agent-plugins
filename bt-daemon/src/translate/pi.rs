@@ -613,6 +613,7 @@ impl PiTranslator {
             parent_span_ids: vec![self.root_span_id.clone()],
             name: format!("Turn {}", self.turn_seq),
             span_type: SpanType::Task,
+            is_turn: true,
             start_ms: Some(ts),
             input: Some(input),
             metadata: Some(metadata),

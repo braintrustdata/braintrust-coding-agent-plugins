@@ -32,12 +32,7 @@ struct TrackingSinkFactory {
 }
 
 impl SinkFactory for TrackingSinkFactory {
-    fn create(
-        &self,
-        session_id: &str,
-        _source: &str,
-        _plugin_version: Option<&str>,
-    ) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, session_id: &str, _source: &str) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(TrackingSink {
             session_id: session_id.to_string(),
             flushes: self.flushes.clone(),
@@ -67,7 +62,7 @@ impl Sink for SlowSink {
 struct SlowSinkFactory;
 
 impl SinkFactory for SlowSinkFactory {
-    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(SlowSink))
     }
 }
@@ -104,7 +99,7 @@ impl Sink for GateSink {
 }
 
 impl SinkFactory for GateSinkFactory {
-    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(GateSink {
             blocked: self.blocked.clone(),
             gate: self.gate.clone(),
@@ -149,12 +144,7 @@ struct RouteRecordingSinkFactory {
 }
 
 impl SinkFactory for RouteRecordingSinkFactory {
-    fn create(
-        &self,
-        _session_id: &str,
-        _source: &str,
-        _plugin_version: Option<&str>,
-    ) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, _session_id: &str, _source: &str) -> anyhow::Result<Box<dyn Sink>> {
         let record = Arc::new(RouteSinkRecord::default());
         self.sinks.lock().unwrap().push(record.clone());
         Ok(Box::new(RouteRecordingSink { record }))
@@ -2564,30 +2554,16 @@ esac
 }
 
 #[cfg(all(feature = "cli", unix))]
-type CreatedDebugSinks = Arc<Mutex<Vec<(String, String, Option<String>)>>>;
-
-#[cfg(all(feature = "cli", unix))]
 struct FlushTrackingDebugSinkFactory {
     inner: DebugSinkFactory,
     flushes: Arc<Mutex<HashMap<String, usize>>>,
-    created: CreatedDebugSinks,
 }
 
 #[cfg(all(feature = "cli", unix))]
 impl SinkFactory for FlushTrackingDebugSinkFactory {
-    fn create(
-        &self,
-        session_id: &str,
-        source: &str,
-        plugin_version: Option<&str>,
-    ) -> anyhow::Result<Box<dyn Sink>> {
-        self.created.lock().unwrap().push((
-            session_id.to_string(),
-            source.to_string(),
-            plugin_version.map(str::to_string),
-        ));
+    fn create(&self, session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(FlushTrackingDebugSink {
-            inner: self.inner.create(session_id, source, plugin_version)?,
+            inner: self.inner.create(session_id, source)?,
             session_id: session_id.to_string(),
             flushes: self.flushes.clone(),
         }))
@@ -2629,7 +2605,6 @@ async fn start_grok_debug_daemon_at(
     data_dir: PathBuf,
     socket: PathBuf,
     flushes: Arc<Mutex<HashMap<String, usize>>>,
-    created: CreatedDebugSinks,
 ) -> tokio::task::JoinHandle<()> {
     let args = ServeArgs {
         socket: Some(socket.clone()),
@@ -2645,7 +2620,6 @@ async fn start_grok_debug_daemon_at(
                 dir: data_dir.join("spans"),
             },
             flushes,
-            created,
         }),
         auth_provider: Some(Arc::new(TestAuthProvider {
             calls: Mutex::new(Vec::new()),
@@ -2847,14 +2821,7 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     });
 
     let flushes = Arc::new(Mutex::new(HashMap::new()));
-    let created = Arc::new(Mutex::new(Vec::new()));
-    let first = start_grok_debug_daemon_at(
-        data_dir.clone(),
-        socket.clone(),
-        flushes.clone(),
-        created.clone(),
-    )
-    .await;
+    let first = start_grok_debug_daemon_at(data_dir.clone(), socket.clone(), flushes.clone()).await;
     invoke_grok_hook(
         &socket,
         plugin_version,
@@ -2958,13 +2925,8 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
 
     std::fs::write(&primary_updates, &updates).unwrap();
     std::fs::write(&primary_events, &events).unwrap();
-    let second = start_grok_debug_daemon_at(
-        data_dir.clone(),
-        socket.clone(),
-        flushes.clone(),
-        created.clone(),
-    )
-    .await;
+    let second =
+        start_grok_debug_daemon_at(data_dir.clone(), socket.clone(), flushes.clone()).await;
     let primary_end = serde_json::json!({
         "sessionId": "grok-primary",
         "hookEventName": "session_end",
@@ -3228,12 +3190,6 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     let primary_text = std::fs::read_to_string(&primary_spans_path).unwrap();
     assert!(primary_text.contains("primary-route"));
     assert!(!primary_text.contains("decoy-route"));
-
-    let created = created.lock().unwrap().clone();
-    assert_eq!(created.len(), 3);
-    assert!(created.iter().all(|(_, source, version)| {
-        source == "grok" && version.as_deref() == Some(plugin_version)
-    }));
 
     shutdown(&socket).await;
     second.await.unwrap();

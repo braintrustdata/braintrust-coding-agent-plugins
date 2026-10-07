@@ -14,9 +14,9 @@ use crate::translate::{SpanOp, SpanRow, SpanType};
 use crate::wire::{SessionConfig, TraceDestination};
 use braintrust_sdk_rust::{
     BraintrustClient, ParentSpanInfo, SpanComponents, SpanHandle, SpanLog, SpanObjectType,
-    SpanOrigin, SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
+    SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
 };
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::Arc;
@@ -29,13 +29,11 @@ use tokio::sync::Mutex as AsyncMutex;
 pub struct BraintrustSinkConfig {
     pub api_url: Option<String>,
     pub app_url: Option<String>,
-    pub version: String,
 }
 
 /// Lazily-built, shared-by-URL client pool.
 struct ClientCache {
     state: AsyncMutex<ClientCacheState>,
-    version: String,
 }
 
 const CLIENT_CACHE_CAPACITY: usize = 16;
@@ -103,10 +101,9 @@ impl ClientCacheState {
 }
 
 impl ClientCache {
-    fn new(version: String) -> Self {
+    fn new() -> Self {
         Self {
             state: AsyncMutex::new(ClientCacheState::default()),
-            version,
         }
     }
 
@@ -125,7 +122,6 @@ impl ClientCache {
         }
         let client = BraintrustClient::builder()
             .skip_login(true)
-            .span_origin(SpanOrigin::new().version(self.version.clone()))
             .api_url(api_url.to_string())
             .app_url(app_url.to_string())
             .build()
@@ -147,32 +143,24 @@ pub struct BraintrustSinkFactory {
     cache: Arc<ClientCache>,
     default_api_url: Option<String>,
     default_app_url: Option<String>,
-    version: String,
 }
 
 impl BraintrustSinkFactory {
     pub fn new(cfg: BraintrustSinkConfig) -> Self {
         Self {
-            cache: Arc::new(ClientCache::new(cfg.version.clone())),
+            cache: Arc::new(ClientCache::new()),
             default_api_url: cfg.api_url,
             default_app_url: cfg.app_url,
-            version: cfg.version,
         }
     }
 }
 
 impl SinkFactory for BraintrustSinkFactory {
-    fn create(
-        &self,
-        _session_id: &str,
-        source: &str,
-        plugin_version: Option<&str>,
-    ) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, _session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(BraintrustSink {
             cache: self.cache.clone(),
             default_api_url: self.default_api_url.clone(),
             default_app_url: self.default_app_url.clone(),
-            version: plugin_version.unwrap_or(&self.version).to_string(),
             source: source.to_string(),
             creds: None,
             urls: None,
@@ -205,7 +193,6 @@ struct BraintrustSink {
     cache: Arc<ClientCache>,
     default_api_url: Option<String>,
     default_app_url: Option<String>,
-    version: String,
     source: String,
     creds: Option<Creds>,
     /// Resolved `(api_url, app_url)` for this session, from its config.
@@ -268,13 +255,6 @@ impl BraintrustSink {
         Ok(client)
     }
 
-    fn span_origin(&self) -> SpanOrigin {
-        SpanOrigin::new()
-            .name(format!("braintrust.plugin.{}", self.source))
-            .version(self.version.clone())
-            .instrumentation("braintrust-plugin")
-    }
-
     fn ensure_handle(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         if self.open.contains_key(&row.span_id) {
             return Ok(());
@@ -291,8 +271,7 @@ impl BraintrustSink {
             .span_type(map_span_type(row.span_type))
             .span_id(row.span_id.clone())
             .row_id(row.span_id.clone())
-            .parent_info(parent)
-            .span_origin(self.span_origin());
+            .parent_info(parent);
         if let Some(org_name) = &creds.org_name {
             builder = builder.org_name(org_name.clone());
         }
@@ -306,7 +285,7 @@ impl BraintrustSink {
     fn update_open(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         self.ensure_handle(client, row)?;
         let handle = self.open.get(&row.span_id).expect("just inserted");
-        handle.log(build_log(row, self.span_origin())?);
+        handle.log(build_log(row, &self.source, false)?);
         if let Some(end) = row.end_ms {
             handle.end_with_time(ms_to_secs(end));
             // SpanHandle retains the complete accumulated input/output. Once a
@@ -323,13 +302,25 @@ impl BraintrustSink {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("session has no credentials/config yet"))?;
         let project = self.project(creds);
-        let components = self.span_components(row, creds, &project).to_str();
+        let mut components = self.span_components(row, creds, &project);
+        if row.origin.is_none() {
+            // An attached parent's provenance is not the existing span's origin.
+            // Legacy spans have no birth snapshot with which to override it.
+            if let Some(context) = components
+                .propagated_event
+                .as_mut()
+                .and_then(|event| event.get_mut("context"))
+                .and_then(Value::as_object_mut)
+            {
+                context.remove("span_origin");
+            }
+        }
         client
             .update_span_with_credentials(
                 creds.token.clone(),
                 creds.org_id.clone(),
-                &components,
-                build_log(row, self.span_origin())?,
+                &components.to_str(),
+                build_log(row, &self.source, true)?,
             )
             .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))
     }
@@ -627,9 +618,26 @@ fn ms_to_secs(ms: i64) -> f64 {
     ms as f64 / 1000.0
 }
 
-fn build_log(row: &SpanRow, origin: SpanOrigin) -> anyhow::Result<SpanLog> {
-    // Repeat the plugin origin so stateless merges cannot use SDK defaults.
-    let mut builder = SpanLog::builder().span_origin(origin);
+fn build_log(row: &SpanRow, source: &str, is_merge: bool) -> anyhow::Result<SpanLog> {
+    let mut builder = SpanLog::builder();
+    if let Some(origin) = &row.origin {
+        // The ledger supplies the immutable birth snapshot on every root/turn op.
+        // Explicit null prevents SDK version defaults on spans with unknown
+        // plugin versions, including stateless merges after close or recovery.
+        builder = builder.context(json!({
+            "span_origin": {
+                "name": format!("braintrust.plugin.{source}"),
+                "version": origin.plugin_version,
+                "bt": { "version": origin.bt_version },
+                (source): { "version": origin.source_version },
+                "instrumentation": { "name": "braintrust-plugin" },
+            },
+        }));
+    } else if is_merge {
+        // An update without a saved snapshot must leave existing provenance
+        // untouched, not replace legacy plugin attribution with SDK defaults.
+        builder = builder.skip_span_origin();
+    }
 
     // The span's display name is carried on the log event, not the builder.
     // An empty name means "unchanged" (many merge ops use `..Default::default()`
@@ -702,4 +710,94 @@ fn serialized_len(op: &SpanOp) -> serde_json::Result<usize> {
     let mut counter = ByteCounter::default();
     serde_json::to_writer(&mut counter, op)?;
     Ok(counter.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translate::OriginSnapshot;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn root_context_retains_sdk_environment_on_insert_and_stateless_merge() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .api_url(server.uri())
+            .app_url(server.uri())
+            .environment("test", Some("sink-test"))
+            .build()
+            .await
+            .unwrap();
+        let row = SpanRow {
+            span_id: "root".into(),
+            root_span_id: "root".into(),
+            origin: Some(OriginSnapshot {
+                plugin_version: None,
+                bt_version: "birth-bt".into(),
+                source_version: None,
+            }),
+            ..Default::default()
+        };
+        let handle = client
+            .span_builder_with_credentials("sk-test", "org-test")
+            .span_id(row.span_id.clone())
+            .row_id(row.span_id.clone())
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "proj-test".into(),
+            })
+            .build();
+        handle.log(build_log(&row, "codex", false).unwrap());
+        handle.end_with_time(2.0);
+        client.flush().await.unwrap();
+
+        let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+        components.object_id = Some("proj-test".into());
+        components.row_id = Some(row.span_id.clone());
+        components.span_id = Some(row.span_id.clone());
+        components.root_span_id = Some(row.root_span_id.clone());
+        client
+            .update_span_with_credentials(
+                "sk-test",
+                "org-test",
+                &components.to_str(),
+                build_log(&row, "codex", true).unwrap(),
+            )
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let rows: Vec<Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/logs3")
+            .flat_map(|request| {
+                serde_json::from_slice::<Value>(&request.body).unwrap()["rows"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        assert!(rows.len() >= 2);
+        for row in rows {
+            let origin = &row["context"]["span_origin"];
+            assert_eq!(origin["name"], "braintrust.plugin.codex");
+            assert_eq!(origin.get("version"), Some(&Value::Null));
+            assert_eq!(origin["bt"]["version"], "birth-bt");
+            assert_eq!(
+                origin["environment"],
+                json!({"type": "test", "name": "sink-test"})
+            );
+        }
+    }
 }

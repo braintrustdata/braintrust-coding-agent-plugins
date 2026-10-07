@@ -221,6 +221,7 @@ impl AntigravityTranslator {
             parent_span_ids: vec![self.session_span_id.clone()],
             name: format!("Turn {}", self.turn_count),
             span_type: SpanType::Task,
+            is_turn: true,
             start_ms: Some(ts_ms),
             input: nonempty_value(input),
             metadata: Some(json!({"turn_number": self.turn_count})),
