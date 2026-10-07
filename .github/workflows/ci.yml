@@ -47,13 +47,35 @@ jobs:
             echo "OpenCode still contains a Bun lockfile" >&2
             exit 1
           fi
-      - name: Build and validate plugins
-        run: make test
-      - name: Build Cursor extension
-        working-directory: dist/cursor
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run build
+      # Each plugin writes only to its own dist/<plugin> directory.
+      - parallel:
+          - name: Build Antigravity package
+            run: make build-antigravity
+          - name: Build Claude package
+            run: make build-claude
+          - name: Build Codex package
+            run: make build-codex
+          - name: Build Cursor package
+            run: make build-cursor
+          - name: Build Grok package
+            run: make build-grok
+      # Validation and the Cursor extension build read independent artifacts.
+      - parallel:
+          - name: Validate Antigravity package
+            run: src/plugins/antigravity/validate.sh dist/antigravity
+          - name: Validate Claude package
+            run: src/plugins/claude/validate.sh dist/claude
+          - name: Validate Codex package
+            run: src/plugins/codex/validate.sh dist/codex
+          - name: Validate Cursor package
+            run: src/plugins/cursor/validate.sh dist/cursor
+          - name: Validate Grok package
+            run: src/plugins/grok/validate.sh dist/grok
+          - name: Build Cursor extension
+            working-directory: dist/cursor
+            run: |
+              npm ci --ignore-scripts --no-audit --no-fund
+              npm run build
 
   # Pi and OpenCode run inside the user's agent process, so their unit tests
   # run on every host OS. Packaging and validation stay in `plugins`.
@@ -79,25 +101,28 @@ jobs:
           cache-dependency-path: |
             src/plugins/opencode/content/pnpm-lock.yaml
             src/plugins/pi/content/pnpm-lock.yaml
-      - name: Test RPC transport contracts
-        run: node --test src/runtime/js-daemon-client/tests/client.test.ts
-      - name: Verify generated client preparation
+      - name: Prepare and verify generated client copies
         run: |
           node scripts/prepare-js-daemon-client.mjs all
           node scripts/prepare-js-daemon-client.mjs all --check
-      - name: Test Pi package
-        shell: bash
-        working-directory: src/plugins/pi/content
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm test
-      - name: Test OpenCode package
-        shell: bash
-        if: ${{ !cancelled() }}
-        working-directory: src/plugins/opencode/content
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm test
+      # Package installs write to separate node_modules trees. The RPC
+      # contract tests are read-only, so these checks can share the runner.
+      - parallel:
+          - name: Test RPC transport contracts
+            run: node --test src/runtime/js-daemon-client/tests/client.test.ts
+          - name: Test Pi package
+            shell: bash
+            working-directory: src/plugins/pi/content
+            run: |
+              pnpm install --frozen-lockfile
+              pnpm test
+          - name: Test OpenCode package
+            if: ${{ !cancelled() }}
+            shell: bash
+            working-directory: src/plugins/opencode/content
+            run: |
+              pnpm install --frozen-lockfile
+              pnpm test
       - name: Lint shared daemon client
         shell: bash
         working-directory: src/runtime/js-daemon-client
@@ -290,27 +315,29 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup component add clippy rustfmt
+      # Rust and agent CLI installs use separate toolchains and directories.
+      - parallel:
+          - name: Install Rust
+            run: |
+              rustup toolchain install stable --profile minimal
+              rustup default stable
+              rustup component add clippy rustfmt
+          - name: Install resolved coding agents
+            shell: bash
+            run: |
+              npm install --prefix "${{ runner.temp }}/coding-agents" \
+                --no-save --no-package-lock --no-audit --no-fund \
+                --cache "${{ runner.temp }}/npm-cache" \
+                "@openai/codex@${{ needs.resolve-coding-agent-versions.outputs.codex }}" \
+                "@anthropic-ai/claude-code@${{ needs.resolve-coding-agent-versions.outputs.claude }}" \
+                "opencode-ai@${{ needs.resolve-coding-agent-versions.outputs.opencode }}" \
+                "@earendil-works/pi-coding-agent@${{ needs.resolve-coding-agent-versions.outputs.pi }}"
       # PRs restore main's cache; pushes to main and manual runs refresh it.
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.os == 'Windows' && 'bt-daemon -> ../.devdrive/target' || 'bt-daemon -> target' }}
           save-if: ${{ github.event_name != 'pull_request' }}
-      - name: Install resolved coding agents
-        shell: bash
-        run: |
-          npm install --prefix "${{ runner.temp }}/coding-agents" \
-            --no-save --no-package-lock --no-audit --no-fund \
-            --cache "${{ runner.temp }}/npm-cache" \
-            "@openai/codex@${{ needs.resolve-coding-agent-versions.outputs.codex }}" \
-            "@anthropic-ai/claude-code@${{ needs.resolve-coding-agent-versions.outputs.claude }}" \
-            "opencode-ai@${{ needs.resolve-coding-agent-versions.outputs.opencode }}" \
-            "@earendil-works/pi-coding-agent@${{ needs.resolve-coding-agent-versions.outputs.pi }}"
       - name: Ensure Codex platform binary is available
         shell: bash
         run: |
