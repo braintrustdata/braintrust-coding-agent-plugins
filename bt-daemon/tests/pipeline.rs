@@ -2031,8 +2031,8 @@ async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
     .unwrap();
     assert!(status
         .sessions
-        .first()
-        .map_or(true, |session| session.last_error.is_none()));
+        .iter()
+        .all(|session| session.last_error.is_none()));
 
     shutdown(&socket).await;
     handle.await.unwrap();
