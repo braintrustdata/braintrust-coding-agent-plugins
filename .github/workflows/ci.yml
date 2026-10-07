@@ -302,6 +302,7 @@ jobs:
           workspaces: ${{ runner.os == 'Windows' && 'bt-daemon -> ../.devdrive/target' || 'bt-daemon -> target' }}
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install resolved coding agents
+        shell: bash
         run: |
           npm install --prefix "${{ runner.temp }}/coding-agents" \
             --no-save --no-package-lock --no-audit --no-fund \
