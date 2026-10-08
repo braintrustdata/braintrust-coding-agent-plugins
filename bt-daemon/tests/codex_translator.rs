@@ -22,6 +22,43 @@ fn line(v: Value) -> String {
     serde_json::to_string(&v).unwrap()
 }
 
+#[test]
+fn codex_optional_session_start_fields_allow_absence_but_reject_wrong_types() {
+    let registry = Registry::default_agents();
+    let ctx = SessionCtx {
+        session_id: "session-start-shape".into(),
+        config: None,
+    };
+    let mut absent_fields_translator = registry.create("codex", "session-start-shape");
+    assert!(absent_fields_translator
+        .handle(
+            &envelope(
+                "session-start-shape",
+                "SessionStart",
+                "/missing/rollout.jsonl",
+                json!({}),
+            ),
+            &ctx,
+        )
+        .is_ok());
+
+    let mut translator = registry.create("codex", "session-start-shape");
+    let error = translator
+        .handle(
+            &envelope(
+                "session-start-shape",
+                "SessionStart",
+                "/missing/rollout.jsonl",
+                json!({"source": 42}),
+            ),
+            &ctx,
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .starts_with("unsupported shape for SessionStart"));
+}
+
 fn expected_username() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -182,6 +219,10 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
         )
         .unwrap(),
     );
+    while let Some(batch) = tr.drain_pending(&ctx).unwrap() {
+        ops.extend(batch);
+    }
+    tr.restore(tr.snapshot().unwrap()).unwrap();
     // A later trigger (Stop) — nothing new in the transcript here.
     ops.extend(
         tr.handle(&envelope("sess-1", "Stop", tpath, json!({})), &ctx)

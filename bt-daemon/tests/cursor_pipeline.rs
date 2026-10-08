@@ -1,6 +1,9 @@
 //! Cursor hooks freeze native transcript observations before journal ingress.
 //! Recovery must use those mirrors even after native files change or disappear.
 
+#[path = "support/ledger.rs"]
+mod ledger;
+
 use async_trait::async_trait;
 use bt_daemon::wire::{
     AuthSelection, BackendAuth, Envelope, FlushMode, SessionRoute, TraceDestination,
@@ -417,7 +420,6 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
     ] {
         send_with_flush_mode(&socket, event, ts_ms, payload, FlushMode::FlushOnTurnEnd).await;
     }
-    let journal = source_journal_path(&data, "cursor", "cursor-recovery");
     // Ingress acknowledges capture before the out-of-band sink flush finishes.
     // Wait for delivery and its checkpoint without requesting an explicit flush.
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
@@ -425,24 +427,13 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
             let delivered = buffered.lock().unwrap().delivered.iter().any(|op| {
                 matches!(op, SpanOp::Merge(row) if row.output == Some(json!("late final answer")))
             });
-            let text = std::fs::read_to_string(&journal).unwrap_or_default();
-            let mut position = 0;
-            let mut response_through = None;
-            let mut checkpoint_through = 0;
-            for line in text.split_inclusive('\n') {
-                position += line.len() as u64;
-                let Ok(row) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                if row["event"] == "afterAgentResponse" {
-                    response_through = Some(position);
-                }
-                if row.get("_bt_record_type").is_some() {
-                    checkpoint_through =
-                        checkpoint_through.max(row["through"].as_u64().unwrap_or(0));
-                }
-            }
-            if delivered && response_through.is_some_and(|offset| checkpoint_through >= offset) {
+            let checkpointed =
+                rusqlite::Connection::open(ledger::database(&data, "cursor", "cursor-recovery"))
+                    .and_then(|db| {
+                        db.query_row("SELECT COUNT(*) FROM batches", [], |r| r.get::<_, i64>(0))
+                    })
+                    .is_ok_and(|pending| pending == 0);
+            if delivered && checkpointed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -525,7 +516,7 @@ async fn repeated_transcript_prompt_is_delivered_as_a_second_turn_after_checkpoi
 }
 
 #[tokio::test]
-async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_recovery() {
+async fn cursor_continuation_survives_collected_input_and_deleted_native_history() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     let socket = endpoint(tmp.path());
@@ -650,33 +641,15 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
         .iter()
         .all(|row| row["parent_span_ids"].as_array().unwrap().len() == 1));
     let journal = source_journal_path(&data, "cursor", "cursor-recovery");
-    let persisted = rows(&journal);
-    let observations = persisted
+    assert!(rows(&journal)
         .iter()
-        .filter(|row| row["event"] == "stop")
-        .map(|row| &row["payload"]["_bt_transcript_mirror"])
-        .collect::<Vec<_>>();
-    assert_eq!(observations.len(), 2);
-    assert_ne!(observations[0]["mirror"], observations[1]["mirror"]);
-    for observation in &observations {
-        assert_eq!(observation["through"], first.len());
-        assert!(Path::new(observation["mirror"].as_str().unwrap())
-            .starts_with(data.join("transcripts")));
-    }
+        .all(|row| row.get("_bt_wal_base").is_some()));
     assert!(!std::fs::read_to_string(&journal)
         .unwrap()
         .contains("cursor-test-secret"));
-
-    // Simulate a delivery loss: retain accepted ingress, discard sink receipts.
-    let pending = persisted
-        .iter()
-        .filter(|row| row.get("_bt_record_type").is_none())
-        .map(|row| format!("{row}\n"))
-        .collect::<String>();
-    std::fs::write(&journal, pending).unwrap();
-    std::fs::remove_dir_all(data.join("delivery-ledger")).unwrap();
     std::fs::remove_file(&native).unwrap();
-    std::fs::remove_file(&output).unwrap();
+    // All delivery was acknowledged. Restart relies on SQLite continuation, without native
+    // history or redelivery of already-collected span operations.
     let recovered_daemon = start(&data, &socket).await;
     assert!(
         flush_session("cursor-recovery", &socket, 5000)

@@ -832,6 +832,7 @@ fn resumed_process_reuses_invocation_zero_without_reparenting_to_turn_one() {
         ),
     ] {
         ops.extend(translator.handle(&hook, &ctx).unwrap());
+        translator.restore(translator.snapshot().unwrap()).unwrap();
     }
 
     let rows = reduce(ops);

@@ -67,7 +67,7 @@ struct BeforeAgentStart {
 
 /// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
 /// routes each request to a physical model.
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct SelectedModel {
     provider: String,
     id: String,
@@ -315,6 +315,17 @@ fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
 
+fn decode_required<T: DeserializeOwned>(event: &str, value: &Value) -> anyhow::Result<T> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        crate::translate::InputShapeError {
+            event: event.to_owned(),
+            detail: error.to_string(),
+        }
+        .into()
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingLlm {
     start_ms: i64,
     input: Value,
@@ -322,13 +333,14 @@ struct PendingLlm {
     request_config: Map<String, Value>,
     selected_model: Option<SelectedModel>,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ToolStart {
     start_ms: i64,
     name: String,
     args: Value,
     parent_call: Option<String>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PiTranslator {
     session_id: String,
     root_span_id: String,
@@ -351,13 +363,116 @@ struct PiTranslator {
     branch_summary: Option<(String, i64, Value)>,
     last_ts: i64,
     thinking_level: Option<String>,
+    #[serde(skip)]
     git: Arc<GitMetadataCache>,
 }
 
 impl AgentTranslator for PiTranslator {
+    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+
+    fn restore(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
+        let mut restored: Self = serde_json::from_value(snapshot)?;
+        restored.git = self.git.clone();
+        *self = restored;
+        Ok(())
+    }
+
     fn handle(&mut self, envelope: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
-        self.last_ts = self.last_ts.max(envelope.ts_ms);
+        if !matches!(
+            envelope.event.as_str(),
+            "session_start"
+                | "before_agent_start"
+                | "context"
+                | "before_provider_request"
+                | "message_update"
+                | "thinking_level_select"
+                | "message_end"
+                | "tool_execution_start"
+                | "tool_execution_end"
+                | "agent_end"
+                | "session_before_compact"
+                | "session_compact"
+                | "session_before_tree"
+                | "session_tree"
+                | "session_shutdown"
+        ) {
+            return Ok(Vec::new());
+        }
         let event = envelope.payload.get("event").unwrap_or(&envelope.payload);
+        if !event.is_object() {
+            return Err(crate::translate::InputShapeError {
+                event: envelope.event.clone(),
+                detail: "expected an event object".into(),
+            }
+            .into());
+        }
+        match envelope.event.as_str() {
+            "before_agent_start" => {
+                let _: BeforeAgentStart = decode_required(&envelope.event, event)?;
+            }
+            "context" => {
+                let _: ContextEvent = decode_required(&envelope.event, event)?;
+                if let Some(model) = envelope.payload.get("model") {
+                    let _: SelectedModel = decode_required(&envelope.event, model)?;
+                }
+            }
+            "message_update" => {
+                let _: MessageUpdate = decode_required(&envelope.event, event)?;
+            }
+            "thinking_level_select" => {
+                let _: ThinkingLevel = decode_required(&envelope.event, event)?;
+            }
+            "tool_execution_start" => {
+                let _: ToolExecutionStart = decode_required(&envelope.event, event)?;
+            }
+            "message_end" => {
+                let message = event.get("message").unwrap_or(event);
+                let role = message.get("role").and_then(Value::as_str);
+                if role.is_none_or(str::is_empty) {
+                    return Err(crate::translate::InputShapeError {
+                        event: envelope.event.clone(),
+                        detail: "missing required message role".into(),
+                    }
+                    .into());
+                }
+                // Pi emits system/user message_end notifications as well, but
+                // this translator only creates LLM spans from assistant
+                // messages. Preserve those unused message shapes without
+                // pausing the source session.
+                if role == Some("assistant") {
+                    decode_required::<AssistantMessage>(&envelope.event, message)?;
+                }
+            }
+            "tool_execution_end" => {
+                let end = decode_required::<ToolExecutionEnd>(&envelope.event, event)?;
+                if end.tool_call_id.as_deref().is_none_or(str::is_empty) {
+                    return Err(crate::translate::InputShapeError {
+                        event: envelope.event.clone(),
+                        detail: "missing required toolCallId".into(),
+                    }
+                    .into());
+                }
+            }
+            "agent_end" => {
+                let _: AgentEnd = decode_required(&envelope.event, event)?;
+            }
+            "session_before_compact" => {
+                let _: BeforeCompact = decode_required(&envelope.event, event)?;
+            }
+            "session_compact" => {
+                let _: SessionCompact = decode_required(&envelope.event, event)?;
+            }
+            "session_before_tree" => {
+                let _: BeforeTree = decode_required(&envelope.event, event)?;
+            }
+            "session_tree" => {
+                let _: SessionTree = decode_required(&envelope.event, event)?;
+            }
+            _ => {}
+        }
+        self.last_ts = self.last_ts.max(envelope.ts_ms);
         let mut ops = self.ensure_root(envelope, ctx);
         match envelope.event.as_str() {
             "before_agent_start" => {
@@ -389,14 +504,12 @@ impl AgentTranslator for PiTranslator {
             }
             "message_end" => ops.extend(self.message_end(event, envelope.ts_ms)),
             "tool_execution_start" => {
-                if let Some(event) = decode(event) {
-                    ops.extend(self.tool_start(event, envelope.ts_ms));
-                }
+                let event = decode_required("tool_execution_start", event)?;
+                ops.extend(self.tool_start(event, envelope.ts_ms));
             }
             "tool_execution_end" => {
-                if let Some(event) = decode(event) {
-                    ops.extend(self.tool_end(event, envelope.ts_ms));
-                }
+                let event = decode_required("tool_execution_end", event)?;
+                ops.extend(self.tool_end(event, envelope.ts_ms));
             }
             "agent_end" if decode::<AgentEnd>(event).is_none_or(|event| !event.will_retry) => {
                 ops.extend(self.close_turn(envelope.ts_ms, None));

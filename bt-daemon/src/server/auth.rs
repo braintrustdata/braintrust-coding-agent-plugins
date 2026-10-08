@@ -150,7 +150,9 @@ impl Daemon {
                     provider.as_ref(),
                     &selection,
                     AuthResolveReason::Initial,
-                    selection.org_name.as_deref(),
+                    // Report whether the daemon can resolve credentials. A
+                    // route's required org is a separate delivery failure.
+                    None,
                 )
                 .await
             }

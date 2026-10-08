@@ -171,6 +171,7 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
     let mut ops = Vec::new();
     for event in events {
         ops.extend(translator.handle(&event, &ctx).unwrap());
+        translator.restore(translator.snapshot().unwrap()).unwrap();
     }
     let rows = reduce(ops);
     assert_eq!(
@@ -636,7 +637,7 @@ fn pi_ignores_unknown_native_fields_at_typed_event_boundaries() {
 }
 
 #[test]
-fn pi_ignores_malformed_typed_events_without_failing_the_session() {
+fn pi_reports_malformed_required_tool_identity() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("pi", "pi-session");
     let ctx = SessionCtx {
@@ -650,9 +651,9 @@ fn pi_ignores_malformed_typed_events_without_failing_the_session() {
         )
         .unwrap();
 
-    // A future Pi version could change this identifier's representation. The
-    // raw event remains journaled, but a typed reducer must not fail the actor.
-    let ops = translator
+    // A changed identifier shape must pause translation so a newer daemon can
+    // reinterpret the journaled event instead of silently losing a tool.
+    let error = translator
         .handle(
             &event(
                 "tool_execution_start",
@@ -661,16 +662,36 @@ fn pi_ignores_malformed_typed_events_without_failing_the_session() {
             ),
             &ctx,
         )
-        .unwrap();
-    assert!(ops
-        .iter()
-        .all(|op| !matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Tool)));
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unsupported shape for tool_execution_start"));
+}
 
-    assert!(translator
-        .handle(&event("agent_end", 3, json!({})), &ctx)
-        .unwrap()
-        .iter()
-        .any(|op| matches!(op, SpanOp::Merge(row) if row.end_ms == Some(3))));
+#[test]
+fn pi_ignores_non_assistant_message_end_shapes_but_rejects_malformed_assistant_messages() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let system = event(
+        "message_end",
+        1,
+        json!({"type":"message_end","message":{"role":"system","content":"system prompt"}}),
+    );
+    assert!(translator.handle(&system, &ctx).is_ok());
+
+    let malformed_assistant = event(
+        "message_end",
+        2,
+        json!({"type":"message_end","message":{"role":"assistant","content":"unexpected string"}}),
+    );
+    let error = translator.handle(&malformed_assistant, &ctx).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unsupported shape for message_end"));
 }
 
 #[test]

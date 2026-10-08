@@ -73,6 +73,9 @@ impl Harness {
                 "transcript draining did not make bounded progress"
             );
         }
+        let snapshot = self.translator.snapshot().unwrap();
+        self.translator = Registry::default_agents().create("cursor", &self.ctx.session_id);
+        self.translator.restore(snapshot).unwrap();
     }
     fn finish(&mut self) {
         let ops = self.translator.finalize(&self.ctx).unwrap();
@@ -1868,7 +1871,8 @@ fn malformed_hooks_fail_the_event_instead_of_dropping_fields() {
             .unwrap_err()
             .to_string();
         assert!(
-            error.starts_with(&format!("unexpected cursor {kind} hook format")),
+            error.starts_with(&format!("unexpected cursor {kind} hook format"))
+                || error.starts_with(&format!("unsupported shape for {kind}")),
             "{error}"
         );
     }

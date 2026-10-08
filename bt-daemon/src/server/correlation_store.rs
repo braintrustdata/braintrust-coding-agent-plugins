@@ -573,7 +573,7 @@ pub(super) fn automatic_link_key(env: &Envelope) -> String {
 /// while their delivery checkpoint belongs to the resolved parent route.
 /// Recover against that effective route without rewriting the captured event.
 pub(super) async fn recovered_delivery_route(
-    daemon: &Arc<Daemon>,
+    daemon: &Daemon,
     env: &Envelope,
 ) -> Option<SessionRoute> {
     let key = automatic_link_key(env);

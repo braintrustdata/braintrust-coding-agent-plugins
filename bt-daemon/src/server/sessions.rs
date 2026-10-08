@@ -68,7 +68,7 @@ impl Daemon {
             } else {
                 crate::ids::session_namespace(&env.source, &env.session_id)
             };
-        let replay = ReplayPlan {
+        let mut replay = ReplayPlan {
             acknowledged_through: journal::JournalReader::acknowledged_through(
                 &journal_path,
                 replay_through,
@@ -76,8 +76,36 @@ impl Daemon {
             )
             .await,
             through: replay_through,
-            journal_path,
         };
+        let source_key = crate::ids::session_namespace(&env.source, &env.session_id);
+        let derived = {
+            let mut map = self.derived.lock().unwrap();
+            if let Some(existing) = map.get(&source_key) {
+                existing.clone()
+            } else {
+                let created = crate::derived::SourceTranslation::new(
+                    &env.source,
+                    &env.session_id,
+                    &translator_session_id,
+                    &self.data_dir,
+                    &self.translators,
+                )?;
+                map.insert(source_key, created.clone());
+                created
+            }
+        };
+        for captured in journal::captured_routes(&journal_path)? {
+            let template = journal::envelope_from_redacted(captured.envelope);
+            if let (Some(original), Some(effective)) = (
+                template.route.as_ref(),
+                recovered_delivery_route(self, &template).await,
+            ) {
+                if effective.same_route(route) {
+                    derived.bind_route(original, route)?;
+                }
+            }
+        }
+        replay.acknowledged_through = derived.register(route, replay.acknowledged_through)?;
         let journal = self
             .journal_writer_for(&env.source, &env.session_id)
             .await?;
@@ -88,7 +116,6 @@ impl Daemon {
         let session = Session::spawn(
             SessionOptions {
                 session_id: env.session_id.clone(),
-                translator_session_id,
                 source: env.source.clone(),
                 plugin_version: env.plugin_version.clone(),
                 replay: Some(replay),
@@ -99,6 +126,8 @@ impl Daemon {
                 data_dir: self.data_dir.clone(),
                 journal,
                 correlation_changed: self.correlation_changed.clone(),
+                auth_provider: self.auth_provider.clone(),
+                derived,
             },
             self.translators.clone(),
             self.sink_factory.clone(),
@@ -185,7 +214,7 @@ impl Daemon {
             .filter(|(_, session)| {
                 session.idle_for() >= idle_timeout
                     && session.counters.queued.load(Ordering::Relaxed) == 0
-                    && !session.has_paused_plugin()
+                    && !session.has_paused_work()
             })
             .filter(|(key, _)| !self.correlation.has_active_tools(&key.correlation_key()))
             .map(|(key, _)| key.clone())

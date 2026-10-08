@@ -157,6 +157,8 @@ pub struct DoctorCommandOutput {
     pub auth: AuthDiagnostic,
     pub daemon: DaemonDiagnostic,
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recovery_incidents: Vec<crate::RecoveryIncident>,
     pub plugin_diagnostics: Vec<crate::PluginDiagnostic>,
 }
 
@@ -274,35 +276,35 @@ impl TraceCommandOutput {
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
                 }
-                for diagnostic in &doctor.plugin_diagnostics {
-                    let state = match diagnostic.state {
-                        Some(crate::plugin_diagnostics::PluginRecoveryState::Paused) => "paused",
-                        Some(crate::plugin_diagnostics::PluginRecoveryState::Reprocessing) => "reprocessing",
-                        Some(crate::plugin_diagnostics::PluginRecoveryState::Recovered) => "recovered",
-                        None => "historical (current state unknown)",
-                    };
+                for incident in &doctor.recovery_incidents {
+                    let (source, session_id) = incident.scope.source_session();
                     rendered.push_str(&format!(
-                        "\nSpan plugin: {}\nState: {}\nSource: {}\nSession: {}\nSpan: {}\nOperation: {}\nFailure journal offset: {}\nPending journal bytes: {}\nFirst failure: {}\nLast failure: {}\nCause: {}",
+                        "\nRecovery: {:?}\nSource: {}\nSession: {}\nRecovery cursor ({:?}): {}\nOperation index: {}\nCause: {:?}\nDetail: {}\nAttempts: {}",
+                        incident.state,
+                        source,
+                        session_id,
+                        incident.scope,
+                        incident.first_unprocessed,
+                        incident.operation_index,
+                        incident.cause,
+                        incident.local_error,
+                        incident.attempts,
+                    ));
+                }
+                for diagnostic in &doctor.plugin_diagnostics {
+                    rendered.push_str(&format!(
+                        "\nSpan plugin failure history: {}\nSource: {}\nSession: {}\nSpan: {}\nOperation: {}\nFailure span ledger cursor: {}\nPending span revisions at last report: {}\nFirst failure: {}\nLast failure: {}\nCause: {}",
                         diagnostic.plugin_path.display(),
-                        state,
                         diagnostic.source,
                         diagnostic.session_id.as_deref().unwrap_or("unknown"),
                         diagnostic.span_id.as_deref().unwrap_or("unknown"),
                         diagnostic.operation.as_deref().unwrap_or("unknown"),
-                        diagnostic.journal_start.unwrap_or(0),
-                        diagnostic.pending_bytes.unwrap_or(0),
+                        diagnostic.span_cursor.unwrap_or(0),
+                        diagnostic.pending_revisions.unwrap_or(0),
                         render_timestamp(diagnostic.first_seen_ms),
                         render_timestamp(diagnostic.last_seen_ms),
                         diagnostic.exception
                     ));
-                    if diagnostic.state == Some(crate::plugin_diagnostics::PluginRecoveryState::Recovered) {
-                        if let Some(when) = diagnostic.state_changed_ms {
-                            rendered.push_str(&format!("\nRecovered: {}", render_timestamp(when)));
-                        }
-                    }
-                    if diagnostic.state == Some(crate::plugin_diagnostics::PluginRecoveryState::Paused) {
-                        rendered.push_str("\nNext: edit the failing plugin; tracing will retry this session automatically.");
-                    }
                 }
                 Ok(rendered)
             }
@@ -554,6 +556,25 @@ mod tests {
                 error: None,
             },
             warnings: Vec::new(),
+            recovery_incidents: vec![crate::RecoveryIncident {
+                scope: crate::WorkScope::SourceSession {
+                    source: "pi".into(),
+                    session_id: "pi-session".into(),
+                },
+                state: crate::WorkState::Paused,
+                first_unprocessed: 42,
+                operation_index: 0,
+                cause: crate::FailureCause::InputShape {
+                    event: "tool_execution_start".into(),
+                    translator_revision: "revision-a".into(),
+                },
+                local_error: "missing toolCallId".into(),
+                marker_span_id: None,
+                first_seen_ms: 1,
+                last_seen_ms: 2,
+                attempts: 0,
+                resolved_at_ms: None,
+            }],
             plugin_diagnostics: vec![crate::PluginDiagnostic {
                 source: "codex".into(),
                 plugin_path: PathBuf::from("/tmp/redact.mjs"),
@@ -565,8 +586,7 @@ mod tests {
                 session_id: Some("session-1".into()),
                 span_id: Some("span-1".into()),
                 operation: Some("merge".into()),
-                state: Some(crate::plugin_diagnostics::PluginRecoveryState::Paused),
-                pending_bytes: Some(1024),
+                pending_revisions: Some(1024),
                 ..Default::default()
             }],
         });
@@ -576,6 +596,14 @@ mod tests {
         assert_eq!(value["auth"]["source"], "saved_profile");
         assert_eq!(value["daemon"]["status"], "running");
         assert_eq!(value["daemon"]["auth"]["status"], "error");
+        assert_eq!(
+            value["recovery_incidents"][0]["scope"]["session_id"],
+            "pi-session"
+        );
+        assert_eq!(
+            value["recovery_incidents"][0]["cause"]["kind"],
+            "input_shape"
+        );
         assert_eq!(
             value["daemon"]["session_errors"][0],
             "could not resolve Braintrust auth for codex"
@@ -587,10 +615,9 @@ mod tests {
             "Error: raw secret\n    at redact (redact.mjs:1)"
         );
         let human = output.render(OutputFormat::Human).unwrap();
-        assert!(human.contains("State: paused"));
+        assert!(human.contains("Span plugin failure history: /tmp/redact.mjs"));
         assert!(human.contains("Session: session-1"));
         assert!(human.contains("Span: span-1"));
-        assert!(human.contains("Pending journal bytes: 1024"));
-        assert!(human.contains("Next: edit the failing plugin"));
+        assert!(human.contains("Pending span revisions at last report: 1024"));
     }
 }

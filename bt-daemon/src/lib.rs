@@ -17,13 +17,16 @@ mod client;
 mod command_output;
 mod correlation;
 mod delivery_ledger;
+mod derived;
 mod dispatch;
+mod durable;
 mod hook;
 mod ids;
 mod journal;
 mod managed_run;
 mod plugin_diagnostics;
 pub(crate) mod process;
+mod recovery;
 mod route;
 mod server;
 mod settings;
@@ -57,6 +60,7 @@ pub use hook::run_hook;
 pub use journal::source_journal_path;
 pub use managed_run::run_traced;
 pub use plugin_diagnostics::PluginDiagnostic;
+pub use recovery::{FailureCause, Incident as RecoveryIncident, WorkScope, WorkState};
 pub use server::{
     braintrust_serve_options, debug_serve_options, run_serve, AuthLease, AuthProvider,
     AuthResolveReason, ServeOptions,

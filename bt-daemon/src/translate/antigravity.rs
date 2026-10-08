@@ -39,6 +39,7 @@ impl TranslatorFactory for AntigravityTranslatorFactory {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Turn {
     span_id: String,
     number: u32,
@@ -46,6 +47,7 @@ struct Turn {
     last_output: Option<Value>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Invocation {
     span_id: String,
     parent_span_id: String,
@@ -53,12 +55,14 @@ struct Invocation {
     record_start: usize,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingTool {
     span_id: String,
     parent_span_id: String,
     name: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct AntigravityTranslator {
     session_id: String,
     session_span_id: String,
@@ -75,6 +79,7 @@ struct AntigravityTranslator {
     invocations: HashMap<i64, Invocation>,
     tools: HashMap<i64, PendingTool>,
     last_ts_ms: i64,
+    #[serde(skip)]
     git: Arc<GitMetadataCache>,
 }
 
@@ -516,7 +521,43 @@ impl AntigravityTranslator {
 }
 
 impl AgentTranslator for AntigravityTranslator {
+    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+
+    fn restore(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
+        let mut restored: Self = serde_json::from_value(snapshot)?;
+        restored.git = self.git.clone();
+        *self = restored;
+        Ok(())
+    }
+
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        let required_integer = match event.event.as_str() {
+            "PreInvocation" | "PostInvocation" => Some("invocationNum"),
+            "PreToolUse" | "PostToolUse" => Some("stepIdx"),
+            _ => None,
+        };
+        if let Some(field) = required_integer {
+            if integer_field(&event.payload, field).is_none() {
+                return Err(crate::translate::InputShapeError {
+                    event: event.event.clone(),
+                    detail: format!("missing required integer `{field}`"),
+                }
+                .into());
+            }
+        }
+        if matches!(
+            event.event.as_str(),
+            "PreInvocation" | "PostInvocation" | "PreToolUse" | "PostToolUse" | "Stop"
+        ) && !event.payload.is_object()
+        {
+            return Err(crate::translate::InputShapeError {
+                event: event.event.clone(),
+                detail: "expected an event object".into(),
+            }
+            .into());
+        }
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut ops = Vec::new();
         // A later Antigravity process can resume the same conversation after a

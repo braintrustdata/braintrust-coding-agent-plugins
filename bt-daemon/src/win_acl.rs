@@ -119,7 +119,7 @@ pub(crate) fn is_owner_only(path: &Path, directory: bool) -> io::Result<bool> {
 }
 
 fn set_dacl(path: &Path, descriptor: &SecurityDescriptor) -> io::Result<()> {
-    let name = wide(path.as_os_str());
+    let name = wide_path(path);
     let status = unsafe {
         SetNamedSecurityInfoW(
             name.as_ptr(),
@@ -148,7 +148,7 @@ impl NamedDacl {
     }
 
     fn read(path: &Path) -> io::Result<Self> {
-        let name = wide(path.as_os_str());
+        let name = wide_path(path);
         let mut dacl = null_mut();
         let mut descriptor = null_mut();
         let status = unsafe {
@@ -233,6 +233,21 @@ fn token_user_sid(token: HANDLE) -> io::Result<String> {
 
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn wide_path(path: &Path) -> Vec<u16> {
+    let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    if path.is_absolute() && value.len() > 240 && !value.starts_with(&prefix) {
+        if value.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            value.drain(..2);
+            value.splice(0..0, "\\\\?\\UNC\\".encode_utf16());
+        } else {
+            value.splice(0..0, prefix);
+        }
+    }
+    value.push(0);
+    value
 }
 
 unsafe fn from_wide(value: *const u16) -> String {

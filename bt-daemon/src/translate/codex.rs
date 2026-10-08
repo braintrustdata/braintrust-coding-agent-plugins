@@ -149,12 +149,13 @@ impl TranslatorFactory for CodexTranslatorFactory {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum ScopeKind {
     Main,
     Subagent,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenTurn {
     turn_id: String,
     span_id: String,
@@ -165,12 +166,13 @@ struct OpenTurn {
     input_source: Option<TurnInputSource>,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum TurnInputSource {
     Native,
     Authoritative,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenLlm {
     span_id: String,
     turn_id: String,
@@ -180,6 +182,7 @@ struct OpenLlm {
     output_preset: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Scope {
     path: String,
     kind: ScopeKind,
@@ -203,6 +206,7 @@ struct Scope {
     subagent_ended: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 enum DeferredHook {
     None,
     PostToolUse(Value),
@@ -221,6 +225,7 @@ enum DeferredHook {
     },
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 enum PendingWork {
     Hook {
         path: String,
@@ -236,6 +241,7 @@ enum PendingWork {
     },
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CodexTranslator {
     session_id: String,
     /// The daemon-owned session row. Child spans always parent to this id.
@@ -257,16 +263,62 @@ struct CodexTranslator {
     compaction_trigger_by_turn: RecentMap<String, String>,
     compaction_spans: RecentSet<String>,
     pending: Option<PendingWork>,
+    #[serde(skip)]
     git: Arc<GitMetadataCache>,
 }
 
 impl AgentTranslator for CodexTranslator {
+    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+
+    fn restore(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
+        let mut restored: Self = serde_json::from_value(snapshot)?;
+        restored.git = self.git.clone();
+        *self = restored;
+        Ok(())
+    }
+
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),
             "Codex translator has pending catch-up work; drain it before handling another event"
         );
         let payload = &event.payload;
+        match event.event.as_str() {
+            "SessionStart" if !payload.is_object() => {
+                return Err(crate::translate::InputShapeError {
+                    event: event.event.clone(),
+                    detail: "expected an object payload".into(),
+                }
+                .into());
+            }
+            "SessionStart" => {
+                let _ = decode::<SessionStartHook>(payload).ok_or_else(|| {
+                    crate::translate::InputShapeError {
+                        event: event.event.clone(),
+                        detail: "session start fields did not match their declared types".into(),
+                    }
+                })?;
+            }
+            "SubagentStart" => {
+                let _ = decode::<SubagentStartHook>(payload)
+                    .filter(|hook| !hook.agent_id.trim().is_empty())
+                    .ok_or_else(|| crate::translate::InputShapeError {
+                        event: event.event.clone(),
+                        detail: "expected a non-empty agent_id".into(),
+                    })?;
+            }
+            "PreCompact" | "PostCompact" => {
+                let _ = decode::<CompactHook>(payload)
+                    .filter(|hook| !hook.turn_id.trim().is_empty())
+                    .ok_or_else(|| crate::translate::InputShapeError {
+                        event: event.event.clone(),
+                        detail: "expected a non-empty turn_id".into(),
+                    })?;
+            }
+            _ => {}
+        }
         let mut ops = Vec::new();
 
         if let Some(config) = &ctx.config {

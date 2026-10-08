@@ -69,6 +69,9 @@ pub(super) fn spawn_gc(daemon: Arc<Daemon>) {
                 _ = daemon.shutdown.notified() => return,
                 _ = tokio::time::sleep(GC_INTERVAL) => {}
             }
+            // Mirror reference discovery and deletion must not race a new capture that has
+            // hydrated an older mirror but has not yet durably appended its referencing event.
+            let _capture_guard = daemon.capture_gate.write().await;
             collect_garbage(&daemon.data_dir).await;
             daemon
                 .correlation
@@ -96,7 +99,7 @@ pub(super) fn spawn_idle_watchdog(daemon: Arc<Daemon>, idle_timeout: Duration) {
                     .lock()
                     .unwrap()
                     .values()
-                    .any(|session| session.has_paused_plugin())
+                    .any(|session| session.has_paused_work())
                 && !daemon.correlation.has_any_active_tools()
             {
                 tracing::info!("idle for {:?}; shutting down", idle_for);

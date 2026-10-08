@@ -7,6 +7,9 @@
     reason = "Test fixtures intentionally launch raw children."
 )]
 
+#[path = "support/ledger.rs"]
+mod ledger;
+
 use async_trait::async_trait;
 use bt_daemon::wire::{
     AuthSelection, AuthSource, BackendAuth, Envelope, SessionConfig, SessionRoute,
@@ -20,6 +23,7 @@ use bt_daemon::{
 };
 #[cfg(all(feature = "cli", unix))]
 use bt_daemon::{run_traced, RunArgs, RunHookCommand, RunSource, SpanType};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -48,28 +52,6 @@ impl SinkFactory for TrackingSinkFactory {
 struct TrackingSink {
     session_id: String,
     flushes: Arc<Mutex<HashMap<String, usize>>>,
-}
-
-struct SlowSink;
-
-#[async_trait]
-impl Sink for SlowSink {
-    fn configure(&mut self, _config: &SessionConfig) {}
-    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        Ok(ops.len() as u64)
-    }
-    async fn flush(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-struct SlowSinkFactory;
-
-impl SinkFactory for SlowSinkFactory {
-    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
-        Ok(Box::new(SlowSink))
-    }
 }
 
 struct GateSinkFactory {
@@ -483,33 +465,6 @@ async fn start_tracking_daemon(
     (socket, handle, flushes, tmp)
 }
 
-async fn start_slow_daemon() -> (PathBuf, tokio::task::JoinHandle<()>, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
-    let data_dir = tmp.path().join("data");
-    let socket = test_endpoint(tmp.path());
-    let opts = ServeOptions {
-        version: "test".into(),
-        translators: Arc::new(Registry::default_agents()),
-        sink_factory: Arc::new(SlowSinkFactory),
-        auth_provider: Some(Arc::new(TestAuthProvider {
-            calls: Mutex::new(Vec::new()),
-            fail: false,
-            first_lease_expired: false,
-        })),
-    };
-    let args = ServeArgs {
-        socket: Some(socket.clone()),
-        data_dir: Some(data_dir),
-        idle_timeout_secs: 0,
-        session_idle_timeout_secs: 0,
-    };
-    let handle = tokio::spawn(async move {
-        let _ = run_serve(args, opts).await;
-    });
-    wait_for(&socket).await;
-    (socket, handle, tmp)
-}
-
 async fn start_gated_daemon(
     gate: Arc<tokio::sync::Notify>,
     emitted: Arc<std::sync::atomic::AtomicU64>,
@@ -610,7 +565,7 @@ async fn routed_sessions_resolve_multiple_profiles_without_journaling_credential
     for session in ["work-session", "personal-session"] {
         let journal =
             std::fs::read_to_string(source_journal_path(&data_dir, "debug", session)).unwrap();
-        assert!(journal.contains("\"route\""));
+        assert!(ledger::catalog(&data_dir, "debug", session)[0]["envelope"]["route"].is_object());
         assert!(!journal.contains("secret-"));
         assert!(!journal.contains("token_sha256_prefix"));
         assert!(!journal.contains("\"config\""));
@@ -654,7 +609,11 @@ async fn environment_routes_remain_environment_auth_without_journaling_credentia
         "environment-session",
     ))
     .unwrap();
-    assert!(journal.contains(r#""source":"environment""#));
+    assert_eq!(
+        ledger::catalog(&data_dir, "debug", "environment-session")[0]["envelope"]["route"]["auth"]
+            ["source"],
+        "environment"
+    );
     assert!(!journal.contains("secret-environment"));
 
     shutdown(&socket).await;
@@ -876,9 +835,8 @@ async fn a_route_backfills_observations_captured_by_another_route_once() {
     shutdown(&socket).await;
     handle.await.unwrap();
 
-    // A fresh daemon generation can activate an existing route after another
-    // route captured an event. It must backfill the missing observation once,
-    // then record a checkpoint for the receiving destination.
+    // Both active routes consumed the shared revision stream in the first
+    // generation. A fresh daemon only needs to deliver the new Stop.
     let provider = Arc::new(TestAuthProvider {
         calls: Mutex::new(Vec::new()),
         fail: false,
@@ -916,8 +874,8 @@ async fn a_route_backfills_observations_captured_by_another_route_once() {
     );
     assert_eq!(
         sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed),
-        2,
-        "work receives the personal-route observation once, then its new Stop"
+        1,
+        "work receives only the new Stop after its shared cursor checkpoint"
     );
 
     shutdown(&socket).await;
@@ -925,7 +883,7 @@ async fn a_route_backfills_observations_captured_by_another_route_once() {
 }
 
 #[tokio::test]
-async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() {
+async fn a_new_destination_consumes_available_output_then_uses_its_own_checkpoint() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
@@ -985,8 +943,8 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
         delivered[0]
             .emitted
             .load(std::sync::atomic::Ordering::Relaxed),
-        3,
-        "personal receives work's root and SessionStart plus its own Stop"
+        1,
+        "collected history requires transcript import; the new route receives its Stop"
     );
     assert_eq!(
         delivered[0].org.lock().unwrap().clone().as_deref(),
@@ -1015,7 +973,14 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
     flush_session("shared-history", &socket, 5000)
         .await
         .unwrap();
-    let delivered = third_sinks.sinks.lock().unwrap().clone();
+    let delivered = third_sinks
+        .sinks
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|sink| sink.org.lock().unwrap().as_deref() == Some("personal-org"))
+        .cloned()
+        .collect::<Vec<_>>();
     assert_eq!(delivered.len(), 1);
     assert_eq!(
         delivered[0]
@@ -1066,6 +1031,211 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     handle.await.unwrap();
 }
 
+struct ToggleAuthProvider {
+    denied: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl AuthProvider for ToggleAuthProvider {
+    async fn resolve(
+        &self,
+        selection: &AuthSelection,
+        _reason: AuthResolveReason,
+    ) -> anyhow::Result<AuthLease> {
+        if selection.profile.as_deref() == Some("missing")
+            && self.denied.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("profile credential unavailable")
+        }
+        Ok(AuthLease {
+            selection: selection.clone().canonicalized()?,
+            auth: BackendAuth {
+                token: "secret-current".into(),
+                api_url: None,
+                app_url: None,
+                org_name: selection.org_name.clone(),
+                org_id: None,
+            },
+            expires_at_ms: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn login_recovery_replays_only_the_held_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    let socket = test_endpoint(temp.path());
+    let provider = Arc::new(ToggleAuthProvider {
+        denied: std::sync::atomic::AtomicBool::new(true),
+    });
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let mut opts = debug_serve_options("test", &data_dir);
+    opts.auth_provider = Some(provider.clone());
+    let daemon = tokio::spawn(async move { run_serve(args, opts).await.unwrap() });
+    wait_for(&socket).await;
+    let host = dummy_host();
+    for event in ["SessionStart", "Stop"] {
+        forward_envelope(
+            &routed_envelope("held-login", "missing", "org", event),
+            &socket,
+            &host,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    forward_envelope(
+        &routed_envelope("healthy-login", "working", "org", "SessionStart"),
+        &socket,
+        &host,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        flush_session("healthy-login", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    assert!(data_dir.join("spans/healthy-login.ndjson").exists());
+    assert!(!data_dir.join("spans/held-login.ndjson").exists());
+    let incident: Value =
+        serde_json::from_slice(&std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap())
+            .unwrap();
+    assert_eq!(incident["active"][0]["cause"]["kind"], "credentials");
+
+    provider
+        .denied
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let output = std::fs::read_to_string(data_dir.join("spans/held-login.ndjson"))
+                .unwrap_or_default();
+            let incident: Value = serde_json::from_slice(
+                &std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap(),
+            )
+            .unwrap();
+            if output.contains("Stop") && incident["active"].as_array().is_some_and(Vec::is_empty) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("login recovery did not replay held events");
+    shutdown(&socket).await;
+    daemon.await.unwrap();
+}
+
+#[tokio::test]
+async fn transient_delivery_replays_without_new_agent_events() {
+    struct FlakySinkFactory {
+        unavailable: Arc<std::sync::atomic::AtomicBool>,
+        delivered: Arc<Mutex<Vec<SpanOp>>>,
+    }
+    struct FlakySink {
+        unavailable: Arc<std::sync::atomic::AtomicBool>,
+        delivered: Arc<Mutex<Vec<SpanOp>>>,
+        pending: Vec<SpanOp>,
+    }
+    impl SinkFactory for FlakySinkFactory {
+        fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+            Ok(Box::new(FlakySink {
+                unavailable: self.unavailable.clone(),
+                delivered: self.delivered.clone(),
+                pending: Vec::new(),
+            }))
+        }
+    }
+    #[async_trait]
+    impl Sink for FlakySink {
+        async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+            self.pending.extend_from_slice(ops);
+            Ok(ops.len() as u64)
+        }
+        async fn flush(&mut self) -> anyhow::Result<()> {
+            if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(braintrust_sdk_rust::BraintrustError::Api {
+                    status: 503,
+                    message: "server unavailable".into(),
+                }
+                .into());
+            }
+            self.delivered.lock().unwrap().append(&mut self.pending);
+            Ok(())
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    let socket = test_endpoint(temp.path());
+    let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let opts = ServeOptions {
+        version: "test".into(),
+        translators: Arc::new(Registry::default_agents()),
+        sink_factory: Arc::new(FlakySinkFactory {
+            unavailable: unavailable.clone(),
+            delivered: delivered.clone(),
+        }),
+        auth_provider: Some(Arc::new(TestAuthProvider {
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+            first_lease_expired: false,
+        })),
+    };
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let daemon = tokio::spawn(async move { run_serve(args, opts).await.unwrap() });
+    wait_for(&socket).await;
+    forward_envelope(
+        &envelope("transport-held", "SessionStart", 1),
+        &socket,
+        &dummy_host(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !flush_session("transport-held", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    let incident: Value =
+        serde_json::from_slice(&std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap())
+            .unwrap();
+    assert_eq!(incident["active"][0]["cause"]["kind"], "transport");
+    unavailable.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let incident: Value = serde_json::from_slice(
+                &std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap(),
+            )
+            .unwrap();
+            if incident["active"].as_array().is_some_and(Vec::is_empty) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("endpoint recovery did not replay the held route");
+    assert!(!delivered.lock().unwrap().is_empty());
+    shutdown(&socket).await;
+    daemon.await.unwrap();
+}
+
 #[tokio::test]
 async fn events_are_ordered_journaled_and_emitted() {
     let (data_dir, socket, handle, _tmp) = start_daemon().await;
@@ -1081,34 +1251,13 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
     assert_eq!(flushed.pending, 0);
 
-    // Journal: three events plus a durable delivery checkpoint, with only the
-    // non-secret route. Checkpoints are control records, not agent events.
+    // Translation has durably transferred all accepted events into spans.
     let journal = source_journal_path(&data_dir, "debug", "sess-1");
     let jtext = std::fs::read_to_string(&journal).unwrap();
-    let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(
-        jlines.len(),
-        4,
-        "expected 3 event lines plus one checkpoint, got {}",
-        jlines.len()
-    );
-    assert!(
-        !jtext.contains("sk-TOP-SECRET-abc123"),
-        "token leaked into journal!"
-    );
+    assert_eq!(jtext.lines().count(), 1);
+    assert!(jtext.contains("_bt_wal_base"));
+    assert!(!jtext.contains("sk-TOP-SECRET-abc123"));
     assert!(!jtext.contains("token_sha256_prefix"));
-
-    let events: Vec<String> = jlines
-        .iter()
-        .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
-        .map(|l| {
-            serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect();
-    assert_eq!(events, vec!["SessionStart", "PostToolUse", "Stop"]);
 
     // Spans: debug translator emits a root once + one span per event = 4.
     let spans = data_dir.join("spans").join("sess-1.ndjson");
@@ -1149,13 +1298,8 @@ async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
 
     let jtext = std::fs::read_to_string(source_journal_path(&data_dir, "debug", &session)).unwrap();
-    assert_eq!(
-        jtext
-            .lines()
-            .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
-            .count(),
-        2
-    );
+    assert!(jtext.contains("_bt_wal_base"));
+    assert!(!jtext.contains("SessionStart"));
     let spans: Vec<_> = std::fs::read_dir(data_dir.join("spans"))
         .unwrap()
         .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
@@ -1249,14 +1393,14 @@ async fn identical_native_ids_from_different_sources_are_isolated() {
             .unwrap()
             .lines()
             .count(),
-        2
+        1
     );
     assert_eq!(
         std::fs::read_to_string(claude_journal)
             .unwrap()
             .lines()
             .count(),
-        2
+        1
     );
 
     let rows = std::fs::read_to_string(data_dir.join("spans/shared-native-id.ndjson")).unwrap();
@@ -1292,8 +1436,10 @@ async fn distinct_sessions_are_isolated() {
 
     let a = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "a")).unwrap();
     let b = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "b")).unwrap();
-    assert_eq!(a.lines().filter(|l| !l.trim().is_empty()).count(), 3);
-    assert_eq!(b.lines().filter(|l| !l.trim().is_empty()).count(), 2);
+    assert!(a.contains("_bt_wal_base"));
+    assert!(!a.contains("SessionStart"));
+    assert!(b.contains("_bt_wal_base"));
+    assert!(!b.contains("SessionStart"));
 
     handle.abort();
 }
@@ -1401,7 +1547,9 @@ async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
 
 #[tokio::test]
 async fn hook_capture_stops_at_the_durable_journal_boundary() {
-    let (socket, handle, tmp) = start_slow_daemon().await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (data_dir, socket, handle, _tmp) = start_gated_daemon(gate.clone(), emitted.clone()).await;
     let host = dummy_host();
     forward_envelope(
         &envelope("fast-capture", "SessionStart", 1),
@@ -1416,7 +1564,7 @@ async fn hook_capture_stops_at_the_durable_journal_boundary() {
     let mut turn_end = envelope("fast-capture", "Stop", 2);
     turn_end.route.as_mut().unwrap().flush_mode = bt_daemon::wire::FlushMode::FlushOnTurnEnd;
     let accepted = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(5),
         forward_envelope(&turn_end, &socket, &host, false),
     )
     .await;
@@ -1424,17 +1572,15 @@ async fn hook_capture_stops_at_the_durable_journal_boundary() {
         matches!(accepted, Ok(Ok(()))),
         "turn-end capture waited for translation or flushing: {accepted:?}"
     );
-    let journal = std::fs::read_to_string(source_journal_path(
-        &tmp.path().join("data"),
-        "debug",
-        "fast-capture",
-    ))
-    .unwrap();
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "fast-capture")).unwrap();
+    assert!(journal.contains("Stop"), "hook returned before journaling");
     assert_eq!(
-        journal.lines().count(),
-        2,
-        "hook returned before journaling"
+        emitted.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "capture must complete while span delivery is still blocked"
     );
+    gate.notify_one();
     shutdown(&socket).await;
     handle.await.unwrap();
 }
@@ -1655,8 +1801,8 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
         std::fs::read_to_string(source_journal_path(&data_dir, "debug", "drained-shutdown"))
             .unwrap();
     assert!(
-        journal.contains(r#""n":2"#),
-        "replacement daemon did not journal the retried event: {journal}"
+        journal.contains("_bt_wal_base"),
+        "replacement daemon did not consume the retried event: {journal}"
     );
 }
 
@@ -1697,7 +1843,7 @@ async fn spawn_on_demand_runs_the_real_standalone_daemon() {
 }
 
 #[tokio::test]
-async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
+async fn cold_worker_restores_continuation_after_input_collection_without_redelivery() {
     let (data_dir, socket, first, tmp) = start_daemon().await;
     let host = dummy_host();
     forward_envelope(
@@ -1712,13 +1858,11 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     shutdown(&socket).await;
     first.await.unwrap();
 
-    // A cold worker receives only the saved journal, not the first worker's
-    // daemon state. Its delivery checkpoint must travel with that journal.
+    // Restore the recovery cache including SQLite continuation and consumer cursors.
     let recovered_data_dir = tmp.path().join("recovered-data");
-    let source = source_journal_path(&data_dir, "debug", "resume");
+    ledger::copy_tree(&data_dir, &recovered_data_dir);
+    std::fs::remove_dir_all(recovered_data_dir.join("spans")).unwrap();
     let recovered_journal = source_journal_path(&recovered_data_dir, "debug", "resume");
-    std::fs::create_dir_all(recovered_journal.parent().unwrap()).unwrap();
-    std::fs::copy(source, &recovered_journal).unwrap();
 
     let second = start_daemon_at(recovered_data_dir.clone(), socket.clone()).await;
     forward_envelope(&envelope("resume", "Stop", 2), &socket, &host, false)
@@ -1729,8 +1873,8 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     let journal = std::fs::read_to_string(recovered_journal).unwrap();
     assert_eq!(
         journal.lines().count(),
-        4,
-        "two events plus two delivery checkpoints"
+        1,
+        "consumed input has been collected"
     );
     let spans = std::fs::read_to_string(recovered_data_dir.join("spans/resume.ndjson")).unwrap();
     let rows: Vec<serde_json::Value> = spans
@@ -1859,6 +2003,148 @@ async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment()
 }
 
 #[tokio::test]
+async fn translation_failure_preserves_input_but_does_not_block_produced_spans() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    for (index, (name, payload)) in [
+        ("session_start", serde_json::json!({"reason":"new"})),
+        (
+            "before_agent_start",
+            serde_json::json!({"prompt":"already translated"}),
+        ),
+        (
+            "tool_execution_start",
+            serde_json::json!({"toolName":"bash"}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut env = envelope("source-pause", name, index as i64);
+        env.source = "pi".into();
+        env.payload = payload;
+        forward_envelope(&env, &socket, &dummy_host(), false)
+            .await
+            .unwrap();
+    }
+    let result = flush_session("source-pause", &socket, 5000).await.unwrap();
+    assert!(result.pending > 0, "translation remains paused");
+    let spans = std::fs::read_to_string(data_dir.join("spans/source-pause.ndjson")).unwrap();
+    assert!(
+        spans.contains("already translated"),
+        "committed spans must still reach delivery"
+    );
+    let raw =
+        std::fs::read_to_string(source_journal_path(&data_dir, "pi", "source-pause")).unwrap();
+    assert!(raw.contains("tool_execution_start"));
+    assert!(
+        !raw.contains("already translated"),
+        "completed input has been collected"
+    );
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn known_bad_pi_shape_pauses_its_session_while_unknown_events_are_journaled() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let mut unknown = envelope("pi-unknown", "future_native_event", 1);
+    unknown.source = "pi".into();
+    unknown.payload = serde_json::json!({"event": {"type": "future_native_event", "new": 1}});
+    forward_envelope(&unknown, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+
+    let mut malformed = envelope("pi-bad-shape", "tool_execution_start", 2);
+    malformed.source = "pi".into();
+    malformed.payload = serde_json::json!({
+        "event": {"type": "tool_execution_start", "toolName": "read"}
+    });
+    forward_envelope(&malformed, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    let mut later = envelope("pi-bad-shape", "session_shutdown", 3);
+    later.source = "pi".into();
+    later.payload = serde_json::json!({"event": {"type": "session_shutdown"}});
+    forward_envelope(&later, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if std::fs::read_to_string(data_dir.join("diagnostics/recovery.json"))
+            .is_ok_and(|value| value.contains("\"kind\": \"input_shape\""))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let incident = std::fs::read_to_string(data_dir.join("diagnostics/recovery.json")).unwrap();
+    assert!(incident.contains("\"kind\": \"input_shape\""), "{incident}");
+    assert!(incident.contains("tool_execution_start"), "{incident}");
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "pi", "pi-bad-shape")).unwrap();
+    assert!(journal.contains("tool_execution_start"));
+    assert!(journal.contains("session_shutdown"));
+    let unknown_journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "pi", "pi-unknown")).unwrap();
+    assert!(unknown_journal.contains("_bt_wal_base"));
+    assert!(
+        !unknown_journal.contains("future_native_event"),
+        "ignored input has been consumed"
+    );
+    assert!(!incident.contains("pi-unknown"), "{incident}");
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn recognized_codex_and_cursor_shape_mismatches_pause_their_sessions() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    let mut codex = envelope("codex-bad-shape", "PostCompact", 1);
+    codex.source = "codex".into();
+    codex.payload = serde_json::json!({"session_id":"codex-bad-shape"});
+    forward_envelope(&codex, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+
+    let mut cursor = envelope("cursor-bad-shape", "preToolUse", 2);
+    cursor.source = "cursor".into();
+    cursor.payload = serde_json::json!({"tool_name":"Read"});
+    forward_envelope(&cursor, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let raw = std::fs::read_to_string(data_dir.join("diagnostics/recovery.json"))
+                .unwrap_or_default();
+            if raw.matches("input_shape").count() >= 2 {
+                break raw;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "recognized event shape failures should pause both source sessions: {}",
+            std::fs::read_to_string(data_dir.join("diagnostics/recovery.json"))
+                .unwrap_or_else(|error| format!("diagnostic unavailable: {error}"))
+        )
+    });
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "codex", "codex-bad-shape"))
+            .unwrap();
+    assert!(journal.contains("PostCompact"));
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "cursor", "cursor-bad-shape"))
+            .unwrap();
+    assert!(journal.contains("preToolUse"));
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
     let (data_dir, socket, handle, tmp) = start_daemon_with_session_ttl(1).await;
     let plugin = tmp.path().join("bad.mjs");
@@ -1950,7 +2236,10 @@ async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
     assert!(diagnostics.contains("Error: raw local secret"));
     assert!(diagnostics.contains("bad.mjs"));
     assert!(diagnostics.contains("plugin-failure"));
-    assert!(diagnostics.contains("\"state\": \"paused\""));
+    let incident: Value =
+        serde_json::from_slice(&std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap())
+            .unwrap();
+    assert_eq!(incident["active"][0]["state"], "paused");
 
     std::fs::write(
         &later_plugin,
@@ -1999,7 +2288,7 @@ async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
         loop {
             let spans =
                 std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
-            if spans.contains("changed:") {
+            if spans.contains("changed:") && spans.contains("Stop") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2011,17 +2300,28 @@ async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
         loop {
             let spans =
                 std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
-            let diagnostics =
-                std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json"))
-                    .unwrap();
-            if spans.contains("Stop") && diagnostics.contains("\"state\": \"recovered\"") {
+            let recovery: Value = serde_json::from_slice(
+                &std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap(),
+            )
+            .unwrap();
+            if spans.contains("Stop")
+                && recovery["active"].as_array().is_some_and(Vec::is_empty)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("successful replay should be reflected in spans and diagnostics");
+    .unwrap_or_else(|_| {
+        panic!(
+            "successful replay should be reflected in spans and recovery diagnostics: spans={} recovery={}",
+            std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson"))
+                .unwrap_or_default(),
+            std::fs::read_to_string(data_dir.join("diagnostics/recovery.json"))
+                .unwrap_or_default()
+        )
+    });
     let status = run_status(StatusArgs {
         socket: Some(socket.clone()),
         session_id: Some("plugin-failure".into()),
@@ -2034,6 +2334,57 @@ async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
         .iter()
         .all(|session| session.last_error.is_none()));
 
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn plugin_replay_starts_at_the_failed_operation_within_an_event() {
+    let (data_dir, socket, handle, tmp) = start_daemon().await;
+    let plugin = tmp.path().join("second-op.mjs");
+    std::fs::write(
+        &plugin,
+        "export default span => { if (span.name === 'SessionStart') throw new Error('second op'); return span; }",
+    )
+    .unwrap();
+    let mut event = envelope("op-cursor", "SessionStart", 1);
+    event
+        .route
+        .as_mut()
+        .unwrap()
+        .span_plugins
+        .push(plugin.clone());
+    forward_envelope(&event, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    let _ = flush_session("op-cursor", &socket, 5000).await.unwrap();
+    let incident: Value =
+        serde_json::from_slice(&std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap())
+            .unwrap();
+    assert_eq!(incident["active"][0]["operation_index"], 1);
+
+    std::fs::write(&plugin, "export default span => span").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let incident: Value = serde_json::from_slice(
+                &std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap(),
+            )
+            .unwrap();
+            if incident["active"].as_array().is_some_and(Vec::is_empty) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("plugin retry did not complete");
+    let ops = std::fs::read_to_string(data_dir.join("spans/op-cursor.ndjson")).unwrap();
+    let root_inserts = ops
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|op| op["Insert"]["name"] == "debug: op-cursor")
+        .count();
+    assert_eq!(root_inserts, 1, "acknowledged prefix must not replay");
     shutdown(&socket).await;
     handle.await.unwrap();
 }
@@ -2063,16 +2414,42 @@ async fn a_paused_plugin_session_recovers_after_process_restart_without_a_new_ev
     shutdown(&socket).await;
     handle.await.unwrap();
 
+    let captured = std::fs::read_to_string(source_journal_path(
+        &data_dir,
+        "debug",
+        "plugin-cold-recovery",
+    ))
+    .unwrap();
+    assert!(
+        !captured.contains("SessionStart"),
+        "plugin recovery must not retain translated input"
+    );
+    let pending =
+        rusqlite::Connection::open(ledger::database(&data_dir, "debug", "plugin-cold-recovery"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+    assert!(pending > 0, "the span ledger protects paused delivery");
+
     std::fs::write(&plugin, "export default span => span").unwrap();
     let restarted = start_daemon_at(data_dir.clone(), socket.clone()).await;
     tokio::time::timeout(Duration::from_secs(6), async {
         loop {
             let spans = std::fs::read_to_string(data_dir.join("spans/plugin-cold-recovery.ndjson"))
                 .unwrap();
-            let diagnostics =
-                std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json"))
-                    .unwrap();
-            if spans.contains("SessionStart") && diagnostics.contains("\"state\": \"recovered\"") {
+            let incident: Value = serde_json::from_slice(
+                &std::fs::read(data_dir.join("diagnostics/recovery.json")).unwrap(),
+            )
+            .unwrap();
+            if incident["active"].as_array().is_some_and(Vec::is_empty) {
+                let last = spans
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter_map(|op| op.get("Insert").or_else(|| op.get("Merge")).cloned())
+                    .next_back()
+                    .expect("replayed span should be present");
+                assert_ne!(last["name"], "Plugin failure");
+                assert!(last.get("error").is_none());
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3018,6 +3395,7 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
         "stop alone must not masquerade as the terminal flush"
     );
 
+    let first_capture = ledger::catalog(&data_dir, "grok", "grok-primary")[0]["envelope"].clone();
     let primary_spans_path = data_dir.join("spans/grok-primary.ndjson");
     let first_ops = read_span_ops(&primary_spans_path);
     let first_llm = first_ops
@@ -3139,11 +3517,10 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     assert!(!journal_text.contains("secret-environment"));
     assert!(!journal_text.contains("token_sha256_prefix"));
     assert!(!journal_text.contains("decoy-route"));
-    let journal: Vec<serde_json::Value> = journal_text
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record["_bt_record_type"] != "delivery_checkpoint")
-        .collect();
+    let journal = [
+        first_capture,
+        ledger::catalog(&data_dir, "grok", "grok-primary")[0]["envelope"].clone(),
+    ];
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0]["source"], "grok");
     assert_eq!(journal[1]["source"], "grok");

@@ -113,6 +113,7 @@ pub struct Daemon {
     /// capture, which must never inherit actor or sink backpressure.
     dispatch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     journals: Mutex<HashMap<String, Arc<tokio::sync::Mutex<JournalWriter>>>>,
+    derived: Mutex<HashMap<String, Arc<crate::derived::SourceTranslation>>>,
     claude_transcripts: Mutex<HashMap<DeliveryKey, ClaudeTranscriptObservation>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
     auth_errors: Mutex<HashMap<DeliveryKey, (String, String)>>,
@@ -152,6 +153,7 @@ impl Daemon {
             session_locks: Mutex::new(HashMap::new()),
             dispatch_locks: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
+            derived: Mutex::new(HashMap::new()),
             claude_transcripts: Mutex::new(HashMap::new()),
             managed_run_sessions: Mutex::new(HashMap::new()),
             auth_errors: Mutex::new(HashMap::new()),
@@ -246,6 +248,9 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
     tracing::info!(socket = %socket.display(), "bt-daemon listening");
 
     let daemon = Daemon::new(opts, data_dir);
+    // Pin the translator revision before a binary update changes the executable
+    // observed by recovery checks.
+    let _translator_revision = crate::recovery::translator_revision();
     collect_garbage(&daemon.data_dir).await;
     restore_active_parent_snapshots(&daemon.data_dir, &daemon.correlation).await;
     restore_pending_sessions(&daemon).await;
