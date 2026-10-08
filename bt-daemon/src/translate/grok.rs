@@ -489,6 +489,7 @@ impl GrokTranslator {
                     start_ms: Some(ts_ms),
                     input,
                     metadata: Some(json!({"transcript_turn_key": turn_key})),
+                    turn_span_id: Some(span_id.clone()),
                     ..Default::default()
                 }));
                 self.current_turn = Some(OpenTurn {
@@ -583,6 +584,7 @@ impl GrokTranslator {
                         span_id: span_id.clone(),
                         root_span_id: self.root_span_id.clone(),
                         parent_span_ids: vec![llm_parent_span_id.clone()],
+                        turn_span_id: Some(llm_parent_span_id.clone()),
                         name: format!("{model} call {sequence}"),
                         span_type: SpanType::Llm,
                         start_ms: Some(boundary_ms),
@@ -664,6 +666,7 @@ impl GrokTranslator {
                     span_id: span_id.clone(),
                     root_span_id: self.root_span_id.clone(),
                     parent_span_ids: vec![tool_parent_span_id.clone()],
+                    turn_span_id: Some(tool_parent_span_id.clone()),
                     name,
                     span_type: SpanType::Tool,
                     start_ms: Some(ts_ms),
@@ -715,6 +718,7 @@ impl GrokTranslator {
                         span_id: span_id.clone(),
                         root_span_id: self.root_span_id.clone(),
                         parent_span_ids: vec![parent_span_id.clone()],
+                        turn_span_id: Some(parent_span_id.clone()),
                         name: update
                             .get("title")
                             .and_then(Value::as_str)

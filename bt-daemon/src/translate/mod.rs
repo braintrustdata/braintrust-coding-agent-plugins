@@ -20,6 +20,8 @@ mod pi;
 pub(crate) use pi::request_config as pi_request_config;
 mod recent;
 mod tool;
+mod turn_lineage;
+pub use turn_lineage::TURN_SPAN_ID_KEY;
 
 use debug::DebugTranslatorFactory;
 
@@ -86,6 +88,12 @@ pub struct SpanRow {
     #[serde(skip)]
     #[doc(hidden)]
     pub late_merge_key: Option<String>,
+    /// Span id of the user turn that owns this row, recorded by the translator
+    /// from its native turn tracking. [`turn_lineage`] publishes it as
+    /// `metadata.turn_span_id`.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub turn_span_id: Option<String>,
     /// Labels for filtering in Braintrust (e.g. `compaction`, `permission-request`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
@@ -241,7 +249,9 @@ impl Registry {
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
         let factory = self.factories.get(canonical);
         let factory = factory.expect("canonical source must have a factory");
-        Ok(factory.create(session_namespace))
+        Ok(Box::new(turn_lineage::TurnLineage::new(
+            factory.create(session_namespace),
+        )))
     }
 
     /// Create a known translator. Production ingress uses

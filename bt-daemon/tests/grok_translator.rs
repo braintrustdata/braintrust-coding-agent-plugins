@@ -10,7 +10,7 @@ use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{AgentTranslator, Registry, SessionCtx, SpanOp, SpanType};
 use serde_json::json;
-use span_identity::{assert_merges_preserve_insert_identity, IdentityLedger};
+use span_identity::{assert_merges_preserve_insert_identity, assert_turn_lineage, IdentityLedger};
 use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> PathBuf {
@@ -101,6 +101,17 @@ fn drain(translator: &mut dyn AgentTranslator) -> Vec<SpanOp> {
         ops.extend(batch);
     }
     ops
+}
+
+#[test]
+fn grok_spans_under_a_turn_carry_its_turn_span_id() {
+    let updates = std::fs::metadata(fixture("updates.jsonl")).unwrap().len();
+    let events = std::fs::metadata(fixture("events.jsonl")).unwrap().len();
+    let mut translator = Registry::default_agents().create("grok", "grok-session");
+    let ops = translator
+        .handle(&envelope(updates, events), &ctx())
+        .unwrap();
+    assert!(assert_turn_lineage(&ops, |row| row.name.starts_with("Turn ")) >= 3);
 }
 
 #[test]

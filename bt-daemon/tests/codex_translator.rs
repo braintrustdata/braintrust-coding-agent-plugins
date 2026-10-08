@@ -14,7 +14,7 @@ use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, FlushMode, SessionConfig, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
-use span_identity::assert_merges_preserve_insert_identity;
+use span_identity::{assert_merges_preserve_insert_identity, assert_turn_lineage};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -1270,6 +1270,9 @@ fn codex_compaction_relabels_turn_and_adds_compaction_llm() {
         .unwrap(),
     );
     assert_merges_preserve_insert_identity(&ops);
+    // Compaction discovered only during catch-up opened as a turn, so its
+    // synthetic llm span follows that turn's ownership.
+    assert!(assert_turn_lineage(&ops, |row| row.is_turn) >= 2);
     let rows = reduce(ops);
 
     let compaction = find(&rows, SpanType::Task, "compaction");
@@ -1308,6 +1311,78 @@ fn codex_compaction_relabels_turn_and_adds_compaction_llm() {
         json!(5000.0)
     );
     assert!(llm.end_ms.is_some());
+}
+
+#[test]
+fn codex_hook_identified_compaction_is_not_a_user_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path().join("rollout.jsonl");
+    let tpath = t.to_str().unwrap();
+    for v in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta", "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context", "payload": { "model": "gpt-5.5" } }),
+    ] {
+        append(&t, v);
+    }
+
+    let reg = Registry::default_agents();
+    let mut tr = reg.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+
+    let mut ops = Vec::new();
+    ops.extend(
+        tr.handle(&envelope("s", "SessionStart", tpath, json!({})), &ctx)
+            .unwrap(),
+    );
+    // PreCompact arrives before the compaction turn reaches the transcript.
+    ops.extend(
+        tr.handle(
+            &envelope(
+                "s",
+                "PreCompact",
+                tpath,
+                json!({ "turn_id": "c1", "trigger": "auto" }),
+            ),
+            &ctx,
+        )
+        .unwrap(),
+    );
+    for v in [
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "c1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "compacted", "payload": {
+            "window_id": "w1",
+            "replacement_history": [{ "role": "user", "content": "kept" }]
+        } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 5000, "output_tokens": 50 } } } }),
+    ] {
+        append(&t, v);
+    }
+    ops.extend(
+        tr.handle(
+            &envelope(
+                "s",
+                "PostCompact",
+                tpath,
+                json!({ "turn_id": "c1", "trigger": "auto" }),
+            ),
+            &ctx,
+        )
+        .unwrap(),
+    );
+
+    assert_merges_preserve_insert_identity(&ops);
+    // Maintenance compaction must not create a chargeable user turn.
+    assert_eq!(assert_turn_lineage(&ops, |row| row.is_turn), 0);
+    let llm_inserted = ops
+        .iter()
+        .any(|op| matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Llm));
+    assert!(
+        llm_inserted,
+        "fixture should emit the synthetic compaction llm"
+    );
 }
 
 #[test]
@@ -1536,6 +1611,8 @@ fn codex_subagent_with_malformed_optional_type_nests_under_spawning_turn() {
     );
 
     assert_merges_preserve_insert_identity(&ops);
+    // The subagent's own turn and model call roll up to the spawning user turn.
+    assert!(assert_turn_lineage(&ops, |row| row.name.starts_with("turn: ")) >= 5);
     let rows = reduce(ops);
 
     let root = find(&rows, SpanType::Task, "codex: app");

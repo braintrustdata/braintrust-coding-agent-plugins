@@ -74,4 +74,5 @@ pub use trace_runtime::{
 pub use transcript_import::{import_transcript, import_transcripts, run_import};
 pub use translate::{
     AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, SpanRow, SpanType,
+    TURN_SPAN_ID_KEY,
 };

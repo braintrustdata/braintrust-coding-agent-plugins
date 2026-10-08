@@ -335,6 +335,8 @@ struct NativeSession {
     effective_root_span_id: String,
     parent_span_ids: Vec<String>,
     parent_session_id: Option<String>,
+    /// For child sessions, the user turn in the root session that spawned them.
+    owner_turn_span_id: Option<String>,
     root_idle: bool,
     current_turn_span_id: Option<String>,
     turn_number: u32,
@@ -358,6 +360,15 @@ struct NativeSession {
     user_message_ids: HashSet<String>,
     user_parts: HashMap<String, Vec<(String, String)>>,
     history_tool_results: HashMap<String, HashMap<String, Value>>,
+}
+
+impl NativeSession {
+    /// The user turn that owns work in this session right now.
+    fn turn_owner(&self) -> Option<String> {
+        self.owner_turn_span_id
+            .clone()
+            .or_else(|| self.current_turn_span_id.clone())
+    }
 }
 
 #[derive(Default)]
@@ -621,6 +632,9 @@ impl OpenCodeTranslator {
             metadata.insert("parent_session_id".into(), Value::String(parent.into()));
             metadata.insert("is_subagent".into(), Value::Bool(true));
         }
+        let owner_turn_span_id = parent_id
+            .and_then(|parent| self.sessions.get(parent))
+            .and_then(NativeSession::turn_owner);
         self.sessions.insert(
             native_id.to_string(),
             NativeSession {
@@ -628,6 +642,7 @@ impl OpenCodeTranslator {
                 effective_root_span_id: effective_root_span_id.clone(),
                 parent_span_ids: parent_span_ids.clone(),
                 parent_session_id: parent_id.map(str::to_owned),
+                owner_turn_span_id: owner_turn_span_id.clone(),
                 ..Default::default()
             },
         );
@@ -635,6 +650,7 @@ impl OpenCodeTranslator {
             span_id: root_span_id,
             root_span_id: effective_root_span_id,
             parent_span_ids,
+            turn_span_id: owner_turn_span_id,
             name,
             span_type: SpanType::Task,
             start_ms: Some(ts),
@@ -745,7 +761,7 @@ impl OpenCodeTranslator {
             .and_then(Value::as_str);
         let skills = explicit_skills(&input);
         ops.push(SpanOp::Insert(SpanRow {
-            span_id: turn_id,
+            span_id: turn_id.clone(),
             root_span_id: state.effective_root_span_id.clone(),
             parent_span_ids: vec![state.root_span_id.clone()],
             name: format!("Turn {}", state.turn_number),
@@ -756,6 +772,7 @@ impl OpenCodeTranslator {
             metadata: Some(
                 json!({"turn_number":state.turn_number,"model":model,"loaded_skill_names":skills}),
             ),
+            turn_span_id: Some(state.owner_turn_span_id.clone().unwrap_or(turn_id)),
             ..Default::default()
         }));
         ops
@@ -954,6 +971,12 @@ impl OpenCodeTranslator {
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("llm:{sid}:{mid}")),
             root_span_id: state.effective_root_span_id.clone(),
+            turn_span_id: Some(
+                state
+                    .owner_turn_span_id
+                    .clone()
+                    .unwrap_or_else(|| turn.clone()),
+            ),
             parent_span_ids: vec![turn],
             name: format!("{provider}/{model}"),
             span_type: SpanType::Llm,
@@ -1000,6 +1023,7 @@ impl OpenCodeTranslator {
             return vec![SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
                 root_span_id: s.effective_root_span_id.clone(),
+                turn_span_id: s.turn_owner(),
                 parent_span_ids: vec![turn],
                 name: tool.clone(),
                 span_type: SpanType::Tool,
@@ -1076,6 +1100,7 @@ impl OpenCodeTranslator {
             span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
             root_span_id: s.effective_root_span_id.clone(),
             parent_span_ids: vec![parent_span_id],
+            turn_span_id: (!had_start).then(|| s.turn_owner()).flatten(),
             name,
             span_type: SpanType::Tool,
             start_ms: (!had_start).then(|| s.tool_starts.remove(&call).unwrap_or(ts_ms)),
@@ -1202,6 +1227,7 @@ impl OpenCodeTranslator {
             span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
             root_span_id: s.effective_root_span_id.clone(),
             parent_span_ids: vec![parent_span_id],
+            turn_span_id: (!had_start).then(|| s.turn_owner()).flatten(),
             name: title.unwrap_or(tool),
             span_type: SpanType::Tool,
             start_ms: (!had_start).then(|| s.tool_starts.remove(&call).unwrap_or(ts_ms)),

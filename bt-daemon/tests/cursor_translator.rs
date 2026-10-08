@@ -7,7 +7,7 @@ use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
-use span_identity::IdentityLedger;
+use span_identity::{assert_turn_lineage, IdentityLedger};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -158,6 +158,25 @@ fn real_capture(scenario: &str) -> Harness {
     harness.finish();
     harness
 }
+#[test]
+fn real_cursor_spans_under_a_turn_carry_its_turn_span_id() {
+    for scenario in [
+        "daemon-two-turn-success",
+        "headless-tools-error",
+        "headless-tools-success",
+        "interactive-multi-turn-error",
+        "interactive-multi-turn-success",
+        "plugin-headless-resume-success",
+    ] {
+        let h = real_capture(scenario);
+        let stamped = assert_turn_lineage(&h.ops, |row| row.name.starts_with("Turn "));
+        assert!(
+            stamped > h.turns().len(),
+            "{scenario}: expected turn children"
+        );
+    }
+}
+
 #[test]
 fn real_interactive_error_capture_has_two_turns_one_read_and_turn_scoped_usage() {
     let h = real_capture("interactive-multi-turn-error");

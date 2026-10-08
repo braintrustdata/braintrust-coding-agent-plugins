@@ -55,6 +55,7 @@ fn row(
         metrics: None,
         error: None,
         late_merge_key: None,
+        turn_span_id: None,
         tags: None,
         origin: parents.is_empty().then(|| OriginSnapshot {
             plugin_version: None,

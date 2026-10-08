@@ -10,7 +10,7 @@ use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
-use span_identity::assert_merges_preserve_insert_identity;
+use span_identity::{assert_merges_preserve_insert_identity, assert_turn_lineage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -146,6 +146,26 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
         }
     }
     rows
+}
+
+/// Recorded sessions, including subagents and compaction, attribute every span
+/// under a user turn to that turn so its cost can be aggregated flatly.
+#[test]
+fn every_span_under_a_turn_carries_its_turn_span_id() {
+    for name in ["test-fixture", "example-simple", "subagent-compact"] {
+        let ops = replay_from(name, Source::Mirror);
+        let llm_spans = ops
+            .iter()
+            .filter(|op| matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Llm))
+            .count();
+        let stamped = assert_turn_lineage(&ops, |row| {
+            row.name.starts_with("Turn ") || row.name.starts_with("Continuation")
+        });
+        assert!(
+            stamped > llm_spans,
+            "{name}: expected turns, LLM calls, and tools"
+        );
+    }
 }
 
 /// Journals recorded before transcript mirroring inline the whole transcript.
