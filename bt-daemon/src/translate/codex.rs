@@ -841,20 +841,29 @@ impl CodexTranslator {
             return;
         }
         let span_id = ids::span_id(&self.session_id, &format!("turn:{turn_id}"));
-        let owner = scope.turn_owner(&span_id);
-        self.turn_owners.insert(span_id.clone(), owner.clone());
+        // Native compaction hooks identify maintenance turns before catch-up.
+        let is_turn = self.compaction_trigger_by_turn.get(&turn_id).is_none()
+            && !self.compaction_spans.contains(&turn_id);
+        // A maintenance turn is not a user turn; inside a subagent it still
+        // belongs to the user turn that spawned the subagent.
+        let owner = if is_turn {
+            Some(scope.turn_owner(&span_id))
+        } else {
+            scope.owner_turn_span_id.clone()
+        };
+        if let Some(owner) = &owner {
+            self.turn_owners.insert(span_id.clone(), owner.clone());
+        }
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![scope.turn_parent_span_id.clone()],
             name: format!("turn: {turn_id}"),
             span_type: SpanType::Task,
-            // Native compaction hooks identify maintenance turns before catch-up.
-            is_turn: self.compaction_trigger_by_turn.get(&turn_id).is_none()
-                && !self.compaction_spans.contains(&turn_id),
+            is_turn,
             start_ms: Some(ts),
             metadata: Some(json!({ "turn_id": turn_id, "model": scope.model })),
-            turn_span_id: Some(owner),
+            turn_span_id: owner,
             ..Default::default()
         }));
         scope.open_turns.push(OpenTurn {
@@ -951,7 +960,7 @@ impl CodexTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
-            turn_span_id: Some(scope.turn_owner(&turn_span)),
+            turn_span_id: self.turn_owners.get(&turn_span).cloned(),
             parent_span_ids: vec![turn_span],
             name,
             span_type: SpanType::Llm,
@@ -1115,7 +1124,7 @@ impl CodexTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
-            turn_span_id: Some(scope.turn_owner(&turn_span)),
+            turn_span_id: self.turn_owners.get(&turn_span).cloned(),
             parent_span_ids: vec![turn_span],
             name,
             span_type: SpanType::Tool,
@@ -1361,7 +1370,7 @@ impl CodexTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
-            turn_span_id: Some(scope.turn_owner(&turn_span)),
+            turn_span_id: self.turn_owners.get(&turn_span).cloned(),
             parent_span_ids: vec![turn_span.clone()],
             name: name.clone(),
             span_type: SpanType::Llm,
