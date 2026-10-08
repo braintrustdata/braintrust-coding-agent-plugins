@@ -1868,7 +1868,8 @@ fn malformed_hooks_fail_the_event_instead_of_dropping_fields() {
             .unwrap_err()
             .to_string();
         assert!(
-            error.starts_with(&format!("unexpected cursor {kind} hook format")),
+            error.starts_with(&format!("unexpected cursor {kind} hook format"))
+                || error.starts_with(&format!("unsupported shape for {kind}")),
             "{error}"
         );
     }

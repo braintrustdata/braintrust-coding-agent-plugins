@@ -1489,9 +1489,8 @@ impl AgentTranslator for CursorTranslator {
             self.pending.is_none(),
             "Cursor pending transcript work must be drained before the next hook"
         );
-        // Decode before touching any state, so a payload in an unexpected
-        // format leaves the translator where it was.
-        let hook = Hook::decode(&e.event, &e.payload)?;
+        // Preserve a typed failure for expected hooks with malformed shapes;
+        // recovery can then wait for a translator revision before replaying.
         match e.event.as_str() {
             "beforeSubmitPrompt" if e.payload.get("prompt").and_then(Value::as_str).is_none() => {
                 return Err(crate::translate::InputShapeError {
@@ -1527,6 +1526,9 @@ impl AgentTranslator for CursorTranslator {
             }
             _ => {}
         }
+        // Decode before touching any state, so a payload in an unexpected
+        // format leaves the translator where it was.
+        let hook = Hook::decode(&e.event, &e.payload)?;
         let mut ops = Vec::new();
         self.root(e, &hook, ctx, &mut ops);
         if self.transcript_batch(e, &hook, &mut ops)? {
