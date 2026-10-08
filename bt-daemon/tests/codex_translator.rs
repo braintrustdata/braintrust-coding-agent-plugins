@@ -25,11 +25,24 @@ fn line(v: Value) -> String {
 #[test]
 fn codex_optional_session_start_fields_allow_absence_but_reject_wrong_types() {
     let registry = Registry::default_agents();
-    let mut translator = registry.create("codex", "session-start-shape");
     let ctx = SessionCtx {
         session_id: "session-start-shape".into(),
         config: None,
     };
+    let mut absent_fields_translator = registry.create("codex", "session-start-shape");
+    assert!(absent_fields_translator
+        .handle(
+            &envelope(
+                "session-start-shape",
+                "SessionStart",
+                "/missing/rollout.jsonl",
+                json!({}),
+            ),
+            &ctx,
+        )
+        .is_ok());
+
+    let mut translator = registry.create("codex", "session-start-shape");
     let error = translator
         .handle(
             &envelope(
