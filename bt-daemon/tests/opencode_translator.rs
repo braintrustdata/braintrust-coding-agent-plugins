@@ -148,6 +148,32 @@ fn opencode_accepts_summary_diff_metadata_on_message_updates() {
 }
 
 #[test]
+fn opencode_rejects_wrong_type_for_optional_summary_field() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let error = translator
+        .handle(
+            &event(
+                "message.updated",
+                1,
+                json!({"properties":{"info":{"id":"m1","sessionID":"native","role":"user","summary":42}}}),
+            ),
+            &ctx,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("unsupported shape for message.updated"),
+        "{error}"
+    );
+}
+
+#[test]
 fn opencode_idle_updates_a_resumable_session_root() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("opencode", "root-session");
@@ -708,7 +734,7 @@ fn opencode_ignores_unknown_fields_at_typed_reducer_boundaries() {
 }
 
 #[test]
-fn opencode_ignores_malformed_typed_events_without_failing_the_session() {
+fn opencode_fails_present_optional_fields_with_the_wrong_type() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("opencode", "root-session");
     let ctx = SessionCtx {
@@ -736,7 +762,7 @@ fn opencode_ignores_malformed_typed_events_without_failing_the_session() {
         )
         .unwrap();
 
-    let ops = translator
+    let error = translator
         .handle(
             &event(
                 "tool.execute.before",
@@ -745,10 +771,13 @@ fn opencode_ignores_malformed_typed_events_without_failing_the_session() {
             ),
             &ctx,
         )
-        .unwrap();
-    assert!(ops
-        .iter()
-        .all(|op| !matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Tool)));
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("unsupported shape for tool.execute.before"),
+        "{error}"
+    );
     assert!(translator
         .handle(
             &event(

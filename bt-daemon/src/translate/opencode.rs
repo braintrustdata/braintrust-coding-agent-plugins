@@ -12,7 +12,7 @@ use crate::ids;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -239,8 +239,8 @@ impl PermissionTool {
     }
 }
 
-fn permission_properties(payload: &Value) -> Option<PermissionProperties> {
-    decode(payload.get("properties").unwrap_or(payload))
+fn permission_properties(event: &str, payload: &Value) -> anyhow::Result<PermissionProperties> {
+    decode_required(event, payload.get("properties").unwrap_or(payload))
 }
 
 #[derive(Deserialize)]
@@ -301,18 +301,20 @@ struct MessageInfo {
     time: Option<MessageTime>,
     #[serde(default)]
     tokens: Option<MessageTokens>,
-    #[serde(default, deserialize_with = "deserialize_summary")]
-    summary: bool,
+    #[serde(default)]
+    summary: Option<MessageSummary>,
     #[serde(default)]
     error: Option<Value>,
 }
 
-fn deserialize_summary<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    Ok(value.as_bool().unwrap_or(false))
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MessageSummary {
+    Flag(bool),
+    Diff {
+        #[serde(flatten)]
+        _fields: Map<String, Value>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -343,10 +345,6 @@ struct MessageCacheTokens {
     write: i64,
 }
 
-fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
-    serde_json::from_value(value.clone()).ok()
-}
-
 fn decode_required<T: DeserializeOwned>(event: &str, value: &Value) -> anyhow::Result<T> {
     serde_json::from_value(value.clone()).map_err(|error| {
         crate::translate::InputShapeError {
@@ -361,8 +359,7 @@ fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Value::deserialize(deserializer)?;
-    Ok(value.as_str().map(ToOwned::to_owned))
+    Option::<String>::deserialize(deserializer)
 }
 
 fn properties_required<T: DeserializeOwned>(
@@ -591,12 +588,13 @@ impl AgentTranslator for OpenCodeTranslator {
                 )?),
                 event.ts_ms,
             ),
-            "permission.asked" => permission_properties(&event.payload)
-                .map(|permission| self.permission_asked(permission))
-                .unwrap_or_default(),
-            "permission.replied" => permission_properties(&event.payload)
-                .map(|permission| self.permission_replied(permission, event.ts_ms))
-                .unwrap_or_default(),
+            "permission.asked" => {
+                self.permission_asked(permission_properties(&event.event, &event.payload)?)
+            }
+            "permission.replied" => self.permission_replied(
+                permission_properties(&event.event, &event.payload)?,
+                event.ts_ms,
+            ),
             "session.idle" => self.finish_session_event(event, false, None),
             "session.compacted" => Vec::new(),
             "session.deleted" => self.finish_session_event(event, true, None),
@@ -1018,7 +1016,7 @@ impl OpenCodeTranslator {
         if let Some(system) = &state.system_prompt {
             input.push(json!({"role":"system","content":system}))
         }
-        if info.summary {
+        if matches!(info.summary, Some(MessageSummary::Flag(true))) {
             input.extend(state.history.compaction_input());
             state.history.begin_compacted(
                 mid,

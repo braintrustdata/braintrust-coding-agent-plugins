@@ -463,7 +463,7 @@ fn claude_turns_capture_the_effective_permission_mode() {
 }
 
 #[test]
-fn claude_subagent_routing_tolerates_malformed_optional_metadata() {
+fn claude_rejects_malformed_present_optional_subagent_metadata() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", "subagent-session");
     let ctx = SessionCtx {
@@ -489,17 +489,48 @@ fn claude_subagent_routing_tolerates_malformed_optional_metadata() {
         capture: None,
     };
 
-    let rows = reduce(translator.handle(&event, &ctx).unwrap());
-    assert!(rows.values().any(|row| row.name == "Claude Code: demo"));
-    let subagent = rows
-        .values()
-        .find(|row| row.name == "subagent: agent")
-        .expect("valid agent_id must create a subagent span");
-    assert_eq!(subagent.metadata.as_ref().unwrap()["agent_id"], "agent-1");
+    let error = translator.handle(&event, &ctx).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("unsupported shape for SubagentStart"),
+        "{error}"
+    );
 }
 
 #[test]
-fn claude_ignores_empty_subagent_identifier() {
+fn claude_optional_hook_fields_allow_absence_but_reject_wrong_types() {
+    let registry = Registry::default_agents();
+    let ctx = SessionCtx {
+        session_id: "optional-hook-fields".into(),
+        config: None,
+    };
+    let mut translator = registry.create("claude-code", "optional-hook-fields");
+    assert!(translator
+        .handle(
+            &claude_event("optional-hook-fields", "SessionStart", 1, json!({})),
+            &ctx,
+        )
+        .is_ok());
+
+    let error = translator
+        .handle(
+            &claude_event(
+                "optional-hook-fields",
+                "SessionStart",
+                2,
+                json!({"cwd": 42}),
+            ),
+            &ctx,
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .starts_with("unsupported shape for SessionStart"));
+}
+
+#[test]
+fn claude_rejects_empty_required_subagent_identifier() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", "empty-subagent-session");
     let ctx = SessionCtx {
@@ -524,8 +555,10 @@ fn claude_ignores_empty_subagent_identifier() {
         capture: None,
     };
 
-    let rows = reduce(translator.handle(&event, &ctx).unwrap());
-    assert!(rows.values().all(|row| !row.name.starts_with("subagent:")));
+    let error = translator.handle(&event, &ctx).unwrap_err();
+    assert!(error
+        .to_string()
+        .starts_with("unsupported shape for SubagentStart"));
 }
 
 #[test]

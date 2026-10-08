@@ -395,6 +395,24 @@ impl AgentTranslator for PiTranslator {
             .into());
         }
         match envelope.event.as_str() {
+            "before_agent_start" => {
+                let _: BeforeAgentStart = decode_required(&envelope.event, event)?;
+            }
+            "context" => {
+                let _: ContextEvent = decode_required(&envelope.event, event)?;
+                if let Some(model) = envelope.payload.get("model") {
+                    let _: SelectedModel = decode_required(&envelope.event, model)?;
+                }
+            }
+            "message_update" => {
+                let _: MessageUpdate = decode_required(&envelope.event, event)?;
+            }
+            "thinking_level_select" => {
+                let _: ThinkingLevel = decode_required(&envelope.event, event)?;
+            }
+            "tool_execution_start" => {
+                let _: ToolExecutionStart = decode_required(&envelope.event, event)?;
+            }
             "message_end" => {
                 let message = event.get("message").unwrap_or(event);
                 let role = message.get("role").and_then(Value::as_str);
@@ -422,6 +440,21 @@ impl AgentTranslator for PiTranslator {
                     }
                     .into());
                 }
+            }
+            "agent_end" => {
+                let _: AgentEnd = decode_required(&envelope.event, event)?;
+            }
+            "session_before_compact" => {
+                let _: BeforeCompact = decode_required(&envelope.event, event)?;
+            }
+            "session_compact" => {
+                let _: SessionCompact = decode_required(&envelope.event, event)?;
+            }
+            "session_before_tree" => {
+                let _: BeforeTree = decode_required(&envelope.event, event)?;
+            }
+            "session_tree" => {
+                let _: SessionTree = decode_required(&envelope.event, event)?;
             }
             _ => {}
         }

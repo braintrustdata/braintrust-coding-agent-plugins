@@ -22,6 +22,30 @@ fn line(v: Value) -> String {
     serde_json::to_string(&v).unwrap()
 }
 
+#[test]
+fn codex_optional_session_start_fields_allow_absence_but_reject_wrong_types() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "session-start-shape");
+    let ctx = SessionCtx {
+        session_id: "session-start-shape".into(),
+        config: None,
+    };
+    let error = translator
+        .handle(
+            &envelope(
+                "session-start-shape",
+                "SessionStart",
+                "/missing/rollout.jsonl",
+                json!({"source": 42}),
+            ),
+            &ctx,
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .starts_with("unsupported shape for SessionStart"));
+}
+
 fn expected_username() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))

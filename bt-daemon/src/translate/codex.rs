@@ -275,6 +275,14 @@ impl AgentTranslator for CodexTranslator {
                 }
                 .into());
             }
+            "SessionStart" => {
+                let _ = decode::<SessionStartHook>(payload).ok_or_else(|| {
+                    crate::translate::InputShapeError {
+                        event: event.event.clone(),
+                        detail: "session start fields did not match their declared types".into(),
+                    }
+                })?;
+            }
             "SubagentStart" => {
                 let _ = decode::<SubagentStartHook>(payload)
                     .filter(|hook| !hook.agent_id.trim().is_empty())

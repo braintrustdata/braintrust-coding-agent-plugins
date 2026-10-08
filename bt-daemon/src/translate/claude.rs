@@ -77,13 +77,21 @@ fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
 
+fn decode_required<T: DeserializeOwned>(event: &str, value: &Value) -> anyhow::Result<T> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        crate::translate::InputShapeError {
+            event: event.to_owned(),
+            detail: error.to_string(),
+        }
+        .into()
+    })
+}
+
 fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<Value>::deserialize(deserializer)?
-        .as_ref()
-        .and_then(value_as_nonempty_string))
+    Option::<String>::deserialize(deserializer)
 }
 
 fn deserialize_nonempty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -99,10 +107,12 @@ fn deserialize_optional_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<Value>::deserialize(deserializer)?
-        .as_ref()
-        .and_then(Value::as_str)
-        .and_then(parse_rfc3339_timestamp))
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| {
+            parse_rfc3339_timestamp(&value)
+                .ok_or_else(|| serde::de::Error::custom("expected an RFC 3339 timestamp"))
+        })
+        .transpose()
 }
 
 fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
@@ -1267,29 +1277,41 @@ impl AgentTranslator for ClaudeTranslator {
             }
             .into());
         }
+        let hook = if known_event {
+            decode_required::<HookContext>(&event.event, &event.payload)?
+        } else {
+            decode::<HookContext>(&event.payload).unwrap_or_default()
+        };
+        if event.event == "SubagentStart" {
+            let _: SubagentHook = decode_required(&event.event, &event.payload)?;
+        }
+        let subagent_stop = if event.event == "SubagentStop" {
+            Some(decode_required::<SubagentHook>(
+                &event.event,
+                &event.payload,
+            )?)
+        } else {
+            None
+        };
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         anyhow::ensure!(
             self.pending_emission.is_none(),
             "Claude translator has pending catch-up work; drain it before handling another event"
         );
         let mut ops = Vec::new();
-        let hook = decode::<HookContext>(&event.payload).unwrap_or_default();
         if let Some(cwd) = &hook.cwd {
             self.current_cwd = Some(cwd.clone());
         }
         self.tail_main(event, &hook);
         self.observe_session_details(&hook);
-        let subagent_stop = if event.event == "SubagentStop" {
-            decode::<SubagentHook>(&event.payload)
-        } else {
-            None
-        };
         if let Some(hook) = &subagent_stop {
             // Claude's internal agents (such as prompt suggestions) emit
             // unpaired stops with an empty type. They are not delegated tasks.
             // Keep known agents even if their stop omits the type, and recover
             // named agents whose start hook was missed.
-            if hook.agent_type.is_none() && !self.subagents.contains_key(&hook.agent_id) {
+            if hook.agent_type.as_deref().is_none_or(str::is_empty)
+                && !self.subagents.contains_key(&hook.agent_id)
+            {
                 return Ok(ops);
             }
         }

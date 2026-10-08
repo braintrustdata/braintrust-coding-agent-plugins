@@ -168,9 +168,11 @@ The `Result<TranslationOutcome, TranslationFailure>` boundary is important:
 - An event name the translator does not recognize is `Ignored::UnknownEvent`.
   A known event that has no trace-bearing use is `Ignored::UnusedEvent`.
   Neither blocks the stream. Both remain in the native WAL.
-- A recognized event with unknown extra fields is generally supported. An
-  absent or malformed optional field should be ignored when useful translation
-  is still correct.
+- A recognized event with unknown extra fields is generally supported. For a
+  field modeled as `Option<T>`, absence is valid and represents `None`; when
+  the field is present, it must match the expected shape of `T`. A present
+  value with the wrong type or structure is `UnsupportedShape`, even when the
+  field is optional. Do not treat malformed data as though it were absent.
 - A recognized event missing a required identity, relationship, lifecycle, or
   content field returns `UnsupportedShape`. The source session pauses before
   consuming that event. Later native events continue to be captured.
