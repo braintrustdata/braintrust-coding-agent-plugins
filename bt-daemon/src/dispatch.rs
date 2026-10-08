@@ -56,7 +56,7 @@ pub(crate) struct SessionOptions {
     pub session_id: String,
     pub translator_session_id: String,
     pub source: String,
-    pub plugin_version: Option<String>,
+    pub bt_version: String,
     pub replay: Option<ReplayPlan>,
     pub config: crate::wire::SessionConfig,
     pub correlation_key: String,
@@ -88,7 +88,7 @@ impl Session {
             session_id,
             translator_session_id,
             source,
-            plugin_version,
+            bt_version,
             replay,
             config,
             correlation_key,
@@ -107,7 +107,7 @@ impl Session {
             session_id: session_id.clone(),
             translator_session_id,
             source: source.clone(),
-            plugin_version,
+            bt_version,
             translators,
             sink_factory,
             counters: counters.clone(),
@@ -450,7 +450,7 @@ struct SessionActor {
     session_id: String,
     translator_session_id: String,
     source: String,
-    plugin_version: Option<String>,
+    bt_version: String,
     translators: Arc<Registry>,
     sink_factory: Arc<dyn SinkFactory>,
     counters: Arc<Counters>,
@@ -508,11 +508,7 @@ impl SessionActor {
                 return;
             }
         };
-        let sink = match self.sink_factory.create(
-            &self.session_id,
-            &self.source,
-            self.plugin_version.as_deref(),
-        ) {
+        let sink = match self.sink_factory.create(&self.session_id, &self.source) {
             Ok(s) => s,
             Err(e) => {
                 self.set_error(format!("sink init failed: {e}"));
@@ -547,10 +543,11 @@ impl SessionActor {
         let mut sink: Box<dyn crate::sink::Sink> = Box::new(
             LedgerSink::new(
                 sink,
-                &self.data_dir,
+                Some(&self.data_dir),
                 &self.source,
                 &self.session_id,
                 Some(&self.config),
+                &self.bt_version,
             )
             .await,
         );
@@ -582,6 +579,10 @@ impl SessionActor {
                         ctx.config = Some(cfg.clone());
                         self.refresh_permalink(sink.as_ref());
                     }
+                    sink.set_capture_versions(
+                        env.plugin_version.as_deref(),
+                        env.source_version.as_deref(),
+                    );
                     let translated = translator.handle(&env, &ctx);
                     let (correlation_changed, delivered) = self
                         .emit_translator_batches(
@@ -847,6 +848,7 @@ impl SessionActor {
                     payload.insert("_bt_transcript_replay".to_string(), serde_json::json!(true));
                 }
             }
+            sink.set_capture_versions(env.plugin_version.as_deref(), env.source_version.as_deref());
             let translated = translator.handle(&env, ctx);
             if entry_through <= plan.acknowledged_through {
                 self.replay_without_delivery(translator, ctx, translated)

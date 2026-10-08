@@ -20,13 +20,17 @@ with tempfile.TemporaryDirectory(prefix="cursor-capture-") as temporary:
     fake_bt.write_text('''#!/bin/sh
 printf '%s\\n' "$*" >> "$CAPTURE_DIR/args"
 /bin/cat > "$CAPTURE_DIR/payload"
+case " $* " in
+  *" --event beforeSubmitPrompt "*) printf '%s\\n' '{"continue":true}' ;;
+  *) printf '%s\\n' '{}' ;;
+esac
 exit "${BT_EXIT_CODE:-0}"
 ''')
     fake_bt.chmod(0o755)
     environment = dict(os.environ, CAPTURE_DIR=str(root), PATH=str(fake_bin))
     payload = b'{"conversation_id":"session-a","hook_event_name":"postToolUse","transcript_path":null,"tool_input":{"command":"echo $HOME; `pwd`"},"additive_field":42}\n'
-    # One successful and one failed invocation exercise direct executable
-    # forwarding; Cursor's failClosed=false setting keeps capture fail-open.
+    # Cursor hook responses come from the CLI after capture. The protocol
+    # response must still be present when capture itself fails.
     for exit_code in ('0', '1'):
         environment['BT_EXIT_CODE'] = exit_code
         for event, registrations in config['hooks'].items():
@@ -35,10 +39,13 @@ exit "${BT_EXIT_CODE:-0}"
                                     input=payload, env=environment,
                                     capture_output=True, executable='/bin/sh')
             assert result.returncode == int(exit_code), (event, result.returncode)
-            assert result.stdout == b'', (event, result.stdout)
+            expected_output = (b'{"continue":true}\n' if event == 'beforeSubmitPrompt'
+                               else b'{}\n')
+            assert result.stdout == expected_output, (event, result.stdout)
             assert (root / 'payload').read_bytes() == payload
             args = (root / 'args').read_text().splitlines()[-1]
             assert args == ('trace hook --source cursor '
+                            f'--event {event} '
                             '--session-id-field conversation_id --event-field hook_event_name '
                             '--transcript-path-field transcript_path --flush-on-turn-end '
                             '--capture-timeout-ms 8000'), args
@@ -51,5 +58,5 @@ exit "${BT_EXIT_CODE:-0}"
                                 capture_output=True, executable='/bin/sh')
         assert result.returncode != 0, (event, result.returncode)
         assert registrations[0]['failClosed'] is False
-print('cursor capture: direct command forwarding and fail-open configuration OK')
+print('cursor capture: portable command forwarding OK')
 PY

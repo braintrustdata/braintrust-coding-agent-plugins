@@ -90,7 +90,7 @@ impl Daemon {
                 session_id: env.session_id.clone(),
                 translator_session_id,
                 source: env.source.clone(),
-                plugin_version: env.plugin_version.clone(),
+                bt_version: self.version.clone(),
                 replay: Some(replay),
                 config,
                 correlation_key: key.correlation_key(),

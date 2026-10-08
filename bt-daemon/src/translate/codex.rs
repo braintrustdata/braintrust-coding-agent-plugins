@@ -849,6 +849,9 @@ impl CodexTranslator {
             parent_span_ids: vec![scope.turn_parent_span_id.clone()],
             name: format!("turn: {turn_id}"),
             span_type: SpanType::Task,
+            // Native compaction hooks identify maintenance turns before catch-up.
+            is_turn: self.compaction_trigger_by_turn.get(&turn_id).is_none()
+                && !self.compaction_spans.contains(&turn_id),
             start_ms: Some(ts),
             metadata: Some(json!({ "turn_id": turn_id, "model": scope.model })),
             turn_span_id: Some(owner),

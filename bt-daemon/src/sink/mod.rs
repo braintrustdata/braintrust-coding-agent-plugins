@@ -27,6 +27,14 @@ pub trait Sink: Send {
         let _ = config;
     }
 
+    /// Versions of the event currently being translated, including replay.
+    fn set_capture_versions(
+        &mut self,
+        _plugin_version: Option<&str>,
+        _source_version: Option<&str>,
+    ) {
+    }
+
     /// Emit span ops. Returns the number of rows written, for status counters.
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64>;
 
@@ -46,14 +54,8 @@ pub trait Sink: Send {
     }
 }
 
-/// Builds a sink per session. `source` and `plugin_version` identify the
-/// instrumentation that captured the events and are used to stamp
-/// `context.span_origin` centrally.
+/// Builds a sink per session. Capture provenance belongs to span creation,
+/// not to the event that happens to create the session actor.
 pub trait SinkFactory: Send + Sync {
-    fn create(
-        &self,
-        session_id: &str,
-        source: &str,
-        plugin_version: Option<&str>,
-    ) -> anyhow::Result<Box<dyn Sink>>;
+    fn create(&self, session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>>;
 }

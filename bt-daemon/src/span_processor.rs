@@ -238,7 +238,7 @@ pub fn process(
                 engine.failed_plugins.remove(plugin);
             }
             let candidate = engine.call(plugin, &row, operation, source, session_id);
-            let candidate = match candidate {
+            let mut candidate = match candidate {
                 Ok(candidate)
                     if (
                         candidate.span_id.as_str(),
@@ -277,6 +277,8 @@ pub fn process(
                     break;
                 }
             };
+            // Turn identity belongs to the translator, not the JSON transform.
+            candidate.is_turn = row.is_turn;
             row = candidate;
         }
         Ok(())

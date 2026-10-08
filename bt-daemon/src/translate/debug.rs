@@ -64,6 +64,8 @@ impl AgentTranslator for DebugTranslator {
                 late_merge_key: None,
                 turn_span_id: None,
                 tags: None,
+                is_turn: false,
+                origin: None,
             }));
         }
 
@@ -86,6 +88,8 @@ impl AgentTranslator for DebugTranslator {
             late_merge_key: None,
             turn_span_id: None,
             tags: None,
+            is_turn: false,
+            origin: None,
         }));
 
         Ok(ops)

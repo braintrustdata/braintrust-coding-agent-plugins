@@ -90,14 +90,31 @@ pub(crate) fn should_flush_ingress_event(env: &wire::Envelope) -> bool {
 /// Returns `Ok` once the daemon has durably journaled the event. Delivery
 /// happens later; an `Err` means capture failed before acknowledgement.
 pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> anyhow::Result<()> {
-    if suppress_inherited_hook(&args) {
-        return Ok(());
+    let response =
+        (args.source == "cursor").then(|| cursor_hook_response_for_event(args.event.as_deref()));
+    let result = async move {
+        if suppress_inherited_hook(&args) {
+            return Ok(());
+        }
+        let settings = settings::AgentSettings::load_for_hook(&args.source)?;
+        if !settings.tracing_enabled() {
+            return Ok(());
+        }
+        run_hook_with_route(args, settings.route.unwrap_or(route), host).await
     }
-    let settings = settings::AgentSettings::load_for_hook(&args.source)?;
-    if !settings.tracing_enabled() {
-        return Ok(());
+    .await;
+    if let Some(response) = response {
+        println!("{response}");
     }
-    run_hook_with_route(args, settings.route.unwrap_or(route), host).await
+    result
+}
+
+fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
+    if event == Some("beforeSubmitPrompt") {
+        r#"{"continue":true}"#
+    } else {
+        "{}"
+    }
 }
 
 /// A managed run injects its own hook definitions. Suppress an inherited

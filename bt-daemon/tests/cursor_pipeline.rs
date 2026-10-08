@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Smoke-test Cursor's proposed direct Windows command through the native
-/// command shell. This checks executable lookup and stdin forwarding, which
-/// the POSIX-only launcher cannot exercise on a Windows runner.
+/// Smoke-test Cursor's portable direct command through the native Windows
+/// shell. This checks executable lookup, stdin forwarding, and its JSON
+/// response without relying on a POSIX-only launcher.
 #[cfg(windows)]
 #[allow(
     clippy::disallowed_methods,
@@ -35,14 +35,14 @@ fn cursor_direct_hook_command_receives_native_stdin_on_windows() {
     let shim = tmp.path().join("bt.cmd");
     std::fs::write(
         &shim,
-        "@echo off\r\nif /I not \"%~1 %~2\"==\"trace hook\" exit /b 13\r\n> \"%CURSOR_HOOK_ARGS_FILE%\" echo %*\r\nset /p BT_EVENT=\r\n> \"%CURSOR_HOOK_INPUT_FILE%\" echo %BT_EVENT%\r\nexit /b 0\r\n",
+        "@echo off\r\nif /I not \"%~1 %~2\"==\"trace hook\" exit /b 13\r\n> \"%CURSOR_HOOK_ARGS_FILE%\" echo %*\r\nset /p BT_EVENT=\r\n> \"%CURSOR_HOOK_INPUT_FILE%\" echo %BT_EVENT%\r\necho {}\r\nexit /b 0\r\n",
     )
     .unwrap();
     let path = std::env::join_paths(std::iter::once(tmp.path().to_owned()).chain(
         std::env::split_paths(&std::env::var_os("PATH").expect("Windows PATH is present")),
     ))
     .unwrap();
-    let command = "bt trace hook --source cursor --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000";
+    let command = "bt trace hook --source cursor --event afterAgentResponse --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000";
     let payload = r#"{"conversation_id":"windows-smoke","hook_event_name":"afterAgentResponse","transcript_path":null}"#;
     let mut child = Command::new("cmd.exe")
         .args(["/d", "/s", "/c", command])
@@ -67,8 +67,8 @@ fn cursor_direct_hook_command_receives_native_stdin_on_windows() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        output.stdout.is_empty(),
-        "direct tracing command must not write a policy response"
+        String::from_utf8_lossy(&output.stdout).trim() == "{}",
+        "Cursor CLI hook response must be valid JSON"
     );
     let args = std::fs::read_to_string(args_path).unwrap();
     assert!(args.starts_with("trace hook --source cursor "), "{args}");
@@ -381,7 +381,7 @@ impl Sink for BufferedSink {
 }
 
 impl SinkFactory for BufferedSink {
-    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
+    fn create(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Sink>> {
         Ok(Box::new(Self(self.0.clone())))
     }
 }

@@ -50,6 +50,14 @@ pub enum SpanType {
     Tool,
 }
 
+/// Immutable versions captured when a session root or turn is first created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginSnapshot {
+    pub plugin_version: Option<String>,
+    pub bt_version: String,
+    pub source_version: Option<String>,
+}
+
 /// A resolved span row, ready for a sink to insert or merge. Field set is the
 /// subset every current plugin uses; extend as translators need more.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -89,6 +97,12 @@ pub struct SpanRow {
     /// Labels for filtering in Braintrust (e.g. `compaction`, `permission-request`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Translator-owned marker for turn creation, not other task spans.
+    #[serde(skip)]
+    pub is_turn: bool,
+    /// Delivery-owned creation snapshot, present on session roots and turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<OriginSnapshot>,
 }
 
 /// A span operation. `Insert` creates (or replaces) a row; `Merge` updates an
