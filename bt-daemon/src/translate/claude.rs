@@ -149,6 +149,7 @@ impl TranslatorFactory for ClaudeTranslatorFactory {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Turn {
     id: String,
     number: u32,
@@ -157,47 +158,52 @@ struct Turn {
     user_turn_id: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingPrompt {
     turn_id: Arc<String>,
     content: Value,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct TranscriptCursor {
     offset: u64,
     buffered: Vec<Value>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Subagent {
     span_id: String,
     parent_span_id: String,
     transcript_path: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AgentOrigin {
     parent_id: String,
     user_turn_id: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingTool {
     span_id: String,
     parent_id: String,
     metadata: Value,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 enum PendingHistory {
     Main,
     Owned(MessageHistory),
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct MessageHistory {
     messages: Vec<HistoryMessage>,
     preserved_after_compaction: Vec<String>,
     fork_context_prefix: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct HistoryMessage {
     value: Value,
     source_uuids: Vec<String>,
@@ -263,6 +269,7 @@ impl MessageHistory {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingEmission {
     segments: VecDeque<Vec<Value>>,
     history: PendingHistory,
@@ -272,6 +279,7 @@ struct PendingEmission {
     clear_after: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ClaudeTranslator {
     session_id: String,
     session_span_id: String,
@@ -308,6 +316,7 @@ struct ClaudeTranslator {
     session_model: Option<String>,
     permission_mode: Option<String>,
     system_prompt: Option<String>,
+    #[serde(skip)]
     git: Arc<GitMetadataCache>,
     current_cwd: Option<String>,
     last_turn_cwd: Option<String>,
@@ -1245,6 +1254,17 @@ impl ClaudeTranslator {
 }
 
 impl AgentTranslator for ClaudeTranslator {
+    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+
+    fn restore(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
+        let mut restored: Self = serde_json::from_value(snapshot)?;
+        restored.git = self.git.clone();
+        *self = restored;
+        Ok(())
+    }
+
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let known_event = matches!(
             event.event.as_str(),

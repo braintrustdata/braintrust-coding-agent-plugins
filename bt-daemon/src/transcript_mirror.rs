@@ -158,15 +158,155 @@ pub async fn capture_generation(
     Ok((path, from + copied))
 }
 
-/// Transcript mirrors are referenced by retained native WAL records and are
-/// therefore retained for the lifetime of the data directory.
+/// Age only permits collection of unreferenced auxiliary input. Remaining events,
+/// committed translator continuation, and current observation templates protect mirrors.
 pub async fn gc_old_mirrors(data_dir: &Path, max_age: std::time::Duration) {
-    let _ = (data_dir, max_age);
+    let data_dir = data_dir.to_owned();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use std::collections::HashSet;
+        fn references(value: &serde_json::Value, names: &mut HashSet<String>) {
+            match value {
+                serde_json::Value::String(value) => {
+                    if let Some(name) = Path::new(value).file_name().and_then(|n| n.to_str()) {
+                        names.insert(name.to_owned());
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        references(value, names);
+                    }
+                }
+                serde_json::Value::Object(values) => {
+                    for (key, value) in values {
+                        references(&serde_json::Value::String(key.clone()), names);
+                        references(value, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut protected = HashSet::new();
+        // Scan remaining JSONL input, including framed and released unframed records. Fail closed
+        // on unreadable control/input state so maintenance cannot make recovery lossy.
+        if crate::journal::journal_dir(&data_dir).exists() {
+            for entry in std::fs::read_dir(crate::journal::journal_dir(&data_dir))? {
+                let path = entry?.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+                    continue;
+                }
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(std::fs::File::open(&path)?).lines() {
+                    let line = line?;
+                    if !line.trim().is_empty() {
+                        references(&serde_json::from_str(&line)?, &mut protected);
+                    }
+                }
+                for route in crate::journal::captured_routes(&path)? {
+                    references(&serde_json::to_value(route.envelope)?, &mut protected);
+                }
+            }
+        }
+        let derived = data_dir.join("derived");
+        if derived.exists() {
+            for entry in std::fs::read_dir(derived)? {
+                let path = entry?.path().join("spans.sqlite");
+                if !path.exists() {
+                    continue;
+                }
+                let db = rusqlite::Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                db.busy_timeout(std::time::Duration::from_secs(5))?;
+                let mut stmt = db.prepare("SELECT state FROM continuation")?;
+                for state in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                    references(&serde_json::from_str(&state?)?, &mut protected);
+                }
+            }
+        }
+        let dir = mirror_dir(&data_dir);
+        if !dir.exists() {
+            return Ok(());
+        }
+        let entries = std::fs::read_dir(&dir)?.collect::<Result<Vec<_>, _>>()?;
+        let now = std::time::SystemTime::now();
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+                || protected.contains(path.file_name().unwrap().to_str().unwrap_or_default())
+            {
+                continue;
+            }
+            let old = entry
+                .metadata()?
+                .modified()
+                .ok()
+                .and_then(|time| now.duration_since(time).ok())
+                .is_some_and(|age| age > max_age);
+            if old {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error,"transcript mirror collection skipped"),
+        Err(error) => tracing::warn!(%error,"transcript mirror collection task failed"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn collection_protects_untranslated_input_and_continuation_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = temp.path().join("native.jsonl");
+        std::fs::write(&native, "original\n").unwrap();
+        let (mirror, _) = capture(temp.path(), "session", native.to_str().unwrap())
+            .await
+            .unwrap();
+        let env: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
+            "source":"debug","session_id":"session","event":"unknown","ts_ms":1,
+            "payload":{"_bt_transcript_mirror":{"mirror":mirror}}
+        }))
+        .unwrap();
+        let journal = crate::journal::source_journal_path(temp.path(), "debug", "session");
+        let mut writer = crate::journal::JournalWriter::open_path(&journal)
+            .await
+            .unwrap();
+        let through = writer.append(&env).await.unwrap();
+        gc_old_mirrors(temp.path(), std::time::Duration::ZERO).await;
+        assert!(
+            mirror.exists(),
+            "untranslated events protect their observations"
+        );
+        let db_path = temp.path().join("derived/test/spans.sqlite");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(db_path).unwrap();
+        db.execute_batch("CREATE TABLE continuation(state TEXT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO continuation VALUES(?1)",
+            [serde_json::json!({"path":mirror}).to_string()],
+        )
+        .unwrap();
+        writer.collect_through(through).await.unwrap();
+        gc_old_mirrors(temp.path(), std::time::Duration::ZERO).await;
+        assert!(
+            mirror.exists(),
+            "continuation protects observations after input collection"
+        );
+        db.execute("DELETE FROM continuation", []).unwrap();
+        gc_old_mirrors(temp.path(), std::time::Duration::ZERO).await;
+        assert!(
+            !mirror.exists(),
+            "unreferenced observations are not retained forever"
+        );
+    }
 
     #[tokio::test]
     async fn capture_is_incremental_and_reports_the_high_water_offset() {

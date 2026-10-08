@@ -219,6 +219,10 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
         )
         .unwrap(),
     );
+    while let Some(batch) = tr.drain_pending(&ctx).unwrap() {
+        ops.extend(batch);
+    }
+    tr.restore(tr.snapshot().unwrap()).unwrap();
     // A later trigger (Stop) — nothing new in the transcript here.
     ops.extend(
         tr.handle(&envelope("sess-1", "Stop", tpath, json!({})), &ctx)

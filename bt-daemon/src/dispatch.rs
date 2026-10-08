@@ -58,7 +58,6 @@ enum SessionMsg {
 
 /// Where to rebuild a session's translator state from, streamed at startup.
 pub struct ReplayPlan {
-    pub journal_path: PathBuf,
     /// Replay stops here — the journal's length when this session was
     /// created, so the event creating it is not replayed and then delivered
     /// a second time from the queue.
@@ -107,7 +106,7 @@ impl Session {
     /// Spawn a session's actor task and return its handle.
     pub fn spawn(
         options: SessionOptions,
-        translators: Arc<Registry>,
+        _translators: Arc<Registry>,
         sink_factory: Arc<dyn SinkFactory>,
     ) -> Arc<Session> {
         let SessionOptions {
@@ -135,7 +134,6 @@ impl Session {
             session_id: session_id.clone(),
             source: source.clone(),
             plugin_version,
-            translators,
             sink_factory,
             counters: counters.clone(),
             last_error: last_error.clone(),
@@ -151,6 +149,7 @@ impl Session {
             correlation_changed,
             auth_provider,
             derived,
+            delivered_sequence: AtomicU64::new(0),
         };
         tokio::spawn(actor.run(rx));
 
@@ -495,7 +494,6 @@ struct SessionActor {
     session_id: String,
     source: String,
     plugin_version: Option<String>,
-    translators: Arc<Registry>,
     sink_factory: Arc<dyn SinkFactory>,
     counters: Arc<Counters>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -511,6 +509,7 @@ struct SessionActor {
     correlation_changed: Arc<tokio::sync::Notify>,
     auth_provider: Option<Arc<dyn crate::server::AuthProvider>>,
     derived: Arc<crate::derived::SourceTranslation>,
+    delivered_sequence: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -566,39 +565,6 @@ impl SessionActor {
                 marker_emitted: incident.marker_span_id.is_some(),
                 marker_cleared: false,
             });
-        } else if let Ok(Some(active)) = crate::plugin_diagnostics::active_pipeline(
-            &self.data_dir,
-            &self.source,
-            &self.session_id,
-            &self.route,
-        ) {
-            if let Some(span_id) = active.span_id {
-                if let Some(scope) = &recovery_scope {
-                    let _ = crate::recovery::pause(
-                        &self.data_dir,
-                        scope.clone(),
-                        active.journal_start.unwrap_or(0),
-                        0,
-                        crate::recovery::FailureCause::PluginFile {
-                            path: active.plugin_path.clone(),
-                            digest: active.plugin_digest.clone(),
-                            plugin_index: self
-                                .route
-                                .span_plugins
-                                .iter()
-                                .position(|path| path == &active.plugin_path)
-                                .unwrap_or(0),
-                        },
-                        active.exception.clone(),
-                        Some(span_id.clone()),
-                    );
-                }
-                *self.pause.lock().unwrap() = Some(PausedWork {
-                    marker_span_id: Some(span_id),
-                    marker_emitted: true,
-                    marker_cleared: false,
-                });
-            }
         }
         let source_scope = crate::recovery::WorkScope::SourceSession {
             source: self.source.clone(),
@@ -630,7 +596,7 @@ impl SessionActor {
         // Keep the journal conservative for this actor generation rather than
         // checkpointing past an event that may need recovery delivery.
         let mut checkpointable = self
-            .replay_into(
+            .prepare_and_replay(
                 &mut translator,
                 &mut sink,
                 &ctx,
@@ -669,15 +635,38 @@ impl SessionActor {
                 _ = retry_tick.tick(), if self.pause.lock().unwrap().is_some() => {
                     let route_incident = recovery_scope.as_ref().and_then(|scope| crate::recovery::active(&self.data_dir, scope).ok().flatten());
                     let source_incident = crate::recovery::active(&self.data_dir, &source_scope).ok().flatten();
-                    let (scope, incident) = if source_incident.is_some() { (Some(&source_scope), source_incident) } else { (recovery_scope.as_ref(), route_incident) };
                     let now = crate::recovery::now_ms();
-                    let eligible = incident.as_ref().is_some_and(|incident| match &incident.cause {
+                    let eligible = |incident: &crate::recovery::Incident| match &incident.cause {
                         crate::recovery::FailureCause::Credentials { retry_after_ms, .. } => now >= *retry_after_ms,
                         cause => cause.check_local(crate::recovery::translator_revision(), now)
                             == crate::recovery::CheckResult::RetryCandidate,
-                    });
-                    if !eligible {
-                        continue;
+                    };
+                    let retry_source = source_incident.as_ref().is_some_and(eligible);
+                    let (mut scope, mut incident) = if retry_source {
+                        (Some(&source_scope), source_incident.clone())
+                    } else if route_incident.as_ref().is_some_and(eligible) {
+                        (recovery_scope.as_ref(), route_incident.clone())
+                    } else if source_incident.is_none() && route_incident.is_none() {
+                        // Another route may have recovered the shared source.
+                        // Drain its newly committed output even without a native event.
+                        (recovery_scope.as_ref(), None)
+                    } else { continue; };
+                    if retry_source {
+                        let tip=self.journal.lock().await.position();
+                        if let Err(error)=self.derived.ensure_event(tip).await {
+                            self.record_translation_failure(&error,Some((0,tip)));
+                            self.set_error(format!("span production retry failed: {error}"));continue;
+                        }
+                        if let Err(error)=self.derived.collect_input(&self.journal).await {self.set_error(format!("event WAL collection failed: {error}"));}
+                        let _=crate::recovery::resolve(&self.data_dir,&source_scope);
+                        if let Some(route_incident)=&route_incident {
+                            if !matches!(route_incident.cause,crate::recovery::FailureCause::Credentials{..}) &&
+                                route_incident.cause.check_local(crate::recovery::translator_revision(),now)!=crate::recovery::CheckResult::RetryCandidate {
+                                continue;
+                            }
+                        }
+                        scope=recovery_scope.as_ref();
+                        incident=route_incident.clone();
                     }
                     if !auth_ready || incident.as_ref().is_some_and(|incident| matches!(incident.cause, crate::recovery::FailureCause::Credentials { .. })) {
                         let Some(provider) = &self.auth_provider else {
@@ -735,14 +724,11 @@ impl SessionActor {
                     if let Some(config) = &ctx.config { next_sink.configure(config); }
                     let tip = self.journal.lock().await.position();
                     let plan = ReplayPlan {
-                        journal_path: crate::journal::source_journal_path(
-                            &self.data_dir, &self.source, &self.session_id,
-                        ),
                         through: tip,
                         acknowledged_through,
                     };
                     let mut next_translator = next_translator;
-                    let replay_ok = self.replay_into(
+                    let replay_ok = self.prepare_and_replay(
                         &mut next_translator, &mut next_sink, &ctx, Some(&plan), true,
                     ).await;
                     let flushed = replay_ok && self.checkpoint_and_flush(
@@ -789,9 +775,10 @@ impl SessionActor {
                             incident.cause,
                             crate::recovery::FailureCause::InputShape { .. }
                                 | crate::recovery::FailureCause::TranslatorFault { .. }
+                                | crate::recovery::FailureCause::LocalStorage { .. }
                         )
                     });
-                    let skip_for_pause = translation_paused || (auth_ready && paused.is_some());
+                    let skip_for_pause = translation_paused;
                     if journal_through <= replayed_through || skip_for_pause {
                         last_event_through = last_event_through.max(journal_through);
                         self.counters.queued.fetch_sub(1, Ordering::Relaxed);
@@ -806,34 +793,42 @@ impl SessionActor {
                         ctx.config = Some(cfg.clone());
                         self.refresh_permalink(sink.as_ref());
                     }
-                    let translated = match self.derived.ensure_event(journal_through).await {
-                        Ok(path) => {
-                            translator.set_revision_path(&path);
-                            translator.handle(&env, &ctx)
-                        }
-                        Err(error) => Err(error),
-                    };
-                    let (correlation_changed, delivered) = if auth_ready {
-                        self.emit_translator_batches(
-                            &mut translator,
-                            &mut sink,
-                            &ctx,
-                            translated,
-                            BatchMode::Live,
-                            event_window,
-                        )
-                        .await
-                    } else {
-                        (
-                            false,
-                            self.replay_without_delivery(
+                    let produced = self.derived.ensure_event(journal_through).await;
+                    let (correlation_changed, delivered) = match produced {
+                        Ok(_) => {
+                            if let Err(error) = self.derived.collect_input(&self.journal).await {
+                                self.set_error(format!("event WAL collection failed: {error}"));
+                            }
+                            if auth_ready && paused.is_some() {
+                                self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            self.consume_into(
                                 &mut translator,
+                                &mut sink,
                                 &ctx,
-                                translated,
-                                (event_start, journal_through),
+                                auth_ready,
+                                BatchMode::Live,
                             )
-                            .await,
-                        )
+                            .await
+                        }
+                        Err(error) => {
+                            self.record_translation_failure(&error, event_window);
+                            self.set_error(format!("span production failed: {error}"));
+                            if let Err(error) = self.derived.collect_input(&self.journal).await {
+                                self.set_error(format!("event WAL collection failed: {error}"));
+                            }
+                            let (changed, _) = self
+                                .consume_into(
+                                    &mut translator,
+                                    &mut sink,
+                                    &ctx,
+                                    auth_ready,
+                                    BatchMode::Live,
+                                )
+                                .await;
+                            (changed, false)
+                        }
                     };
                     if correlation_changed || correlation_barrier {
                         if let Err(error) = crate::server::persist_active_parent_snapshot(
@@ -871,14 +866,23 @@ impl SessionActor {
                     let became_ready = !auth_ready;
                     auth_ready = true;
                     ctx.config = Some(config.clone());
-                    if became_ready
-                        && self.pause.lock().unwrap().as_ref().is_none_or(|_| {
-                            crate::recovery::active(&self.data_dir, &source_scope)
+                    let route_retry_allowed = recovery_scope
+                        .as_ref()
+                        .and_then(|scope| {
+                            crate::recovery::active(&self.data_dir, scope)
                                 .ok()
                                 .flatten()
-                                .is_none()
                         })
-                    {
+                        .is_none_or(|incident| {
+                            matches!(
+                                incident.cause,
+                                crate::recovery::FailureCause::Credentials { .. }
+                            ) || incident.cause.check_local(
+                                crate::recovery::translator_revision(),
+                                crate::recovery::now_ms(),
+                            ) == crate::recovery::CheckResult::RetryCandidate
+                        });
+                    if became_ready && route_retry_allowed {
                         if let Ok(next_sink) = self.sink_factory.create(
                             &self.session_id,
                             &self.source,
@@ -898,16 +902,11 @@ impl SessionActor {
                             next_sink.configure(&config);
                             let tip = last_event_through;
                             let plan = ReplayPlan {
-                                journal_path: crate::journal::source_journal_path(
-                                    &self.data_dir,
-                                    &self.source,
-                                    &self.session_id,
-                                ),
                                 through: tip,
                                 acknowledged_through,
                             };
                             let replay_ok = self
-                                .replay_into(
+                                .prepare_and_replay(
                                     &mut next_translator,
                                     &mut next_sink,
                                     &ctx,
@@ -948,7 +947,12 @@ impl SessionActor {
                     }
                     let _ = reply.send(());
                 }
-                SessionMsg::AuthFailure(error, first_unprocessed) => {
+                SessionMsg::AuthFailure(error, _capture_cursor) => {
+                    let first_unprocessed = self
+                        .derived
+                        .consumer_sequence(&self.route)
+                        .await
+                        .unwrap_or(0);
                     auth_ready = false;
                     if let Ok(scope) = crate::recovery::WorkScope::delivery(
                         &self.source,
@@ -985,6 +989,21 @@ impl SessionActor {
                     let _ = reply.send(());
                 }
                 SessionMsg::Flush(reply) => {
+                    if self.source_paused() && !self.delivery_paused() {
+                        let (_, delivered) = self
+                            .consume_into(&mut translator, &mut sink, &ctx, true, BatchMode::Replay)
+                            .await;
+                        if delivered {
+                            self.record_delivery_checkpoint(
+                                &mut sink,
+                                pending_through,
+                                &mut acknowledged_through,
+                            )
+                            .await;
+                        }
+                        let _ = reply.send(self.counters.queued.load(Ordering::Relaxed).max(1));
+                        continue;
+                    }
                     if self.pause.lock().unwrap().is_some() {
                         let _ = reply.send(self.counters.queued.load(Ordering::Relaxed).max(1));
                         continue;
@@ -1090,6 +1109,11 @@ impl SessionActor {
                 return (false, false);
             }
         };
+        let event_window = translator
+            .ledger_sequence()
+            .filter(|seq| *seq > 0)
+            .map(|seq| (seq - 1, seq))
+            .or(event_window);
         let mut correlation_changed = false;
         let mut delivered = true;
         let mut operation_index = 0u32;
@@ -1271,6 +1295,12 @@ impl SessionActor {
                 }
             };
         }
+        if delivered {
+            if let Some(sequence) = translator.ledger_sequence() {
+                self.delivered_sequence
+                    .fetch_max(sequence, Ordering::Relaxed);
+            }
+        }
         (correlation_changed, delivered)
     }
 
@@ -1287,7 +1317,7 @@ impl SessionActor {
             crate::translate::SpanOp::Insert(row) => (row, "insert"),
             crate::translate::SpanOp::Merge(row) => (row, "merge"),
         };
-        let (start, through) = event_window.unwrap_or((0, self.journal.lock().await.position()));
+        let (start, through) = event_window.unwrap_or((0, self.derived.tip().await.unwrap_or(0)));
         let marker = crate::translate::SpanOp::Merge(crate::translate::SpanRow {
             span_id: row.span_id.clone(),
             root_span_id: row.root_span_id.clone(),
@@ -1352,8 +1382,8 @@ impl SessionActor {
                 operation,
                 plugin_path: plugin,
                 exception: message,
-                journal_start: start,
-                journal_through: through,
+                span_cursor: start,
+                span_through: through,
             },
         ) {
             self.set_error(format!("failed to persist span plugin diagnostic: {error}"));
@@ -1367,11 +1397,18 @@ impl SessionActor {
     }
 
     fn record_translation_failure(&self, error: &anyhow::Error, event_window: Option<(u64, u64)>) {
-        let Some((start, _)) = event_window else {
+        let Some((mut start, _)) = event_window else {
             return;
         };
+        if let Some(position) = error.downcast_ref::<crate::derived::InputFailurePosition>() {
+            start = position.start;
+        }
         let revision = crate::recovery::translator_revision().to_owned();
-        let cause = if let Some(shape) = error.downcast_ref::<crate::translate::InputShapeError>() {
+        let cause = if crate::derived::retryable_storage(error) {
+            crate::recovery::FailureCause::LocalStorage {
+                retry_after_ms: crate::recovery::now_ms() + 1_000,
+            }
+        } else if let Some(shape) = error.downcast_ref::<crate::translate::InputShapeError>() {
             crate::recovery::FailureCause::InputShape {
                 event: shape.event.clone(),
                 translator_revision: revision.clone(),
@@ -1398,7 +1435,9 @@ impl SessionActor {
                 "failed to persist translation incident: {persist_error}"
             ));
         }
-        *self.pause.lock().unwrap() = Some(PausedWork::default());
+        if self.pause.lock().unwrap().is_none() {
+            *self.pause.lock().unwrap() = Some(PausedWork::default());
+        }
     }
 
     fn record_delivery_failure(
@@ -1441,10 +1480,70 @@ impl SessionActor {
         }
     }
 
-    /// Stream the journal through the translator, emitting each entry's spans
-    /// as they are produced. Nothing is accumulated across entries: peak
-    /// memory is one journal entry and the ops it yields, so recovering a
-    /// long session costs the same as running it.
+    /// Source translation and route delivery pause independently.
+    fn source_paused(&self) -> bool {
+        crate::recovery::active(
+            &self.data_dir,
+            &crate::recovery::WorkScope::SourceSession {
+                source: self.source.clone(),
+                session_id: self.session_id.clone(),
+            },
+        )
+        .ok()
+        .flatten()
+        .is_some()
+    }
+    fn delivery_paused(&self) -> bool {
+        crate::recovery::WorkScope::delivery(&self.source, &self.session_id, &self.route)
+            .ok()
+            .and_then(|scope| {
+                crate::recovery::active(&self.data_dir, &scope)
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+    }
+
+    async fn prepare_and_replay(
+        &self,
+        translator: &mut Box<dyn crate::translate::AgentTranslator>,
+        sink: &mut Box<dyn crate::sink::Sink>,
+        ctx: &SessionCtx,
+        plan: Option<&ReplayPlan>,
+        deliver: bool,
+    ) -> bool {
+        if let Some(plan) = plan {
+            // Produce outstanding captured input upstream, then consume only the committed span ledger.
+            let source_scope = crate::recovery::WorkScope::SourceSession {
+                source: self.source.clone(),
+                session_id: self.session_id.clone(),
+            };
+            let can_produce = crate::recovery::active(&self.data_dir, &source_scope)
+                .ok()
+                .flatten()
+                .is_none_or(|incident| {
+                    incident.cause.check_local(
+                        crate::recovery::translator_revision(),
+                        crate::recovery::now_ms(),
+                    ) == crate::recovery::CheckResult::RetryCandidate
+                });
+            if can_produce {
+                if let Err(error) = self.derived.ensure_event(plan.through).await {
+                    self.record_translation_failure(
+                        &error,
+                        Some((plan.acknowledged_through, plan.through)),
+                    );
+                    self.set_error(format!("span production failed: {error}"));
+                }
+            }
+            if let Err(error) = self.derived.collect_input(&self.journal).await {
+                self.set_error(format!("event WAL collection failed: {error}"));
+                return false;
+            }
+        }
+        self.replay_into(translator, sink, ctx, plan, deliver).await
+    }
+
     async fn replay_into(
         &self,
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
@@ -1453,85 +1552,105 @@ impl SessionActor {
         plan: Option<&ReplayPlan>,
         deliver: bool,
     ) -> bool {
-        let Some(plan) = plan else {
+        if plan.is_none() {
             return true;
-        };
-        let mut reader = match crate::journal::JournalReader::open(&plan.journal_path, plan.through)
-            .await
-        {
-            Ok(Some(reader)) => reader,
-            Ok(None) => return true,
+        }
+        match self.derived.consumer_sequence(&self.route).await {
+            Ok(sequence) => self.delivered_sequence.store(sequence, Ordering::Relaxed),
             Err(error) => {
-                tracing::warn!(session_id = %self.session_id, "journal replay skipped: {error}");
+                self.record_delivery_failure(
+                    &error,
+                    Some((
+                        self.delivered_sequence.load(Ordering::Relaxed),
+                        self.delivered_sequence.load(Ordering::Relaxed),
+                    )),
+                    0,
+                );
+                self.set_error(format!("span ledger cursor failed: {error}"));
                 return false;
             }
+        }
+        self.consume_into(translator, sink, ctx, deliver, BatchMode::Replay)
+            .await
+            .1
+    }
+
+    /// Every downstream stage reads only committed span revisions, in output sequence order.
+    async fn consume_into(
+        &self,
+        translator: &mut Box<dyn crate::translate::AgentTranslator>,
+        sink: &mut Box<dyn crate::sink::Sink>,
+        ctx: &SessionCtx,
+        deliver: bool,
+        mode: BatchMode,
+    ) -> (bool, bool) {
+        let tip = match self.derived.tip().await {
+            Ok(tip) => tip,
+            Err(error) => {
+                self.record_delivery_failure(&error, None, 0);
+                self.set_error(format!("span ledger tip failed: {error}"));
+                return (false, false);
+            }
         };
-        let mut delivered = true;
-        let mut before = 0;
+        let mut after = self.delivered_sequence.load(Ordering::Relaxed);
+        let mut changed = false;
         loop {
-            let entry = match reader.next_record().await {
-                Ok(Some(entry)) => entry,
+            let revision = match self.derived.next_revision(after, tip).await {
+                Ok(Some(revision)) => revision,
                 Ok(None) => break,
                 Err(error) => {
-                    tracing::warn!(session_id = %self.session_id, "journal replay stopped: {error}");
-                    delivered = false;
-                    break;
+                    self.record_delivery_failure(&error, Some((after, after)), 0);
+                    self.set_error(format!("span ledger replay failed: {error}"));
+                    return (changed, false);
                 }
             };
-            let entry_through = entry.through;
-            let crate::journal::JournalRecord::Event(entry) = entry.record else {
-                before = entry_through;
-                continue;
-            };
-            let mut env = crate::journal::envelope_from_redacted(entry);
-            let Some(canonical_source) = self.translators.canonical_source(&env.source) else {
-                before = entry_through;
-                continue;
-            };
-            if canonical_source != self.source {
-                before = entry_through;
-                continue;
-            }
-            env.source = self.source.clone();
-            if env.source == "claude-code" {
-                if let Some(payload) = env.payload.as_object_mut() {
-                    payload.insert("_bt_transcript_replay".to_string(), serde_json::json!(true));
-                }
-            }
-            let translated = match self.derived.ensure_event(entry_through).await {
-                Ok(path) => {
-                    translator.set_revision_path(&path);
-                    translator.handle(&env, ctx)
-                }
-                Err(error) => Err(error),
-            };
-            if !deliver || entry_through <= plan.acknowledged_through {
-                if !self
-                    .replay_without_delivery(translator, ctx, translated, (before, entry_through))
-                    .await
-                {
-                    delivered = false;
-                    break;
-                }
-            } else {
-                let (_, replayed) = self
+            after = revision.sequence;
+            let env = revision
+                .envelope
+                .map(crate::journal::envelope_from_redacted)
+                .unwrap_or_else(|| Envelope {
+                    source: self.source.clone(),
+                    session_id: self.session_id.clone(),
+                    event: String::new(),
+                    ts_ms: 0,
+                    payload: serde_json::Value::Null,
+                    source_version: None,
+                    plugin_version: None,
+                    managed_run_id: None,
+                    capture: None,
+                    route: None,
+                    config: None,
+                });
+            translator.set_revision_path(&self.derived.revision_path_for_id(&revision.id));
+            let translated = translator.handle(&env, ctx);
+            if deliver {
+                let (revision_changed, delivered) = self
                     .emit_translator_batches(
                         translator,
                         sink,
                         ctx,
                         translated,
-                        BatchMode::Replay,
-                        Some((before, entry_through)),
+                        mode,
+                        Some((revision.sequence - 1, revision.sequence)),
                     )
                     .await;
-                delivered &= replayed;
-                if self.pause.lock().unwrap().is_some() && !replayed {
-                    break;
+                changed |= revision_changed;
+                if !delivered {
+                    return (changed, false);
                 }
+            } else if !self
+                .replay_without_delivery(
+                    translator,
+                    ctx,
+                    translated,
+                    (revision.sequence - 1, revision.sequence),
+                )
+                .await
+            {
+                return (changed, false);
             }
-            before = entry_through;
         }
-        delivered
+        (changed, true)
     }
 
     /// Continue a replayed translator exactly as usual but deliberately omit
@@ -1581,7 +1700,7 @@ impl SessionActor {
         ctx: &SessionCtx,
         event_window: Option<(u64, u64)>,
     ) -> bool {
-        let translated = match self
+        if let Err(error) = self
             .derived
             .ensure_control(
                 crate::derived::ControlKind::Checkpoint,
@@ -1589,24 +1708,14 @@ impl SessionActor {
             )
             .await
         {
-            Ok(path) => {
-                translator.set_revision_path(&path);
-                translator.checkpoint(ctx)
-            }
-            Err(error) => Err(error),
-        };
-        let (correlation_changed, delivered) = self
-            .emit_translator_batches(
-                translator,
-                sink,
-                ctx,
-                translated,
-                BatchMode::Checkpoint,
-                event_window,
-            )
+            self.record_translation_failure(&error, event_window);
+            self.set_error(format!("span production failed: {error}"));
+            return false;
+        }
+        let (changed, delivered) = self
+            .consume_into(translator, sink, ctx, true, BatchMode::Checkpoint)
             .await;
-        self.persist_correlation_if_changed(correlation_changed)
-            .await;
+        self.persist_correlation_if_changed(changed).await;
         delivered
     }
 
@@ -1618,7 +1727,7 @@ impl SessionActor {
         mode: BatchMode,
         event_window: Option<(u64, u64)>,
     ) -> bool {
-        let translated = match self
+        if let Err(error) = self
             .derived
             .ensure_control(
                 crate::derived::ControlKind::Finalize,
@@ -1626,17 +1735,12 @@ impl SessionActor {
             )
             .await
         {
-            Ok(path) => {
-                translator.set_revision_path(&path);
-                translator.finalize(ctx)
-            }
-            Err(error) => Err(error),
-        };
-        let (correlation_changed, delivered) = self
-            .emit_translator_batches(translator, sink, ctx, translated, mode, event_window)
-            .await;
-        self.persist_correlation_if_changed(correlation_changed)
-            .await;
+            self.record_translation_failure(&error, event_window);
+            self.set_error(format!("span production failed: {error}"));
+            return false;
+        }
+        let (changed, delivered) = self.consume_into(translator, sink, ctx, true, mode).await;
+        self.persist_correlation_if_changed(changed).await;
         delivered
     }
 
@@ -1658,8 +1762,23 @@ impl SessionActor {
     async fn flush_sink(
         &self,
         sink: &mut Box<dyn crate::sink::Sink>,
-        first_unprocessed: u64,
+        _capture_cursor: u64,
     ) -> bool {
+        let first_unprocessed = match self.derived.consumer_sequence(&self.route).await {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                self.record_delivery_failure(
+                    &error,
+                    Some((
+                        self.delivered_sequence.load(Ordering::Relaxed),
+                        self.delivered_sequence.load(Ordering::Relaxed),
+                    )),
+                    0,
+                );
+                self.set_error(format!("span ledger cursor failed: {error}"));
+                return false;
+            }
+        };
         if let Err(e) = sink.flush().await {
             self.record_delivery_failure(&e, Some((first_unprocessed, first_unprocessed)), 0);
             self.set_error(format!("sink flush failed: {e}"));
@@ -1672,25 +1791,29 @@ impl SessionActor {
     async fn record_delivery_checkpoint(
         &self,
         sink: &mut Box<dyn crate::sink::Sink>,
-        through: u64,
+        _capture_tip: u64,
         acknowledged_through: &mut u64,
     ) {
         if !self.flush_sink(sink, *acknowledged_through).await {
             return;
         }
-        if through <= *acknowledged_through {
-            return;
-        }
-        if let Err(error) = self
-            .journal
-            .lock()
-            .await
-            .append_delivery_checkpoint(&self.route, through)
+        match self
+            .derived
+            .acknowledge(&self.route, self.delivered_sequence.load(Ordering::Relaxed))
             .await
         {
-            self.set_error(format!("delivery checkpoint failed: {error}"));
-        } else {
-            *acknowledged_through = through;
+            Ok(through) => *acknowledged_through = through,
+            Err(error) => {
+                self.record_delivery_failure(
+                    &error,
+                    Some((
+                        self.delivered_sequence.load(Ordering::Relaxed),
+                        self.delivered_sequence.load(Ordering::Relaxed),
+                    )),
+                    0,
+                );
+                self.set_error(format!("delivery checkpoint failed: {error}"));
+            }
         }
     }
 

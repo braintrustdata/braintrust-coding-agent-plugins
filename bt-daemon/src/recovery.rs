@@ -62,6 +62,9 @@ pub enum FailureCause {
     TranslatorFault {
         translator_revision: String,
     },
+    LocalStorage {
+        retry_after_ms: i64,
+    },
     PluginFile {
         path: PathBuf,
         digest: Option<String>,
@@ -105,9 +108,10 @@ pub enum WorkState {
 pub struct Incident {
     pub scope: WorkScope,
     pub state: WorkState,
-    /// Journal byte offset of the first event that has not fully succeeded.
+    /// Cursor immediately before blocked work: an event WAL byte offset for a
+    /// source scope, or a span ledger sequence for a delivery scope.
     pub first_unprocessed: u64,
-    /// Operation index within that event, when a durable derived log exists.
+    /// Operation index within the blocked span revision.
     pub operation_index: u32,
     pub cause: FailureCause,
     pub local_error: String,
@@ -145,7 +149,8 @@ impl FailureCause {
                 translator_revision: failed,
             } => failed != translator_revision,
             Self::PluginFile { path, digest, .. } => &plugin_digest(path) != digest,
-            Self::RateLimited { retry_after_ms }
+            Self::LocalStorage { retry_after_ms }
+            | Self::RateLimited { retry_after_ms }
             | Self::Transport { retry_after_ms, .. }
             | Self::Destination { retry_after_ms, .. }
             | Self::Permission { retry_after_ms, .. } => now_ms >= *retry_after_ms,
@@ -182,6 +187,16 @@ pub fn classify_delivery_error(
     api_url: Option<&str>,
     attempts: u64,
 ) -> FailureCause {
+    if error
+        .downcast_ref::<braintrust_sdk_rust::BraintrustError>()
+        .is_none()
+        && crate::derived::retryable_storage(error)
+    {
+        return FailureCause::LocalStorage {
+            retry_after_ms: now_ms() + 1_000,
+        };
+    }
+
     let now = now_ms();
     let delay_ms = (1_000i64.saturating_mul(1i64 << attempts.min(6))).min(60_000);
     let destination = route

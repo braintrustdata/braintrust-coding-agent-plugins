@@ -19,6 +19,7 @@ mod correlation;
 mod delivery_ledger;
 mod derived;
 mod dispatch;
+mod durable;
 mod hook;
 mod ids;
 mod journal;

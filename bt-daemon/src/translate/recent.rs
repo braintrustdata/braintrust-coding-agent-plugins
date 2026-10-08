@@ -11,6 +11,8 @@ use std::hash::Hash;
 
 pub(super) const RECENT_ID_CAPACITY: usize = 4_096;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "K: Eq + Hash + serde::Deserialize<'de>"))]
 pub(super) struct RecentSet<K> {
     values: HashSet<K>,
     order: VecDeque<K>,
@@ -59,6 +61,8 @@ impl<K: Eq + Hash + Clone> RecentSet<K> {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "K: Eq + Hash + serde::Deserialize<'de>, V: serde::Deserialize<'de>"))]
 pub(super) struct RecentMap<K, V> {
     values: HashMap<K, V>,
     order: VecDeque<K>,

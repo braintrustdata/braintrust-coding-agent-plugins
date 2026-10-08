@@ -153,10 +153,11 @@ bt trace run --plugin ./local.mjs codex -- "summarize this change"
 bt trace import codex SESSION_ID --plugin ./sanitize-history.mjs
 ```
 
-The journal stores raw input events, not transformed spans. After daemon
-recovery, replayed events therefore pass through the resumed session's current
-route: ordinary sessions use the current globally configured plugins, while a
-managed session continues using only that run's isolated plugins.
+Capture writes complete native input to the NDJSON event WAL. Translation commits
+route-neutral span operations and continuation state to a SQLite span ledger,
+then collects the translated event prefix. Plugins and delivery consume only
+the span ledger, using the resumed route's plugin configuration. Historical
+import reads agent transcripts independently of these recovery caches.
 
 `context.operation` is `"insert"` or `"merge"`; `context.source` and
 `context.session_id` identify the translated event stream; and `context.env`
@@ -171,7 +172,8 @@ self-contained and transforms must be stateless: module globals belong to a
 worker thread, not a session. Every configured plugin is mandatory. If one
 fails, delivery pauses only for that route and source session; other routes
 and sessions continue. The daemon sends a failure marker on the affected span
-with `plugin failure: <path>`, then keeps new events in that session's journal.
+with `plugin failure: <path>`, then holds that route's undelivered operations in the span ledger.
+Source translation continues while the route is paused.
 It checks the failed plugin's content digest once a second. When that file
 changes, it reprocesses the paused route from the failed operation through the
 current plugin chain, replaces the marker with the ordinary translated span,
@@ -188,7 +190,7 @@ bt trace doctor codex
 ```
 
 The doctor output reports the plugin path, full local exception, session and
-span IDs, first unprocessed journal position, and active recovery state. Raw
+span IDs, first unprocessed span ledger position, and active recovery state. Raw
 exception details remain local; the Braintrust marker only includes the
 plugin path.
 Managed-run diagnostics are copied out of their temporary daemon directory
@@ -299,27 +301,24 @@ different profiles, organizations, projects, experiments, or parent spans.
 
 ## Recovery and storage
 
-Capture requests return after the event is flushed to its journal. Daemon
-workers handle authentication, translation, and delivery. Restart recovery
-replays journaled events with deterministic span IDs, so repeated delivery
-updates the same spans.
+Capture requests return after the native event is synced to its NDJSON WAL.
+Translation atomically commits span operations, continuation state, and its
+input watermark to a private SQLite database with WAL mode and full durability.
+The translated input prefix can then be collected without affecting plugins,
+authentication, delivery, or their recovery.
 
-Claude, Codex, and Cursor events reference daemon-owned transcript mirrors. Cursor
-preserves separate immutable generations when its native transcript is rewritten.
-Grok uses
-separate updates and events mirrors. Replay does not depend on the original
-transcript staying at its old path.
+Each delivery route has an independent span ledger cursor. After checked backend
+acceptance, SQLite commits the cursor and collects operations through the slowest
+registered consumer. Paused routes protect undelivered spans; translation failures
+protect untranslated events. Open sessions and turns retain continuation state
+and stable IDs for later merges, rather than retaining earlier operations.
 
-The daemon streams journals and transcripts, applies queue backpressure, and
-retires idle sessions. Retired sessions are rebuilt from their journals when
-another event arrives. Journals and mirrors preserve conversation content;
-credentials are excluded from journaled routing data.
-
-Native session WALs and transcript mirrors are retained indefinitely because
-they are required to reconstruct translation state. Active and resolved
-recovery incidents are stored separately from native events; resolved local
-incident history is bounded. No age-based cleanup currently removes the
-authoritative event record.
+Restart and idle-session resumption restore translator continuation and replay
+pending span operations. Historical import and attach work directly from agent
+transcripts; previously collected hook details may be unavailable in those files.
+Native payloads, span ledgers, continuation, and transcript mirrors can contain
+conversation content and are private local state. Credentials are excluded.
+Resolved incident history is bounded and does not prevent cache collection.
 
 ## Platform and integration coverage
 

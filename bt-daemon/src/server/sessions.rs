@@ -68,7 +68,7 @@ impl Daemon {
             } else {
                 crate::ids::session_namespace(&env.source, &env.session_id)
             };
-        let replay = ReplayPlan {
+        let mut replay = ReplayPlan {
             acknowledged_through: journal::JournalReader::acknowledged_through(
                 &journal_path,
                 replay_through,
@@ -76,7 +76,6 @@ impl Daemon {
             )
             .await,
             through: replay_through,
-            journal_path,
         };
         let source_key = crate::ids::session_namespace(&env.source, &env.session_id);
         let derived = {
@@ -95,6 +94,18 @@ impl Daemon {
                 created
             }
         };
+        for captured in journal::captured_routes(&journal_path)? {
+            let template = journal::envelope_from_redacted(captured.envelope);
+            if let (Some(original), Some(effective)) = (
+                template.route.as_ref(),
+                recovered_delivery_route(self, &template).await,
+            ) {
+                if effective.same_route(route) {
+                    derived.bind_route(original, route)?;
+                }
+            }
+        }
+        replay.acknowledged_through = derived.register(route, replay.acknowledged_through)?;
         let journal = self
             .journal_writer_for(&env.source, &env.session_id)
             .await?;

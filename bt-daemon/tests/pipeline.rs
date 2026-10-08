@@ -7,6 +7,9 @@
     reason = "Test fixtures intentionally launch raw children."
 )]
 
+#[path = "support/ledger.rs"]
+mod ledger;
+
 use async_trait::async_trait;
 use bt_daemon::wire::{
     AuthSelection, AuthSource, BackendAuth, Envelope, SessionConfig, SessionRoute,
@@ -49,28 +52,6 @@ impl SinkFactory for TrackingSinkFactory {
 struct TrackingSink {
     session_id: String,
     flushes: Arc<Mutex<HashMap<String, usize>>>,
-}
-
-struct SlowSink;
-
-#[async_trait]
-impl Sink for SlowSink {
-    fn configure(&mut self, _config: &SessionConfig) {}
-    async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        Ok(ops.len() as u64)
-    }
-    async fn flush(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-struct SlowSinkFactory;
-
-impl SinkFactory for SlowSinkFactory {
-    fn create(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Box<dyn Sink>> {
-        Ok(Box::new(SlowSink))
-    }
 }
 
 struct GateSinkFactory {
@@ -484,33 +465,6 @@ async fn start_tracking_daemon(
     (socket, handle, flushes, tmp)
 }
 
-async fn start_slow_daemon() -> (PathBuf, tokio::task::JoinHandle<()>, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
-    let data_dir = tmp.path().join("data");
-    let socket = test_endpoint(tmp.path());
-    let opts = ServeOptions {
-        version: "test".into(),
-        translators: Arc::new(Registry::default_agents()),
-        sink_factory: Arc::new(SlowSinkFactory),
-        auth_provider: Some(Arc::new(TestAuthProvider {
-            calls: Mutex::new(Vec::new()),
-            fail: false,
-            first_lease_expired: false,
-        })),
-    };
-    let args = ServeArgs {
-        socket: Some(socket.clone()),
-        data_dir: Some(data_dir),
-        idle_timeout_secs: 0,
-        session_idle_timeout_secs: 0,
-    };
-    let handle = tokio::spawn(async move {
-        let _ = run_serve(args, opts).await;
-    });
-    wait_for(&socket).await;
-    (socket, handle, tmp)
-}
-
 async fn start_gated_daemon(
     gate: Arc<tokio::sync::Notify>,
     emitted: Arc<std::sync::atomic::AtomicU64>,
@@ -611,7 +565,7 @@ async fn routed_sessions_resolve_multiple_profiles_without_journaling_credential
     for session in ["work-session", "personal-session"] {
         let journal =
             std::fs::read_to_string(source_journal_path(&data_dir, "debug", session)).unwrap();
-        assert!(journal.contains("\"route\""));
+        assert!(ledger::catalog(&data_dir, "debug", session)[0]["envelope"]["route"].is_object());
         assert!(!journal.contains("secret-"));
         assert!(!journal.contains("token_sha256_prefix"));
         assert!(!journal.contains("\"config\""));
@@ -655,7 +609,11 @@ async fn environment_routes_remain_environment_auth_without_journaling_credentia
         "environment-session",
     ))
     .unwrap();
-    assert!(journal.contains(r#""source":"environment""#));
+    assert_eq!(
+        ledger::catalog(&data_dir, "debug", "environment-session")[0]["envelope"]["route"]["auth"]
+            ["source"],
+        "environment"
+    );
     assert!(!journal.contains("secret-environment"));
 
     shutdown(&socket).await;
@@ -925,7 +883,7 @@ async fn a_route_backfills_observations_captured_by_another_route_once() {
 }
 
 #[tokio::test]
-async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() {
+async fn a_new_destination_consumes_available_output_then_uses_its_own_checkpoint() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
@@ -985,8 +943,8 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
         delivered[0]
             .emitted
             .load(std::sync::atomic::Ordering::Relaxed),
-        3,
-        "personal receives work's root and SessionStart plus its own Stop"
+        1,
+        "collected history requires transcript import; the new route receives its Stop"
     );
     assert_eq!(
         delivered[0].org.lock().unwrap().clone().as_deref(),
@@ -1015,7 +973,14 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
     flush_session("shared-history", &socket, 5000)
         .await
         .unwrap();
-    let delivered = third_sinks.sinks.lock().unwrap().clone();
+    let delivered = third_sinks
+        .sinks
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|sink| sink.org.lock().unwrap().as_deref() == Some("personal-org"))
+        .cloned()
+        .collect::<Vec<_>>();
     assert_eq!(delivered.len(), 1);
     assert_eq!(
         delivered[0]
@@ -1286,34 +1251,13 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
     assert_eq!(flushed.pending, 0);
 
-    // Native WAL records contain only captured events; route progress lives
-    // in the separate journal-control stream.
+    // Translation has durably transferred all accepted events into spans.
     let journal = source_journal_path(&data_dir, "debug", "sess-1");
     let jtext = std::fs::read_to_string(&journal).unwrap();
-    let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(
-        jlines.len(),
-        3,
-        "expected 3 event lines, got {}",
-        jlines.len()
-    );
-    assert!(
-        !jtext.contains("sk-TOP-SECRET-abc123"),
-        "token leaked into journal!"
-    );
+    assert_eq!(jtext.lines().count(), 1);
+    assert!(jtext.contains("_bt_wal_base"));
+    assert!(!jtext.contains("sk-TOP-SECRET-abc123"));
     assert!(!jtext.contains("token_sha256_prefix"));
-
-    let events: Vec<String> = jlines
-        .iter()
-        .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
-        .map(|l| {
-            serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect();
-    assert_eq!(events, vec!["SessionStart", "PostToolUse", "Stop"]);
 
     // Spans: debug translator emits a root once + one span per event = 4.
     let spans = data_dir.join("spans").join("sess-1.ndjson");
@@ -1354,13 +1298,8 @@ async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
 
     let jtext = std::fs::read_to_string(source_journal_path(&data_dir, "debug", &session)).unwrap();
-    assert_eq!(
-        jtext
-            .lines()
-            .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
-            .count(),
-        2
-    );
+    assert!(jtext.contains("_bt_wal_base"));
+    assert!(!jtext.contains("SessionStart"));
     let spans: Vec<_> = std::fs::read_dir(data_dir.join("spans"))
         .unwrap()
         .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
@@ -1497,8 +1436,10 @@ async fn distinct_sessions_are_isolated() {
 
     let a = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "a")).unwrap();
     let b = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "b")).unwrap();
-    assert_eq!(a.lines().filter(|l| !l.trim().is_empty()).count(), 2);
-    assert_eq!(b.lines().filter(|l| !l.trim().is_empty()).count(), 1);
+    assert!(a.contains("_bt_wal_base"));
+    assert!(!a.contains("SessionStart"));
+    assert!(b.contains("_bt_wal_base"));
+    assert!(!b.contains("SessionStart"));
 
     handle.abort();
 }
@@ -1606,7 +1547,9 @@ async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
 
 #[tokio::test]
 async fn hook_capture_stops_at_the_durable_journal_boundary() {
-    let (socket, handle, tmp) = start_slow_daemon().await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (data_dir, socket, handle, _tmp) = start_gated_daemon(gate.clone(), emitted.clone()).await;
     let host = dummy_host();
     forward_envelope(
         &envelope("fast-capture", "SessionStart", 1),
@@ -1621,7 +1564,7 @@ async fn hook_capture_stops_at_the_durable_journal_boundary() {
     let mut turn_end = envelope("fast-capture", "Stop", 2);
     turn_end.route.as_mut().unwrap().flush_mode = bt_daemon::wire::FlushMode::FlushOnTurnEnd;
     let accepted = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(5),
         forward_envelope(&turn_end, &socket, &host, false),
     )
     .await;
@@ -1629,17 +1572,15 @@ async fn hook_capture_stops_at_the_durable_journal_boundary() {
         matches!(accepted, Ok(Ok(()))),
         "turn-end capture waited for translation or flushing: {accepted:?}"
     );
-    let journal = std::fs::read_to_string(source_journal_path(
-        &tmp.path().join("data"),
-        "debug",
-        "fast-capture",
-    ))
-    .unwrap();
+    let journal =
+        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "fast-capture")).unwrap();
+    assert!(journal.contains("Stop"), "hook returned before journaling");
     assert_eq!(
-        journal.lines().count(),
-        2,
-        "hook returned before journaling"
+        emitted.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "capture must complete while span delivery is still blocked"
     );
+    gate.notify_one();
     shutdown(&socket).await;
     handle.await.unwrap();
 }
@@ -1860,8 +1801,8 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
         std::fs::read_to_string(source_journal_path(&data_dir, "debug", "drained-shutdown"))
             .unwrap();
     assert!(
-        journal.contains(r#""n":2"#),
-        "replacement daemon did not journal the retried event: {journal}"
+        journal.contains("_bt_wal_base"),
+        "replacement daemon did not consume the retried event: {journal}"
     );
 }
 
@@ -1902,7 +1843,7 @@ async fn spawn_on_demand_runs_the_real_standalone_daemon() {
 }
 
 #[tokio::test]
-async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
+async fn cold_worker_restores_continuation_after_input_collection_without_redelivery() {
     let (data_dir, socket, first, tmp) = start_daemon().await;
     let host = dummy_host();
     forward_envelope(
@@ -1917,20 +1858,11 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     shutdown(&socket).await;
     first.await.unwrap();
 
-    // A cold worker receives only the saved journal, not the first worker's
-    // daemon state. Its delivery checkpoint must travel with that journal.
+    // Restore the recovery cache including SQLite continuation and consumer cursors.
     let recovered_data_dir = tmp.path().join("recovered-data");
-    let source = source_journal_path(&data_dir, "debug", "resume");
+    ledger::copy_tree(&data_dir, &recovered_data_dir);
+    std::fs::remove_dir_all(recovered_data_dir.join("spans")).unwrap();
     let recovered_journal = source_journal_path(&recovered_data_dir, "debug", "resume");
-    std::fs::create_dir_all(recovered_journal.parent().unwrap()).unwrap();
-    std::fs::copy(source, &recovered_journal).unwrap();
-    let control_name = recovered_journal.file_name().unwrap();
-    let source_control = data_dir.join("journal-control").join(control_name);
-    let recovered_control = recovered_data_dir
-        .join("journal-control")
-        .join(control_name);
-    std::fs::create_dir_all(recovered_control.parent().unwrap()).unwrap();
-    std::fs::copy(source_control, recovered_control).unwrap();
 
     let second = start_daemon_at(recovered_data_dir.clone(), socket.clone()).await;
     forward_envelope(&envelope("resume", "Stop", 2), &socket, &host, false)
@@ -1941,8 +1873,8 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     let journal = std::fs::read_to_string(recovered_journal).unwrap();
     assert_eq!(
         journal.lines().count(),
-        2,
-        "native WAL contains only the two events"
+        1,
+        "consumed input has been collected"
     );
     let spans = std::fs::read_to_string(recovered_data_dir.join("spans/resume.ndjson")).unwrap();
     let rows: Vec<serde_json::Value> = spans
@@ -2071,6 +2003,48 @@ async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment()
 }
 
 #[tokio::test]
+async fn translation_failure_preserves_input_but_does_not_block_produced_spans() {
+    let (data_dir, socket, handle, _tmp) = start_daemon().await;
+    for (index, (name, payload)) in [
+        ("session_start", serde_json::json!({"reason":"new"})),
+        (
+            "before_agent_start",
+            serde_json::json!({"prompt":"already translated"}),
+        ),
+        (
+            "tool_execution_start",
+            serde_json::json!({"toolName":"bash"}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut env = envelope("source-pause", name, index as i64);
+        env.source = "pi".into();
+        env.payload = payload;
+        forward_envelope(&env, &socket, &dummy_host(), false)
+            .await
+            .unwrap();
+    }
+    let result = flush_session("source-pause", &socket, 5000).await.unwrap();
+    assert!(result.pending > 0, "translation remains paused");
+    let spans = std::fs::read_to_string(data_dir.join("spans/source-pause.ndjson")).unwrap();
+    assert!(
+        spans.contains("already translated"),
+        "committed spans must still reach delivery"
+    );
+    let raw =
+        std::fs::read_to_string(source_journal_path(&data_dir, "pi", "source-pause")).unwrap();
+    assert!(raw.contains("tool_execution_start"));
+    assert!(
+        !raw.contains("already translated"),
+        "completed input has been collected"
+    );
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn known_bad_pi_shape_pauses_its_session_while_unknown_events_are_journaled() {
     let (data_dir, socket, handle, _tmp) = start_daemon().await;
     let mut unknown = envelope("pi-unknown", "future_native_event", 1);
@@ -2111,7 +2085,11 @@ async fn known_bad_pi_shape_pauses_its_session_while_unknown_events_are_journale
     assert!(journal.contains("session_shutdown"));
     let unknown_journal =
         std::fs::read_to_string(source_journal_path(&data_dir, "pi", "pi-unknown")).unwrap();
-    assert!(unknown_journal.contains("future_native_event"));
+    assert!(unknown_journal.contains("_bt_wal_base"));
+    assert!(
+        !unknown_journal.contains("future_native_event"),
+        "ignored input has been consumed"
+    );
     assert!(!incident.contains("pi-unknown"), "{incident}");
 
     shutdown(&socket).await;
@@ -2435,6 +2413,23 @@ async fn a_paused_plugin_session_recovers_after_process_restart_without_a_new_ev
         .unwrap();
     shutdown(&socket).await;
     handle.await.unwrap();
+
+    let captured = std::fs::read_to_string(source_journal_path(
+        &data_dir,
+        "debug",
+        "plugin-cold-recovery",
+    ))
+    .unwrap();
+    assert!(
+        !captured.contains("SessionStart"),
+        "plugin recovery must not retain translated input"
+    );
+    let pending =
+        rusqlite::Connection::open(ledger::database(&data_dir, "debug", "plugin-cold-recovery"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+    assert!(pending > 0, "the span ledger protects paused delivery");
 
     std::fs::write(&plugin, "export default span => span").unwrap();
     let restarted = start_daemon_at(data_dir.clone(), socket.clone()).await;
@@ -3400,6 +3395,7 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
         "stop alone must not masquerade as the terminal flush"
     );
 
+    let first_capture = ledger::catalog(&data_dir, "grok", "grok-primary")[0]["envelope"].clone();
     let primary_spans_path = data_dir.join("spans/grok-primary.ndjson");
     let first_ops = read_span_ops(&primary_spans_path);
     let first_llm = first_ops
@@ -3521,11 +3517,10 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     assert!(!journal_text.contains("secret-environment"));
     assert!(!journal_text.contains("token_sha256_prefix"));
     assert!(!journal_text.contains("decoy-route"));
-    let journal: Vec<serde_json::Value> = journal_text
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record["_bt_record_type"] != "delivery_checkpoint")
-        .collect();
+    let journal = [
+        first_capture,
+        ledger::catalog(&data_dir, "grok", "grok-primary")[0]["envelope"].clone(),
+    ];
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0]["source"], "grok");
     assert_eq!(journal[1]["source"], "grok");

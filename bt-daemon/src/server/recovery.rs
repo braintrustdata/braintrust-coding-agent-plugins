@@ -73,6 +73,20 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             }
             before = through;
         }
+        // The capture catalog survives input collection and retains only routing/recovery metadata.
+        if let Ok(routes) = journal::captured_routes(&path) {
+            for captured in routes {
+                let env = journal::envelope_from_redacted(captured.envelope);
+                if let Some(route) = env.route.as_ref() {
+                    let key = serde_json::to_string(route).unwrap_or_default();
+                    latest_by_route.entry(key).or_insert(PendingEvent {
+                        env,
+                        replay_through: recorded_len,
+                        journal_through: captured.through,
+                    });
+                }
+            }
+        }
         for (route, through) in journal::read_checkpoint_state(&path).await {
             let key = serde_json::to_string(&route).unwrap_or_default();
             let acknowledged = acknowledged_by_route.entry(key).or_default();
@@ -91,7 +105,18 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                 .as_ref()
                 .and_then(|route| serde_json::to_string(route).ok())
                 .unwrap_or_default();
-            if acknowledged_by_route.get(&route).copied().unwrap_or(0) < event.journal_through {
+            let output_pending = event.env.route.as_ref().is_some_and(|route| {
+                crate::derived::pending_output(
+                    &daemon.data_dir,
+                    &event.env.source,
+                    &event.env.session_id,
+                    route,
+                )
+                .unwrap_or(true)
+            });
+            if output_pending
+                || acknowledged_by_route.get(&route).copied().unwrap_or(0) < event.journal_through
+            {
                 candidates.push(event);
             } else if event.env.source == "claude-code" {
                 // A fully delivered historical session has no actor to retire

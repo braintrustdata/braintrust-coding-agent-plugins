@@ -279,10 +279,11 @@ impl TraceCommandOutput {
                 for incident in &doctor.recovery_incidents {
                     let (source, session_id) = incident.scope.source_session();
                     rendered.push_str(&format!(
-                        "\nRecovery: {:?}\nSource: {}\nSession: {}\nFirst blocked journal offset: {}\nOperation index: {}\nCause: {:?}\nDetail: {}\nAttempts: {}",
+                        "\nRecovery: {:?}\nSource: {}\nSession: {}\nRecovery cursor ({:?}): {}\nOperation index: {}\nCause: {:?}\nDetail: {}\nAttempts: {}",
                         incident.state,
                         source,
                         session_id,
+                        incident.scope,
                         incident.first_unprocessed,
                         incident.operation_index,
                         incident.cause,
@@ -292,14 +293,14 @@ impl TraceCommandOutput {
                 }
                 for diagnostic in &doctor.plugin_diagnostics {
                     rendered.push_str(&format!(
-                        "\nSpan plugin failure history: {}\nSource: {}\nSession: {}\nSpan: {}\nOperation: {}\nFailure journal offset: {}\nPending journal bytes at last report: {}\nFirst failure: {}\nLast failure: {}\nCause: {}",
+                        "\nSpan plugin failure history: {}\nSource: {}\nSession: {}\nSpan: {}\nOperation: {}\nFailure span ledger cursor: {}\nPending span revisions at last report: {}\nFirst failure: {}\nLast failure: {}\nCause: {}",
                         diagnostic.plugin_path.display(),
                         diagnostic.source,
                         diagnostic.session_id.as_deref().unwrap_or("unknown"),
                         diagnostic.span_id.as_deref().unwrap_or("unknown"),
                         diagnostic.operation.as_deref().unwrap_or("unknown"),
-                        diagnostic.journal_start.unwrap_or(0),
-                        diagnostic.pending_bytes.unwrap_or(0),
+                        diagnostic.span_cursor.unwrap_or(0),
+                        diagnostic.pending_revisions.unwrap_or(0),
                         render_timestamp(diagnostic.first_seen_ms),
                         render_timestamp(diagnostic.last_seen_ms),
                         diagnostic.exception
@@ -585,7 +586,7 @@ mod tests {
                 session_id: Some("session-1".into()),
                 span_id: Some("span-1".into()),
                 operation: Some("merge".into()),
-                pending_bytes: Some(1024),
+                pending_revisions: Some(1024),
                 ..Default::default()
             }],
         });
@@ -617,6 +618,6 @@ mod tests {
         assert!(human.contains("Span plugin failure history: /tmp/redact.mjs"));
         assert!(human.contains("Session: session-1"));
         assert!(human.contains("Span: span-1"));
-        assert!(human.contains("Pending journal bytes at last report: 1024"));
+        assert!(human.contains("Pending span revisions at last report: 1024"));
     }
 }

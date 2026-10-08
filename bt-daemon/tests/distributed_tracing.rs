@@ -5,14 +5,16 @@
 //! matrix in the ordinary test suite while still exercising IPC, journaling,
 //! translation, automatic routing, and sink configuration.
 
+#[path = "support/ledger.rs"]
+mod ledger;
 mod support;
 
 use async_trait::async_trait;
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionConfig, TraceDestination};
 use bt_daemon::{
-    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, source_journal_path,
-    AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs, ServeOptions, Sink,
+    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, AuthLease,
+    AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs, ServeOptions, Sink,
     SinkFactory, SpanOp, SpanRow, SpanType, StatusArgs,
 };
 use std::collections::HashMap;
@@ -1304,14 +1306,12 @@ async fn ipc_initialize_pid_is_captured_without_hook_metadata() {
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
 
-    let journal = tokio::fs::read_to_string(source_journal_path(
+    let row = ledger::catalog(
         &tmp.path().join("data"),
         "claude-code",
         "automatic-process-capture",
-    ))
-    .await
-    .unwrap();
-    let row: serde_json::Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    )[0]["envelope"]
+        .clone();
     let chain = row
         .pointer("/capture/process_chain")
         .and_then(serde_json::Value::as_array)
@@ -2909,8 +2909,24 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         let journal_path =
             bt_daemon::source_journal_path(&data_dir, "claude-code", "bounded-child");
         let journal = tokio::fs::read(&journal_path).await.unwrap();
+        let span_db = ledger::database(&data_dir, "claude-code", "bounded-child");
+        let saved_db = tmp.path().join("before-shutdown.sqlite");
+        let had_db = span_db.exists();
+        if had_db {
+            rusqlite::Connection::open(&span_db)
+                .unwrap()
+                .execute("VACUUM INTO ?1", [saved_db.to_str().unwrap()])
+                .unwrap();
+        }
         shutdown_daemon(&socket).await.unwrap();
         daemon.await.unwrap();
+        if span_db.parent().unwrap().exists() {
+            std::fs::remove_dir_all(span_db.parent().unwrap()).unwrap();
+        }
+        if had_db {
+            std::fs::create_dir_all(span_db.parent().unwrap()).unwrap();
+            std::fs::copy(saved_db, &span_db).unwrap();
+        }
         // Restore the accepted-but-undelivered checkpoint, as after an abrupt
         // process exit. Shutdown itself is covered separately above.
         tokio::fs::write(&journal_path, journal).await.unwrap();

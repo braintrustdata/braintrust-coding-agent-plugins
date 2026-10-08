@@ -31,9 +31,9 @@ pub struct PluginDiagnostic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub journal_start: Option<u64>,
+    pub span_cursor: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_bytes: Option<u64>,
+    pub pending_revisions: Option<u64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -76,8 +76,8 @@ pub fn record(
                 span_id: None,
                 operation: None,
                 pipeline_id: None,
-                journal_start: None,
-                pending_bytes: None,
+                span_cursor: None,
+                pending_revisions: None,
             });
         }
         trim(&mut store);
@@ -97,8 +97,8 @@ pub struct PipelineFailure<'a> {
     pub operation: &'a str,
     pub plugin_path: &'a Path,
     pub exception: &'a str,
-    pub journal_start: u64,
-    pub journal_through: u64,
+    pub span_cursor: u64,
+    pub span_through: u64,
 }
 
 pub fn record_pipeline_failure(
@@ -123,12 +123,9 @@ pub fn record_pipeline_failure(
             entry.exception = failure.exception.to_owned();
             entry.span_id = Some(failure.span_id.to_owned());
             entry.operation = Some(failure.operation.to_owned());
-            entry.journal_start = Some(failure.journal_start);
-            entry.pending_bytes = Some(
-                failure
-                    .journal_through
-                    .saturating_sub(failure.journal_start),
-            );
+            entry.span_cursor = Some(failure.span_cursor);
+            entry.pending_revisions =
+                Some(failure.span_through.saturating_sub(failure.span_cursor));
             entry.last_seen_ms = now;
             entry.occurrences = entry.occurrences.saturating_add(1);
         } else {
@@ -144,12 +141,8 @@ pub fn record_pipeline_failure(
                 span_id: Some(failure.span_id.to_owned()),
                 operation: Some(failure.operation.to_owned()),
                 pipeline_id: Some(id),
-                journal_start: Some(failure.journal_start),
-                pending_bytes: Some(
-                    failure
-                        .journal_through
-                        .saturating_sub(failure.journal_start),
-                ),
+                span_cursor: Some(failure.span_cursor),
+                pending_revisions: Some(failure.span_through.saturating_sub(failure.span_cursor)),
             });
         }
         trim(&mut store);
@@ -169,73 +162,6 @@ pub fn read(data_dir: &Path) -> anyhow::Result<Vec<PluginDiagnostic>> {
     let path = diagnostics_path(data_dir);
     ensure_diagnostics_dir(&path)?;
     crate::settings::with_settings_lock(&path, || Ok(read_unlocked(&path)?.entries))
-}
-
-pub fn active_pipeline(
-    data_dir: &Path,
-    source: &str,
-    session_id: &str,
-    route: &SessionRoute,
-) -> anyhow::Result<Option<PluginDiagnostic>> {
-    // Read the old plugin-specific store only to migrate an incident written
-    // by PR #130. New recovery state is stored exclusively in recovery.json.
-    #[derive(Deserialize)]
-    struct LegacyEntry {
-        source: String,
-        session_id: Option<String>,
-        pipeline_id: Option<String>,
-        plugin_path: PathBuf,
-        plugin_digest: Option<String>,
-        exception: String,
-        span_id: Option<String>,
-        operation: Option<String>,
-        journal_start: Option<u64>,
-        pending_bytes: Option<u64>,
-        first_seen_ms: i64,
-        last_seen_ms: i64,
-        occurrences: u64,
-        state: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct LegacyStore {
-        entries: Vec<LegacyEntry>,
-    }
-    let path = diagnostics_path(data_dir);
-    ensure_diagnostics_dir(&path)?;
-    let id = pipeline_id(route)?;
-    crate::settings::with_settings_lock(&path, || {
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let store: LegacyStore = serde_json::from_slice(&bytes)?;
-        Ok(store
-            .entries
-            .into_iter()
-            .rev()
-            .find(|entry| {
-                entry.source == source
-                    && entry.session_id.as_deref() == Some(session_id)
-                    && entry.pipeline_id.as_deref() == Some(id.as_str())
-                    && matches!(entry.state.as_deref(), Some("paused" | "reprocessing"))
-            })
-            .map(|entry| PluginDiagnostic {
-                source: entry.source,
-                plugin_path: entry.plugin_path,
-                plugin_digest: entry.plugin_digest,
-                exception: entry.exception,
-                first_seen_ms: entry.first_seen_ms,
-                last_seen_ms: entry.last_seen_ms,
-                occurrences: entry.occurrences,
-                session_id: entry.session_id,
-                span_id: entry.span_id,
-                operation: entry.operation,
-                pipeline_id: entry.pipeline_id,
-                journal_start: entry.journal_start,
-                pending_bytes: entry.pending_bytes,
-            }))
-    })
 }
 
 pub fn merge(from_data_dir: &Path, into_data_dir: &Path) -> anyhow::Result<()> {

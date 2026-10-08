@@ -73,6 +73,9 @@ impl Harness {
                 "transcript draining did not make bounded progress"
             );
         }
+        let snapshot = self.translator.snapshot().unwrap();
+        self.translator = Registry::default_agents().create("cursor", &self.ctx.session_id);
+        self.translator.restore(snapshot).unwrap();
     }
     fn finish(&mut self) {
         let ops = self.translator.finalize(&self.ctx).unwrap();

@@ -79,7 +79,7 @@ impl TranslatorFactory for CursorTranslatorFactory {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct History {
     messages: VecDeque<Value>,
     bytes: usize,
@@ -106,7 +106,7 @@ impl History {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Turn {
     ordinal: u64,
     id: String,
@@ -119,6 +119,7 @@ struct Turn {
     emitted_text: String,
     usage: serde_json::Map<String, Value>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ModelStep {
     row: SpanRow,
     content: Vec<Value>,
@@ -159,14 +160,14 @@ impl ModelStep {
         self.content.push(value);
     }
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Tool {
     row: SpanRow,
     turn: String,
     call_id: String,
     ended: bool,
 }
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct TranscriptCursor {
     path: String,
     offset: u64,
@@ -214,6 +215,7 @@ impl TranscriptCursor {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CursorTranslator {
     namespace: String,
     root: String,
@@ -224,6 +226,7 @@ struct CursorTranslator {
     cwd: Option<String>,
     model: Option<String>,
     model_params: Option<Value>,
+    #[serde(skip)]
     git: Arc<GitMetadataCache>,
     turn_seq: u64,
     turn: Option<Turn>,
@@ -1484,6 +1487,17 @@ impl CursorTranslator {
     }
 }
 impl AgentTranslator for CursorTranslator {
+    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+
+    fn restore(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
+        let mut restored: Self = serde_json::from_value(snapshot)?;
+        restored.git = self.git.clone();
+        *self = restored;
+        Ok(())
+    }
+
     fn handle(&mut self, e: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),

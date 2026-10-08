@@ -1,13 +1,11 @@
 # Agent event WAL and failure recovery
 
-Status: draft for review. This is a proposed replacement for the plugin-specific
-recovery machinery in [draft PR #130](https://github.com/braintrustdata/braintrust-coding-agent-plugins/pull/130).
-It does not describe behavior already implemented by that PR.
+Status: implementation under review in [draft PR #132](https://github.com/braintrustdata/braintrust-coding-agent-plugins/pull/132), superseding the plugin-specific recovery model. There is no migration from unreleased PR #130 state.
 
 ## Purpose and governing rules
 
-The daemon should retain a complete, ordered record of every native event it
-accepts from a coding-agent capture adapter. The translator reads that record
+The daemon captures a complete, ordered record of every native event it
+accepts from a coding-agent capture adapter until translation has durably transferred its required state and output to the next pipeline stage. The WAL is an immediate-term recovery cache, not a permanent archive. The translator reads that record
 and produces Braintrust spans to the best of its ability. A translator's current
 interests and schema knowledge must not decide which native fields or events
 survive in the journal.
@@ -46,8 +44,7 @@ These are the proposed invariants:
    native-event WAL or a persisted recovery condition.
 
 "Complete" here means complete for events delivered to the capture adapter.
-The daemon cannot reconstruct events an agent never exposes. The retention
-lifetime of captured events is a separate product decision below.
+The daemon cannot reconstruct events an agent never exposes. Captured events are collected after their output and continuation state have been committed. Historical import reads agent transcripts, with potentially reduced detail compared with live hooks.
 
 ## Current seams that this design replaces
 
@@ -63,8 +60,8 @@ boundaries while replacing several constraints:
 | The journal serializes `RedactedEnvelope.payload` as `serde_json::Value`. Pi journal compaction drops some native fields from provider, streaming, and terminal events. | Preserve the complete native payload. Replace lossy Pi compaction with lossless compression or storage of the original payload. |
 | `configure_event` resolves auth before `session_for` creates an actor. `SessionConfig` combines routing and credentials. | Create source-session and route work from non-secret routing information. Give translators route-neutral context and resolve credentials only for delivery. |
 | Some known-event typed decoders return `None` and their callers silently emit no operations. | Distinguish unknown or unused events from known events whose required fields fail decoding. |
-| `PluginRecoveryState`, `PluginPause`, and plugin diagnostics each hold part of the recovery state. | Persist one mode-neutral work state and a separate typed failure cause. Derive doctor output from incidents; retain plugin diagnostics only as bounded history and for migration. |
-| Journal events are synced before acknowledgement, but native records are collected by age. | Keep accepted native WAL records for the lifetime of the data directory. Do not collect records needed by paused work or active failure history. |
+| `PluginRecoveryState`, `PluginPause`, and plugin diagnostics each hold part of the recovery state. | Persist one mode-neutral work state and a separate typed failure cause. Derive doctor output from incidents; retain plugin diagnostics only as bounded history. |
+| Journal events are synced before acknowledgement, but native records are collected by age. | Collect input only through durable translation progress. Collect span operations only through the slowest registered consumer cursor. Incident history does not protect already-consumed payloads. |
 
 Old journals remain readable during migration. Native fields that an old lossy
 journal omitted cannot be reconstructed; the migration must not label those
@@ -87,17 +84,35 @@ flowchart LR
   State -.-> RouteB
 ```
 
-The native-event WAL is authoritative. A derived span log and snapshots are
-rebuildable indexes, not replacements for it. A source session owns one
-translator state machine and ordered logical span revisions. Each route owns
-its destination overlay, ordered plugin chain, credentials, sink, delivery
-cursor, and marker state. This avoids translating the same native session
-independently for multiple destinations and confines plugin and backend
-failures to their route.
+The pipeline has two recovery boundaries:
 
-The implementation rebuilds translator state by streaming the native WAL.
-Replay is bounded in memory. Durable translator snapshots remain an optional
-performance improvement; they are not required for correctness.
+1. **NDJSON event WAL:** untranslated native input, including malformed recognized events. Translation owns this stream and its input watermark.
+2. **SQLite span ledger:** committed route-neutral create/merge operations and durable translator continuation. Plugins, credentials, backend delivery, and downstream recovery consume this ledger exclusively.
+
+A source session owns one translator. Each route owns its overlay, plugin chain, credentials, sink, and independent output cursor. A paused delivery route does not pause source translation. A source translation failure protects the unprocessed event suffix while previously produced output remains deliverable.
+
+Translator continuation is required for correctness after input collection. It retains open-span identities, message context, counters, native transcript offsets, and pending correlation state needed by later events. Session and turn spans can be created early and finalized later by merge; retaining every earlier create or merge is unnecessary.
+
+### SQLite storage and commit boundary
+
+Each `(source, session_id)` has a private `derived/<storage-id>/spans.sqlite` database. SQLite uses WAL mode and `synchronous=FULL`. The storage schema contains:
+
+| Table | Purpose |
+| --- | --- |
+| `revisions` | Ordered output revisions with an independent monotonic sequence, identity, and input provenance. Both event output and checkpoint/finalization output are included. |
+| `batches` | Bounded serialized create/merge batches, ordered within each revision. Stable span IDs and graph relationships remain in the JSON payload. Sink-only late-merge keys are preserved explicitly. |
+| `continuation` | Versioned translator state and committed event input watermark. |
+| `consumers` | Durable route registrations and acknowledged output sequence, plus input provenance for diagnostics. Actor retirement does not discard a paused consumer. |
+| `aliases` | Maps captured route selection to its resolved attachment route so both names share one consumer cursor. |
+| `controls` | Bounded finalization identity so repeated finalization at the same input boundary is idempotent even after payload collection. |
+
+Ignored input and controls without output commit continuation without creating an output revision. An input event produces bounded scratch batches. One SQLite transaction imports those batches, records the revision, saves the resulting continuation, and advances the input watermark. Scratch files are disposable and are not a recovery ledger. A crash before transaction commit leaves input available; a crash after commit permits input collection and downstream resumption without rereading it. If collection is interrupted, the remaining redundant input is skipped using the committed watermark.
+
+Output sequence numbers are distinct from event WAL offsets. Several output revisions, including checkpoint and finalization output, can have the same input boundary. A consumer advances only after all operations through its output sequence are accepted by checked delivery. Its exact failed operation is recorded within that revision. Consumer cursor advancement and deletion through the slowest cursor occur in a single SQLite transaction. Backend acceptance and a local SQLite commit cannot form one transaction; the existing destination projection ledger suppresses identical retransmission where possible.
+
+Delivery streams one revision and one bounded batch at a time. SQLite stores an operation ledger rather than a normalized or materialized graph. Local graph queries could add a derived index later; they are not needed for replay or merge semantics.
+
+A new historical consumer must reconstruct its requested history using transcript import before attaching to the available live suffix. A collected live-hook prefix is unavailable. Import and attach read transcripts directly and do not require either recovery ledger to contain historical data.
 
 ### Capture and session partitioning
 
@@ -275,6 +290,7 @@ credential or an agent payload.
 | `Credentials` | Non-secret auth selection and error class | Credential-store change if observable, or bounded re-resolution through the host provider. A successful lease makes replay eligible. |
 | `Destination` or `Permission` | Route selection, backend status, and stable destination identity | The same destination becomes usable or its explicit route/auth selection changes; use bounded checks. Never silently redirect old records. |
 | `RateLimited` | Backend retry time and destination | The server's `Retry-After` expires, then a bounded retry. |
+| `LocalStorage` | SQLite lock, unavailable file, or disk write failure | Timed retry of the same transaction with the translator restored to its preceding continuation; committed cursors remain unchanged until success. |
 | `Transport` | Endpoint identity and connection/timeout/server-error class | Capped exponential backoff with jitter; actual delivery confirms success. |
 | `PermanentDelivery` | Typed rejection and route/sink revision | A relevant route or sink revision changes; doctor explains why time alone will not help. |
 
@@ -307,10 +323,7 @@ starts a reprocessing attempt even when no new agent event arrives.
    progress beyond that cursor. Do not send later output for the blocked scope.
 3. A matching retry check moves the scope to `Reprocessing`. Snapshot the WAL
    or derived-log tip so the attempt has a finite boundary.
-4. Rebuild translator state from earlier native records, using a compatible
-   versioned snapshot when available. Earlier committed output is read only
-   for state reconstruction. Resume output at the failed cursor and process
-   through the snapshot tip.
+4. For a source failure, restore committed translator continuation and resume the event WAL at its input watermark. For a downstream failure, read the SQLite span ledger from the consumer cursor and skip only the acknowledged operation prefix of the failed revision. Downstream recovery never rebuilds output from native events.
 5. If replay fails again, keep the original unprocessed boundary unless an
    acknowledged checkpoint moved it forward. Replace the incident cause with
    the newly observed blocker and its evidence. A plugin fix followed by an
@@ -344,44 +357,16 @@ duplicate updates.
 
 ## Durability, acknowledgement, and retention
 
-The native WAL, derived revision log, cursors, and incident state have
-different authorities:
+The capture writer calls `sync_data()` before acknowledging a hook. Event WAL framing preserves logical byte offsets across prefix collection and rejects truncated or checksummed-invalid records. A torn final record is truncated on the next writer open without discarding earlier complete records.
 
-- Native WAL records are authoritative input. Any index, translator snapshot,
-  or derived span log must be rebuildable from them.
-- Translation progress is committed only after its derived revisions are
-  durable. A crash may cause deterministic revisions to be generated again;
-  revision IDs and append deduplication make that safe.
-- Route delivery progress is committed only after the backend has accepted the
-  operations. A local SDK queue flush is insufficient if it can conceal an
-  HTTP failure. The sink needs checked delivery receipts or an equivalent
-  backend acknowledgement contract.
-- A crash between backend acceptance and local cursor commit may resend an
-  operation. Persist the accepted destination-visible span projection with the
-  route cursor. On replay, compare the new projection after overlays and
-  plugins using backend merge semantics; skip an identical write and advance
-  the cursor. Deterministic span IDs alone do not prevent an unnecessary merge
-  from triggering backend work such as scoring. Exactly-once external side
-  effects require backend idempotency support; the WAL alone cannot guarantee
-  them.
-- Control records for cursors and incidents should be separate from native
-  event records, so the latter remain a faithful agent stream. A control write
-  that lags an accepted backend write causes conservative replay, not loss.
+Only the committed translation watermark permits event collection. Translation failures protect the failed event and its later input suffix. Plugin, auth, and network failures protect the span ledger suffix instead; they do not protect already-translated events. Resolved diagnostic history protects neither ledger.
 
-The writer calls `sync_data()` before acknowledging each hook. A torn final
-record is truncated on the next open and never causes earlier records to be
-discarded. Native WAL records are retained indefinitely until a lossless
-archive or explicit retention policy is implemented; derived revisions may be
-rebuilt from the WAL and may be collected after every route has advanced.
+Only checked backend acceptance permits consumer cursor advancement. Collection deletes output through the minimum acknowledged sequence of all registered consumers, including paused consumers. Cursor updates and output deletion are transactional. Continuation is retained independently, so open outer spans can receive future merges after their old operations have been collected.
 
-Do not collect native WAL events. Their retention is indefinite until a
-lossless archive policy is designed. A paused source session's native events
-and a route's required derived revisions are always protected while its
-incident remains active. Derived revisions may be removed once every route
-cursor has advanced because they can be rebuilt from the WAL.
+Compatibility for existing released event journals and span identity namespaces remains. The unreleased PR #130 plugin recovery state is not a supported input format. No historical hook archive or migration of that plugin-specific state is provided.
 
 Native payloads can contain conversation content and secrets that a later
-span plugin would remove before upload. WAL files and any archives need local
+span plugin would remove before upload. WAL files, SQLite databases, and scratch files need local
 access controls; doctor must expose failure causes and offsets without dumping
 payloads. Credentials resolved by the host remain outside these records.
 
@@ -415,8 +400,7 @@ retry check, and first-unprocessed position come from the persisted incident.
 Plugin retries compare the digest of the exact failing path. Marker replacement
 uses the original span ID and clears marker-only fields from the current span.
 Resolved incidents move to bounded local history; no recovered label remains
-on successful spans. Native WAL and required transcript mirrors are retained
-indefinitely because they are the source for future replay.
+on successful spans. Native events are collected after atomic span production; span payloads are collected through the slowest consumer. Translator-owned transcript references remain separate from downstream recovery; downstream replay never consults them. Maintenance collects old mirrors only when remaining input, committed continuation, and current observation templates no longer reference them.
 
 Backend acceptance is checked through the opt-in SDK API in the stacked SDK
 dependency. A crash after backend acceptance and before local acknowledgement

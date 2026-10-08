@@ -171,6 +171,7 @@ fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
     let mut ops = Vec::new();
     for event in events {
         ops.extend(translator.handle(&event, &ctx).unwrap());
+        translator.restore(translator.snapshot().unwrap()).unwrap();
     }
     let rows = reduce(ops);
     assert_eq!(

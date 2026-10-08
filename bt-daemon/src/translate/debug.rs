@@ -23,6 +23,7 @@ impl TranslatorFactory for DebugTranslatorFactory {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct DebugTranslator {
     root_span_id: String,
     root_emitted: bool,
@@ -30,6 +31,14 @@ struct DebugTranslator {
 }
 
 impl AgentTranslator for DebugTranslator {
+    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+
+    fn restore(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
+        *self = serde_json::from_value(snapshot)?;
+        Ok(())
+    }
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let mut ops = Vec::new();
 

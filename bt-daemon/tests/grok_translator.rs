@@ -344,6 +344,9 @@ fn grok_transcript_reads_incrementally_and_replay_is_deterministic() {
     let first = incremental
         .handle(&envelope(first_through, 0), &ctx())
         .unwrap();
+    incremental
+        .restore(incremental.snapshot().unwrap())
+        .unwrap();
     let second = incremental
         .handle(&envelope(full_through, events), &ctx())
         .unwrap();

@@ -112,6 +112,9 @@ fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
         while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
             ops.extend(batch);
         }
+        let snapshot = translator.snapshot().unwrap();
+        translator = registry.create("claude-code", session_id);
+        translator.restore(snapshot).unwrap();
     }
     ops.extend(translator.flush(&ctx).unwrap());
     while let Some(batch) = translator.drain_pending(&ctx).unwrap() {

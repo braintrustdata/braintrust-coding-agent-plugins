@@ -125,8 +125,20 @@ pub(crate) fn root_tags(ctx: &SessionCtx) -> Option<Vec<String>> {
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
 pub trait AgentTranslator: Send {
+    /// Durable continuation state after all output for an input has been drained.
+    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("translator does not support durable continuation state")
+    }
+
+    fn restore(&mut self, _snapshot: serde_json::Value) -> anyhow::Result<()> {
+        anyhow::bail!("translator does not support durable continuation state")
+    }
     /// Route readers select a committed logical revision before requesting its
     /// batches. Native translators ignore this hook.
+    fn ledger_sequence(&self) -> Option<u64> {
+        None
+    }
+
     fn set_revision_path(&mut self, _path: &std::path::Path) {}
 
     /// Handle one event, returning span ops to emit.

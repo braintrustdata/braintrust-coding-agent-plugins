@@ -67,7 +67,7 @@ struct BeforeAgentStart {
 
 /// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
 /// routes each request to a physical model.
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct SelectedModel {
     provider: String,
     id: String,
@@ -325,6 +325,7 @@ fn decode_required<T: DeserializeOwned>(event: &str, value: &Value) -> anyhow::R
     })
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingLlm {
     start_ms: i64,
     input: Value,
@@ -332,13 +333,14 @@ struct PendingLlm {
     request_config: Map<String, Value>,
     selected_model: Option<SelectedModel>,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ToolStart {
     start_ms: i64,
     name: String,
     args: Value,
     parent_call: Option<String>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PiTranslator {
     session_id: String,
     root_span_id: String,
@@ -361,10 +363,22 @@ struct PiTranslator {
     branch_summary: Option<(String, i64, Value)>,
     last_ts: i64,
     thinking_level: Option<String>,
+    #[serde(skip)]
     git: Arc<GitMetadataCache>,
 }
 
 impl AgentTranslator for PiTranslator {
+    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+
+    fn restore(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
+        let mut restored: Self = serde_json::from_value(snapshot)?;
+        restored.git = self.git.clone();
+        *self = restored;
+        Ok(())
+    }
+
     fn handle(&mut self, envelope: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         if !matches!(
             envelope.event.as_str(),

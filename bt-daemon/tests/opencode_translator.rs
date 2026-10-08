@@ -101,6 +101,7 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
     let mut ops = Vec::new();
     for event in events {
         ops.extend(translator.handle(&event, &ctx).unwrap());
+        translator.restore(translator.snapshot().unwrap()).unwrap();
     }
     let rows = reduce(ops);
     assert_eq!(
