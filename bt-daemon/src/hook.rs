@@ -93,7 +93,7 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
     let response =
         (args.source == "cursor").then(|| cursor_hook_response_for_event(args.event.as_deref()));
     let result = async move {
-        if suppress_inherited_hook(&args) || suppress_cursor_plugin_hook(&args) {
+        if suppress_hook(&args) {
             return Ok(());
         }
         let settings = settings::AgentSettings::load_for_hook(&args.source)?;
@@ -107,6 +107,11 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
         println!("{response}");
     }
     result
+}
+
+/// Apply capture ownership before either entry point reads stdin or resolves a route.
+pub(crate) fn suppress_hook(args: &HookArgs) -> bool {
+    suppress_inherited_hook(args) || suppress_cursor_plugin_hook(args)
 }
 
 fn suppress_cursor_plugin_hook(args: &HookArgs) -> bool {
@@ -149,7 +154,7 @@ fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
 /// A managed run injects its own hook definitions. Suppress an inherited
 /// Braintrust plugin hook for the same child, but allow the injected hook
 /// process, which carries the second marker.
-pub(crate) fn suppress_inherited_hook(args: &HookArgs) -> bool {
+fn suppress_inherited_hook(args: &HookArgs) -> bool {
     std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook
 }
 

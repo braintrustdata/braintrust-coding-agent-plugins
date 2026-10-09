@@ -653,7 +653,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             run_serve(serve_args, serve_options(&host)).await
         }
         TraceCommand::Hook(hook_args) => {
-            if crate::hook::suppress_inherited_hook(&hook_args) {
+            if crate::hook::suppress_hook(&hook_args) {
                 return Ok(());
             }
             let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
@@ -1064,6 +1064,72 @@ mod tests {
             flush_timeout_ms: 10_000,
             additional_metadata: None,
             managed_run_hook: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn mounted_cursor_hook_suppresses_only_plugin_capture_before_host_resolution() {
+        const CHILD_ENV: &str = "BT_TEST_MOUNTED_CURSOR_HOOK";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let services = Arc::new(RecordingHost::new(Some("route requested"), None));
+            let mut args = hook_args();
+            args.source = "cursor".into();
+            args.event = Some("stop".into());
+            let result = run_trace(
+                TraceArgs {
+                    command: TraceCommand::Hook(args),
+                },
+                test_host(services.clone()),
+            )
+            .await;
+            if std::env::var_os(crate::setup::cursor::USER_HOOK_ENV).is_some() {
+                assert_eq!(result.unwrap_err().to_string(), "route requested");
+                assert_eq!(services.route_requests.lock().unwrap().len(), 1);
+            } else {
+                result.unwrap();
+                assert!(services.route_requests.lock().unwrap().is_empty());
+            }
+            return;
+        }
+
+        // Isolate environment-based ownership from concurrently running tests.
+        let temp = tempfile::tempdir().unwrap();
+        let (_, command) = crate::setup::cursor::persistent_specs()
+            .iter()
+            .find(|(event, _)| event == "stop")
+            .unwrap();
+        std::fs::write(
+            temp.path().join("hooks.json"),
+            serde_json::json!({"hooks": {"stop": [{"command": command}]}}).to_string(),
+        )
+        .unwrap();
+        let settings = temp.path().join("settings.json");
+        std::fs::write(&settings, r#"{"trace_to_braintrust":true}"#).unwrap();
+        for user_hook in [false, true] {
+            let mut child =
+                crate::subprocess::interactive_command(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "trace_runtime::tests::mounted_cursor_hook_suppresses_only_plugin_capture_before_host_resolution",
+                ])
+                .env(CHILD_ENV, "1")
+                .env(crate::paths::CURSOR_CONFIG_DIR_ENV, temp.path())
+                .env(crate::paths::SETTINGS_ENV, &settings)
+                .env("CURSOR_PLUGIN_ROOT", temp.path())
+                .env_remove("_BT_TRACE_MANAGED_RUN")
+                .env_remove(crate::settings::INVOCATION_SETTINGS_ENV)
+                .env_remove(crate::setup::cursor::USER_HOOK_ENV);
+            if user_hook {
+                child.env(crate::setup::cursor::USER_HOOK_ENV, "1");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "user_hook={user_hook}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
