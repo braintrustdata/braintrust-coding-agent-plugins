@@ -1,9 +1,15 @@
 //! Cursor: a local plugin written to `~/.cursor/plugins/local/trace-cursor`
-//! from files embedded at build time, plus user-level discovery hooks.
+//! from files embedded at build time, plus user-level capture hooks.
 
 mod hooks;
 
-pub(crate) use hooks::{discovery_hooks_are_installed_at, CursorManagedHooks};
+pub(crate) use hooks::{
+    capture_hooks_are_installed_at, user_capture_hook_is_installed_at, CursorManagedHooks,
+    USER_HOOK_ENV,
+};
+
+#[cfg(test)]
+pub(crate) use hooks::persistent_specs;
 
 use crate::agents::Cursor;
 use crate::paths;
@@ -72,10 +78,12 @@ fn ensure_ours(plugin_dir: &Path, unrecognized: &str, different: &str) -> anyhow
     Ok(())
 }
 
-pub(crate) fn plugin_is_installed_at(plugin: &Path) -> bool {
+#[cfg(test)]
+fn plugin_is_installed_at(plugin: &Path) -> bool {
     plugin_is_installed_for_platform_at(plugin, cfg!(windows))
 }
 
+#[cfg(test)]
 fn plugin_is_installed_for_platform_at(plugin: &Path, windows: bool) -> bool {
     if !installed_manifest_at(plugin).is_some_and(|manifest| is_ours(&manifest)) {
         return false;
@@ -157,11 +165,8 @@ impl Setup for Cursor {
     }
 
     fn activation_warning(&self) -> Option<&'static str> {
-        (!plugin_is_installed_at(&paths::cursor_plugin_dir())
-            || !discovery_hooks_are_installed_at(&paths::cursor_config_dir()))
-        .then_some(
-            "Cursor tracing plugin or lifecycle hooks are missing; run `bt trace enable cursor`",
-        )
+        (!capture_hooks_are_installed_at(&paths::cursor_config_dir()))
+            .then_some("Cursor user capture hooks are missing; run `bt trace enable cursor`")
     }
 }
 
@@ -322,31 +327,31 @@ fn update_plugin_at(plugin_dir: &Path) -> anyhow::Result<()> {
     install_plugin_at(plugin_dir)
 }
 
-/// Change the plugin with `change_plugin`, then reconcile the discovery
+/// Change the plugin with `change_plugin`, then reconcile the capture
 /// hooks. The hooks file is validated first, so an unusable `hooks.json`
 /// fails before the plugin is touched.
-fn with_discovery_hooks(
+fn with_capture_hooks(
     plugin_dir: &Path,
     config_dir: &Path,
     install: bool,
     change_plugin: impl FnOnce(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let specs = hooks::persistent_specs();
-    hooks::validate(config_dir, &specs, install)?;
+    hooks::validate(config_dir, specs, install)?;
     change_plugin(plugin_dir)?;
-    hooks::apply(config_dir, &specs, install)
+    hooks::apply(config_dir, specs, install)
 }
 
 fn enable_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
-    with_discovery_hooks(plugin_dir, config_dir, true, install_plugin_at)
+    with_capture_hooks(plugin_dir, config_dir, true, install_plugin_at)
 }
 
 fn disable_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
-    with_discovery_hooks(plugin_dir, config_dir, false, remove_plugin_at)
+    with_capture_hooks(plugin_dir, config_dir, false, remove_plugin_at)
 }
 
 fn update_at(plugin_dir: &Path, config_dir: &Path) -> anyhow::Result<()> {
-    with_discovery_hooks(plugin_dir, config_dir, true, update_plugin_at)
+    with_capture_hooks(plugin_dir, config_dir, true, update_plugin_at)
 }
 
 #[cfg(test)]
@@ -354,16 +359,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_is_repeatable_and_preserves_neighbor_plugins() {
+    fn setup_lifecycle_preserves_neighbor_plugins() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("plugins/local");
         let plugin = root.join(PLUGIN_NAME);
+        let config_dir = temp.path().join(".cursor");
         let neighbor = root.join("my-plugin/keep.txt");
         std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
         std::fs::write(&neighbor, "leave me").unwrap();
 
-        install_plugin_at(&plugin).unwrap();
-        install_plugin_at(&plugin).unwrap();
+        enable_at(&plugin, &config_dir).unwrap();
+        enable_at(&plugin, &config_dir).unwrap();
+        update_at(&plugin, &config_dir).unwrap();
+        assert!(capture_hooks_are_installed_at(&config_dir));
 
         assert_eq!(std::fs::read_to_string(&neighbor).unwrap(), "leave me");
         assert_eq!(
@@ -389,6 +397,11 @@ mod tests {
         assert!(plugin_is_installed_at(&plugin));
         assert!(is_ours(&manifest));
         assert!(plugin.join("mcp.json").is_file());
+
+        disable_at(&plugin, &config_dir).unwrap();
+        assert!(!plugin.exists());
+        assert!(!capture_hooks_are_installed_at(&config_dir));
+        assert_eq!(std::fs::read_to_string(&neighbor).unwrap(), "leave me");
     }
 
     #[test]
@@ -437,18 +450,6 @@ mod tests {
     }
 
     #[test]
-    fn enable_installs_the_plugin_and_discovery_hooks() {
-        let temp = tempfile::tempdir().unwrap();
-        let plugin = temp.path().join(PLUGIN_NAME);
-        let config_dir = temp.path().join(".cursor");
-
-        enable_at(&plugin, &config_dir).unwrap();
-
-        assert!(plugin_is_installed_at(&plugin));
-        assert!(discovery_hooks_are_installed_at(&config_dir));
-    }
-
-    #[test]
     fn setup_refuses_to_replace_or_remove_an_unrelated_plugin() {
         let temp = tempfile::tempdir().unwrap();
         let plugin = temp.path().join(PLUGIN_NAME);
@@ -467,21 +468,5 @@ mod tests {
         );
         assert!(!plugin_is_installed_at(&plugin));
         assert!(plugin.join(".cursor-plugin/plugin.json").exists());
-    }
-
-    #[test]
-    fn disable_removes_only_its_plugin() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("plugins/local");
-        let plugin = root.join(PLUGIN_NAME);
-        let neighbor = root.join("other-plugin/file");
-        std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
-        std::fs::write(&neighbor, "preserve").unwrap();
-
-        install_plugin_at(&plugin).unwrap();
-        remove_plugin_at(&plugin).unwrap();
-
-        assert!(!plugin.exists());
-        assert_eq!(std::fs::read_to_string(neighbor).unwrap(), "preserve");
     }
 }

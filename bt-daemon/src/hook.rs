@@ -93,7 +93,7 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
     let response =
         (args.source == "cursor").then(|| cursor_hook_response_for_event(args.event.as_deref()));
     let result = async move {
-        if suppress_inherited_hook(&args) {
+        if suppress_hook(&args) {
             return Ok(());
         }
         let settings = settings::AgentSettings::load_for_hook(&args.source)?;
@@ -109,6 +109,40 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
     result
 }
 
+/// Apply capture ownership before either entry point reads stdin or resolves a route.
+pub(crate) fn suppress_hook(args: &HookArgs) -> bool {
+    suppress_inherited_hook(args) || suppress_cursor_plugin_hook(args)
+}
+
+fn suppress_cursor_plugin_hook(args: &HookArgs) -> bool {
+    cursor_plugin_hook_is_redundant(
+        args,
+        &paths::cursor_config_dir(),
+        std::env::var_os("CURSOR_PLUGIN_ROOT").is_some(),
+        std::env::var_os(crate::setup::cursor::USER_HOOK_ENV).is_some(),
+    )
+}
+
+fn cursor_plugin_hook_is_redundant(
+    args: &HookArgs,
+    config_dir: &std::path::Path,
+    plugin_hook: bool,
+    user_hook: bool,
+) -> bool {
+    args.source == "cursor"
+        && !args.managed_run_hook
+        && plugin_hook
+        && !user_hook
+        && match args.event.as_deref() {
+            Some(event) => {
+                crate::setup::cursor::user_capture_hook_is_installed_at(config_dir, event)
+            }
+            // Older launchers infer the event from stdin; suppress only when
+            // every user capture registration is present.
+            None => crate::setup::cursor::capture_hooks_are_installed_at(config_dir),
+        }
+}
+
 fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
     if event == Some("beforeSubmitPrompt") {
         r#"{"continue":true}"#
@@ -120,7 +154,7 @@ fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
 /// A managed run injects its own hook definitions. Suppress an inherited
 /// Braintrust plugin hook for the same child, but allow the injected hook
 /// process, which carries the second marker.
-pub(crate) fn suppress_inherited_hook(args: &HookArgs) -> bool {
+fn suppress_inherited_hook(args: &HookArgs) -> bool {
     std::env::var_os("_BT_TRACE_MANAGED_RUN").is_some() && !args.managed_run_hook
 }
 
@@ -329,6 +363,77 @@ mod tests {
     struct HookCli {
         #[command(flatten)]
         args: HookArgs,
+    }
+
+    #[test]
+    fn cursor_capture_ownership_preserves_user_managed_and_uncovered_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let specs = crate::setup::cursor::persistent_specs();
+        let command = &specs.iter().find(|(event, _)| event == "stop").unwrap().1;
+        let mut config = json!({"version":1,"hooks":{"stop":[{"command":command,"timeout":10,"failClosed":false}]}});
+        let path = temp.path().join("hooks.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut args = HookCli::try_parse_from(["test", "--source", "cursor", "--event", "stop"])
+            .unwrap()
+            .args;
+        assert!(cursor_plugin_hook_is_redundant(
+            &args,
+            temp.path(),
+            true,
+            false
+        ));
+        assert!(!cursor_plugin_hook_is_redundant(
+            &args,
+            temp.path(),
+            true,
+            true
+        ));
+        assert!(!cursor_plugin_hook_is_redundant(
+            &args,
+            temp.path(),
+            false,
+            false
+        ));
+        args.managed_run_hook = true;
+        assert!(!cursor_plugin_hook_is_redundant(
+            &args,
+            temp.path(),
+            true,
+            false
+        ));
+        args.managed_run_hook = false;
+        args.event = Some("sessionStart".into());
+        assert!(!cursor_plugin_hook_is_redundant(
+            &args,
+            temp.path(),
+            true,
+            false
+        ));
+        args.event = None;
+        assert!(!cursor_plugin_hook_is_redundant(
+            &args,
+            temp.path(),
+            true,
+            false
+        ));
+        for (event, command) in specs {
+            config["hooks"][event] = json!([{"command":command,"timeout":10,"failClosed":false}]);
+        }
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(cursor_plugin_hook_is_redundant(
+            &args,
+            temp.path(),
+            true,
+            false
+        ));
+        args.source = "claude-code".into();
+        args.event = Some("stop".into());
+        assert!(!cursor_plugin_hook_is_redundant(
+            &args,
+            temp.path(),
+            true,
+            false
+        ));
     }
 
     #[test]
