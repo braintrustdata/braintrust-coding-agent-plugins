@@ -10,10 +10,9 @@ the Braintrust VS Code extension for Cursor.
 
 ## Prerequisites
 
-- A [Braintrust account](https://braintrust.dev)
+- A [Braintrust account](https://braintrust.dev) (MCP uses OAuth)
 - Cursor with the CLI or desktop app
 - The [Braintrust CLI](https://www.braintrust.dev/docs/reference/cli/quickstart)
-- A Braintrust API key to use the MCP server
 
 ## Install from Cursor Marketplace
 
@@ -22,9 +21,33 @@ Use `/add-plugin` in Cursor and search for **Braintrust**, or install from the
 Braintrust MCP server and tracing hooks. For tracing, install and authenticate
 the `bt` CLI, then run `bt trace enable cursor --project my-coding-agent`.
 
-The Braintrust MCP server uses `https://api.braintrust.dev/mcp`. Configure its
-`BRAINTRUST_API_KEY` variable in Cursor's plugin settings. MCP access and tracing
-use separate authentication: `bt login` authenticates the tracing CLI.
+The Braintrust MCP server uses `https://api.braintrust.dev/mcp` and Cursor's
+OAuth flow for per-user authentication. MCP access and tracing use separate
+authentication: `bt login` authenticates the tracing CLI.
+
+### Breaking change: API-key authentication removed
+
+This plugin no longer accepts `BRAINTRUST_API_KEY` for MCP authentication.
+Any key previously saved in the plugin settings will no longer be used. After
+updating, authorize Braintrust through Cursor's OAuth prompt. If you must keep
+using an API key, remove the plugin's MCP server and configure it manually in
+Cursor's MCP settings, with `BRAINTRUST_API_KEY` available in Cursor's
+environment:
+
+```json
+{
+  "mcpServers": {
+    "braintrust": {
+      "url": "https://api.braintrust.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:BRAINTRUST_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Do not register a second server named `braintrust` alongside the manual one.
 
 The existing VS Code extension remains available from Cursor's extension
 panel. It reads `BRAINTRUST_API_KEY` from Cursor's environment and registers
@@ -54,7 +77,8 @@ Cursor must allow local plugin imports. Reload the Cursor window after setup so
 the plugin is active.
 
 Use `--profile` or `--org` to select a different Braintrust account or
-organization. To use MCP, configure `BRAINTRUST_API_KEY` in Cursor's plugin settings.
+organization. The plugin's MCP server prompts you to authorize Braintrust with
+OAuth when you first use it.
 
 ## Data handling
 

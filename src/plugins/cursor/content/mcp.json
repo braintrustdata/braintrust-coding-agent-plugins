@@ -1,10 +1,7 @@
 {
   "mcpServers": {
     "braintrust": {
-      "url": "https://api.braintrust.dev/mcp",
-      "headers": {
-        "Authorization": "Bearer ${BRAINTRUST_API_KEY}"
-      }
+      "url": "https://api.braintrust.dev/mcp"
     }
   }
 }
