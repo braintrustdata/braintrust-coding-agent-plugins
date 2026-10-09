@@ -27,6 +27,8 @@ $hookArgs = @('trace', 'hook', '--source', 'cursor', '--session-id-field', 'conv
 try { & $bt @hookArgs *> $null } catch {}
 if ($args.Count -gt 0 -and $args[0] -eq 'beforeSubmitPrompt') {
   [Console]::Out.WriteLine('{"continue":true}')
+} elseif ($args.Count -gt 0 -and ($args[0] -eq 'preToolUse' -or $args[0] -eq 'subagentStart')) {
+  [Console]::Out.WriteLine('{"permission":"allow"}')
 } else {
   [Console]::Out.WriteLine('{}')
 }
@@ -414,6 +416,7 @@ mod tests {
         assert!(script.contains("'--source', 'cursor'"));
         assert!(script.contains("'--event-field', 'hook_event_name'"));
         assert!(script.contains("'{\"continue\":true}'") || script.contains("\"continue\":true"));
+        assert!(script.contains("permission\":\"allow\""));
         assert!(script.contains("[Console]::Out.WriteLine('{}')"));
     }
 

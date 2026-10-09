@@ -108,6 +108,7 @@ fn write_cursor_managed_plugin_for_platform(
         }))?,
     )?;
     let script_path = hook_dir.join(if windows { "trace.ps1" } else { "trace.sh" });
+    let source_manifest: serde_json::Value = serde_json::from_str(CURSOR_HOOKS_MANIFEST)?;
     let hooks = cursor_hook_events()?
         .iter()
         .map(|event| {
@@ -119,14 +120,15 @@ fn write_cursor_managed_plugin_for_platform(
             } else {
                 format!("\"${{CURSOR_PLUGIN_ROOT}}/hooks/trace.sh\" {event}")
             };
-            (
-                event.clone(),
-                serde_json::json!([{
-                    "command": command,
-                    "timeout": 10,
-                    "failClosed": false
-                }]),
-            )
+            let mut registration = serde_json::json!({
+                "command": command,
+                "timeout": 10,
+                "failClosed": false
+            });
+            if let Some(matcher) = source_manifest["hooks"][event][0]["matcher"].as_str() {
+                registration["matcher"] = serde_json::json!(matcher);
+            }
+            (event.clone(), serde_json::json!([registration]))
         })
         .collect::<serde_json::Map<_, _>>();
     std::fs::write(
@@ -156,7 +158,7 @@ fn write_cursor_managed_plugin_for_platform(
             command.push_str(&quote_unix_shell_arg(arg));
         }
         let script = format!(
-            "#!/bin/sh\n# Keep Cursor's prompt response valid even when tracing fails.\nif ! {command} >/dev/null 2>/dev/null; then\n  :\nfi\ncase \"${{1-}}\" in\n  beforeSubmitPrompt) printf '%s\\n' '{{\"continue\":true}}' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\nexit 0\n"
+            "#!/bin/sh\n# Keep Cursor's hook response valid even when tracing fails.\nif ! {command} >/dev/null 2>/dev/null; then\n  :\nfi\ncase \"${{1-}}\" in\n  beforeSubmitPrompt) printf '%s\\n' '{{\"continue\":true}}' ;;\n  preToolUse|subagentStart) printf '%s\\n' '{{\"permission\":\"allow\"}}' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\nexit 0\n"
         );
         std::fs::write(&script_path, script)?;
         #[cfg(unix)]
@@ -202,7 +204,7 @@ fn cursor_managed_powershell_script(hook_command: &RunHookCommand) -> anyhow::Re
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!(
-        "$bt = {}\n$hookArgs = @({})\ntry {{ & $bt @hookArgs *> $null }} catch {{}}\nif ($args.Count -gt 0 -and $args[0] -eq 'beforeSubmitPrompt') {{\n  [Console]::Out.WriteLine('{{\"continue\":true}}')\n}} else {{\n  [Console]::Out.WriteLine('{{}}')\n}}\nexit 0\n",
+        "$bt = {}\n$hookArgs = @({})\ntry {{ & $bt @hookArgs *> $null }} catch {{}}\nif ($args.Count -gt 0 -and $args[0] -eq 'beforeSubmitPrompt') {{\n  [Console]::Out.WriteLine('{{\"continue\":true}}')\n}} elseif ($args.Count -gt 0 -and ($args[0] -eq 'preToolUse' -or $args[0] -eq 'subagentStart')) {{\n  [Console]::Out.WriteLine('{{\"permission\":\"allow\"}}')\n}} else {{\n  [Console]::Out.WriteLine('{{}}')\n}}\nexit 0\n",
         powershell_literal(executable),
         rendered_args
     ))
@@ -236,6 +238,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plugin_manifest["hooks"], "hooks/hooks.json");
+        assert_eq!(manifest["hooks"]["preToolUse"][0]["matcher"], "Task");
         for event in cursor_hook_events().unwrap() {
             let entry = &manifest["hooks"][event][0];
             assert_eq!(entry["failClosed"], false);
@@ -253,14 +256,14 @@ mod tests {
             assert!(script.contains("'--managed-run-hook'"));
             assert!(script.contains("'--session-id-field'"));
             assert!(script.contains("'conversation_id'"));
-            assert!(!script.contains("permission\":\"allow"));
+            assert!(script.contains("permission\":\"allow\""));
             assert!(script.contains("{\"continue\":true}"));
             assert!(!script.contains("--dangerously-bypass"));
         } else {
             let script = std::fs::read_to_string(plugin.join("hooks/trace.sh")).unwrap();
             assert!(script.contains("'--source' 'cursor' '--managed-run-hook'"));
             assert!(script.contains("'--session-id-field' 'conversation_id'"));
-            assert!(!script.contains("\"permission\":\"allow\""));
+            assert!(script.contains("\"permission\":\"allow\""));
             assert!(script.contains("\"continue\":true"));
             assert!(!script.contains("--dangerously-bypass"));
         }
@@ -319,7 +322,7 @@ mod tests {
         assert!(script.contains("--session-id-field"));
         assert!(script.contains("[Console]::Out.WriteLine('{}')"));
         assert!(script.contains("{\"continue\":true}"));
-        assert!(!script.contains("permission\":\"allow"));
+        assert!(script.contains("permission\":\"allow\""));
         assert!(!script.contains("/bin/sh"));
     }
 }

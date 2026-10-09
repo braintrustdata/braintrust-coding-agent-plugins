@@ -43,21 +43,24 @@ assert 'MIT License' in (root / 'LICENSE').read_text()
 config = json.loads((root / manifest['hooks']).read_text())
 assert config['version'] == 1
 expected = {
-    'sessionStart', 'sessionEnd', 'beforeSubmitPrompt',
-    'postToolUse', 'postToolUseFailure', 'subagentStop',
+    'sessionStart', 'sessionEnd', 'beforeSubmitPrompt', 'preToolUse',
+    'postToolUse', 'postToolUseFailure', 'subagentStart', 'subagentStop',
     'afterShellExecution', 'afterMCPExecution', 'afterFileEdit', 'preCompact',
     'stop', 'afterAgentResponse',
 }
 assert set(config['hooks']) == expected
 for event, registrations in config['hooks'].items():
-    assert registrations == [{
+    expected_registration = {
         'command': ('bt trace hook --source cursor '
                     f'--event {event} --session-id-field conversation_id '
                     '--event-field hook_event_name --transcript-path-field transcript_path '
                     '--flush-on-turn-end --capture-timeout-ms 8000'),
         'timeout': 10,
         'failClosed': False,
-    }]
+    }
+    if event == 'preToolUse':
+        expected_registration['matcher'] = 'Task'
+    assert registrations == [expected_registration]
 PY
 
 "$SRC_DIR/test/test_capture.sh" "$TARGET_DIR"

@@ -110,10 +110,10 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
 }
 
 fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
-    if event == Some("beforeSubmitPrompt") {
-        r#"{"continue":true}"#
-    } else {
-        "{}"
+    match event {
+        Some("beforeSubmitPrompt") => r#"{"continue":true}"#,
+        Some("preToolUse" | "subagentStart") => r#"{"permission":"allow"}"#,
+        _ => "{}",
     }
 }
 
@@ -329,6 +329,16 @@ mod tests {
     struct HookCli {
         #[command(flatten)]
         args: HookArgs,
+    }
+
+    #[test]
+    fn cursor_permission_hooks_allow_actions_after_capture() {
+        for event in ["preToolUse", "subagentStart"] {
+            assert_eq!(
+                cursor_hook_response_for_event(Some(event)),
+                r#"{"permission":"allow"}"#
+            );
+        }
     }
 
     #[test]
