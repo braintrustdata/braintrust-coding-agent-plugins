@@ -100,11 +100,20 @@ separate event-driven runs under one workflow entry, named `Prepare …` and
 publication. It never pushes source changes to `main`. CI runs on release PRs;
 the current rules require one approval but do not require passing CI.
 
+Cursor production releases then package and publish `braintrustdata.braintrust`
+to Open VSX with GitHub Actions OIDC in the `openvsx-cursor` environment. Register
+the monorepo's `release.yml` as the trusted publisher; see
+[`src/plugins/cursor/content/CONTRIBUTING.md`](src/plugins/cursor/content/CONTRIBUTING.md#one-time-open-vsx-trusted-publishing-setup)
+for the exact configuration. Sandbox releases and manual distribution pushes
+do not publish to Open VSX. No Open VSX access-token secret is required.
+
 If publishing is interrupted, rerun the **publication run** in Release Plugin
 rather than manually preparing the merged version again. An existing source tag must match the
 approved merge SHA; an existing distribution tag still rejects publication.
 An unchanged Antigravity artifact may reuse its previous distribution commit
 under the new version tag.
+If only the Cursor Open VSX job failed after distribution publication succeeded,
+use **Re-run failed jobs** to preserve the completed distribution release.
 
 The manual `test-release.yml` workflow calls `_release.yml` at the selected
 commit, stamps versions only on the runner, and **overwrites the shared test

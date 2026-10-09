@@ -28,6 +28,8 @@ assert manifest['variables']['properties']['BRAINTRUST_API_KEY']['type'] == 'str
 assert manifest['variables']['required'] == ['BRAINTRUST_API_KEY']
 package = json.loads((root / 'package.json').read_text())
 lock = json.loads((root / 'package-lock.json').read_text())
+assert package['publisher'] == 'braintrustdata'
+assert package['name'] == 'braintrust'
 assert package['version'] == manifest['version']
 assert lock['version'] == manifest['version']
 assert lock['packages']['']['version'] == manifest['version']
