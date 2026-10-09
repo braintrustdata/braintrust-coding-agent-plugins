@@ -446,6 +446,33 @@ impl Sink for BraintrustSink {
         Ok(n)
     }
 
+    async fn replace_plugin_marker(&mut self, op: &SpanOp) -> anyhow::Result<u64> {
+        // The marker already made this row visible, so a recovered deferred
+        // root must update it immediately rather than waiting for a child.
+        self.emit_op(op).await?;
+        let row = match op {
+            SpanOp::Insert(row) | SpanOp::Merge(row) => row,
+        };
+        if row.error.is_none() {
+            let client = self.ensure_client().await?;
+            let creds = self
+                .creds
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("session has no credentials/config yet"))?;
+            let project = self.project(creds);
+            let components = self.span_components(row, creds, &project).to_str();
+            let clear = SpanLog::builder().error(Value::Null).build()?;
+            client.client.update_span_with_credentials(
+                creds.token.clone(),
+                creds.org_id.clone(),
+                &components,
+                clear,
+            )?;
+            client.account_and_flush(0).await?;
+        }
+        Ok(1)
+    }
+
     async fn flush(&mut self) -> anyhow::Result<()> {
         match &self.client {
             Some(client) => client.flush().await,

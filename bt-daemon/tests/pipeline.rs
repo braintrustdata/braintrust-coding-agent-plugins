@@ -1849,13 +1849,13 @@ async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment()
 }
 
 #[tokio::test]
-async fn a_failing_span_plugin_discards_rows_and_persists_the_raw_exception() {
-    let (data_dir, socket, handle, tmp) = start_daemon().await;
+async fn a_failing_span_plugin_pauses_only_its_session_and_recovers_on_edit() {
+    let (data_dir, socket, handle, tmp) = start_daemon_with_session_ttl(1).await;
     let plugin = tmp.path().join("bad.mjs");
     let later_plugin = tmp.path().join("later.mjs");
     std::fs::write(
         &plugin,
-        "export default () => { throw new Error('raw local secret') }",
+        "export default (span, context) => { if (context.session_id === 'plugin-failure') throw new Error('raw local secret'); return span; }",
     )
     .unwrap();
     std::fs::write(
@@ -1887,46 +1887,189 @@ async fn a_failing_span_plugin_discards_rows_and_persists_the_raw_exception() {
         status.sessions[0]
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("span operations are being discarded")),
+            .is_some_and(|error| error.contains("session delivery paused")),
         "unexpected plugin status: {:?}",
         status.sessions[0].last_error
     );
     let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
     assert!(
-        spans.is_empty(),
-        "no untransformed rows should be delivered"
+        spans.contains("plugin failure"),
+        "the UI marker should be delivered"
     );
     assert!(!spans.contains("after-failure:"));
 
-    let diagnostics =
-        std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json")).unwrap();
-    assert!(diagnostics.contains("Error: raw local secret"));
-    assert!(diagnostics.contains("bad.mjs"));
-
-    shutdown(&socket).await;
-    handle.await.unwrap();
-
-    std::fs::write(&plugin, "export default span => span").unwrap();
-    let restarted = start_daemon_at(data_dir.clone(), socket.clone()).await;
-    let mut stop = envelope("plugin-failure", "Stop", 2);
-    stop.route
+    let mut later_event = envelope("plugin-failure", "Stop", 2);
+    later_event
+        .route
         .as_mut()
         .unwrap()
         .span_plugins
-        .extend([plugin, later_plugin]);
-    forward_envelope(&stop, &socket, &dummy_host(), false)
+        .extend([plugin.clone(), later_plugin.clone()]);
+    forward_envelope(&later_event, &socket, &dummy_host(), false)
         .await
         .unwrap();
     flush_session("plugin-failure", &socket, 5000)
         .await
         .unwrap();
-
-    let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
-    assert!(
-        spans.contains("after-failure:"),
-        "fixing the plugin and restarting should replay withheld journal rows"
+    let paused_spans =
+        std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+    assert_eq!(
+        paused_spans, spans,
+        "later events must stay journaled without delivery"
     );
 
+    let mut healthy = envelope("plugin-healthy", "SessionStart", 1);
+    healthy
+        .route
+        .as_mut()
+        .unwrap()
+        .span_plugins
+        .extend([plugin.clone(), later_plugin.clone()]);
+    forward_envelope(&healthy, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    flush_session("plugin-healthy", &socket, 5000)
+        .await
+        .unwrap();
+    let healthy_spans =
+        std::fs::read_to_string(data_dir.join("spans/plugin-healthy.ndjson")).unwrap();
+    assert!(healthy_spans.contains("after-failure:"));
+
+    let diagnostics =
+        std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json")).unwrap();
+    assert!(diagnostics.contains("Error: raw local secret"));
+    assert!(diagnostics.contains("bad.mjs"));
+    assert!(diagnostics.contains("plugin-failure"));
+    assert!(diagnostics.contains("\"state\": \"paused\""));
+
+    std::fs::write(
+        &later_plugin,
+        "export default span => ({...span, name: `changed:${span.name}`})",
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("plugin-failure".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status.sessions.len(), 1, "paused session must not retire");
+    let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+    assert!(
+        !spans.contains("changed:"),
+        "changing a different plugin must not retry"
+    );
+    std::fs::write(
+        &plugin,
+        "export default () => { throw new Error('still broken') }",
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let diagnostics =
+                std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json"))
+                    .unwrap();
+            if diagnostics.contains("still broken") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("changed but still failing plugin should update the cause");
+    let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+    assert!(
+        !spans.contains("changed:"),
+        "failed retry must remain paused"
+    );
+    std::fs::write(&plugin, "export default span => span").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let spans =
+                std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+            if spans.contains("changed:") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("fixing the failed plugin should replay without a new event");
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let spans =
+                std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+            let diagnostics =
+                std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json"))
+                    .unwrap();
+            if spans.contains("Stop") && diagnostics.contains("\"state\": \"recovered\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("successful replay should be reflected in spans and diagnostics");
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("plugin-failure".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status
+        .sessions
+        .iter()
+        .all(|session| session.last_error.is_none()));
+
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_paused_plugin_session_recovers_after_process_restart_without_a_new_event() {
+    let (data_dir, socket, handle, tmp) = start_daemon().await;
+    let plugin = tmp.path().join("redact.mjs");
+    std::fs::write(
+        &plugin,
+        "export default () => { throw new Error('broken') }",
+    )
+    .unwrap();
+    let mut start = envelope("plugin-cold-recovery", "SessionStart", 1);
+    start
+        .route
+        .as_mut()
+        .unwrap()
+        .span_plugins
+        .push(plugin.clone());
+    forward_envelope(&start, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    flush_session("plugin-cold-recovery", &socket, 5000)
+        .await
+        .unwrap();
+    shutdown(&socket).await;
+    handle.await.unwrap();
+
+    std::fs::write(&plugin, "export default span => span").unwrap();
+    let restarted = start_daemon_at(data_dir.clone(), socket.clone()).await;
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let spans = std::fs::read_to_string(data_dir.join("spans/plugin-cold-recovery.ndjson"))
+                .unwrap();
+            let diagnostics =
+                std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json"))
+                    .unwrap();
+            if spans.contains("SessionStart") && diagnostics.contains("\"state\": \"recovered\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cold recovery should replace the failure marker without another event");
     shutdown(&socket).await;
     restarted.await.unwrap();
 }

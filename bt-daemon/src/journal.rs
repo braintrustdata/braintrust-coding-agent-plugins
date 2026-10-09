@@ -549,12 +549,39 @@ fn expand_pi_payload(
 /// and ignored; stale state must never prevent the daemon from serving hooks.
 pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
     let dir = journal_dir(data_dir);
+    let diagnostics = match crate::plugin_diagnostics::read(data_dir) {
+        Ok(diagnostics) => diagnostics,
+        Err(error) => {
+            tracing::warn!(%error, "journal collection skipped because plugin recovery state is unreadable");
+            return;
+        }
+    };
+    let protected: HashSet<PathBuf> = diagnostics
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.state,
+                Some(
+                    crate::plugin_diagnostics::PluginRecoveryState::Paused
+                        | crate::plugin_diagnostics::PluginRecoveryState::Reprocessing
+                )
+            )
+        })
+        .filter_map(|entry| {
+            entry
+                .session_id
+                .map(|session_id| source_journal_path(data_dir, &entry.source, &session_id))
+        })
+        .collect();
     let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
         return;
     };
     let now = std::time::SystemTime::now();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
+        if protected.contains(&path) {
+            continue;
+        }
         if path.extension().and_then(|v| v.to_str()) != Some("ndjson") {
             continue;
         }
@@ -606,6 +633,55 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn collection_keeps_a_journal_with_a_paused_plugin_pipeline() {
+        let temp = tempfile::tempdir().unwrap();
+        let route = SessionRoute::default();
+        let path = source_journal_path(temp.path(), "claude", "session");
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, b"event\n").await.unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .unwrap();
+        let plugin = temp.path().join("redact.mjs");
+        tokio::fs::write(&plugin, b"export default span => span")
+            .await
+            .unwrap();
+        crate::plugin_diagnostics::record_pipeline_failure(
+            temp.path(),
+            crate::plugin_diagnostics::PipelineFailure {
+                source: "claude",
+                session_id: "session",
+                route: &route,
+                span_id: "span",
+                operation: "insert",
+                plugin_path: &plugin,
+                exception: "interrupted",
+                journal_start: 0,
+                journal_through: 6,
+            },
+        )
+        .unwrap();
+        gc_old_journals(temp.path(), std::time::Duration::from_secs(1)).await;
+        assert!(path.exists());
+        crate::plugin_diagnostics::update_pipeline(
+            temp.path(),
+            "claude",
+            "session",
+            &route,
+            crate::plugin_diagnostics::PluginRecoveryState::Recovered,
+            6,
+        )
+        .unwrap();
+        gc_old_journals(temp.path(), std::time::Duration::from_secs(1)).await;
+        assert!(!path.exists());
+    }
 
     fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
         Envelope {

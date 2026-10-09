@@ -273,6 +273,20 @@ impl Sink for LedgerSink {
         Ok(emitted)
     }
 
+    async fn emit_plugin_marker(&mut self, op: &SpanOp) -> anyhow::Result<u64> {
+        self.inner.emit_plugin_marker(op).await
+    }
+
+    async fn replace_plugin_marker(&mut self, op: &SpanOp) -> anyhow::Result<u64> {
+        let emitted = self.inner.replace_plugin_marker(op).await?;
+        if emitted > 0 {
+            if let Some(ledger) = &mut self.ledger {
+                ledger.record_emitted(std::slice::from_ref(op));
+            }
+        }
+        Ok(emitted)
+    }
+
     async fn flush(&mut self) -> anyhow::Result<()> {
         self.inner.flush().await?;
         if let Some(ledger) = &mut self.ledger {

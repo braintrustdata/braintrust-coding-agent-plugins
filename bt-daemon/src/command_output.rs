@@ -275,15 +275,34 @@ impl TraceCommandOutput {
                     rendered.push_str(&format!("\nWarning: {warning}"));
                 }
                 for diagnostic in &doctor.plugin_diagnostics {
+                    let state = match diagnostic.state {
+                        Some(crate::plugin_diagnostics::PluginRecoveryState::Paused) => "paused",
+                        Some(crate::plugin_diagnostics::PluginRecoveryState::Reprocessing) => "reprocessing",
+                        Some(crate::plugin_diagnostics::PluginRecoveryState::Recovered) => "recovered",
+                        None => "historical (current state unknown)",
+                    };
                     rendered.push_str(&format!(
-                        "\nPlugin error: {} ({} occurrence{})\nFirst seen: {}\nLast seen: {}\n{}",
+                        "\nSpan plugin: {}\nState: {}\nSource: {}\nSession: {}\nSpan: {}\nOperation: {}\nFailure journal offset: {}\nPending journal bytes: {}\nFirst failure: {}\nLast failure: {}\nCause: {}",
                         diagnostic.plugin_path.display(),
-                        diagnostic.occurrences,
-                        if diagnostic.occurrences == 1 { "" } else { "s" },
+                        state,
+                        diagnostic.source,
+                        diagnostic.session_id.as_deref().unwrap_or("unknown"),
+                        diagnostic.span_id.as_deref().unwrap_or("unknown"),
+                        diagnostic.operation.as_deref().unwrap_or("unknown"),
+                        diagnostic.journal_start.unwrap_or(0),
+                        diagnostic.pending_bytes.unwrap_or(0),
                         render_timestamp(diagnostic.first_seen_ms),
                         render_timestamp(diagnostic.last_seen_ms),
                         diagnostic.exception
                     ));
+                    if diagnostic.state == Some(crate::plugin_diagnostics::PluginRecoveryState::Recovered) {
+                        if let Some(when) = diagnostic.state_changed_ms {
+                            rendered.push_str(&format!("\nRecovered: {}", render_timestamp(when)));
+                        }
+                    }
+                    if diagnostic.state == Some(crate::plugin_diagnostics::PluginRecoveryState::Paused) {
+                        rendered.push_str("\nNext: edit the failing plugin; tracing will retry this session automatically.");
+                    }
                 }
                 Ok(rendered)
             }
@@ -543,6 +562,12 @@ mod tests {
                 first_seen_ms: 1,
                 last_seen_ms: 2,
                 occurrences: 3,
+                session_id: Some("session-1".into()),
+                span_id: Some("span-1".into()),
+                operation: Some("merge".into()),
+                state: Some(crate::plugin_diagnostics::PluginRecoveryState::Paused),
+                pending_bytes: Some(1024),
+                ..Default::default()
             }],
         });
         let rendered = output.render(OutputFormat::Json).unwrap();
@@ -561,5 +586,11 @@ mod tests {
             value["plugin_diagnostics"][0]["exception"],
             "Error: raw secret\n    at redact (redact.mjs:1)"
         );
+        let human = output.render(OutputFormat::Human).unwrap();
+        assert!(human.contains("State: paused"));
+        assert!(human.contains("Session: session-1"));
+        assert!(human.contains("Span: span-1"));
+        assert!(human.contains("Pending journal bytes: 1024"));
+        assert!(human.contains("Next: edit the failing plugin"));
     }
 }

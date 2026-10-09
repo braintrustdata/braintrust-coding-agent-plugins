@@ -15,6 +15,7 @@ use crate::wire::{Envelope, SessionRoute};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
@@ -74,7 +75,18 @@ pub struct Session {
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
     pub permalink: Arc<Mutex<Option<String>>>,
+    pause: Arc<Mutex<Option<PluginPause>>>,
     last_activity: Mutex<Instant>,
+}
+
+#[derive(Clone)]
+struct PluginPause {
+    path: PathBuf,
+    digest: Option<String>,
+    span_id: String,
+    journal_start: u64,
+    marker_emitted: bool,
+    marker_cleared: bool,
 }
 
 impl Session {
@@ -102,6 +114,7 @@ impl Session {
         let counters = Arc::new(Counters::default());
         let last_error = Arc::new(Mutex::new(None));
         let permalink = Arc::new(Mutex::new(None));
+        let pause = Arc::new(Mutex::new(None));
 
         let actor = SessionActor {
             session_id: session_id.clone(),
@@ -113,6 +126,7 @@ impl Session {
             counters: counters.clone(),
             last_error: last_error.clone(),
             permalink: permalink.clone(),
+            pause: pause.clone(),
             replay,
             config,
             correlation_key,
@@ -130,6 +144,7 @@ impl Session {
             counters,
             last_error,
             permalink,
+            pause,
             last_activity: Mutex::new(Instant::now()),
         })
     }
@@ -159,7 +174,14 @@ impl Session {
 
     /// How long since this session last saw traffic. Drives idle retirement.
     pub fn idle_for(&self) -> std::time::Duration {
+        if self.pause.lock().unwrap().is_some() {
+            return std::time::Duration::ZERO;
+        }
         self.last_activity.lock().unwrap().elapsed()
+    }
+
+    pub fn has_paused_plugin(&self) -> bool {
+        self.pause.lock().unwrap().is_some()
     }
 
     /// Insert a flush in actor order without waiting for backend delivery.
@@ -456,6 +478,7 @@ struct SessionActor {
     counters: Arc<Counters>,
     last_error: Arc<Mutex<Option<String>>>,
     permalink: Arc<Mutex<Option<String>>>,
+    pause: Arc<Mutex<Option<PluginPause>>>,
     replay: Option<ReplayPlan>,
     config: crate::wire::SessionConfig,
     correlation_key: String,
@@ -557,6 +580,23 @@ impl SessionActor {
         };
         sink.configure(&self.config);
         self.refresh_permalink(sink.as_ref());
+        if let Ok(Some(active)) = crate::plugin_diagnostics::active_pipeline(
+            &self.data_dir,
+            &self.source,
+            &self.session_id,
+            &self.route,
+        ) {
+            if let Some(span_id) = active.span_id {
+                *self.pause.lock().unwrap() = Some(PluginPause {
+                    path: active.plugin_path,
+                    digest: active.plugin_digest,
+                    span_id,
+                    journal_start: active.journal_start.unwrap_or(0),
+                    marker_emitted: true,
+                    marker_cleared: false,
+                });
+            }
+        }
         // Rebuild translator state before accepting the first new event.
         // Stable span ids make this both crash recovery and a complete copy
         // when an existing source session is sent to another destination.
@@ -568,11 +608,138 @@ impl SessionActor {
         // A failed sink write makes the contiguous delivery boundary unknown.
         // Keep the journal conservative for this actor generation rather than
         // checkpointing past an event that may need recovery delivery.
-        let mut checkpointable = self.replay_into(&mut translator, &mut sink, &ctx).await;
+        let mut checkpointable = self
+            .replay_into(&mut translator, &mut sink, &ctx, self.replay.as_ref())
+            .await;
+        if checkpointable && self.pause.lock().unwrap().is_some() {
+            let tip = self.replay.as_ref().map_or(0, |plan| plan.through);
+            let marker_cleared = self
+                .pause
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|pause| pause.marker_cleared);
+            if marker_cleared && self.flush_sink(&mut sink).await {
+                self.record_delivery_checkpoint(&mut sink, tip, &mut acknowledged_through)
+                    .await;
+                if acknowledged_through >= tip {
+                    let _ = crate::plugin_diagnostics::update_pipeline(
+                        &self.data_dir,
+                        &self.source,
+                        &self.session_id,
+                        &self.route,
+                        crate::plugin_diagnostics::PluginRecoveryState::Recovered,
+                        tip,
+                    );
+                    *self.pause.lock().unwrap() = None;
+                    *self.last_error.lock().unwrap() = None;
+                }
+            }
+        }
+        let mut last_event_through = self.replay.as_ref().map_or(0, |plan| plan.through);
+        let mut replayed_through = 0;
+        let mut retry_tick = tokio::time::interval(Duration::from_secs(1));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        while let Some(msg) = rx.recv().await {
+        loop {
+            let msg = tokio::select! {
+                msg = rx.recv() => match msg { Some(msg) => msg, None => break },
+                _ = retry_tick.tick(), if self.pause.lock().unwrap().is_some() => {
+                    let paused = self.pause.lock().unwrap().clone().expect("paused");
+                    let changed = crate::plugin_diagnostics::plugin_digest(&paused.path);
+                    if changed.is_none() || changed == paused.digest {
+                        continue;
+                    }
+                    if let Err(error) = crate::plugin_diagnostics::update_pipeline(
+                        &self.data_dir, &self.source, &self.session_id, &self.route,
+                        crate::plugin_diagnostics::PluginRecoveryState::Reprocessing,
+                        last_event_through,
+                    ) {
+                        self.set_error(format!("failed to record plugin recovery: {error}"));
+                    }
+                    let Ok(next_translator) = self.translators.create_checked_with_session_namespace(
+                        &self.source, &self.translator_session_id,
+                    ) else {
+                        self.set_error("plugin recovery could not create translator".into());
+                        continue;
+                    };
+                    let Ok(next_sink) = self.sink_factory.create(
+                        &self.session_id, &self.source, self.plugin_version.as_deref(),
+                    ) else {
+                        self.set_error("plugin recovery could not create sink".into());
+                        continue;
+                    };
+                    let mut next_sink: Box<dyn crate::sink::Sink> = Box::new(
+                        LedgerSink::new(next_sink, &self.data_dir, &self.source, &self.session_id,
+                            ctx.config.as_ref()).await,
+                    );
+                    if let Some(config) = &ctx.config { next_sink.configure(config); }
+                    let tip = self.journal.lock().await.position();
+                    let plan = ReplayPlan {
+                        journal_path: crate::journal::source_journal_path(
+                            &self.data_dir, &self.source, &self.session_id,
+                        ),
+                        through: tip,
+                        acknowledged_through,
+                    };
+                    let mut next_translator = next_translator;
+                    let replay_ok = self.replay_into(
+                        &mut next_translator, &mut next_sink, &ctx, Some(&plan),
+                    ).await;
+                    let flushed = replay_ok && self.checkpoint_and_flush(
+                        &mut next_translator, &mut next_sink, &ctx,
+                        Some((acknowledged_through, tip)),
+                    ).await;
+                    let stable = crate::plugin_diagnostics::plugin_digest(&paused.path) == changed;
+                    let marker_cleared = self.pause.lock().unwrap().as_ref()
+                        .is_some_and(|current| !current.marker_emitted || current.marker_cleared);
+                    if flushed && stable && marker_cleared {
+                        self.record_delivery_checkpoint(&mut next_sink, tip, &mut acknowledged_through).await;
+                        if acknowledged_through >= tip {
+                            let _ = crate::plugin_diagnostics::update_pipeline(
+                                &self.data_dir, &self.source, &self.session_id, &self.route,
+                                crate::plugin_diagnostics::PluginRecoveryState::Recovered, tip,
+                            );
+                            *self.pause.lock().unwrap() = None;
+                            *self.last_error.lock().unwrap() = None;
+                            translator = next_translator;
+                            sink = next_sink;
+                            checkpointable = true;
+                            pending_through = tip;
+                            replayed_through = tip;
+                            last_event_through = tip;
+                            continue;
+                        }
+                    }
+                    // A new plugin failure records its new digest. A sink
+                    // failure retains the old one so a later tick can retry.
+                    let _ = crate::plugin_diagnostics::update_pipeline(
+                        &self.data_dir, &self.source, &self.session_id, &self.route,
+                        crate::plugin_diagnostics::PluginRecoveryState::Paused, tip,
+                    );
+                    continue;
+                }
+            };
             match msg {
                 SessionMsg::Event(env, journal_through) => {
+                    if journal_through <= replayed_through || self.pause.lock().unwrap().is_some() {
+                        last_event_through = last_event_through.max(journal_through);
+                        self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                        if self.pause.lock().unwrap().is_some() {
+                            let _ = crate::plugin_diagnostics::update_pipeline(
+                                &self.data_dir,
+                                &self.source,
+                                &self.session_id,
+                                &self.route,
+                                crate::plugin_diagnostics::PluginRecoveryState::Paused,
+                                last_event_through,
+                            );
+                        }
+                        continue;
+                    }
+                    let event_start = last_event_through;
+                    let event_window = Some((event_start, journal_through));
+                    last_event_through = journal_through;
                     let correlation_barrier = is_tool_lifecycle_event(&env.event);
                     if let Some(cfg) = &env.config {
                         sink.configure(cfg);
@@ -591,6 +758,7 @@ impl SessionActor {
                             &ctx,
                             translated,
                             BatchMode::Live,
+                            event_window,
                         )
                         .await;
                     if correlation_changed || correlation_barrier {
@@ -606,6 +774,18 @@ impl SessionActor {
                         self.correlation_changed.notify_one();
                     }
                     self.counters.queued.fetch_sub(1, Ordering::Relaxed);
+                    if !delivered && checkpointable && self.pause.lock().unwrap().is_some() {
+                        // The current event may have emitted only some of its
+                        // bounded batches. Checkpoint strictly before it so
+                        // recovery delivers that event again, but does not
+                        // resend earlier accepted events.
+                        self.record_delivery_checkpoint(
+                            &mut sink,
+                            event_start,
+                            &mut acknowledged_through,
+                        )
+                        .await;
+                    }
                     if delivered && checkpointable {
                         pending_through = pending_through.max(journal_through);
                     } else {
@@ -622,8 +802,17 @@ impl SessionActor {
                     let _ = reply.send(());
                 }
                 SessionMsg::Flush(reply) => {
+                    if self.pause.lock().unwrap().is_some() {
+                        let _ = reply.send(self.counters.queued.load(Ordering::Relaxed).max(1));
+                        continue;
+                    }
                     checkpointable &= self
-                        .checkpoint_and_flush(&mut translator, &mut sink, &ctx)
+                        .checkpoint_and_flush(
+                            &mut translator,
+                            &mut sink,
+                            &ctx,
+                            Some((acknowledged_through, last_event_through)),
+                        )
                         .await;
                     if checkpointable {
                         self.record_delivery_checkpoint(
@@ -636,12 +825,17 @@ impl SessionActor {
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
                 SessionMsg::Finalize(reply) => {
+                    if self.pause.lock().unwrap().is_some() {
+                        let _ = reply.send(self.counters.queued.load(Ordering::Relaxed).max(1));
+                        continue;
+                    }
                     checkpointable &= self
                         .finalize_and_flush(
                             &mut translator,
                             &mut sink,
                             &ctx,
                             BatchMode::TerminalFinalize,
+                            Some((acknowledged_through, last_event_through)),
                         )
                         .await;
                     if checkpointable {
@@ -655,12 +849,17 @@ impl SessionActor {
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
                 SessionMsg::Shutdown(reply) => {
+                    if self.pause.lock().unwrap().is_some() {
+                        let _ = reply.send(());
+                        break;
+                    }
                     checkpointable &= self
                         .finalize_and_flush(
                             &mut translator,
                             &mut sink,
                             &ctx,
                             BatchMode::ShutdownFinalize,
+                            Some((acknowledged_through, last_event_through)),
                         )
                         .await;
                     if checkpointable {
@@ -688,6 +887,7 @@ impl SessionActor {
         ctx: &SessionCtx,
         first: anyhow::Result<Vec<crate::translate::SpanOp>>,
         mode: BatchMode,
+        event_window: Option<(u64, u64)>,
     ) -> (bool, bool) {
         let (translate_error, emit_error) = mode.errors();
         let mut next = match first {
@@ -725,56 +925,85 @@ impl SessionActor {
                         op,
                         &self.source,
                         &self.session_id,
+                        &self.correlation_key,
                     ) {
                         Ok(result) => {
                             if let Some(failure) = result.failure {
                                 delivered = false;
-                                if failure.newly_seen {
-                                    if let Err(error) = crate::plugin_diagnostics::record(
-                                        &self.data_dir,
-                                        &self.source,
-                                        &failure.path,
-                                        &failure.message,
-                                    ) {
-                                        tracing::warn!(
-                                            session_id = %self.session_id,
-                                            "failed to persist span plugin diagnostic: {error}"
-                                        );
-                                    }
-                                    self.set_error(format!(
-                                        "span plugin {} failed; span operations are being discarded: {}",
-                                        failure.path.display(),
-                                        failure.message
-                                    ));
-                                }
+                                self.record_plugin_failure(
+                                    sink,
+                                    op,
+                                    &failure.path,
+                                    &failure.message,
+                                    event_window,
+                                )
+                                .await;
+                                break;
                             }
-                            if let Some(op) = result.op {
-                                processed.push(op);
+                            if let Some(processed_op) = result.op {
+                                processed.push(processed_op);
                             }
                         }
                         Err(error) => {
                             delivered = false;
                             if let Some(plugin) = plugin_paths.first() {
-                                if let Err(diagnostic_error) = crate::plugin_diagnostics::record(
-                                    &self.data_dir,
-                                    &self.source,
+                                self.record_plugin_failure(
+                                    sink,
+                                    op,
                                     plugin,
                                     &error.to_string(),
-                                ) {
-                                    tracing::warn!(
-                                        session_id = %self.session_id,
-                                        "failed to persist span plugin diagnostic: {diagnostic_error}"
-                                    );
-                                }
+                                    event_window,
+                                )
+                                .await;
                             }
                             self.set_error(format!(
                                 "span plugin processor failed; span operation discarded: {error}"
                             ));
+                            break;
                         }
                     }
                 }
-                if !processed.is_empty() {
-                    match sink.emit(&processed).await {
+                if delivered && !processed.is_empty() {
+                    let paused = self.pause.lock().unwrap().clone();
+                    let recovery_span = paused.and_then(|pause| {
+                        event_window
+                            .filter(|(start, _)| *start >= pause.journal_start)
+                            .map(|_| pause.span_id)
+                    });
+                    let result = if let Some(recovery_span) = recovery_span {
+                        let mut emitted = 0;
+                        let mut result = Ok(());
+                        for op in &processed {
+                            let row = match op {
+                                crate::translate::SpanOp::Insert(row)
+                                | crate::translate::SpanOp::Merge(row) => row,
+                            };
+                            let replacing = row.span_id == recovery_span;
+                            let outcome = if replacing {
+                                sink.replace_plugin_marker(op).await
+                            } else {
+                                sink.emit(std::slice::from_ref(op)).await
+                            };
+                            match outcome {
+                                Ok(n) => {
+                                    emitted += n;
+                                    if replacing {
+                                        if let Some(paused) = self.pause.lock().unwrap().as_mut() {
+                                            paused.marker_cleared = true;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    result = Err(error);
+                                    break;
+                                }
+                            }
+                        }
+                        result.map(|()| emitted)
+                    } else {
+                        sink.emit(&processed).await
+                    };
+                    match result {
                         Ok(n) => {
                             self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
                         }
@@ -784,6 +1013,9 @@ impl SessionActor {
                         }
                     }
                 }
+            }
+            if !delivered && self.pause.lock().unwrap().is_some() {
+                break;
             }
             next = match translator.drain_pending(ctx) {
                 Ok(next) => next,
@@ -797,6 +1029,74 @@ impl SessionActor {
         (correlation_changed, delivered)
     }
 
+    async fn record_plugin_failure(
+        &self,
+        sink: &mut Box<dyn crate::sink::Sink>,
+        op: &crate::translate::SpanOp,
+        plugin: &std::path::Path,
+        message: &str,
+        event_window: Option<(u64, u64)>,
+    ) {
+        let (row, operation) = match op {
+            crate::translate::SpanOp::Insert(row) => (row, "insert"),
+            crate::translate::SpanOp::Merge(row) => (row, "merge"),
+        };
+        let (start, through) = event_window.unwrap_or((0, self.journal.lock().await.position()));
+        let marker = crate::translate::SpanOp::Merge(crate::translate::SpanRow {
+            span_id: row.span_id.clone(),
+            root_span_id: row.root_span_id.clone(),
+            parent_span_ids: row.parent_span_ids.clone(),
+            name: if row.name.is_empty() {
+                String::new()
+            } else {
+                "Plugin failure".into()
+            },
+            span_type: row.span_type,
+            start_ms: row.start_ms,
+            error: Some(format!("plugin failure: {}", plugin.display())),
+            ..Default::default()
+        });
+        let marker_emitted = match sink.emit_plugin_marker(&marker).await {
+            Ok(_) => sink.flush().await.is_ok(),
+            Err(error) => {
+                self.set_error(format!(
+                    "plugin failure marker could not be delivered: {error}"
+                ));
+                false
+            }
+        };
+        *self.pause.lock().unwrap() = Some(PluginPause {
+            path: plugin.to_path_buf(),
+            digest: crate::plugin_diagnostics::plugin_digest(plugin),
+            span_id: row.span_id.clone(),
+            journal_start: start,
+            marker_emitted,
+            marker_cleared: false,
+        });
+        if let Err(error) = crate::plugin_diagnostics::record_pipeline_failure(
+            &self.data_dir,
+            crate::plugin_diagnostics::PipelineFailure {
+                source: &self.source,
+                session_id: &self.session_id,
+                route: &self.route,
+                span_id: &row.span_id,
+                operation,
+                plugin_path: plugin,
+                exception: message,
+                journal_start: start,
+                journal_through: through,
+            },
+        ) {
+            self.set_error(format!("failed to persist span plugin diagnostic: {error}"));
+        }
+        self.set_error(format!(
+            "span plugin {} failed for span {}; session delivery paused: {}",
+            plugin.display(),
+            row.span_id,
+            message,
+        ));
+    }
+
     /// Stream the journal through the translator, emitting each entry's spans
     /// as they are produced. Nothing is accumulated across entries: peak
     /// memory is one journal entry and the ops it yields, so recovering a
@@ -806,8 +1106,9 @@ impl SessionActor {
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
+        plan: Option<&ReplayPlan>,
     ) -> bool {
-        let Some(plan) = &self.replay else {
+        let Some(plan) = plan else {
             return true;
         };
         let mut reader = match crate::journal::JournalReader::open(&plan.journal_path, plan.through)
@@ -821,6 +1122,7 @@ impl SessionActor {
             }
         };
         let mut delivered = true;
+        let mut before = 0;
         loop {
             let entry = match reader.next_record().await {
                 Ok(Some(entry)) => entry,
@@ -833,13 +1135,16 @@ impl SessionActor {
             };
             let entry_through = entry.through;
             let crate::journal::JournalRecord::Event(entry) = entry.record else {
+                before = entry_through;
                 continue;
             };
             let mut env = crate::journal::envelope_from_redacted(entry);
             let Some(canonical_source) = self.translators.canonical_source(&env.source) else {
+                before = entry_through;
                 continue;
             };
             if canonical_source != self.source {
+                before = entry_through;
                 continue;
             }
             env.source = self.source.clone();
@@ -855,10 +1160,21 @@ impl SessionActor {
                     .await;
             } else {
                 let (_, replayed) = self
-                    .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Replay)
+                    .emit_translator_batches(
+                        translator,
+                        sink,
+                        ctx,
+                        translated,
+                        BatchMode::Replay,
+                        Some((before, entry_through)),
+                    )
                     .await;
                 delivered &= replayed;
+                if self.pause.lock().unwrap().is_some() && !replayed {
+                    break;
+                }
             }
+            before = entry_through;
         }
         delivered
     }
@@ -904,10 +1220,18 @@ impl SessionActor {
         translator: &mut Box<dyn crate::translate::AgentTranslator>,
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
+        event_window: Option<(u64, u64)>,
     ) -> bool {
         let translated = translator.checkpoint(ctx);
         let (correlation_changed, delivered) = self
-            .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Checkpoint)
+            .emit_translator_batches(
+                translator,
+                sink,
+                ctx,
+                translated,
+                BatchMode::Checkpoint,
+                event_window,
+            )
             .await;
         self.persist_correlation_if_changed(correlation_changed)
             .await;
@@ -920,10 +1244,11 @@ impl SessionActor {
         sink: &mut Box<dyn crate::sink::Sink>,
         ctx: &SessionCtx,
         mode: BatchMode,
+        event_window: Option<(u64, u64)>,
     ) -> bool {
         let translated = translator.finalize(ctx);
         let (correlation_changed, delivered) = self
-            .emit_translator_batches(translator, sink, ctx, translated, mode)
+            .emit_translator_batches(translator, sink, ctx, translated, mode, event_window)
             .await;
         self.persist_correlation_if_changed(correlation_changed)
             .await;
@@ -1052,6 +1377,7 @@ mod tests {
             counters: Arc::new(Counters::default()),
             last_error: Arc::new(Mutex::new(None)),
             permalink: Arc::new(Mutex::new(None)),
+            pause: Arc::new(Mutex::new(None)),
             last_activity: Mutex::new(Instant::now()),
         };
         let envelope = |event| {

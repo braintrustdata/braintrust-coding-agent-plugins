@@ -185,6 +185,7 @@ impl Daemon {
             .filter(|(_, session)| {
                 session.idle_for() >= idle_timeout
                     && session.counters.queued.load(Ordering::Relaxed) == 0
+                    && !session.has_paused_plugin()
             })
             .filter(|(key, _)| !self.correlation.has_active_tools(&key.correlation_key()))
             .map(|(key, _)| key.clone())

@@ -38,6 +38,18 @@ pub trait Sink: Send {
     /// Emit span ops. Returns the number of rows written, for status counters.
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64>;
 
+    /// Emit daemon-owned, payload-free failure markers without running them
+    /// through user plugins or the completed-span suppression ledger.
+    async fn emit_plugin_marker(&mut self, op: &SpanOp) -> anyhow::Result<u64> {
+        self.emit(std::slice::from_ref(op)).await
+    }
+
+    /// Replace a temporary failure marker with the successfully transformed
+    /// operation, including an explicit clear of the marker's error field.
+    async fn replace_plugin_marker(&mut self, op: &SpanOp) -> anyhow::Result<u64> {
+        self.emit(std::slice::from_ref(op)).await
+    }
+
     /// Deliver everything buffered (bounded by the caller's flush timeout).
     async fn flush(&mut self) -> anyhow::Result<()>;
 

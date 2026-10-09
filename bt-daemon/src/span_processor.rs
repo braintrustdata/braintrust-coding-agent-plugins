@@ -13,11 +13,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const STACK_LIMIT_BYTES: usize = 512 * 1024;
-const CALL_TIMEOUT: Duration = Duration::from_millis(50);
+const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
@@ -40,7 +40,7 @@ struct PluginContext<'a> {
 
 struct Engine {
     modules: HashMap<PathBuf, CachedModule>,
-    failed_plugins: HashMap<PathBuf, FailedPlugin>,
+    failed_plugins: HashMap<(PathBuf, String), FailedPlugin>,
     env: BTreeMap<String, String>,
     context: Context,
     started: Instant,
@@ -50,8 +50,7 @@ struct Engine {
 }
 
 struct CachedModule {
-    modified: Option<SystemTime>,
-    len: u64,
+    digest: [u8; 32],
     function: Persistent<Function<'static>>,
 }
 
@@ -63,8 +62,7 @@ struct FailedPlugin {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PluginFingerprint {
-    modified: Option<SystemTime>,
-    len: u64,
+    digest: [u8; 32],
 }
 
 impl Engine {
@@ -93,18 +91,16 @@ impl Engine {
     }
 
     fn load(&mut self, path: &Path) -> anyhow::Result<Persistent<Function<'static>>> {
-        let metadata = std::fs::metadata(path)
-            .map_err(|error| anyhow::anyhow!("failed to inspect {}: {error}", path.display()))?;
-        let modified = metadata.modified().ok();
+        let source = std::fs::read(path)
+            .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+        let hash = Sha256::digest(&source);
+        let digest: [u8; 32] = hash.into();
         if let Some(module) = self.modules.get(path) {
-            if module.modified == modified && module.len == metadata.len() {
+            if module.digest == digest {
                 return Ok(module.function.clone());
             }
         }
-        let source = std::fs::read(path)
-            .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
-        let digest = Sha256::digest(&source);
-        let name = format!("bt-span-plugin:{digest:x}");
+        let name = format!("bt-span-plugin:{hash:x}");
         self.arm_deadline();
         let function = self.context.with(|ctx| -> anyhow::Result<_> {
             let (module, promise) = Module::declare(ctx.clone(), name, source)
@@ -128,8 +124,7 @@ impl Engine {
         self.modules.insert(
             path.to_path_buf(),
             CachedModule {
-                modified,
-                len: metadata.len(),
+                digest,
                 function: function.clone(),
             },
         );
@@ -203,6 +198,7 @@ pub fn process(
     op: &SpanOp,
     source: &str,
     session_id: &str,
+    pipeline_id: &str,
 ) -> anyhow::Result<ProcessResult> {
     if plugins.is_empty() {
         return Ok(ProcessResult {
@@ -226,7 +222,8 @@ pub fn process(
         }
         let engine = slot.as_mut().expect("engine initialized");
         for plugin in plugins {
-            if let Some(failed) = engine.failed_plugins.get(plugin).cloned() {
+            let key = (plugin.clone(), pipeline_id.to_owned());
+            if let Some(failed) = engine.failed_plugins.get(&key).cloned() {
                 if failed.fingerprint == plugin_fingerprint(plugin) {
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
@@ -235,7 +232,7 @@ pub fn process(
                     });
                     break;
                 }
-                engine.failed_plugins.remove(plugin);
+                engine.failed_plugins.remove(&key);
             }
             let candidate = engine.call(plugin, &row, operation, source, session_id);
             let mut candidate = match candidate {
@@ -256,7 +253,7 @@ pub fn process(
                     let message = "changed immutable span identity fields".to_owned();
                     engine
                         .failed_plugins
-                        .insert(plugin.clone(), failed_plugin(plugin, &message));
+                        .insert(key.clone(), failed_plugin(plugin, &message));
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
                         message,
@@ -268,7 +265,7 @@ pub fn process(
                     let message = error.to_string();
                     engine
                         .failed_plugins
-                        .insert(plugin.clone(), failed_plugin(plugin, &message));
+                        .insert(key, failed_plugin(plugin, &message));
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
                         message,
@@ -300,10 +297,9 @@ fn failed_plugin(path: &Path, message: &str) -> FailedPlugin {
 }
 
 fn plugin_fingerprint(path: &Path) -> Option<PluginFingerprint> {
-    let metadata = std::fs::metadata(path).ok()?;
+    let bytes = std::fs::read(path).ok()?;
     Some(PluginFingerprint {
-        modified: metadata.modified().ok(),
-        len: metadata.len(),
+        digest: Sha256::digest(bytes).into(),
     })
 }
 
@@ -365,7 +361,14 @@ mod tests {
             "export default span => ({...span, metadata: {second: true}})",
         )
         .unwrap();
-        let result = process(&[first, second], &SpanOp::Insert(row()), "codex", "session").unwrap();
+        let result = process(
+            &[first, second],
+            &SpanOp::Insert(row()),
+            "codex",
+            "session",
+            "route",
+        )
+        .unwrap();
         assert!(result.failure.is_none());
         let Some(SpanOp::Insert(processed)) = result.op else {
             panic!("expected insert")
@@ -386,7 +389,14 @@ mod tests {
             "export default span => ({...span, span_id: 'different'})",
         )
         .unwrap();
-        let result = process(&[plugin], &SpanOp::Insert(row()), "codex", "session").unwrap();
+        let result = process(
+            &[plugin],
+            &SpanOp::Insert(row()),
+            "codex",
+            "session",
+            "route",
+        )
+        .unwrap();
         assert!(result
             .failure
             .as_ref()
@@ -402,10 +412,17 @@ mod tests {
         let runaway = dir.path().join("runaway.mjs");
         std::fs::write(&runaway, "export default span => { while (true) {} }").unwrap();
         let started = Instant::now();
-        let result = process(&[runaway], &SpanOp::Insert(row()), "codex", "session").unwrap();
+        let result = process(
+            &[runaway],
+            &SpanOp::Insert(row()),
+            "codex",
+            "session",
+            "route",
+        )
+        .unwrap();
         assert!(result.failure.is_some());
         assert!(result.op.is_none());
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
 
         let asynchronous = dir.path().join("async.mjs");
         std::fs::write(
@@ -413,7 +430,14 @@ mod tests {
             "export default async span => ({...span, name: 'later'})",
         )
         .unwrap();
-        let result = process(&[asynchronous], &SpanOp::Insert(row()), "codex", "session").unwrap();
+        let result = process(
+            &[asynchronous],
+            &SpanOp::Insert(row()),
+            "codex",
+            "session",
+            "route",
+        )
+        .unwrap();
         assert!(result
             .failure
             .as_ref()
@@ -423,9 +447,56 @@ mod tests {
 
         let non_json = dir.path().join("non-json.mjs");
         std::fs::write(&non_json, "export default () => Symbol('not-json')").unwrap();
-        let result = process(&[non_json], &SpanOp::Insert(row()), "codex", "session").unwrap();
+        let result = process(
+            &[non_json],
+            &SpanOp::Insert(row()),
+            "codex",
+            "session",
+            "route",
+        )
+        .unwrap();
         assert!(result.failure.is_some());
         assert!(result.op.is_none());
+    }
+
+    #[test]
+    fn redacts_a_large_span_within_the_plugin_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("redact.mjs");
+        std::fs::write(
+            &plugin,
+            r#"const secret = /\bsk-[A-Za-z0-9_-]{16,}/g;
+function redact(value) {
+  if (typeof value === 'string') return value.replace(secret, '[REDACTED]');
+  if (Array.isArray(value)) return value.map(redact);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, redact(child)]));
+  }
+  return value;
+}
+export default span => ({...span, input: redact(span.input), output: redact(span.output), metadata: redact(span.metadata)});"#,
+        )
+        .unwrap();
+        let secret = "sk-abcdefghijklmnop";
+        let mut large_row = row();
+        large_row.input = Some(serde_json::json!({"messages": ["x".repeat(1024 * 1024), secret]}));
+        let result = process(
+            &[plugin],
+            &SpanOp::Insert(large_row),
+            "claude",
+            "session",
+            "route",
+        )
+        .unwrap();
+        assert!(
+            result.failure.is_none(),
+            "plugin failed: {:?}",
+            result.failure
+        );
+        let Some(SpanOp::Insert(processed)) = result.op else {
+            panic!("expected insert")
+        };
+        assert_eq!(processed.input.unwrap()["messages"][1], "[REDACTED]");
     }
 
     #[test]
@@ -451,14 +522,28 @@ mod tests {
         .unwrap();
         let plugins = [first, broken.clone(), last];
 
-        let first_result = process(&plugins, &SpanOp::Insert(row()), "codex", "session").unwrap();
+        let first_result = process(
+            &plugins,
+            &SpanOp::Insert(row()),
+            "codex",
+            "session",
+            "route",
+        )
+        .unwrap();
         let first_failure = first_result.failure.unwrap();
         assert_eq!(first_failure.path, broken);
         assert!(first_failure.newly_seen);
         assert!(first_failure.message.contains("Error: broken"));
         assert!(first_result.op.is_none());
 
-        let second_result = process(&plugins, &SpanOp::Insert(row()), "codex", "session").unwrap();
+        let second_result = process(
+            &plugins,
+            &SpanOp::Insert(row()),
+            "codex",
+            "session",
+            "route",
+        )
+        .unwrap();
         let second_failure = second_result.failure.unwrap();
         assert_eq!(second_failure.path, broken);
         assert!(!second_failure.newly_seen);
