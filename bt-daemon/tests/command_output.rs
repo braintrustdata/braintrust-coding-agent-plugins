@@ -52,7 +52,7 @@ fn standalone_hook_exit_status_distinguishes_capture_failures_from_disabled_trac
         let mut child = Command::new(env!("CARGO_BIN_EXE_bt-daemon"))
             .args(["hook", "--source", "codex", "--no-spawn", "--socket"])
             .arg(&socket)
-            .env("BT_DAEMON_CONFIG", &config)
+            .env("BRAINTRUST_DAEMON_CONFIG", &config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -98,4 +98,50 @@ fn standalone_hook_exit_status_distinguishes_capture_failures_from_disabled_trac
         hook(r#"{"session_id":"test","hook_event_name":"SessionStart"}"#),
         "trace destination is not configured",
     );
+}
+
+#[test]
+fn standalone_hook_honors_deprecated_bt_env_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let old_config = temp.path().join("old.json");
+    let new_config = temp.path().join("new.json");
+    std::fs::write(&old_config, r#"{"trace_to_braintrust":false}"#).unwrap();
+    #[cfg(unix)]
+    let socket = temp.path().join("missing.sock");
+    #[cfg(windows)]
+    let socket = std::path::PathBuf::from(format!(
+        r"\\.\pipe\missing-bt-daemon-{}",
+        uuid::Uuid::new_v4()
+    ));
+
+    let hook = |env: &[(&str, &std::path::Path)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bt-daemon"));
+        command
+            .args(["hook", "--source", "codex", "--no-spawn", "--socket"])
+            .arg(&socket)
+            .env("HOME", temp.path())
+            .env("USERPROFILE", temp.path())
+            .env_remove("BT_DAEMON_CONFIG")
+            .env_remove("BRAINTRUST_DAEMON_CONFIG")
+            .stdin(Stdio::null());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.output().unwrap()
+    };
+
+    // The deprecated name alone still selects the settings file, silently.
+    let output = hook(&[("BT_DAEMON_CONFIG", &old_config)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+
+    // The canonical name wins when both are set.
+    let output = hook(&[
+        ("BT_DAEMON_CONFIG", &old_config),
+        ("BRAINTRUST_DAEMON_CONFIG", &new_config),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("new.json"), "stderr: {stderr}");
 }

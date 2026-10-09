@@ -17,7 +17,7 @@ use crate::client::{flush_managed_run_in, shutdown_daemon};
 use crate::hook::MANAGED_RUN_ID_ENV;
 use crate::route::resolve_span_plugin_paths;
 use crate::wire::{self, SessionRoute};
-use crate::{paths, settings, subprocess};
+use crate::{env, paths, settings, subprocess};
 
 const MANAGED_RUN_FLUSH_TIMEOUT_MS: u64 = 10_000;
 
@@ -94,7 +94,7 @@ pub async fn run_traced(
     // Only create our own boundary when environment auth would otherwise use
     // the ambient shared daemon.
     let isolate_daemon = route.auth.effective_source() == wire::AuthSource::Environment
-        && std::env::var_os(paths::SOCKET_ENV).is_none();
+        && env::var_os(paths::SOCKET_ENV).is_none();
     let isolated_runtime = isolate_daemon
         .then(|| ManagedRunRuntime::new(&managed_run_id))
         .transpose()?;
@@ -107,9 +107,8 @@ pub async fn run_traced(
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
     if let Some(runtime) = &isolated_runtime {
-        command
-            .env(paths::SOCKET_ENV, &runtime.socket)
-            .env(paths::DATA_DIR_ENV, runtime.temp_dir.path());
+        env::set_with_alias(&mut command, paths::SOCKET_ENV, &runtime.socket);
+        env::set_with_alias(&mut command, paths::DATA_DIR_ENV, runtime.temp_dir.path());
     }
     command.envs(injection.env);
     let _guards = injection.guards;

@@ -2488,7 +2488,7 @@ esac
     .unwrap();
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let _socket = EnvVarGuard::set("BT_DAEMON_SOCKET", &socket);
+    let _socket = EnvVarGuard::set("BRAINTRUST_DAEMON_SOCKET", &socket);
     let _agent = EnvVarGuard::set("CODEX_BIN", &agent);
     let _daemon = EnvVarGuard::set("BT_DAEMON_TEST_BIN", env!("CARGO_BIN_EXE_bt-daemon"));
     let route = || SessionRoute {
@@ -2694,7 +2694,7 @@ async fn invoke_grok_hook(
             "transcriptPath",
             "--no-spawn",
         ])
-        .env("BT_DAEMON_SOCKET", socket)
+        .env("BRAINTRUST_DAEMON_SOCKET", socket)
         .env(
             "BT_TRACE_INVOCATION_SETTINGS",
             invocation_settings.to_string(),

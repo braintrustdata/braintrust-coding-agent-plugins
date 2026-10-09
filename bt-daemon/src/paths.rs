@@ -5,18 +5,18 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Env override for the socket path (also settable via `--socket`).
-pub const SOCKET_ENV: &str = "BT_DAEMON_SOCKET";
+pub const SOCKET_ENV: &str = "BRAINTRUST_DAEMON_SOCKET";
 /// Env override for the data/journal directory.
-pub const DATA_DIR_ENV: &str = "BT_DAEMON_DATA_DIR";
+pub const DATA_DIR_ENV: &str = "BRAINTRUST_DAEMON_DATA_DIR";
 /// Env override for the current agent's non-credential tracing settings file.
-pub const SETTINGS_ENV: &str = "BT_DAEMON_CONFIG";
+pub const SETTINGS_ENV: &str = "BRAINTRUST_DAEMON_CONFIG";
 /// Env override for Antigravity's native configuration directory. Primarily
 /// useful for isolated validation and managed environments.
-pub const ANTIGRAVITY_CONFIG_DIR_ENV: &str = "BT_ANTIGRAVITY_CONFIG_DIR";
+pub const ANTIGRAVITY_CONFIG_DIR_ENV: &str = "BRAINTRUST_ANTIGRAVITY_CONFIG_DIR";
 /// Env override for Cursor's per-user local plugin directory.
-pub const CURSOR_PLUGIN_DIR_ENV: &str = "BT_CURSOR_PLUGIN_DIR";
+pub const CURSOR_PLUGIN_DIR_ENV: &str = "BRAINTRUST_CURSOR_PLUGIN_DIR";
 /// Env override for Cursor's per-user configuration directory.
-pub const CURSOR_CONFIG_DIR_ENV: &str = "BT_CURSOR_CONFIG_DIR";
+pub const CURSOR_CONFIG_DIR_ENV: &str = "BRAINTRUST_CURSOR_CONFIG_DIR";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -25,13 +25,13 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Resolve the socket path: explicit `override` → `$BT_DAEMON_SOCKET` →
+/// Resolve the socket path: explicit `override` → `$BRAINTRUST_DAEMON_SOCKET` →
 /// `$XDG_RUNTIME_DIR/braintrust/daemon.sock` → `~/.braintrust/run/daemon.sock`.
 pub fn socket_path(explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
     }
-    if let Some(p) = std::env::var_os(SOCKET_ENV) {
+    if let Some(p) = crate::env::var_os(SOCKET_ENV) {
         return PathBuf::from(p);
     }
     #[cfg(windows)]
@@ -65,13 +65,13 @@ fn windows_pipe_name(domain: &str, user: &str) -> String {
     format!(r"\\.\pipe\braintrust-bt-daemon-{suffix}")
 }
 
-/// Resolve the data dir: explicit `override` → `$BT_DAEMON_DATA_DIR` →
+/// Resolve the data dir: explicit `override` → `$BRAINTRUST_DAEMON_DATA_DIR` →
 /// `$XDG_STATE_HOME/braintrust/bt-daemon` → `~/.braintrust/state/bt-daemon`.
 pub fn data_dir(explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
     }
-    if let Some(p) = std::env::var_os(DATA_DIR_ENV) {
+    if let Some(p) = crate::env::var_os(DATA_DIR_ENV) {
         return PathBuf::from(p);
     }
     #[cfg(windows)]
@@ -91,14 +91,14 @@ pub fn data_dir(explicit: Option<&Path>) -> PathBuf {
 
 /// Resolve one coding agent's persistent tracing settings file.
 ///
-/// An explicit override and `$BT_DAEMON_CONFIG` remain useful for isolated
-/// tests and managed environments. Normal setup keeps every agent independent
+/// An explicit override and `$BRAINTRUST_DAEMON_CONFIG` remain useful for
+/// isolated tests and managed environments. Normal setup keeps every agent independent
 /// by writing into that agent's native configuration directory.
 pub fn agent_settings_path(source: &str, explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    if let Some(path) = std::env::var_os(SETTINGS_ENV) {
+    if let Some(path) = crate::env::var_os(SETTINGS_ENV) {
         return PathBuf::from(path);
     }
     match source {
@@ -141,7 +141,7 @@ fn claude_config_dir_from(config_dir: Option<&OsStr>, home: &Path) -> PathBuf {
 
 /// Resolve Antigravity's native configuration directory.
 pub(crate) fn antigravity_config_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os(ANTIGRAVITY_CONFIG_DIR_ENV) {
+    if let Some(path) = crate::env::var_os(ANTIGRAVITY_CONFIG_DIR_ENV) {
         if !path.is_empty() {
             return PathBuf::from(path);
         }
@@ -151,7 +151,7 @@ pub(crate) fn antigravity_config_dir() -> PathBuf {
 
 /// Resolve Cursor's per-user local plugin directory for the tracing plugin.
 pub(crate) fn cursor_plugin_dir() -> PathBuf {
-    std::env::var_os(CURSOR_PLUGIN_DIR_ENV)
+    crate::env::var_os(CURSOR_PLUGIN_DIR_ENV)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".cursor").join("plugins").join("local"))
@@ -160,7 +160,7 @@ pub(crate) fn cursor_plugin_dir() -> PathBuf {
 
 /// Resolve Cursor's per-user configuration directory.
 pub(crate) fn cursor_config_dir() -> PathBuf {
-    std::env::var_os(CURSOR_CONFIG_DIR_ENV)
+    crate::env::var_os(CURSOR_CONFIG_DIR_ENV)
         .or_else(|| std::env::var_os("CURSOR_CONFIG_DIR"))
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)

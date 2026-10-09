@@ -90,14 +90,14 @@ case "$(uname -s)" in
     DAEMON_BIN="$DAEMON_BIN.exe"
     NATIVE_DIR="$(cygpath -m "$RUN_DIR")"
     export MSYS2_ARG_CONV_EXCL='*'
-    export MSYS2_ENV_CONV_EXCL='BT_DAEMON_SOCKET;BT_DAEMON_DATA_DIR;BT_DAEMON_CONFIG'
-    export BT_DAEMON_SOCKET="\\\\.\\pipe\\braintrust-bt-local-${RUN_DIR##*/}-$$"
+    export MSYS2_ENV_CONV_EXCL='BRAINTRUST_DAEMON_SOCKET;BRAINTRUST_DAEMON_DATA_DIR;BRAINTRUST_DAEMON_CONFIG'
+    export BRAINTRUST_DAEMON_SOCKET="\\\\.\\pipe\\braintrust-bt-local-${RUN_DIR##*/}-$$"
     ;;
-  *) export BT_DAEMON_SOCKET="$RUN_DIR/daemon.sock" ;;
+  *) export BRAINTRUST_DAEMON_SOCKET="$RUN_DIR/daemon.sock" ;;
 esac
 [[ -x "$DAEMON_BIN" ]] || fail "built daemon not found at $DAEMON_BIN; use a native CARGO_BUILD_TARGET"
-export BT_DAEMON_DATA_DIR="$NATIVE_DIR/state"
-export BT_DAEMON_CONFIG="$NATIVE_DIR/braintrust.json"
+export BRAINTRUST_DAEMON_DATA_DIR="$NATIVE_DIR/state"
+export BRAINTRUST_DAEMON_CONFIG="$NATIVE_DIR/braintrust.json"
 # This runner uses environment auth and an explicit project, never saved routes.
 unset BRAINTRUST_PROFILE BRAINTRUST_DESTINATION
 
@@ -121,7 +121,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-DAEMON_ARGS=(serve --socket "$BT_DAEMON_SOCKET" --data-dir "$BT_DAEMON_DATA_DIR" --idle-timeout-secs 0)
+DAEMON_ARGS=(serve --socket "$BRAINTRUST_DAEMON_SOCKET" --data-dir "$BRAINTRUST_DAEMON_DATA_DIR" --idle-timeout-secs 0)
 if [[ "$UPLOAD" == false ]]; then
   DAEMON_ARGS+=(--debug-sink)
 fi
@@ -130,7 +130,7 @@ DAEMON_PID=$!
 READY=false
 for ((attempt = 0; attempt < 100; attempt++)); do
   kill -0 "$DAEMON_PID" 2>/dev/null || { cat "$RUN_DIR/daemon.log" >&2; fail 'daemon exited during startup'; }
-  STATUS="$("$DAEMON_BIN" status --socket "$BT_DAEMON_SOCKET" --json 2>/dev/null || true)"
+  STATUS="$("$DAEMON_BIN" status --socket "$BRAINTRUST_DAEMON_SOCKET" --json 2>/dev/null || true)"
   if [[ "$STATUS" == *'"running":true'* ]]; then
     READY=true
     break

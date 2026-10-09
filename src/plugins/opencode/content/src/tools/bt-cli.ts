@@ -26,7 +26,8 @@ export interface ToolLogData {
 export type BtCliRunner = (args: string[]) => Promise<string>;
 
 async function defaultRunner(args: string[]): Promise<string> {
-  const executable = process.env.BT_EXECUTABLE || "bt";
+  // BT_EXECUTABLE is the deprecated name of BRAINTRUST_BT_BIN.
+  const executable = process.env.BRAINTRUST_BT_BIN || process.env.BT_EXECUTABLE || "bt";
   try {
     const { stdout } = await execFileBackground(executable, args, {
       encoding: "utf8",
