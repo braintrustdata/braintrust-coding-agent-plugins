@@ -1063,7 +1063,7 @@ fn synthetic_usage_without_verified_prompt_generation_stays_unavailable() {
 }
 
 #[test]
-fn synthetic_subagents_parent_to_spawning_turn_and_unmatched_stop_stays_incomplete() {
+fn synthetic_subagents_parent_to_spawning_tool_and_unmatched_stop_stays_incomplete() {
     let mut h = Harness::new("test-session");
     h.handle(&event(
         "beforeSubmitPrompt",
@@ -1075,13 +1075,20 @@ fn synthetic_subagents_parent_to_spawning_turn_and_unmatched_stop_stays_incomple
         110,
         json!({"tool_name":"Task","tool_use_id":"spawn","tool_input":{"task":"explore"}}),
     ));
-    for (ts, id) in [(120, "child-a"), (130, "child-b")] {
-        h.handle(&event("subagentStart", ts, json!({"subagent_id":id,"tool_call_id":"spawn","subagent_type":"explore","subagent_model":"auto","task":"explore"})));
-    }
+    h.handle(&event(
+        "subagentStart",
+        120,
+        json!({"subagent_id":"child-a","tool_call_id":"spawn","subagent_type":"explore","subagent_model":"auto","task":"inspect the code"}),
+    ));
+    h.handle(&event(
+        "subagentStart",
+        130,
+        json!({"subagent_id":"child-b","tool_call_id":"spawn","subagent_type":"explore","subagent_model":"auto","task":"explore"}),
+    ));
     h.handle(&event(
         "subagentStop",
         140,
-        json!({"subagent_id":"child-a","subagent_type":"explore","status":"completed","summary":"available summary"}),
+        json!({"subagent_id":"child-a","subagent_type":"explore","status":"completed","summary":"found the issue"}),
     ));
     h.handle(&event(
         "sessionEnd",
@@ -1096,21 +1103,28 @@ fn synthetic_subagents_parent_to_spawning_turn_and_unmatched_stop_stays_incomple
         .collect();
     assert_eq!(children.len(), 2);
     let rows = h.rows();
+    let spawn_tool_id = h
+        .inserted(SpanType::Tool)
+        .into_iter()
+        .find(|row| row.name == "Task")
+        .unwrap()
+        .span_id
+        .clone();
     for child in children {
-        assert_eq!(child.parent_span_ids, vec![h.turns()[0].span_id.clone()]);
-        assert!(child
-            .metadata
-            .as_ref()
-            .unwrap()
-            .get("spawning_tool_call_id")
-            .is_none());
+        assert_eq!(child.parent_span_ids, vec![spawn_tool_id.clone()]);
+        assert_eq!(
+            child.metadata.as_ref().unwrap()["spawning_tool_call_id"],
+            "spawn"
+        );
         assert_eq!(
             child.metadata.as_ref().unwrap()["recursive_activity_verified"],
             false
         );
         let row = &rows[&child.span_id];
         if child.start_ms == Some(120) {
-            assert_eq!(row["output"], "available summary");
+            assert_eq!(row["end_ms"], 140);
+            assert_eq!(child.input, Some(json!("inspect the code")));
+            assert_eq!(row["output"], "found the issue");
             assert_eq!(row["metadata"]["status"], "completed");
         } else {
             assert!(row.get("output").is_none());

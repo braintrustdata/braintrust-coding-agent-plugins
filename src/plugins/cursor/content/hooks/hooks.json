@@ -36,6 +36,13 @@
         "failClosed": false
       }
     ],
+    "subagentStart": [
+      {
+        "command": "bt trace hook --source cursor --event subagentStart --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",
+        "timeout": 10,
+        "failClosed": false
+      }
+    ],
     "subagentStop": [
       {
         "command": "bt trace hook --source cursor --event subagentStop --session-id-field conversation_id --event-field hook_event_name --transcript-path-field transcript_path --flush-on-turn-end --capture-timeout-ms 8000",

@@ -44,7 +44,7 @@ config = json.loads((root / manifest['hooks']).read_text())
 assert config['version'] == 1
 expected = {
     'sessionStart', 'sessionEnd', 'beforeSubmitPrompt',
-    'postToolUse', 'postToolUseFailure', 'subagentStop',
+    'postToolUse', 'postToolUseFailure', 'subagentStart', 'subagentStop',
     'afterShellExecution', 'afterMCPExecution', 'afterFileEdit', 'preCompact',
     'stop', 'afterAgentResponse',
 }

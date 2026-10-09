@@ -56,6 +56,8 @@ const CURSOR_METADATA_FIELDS: &[&str] = &[
     "is_interrupt",
     "tool_approval",
     "subagent_type",
+    "subagent_id",
+    "spawning_tool_call_id",
     "recursive_activity_verified",
     "observation_only",
     "completion_observed",
@@ -1131,7 +1133,7 @@ impl CursorTranslator {
         let spawn = hook.tool_call_id.as_deref();
         let parent = spawn
             .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
-            .map(|t| t.turn.clone())
+            .map(|t| t.row.span_id.clone())
             .unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
         let mut row = self.row(
             ids::span_id(&self.namespace, &format!("subagent:{id}")),
