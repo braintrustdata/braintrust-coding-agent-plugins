@@ -1143,10 +1143,14 @@ impl CursorTranslator {
         }
         self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
         let spawn = hook.tool_call_id.as_deref();
-        let Some(parent) = spawn
+        let Some((parent, turn)) = spawn
             .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
-            .map(|t| t.row.span_id.clone())
-            .or_else(|| self.turn.as_ref().map(|turn| turn.id.clone()))
+            .map(|t| (t.row.span_id.clone(), t.turn.clone()))
+            .or_else(|| {
+                self.turn
+                    .as_ref()
+                    .map(|turn| (turn.id.clone(), turn.id.clone()))
+            })
         else {
             return;
         };
@@ -1156,6 +1160,7 @@ impl CursorTranslator {
             "Cursor subagent",
             SpanType::Task,
         );
+        row.turn_span_id = Some(turn);
         row.start_ms = Some(e.ts_ms);
         row.input = Some(json!(hook.task));
         row.metadata = Some(

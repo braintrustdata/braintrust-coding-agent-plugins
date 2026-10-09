@@ -22,6 +22,7 @@ printf '%s\\n' "$*" >> "$CAPTURE_DIR/args"
 /bin/cat > "$CAPTURE_DIR/payload"
 case " $* " in
   *" --event beforeSubmitPrompt "*) printf '%s\\n' '{"continue":true}' ;;
+  *" --event preToolUse "*|*" --event subagentStart "*) printf '%s\\n' '{"permission":"allow"}' ;;
   *) printf '%s\\n' '{}' ;;
 esac
 exit "${BT_EXIT_CODE:-0}"
@@ -39,8 +40,11 @@ exit "${BT_EXIT_CODE:-0}"
                                     input=payload, env=environment,
                                     capture_output=True, executable='/bin/sh')
             assert result.returncode == int(exit_code), (event, result.returncode)
-            expected_output = (b'{"continue":true}\n' if event == 'beforeSubmitPrompt'
-                               else b'{}\n')
+            expected_output = {
+                'beforeSubmitPrompt': b'{"continue":true}\n',
+                'preToolUse': b'{"permission":"allow"}\n',
+                'subagentStart': b'{"permission":"allow"}\n',
+            }.get(event, b'{}\n')
             assert result.stdout == expected_output, (event, result.stdout)
             assert (root / 'payload').read_bytes() == payload
             args = (root / 'args').read_text().splitlines()[-1]
@@ -51,6 +55,16 @@ exit "${BT_EXIT_CODE:-0}"
                             '--capture-timeout-ms 8000'), args
             assert registration['failClosed'] is False
             assert registration['timeout'] * 1000 > 8000
+    for event, expected in (
+        ('beforeSubmitPrompt', b'{"continue":true}\n'),
+        ('preToolUse', b'{"permission":"allow"}\n'),
+        ('subagentStart', b'{"permission":"allow"}\n'),
+    ):
+        result = subprocess.run([str(source / 'hooks/trace.sh'), event],
+                                input=payload, env=environment,
+                                capture_output=True)
+        assert result.returncode == 0, (event, result.returncode)
+        assert result.stdout == expected, (event, result.stdout)
     fake_bt.unlink()
     for event, registrations in config['hooks'].items():
         result = subprocess.run(registrations[0]['command'], shell=True,
