@@ -143,6 +143,8 @@ jobs:
 
             Production destination: `${{ steps.vars.outputs.dist_repo }}`.
 
+            Cursor releases also publish `braintrustdata.braintrust` to Open VSX using trusted publishing.
+
             Human approval and merge into `main` authorize tagging the merge commit and publishing this version to the production destination. This preparation does not tag or deploy anything.
 
       - name: Summarize release pull request
@@ -245,3 +247,56 @@ jobs:
       dist_repo: ${{ needs.resolve.outputs.dist_repo }}
       record: true
     secrets: inherit
+
+  publish-cursor-openvsx:
+    name: Publish Cursor extension to Open VSX
+    needs: [resolve, release]
+    if: needs.resolve.outputs.plugin == 'cursor'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: openvsx-cursor
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: cursor-openvsx
+      cancel-in-progress: false
+    steps:
+      - name: Checkout approved release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/plugins/cursor/content/package-lock.json
+
+      - name: Build and validate Cursor distribution
+        run: make validate-cursor
+
+      - name: Package approved extension
+        working-directory: dist/cursor
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e 'if (require("./package.json").version !== process.env.RELEASE_VERSION) throw new Error("Extension version does not match the approved release")'
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run package -- --out "$RUNNER_TEMP/braintrust-cursor.vsix"
+
+      - name: Save extension package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: braintrust-cursor-${{ needs.resolve.outputs.version }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/braintrust-cursor.vsix
+          if-no-files-found: error
+
+      # Register this monorepo + release.yml + openvsx-cursor in Open VSX.
+      # Keep the registry job outside _release.yml so sandbox runs cannot publish.
+      - name: Publish with Open VSX trusted publishing
+        working-directory: dist/cursor
+        run: npm run publish:openvsx -- "$RUNNER_TEMP/braintrust-cursor.vsix" --trusted-publishing
