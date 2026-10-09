@@ -100,9 +100,8 @@ fn powershell_encoded_command(script: &str) -> String {
     )
 }
 
-/// The process that registered a managed entry, from its marker.
-fn managed_process_identity(command: &str) -> Option<ProcessIdentity> {
-    let decoded = command
+fn decode_powershell_command(command: &str) -> Option<String> {
+    command
         .strip_prefix("powershell.exe -NoProfile -EncodedCommand ")
         .and_then(|encoded| {
             use base64::Engine;
@@ -118,7 +117,21 @@ fn managed_process_identity(command: &str) -> Option<ProcessIdentity> {
                 .map(|pair| u16::from_le_bytes(*pair))
                 .collect::<Vec<_>>();
             String::from_utf16(&words).ok()
-        });
+        })
+}
+
+/// Persistent ownership survives changes to the generated command or event set.
+fn is_persistent_command(command: &str) -> bool {
+    let decoded = decode_powershell_command(command);
+    let command = decoded.as_deref().unwrap_or(command);
+    command
+        .rsplit_once('#')
+        .is_some_and(|(_, marker)| matches!(marker.trim(), CAPTURE_MARKER | PERSISTENT_MARKER))
+}
+
+/// The process that registered a managed entry, from its marker.
+fn managed_process_identity(command: &str) -> Option<ProcessIdentity> {
+    let decoded = decode_powershell_command(command);
     let command = decoded.as_deref().unwrap_or(command);
     let marker = command.split(MANAGED_MARKER_PREFIX).nth(1)?;
     let mut parts = marker.splitn(3, '-');
@@ -157,7 +170,8 @@ fn hook_entry(command: &str) -> Value {
 }
 
 /// Add (`enable`) or remove the entries for `specs`, preserving every other
-/// hook. Adding replaces an existing entry with the same command.
+/// hook. Persistent entries are replaced by ownership marker; managed entries
+/// are replaced by exact command.
 fn apply_specs(
     config: &mut Map<String, Value>,
     path: &Path,
@@ -181,12 +195,13 @@ fn apply_specs(
 
         let persistent = specs == persistent_specs();
         if persistent {
-            for (event, command) in self::specs(PERSISTENT_MARKER, cfg!(windows)) {
-                if let Some(entries) = hooks.get_mut(&event).and_then(Value::as_array_mut) {
-                    entries.retain(|entry| {
-                        entry.get("command").and_then(Value::as_str) != Some(command.as_str())
-                    });
-                }
+            for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
+                entries.retain(|entry| {
+                    !entry
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_persistent_command)
+                });
             }
         }
 
@@ -296,43 +311,71 @@ mod tests {
     use crate::setup::common::write_object_atomic_with;
 
     #[test]
-    fn capture_setup_migrates_discovery_preserves_neighbors_and_disables_cleanly() {
-        let temp = tempfile::tempdir().unwrap();
-        let config_dir = temp.path().join(".cursor");
-        let legacy = specs(PERSISTENT_MARKER, cfg!(windows));
-        apply(&config_dir, &legacy, true).unwrap();
-        let path = config_dir.join("hooks.json");
-        let mut config = load_object(&path).unwrap();
-        config["hooks"]["stop"]
-            .as_array_mut()
-            .unwrap()
-            .push(hook_entry("other-hook"));
-        write_object_atomic_with(&path, config, FileAccess::Inherited).unwrap();
-
-        let capture = persistent_specs();
-        apply(&config_dir, capture, true).unwrap();
-        apply(&config_dir, capture, true).unwrap();
-        assert!(capture_hooks_are_installed_at(&config_dir));
-        for (event, _) in capture {
-            assert!(user_capture_hook_is_installed_at(&config_dir, event));
-        }
-        assert!(!user_capture_hook_is_installed_at(&config_dir, "unknown"));
-        let installed = load_object(&path).unwrap();
-        assert_eq!(installed["hooks"]["stop"].as_array().unwrap().len(), 2);
-        for (event, command) in legacy {
-            assert!(installed["hooks"][event]
-                .as_array()
+    fn persistent_setup_reconciles_changed_commands_and_retired_events() {
+        for windows in [false, true] {
+            for enable in [false, true] {
+                let wrap = |script: &str| {
+                    if windows {
+                        powershell_encoded_command(script)
+                    } else {
+                        script.to_owned()
+                    }
+                };
+                let old_capture = wrap("bt trace hook --old-option # braintrust-cursor-capture");
+                let old_discovery = wrap("printf '{}' # braintrust-cursor-discovery");
+                let managed = wrap("printf '{}' # braintrust-cursor-managed-123-42-run");
+                let neighbor = wrap("echo neighbor # braintrust-cursor-capture-custom");
+                let mentioned_marker = wrap("echo braintrust-cursor-capture");
+                let preserved = serde_json::json!([
+                    hook_entry(&managed),
+                    hook_entry(&neighbor),
+                    hook_entry(&mentioned_marker),
+                    {"command": 42}
+                ]);
+                let mut entries = preserved.as_array().unwrap().clone();
+                entries.push(hook_entry(&old_capture));
+                entries.push(hook_entry(&old_discovery));
+                let config = serde_json::json!({
+                    "hooks": {"stop": entries.clone(), "retiredEvent": entries}
+                })
+                .as_object()
                 .unwrap()
-                .iter()
-                .all(|entry| entry["command"] != command));
+                .clone();
+                let temp = tempfile::tempdir().unwrap();
+                let config_dir = temp.path().join(".cursor");
+                let path = config_dir.join("hooks.json");
+                write_object_atomic_with(&path, config, FileAccess::Inherited).unwrap();
+
+                // Disable must clean an old install even before it is upgraded.
+                apply(&config_dir, persistent_specs(), enable).unwrap();
+                apply(&config_dir, persistent_specs(), enable).unwrap();
+                assert_eq!(capture_hooks_are_installed_at(&config_dir), enable);
+                for (event, _) in persistent_specs() {
+                    assert_eq!(
+                        user_capture_hook_is_installed_at(&config_dir, event),
+                        enable
+                    );
+                }
+                assert!(!user_capture_hook_is_installed_at(&config_dir, "unknown"));
+                let config = load_object(&path).unwrap();
+                assert_eq!(config["hooks"]["retiredEvent"], preserved);
+                let mut expected_stop = preserved.as_array().unwrap().clone();
+                if enable {
+                    let (_, command) = persistent_specs()
+                        .iter()
+                        .find(|(event, _)| event == "stop")
+                        .unwrap();
+                    expected_stop.push(hook_entry(command));
+                }
+                assert_eq!(config["hooks"]["stop"], Value::Array(expected_stop));
+
+                apply(&config_dir, persistent_specs(), false).unwrap();
+                assert!(!capture_hooks_are_installed_at(&config_dir));
+                let config = load_object(&path).unwrap();
+                assert_eq!(config["hooks"]["stop"], preserved);
+                assert_eq!(config["hooks"]["retiredEvent"], preserved);
+            }
         }
-        apply(&config_dir, capture, false).unwrap();
-        assert!(!capture_hooks_are_installed_at(&config_dir));
-        let disabled = load_object(&path).unwrap();
-        assert_eq!(
-            disabled["hooks"]["stop"],
-            serde_json::json!([hook_entry("other-hook")])
-        );
     }
 
     #[cfg(unix)]

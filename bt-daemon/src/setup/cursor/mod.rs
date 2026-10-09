@@ -359,16 +359,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_is_repeatable_and_preserves_neighbor_plugins() {
+    fn setup_lifecycle_preserves_neighbor_plugins() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("plugins/local");
         let plugin = root.join(PLUGIN_NAME);
+        let config_dir = temp.path().join(".cursor");
         let neighbor = root.join("my-plugin/keep.txt");
         std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
         std::fs::write(&neighbor, "leave me").unwrap();
 
-        install_plugin_at(&plugin).unwrap();
-        install_plugin_at(&plugin).unwrap();
+        enable_at(&plugin, &config_dir).unwrap();
+        enable_at(&plugin, &config_dir).unwrap();
+        update_at(&plugin, &config_dir).unwrap();
+        assert!(capture_hooks_are_installed_at(&config_dir));
 
         assert_eq!(std::fs::read_to_string(&neighbor).unwrap(), "leave me");
         assert_eq!(
@@ -394,6 +397,11 @@ mod tests {
         assert!(plugin_is_installed_at(&plugin));
         assert!(is_ours(&manifest));
         assert!(plugin.join("mcp.json").is_file());
+
+        disable_at(&plugin, &config_dir).unwrap();
+        assert!(!plugin.exists());
+        assert!(!capture_hooks_are_installed_at(&config_dir));
+        assert_eq!(std::fs::read_to_string(&neighbor).unwrap(), "leave me");
     }
 
     #[test]
@@ -442,18 +450,6 @@ mod tests {
     }
 
     #[test]
-    fn enable_installs_the_plugin_and_capture_hooks() {
-        let temp = tempfile::tempdir().unwrap();
-        let plugin = temp.path().join(PLUGIN_NAME);
-        let config_dir = temp.path().join(".cursor");
-
-        enable_at(&plugin, &config_dir).unwrap();
-
-        assert!(plugin_is_installed_at(&plugin));
-        assert!(capture_hooks_are_installed_at(&config_dir));
-    }
-
-    #[test]
     fn setup_refuses_to_replace_or_remove_an_unrelated_plugin() {
         let temp = tempfile::tempdir().unwrap();
         let plugin = temp.path().join(PLUGIN_NAME);
@@ -472,21 +468,5 @@ mod tests {
         );
         assert!(!plugin_is_installed_at(&plugin));
         assert!(plugin.join(".cursor-plugin/plugin.json").exists());
-    }
-
-    #[test]
-    fn disable_removes_only_its_plugin() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("plugins/local");
-        let plugin = root.join(PLUGIN_NAME);
-        let neighbor = root.join("other-plugin/file");
-        std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
-        std::fs::write(&neighbor, "preserve").unwrap();
-
-        install_plugin_at(&plugin).unwrap();
-        remove_plugin_at(&plugin).unwrap();
-
-        assert!(!plugin.exists());
-        assert_eq!(std::fs::read_to_string(neighbor).unwrap(), "preserve");
     }
 }
