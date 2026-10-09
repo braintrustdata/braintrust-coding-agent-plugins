@@ -70,7 +70,12 @@ Each coding agent reads an independent non-credential `braintrust.json` file:
 - Grok: `~/.grok/braintrust.json`
 - Antigravity: `~/.gemini/config/braintrust.json`
 
-`BT_DAEMON_CONFIG` can override the path for isolated tests and managed hosts.
+`BRAINTRUST_DAEMON_CONFIG` can override the path for isolated tests and managed
+hosts.
+
+Tracing env vars use the `BRAINTRUST_` prefix. The old `BT_` names (for example
+`BT_DAEMON_CONFIG`) are deprecated but still work; the `BRAINTRUST_` name wins
+when both are set.
 
 See [`config.json.example`](config.json.example). `trace_to_braintrust` controls
 enablement and `route` stores the selected profile, organization, typed
@@ -256,13 +261,13 @@ default suite; see the [test harness guide](tests/support/README.md).
 From the monorepo root, in a Unix shell:
 
 ```bash
-export BT_DAEMON_SOCKET=/tmp/btd.sock BT_DAEMON_DATA_DIR=/tmp/btd BT_DAEMON_CONFIG=/tmp/btd-config.json
-printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"debug"}}}' > "$BT_DAEMON_CONFIG"
+export BRAINTRUST_DAEMON_SOCKET=/tmp/btd.sock BRAINTRUST_DAEMON_DATA_DIR=/tmp/btd BRAINTRUST_DAEMON_CONFIG=/tmp/btd-config.json
+printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"debug"}}}' > "$BRAINTRUST_DAEMON_CONFIG"
 cargo build --manifest-path bt-daemon/Cargo.toml --features cli --locked --bin bt-daemon
 echo '{"session_id":"s1","hook_event_name":"SessionStart"}' | ./bt-daemon/target/debug/bt-daemon hook --source debug
 echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./bt-daemon/target/debug/bt-daemon hook --source debug
 ./bt-daemon/target/debug/bt-daemon status
-# Inspect journal/ and spans/ under $BT_DAEMON_DATA_DIR
+# Inspect journal/ and spans/ under $BRAINTRUST_DAEMON_DATA_DIR
 ```
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.

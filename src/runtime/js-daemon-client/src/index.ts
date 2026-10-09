@@ -133,7 +133,9 @@ export function daemonSocketPath(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  if (env.BT_DAEMON_SOCKET) return env.BT_DAEMON_SOCKET
+  // BT_DAEMON_SOCKET is the deprecated name, still set by older `bt trace run`.
+  const explicit = env.BRAINTRUST_DAEMON_SOCKET || env.BT_DAEMON_SOCKET
+  if (explicit) return explicit
   if (platform === "win32") {
     const identity = `${env.USERDOMAIN ?? ""}\\${env.USERNAME ?? ""}`
     const suffix = createHash("sha256").update(identity).digest("hex").slice(0, 16)

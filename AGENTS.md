@@ -50,6 +50,13 @@ process APIs. These helpers prevent Windows console flashes. Foreground commands
 and daemon detachment have explicit exceptions; do not reuse them for background
 work. Clippy and Oxlint enforce use of these helpers in CI.
 
+User-facing environment variables must use the `BRAINTRUST_` prefix (for
+example `BRAINTRUST_DAEMON_SOCKET`), matching `bt` and the Braintrust SDKs. Do
+not add new `BT_*` names. Read them through `bt-daemon/src/env.rs`;
+`DEPRECATED_BT_ENV_VARS` there only keeps old names working.
+`BT_TRACE_MANAGED_RUN_ID` and `BT_TRACE_INVOCATION_SETTINGS` remain the
+internal protocol between `bt trace run` and its child processes.
+
 ## Versioning and distribution
 
 Versioning is per distribution. Claude, Codex, Cursor, and Grok plugins carry

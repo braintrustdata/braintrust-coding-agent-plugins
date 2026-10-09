@@ -22,7 +22,7 @@ const MONOREPO_SOURCE: &str = "braintrustdata/braintrust-coding-agent-plugins";
 const PLUGIN_MANIFEST: &str = plugin_source!("cursor/content/.cursor-plugin/plugin.json");
 const HOOKS_MANIFEST: &str = plugin_source!("cursor/content/hooks/hooks.json");
 const HOOK_LAUNCHER: &str = plugin_source!("cursor/content/hooks/trace.sh");
-const POWERSHELL_LAUNCHER: &str = r#"$bt = if ($env:BT_BIN) { $env:BT_BIN } else { 'bt' }
+const POWERSHELL_LAUNCHER: &str = r#"$bt = if ($env:BRAINTRUST_BT_BIN) { $env:BRAINTRUST_BT_BIN } elseif ($env:BT_BIN) { $env:BT_BIN } else { 'bt' }
 $hookArgs = @('trace', 'hook', '--source', 'cursor', '--session-id-field', 'conversation_id', '--event-field', 'hook_event_name', '--transcript-path-field', 'transcript_path', '--flush-on-turn-end', '--capture-timeout-ms', '8000')
 try { & $bt @hookArgs *> $null } catch {}
 if ($args.Count -gt 0 -and $args[0] -eq 'beforeSubmitPrompt') {
@@ -410,7 +410,7 @@ mod tests {
             assert!(!command.contains("trace.sh"));
         }
         let script = std::fs::read_to_string(plugin.join("hooks/trace.ps1")).unwrap();
-        assert!(script.contains("$env:BT_BIN"));
+        assert!(script.contains("$env:BRAINTRUST_BT_BIN"));
         assert!(script.contains("'--source', 'cursor'"));
         assert!(script.contains("'--event-field', 'hook_event_name'"));
         assert!(script.contains("'{\"continue\":true}'") || script.contains("\"continue\":true"));

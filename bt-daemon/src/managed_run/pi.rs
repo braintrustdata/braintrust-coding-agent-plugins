@@ -16,7 +16,7 @@ impl ManagedRun for Pi {
         _hook_command: &RunHookCommand,
         _managed_run_id: &str,
     ) -> anyhow::Result<Injection> {
-        let extension = match std::env::var_os("BT_TRACE_PI_PLUGIN_SPEC") {
+        let extension = match crate::env::var_os("BRAINTRUST_TRACE_PI_PLUGIN_SPEC") {
             Some(extension) => extension,
             None => OsString::from(crate::setup::pi::plugin_spec()),
         };

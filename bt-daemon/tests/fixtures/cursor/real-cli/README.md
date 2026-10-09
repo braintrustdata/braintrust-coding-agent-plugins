@@ -21,7 +21,7 @@ Both scenarios used an isolated temporary workspace containing only `sample.txt`
   Auto model, two successful user turns. Both `stop` observations precede their
   `afterAgentResponse` observations, which repeat the identical turn usage.
 - `plugin-headless-resume-success`: the exact default development artifact,
-  loaded with `--plugin-dir` and an absolute `BT_BIN` recording shim. A headless
+  loaded with `--plugin-dir` and an absolute `BRAINTRUST_BT_BIN` recording shim. A headless
   Auto Read/Shell session and a separate `--resume` invocation both succeeded.
   This records only the plugin's forwarded payloads, without the shim arguments.
   The two stream-result files retain native terminal success and usage.

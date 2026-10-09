@@ -105,10 +105,10 @@ jobs:
       - name: Run a real traced Cursor session
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          BT_DAEMON_CONFIG: ${{ runner.temp }}/bt-daemon-config.json
-          BT_DAEMON_SOCKET: ${{ runner.temp }}/cursor-daemon.sock
+          BRAINTRUST_DAEMON_CONFIG: ${{ runner.temp }}/bt-daemon-config.json
+          BRAINTRUST_DAEMON_SOCKET: ${{ runner.temp }}/cursor-daemon.sock
           BT_DAEMON_BIN: ${{ github.workspace }}/bt-daemon/target/debug/bt-daemon
-          BT_BIN: ${{ github.workspace }}/src/plugins/cursor/test/bt-standalone-wrapper.sh
+          BRAINTRUST_BT_BIN: ${{ github.workspace }}/src/plugins/cursor/test/bt-standalone-wrapper.sh
           BRAINTRUST_API_KEY: smoke-key
           BRAINTRUST_API_URL: http://127.0.0.1:53999
           BRAINTRUST_APP_URL: http://127.0.0.1:53999
@@ -117,13 +117,13 @@ jobs:
           set -euo pipefail
           cargo build --manifest-path bt-daemon/Cargo.toml --features cli
           mkdir -p "${RUNNER_TEMP}/cursor-bin"
-          install -m 755 "$BT_BIN" "${RUNNER_TEMP}/cursor-bin/bt"
+          install -m 755 "$BRAINTRUST_BT_BIN" "${RUNNER_TEMP}/cursor-bin/bt"
           export PATH="${RUNNER_TEMP}/cursor-bin:$PATH"
-          printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"trace-cursor-smoke"},"flush_mode":"flush_on_turn_end"}}' > "$BT_DAEMON_CONFIG"
+          printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"trace-cursor-smoke"},"flush_mode":"flush_on_turn_end"}}' > "$BRAINTRUST_DAEMON_CONFIG"
           python3 .github/scripts/mock-braintrust.py > "${RUNNER_TEMP}/mock-collector.log" 2>&1 &
           collector_pid=$!
           trap 'kill "$collector_pid" 2>/dev/null || true' EXIT
-          "$BT_DAEMON_BIN" serve --socket "$BT_DAEMON_SOCKET" --data-dir "${RUNNER_TEMP}/cursor-state" --idle-timeout-secs 0 &
+          "$BT_DAEMON_BIN" serve --socket "$BRAINTRUST_DAEMON_SOCKET" --data-dir "${RUNNER_TEMP}/cursor-state" --idle-timeout-secs 0 &
           daemon_pid=$!
           trap 'kill "$daemon_pid" "$collector_pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 50); do
