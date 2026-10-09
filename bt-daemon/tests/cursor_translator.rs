@@ -1112,6 +1112,7 @@ fn synthetic_subagents_parent_to_spawning_tool_and_unmatched_stop_stays_incomple
         .clone();
     for child in children {
         assert_eq!(child.parent_span_ids, vec![spawn_tool_id.clone()]);
+        assert_eq!(child.turn_span_id, Some(h.turns()[0].span_id.clone()));
         assert_eq!(
             child.metadata.as_ref().unwrap()["spawning_tool_call_id"],
             "spawn"

@@ -13,10 +13,12 @@ if command -v "$BT_BIN" >/dev/null 2>&1; then
   fi
 fi
 
-# beforeSubmitPrompt is a continuation hook, not a permission decision.
+# beforeSubmitPrompt is a continuation hook; the others below are permission hooks.
 case "${1-}" in
   beforeSubmitPrompt)
     printf '%s\n' '{"continue":true}' ;;
+  preToolUse|subagentStart)
+    printf '%s\n' '{"permission":"allow"}' ;;
   *)
     printf '%s\n' '{}' ;;
 esac
