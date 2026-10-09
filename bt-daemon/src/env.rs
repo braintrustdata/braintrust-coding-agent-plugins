@@ -47,6 +47,18 @@ pub(crate) fn var(canonical: &str) -> Option<String> {
     var_os(canonical).and_then(|value| value.into_string().ok())
 }
 
+/// Pass every resolved value to a child process under both names, so plugins
+/// released before the rename read the same value instead of a stale or
+/// missing deprecated one.
+pub(crate) fn mirror_aliases(command: &mut tokio::process::Command) {
+    for deprecated in DEPRECATED_BT_ENV_VARS {
+        let canonical = canonical_env_name(deprecated);
+        if let Some(value) = var_os(&canonical) {
+            command.env(&canonical, &value).env(deprecated, &value);
+        }
+    }
+}
+
 /// Set `canonical` and its deprecated alias to the same value on a child
 /// process, so plugins released before the rename still read it.
 pub(crate) fn set_with_alias(

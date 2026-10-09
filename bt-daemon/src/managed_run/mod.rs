@@ -106,6 +106,7 @@ pub async fn run_traced(
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
+    env::mirror_aliases(&mut command);
     if let Some(runtime) = &isolated_runtime {
         env::set_with_alias(&mut command, paths::SOCKET_ENV, &runtime.socket);
         env::set_with_alias(&mut command, paths::DATA_DIR_ENV, runtime.temp_dir.path());
