@@ -7,6 +7,7 @@ use super::*;
 pub(super) enum IngressMsg {
     Event(Box<PendingEvent>),
     Barrier(oneshot::Sender<()>),
+    Stop(oneshot::Sender<()>),
 }
 
 /// The hook path never waits for this queue. Once it fills, the append-only
@@ -24,6 +25,10 @@ pub(super) fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::Receiver<I
                 break;
             };
             match msg {
+                IngressMsg::Stop(reply) => {
+                    let _ = reply.send(());
+                    break;
+                }
                 IngressMsg::Event(event) => {
                     dispatch_ingress_event(&daemon, *event).await;
                 }

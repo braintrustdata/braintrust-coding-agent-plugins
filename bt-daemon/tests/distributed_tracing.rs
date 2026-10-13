@@ -2915,6 +2915,21 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         // Restore the accepted-but-undelivered checkpoint, as after an abrupt
         // process exit. Shutdown itself is covered separately above.
         tokio::fs::write(&journal_path, journal).await.unwrap();
+        // This crash fixture rolls back source persistence as well as delivery.
+        let id = journal_path
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .rsplit("--")
+            .next()
+            .unwrap();
+        for suffix in [".sqlite", ".sqlite-wal", ".sqlite-shm"] {
+            let path = data_dir.join("pipeline").join(format!("{id}{suffix}"));
+            if path.exists() {
+                tokio::fs::remove_file(path).await.unwrap();
+            }
+        }
         // Graceful shutdown delivered the buffered spans. Roll back its local
         // delivery acknowledgements as well as the journal to model a crash.
         tokio::fs::remove_dir_all(data_dir.join("delivery-ledger"))

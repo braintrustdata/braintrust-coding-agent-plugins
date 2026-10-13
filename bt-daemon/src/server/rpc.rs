@@ -334,10 +334,15 @@ impl Daemon {
                 session_id: key.session_id.clone(),
                 source: s.source.clone(),
                 route: serde_json::from_str(&key.route).ok(),
-                queued: s.counters.queued.load(Ordering::Relaxed),
+                queued: s.pending(),
                 spans_emitted: s.counters.spans_emitted.load(Ordering::Relaxed),
-                permalink: s.permalink.lock().clone(),
-                last_error: s.last_error.lock().clone(),
+                permalink: s.permalink.lock().unwrap().clone(),
+                last_error: s
+                    .last_error
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(|| s.source_error.lock().unwrap().clone()),
             })
             .collect();
         for (key, (source, error)) in self.auth_errors.lock().iter() {
