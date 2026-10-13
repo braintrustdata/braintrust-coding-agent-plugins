@@ -1613,15 +1613,27 @@ fn push_tool_result(scope: &mut Scope, call_id: Option<&str>, payload: &Value) {
         .or_else(|| payload.get("result"))
         .cloned()
         .unwrap_or(Value::Null);
-    let content = output
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()));
+    let content = match &output {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(contains_image_data_url)
+            .unwrap_or_else(|| Value::String(text.clone())),
+        _ => Value::String(serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string())),
+    };
     scope.message_history.push(json!({
         "role": "tool",
         "content": content,
         "tool_call_id": call_id.unwrap_or_default(),
     }));
+}
+
+fn contains_image_data_url(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.starts_with("data:image/") && text.contains(","),
+        Value::Array(values) => values.iter().any(contains_image_data_url),
+        Value::Object(values) => values.values().any(contains_image_data_url),
+        _ => false,
+    }
 }
 
 fn args_object(args: Option<&Value>) -> Option<Map<String, Value>> {
