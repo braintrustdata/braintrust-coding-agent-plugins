@@ -20,7 +20,7 @@ pub(super) async fn collect_garbage(daemon: &Arc<Daemon>) {
     journal::gc_old_managed_runs(data_dir, RETENTION).await;
     gc_old_correlation_states(data_dir, RETENTION).await;
     let pipeline = &daemon.pipeline;
-    let mut protected_mirrors = HashSet::new();
+    let mut retained = Vec::new();
     if let Ok(rows) = pipeline
         .store
         .read(crate::pipeline::store::partitions)
@@ -29,6 +29,7 @@ pub(super) async fn collect_garbage(daemon: &Arc<Daemon>) {
         let cutoff = now_ms().saturating_sub(RETENTION.as_millis() as i64);
         for row in rows {
             if row.last_activity_ms > cutoff || pipeline.runtime(&row.partition).is_some() {
+                retained.push(row.partition);
                 continue;
             }
             let pending = match pipeline_pending(pipeline, &row.partition).await {
@@ -37,7 +38,7 @@ pub(super) async fn collect_garbage(daemon: &Arc<Daemon>) {
             };
             if pending {
                 // Held work keeps every input it may still replay.
-                protected_mirrors.extend(referenced_mirrors(pipeline, &row.partition).await);
+                retained.push(row.partition);
                 continue;
             }
             let partition = row.partition.clone();
@@ -54,7 +55,19 @@ pub(super) async fn collect_garbage(daemon: &Arc<Daemon>) {
             }
         }
     }
-    gc_old_mirrors_except(data_dir, &protected_mirrors).await;
+    // A mirror is only collectable once no retained partition's journal names
+    // it, however old the file is.
+    let expired = expired_mirrors(data_dir).await;
+    if expired.is_empty() {
+        return;
+    }
+    let mut protected = HashSet::new();
+    for partition in &retained {
+        protected.extend(referenced_mirrors(pipeline, partition).await);
+    }
+    for path in expired.into_iter().filter(|path| !protected.contains(path)) {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
 }
 
 /// Transcript mirror files referenced by a partition's event journal.
@@ -95,20 +108,20 @@ fn collect_mirror_paths(value: &Value, mirrors: &mut HashSet<PathBuf>) {
     }
 }
 
-async fn gc_old_mirrors_except(data_dir: &std::path::Path, protected: &HashSet<PathBuf>) {
+/// Transcript mirror files past retention.
+async fn expired_mirrors(data_dir: &std::path::Path) -> Vec<PathBuf> {
     let dir = crate::transcript_mirror::mirror_dir(data_dir);
     let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return;
+        return Vec::new();
     };
     let now = SystemTime::now();
+    let mut expired = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if protected.contains(&path)
-            || !matches!(
-                path.extension().and_then(|value| value.to_str()),
-                Some("jsonl" | "current")
-            )
-        {
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("jsonl" | "current")
+        ) {
             continue;
         }
         let old = entry
@@ -119,9 +132,10 @@ async fn gc_old_mirrors_except(data_dir: &std::path::Path, protected: &HashSet<P
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > RETENTION);
         if old {
-            let _ = tokio::fs::remove_file(&path).await;
+            expired.push(path);
         }
     }
+    expired
 }
 
 pub(super) async fn gc_old_correlation_states(data_dir: &std::path::Path, max_age: Duration) {

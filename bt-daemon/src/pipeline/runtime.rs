@@ -166,6 +166,9 @@ pub(crate) struct PartitionRuntime {
     pub(crate) spans_changed: watch::Sender<NodeId>,
     pub(crate) stop: watch::Sender<bool>,
     pub(crate) last_activity: Mutex<std::time::Instant>,
+    /// When `partitions.last_activity_ms` was last written, so capture
+    /// persists activity at most once per interval, not per event.
+    pub(crate) persisted_activity_ms: std::sync::atomic::AtomicI64,
     /// The last native event whose routes assembly has registered.
     pub(crate) assembled: watch::Sender<NodeId>,
     /// Set when a live route registered after events were already handed off:
@@ -360,6 +363,7 @@ impl Pipeline {
             spans_changed: watch::Sender::new(spans_tail),
             stop: watch::Sender::new(false),
             last_activity: Mutex::new(std::time::Instant::now()),
+            persisted_activity_ms: std::sync::atomic::AtomicI64::new(0),
             assembled: watch::Sender::new(assembled),
             reobserve: std::sync::atomic::AtomicBool::new(false),
             reobserve_wake: Notify::new(),
@@ -448,6 +452,22 @@ impl Pipeline {
         let partition = PartitionId::new(&env.source, &env.session_id);
         let runtime = self.partition(&partition).await?;
         runtime.touch();
+        // Retention counts from the last modification, so activity on an old
+        // session is recorded durably (throttled; the window is days).
+        const ACTIVITY_PERSIST_INTERVAL_MS: i64 = 60_000;
+        let now = now_ms();
+        let persisted = runtime
+            .persisted_activity_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now - persisted >= ACTIVITY_PERSIST_INTERVAL_MS {
+            let touched = partition.clone();
+            self.store
+                .write(move |tx| store::touch_partition(tx, &touched, now))
+                .await?;
+            runtime
+                .persisted_activity_ms
+                .store(now, std::sync::atomic::Ordering::Relaxed);
+        }
         let node = self
             .events
             .append(

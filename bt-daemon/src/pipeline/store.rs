@@ -194,6 +194,19 @@ pub(crate) struct PartitionRow {
     pub(crate) last_activity_ms: i64,
 }
 
+/// Record that a partition was modified, restarting its retention window.
+pub(crate) fn touch_partition(
+    tx: &Transaction<'_>,
+    partition: &PartitionId,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE partitions SET last_activity_ms = ?2 WHERE pkey = ?1 AND last_activity_ms < ?2",
+        params![partition.key(), now_ms],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn ensure_partition(
     tx: &Transaction<'_>,
     partition: &PartitionId,
@@ -705,6 +718,28 @@ mod tests {
             store.read_blocking(|conn| head(conn, "j", "c")).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn touching_a_partition_only_moves_its_activity_forward() {
+        let (_dir, store) = store();
+        let partition = PartitionId::new("codex", "touched");
+        let activity = |store: &Store| {
+            store
+                .read_blocking(|conn| Ok(partitions(conn)?.remove(0).last_activity_ms))
+                .unwrap()
+        };
+        store
+            .write_blocking(|tx| ensure_partition(tx, &partition, "ns", 1_000))
+            .unwrap();
+        store
+            .write_blocking(|tx| touch_partition(tx, &partition, 5_000))
+            .unwrap();
+        assert_eq!(activity(&store), 5_000);
+        store
+            .write_blocking(|tx| touch_partition(tx, &partition, 2_000))
+            .unwrap();
+        assert_eq!(activity(&store), 5_000);
     }
 
     #[test]

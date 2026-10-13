@@ -109,38 +109,32 @@ impl EventFile {
                 if read == 0 {
                     break;
                 }
-                let complete = bytes.last() == Some(&b'\n');
-                let parsed = complete
-                    .then(|| parse_line(path, &bytes[..bytes.len() - 1]))
-                    .transpose();
-                match parsed {
-                    Ok(Some(mut line)) if line.node == last_node + 1 => {
-                        expand(&mut line.input, &mut pi_context)?;
-                        last_node = line.node;
-                        offset += read as u64;
-                        good_len = offset;
-                    }
-                    other => {
-                        // Only the final record may be torn by a crash.
-                        let rest = reader.fill_buf()?.is_empty();
-                        if !rest {
-                            match other {
-                                Err(error) => return Err(error),
-                                _ => anyhow::bail!(
-                                    "{}: event journal is corrupt after node {last_node}",
-                                    path.display()
-                                ),
-                            }
-                        }
-                        break;
-                    }
+                if bytes.last() != Some(&b'\n') {
+                    // A crash tears an append mid-record: only an unterminated
+                    // final record is dropped. A complete record that does not
+                    // verify is corruption, however late in the file.
+                    break;
                 }
+                let mut line = parse_line(path, &bytes[..bytes.len() - 1])?;
+                anyhow::ensure!(
+                    line.node == last_node + 1,
+                    "{}: expected node {}, found {}",
+                    path.display(),
+                    last_node + 1,
+                    line.node
+                );
+                expand(&mut line.input, &mut pi_context)?;
+                last_node = line.node;
+                offset += read as u64;
+                good_len = offset;
             }
         }
         if file.metadata()?.len() > good_len {
             tracing::warn!(path = %path.display(), last_node, "truncating torn event journal tail");
-            file.set_len(good_len)?;
-            file.sync_all()?;
+            // The append handle cannot truncate on every platform.
+            let truncate = std::fs::OpenOptions::new().write(true).open(path)?;
+            truncate.set_len(good_len)?;
+            truncate.sync_all()?;
         }
         let (changed, _) = watch::channel(last_node);
         Ok(Self {
@@ -433,6 +427,33 @@ mod tests {
         std::fs::write(&path, text.replacen("\"a\"", "\"x\"", 1)).unwrap();
         let store = EventStore::new(dir.path());
         assert!(store.tail(&partition).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_complete_corrupt_final_record_is_corruption_not_a_torn_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let partition = PartitionId::new("codex", "corrupt-tail");
+        let path = event_path(dir.path(), &partition);
+        {
+            let store = EventStore::new(dir.path());
+            store.append(&partition, native("a")).await.unwrap();
+            store.append(&partition, native("b")).await.unwrap();
+        }
+        let before = std::fs::read_to_string(&path).unwrap();
+        for corrupt in [
+            before.replacen("\"b\"", "\"x\"", 1),
+            format!("{}3\tdeadbeef\t{{}}\n", before),
+            before.replacen("2\t", "5\t", 1),
+        ] {
+            std::fs::write(&path, &corrupt).unwrap();
+            let store = EventStore::new(dir.path());
+            assert!(store.tail(&partition).await.is_err(), "{corrupt}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                corrupt,
+                "a corrupt journal is reported, never truncated"
+            );
+        }
     }
 
     fn pi_input(event: &str, ts_ms: i64, payload: serde_json::Value) -> TranslationInput {

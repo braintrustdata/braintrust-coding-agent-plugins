@@ -54,7 +54,7 @@ impl RecordingSinkFactory {
                     }) if name == project)
                 })
             })
-            .unwrap_or_else(|| panic!("no {project} sink created for session {session_id}"))
+            .unwrap_or_else(|| panic!("no {project} sink created for the session"))
     }
 
     fn session(&self, session_id: &str) -> Arc<RecordedSession> {
@@ -62,7 +62,7 @@ impl RecordingSinkFactory {
             .lock()
             .unwrap()
             .get(session_id)
-            .unwrap_or_else(|| panic!("no sink created for session {session_id}"))
+            .unwrap_or_else(|| panic!("no sink created for the session"))
             .clone()
     }
 }
