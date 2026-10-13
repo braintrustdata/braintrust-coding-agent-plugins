@@ -151,6 +151,7 @@ struct OpenTurn {
     llm_seq: u32,
     explicit_skill_names: Vec<String>,
     input_source: Option<TurnInputSource>,
+    native_prompt_seen: bool,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -875,6 +876,7 @@ impl CodexTranslator {
             llm_seq: 0,
             explicit_skill_names: Vec::new(),
             input_source: None,
+            native_prompt_seen: false,
         });
     }
 
@@ -904,7 +906,11 @@ impl CodexTranslator {
                     // injected runtime context, the initiating prompt, and later
                     // steering/context rows. In the absence of the authoritative
                     // event_msg, retain the first non-injected native prompt.
-                    if turn.input_source.is_some() || is_injected_user_context(&text) {
+                    if turn.native_prompt_seen || is_injected_user_context(&text) {
+                        return;
+                    }
+                    turn.native_prompt_seen = true;
+                    if turn.input_source.is_some() {
                         return;
                     }
                     turn.input_source = Some(TurnInputSource::Native);
@@ -924,6 +930,39 @@ impl CodexTranslator {
                 root_span_id: self.effective_root_span_id.clone(),
                 parent_span_ids: vec![turn_parent_span_id],
                 input: Some(json!(text)),
+                metadata: explicit_skill_metadata(&turn.explicit_skill_names),
+                ..Default::default()
+            }));
+        }
+    }
+
+    fn set_turn_input_image_message(
+        &mut self,
+        scope: &mut Scope,
+        text: &str,
+        content: Value,
+        ops: &mut Vec<SpanOp>,
+    ) {
+        if is_injected_user_context(text) {
+            return;
+        }
+        let turn_parent_span_id = scope.turn_parent_span_id.clone();
+        if let Some(turn) = scope.open_turns.last_mut() {
+            if turn.native_prompt_seen {
+                return;
+            }
+            turn.native_prompt_seen = true;
+            turn.input_source.get_or_insert(TurnInputSource::Native);
+            for name in explicit_skill_names(text) {
+                if !turn.explicit_skill_names.contains(&name) {
+                    turn.explicit_skill_names.push(name);
+                }
+            }
+            ops.push(SpanOp::Merge(SpanRow {
+                span_id: turn.span_id.clone(),
+                root_span_id: self.effective_root_span_id.clone(),
+                parent_span_ids: vec![turn_parent_span_id],
+                input: Some(content),
                 metadata: explicit_skill_metadata(&turn.explicit_skill_names),
                 ..Default::default()
             }));
@@ -982,11 +1021,12 @@ impl CodexTranslator {
 
     fn on_message(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
         let role = str_field(payload, "role").unwrap_or_else(|| "user".to_string());
-        let text = message_text(payload);
-        if text.is_empty() {
+        let (text, multimodal_content) = message_content(payload);
+        if text.is_empty() && multimodal_content.is_none() {
             return;
         }
-        let msg = json!({ "role": role, "content": text });
+        let content = multimodal_content.clone().unwrap_or_else(|| json!(text));
+        let msg = json!({ "role": role, "content": content });
         if role == "assistant" {
             self.ensure_llm(scope, None, ts, ops);
             if let Some(llm) = &mut scope.open_llm {
@@ -997,7 +1037,11 @@ impl CodexTranslator {
             // Newer rollouts carry the initiating prompt solely as a native
             // response item, without the older `event_msg.user_message` row.
             // The task span must remain readable independently of its LLM input.
-            self.set_turn_input_text(scope, text.clone(), TurnInputSource::Native, ops);
+            if let Some(content) = multimodal_content {
+                self.set_turn_input_image_message(scope, &text, content, ops);
+            } else {
+                self.set_turn_input_text(scope, text.clone(), TurnInputSource::Native, ops);
+            }
         }
         scope.message_history.push(msg);
     }
@@ -1585,18 +1629,65 @@ fn basename(path: &str) -> String {
         .to_string()
 }
 
-fn message_text(payload: &Value) -> String {
-    payload
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|parts| {
+fn message_content(payload: &Value) -> (String, Option<Value>) {
+    let Some(parts) = payload.get("content").and_then(Value::as_array) else {
+        return (String::new(), None);
+    };
+    let has_image = parts.iter().any(|part| {
+        matches!(
+            str_field(part, "type").as_deref(),
+            Some("input_image" | "image_url")
+        )
+    });
+    if !has_image {
+        return (
             parts
                 .iter()
-                .filter_map(|p| str_field(p, "text"))
+                .filter_map(|part| str_field(part, "text"))
                 .collect::<Vec<_>>()
-                .join("")
+                .join(""),
+            None,
+        );
+    }
+
+    let mut text = String::new();
+    let content = parts
+        .iter()
+        .filter_map(|part| {
+            let kind = str_field(part, "type");
+            match kind.as_deref() {
+                Some("input_text") | Some("text") => {
+                    let value = str_field(part, "text")?;
+                    text.push_str(&value);
+                    Some(json!({ "type": "text", "text": value }))
+                }
+                Some("input_image") | Some("image_url") => {
+                    if part.get("file_id").is_some() {
+                        // Codex file IDs are useful native references, but not
+                        // local paths the importer should resolve or upload.
+                        return Some(part.clone());
+                    }
+                    let Some(image_url) = part.get("image_url") else {
+                        return Some(part.clone());
+                    };
+                    let url = image_url
+                        .get("url")
+                        .cloned()
+                        .unwrap_or_else(|| image_url.clone());
+                    let mut normalized = json!({
+                        "type": "image_url",
+                        "image_url": { "url": url },
+                    });
+                    if let Some(detail) = part.get("detail") {
+                        normalized["image_url"]["detail"] = detail.clone();
+                    }
+                    Some(normalized)
+                }
+                _ => None,
+            }
         })
-        .unwrap_or_default()
+        .collect::<Vec<_>>();
+    (text, Some(Value::Array(content)))
 }
 
 fn llm_output(items: &[Value]) -> Value {
