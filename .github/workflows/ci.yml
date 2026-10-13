@@ -49,11 +49,11 @@ jobs:
           fi
       - name: Build and validate plugins
         run: make test
-      - name: Build Cursor extension
+      - name: Package Cursor extension
         working-directory: dist/cursor
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
-          npm run build
+          npm run package -- --out "$RUNNER_TEMP/braintrust-cursor.vsix"
 
   # Pi and OpenCode run inside the user's agent process, so their unit tests
   # run on every host OS. Packaging and validation stay in `plugins`.

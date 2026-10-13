@@ -142,7 +142,7 @@ impl OpenCodeAgent {
         server.process_group(0);
         configure_environment(&mut server, self);
         server.env(
-            "BT_TRACE_OPENCODE_PLUGIN_SPEC",
+            "BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC",
             path_to_file_url(&self.plugin),
         );
         world.configure(&mut server);

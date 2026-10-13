@@ -29,7 +29,18 @@ describe("managed adapter claims", () => {
 
 describe("daemonSocketPath", () => {
   test("prefers the explicit environment override", () => {
-    assert.equal(daemonSocketPath({ BT_DAEMON_SOCKET: "/tmp/custom.sock" }), "/tmp/custom.sock")
+    assert.equal(
+      daemonSocketPath({ BRAINTRUST_DAEMON_SOCKET: "/tmp/custom.sock" }),
+      "/tmp/custom.sock",
+    )
+  })
+
+  test("still honors the deprecated BT_DAEMON_SOCKET name", () => {
+    assert.equal(daemonSocketPath({ BT_DAEMON_SOCKET: "/tmp/old.sock" }), "/tmp/old.sock")
+    assert.equal(
+      daemonSocketPath({ BRAINTRUST_DAEMON_SOCKET: "/tmp/new.sock", BT_DAEMON_SOCKET: "/tmp/old.sock" }),
+      "/tmp/new.sock",
+    )
   })
 
   test("matches the Unix runtime-directory contract", () => {

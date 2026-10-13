@@ -119,10 +119,10 @@ jobs:
           BRAINTRUST_API_KEY: smoke-key
           BRAINTRUST_API_URL: http://127.0.0.1:53999
           BRAINTRUST_APP_URL: http://127.0.0.1:53999
-          BT_DAEMON_CONFIG: ${{ runner.temp }}/bt-daemon-config.json
+          BRAINTRUST_DAEMON_CONFIG: ${{ runner.temp }}/bt-daemon-config.json
           MOCK_COLLECTOR_OUT: ${{ runner.temp }}/mock-summary.json
         run: |
-          printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"trace-codex-smoke"},"flush_mode":"flush_on_turn_end"}}' > "$BT_DAEMON_CONFIG"
+          printf '%s\n' '{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"trace-codex-smoke"},"flush_mode":"flush_on_turn_end"}}' > "$BRAINTRUST_DAEMON_CONFIG"
           python3 .github/scripts/mock-braintrust.py > "${{ runner.temp }}/mock-collector.log" 2>&1 &
           collector_pid=$!
           trap 'kill "$collector_pid" 2>/dev/null || true' EXIT

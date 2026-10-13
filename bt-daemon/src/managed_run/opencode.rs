@@ -18,8 +18,8 @@ fn opencode_managed_config(existing: Option<&str>) -> anyhow::Result<String> {
         .or_insert_with(|| serde_json::Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("OPENCODE_CONFIG_CONTENT.plugin must be an array"))?;
-    let plugin = std::env::var("BT_TRACE_OPENCODE_PLUGIN_SPEC")
-        .unwrap_or_else(|_| "@braintrust/trace-opencode/tracing".to_string());
+    let plugin = crate::env::var("BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC")
+        .unwrap_or_else(|| "@braintrust/trace-opencode/tracing".to_string());
     if !plugins.iter().any(|value| value.as_str() == Some(&plugin)) {
         plugins.push(serde_json::Value::String(plugin));
     }
