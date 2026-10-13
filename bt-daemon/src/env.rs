@@ -98,6 +98,8 @@ mod tests {
         const INTERNAL: &[&str] = &[
             "BT_TRACE_INVOCATION_SETTINGS",
             "BT_TRACE_MANAGED_RUN_ID",
+            // Identifies Cursor hooks installed by `bt trace setup`.
+            "BT_TRACE_CURSOR_USER_HOOK",
             // Fallback for `BRAINTRUST_BT_BIN` in the Cursor hook launchers.
             "BT_BIN",
         ];
