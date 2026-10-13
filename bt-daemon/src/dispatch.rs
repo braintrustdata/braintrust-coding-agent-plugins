@@ -43,14 +43,6 @@ enum SessionMsg {
 }
 
 /// Where to rebuild a session's translator state from, streamed at startup.
-pub struct ReplayPlan {
-    pub journal_path: PathBuf,
-    /// Events through this offset reached the backend before the prior daemon
-    /// stopped. Replay still rebuilds translator state from them, but must not
-    /// deliver them again.
-    pub acknowledged_through: u64,
-}
-
 pub(crate) struct SessionOptions {
     pub session_id: String,
     pub source: String,
@@ -59,6 +51,7 @@ pub(crate) struct SessionOptions {
     pub data_dir: PathBuf,
     pub translation: Arc<Translation>,
     pub cursor: crate::pipeline::journal::Cursor,
+    pub auth_provider: Option<Arc<dyn crate::AuthProvider>>,
 }
 
 /// Handle to one live session: its queue plus observable counters/state.
@@ -68,6 +61,8 @@ pub struct Session {
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
     source_progress: Arc<crate::pipeline::translation::Progress>,
+    pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
+    pub source_recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub source_error: Arc<Mutex<Option<String>>>,
     pub permalink: Arc<Mutex<Option<String>>>,
     last_activity: Mutex<Instant>,
@@ -82,6 +77,7 @@ impl Session {
     ) -> Arc<Session> {
         let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let counters = Arc::new(Counters::default());
+        let recovery = Arc::new(Mutex::new(None));
         let last_error = Arc::new(Mutex::new(None));
         let permalink = Arc::new(Mutex::new(None));
         let source = options.source.clone();
@@ -98,10 +94,13 @@ impl Session {
                 error: last_error.clone(),
                 permalink: permalink.clone(),
                 factory: sink_factory,
+                auth_provider: options.auth_provider,
+                recovery: recovery.clone(),
             },
         );
         let producer = options.translation;
         let source_error = producer.error.clone();
+        let source_recovery = producer.recovery.clone();
         let source_progress = producer.progress.clone();
         let errors = last_error.clone();
         let queued = counters.clone();
@@ -190,6 +189,8 @@ impl Session {
             last_error,
             source_error,
             source_progress,
+            recovery,
+            source_recovery,
             permalink,
             last_activity: Mutex::new(Instant::now()),
         })
@@ -586,6 +587,8 @@ mod tests {
             counters: Arc::new(Counters::default()),
             last_error: Arc::new(Mutex::new(None)),
             source_error: Arc::new(Mutex::new(None)),
+            recovery: Arc::new(Mutex::new(None)),
+            source_recovery: Arc::new(Mutex::new(None)),
             source_progress: Arc::new(crate::pipeline::translation::Progress::default()),
             permalink: Arc::new(Mutex::new(None)),
             last_activity: Mutex::new(Instant::now()),

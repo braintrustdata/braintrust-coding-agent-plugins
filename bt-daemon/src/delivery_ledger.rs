@@ -248,6 +248,20 @@ fn late_merge_id(row: &SpanRow, key: &str) -> String {
     format!("{}\u{1f}{key}", row.span_id)
 }
 
+/// The backend accepted delivery; only the local ledger write needs retrying.
+#[derive(Debug)]
+pub(crate) struct CommitFailure(pub anyhow::Error);
+impl std::fmt::Display for CommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for CommitFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 /// Wrap a sink with destination-scoped terminal-span suppression. If durable
 /// ledger state cannot be loaded, callers retain normal delivery rather than
 /// risking lost trace data.

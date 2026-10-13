@@ -21,3 +21,5 @@ pub(crate) mod journal;
 pub(crate) mod translation;
 
 pub(crate) mod consumer;
+
+pub(crate) mod recovery;

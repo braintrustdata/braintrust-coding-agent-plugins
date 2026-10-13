@@ -73,6 +73,7 @@ pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingE
     {
         daemon.settle_session_actors().await;
     }
+    let source_env = event.env.clone();
     match accept_event(daemon, event).await {
         Ok(()) => {
             if let Some(key) = ingress_key {
@@ -83,6 +84,17 @@ pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingE
         }
         Err(error) => {
             tracing::warn!(%error, "journaled ingress event could not be dispatched");
+        }
+    }
+    // Authentication and route discovery do not prevent canonical persistence.
+    match daemon.translation_for(&source_env).await {
+        Ok(source) => {
+            if let Err(error) = source.advance(journal_through).await {
+                tracing::warn!(%error,"source processing could not be queued");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error,"source journal could not be opened; captured events retained")
         }
     }
 }

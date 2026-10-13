@@ -1,6 +1,10 @@
 //! One ordered source consumer. Output publication is independent of route delivery.
 use super::journal::SpanJournal;
 use super::prepare::Prepare;
+use super::{
+    recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
+    Stage,
+};
 use crate::{
     journal::{ControlKind, JournalReader, JournalRecord, JournalWriter, PipelineControl},
     translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp},
@@ -47,6 +51,7 @@ pub(crate) struct Translation {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub journal: SpanJournal,
     pub error: Arc<Mutex<Option<String>>>,
+    pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub routes: AtomicUsize,
     pub progress: Arc<Progress>,
 }
@@ -76,13 +81,21 @@ impl Translation {
             requested: AtomicU64::new(committed),
             committed: AtomicU64::new(committed),
         });
+        let recovery = Arc::new(Mutex::new(None));
         let error = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::channel(64);
+        let state = match journal.source_failure().await? {
+            Some(raw) => State::Recovering(serde_json::from_str(&raw).unwrap_or_else(|_| {
+                Failure::revision(Boundary::Journal, committed + 1, raw, &options.version)
+            })),
+            None => State::Processing,
+        };
         let actor = Producer {
             options,
             progress: progress.clone(),
             journal: journal.clone(),
             error: error.clone(),
+            recovery: recovery.clone(),
             translator: None,
             reader: None,
             observers: Vec::new(),
@@ -91,7 +104,9 @@ impl Translation {
             bounds: HashMap::new(),
             position: 0,
             committed,
-            held: false,
+            state,
+            publication: None,
+            phase: Boundary::Journal,
         };
         let task = tokio::spawn(actor.run(rx));
         Ok(Arc::new(Self {
@@ -99,6 +114,7 @@ impl Translation {
             task: Mutex::new(Some(task)),
             journal,
             error,
+            recovery,
             routes: AtomicUsize::new(0),
             progress,
         }))
@@ -146,11 +162,25 @@ impl Translation {
     }
 }
 
+enum State {
+    Processing,
+    Recovering(Failure),
+}
+struct Publication {
+    input: u64,
+    observation: bool,
+    capture: Option<OriginSnapshot>,
+    ops: Option<Vec<SpanOp>>,
+    begun: bool,
+    complete: bool,
+}
+
 struct Producer {
     options: TranslationOptions,
     progress: Arc<Progress>,
     journal: SpanJournal,
     error: Arc<Mutex<Option<String>>>,
+    recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     translator: Option<Box<dyn AgentTranslator>>,
     reader: Option<JournalReader>,
     observers: Vec<Observation>,
@@ -159,15 +189,97 @@ struct Producer {
     bounds: HashMap<String, u64>,
     position: u64,
     committed: u64,
-    held: bool,
+    state: State,
+    publication: Option<Publication>,
+    phase: Boundary,
 }
 
 impl Producer {
     async fn run(mut self, mut rx: mpsc::Receiver<Command>) {
-        while let Some(command) = rx.recv().await {
+        let mut recorded = None;
+        let mut record_retry = 0;
+        let mut attempts = 0;
+        loop {
+            if let State::Recovering(mut failure) = self.state {
+                *self.error.lock().unwrap() = Some(failure.message());
+                *self.recovery.lock().unwrap() = Some(failure.info(false));
+                let encoded = serde_json::to_string(&failure).expect("source failure evidence");
+                if recorded.as_ref() != Some(&encoded) && super::recovery::now_ms() >= record_retry
+                {
+                    match self.journal.set_source_failure(Some(encoded.clone())).await {
+                        Ok(()) => recorded = Some(encoded.clone()),
+                        Err(error) => {
+                            record_retry = super::recovery::now_ms().saturating_add(1_000);
+                            tracing::warn!(%error,"source recovery evidence could not be persisted; original failure retained");
+                        }
+                    }
+                }
+                self.state = State::Recovering(failure.clone());
+                tokio::select! {
+                    command=rx.recv()=>match command {
+                        Some(Command::Stop)|None=>break,
+                        Some(Command::Barrier(reply))=> { let _=reply.send(self.boundary().await); },
+                        Some(Command::Observe(observer))=> { let _=self.observe_history(&observer).await; self.observers.push(*observer); },
+                        Some(Command::Advance(_))=>{},
+                        Some(Command::Control(kind,reply))=> {
+                            let result=self.append_control(kind).await;
+                            if let Err(error)=result { tracing::warn!(%error,"ordered control could not be persisted while source is recovering"); }
+                            let _=reply.send(self.boundary().await);
+                        },
+                    },
+                    _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},
+                }
+                if recorded.as_ref() != Some(&encoded)
+                    || matches!(
+                        (Recovery {
+                            config: None,
+                            version: &self.options.version
+                        })
+                        .process(&failure)
+                        .await,
+                        RecoveryOutcome::Waiting
+                    )
+                {
+                    continue;
+                }
+                *self.recovery.lock().unwrap() = Some(failure.info(true));
+                attempts = failure.attempt.saturating_add(1);
+                self.state = State::Processing;
+                let result = async {
+                    if self.publication.is_some() {
+                        self.publish().await?;
+                    } else if self.progress.requested.load(Ordering::Relaxed) > self.committed {
+                        self.reader = None;
+                        self.translator = None;
+                        self.position = 0;
+                    }
+                    self.advance(self.progress.requested.load(Ordering::Relaxed))
+                        .await
+                }
+                .await;
+                if let Err(error) = result {
+                    failure = self.failure(error, attempts);
+                    self.state = State::Recovering(failure);
+                    continue;
+                }
+                if let Err(error) = self.journal.set_source_failure(None).await {
+                    self.phase = Boundary::Journal;
+                    self.state = State::Recovering(self.failure(error, attempts));
+                    continue;
+                }
+                *self.error.lock().unwrap() = None;
+                *self.recovery.lock().unwrap() = None;
+                recorded = None;
+                attempts = 0;
+                continue;
+            }
+            let Some(command) = rx.recv().await else {
+                break;
+            };
             let result = match command {
                 Command::Stop => break,
                 Command::Observe(observer) => {
+                    self.phase = Boundary::Journal;
                     let result = self.observe_history(&observer).await;
                     self.observers.push(*observer);
                     result
@@ -184,26 +296,48 @@ impl Producer {
                 }
             };
             if let Err(error) = result {
-                self.held = true;
-                *self.error.lock() =
-                    Some(format!("translation held at {}: {error:#}", self.position));
+                self.state = State::Recovering(self.failure(error, attempts));
             }
         }
     }
+    fn failure(&self, error: anyhow::Error, attempt: u32) -> Failure {
+        let position = self.committed.saturating_add(1);
+        let mut failure = if matches!(self.phase, Boundary::Translation) {
+            Failure::revision(
+                self.phase,
+                position,
+                error.to_string(),
+                &self.options.version,
+            )
+        } else {
+            Failure::storage(&error, position, &self.options.version, attempt)
+        };
+        failure.through = self
+            .publication
+            .as_ref()
+            .map(|publication| publication.input);
+        failure
+    }
 
     async fn boundary(&mut self) -> Result<u64, String> {
-        if self.held {
-            return Err(self
-                .error
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "translation held".into()));
+        if let State::Recovering(failure) = &self.state {
+            return Err(failure.message());
         }
         self.journal.tail().await.map_err(|error| error.to_string())
     }
 
     async fn control(&mut self, kind: ControlKind) -> anyhow::Result<u64> {
-        anyhow::ensure!(!self.held, "translation is held");
+        anyhow::ensure!(
+            matches!(self.state, State::Processing),
+            "translation is recovering"
+        );
+        self.append_control(kind).await?;
+        self.advance(self.progress.requested.load(Ordering::Relaxed))
+            .await?;
+        self.journal.tail().await
+    }
+    async fn append_control(&mut self, kind: ControlKind) -> anyhow::Result<()> {
+        self.phase = Boundary::Journal;
         let mut bounds = HashMap::new();
         for path in self.bounds.keys() {
             let through = tokio::fs::metadata(path)
@@ -223,8 +357,7 @@ impl Producer {
         self.progress
             .requested
             .fetch_max(through, Ordering::Relaxed);
-        self.advance(through).await?;
-        self.journal.tail().await
+        Ok(())
     }
 
     async fn initialize(&mut self) -> anyhow::Result<()> {
@@ -260,10 +393,14 @@ impl Producer {
     }
 
     async fn advance(&mut self, through: u64) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.held, "translation is held");
+        anyhow::ensure!(
+            matches!(self.state, State::Processing),
+            "translation is recovering"
+        );
         if self.translator.is_none() && through <= self.committed {
             return Ok(());
         }
+        self.phase = Boundary::Journal;
         self.initialize().await?;
         let through = through.max(self.committed);
         if self.position >= through {
@@ -274,6 +411,7 @@ impl Producer {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("event journal is missing"))?;
         reader.extend(through);
+        self.phase = Boundary::Journal;
         while let Some(entry) = self
             .reader
             .as_mut()
@@ -318,6 +456,7 @@ impl Producer {
                         bt_version: self.options.version.clone(),
                     };
                     self.capture = Some(capture.clone());
+                    self.phase = Boundary::Translation;
                     (
                         self.translator
                             .as_mut()
@@ -333,6 +472,7 @@ impl Producer {
                         self.position = input;
                         continue;
                     }
+                    self.phase = Boundary::Translation;
                     let translator = self
                         .translator
                         .as_mut()
@@ -355,48 +495,91 @@ impl Producer {
                     continue;
                 }
             };
-            let publish = input > self.committed;
-            if publish {
-                self.journal.begin(input, observation).await?;
+            self.publication = Some(Publication {
+                input,
+                observation,
+                capture,
+                ops: Some(first),
+                begun: false,
+                complete: false,
+            });
+            self.publish().await?;
+            self.phase = Boundary::Journal;
+            self.position = input;
+        }
+        Ok(())
+    }
+
+    /// Each chunk stays owned until its local write succeeds. A commit retry
+    /// cannot call translation or advance to the following event.
+    async fn publish(&mut self) -> anyhow::Result<()> {
+        let mut pending = self.publication.take().expect("pending publication");
+        let result = async {
+            let publish = pending.input > self.committed;
+            let ctx = SessionCtx {
+                session_id: self.options.session_id.clone(),
+                config: None,
+            };
+            if publish && !pending.begun {
+                self.phase = Boundary::Journal;
+                self.journal
+                    .begin(pending.input, pending.observation)
+                    .await?;
+                pending.begun = true;
             }
-            let mut next = Some(first);
-            while let Some(mut ops) = next {
-                for op in &mut ops {
-                    let insert = matches!(op, SpanOp::Insert(_));
-                    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                    if insert {
-                        self.origins.entry(row.span_id.clone()).or_insert_with(|| {
-                            capture.clone().unwrap_or_else(|| OriginSnapshot {
-                                plugin_version: None,
-                                source_version: None,
-                                bt_version: self.options.version.clone(),
-                            })
-                        });
+            while !pending.complete {
+                if let Some(ops) = pending.ops.as_mut() {
+                    for op in ops.iter_mut() {
+                        let insert = matches!(op, SpanOp::Insert(_));
+                        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                        if insert
+                            && (row.is_turn
+                                || (row.span_type == SpanType::Task
+                                    && row.parent_span_ids.is_empty()))
+                        {
+                            if let Some(capture) = &pending.capture {
+                                self.origins
+                                    .entry(row.span_id.clone())
+                                    .or_insert_with(|| capture.clone());
+                            }
+                        }
+                        row.origin = self.origins.get(&row.span_id).cloned();
                     }
-                    row.origin = self.origins.get(&row.span_id).cloned();
-                }
-                if observation {
-                    for observer in &self.observers {
-                        Self::observe(&self.options, &ops, observer).await?;
+                    self.phase = Boundary::Journal;
+                    if pending.observation {
+                        for observer in &self.observers {
+                            Self::observe(&self.options, ops, observer).await?;
+                        }
                     }
+                    if publish {
+                        self.journal.append(pending.input, ops).await?;
+                    }
+                    pending.ops = None;
                 }
-                if publish {
-                    self.journal.append(input, &ops).await?;
-                }
-                next = self
+                self.phase = Boundary::Translation;
+                pending.ops = self
                     .translator
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("translator is missing"))?
                     .drain_pending(&ctx)?;
+                pending.complete = pending.ops.is_none();
             }
             if publish {
-                self.journal.commit(input).await?;
-                self.committed = input;
-                self.progress.committed.store(input, Ordering::Relaxed);
+                self.phase = Boundary::Journal;
+                self.journal.commit(pending.input).await?;
+                self.committed = pending.input;
+                self.progress
+                    .committed
+                    .store(pending.input, Ordering::Relaxed);
             }
-            self.position = input;
+            self.position = pending.input;
+            Ok(())
         }
-        Ok(())
+        .await;
+        if result.is_err() {
+            self.publication = Some(pending);
+        }
+        result
     }
 
     async fn observe_history(&mut self, observer: &Observation) -> anyhow::Result<()> {
@@ -502,5 +685,81 @@ mod tests {
         delivery.into_completed().await.ok().unwrap();
         route.rewind().await.unwrap();
         assert_eq!(route.completed_position(), tail);
+    }
+    struct CountedTranslation(Arc<AtomicU64>);
+    impl AgentTranslator for CountedTranslation {
+        fn handle(
+            &mut self,
+            _: &crate::wire::Envelope,
+            _: &SessionCtx,
+        ) -> anyhow::Result<Vec<SpanOp>> {
+            panic!("publication retry must not translate the event again")
+        }
+        fn drain_pending(&mut self, _: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+    #[tokio::test]
+    async fn failed_append_and_commit_retain_the_built_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spans.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let event_path = tmp.path().join("events.ndjson");
+        let drains = Arc::new(AtomicU64::new(0));
+        let mut producer = Producer {
+            options: TranslationOptions {
+                source: "debug".into(),
+                session_id: "test".into(),
+                namespace: "test".into(),
+                version: "test".into(),
+                data_dir: tmp.path().into(),
+                events: Arc::new(tokio::sync::Mutex::new(
+                    JournalWriter::open_path(&event_path).await.unwrap(),
+                )),
+                event_path,
+                registry: Arc::new(Registry::default_agents()),
+                correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
+                correlation_changed: Arc::new(Notify::new()),
+            },
+            progress: Arc::new(Progress::default()),
+            journal: journal.clone(),
+            error: Arc::new(Mutex::new(None)),
+            recovery: Arc::new(Mutex::new(None)),
+            translator: Some(Box::new(CountedTranslation(drains.clone()))),
+            reader: None,
+            observers: Vec::new(),
+            origins: HashMap::new(),
+            bounds: HashMap::new(),
+            position: 0,
+            committed: 0,
+            state: State::Processing,
+            phase: Boundary::Journal,
+            publication: Some(Publication {
+                input: 10,
+                observation: true,
+                capture: None,
+                ops: Some(vec![SpanOp::Insert(SpanRow {
+                    span_id: "built".into(),
+                    ..Default::default()
+                })]),
+                begun: false,
+                complete: false,
+            }),
+        };
+        db.execute_batch("CREATE TRIGGER fail_append BEFORE INSERT ON ops BEGIN SELECT RAISE(FAIL,'append'); END;").unwrap();
+        assert!(producer.publish().await.is_err());
+        assert_eq!(drains.load(Ordering::Relaxed), 0);
+        assert_eq!(journal.translated_through().await.unwrap(), 0);
+        db.execute_batch("DROP TRIGGER fail_append; CREATE TRIGGER fail_commit BEFORE UPDATE OF committed ON batches BEGIN SELECT RAISE(FAIL,'commit'); END;").unwrap();
+        assert!(producer.publish().await.is_err());
+        assert_eq!(drains.load(Ordering::Relaxed), 1);
+        assert_eq!(journal.tail().await.unwrap(), 0);
+        db.execute_batch("DROP TRIGGER fail_commit").unwrap();
+        producer.publish().await.unwrap();
+        assert_eq!(drains.load(Ordering::Relaxed), 1);
+        assert_eq!(journal.translated_through().await.unwrap(), 10);
+        assert_eq!(journal.tail().await.unwrap(), 1);
     }
 }

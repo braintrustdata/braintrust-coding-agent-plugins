@@ -335,6 +335,12 @@ impl Daemon {
                 source: s.source.clone(),
                 route: serde_json::from_str(&key.route).ok(),
                 queued: s.pending(),
+                recovery: s
+                    .recovery
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(|| s.source_recovery.lock().unwrap().clone()),
                 spans_emitted: s.counters.spans_emitted.load(Ordering::Relaxed),
                 permalink: s.permalink.lock().clone(),
                 last_error: s
@@ -359,6 +365,7 @@ impl Daemon {
                 source: source.clone(),
                 route: serde_json::from_str(&key.route).ok(),
                 queued: 0,
+                recovery: None,
                 spans_emitted: 0,
                 permalink: None,
                 last_error: Some(error.clone()),
@@ -390,6 +397,14 @@ impl Daemon {
                 "awaiting parent process confirmation; standalone fallback within 5 seconds"
             };
             if let Some(session) = existing {
+                session.recovery = state
+                    .recovery
+                    .as_ref()
+                    .map(|failure| failure.info(false))
+                    .or(session.recovery.take());
+                if let Some(failure) = &state.recovery {
+                    session.last_error = Some(failure.message());
+                }
                 session.queued = session.queued.saturating_add(state.events.len() as u64);
                 if session.last_error.is_none() {
                     session.last_error = Some(message.to_string());
@@ -400,9 +415,15 @@ impl Daemon {
                     source: first.env.source.clone(),
                     route: route.cloned(),
                     queued: state.events.len() as u64,
+                    recovery: state.recovery.as_ref().map(|failure| failure.info(false)),
                     spans_emitted: 0,
                     permalink: None,
-                    last_error: Some(message.to_string()),
+                    last_error: Some(
+                        state
+                            .recovery
+                            .as_ref()
+                            .map_or_else(|| message.to_string(), |failure| failure.message()),
+                    ),
                 });
             }
         }
