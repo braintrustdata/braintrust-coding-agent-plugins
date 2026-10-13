@@ -750,7 +750,7 @@ impl SessionActor {
                                         "failed to persist span plugin diagnostic: {error}");
                                 }
                                 self.set_error(format!(
-                                    "span plugin {} failed: {}",
+                                    "span plugin {} failed; span operations are being discarded: {}",
                                     failure.path.display(),
                                     failure.message
                                 ));
