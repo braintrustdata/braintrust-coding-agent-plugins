@@ -720,12 +720,7 @@ impl SessionActor {
         while let Some(ops) = next {
             if !ops.is_empty() {
                 if mode.observes_correlation() {
-                    let changed = self.correlation.observe_ops(
-                        &self.correlation_key,
-                        &self.route,
-                        config,
-                        &ops,
-                    );
+                    let changed = self.observe_ops(&ops, config);
                     correlation_changed |= changed;
                     if changed {
                         self.persist_correlation_if_changed(true).await;
@@ -855,9 +850,7 @@ impl SessionActor {
         };
         while let Some(ops) = next {
             if !ops.is_empty() {
-                let _ =
-                    self.correlation
-                        .observe_ops(&self.correlation_key, &self.route, config, &ops);
+                let _ = self.observe_ops(&ops, config);
             }
             next = match translator.drain_pending(ctx) {
                 Ok(next) => next,
@@ -898,6 +891,17 @@ impl SessionActor {
         self.persist_correlation_if_changed(correlation_changed)
             .await;
         delivered
+    }
+
+    fn observe_ops(
+        &self,
+        ops: &[crate::translate::SpanOp],
+        config: &crate::wire::SessionConfig,
+    ) -> bool {
+        let mut routed = ops.to_vec();
+        crate::pipeline::prepare::Prepare::new(&self.source).apply(&mut routed, config);
+        self.correlation
+            .observe_ops(&self.correlation_key, &self.route, config, &routed)
     }
 
     async fn persist_correlation_if_changed(&self, changed: bool) {
