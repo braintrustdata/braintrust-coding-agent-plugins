@@ -1069,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn mounted_cursor_hook_suppresses_only_plugin_capture_before_host_resolution() {
-        const CHILD_ENV: &str = "BT_TEST_MOUNTED_CURSOR_HOOK";
+        const CHILD_ENV: &str = "BRAINTRUST_TEST_MOUNTED_CURSOR_HOOK";
         if std::env::var_os(CHILD_ENV).is_some() {
             let services = Arc::new(RecordingHost::new(Some("route requested"), None));
             let mut args = hook_args();
