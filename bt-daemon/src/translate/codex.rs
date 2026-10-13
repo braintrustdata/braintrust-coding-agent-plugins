@@ -183,6 +183,7 @@ struct Scope {
     open_llm: Option<OpenLlm>,
     open_tools: HashMap<String, (String, String)>, // call_id -> (tool span_id, turn_id)
     last_turn_end_ms: Option<i64>,
+    last_turn_output: Option<Value>,
     turn_seq: u32,
     // Subagent-only:
     agent_id: Option<String>,
@@ -1275,6 +1276,9 @@ impl CodexTranslator {
         let output = str_field(payload, "last_agent_message")
             .or_else(|| str_field(payload, "last_assistant_message"))
             .map(|s| json!(s));
+        if let Some(output) = &output {
+            scope.last_turn_output = Some(output.clone());
+        }
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn.span_id,
             root_span_id: self.effective_root_span_id.clone(),
@@ -1400,17 +1404,20 @@ impl CodexTranslator {
         if !self.root_opened {
             return;
         }
-        let end_ms = self
+        let main_scope = self
             .main_path
             .as_ref()
-            .and_then(|path| self.scopes.get(path))
+            .and_then(|path| self.scopes.get(path));
+        let end_ms = main_scope
             .and_then(|scope| scope.last_turn_end_ms)
             .unwrap_or(fallback_ts);
+        let output = main_scope.and_then(|scope| scope.last_turn_output.clone());
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: self.external_parent_span_id.clone().into_iter().collect(),
             end_ms: Some(end_ms),
+            output,
             late_merge_key: Some(format!("session:stop:{end_ms}")),
             ..Default::default()
         }));
@@ -1552,6 +1559,7 @@ impl Scope {
             open_llm: None,
             open_tools: HashMap::new(),
             last_turn_end_ms: None,
+            last_turn_output: None,
             turn_seq: 0,
             agent_id: None,
             agent_type: None,
