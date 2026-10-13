@@ -603,7 +603,7 @@ async fn rejected_flush_blocks_checkpoints_until_journal_replay() {
 
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
-    let socket = tmp.path().join("daemon.sock");
+    let socket = test_endpoint(tmp.path());
     let sink = Arc::new(RejectOnce::default());
     let start = || {
         let args = ServeArgs {
