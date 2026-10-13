@@ -3,4 +3,5 @@ allowBuilds:
   msgpackr-extract: false
 overrides:
   "@vitest/mocker": 4.1.11
+  tinypool: 2.1.2
   vitest: 4.1.11
