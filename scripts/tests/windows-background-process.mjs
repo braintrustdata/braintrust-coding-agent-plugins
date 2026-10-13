@@ -154,7 +154,7 @@ async function run() {
     const probe = join(directory, "console probe.exe")
     await execFileAsync("rustc", [
       "--edition=2021", join(repoRoot, "scripts/tests/windows-console-probe.rs"), "-o", probe,
-    ], { windowsHide: true, timeout: 60_000 })
+    ], { windowsHide: true, timeout: 180_000 })
     let failure
     try {
       await execFileAsync(probe, ["--launch", directory, process.execPath, script, "--exercise", directory], {
