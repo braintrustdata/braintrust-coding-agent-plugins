@@ -9,7 +9,6 @@ use tokio::sync::{mpsc, oneshot};
 
 struct Request {
     config: SessionConfig,
-    versions: (Option<String>, Option<String>),
     operation: Operation,
     reply: oneshot::Sender<Response>,
 }
@@ -53,7 +52,6 @@ impl Completion for Forward {
 pub(crate) struct RoutingSink {
     tx: mpsc::Sender<Delivery<Request>>,
     config: Option<SessionConfig>,
-    versions: (Option<String>, Option<String>),
     pending: bool,
     permalink: Option<String>,
 }
@@ -73,10 +71,6 @@ impl RoutingSink {
             while let Ok(Some(delivery)) = InputPort::receive(&mut rx).await {
                 let request = delivery.value();
                 sink.configure(&request.config);
-                sink.set_capture_versions(
-                    request.versions.0.as_deref(),
-                    request.versions.1.as_deref(),
-                );
                 let result = match &request.operation {
                     Operation::Emit(ops) => {
                         let mut ops = ops.clone();
@@ -150,7 +144,6 @@ impl RoutingSink {
         Self {
             tx,
             config: None,
-            versions: (None, None),
             pending: false,
             permalink: None,
         }
@@ -164,7 +157,6 @@ impl RoutingSink {
         let (reply, receive) = oneshot::channel();
         let delivery = Delivery::new(operation, Forward).map(|operation| Request {
             config,
-            versions: self.versions.clone(),
             operation,
             reply,
         });
@@ -186,9 +178,6 @@ impl RoutingSink {
 impl Sink for RoutingSink {
     fn configure(&mut self, config: &SessionConfig) {
         self.config = Some(config.clone());
-    }
-    fn set_capture_versions(&mut self, plugin: Option<&str>, source: Option<&str>) {
-        self.versions = (plugin.map(str::to_owned), source.map(str::to_owned));
     }
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
         self.request(Operation::Emit(ops.to_vec())).await

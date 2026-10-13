@@ -319,7 +319,7 @@ impl ImportProcessor {
                             env.config.as_ref(),
                             &self.opts.version,
                         )
-                        .await,
+                        .await?,
                     );
                     self.sessions.insert(
                         sid.clone(),

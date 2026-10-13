@@ -59,7 +59,7 @@ impl ConsumerOptions {
             Some(config),
             &self.version,
         )
-        .await;
+        .await?;
         let mut sink = RoutingSink::spawn(
             Box::new(ledger),
             self.source.clone(),
@@ -354,8 +354,37 @@ impl Consumer {
                     };
                     let current = settings.borrow_and_update().clone();
                     if sink.is_none() {
+                        journal
+                            .bind(&cursor.route, &current)
+                            .await
+                            .map_err(|error| {
+                                if error
+                                    .downcast_ref::<super::journal::BindingChanged>()
+                                    .is_some()
+                                {
+                                    Box::new((
+                                        Failure::legacy(
+                                            error.to_string(),
+                                            cursor.completed_position() + 1,
+                                            &current,
+                                        ),
+                                        Work::Resubmit,
+                                    ))
+                                } else {
+                                    options.storage(&error, &cursor, attempts, Work::Resubmit)
+                                }
+                            })?;
                         sink = Some(options.sink(&current).await.map_err(|error| {
-                            options.routing(&error, &cursor, &current, attempts)
+                            if error.downcast_ref::<std::io::Error>().is_some()
+                                || error.downcast_ref::<serde_json::Error>().is_some()
+                            {
+                                let mut held =
+                                    options.storage(&error, &cursor, attempts, Work::Resubmit);
+                                held.0.boundary = Boundary::Ledger;
+                                held
+                            } else {
+                                options.routing(&error, &cursor, &current, attempts)
+                            }
                         })?);
                     }
                     let routing = sink.as_mut().ok_or_else(|| {
@@ -707,6 +736,69 @@ mod tests {
         assert_eq!(record.submitted.load(Ordering::SeqCst), 2);
         consumer.shutdown().await;
     }
+    #[tokio::test]
+    async fn real_sdk_rejection_holds_until_relevant_configuration_changes() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let rejection = Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid row"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        stored(&journal).await;
+        let route = SessionRoute {
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: Some("project".into()),
+                project_name: None,
+            }),
+            ..Default::default()
+        };
+        let mut opts = options(tmp.path(), &route, Arc::new(Recording::default()));
+        opts.config.auth.api_url = Some(server.uri());
+        opts.config.auth.app_url = Some(server.uri());
+        opts.factory = Arc::new(crate::BraintrustSinkFactory::new(
+            crate::BraintrustSinkConfig::default(),
+        ));
+        let mut config = opts.config.clone();
+        let consumer = Consumer::spawn(
+            journal.clone(),
+            journal.subscribe(&route, 0).await.unwrap(),
+            opts,
+        );
+        wait_for(|| consumer.error.lock().unwrap().is_some()).await;
+        assert_eq!(*consumer.progress.borrow(), 0);
+        drop(rejection);
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A new credential cannot cure a permanently rejected span body.
+        config.auth.token = "replacement-token".into();
+        consumer.configure(config.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(*consumer.progress.borrow(), 0);
+        config.tags.push("corrected".into());
+        consumer.configure(config);
+        wait_for(|| *consumer.progress.borrow() == 1).await;
+        assert!(consumer.error.lock().unwrap().is_none());
+        consumer.shutdown().await;
+    }
+
     #[tokio::test]
     async fn editing_a_predecessor_releases_a_later_plugins_hold() {
         let tmp = tempfile::tempdir().unwrap();

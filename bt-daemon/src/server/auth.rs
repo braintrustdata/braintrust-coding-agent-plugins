@@ -33,7 +33,49 @@ pub(crate) async fn resolve_route_auth(
     Ok(lease)
 }
 
+/// A route refresh updates the same in-memory lease cache used by later hooks.
+/// Persisted head identity remains independent of the credential itself.
+struct RouteAuthProvider {
+    provider: Arc<dyn AuthProvider>,
+    key: DeliveryKey,
+    states: Arc<tokio::sync::Mutex<HashMap<DeliveryKey, SessionAuthState>>>,
+}
+#[async_trait::async_trait]
+impl AuthProvider for RouteAuthProvider {
+    async fn resolve(
+        &self,
+        selection: &AuthSelection,
+        reason: AuthResolveReason,
+    ) -> anyhow::Result<AuthLease> {
+        let lease = self.provider.resolve(selection, reason).await?;
+        let mut states = self.states.lock().await;
+        if let Some(state) = states.get_mut(&self.key) {
+            anyhow::ensure!(
+                lease.selection == state.lease.selection,
+                "credential refresh changed the pinned auth selection"
+            );
+            anyhow::ensure!(
+                lease.auth.api_url == state.lease.auth.api_url
+                    && lease.auth.org_id == state.lease.auth.org_id
+                    && lease.auth.org_name == state.lease.auth.org_name,
+                "credential refresh changed the pinned backend or organization"
+            );
+            state.lease = lease.clone();
+        }
+        Ok(lease)
+    }
+}
+
 impl Daemon {
+    pub(super) fn route_auth_provider(&self, key: &DeliveryKey) -> Option<Arc<dyn AuthProvider>> {
+        self.auth_provider.as_ref().map(|provider| {
+            Arc::new(RouteAuthProvider {
+                provider: provider.clone(),
+                key: key.clone(),
+                states: self.session_auth.clone(),
+            }) as Arc<dyn AuthProvider>
+        })
+    }
     pub(super) async fn configure_event(&self, env: &mut Envelope) -> anyhow::Result<DeliveryKey> {
         let Some(provider) = &self.auth_provider else {
             anyhow::bail!("daemon host has no Braintrust auth provider");

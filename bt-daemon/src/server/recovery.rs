@@ -73,6 +73,50 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             }
             before = through;
         }
+        // Heads are the authoritative subscriptions, including dormant routes
+        // and canonical profile IDs absent from older captured envelopes.
+        let templates: Vec<_> = latest_by_route.values().cloned().collect();
+        let mut sources = HashSet::new();
+        for template in templates {
+            if !sources.insert((template.env.source.clone(), template.env.session_id.clone())) {
+                continue;
+            }
+            let span_path = daemon.data_dir.join("pipeline").join(format!(
+                "{}.sqlite",
+                crate::ids::session_storage_id(&template.env.source, &template.env.session_id)
+            ));
+            if !tokio::fs::try_exists(&span_path).await.unwrap_or(false) {
+                continue;
+            }
+            let Ok(journal) = crate::pipeline::journal::SpanJournal::open(&span_path).await else {
+                continue;
+            };
+            let Ok(routes) = journal.routes().await else {
+                continue;
+            };
+            for route in routes {
+                let matching = latest_by_route
+                    .iter()
+                    .find(|(_, event)| {
+                        event.env.source == template.env.source
+                            && event.env.session_id == template.env.session_id
+                            && event
+                                .env
+                                .route
+                                .as_ref()
+                                .is_some_and(|recorded| recorded.same_route(&route))
+                    })
+                    .map(|(key, _)| key.clone());
+                let mut event = matching
+                    .and_then(|key| latest_by_route.remove(&key))
+                    .unwrap_or_else(|| template.clone());
+                event.env.route = Some(route.clone());
+                latest_by_route.insert(
+                    serde_json::to_string(&route).expect("persisted route"),
+                    event,
+                );
+            }
+        }
         for mut event in latest_by_route.into_values() {
             if pending.contains(&(
                 event.env.source.clone(),
