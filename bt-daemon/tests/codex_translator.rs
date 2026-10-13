@@ -1701,10 +1701,7 @@ fn codex_subagent_with_malformed_optional_type_nests_under_spawning_turn() {
 
     let reg = Registry::default_agents();
     let mut tr = reg.create("codex", "s");
-    let ctx = SessionCtx {
-        session_id: "s".into(),
-        config: None,
-    };
+    let ctx = configured_ctx("s", json!({"team":"pipeline"}));
 
     let mut ops = Vec::new();
     // The spawn_agent transcript record is first observed on this same
@@ -1791,6 +1788,9 @@ fn codex_subagent_with_malformed_optional_type_nests_under_spawning_turn() {
     let main_turn = find(&rows, SpanType::Task, "turn: t1");
     let subagent = find(&rows, SpanType::Task, "subagent: a1");
     let sub_turn = find(&rows, SpanType::Task, "turn: st1");
+    assert_eq!(root.tags.as_ref().unwrap(), &["ci", "docs"]);
+    assert_eq!(subagent.tags.as_ref().unwrap(), &["ci", "docs"]);
+    assert!(sub_turn.tags.is_none(), "agent tags must not tag its turns");
 
     // Whole thing is one trace under the main root.
     for r in [main_turn, subagent, sub_turn] {

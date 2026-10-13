@@ -31,6 +31,16 @@ impl Prepare {
             if is_root {
                 self.roots.insert(row.span_id.clone());
             }
+            // Native subagent identity is independent of route attachment.
+            let is_subagent = row.span_type == SpanType::Task
+                && !row.is_turn
+                && row.metadata.as_ref().is_some_and(|metadata| {
+                    metadata
+                        .get("is_subagent")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                        || (self.source == "codex" && metadata.get("agent_id").is_some())
+                });
             if let Some(root) = &root {
                 row.root_span_id = root.clone();
             }
@@ -38,30 +48,30 @@ impl Prepare {
                 if let Some(parent) = &parent {
                     row.parent_span_ids = vec![parent.clone()];
                 }
-                if insert {
-                    let metadata = row.metadata.get_or_insert_with(|| serde_json::json!({}));
-                    if let Some(metadata) = metadata.as_object_mut() {
-                        if let Some(extra) = config
-                            .additional_metadata
-                            .as_ref()
-                            .and_then(|v| v.as_object())
-                        {
-                            for (key, value) in extra {
-                                if !key.starts_with("_bt_") {
-                                    metadata.entry(key.clone()).or_insert_with(|| value.clone());
-                                }
-                            }
-                        }
-                        if self.source == "codex" {
-                            if let Some(project) = config.project_name() {
-                                metadata.insert("project".into(), project.into());
+            }
+            if insert && (is_root || (self.source == "opencode" && is_subagent)) {
+                let metadata = row.metadata.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(metadata) = metadata.as_object_mut() {
+                    if let Some(extra) = config
+                        .additional_metadata
+                        .as_ref()
+                        .and_then(|v| v.as_object())
+                    {
+                        for (key, value) in extra {
+                            if !key.starts_with("_bt_") {
+                                metadata.entry(key.clone()).or_insert_with(|| value.clone());
                             }
                         }
                     }
-                    if !config.tags.is_empty() {
-                        row.tags = Some(config.tags.clone());
+                    if self.source == "codex" {
+                        if let Some(project) = config.project_name() {
+                            metadata.insert("project".into(), project.into());
+                        }
                     }
                 }
+            }
+            if insert && (is_root || is_subagent) && !config.tags.is_empty() {
+                row.tags = Some(config.tags.clone());
             }
         }
     }
