@@ -738,7 +738,18 @@ impl SessionActor {
                         }
                         Err(e) => {
                             delivered = false;
-                            self.set_error(format!("{emit_error}: {e}"));
+                            if let Some(failure) =
+                                e.downcast_ref::<crate::pipeline::routing::EmitFailure>()
+                            {
+                                self.counters
+                                    .spans_emitted
+                                    .fetch_add(failure.emitted, Ordering::Relaxed);
+                                if failure.report {
+                                    self.set_error(format!("{emit_error}: {e}"));
+                                }
+                            } else {
+                                self.set_error(format!("{emit_error}: {e}"));
+                            }
                         }
                     }
                 }
