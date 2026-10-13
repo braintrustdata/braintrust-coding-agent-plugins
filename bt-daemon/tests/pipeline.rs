@@ -587,7 +587,7 @@ async fn shutdown(socket: &Path) {
 /// A failed flush consumes its batch, just like checked SDK delivery. An empty
 /// subsequent flush must not acknowledge that lost batch's source events.
 #[tokio::test]
-async fn rejected_flush_blocks_checkpoints_until_journal_replay() {
+async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -656,24 +656,39 @@ async fn rejected_flush_blocks_checkpoints_until_journal_replay() {
         .await
         .unwrap();
     flush_session(session, &socket, 5_000).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (head, tail) = head_and_tail(&data_dir);
+            if head == tail && tail > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        sink.emitted.load(Ordering::SeqCst) >= 5,
+        "rejected initial rows must be resubmitted"
+    );
     shutdown(&socket).await;
     handle.await.unwrap();
 
     let journal_path = source_journal_path(&data_dir, "debug", session);
     let journal = std::fs::read_to_string(&journal_path).unwrap();
     assert!(!journal.contains("delivery_checkpoint"), "{journal}");
-    assert_eq!(sink.flushes.load(Ordering::SeqCst), 1);
+    assert!(sink.flushes.load(Ordering::SeqCst) > 1);
     let emitted_before_restart = sink.emitted.load(Ordering::SeqCst);
 
     let handle = start();
     wait_for(&socket).await;
     flush_session(session, &socket, 5_000).await.unwrap();
-    assert!(sink.emitted.load(Ordering::SeqCst) > emitted_before_restart);
+    assert_eq!(sink.emitted.load(Ordering::SeqCst), emitted_before_restart);
     let (head, tail) = head_and_tail(&data_dir);
     assert!(tail > 0);
     assert_eq!(
         head, tail,
-        "restart completes the durable SpanOp subscription"
+        "automatic retry completed the durable subscription before restart"
     );
     shutdown(&socket).await;
     handle.await.unwrap();
@@ -1989,7 +2004,7 @@ async fn span_plugins_transform_live_and_replayed_rows_with_daemon_environment()
 }
 
 #[tokio::test]
-async fn a_failing_span_plugin_discards_rows_and_persists_the_raw_exception() {
+async fn a_failing_span_plugin_holds_rows_and_persists_the_raw_exception() {
     let (data_dir, socket, handle, tmp) = start_daemon().await;
     let plugin = tmp.path().join("bad.mjs");
     let later_plugin = tmp.path().join("later.mjs");
@@ -2027,7 +2042,7 @@ async fn a_failing_span_plugin_discards_rows_and_persists_the_raw_exception() {
         status.sessions[0]
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("span operations are being discarded")),
+            .is_some_and(|error| error.contains("delivery is held")),
         "unexpected plugin status: {:?}",
         status.sessions[0].last_error
     );
@@ -2061,6 +2076,20 @@ async fn a_failing_span_plugin_discards_rows_and_persists_the_raw_exception() {
         .await
         .unwrap();
 
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if flush_session("plugin-failure", &socket, 5000)
+                .await
+                .unwrap()
+                .flushed
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
     assert!(
         spans.contains("after-failure:"),
@@ -3372,6 +3401,125 @@ async fn status_counts_rows_emitted_before_a_plugin_failure() {
         .as_ref()
         .unwrap()
         .contains("rejected event"));
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_credentials_recover_without_another_native_event() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct AvailableAuth {
+        ready: Arc<AtomicBool>,
+        inner: TestAuthProvider,
+    }
+    #[async_trait]
+    impl AuthProvider for AvailableAuth {
+        async fn resolve(
+            &self,
+            selection: &AuthSelection,
+            reason: AuthResolveReason,
+        ) -> anyhow::Result<AuthLease> {
+            anyhow::ensure!(self.ready.load(Ordering::SeqCst), "credential unavailable");
+            self.inner.resolve(selection, reason).await
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let ready = Arc::new(AtomicBool::new(false));
+    let mut options = debug_serve_options("test", &data_dir);
+    options.auth_provider = Some(Arc::new(AvailableAuth {
+        ready: ready.clone(),
+        inner: TestAuthProvider {
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+            first_lease_expired: false,
+        },
+    }));
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let handle = tokio::spawn(async move { run_serve(args, options).await.unwrap() });
+    wait_for(&socket).await;
+    forward_envelope(
+        &envelope("auth-recovery", "SessionStart", 1),
+        &socket,
+        &dummy_host(),
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session("auth-recovery", &socket, 5000).await.unwrap();
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("auth-recovery".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status.sessions.iter().any(|s| s
+        .recovery
+        .as_ref()
+        .is_some_and(|r| r.stage == "credentials")));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_dir(data_dir.join("pipeline"))
+                .ok()
+                .is_some_and(|mut entries| entries.next().is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let db_path = std::fs::read_dir(data_dir.join("pipeline"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "sqlite"))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let db = rusqlite::Connection::open(&db_path).unwrap();
+            let count: u64 = db
+                .query_row(
+                    "SELECT count(*) FROM ops JOIN batches USING(input) WHERE committed=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    ready.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(data_dir.join("spans/auth-recovery.ndjson"))
+                .is_ok_and(|s| s.lines().count() >= 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        flush_session("auth-recovery", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
     shutdown(&socket).await;
     handle.await.unwrap();
 }

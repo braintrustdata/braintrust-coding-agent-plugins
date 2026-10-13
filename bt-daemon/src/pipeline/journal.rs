@@ -75,6 +75,7 @@ impl SpanJournal {
                 CREATE TABLE IF NOT EXISTS heads (
                     route TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
                     failure TEXT);
+                CREATE TABLE IF NOT EXISTS recovery (id INTEGER PRIMARY KEY CHECK(id=1),failure TEXT);
                 ",
             )?;
             if version == 1 {
@@ -279,6 +280,28 @@ impl SpanJournal {
         }).await
     }
 
+    pub async fn source_failure(&self) -> anyhow::Result<Option<String>> {
+        self.with_db(|db| {
+            Ok(db
+                .query_row("SELECT failure FROM recovery WHERE id=1", [], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten())
+        })
+        .await
+    }
+    pub async fn set_source_failure(&self, failure: Option<String>) -> anyhow::Result<()> {
+        self.with_db(move |db| {
+            db.execute(
+                "INSERT OR REPLACE INTO recovery(id,failure) VALUES(1,?)",
+                [failure],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn failure(&self, route: &str) -> anyhow::Result<Option<String>> {
         let route = route.to_owned();
         self.with_db(move |db| {
@@ -424,7 +447,7 @@ impl Completion for HeadCompletion {
                 if head >= through {
                     return Ok(());
                 }
-                anyhow::ensure!(head == expected, "completion cannot skip unresolved input");
+                anyhow::ensure!(head >= expected, "completion cannot skip unresolved input");
                 tx.execute(
                     "UPDATE heads SET position=?, failure=NULL WHERE route=?",
                     params![through, route],
