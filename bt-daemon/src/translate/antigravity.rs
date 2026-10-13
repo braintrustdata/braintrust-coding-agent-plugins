@@ -8,8 +8,7 @@
 use super::git::GitMetadataCache;
 use super::tool::{with_tool_approval, without_nulls, ToolApproval};
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
-    TranslatorFactory,
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
@@ -95,28 +94,13 @@ impl AntigravityTranslator {
             return;
         }
         self.root_open = true;
-        let (parent_span_id, external_root_span_id) = ctx
-            .config
-            .as_ref()
-            .map(|config| config.attached_span_ids())
-            .unwrap_or_default();
-        if let Some(external_root) = external_root_span_id {
-            self.root_span_id = external_root;
-        }
-        self.session_parent_span_ids = parent_span_id.into_iter().collect();
-
         let workspace = event
             .payload
             .get("workspacePaths")
             .and_then(Value::as_array)
             .and_then(|paths| paths.first())
             .and_then(Value::as_str);
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|config| config.additional_metadata.clone())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
+        let mut metadata = serde_json::Map::new();
         metadata.retain(|key, _| !key.starts_with("_bt_"));
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("conversation_id".into(), json!(ctx.session_id));
@@ -149,7 +133,7 @@ impl AntigravityTranslator {
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
+            tags: None,
             ..Default::default()
         }));
     }

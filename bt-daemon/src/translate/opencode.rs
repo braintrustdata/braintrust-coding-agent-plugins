@@ -5,8 +5,7 @@ use super::git::GitMetadataCache;
 use super::recent::RecentSet;
 use super::tool::{error_text, with_tool_approval, ToolApproval};
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
-    TranslatorFactory,
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
@@ -585,7 +584,7 @@ impl OpenCodeTranslator {
         parent_id: Option<&str>,
         info: Option<&Value>,
         ts: i64,
-        ctx: &SessionCtx,
+        _ctx: &SessionCtx,
     ) -> Vec<SpanOp> {
         if self.sessions.contains_key(native_id) {
             return Vec::new();
@@ -606,24 +605,9 @@ impl OpenCodeTranslator {
                 (root_span_id.clone(), Vec::new(), "Subagent".to_string())
             }
         } else {
-            let external = ctx
-                .config
-                .as_ref()
-                .map(|c| c.attached_span_ids())
-                .unwrap_or_default();
-            (
-                external.1.unwrap_or_else(|| root_span_id.clone()),
-                external.0.into_iter().collect(),
-                "OpenCode".to_string(),
-            )
+            (root_span_id.clone(), Vec::new(), "OpenCode".to_string())
         };
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|c| c.additional_metadata.as_ref())
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        let mut metadata = serde_json::Map::new();
         metadata.insert("session_id".into(), Value::String(native_id.to_string()));
         metadata.insert("source".into(), Value::String("opencode".into()));
         metadata.insert("_bt_defer_root".into(), Value::Bool(true));
@@ -655,7 +639,7 @@ impl OpenCodeTranslator {
             span_type: SpanType::Task,
             start_ms: Some(ts),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
+            tags: None,
             ..Default::default()
         })]
     }
