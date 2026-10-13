@@ -631,12 +631,13 @@ impl SessionActor {
                         .checkpoint_and_flush(&mut translator, &mut sink, &ctx)
                         .await;
                     if checkpointable {
-                        self.record_delivery_checkpoint(
-                            &mut sink,
-                            pending_through,
-                            &mut acknowledged_through,
-                        )
-                        .await;
+                        checkpointable &= self
+                            .record_delivery_checkpoint(
+                                &mut sink,
+                                pending_through,
+                                &mut acknowledged_through,
+                            )
+                            .await;
                     }
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
@@ -650,12 +651,13 @@ impl SessionActor {
                         )
                         .await;
                     if checkpointable {
-                        self.record_delivery_checkpoint(
-                            &mut sink,
-                            pending_through,
-                            &mut acknowledged_through,
-                        )
-                        .await;
+                        checkpointable &= self
+                            .record_delivery_checkpoint(
+                                &mut sink,
+                                pending_through,
+                                &mut acknowledged_through,
+                            )
+                            .await;
                     }
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
@@ -935,26 +937,22 @@ impl SessionActor {
         }
     }
 
-    async fn flush_sink(&self, sink: &mut Box<dyn crate::sink::Sink>) -> bool {
-        if let Err(e) = sink.flush().await {
-            self.set_error(format!("sink flush failed: {e}"));
-            return false;
-        }
-        self.refresh_permalink(sink.as_ref());
-        !sink.has_pending_delivery()
-    }
-
+    /// False means delivery was rejected and this actor must never advance its
+    /// contiguous event boundary. Deferred delivery and failed checkpoint writes
+    /// leave accepted work eligible for a later checkpoint.
     async fn record_delivery_checkpoint(
         &self,
         sink: &mut Box<dyn crate::sink::Sink>,
         through: u64,
         acknowledged_through: &mut u64,
-    ) {
-        if !self.flush_sink(sink).await {
-            return;
+    ) -> bool {
+        if let Err(error) = sink.flush().await {
+            self.set_error(format!("sink flush failed: {error}"));
+            return false;
         }
-        if through <= *acknowledged_through {
-            return;
+        self.refresh_permalink(sink.as_ref());
+        if sink.has_pending_delivery() || through <= *acknowledged_through {
+            return true;
         }
         let pending = Delivery::new(
             through,
@@ -968,6 +966,7 @@ impl SessionActor {
             Ok(through) => *acknowledged_through = through,
             Err(failed) => self.set_error(format!("delivery checkpoint failed: {}", failed.error)),
         }
+        true
     }
 
     fn refresh_permalink(&self, sink: &dyn crate::sink::Sink) {

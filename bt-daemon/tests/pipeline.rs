@@ -569,6 +569,98 @@ async fn shutdown(socket: &Path) {
     shutdown_daemon(socket).await.unwrap();
 }
 
+/// A failed flush consumes its batch, just like checked SDK delivery. An empty
+/// subsequent flush must not acknowledge that lost batch's source events.
+#[tokio::test]
+async fn rejected_flush_blocks_checkpoints_until_journal_replay() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RejectOnce {
+        flushes: AtomicUsize,
+        emitted: AtomicUsize,
+    }
+    struct RejectOnceSink(Arc<RejectOnce>);
+    struct RejectOnceFactory(Arc<RejectOnce>);
+    impl SinkFactory for RejectOnceFactory {
+        fn create(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Sink>> {
+            Ok(Box::new(RejectOnceSink(self.0.clone())))
+        }
+    }
+    #[async_trait]
+    impl Sink for RejectOnceSink {
+        async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+            self.0.emitted.fetch_add(ops.len(), Ordering::SeqCst);
+            Ok(ops.len() as u64)
+        }
+        async fn flush(&mut self) -> anyhow::Result<()> {
+            if self.0.flushes.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("backend rejected and consumed the batch");
+            }
+            Ok(())
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = tmp.path().join("daemon.sock");
+    let sink = Arc::new(RejectOnce::default());
+    let start = || {
+        let args = ServeArgs {
+            socket: Some(socket.clone()),
+            data_dir: Some(data_dir.clone()),
+            idle_timeout_secs: 0,
+            session_idle_timeout_secs: 0,
+        };
+        let opts = ServeOptions {
+            version: "test".into(),
+            translators: Arc::new(Registry::default_agents()),
+            sink_factory: Arc::new(RejectOnceFactory(sink.clone())),
+            auth_provider: Some(Arc::new(TestAuthProvider {
+                calls: Mutex::new(Vec::new()),
+                fail: false,
+                first_lease_expired: false,
+            })),
+        };
+        tokio::spawn(async move { run_serve(args, opts).await.unwrap() })
+    };
+    let handle = start();
+    wait_for(&socket).await;
+    let session = "rejected-flush";
+    forward_envelope(
+        &envelope(session, "SessionStart", 1),
+        &socket,
+        &dummy_host(),
+        false,
+    )
+    .await
+    .unwrap();
+    flush_session(session, &socket, 5_000).await.unwrap();
+    assert_eq!(sink.flushes.load(Ordering::SeqCst), 1);
+    forward_envelope(&envelope(session, "Stop", 2), &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    flush_session(session, &socket, 5_000).await.unwrap();
+    shutdown(&socket).await;
+    handle.await.unwrap();
+
+    let journal_path = source_journal_path(&data_dir, "debug", session);
+    let journal = std::fs::read_to_string(&journal_path).unwrap();
+    assert!(!journal.contains("delivery_checkpoint"), "{journal}");
+    assert_eq!(sink.flushes.load(Ordering::SeqCst), 1);
+    let emitted_before_restart = sink.emitted.load(Ordering::SeqCst);
+
+    let handle = start();
+    wait_for(&socket).await;
+    flush_session(session, &socket, 5_000).await.unwrap();
+    assert!(sink.emitted.load(Ordering::SeqCst) > emitted_before_restart);
+    assert!(std::fs::read_to_string(journal_path)
+        .unwrap()
+        .contains("delivery_checkpoint"));
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
 #[tokio::test]
 async fn routed_sessions_resolve_multiple_profiles_without_journaling_credentials() {
     let provider = Arc::new(TestAuthProvider {

@@ -1,8 +1,3 @@
-// Queue port consumers are introduced in the next stack layer.
-#![allow(dead_code)]
-
-use tokio::sync::mpsc;
-
 /// A message owns its completion obligation until terminal handling succeeds.
 pub(crate) struct Delivery<T> {
     value: T,
@@ -17,6 +12,7 @@ pub(crate) trait Completion: Send {
 }
 
 pub(crate) struct Unfinished<T> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub delivery: Delivery<T>,
     pub error: anyhow::Error,
 }
@@ -29,10 +25,12 @@ impl<T> Delivery<T> {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn value(&self) -> &T {
         &self.value
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn map<U>(self, map: impl FnOnce(T) -> U) -> Delivery<U> {
         Delivery {
             value: map(self.value),
@@ -51,40 +49,6 @@ impl<T> Delivery<T> {
     }
 }
 
-// async_trait adds a redundant must_use annotation to its boxed futures.
-#[allow(clippy::double_must_use)]
-#[async_trait::async_trait]
-pub(crate) trait InputPort: Send {
-    type Item: Send;
-    async fn receive(&mut self) -> Option<Delivery<Self::Item>>;
-}
-
-// async_trait adds a redundant must_use annotation to its boxed futures.
-#[allow(clippy::double_must_use)]
-#[async_trait::async_trait]
-pub(crate) trait OutputPort: Send {
-    type Item: Send;
-    async fn send(&mut self, delivery: Delivery<Self::Item>) -> Result<(), Delivery<Self::Item>>;
-}
-
-#[async_trait::async_trait]
-impl<T: Send + 'static> InputPort for mpsc::Receiver<Delivery<T>> {
-    type Item = T;
-    async fn receive(&mut self) -> Option<Delivery<T>> {
-        self.recv().await
-    }
-}
-
-#[async_trait::async_trait]
-impl<T: Send + 'static> OutputPort for mpsc::Sender<Delivery<T>> {
-    type Item = T;
-    async fn send(&mut self, delivery: Delivery<T>) -> Result<(), Delivery<T>> {
-        mpsc::Sender::send(self, delivery)
-            .await
-            .map_err(|error| error.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +56,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use tokio::sync::mpsc;
 
     struct Count(Arc<AtomicUsize>);
     #[async_trait::async_trait]
@@ -105,14 +70,11 @@ mod tests {
     #[tokio::test]
     async fn mapping_and_channel_forwarding_preserve_completion() {
         let count = Arc::new(AtomicUsize::new(0));
-        let (mut tx, mut rx) = mpsc::channel(1);
-        OutputPort::send(
-            &mut tx,
-            Delivery::new(7, Count(count.clone())).map(|n| n.to_string()),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("channel closed"));
-        let message = InputPort::receive(&mut rx).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Delivery::new(7, Count(count.clone())).map(|n| n.to_string()))
+            .await
+            .unwrap_or_else(|_| panic!("channel closed"));
+        let message = rx.recv().await.unwrap();
         assert_eq!(message.value(), "7");
         assert_eq!(count.load(Ordering::SeqCst), 0);
         assert_eq!(message.into_completed().await.ok().unwrap(), "7");
@@ -122,9 +84,10 @@ mod tests {
     #[tokio::test]
     async fn failed_send_returns_the_obligation_and_drop_does_not_complete() {
         let count = Arc::new(AtomicUsize::new(0));
-        let (mut tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let pending = OutputPort::send(&mut tx, Delivery::new(7, Count(count.clone())))
+        let pending = tx
+            .send(Delivery::new(7, Count(count.clone())))
             .await
             .err()
             .unwrap();
