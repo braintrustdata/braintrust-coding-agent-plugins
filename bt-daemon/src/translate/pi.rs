@@ -705,7 +705,12 @@ impl PiTranslator {
         let output = normalize_assistant(&message);
         let failed = matches!(message.stop_reason.as_deref(), Some("error" | "aborted"));
         let error = failed.then(|| message.error_message.clone()).flatten();
-        if !failed {
+        if failed {
+            // A prior assistant message may be a tool-call continuation. If
+            // the terminal response fails, none of this turn is a completed
+            // session outcome.
+            self.turn_output = None;
+        } else {
             self.turn_output = Some(output.clone());
         }
         let ttft = pending
