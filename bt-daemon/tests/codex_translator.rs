@@ -1445,6 +1445,66 @@ fn codex_compaction_replaces_history_for_following_llms() {
 }
 
 #[test]
+fn codex_tool_result_json_images_are_structured_in_following_llm_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let image = "data:image/jpeg;base64,c3ludGhldGljLWltYWdl";
+    let encoded_result = serde_json::to_string(&json!([{
+        "type": "input_image",
+        "image_url": image,
+    }]))
+    .unwrap();
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta", "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context", "payload": { "model": "gpt-5.5" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item", "payload": { "type": "function_call", "call_id": "c1", "name": "screenshot", "arguments": "{}", "metadata": { "turn_id": "t1" } } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item", "payload": { "type": "function_call_output", "call_id": "c1", "output": encoded_result } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 10, "output_tokens": 2 } } } }),
+        json!({ "timestamp": "2026-01-01T00:00:07Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "I see the screenshot." }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:08Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 20, "output_tokens": 4 } } } }),
+    ] {
+        append(&transcript, record);
+    }
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let rows = reduce(
+        translator
+            .handle(
+                &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    let next_llm = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm
+                && row
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["turn_id"] == json!("t1"))
+                && row
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| input.to_string().contains(image))
+                && row.end_ms.is_some()
+        })
+        .unwrap();
+    let history = next_llm.input.as_ref().unwrap().as_array().unwrap();
+    assert!(
+        history.iter().any(|message| message["role"] == "tool"
+            && message["content"] == json!([{"type":"input_image", "image_url":image}])),
+        "JSON encoded tool results with images should remain structured in conversation history: {history:?}"
+    );
+}
+
+#[test]
 fn codex_untagged_replacement_history_preserves_native_order() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout.jsonl");
