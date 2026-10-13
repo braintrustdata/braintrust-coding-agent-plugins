@@ -100,6 +100,9 @@ mod tests {
             "BT_TRACE_MANAGED_RUN_ID",
             // Fallback for `BRAINTRUST_BT_BIN` in the Cursor hook launchers.
             "BT_BIN",
+            // Sentinel emitted by installed Cursor capture wrappers; not a
+            // user-facing setting. Preserve the released launcher protocol.
+            "BT_TRACE_CURSOR_USER_HOOK",
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut sources = String::new();
