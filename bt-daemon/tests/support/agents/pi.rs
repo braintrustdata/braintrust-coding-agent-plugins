@@ -143,7 +143,7 @@ impl PiAgent {
             .arg(&self.session_dir)
             .current_dir(world.workspace())
             .env("PI_CODING_AGENT_DIR", &self.config_dir)
-            .env("BT_TRACE_PI_PLUGIN_SPEC", &self.extension)
+            .env("BRAINTRUST_TRACE_PI_PLUGIN_SPEC", &self.extension)
             .env("PI_OFFLINE", "true");
         world.configure(&mut command);
         run.options.apply(&mut command);

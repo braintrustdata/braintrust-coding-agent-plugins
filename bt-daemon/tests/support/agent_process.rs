@@ -161,9 +161,9 @@ impl AgentTestWorld {
         let combined = std::env::join_paths(entries).expect("construct test PATH");
         command
             .env("PATH", combined)
-            .env("BT_DAEMON_SOCKET", &self.socket)
-            .env("BT_DAEMON_DATA_DIR", &self.data_dir)
-            .env("BT_DAEMON_CONFIG", &self.config_path)
+            .env("BRAINTRUST_DAEMON_SOCKET", &self.socket)
+            .env("BRAINTRUST_DAEMON_DATA_DIR", &self.data_dir)
+            .env("BRAINTRUST_DAEMON_CONFIG", &self.config_path)
             .env("BRAINTRUST_FLUSH_ON_TURN_END", "true")
             .env("BRAINTRUST_ADDITIONAL_METADATA", r#"{"test_harness":true}"#)
             .stdin(Stdio::null());

@@ -19,6 +19,7 @@ mod command_output;
 mod correlation;
 mod delivery_ledger;
 mod dispatch;
+mod env;
 mod hook;
 mod ids;
 mod journal;

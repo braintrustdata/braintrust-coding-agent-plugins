@@ -48,7 +48,7 @@ async function exercise(directory) {
     assert.equal(JSON.parse(control.stdout)[0].console_window, true,
       "negative control failed: GetConsoleWindow did not detect an unsuppressed console")
 
-    process.env.BT_EXECUTABLE = probe
+    process.env.BRAINTRUST_BT_BIN = probe
     process.env.BT_CONSOLE_PROBE_REPORT = join(directory, "cli success.json")
     delete process.env.BT_CONSOLE_PROBE_MODE
     const tools = new BtCliToolsClient({

@@ -4,10 +4,10 @@
 set -eu
 
 : "${BT_DAEMON_BIN:?set BT_DAEMON_BIN}"
-: "${BT_DAEMON_SOCKET:?set BT_DAEMON_SOCKET}"
+: "${BRAINTRUST_DAEMON_SOCKET:?set BRAINTRUST_DAEMON_SOCKET}"
 
 [ "${1:-}" = "trace" ]
 [ "${2:-}" = "hook" ]
 shift 2
 
-exec "$BT_DAEMON_BIN" hook "$@" --socket "$BT_DAEMON_SOCKET" --no-spawn
+exec "$BT_DAEMON_BIN" hook "$@" --socket "$BRAINTRUST_DAEMON_SOCKET" --no-spawn

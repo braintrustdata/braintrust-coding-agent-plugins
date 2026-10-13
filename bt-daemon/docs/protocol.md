@@ -6,11 +6,11 @@ front-end and the standalone test binary.
 
 Hook clients use an agent-specific non-credential `braintrust.json` file. Codex,
 Claude Code, OpenCode, and Pi therefore retain independent persistent profile,
-organization, and destination selections. `$BT_DAEMON_CONFIG` may explicitly
-override the file path. The hook front-end applies `trace_to_braintrust` and the
-stored `route` before sending an event. A managed run sets
-`BT_TRACE_INVOCATION_SETTINGS` for only its child process tree, keeping global
-agent configuration and generated hook commands unchanged.
+organization, and destination selections. `$BRAINTRUST_DAEMON_CONFIG` may
+explicitly override the file path. The hook front-end applies
+`trace_to_braintrust` and the stored `route` before sending an event. A managed
+run sets `BT_TRACE_INVOCATION_SETTINGS` for only its child process tree, keeping
+global agent configuration and generated hook commands unchanged.
 The profile is optional and defaults through `bt`. Credentials and backend
 URLs are resolved and refreshed inside the daemon and never enter this file.
 
@@ -19,8 +19,8 @@ URLs are resolved and refreshed inside the daemon and never enter this file.
 ## Transport
 
 - **Unix domain socket (Linux/macOS).** Default path resolution (first match wins):
-  1. `--socket <path>` flag / `BT_DAEMON_SOCKET` env (explicit override; used by
-     tests to sandbox a daemon per test).
+  1. `--socket <path>` flag / `BRAINTRUST_DAEMON_SOCKET` env (explicit
+     override; used by tests to sandbox a daemon per test).
   2. `$XDG_RUNTIME_DIR/braintrust/daemon.sock` if `XDG_RUNTIME_DIR` is set.
   3. `$HOME/.braintrust/run/daemon.sock`.
   The containing directory is created mode `0700`. macOS caps `sockaddr_un`
@@ -30,7 +30,7 @@ URLs are resolved and refreshed inside the daemon and never enter this file.
   so `\n` is an unambiguous frame delimiter. Max line length is bounded
   (default 64 MiB) to cap memory on a malformed/huge payload; over-length lines
   are a protocol error and close the connection.
-- **Windows named pipe.** `--socket` / `BT_DAEMON_SOCKET` may provide an
+- **Windows named pipe.** `--socket` / `BRAINTRUST_DAEMON_SOCKET` may provide an
   explicit full pipe name. Otherwise the daemon uses
   `\\.\pipe\braintrust-bt-daemon-<user-hash>`, where the suffix is derived
   from the Windows domain and user name so concurrent users do not share a

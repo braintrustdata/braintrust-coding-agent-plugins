@@ -130,11 +130,14 @@ async fn assert_stalled_daemon_preserves_policy_response(
     let mut child = tokio::process::Command::new("/bin/sh")
         .arg(plugin.join("content/hooks/trace.sh"))
         .arg(event)
-        .env("BT_BIN", plugin.join("test/bt-standalone-wrapper.sh"))
+        .env(
+            "BRAINTRUST_BT_BIN",
+            plugin.join("test/bt-standalone-wrapper.sh"),
+        )
         .env("BT_DAEMON_BIN", env!("CARGO_BIN_EXE_bt-daemon"))
-        .env("BT_DAEMON_SOCKET", &socket)
-        .env("BT_DAEMON_CONFIG", tmp.path().join("settings.json"))
-        .env("BT_DAEMON_DATA_DIR", tmp.path().join("data"))
+        .env("BRAINTRUST_DAEMON_SOCKET", &socket)
+        .env("BRAINTRUST_DAEMON_CONFIG", tmp.path().join("settings.json"))
+        .env("BRAINTRUST_DAEMON_DATA_DIR", tmp.path().join("data"))
         .env("CURSOR_PLUGIN_ROOT", plugin.join("content"))
         .env_remove("_BT_TRACE_MANAGED_RUN")
         .env(
