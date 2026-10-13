@@ -26,6 +26,24 @@ struct Response {
     permalink: Option<String>,
 }
 
+/// Rows accepted before a mandatory plugin failed still count as emitted.
+#[derive(Debug)]
+pub(crate) struct EmitFailure {
+    pub emitted: u64,
+    pub report: bool,
+    pub cause: anyhow::Error,
+}
+impl std::fmt::Display for EmitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+impl std::error::Error for EmitFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
 struct Forward;
 #[async_trait::async_trait]
 impl Completion for Forward {
@@ -68,11 +86,13 @@ impl RoutingSink {
                         };
                         let mut prepared = Vec::with_capacity(ops.len());
                         let mut failure = None;
+                        let mut report = false;
                         for op in ops {
                             match stage.process(op).await {
                                 PluginOutcome::Prepared(op) => prepared.push(*op),
                                 PluginOutcome::Filtered => {}
                                 PluginOutcome::Failed(error) => {
+                                    report |= error.newly_seen;
                                     if error.newly_seen {
                                         if let Err(diagnostic) = crate::plugin_diagnostics::record(
                                             &data_dir,
@@ -87,7 +107,10 @@ impl RoutingSink {
                                         "span plugin {} failed; span operations are being discarded: {}",
                                         error.path.display(), error.message));
                                 }
-                                PluginOutcome::Unavailable(error) => failure = Some(error),
+                                PluginOutcome::Unavailable(error) => {
+                                    report = true;
+                                    failure = Some(error);
+                                }
                             }
                         }
                         let emitted = if prepared.is_empty() {
@@ -95,9 +118,15 @@ impl RoutingSink {
                         } else {
                             sink.emit(&prepared).await
                         };
-                        match failure {
-                            Some(error) => Err(error),
-                            None => emitted,
+                        match (emitted, failure) {
+                            (Err(error), _) => Err(error),
+                            (Ok(emitted), Some(cause)) => Err(EmitFailure {
+                                emitted,
+                                report,
+                                cause,
+                            }
+                            .into()),
+                            (Ok(emitted), None) => Ok(emitted),
                         }
                     }
                     Operation::Flush => sink.flush().await.map(|()| 0),
@@ -171,5 +200,77 @@ impl Sink for RoutingSink {
     }
     fn permalink(&self) -> Option<String> {
         self.permalink.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        translate::SpanRow,
+        wire::{BackendAuth, SessionRoute},
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct CountingSink(Arc<AtomicU64>);
+    #[async_trait::async_trait]
+    impl Sink for CountingSink {
+        async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+            self.0.fetch_add(ops.len() as u64, Ordering::Relaxed);
+            Ok(ops.len() as u64)
+        }
+        async fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_plugin_failure_preserves_count_and_reports_only_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("selective.mjs");
+        std::fs::write(&plugin, "export default span => { if (span.name === 'reject') throw new Error('rejected'); return span; }").unwrap();
+        let emitted = Arc::new(AtomicU64::new(0));
+        let error = Arc::new(Mutex::new(None));
+        let mut sink = RoutingSink::spawn(
+            Box::new(CountingSink(emitted.clone())),
+            "debug".into(),
+            "partial".into(),
+            tmp.path().into(),
+            error.clone(),
+        );
+        sink.configure(
+            &SessionRoute {
+                span_plugins: vec![plugin],
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        );
+        let op = |name: &str| {
+            SpanOp::Insert(SpanRow {
+                span_id: name.into(),
+                name: name.into(),
+                ..SpanRow::default()
+            })
+        };
+        let failure = sink.emit(&[op("accept"), op("reject")]).await.unwrap_err();
+        let first = failure.downcast_ref::<EmitFailure>().unwrap();
+        assert_eq!(first.emitted, 1);
+        assert!(first.report);
+        assert_eq!(emitted.load(Ordering::Relaxed), 1);
+        let failure = sink.emit(&[op("accept")]).await.unwrap_err();
+        let cached = failure.downcast_ref::<EmitFailure>().unwrap();
+        assert_eq!(cached.emitted, 0);
+        assert!(
+            !cached.report,
+            "cached failures must not request another warning"
+        );
+        assert!(error.lock().unwrap().as_ref().unwrap().contains("rejected"));
+        assert_eq!(emitted.load(Ordering::Relaxed), 1);
     }
 }
