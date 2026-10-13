@@ -569,32 +569,6 @@ pub(super) fn automatic_link_key(env: &Envelope) -> String {
     format!("{}\u{1f}{}\u{1f}{route}", env.source, env.session_id)
 }
 
-/// Correlated child events retain their setup route in the immutable journal,
-/// while their delivery checkpoint belongs to the resolved parent route.
-/// Recover against that effective route without rewriting the captured event.
-pub(super) async fn recovered_delivery_route(
-    daemon: &Arc<Daemon>,
-    env: &Envelope,
-) -> Option<SessionRoute> {
-    let key = automatic_link_key(env);
-    if let Some(route) = daemon.automatic_links.lock().unwrap().get(&key).cloned() {
-        return Some(route);
-    }
-    if let Some(route) = daemon
-        .pending_sessions
-        .lock()
-        .unwrap()
-        .get(&key)
-        .and_then(|state| state.linked_route.clone())
-    {
-        return Some(route);
-    }
-    read_correlation_state(&daemon.data_dir, &key)
-        .await
-        .and_then(|state| state.linked_route)
-        .or_else(|| env.route.clone())
-}
-
 impl Daemon {
     pub(super) fn correlation_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.correlation_locks.lock().unwrap();

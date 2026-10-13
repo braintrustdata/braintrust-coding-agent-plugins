@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionRoute, TraceDestination};
 use bt_daemon::{
-    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, source_journal_path,
-    AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, BraintrustSinkFactory,
-    HostInfo, Registry, ServeArgs, ServeOptions, StatusArgs,
+    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, AuthLease,
+    AuthProvider, AuthResolveReason, BraintrustSinkConfig, BraintrustSinkFactory, HostInfo,
+    Registry, ServeArgs, ServeOptions, StatusArgs,
 };
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -216,6 +216,7 @@ fn assert_provenance(
     );
     for row in spans {
         let origin = &row["context"]["span_origin"];
+        assert!(!origin.is_null(), "no origin: {row:#}");
         assert_eq!(origin["name"], format!("braintrust.plugin.{source}"));
         // get() distinguishes explicit null from a missing version field.
         assert_eq!(origin.get("version"), Some(&json!(plugin_version)));
@@ -412,10 +413,17 @@ async fn root_and_turn_birth_snapshots_survive_version_changes_and_daemon_restar
         let turn3 = turn_id(&rows[before..], 3_000);
         assert_ne!(turn3, turn1);
         assert_ne!(turn3, turn2);
-        // Graceful shutdown completed these spans; recovery must not redeliver them.
-        assert!(rows[before..].iter().all(|row| {
-            row["span_id"] != root && row["span_id"] != turn1 && row["span_id"] != turn2
-        }));
+        // Graceful shutdown completed these spans. Recovery never re-inserts
+        // them; the session's real ends arrive as merges of the same spans.
+        assert!(
+            rows[before..]
+                .iter()
+                .filter(|row| {
+                    row["span_id"] == root || row["span_id"] == turn1 || row["span_id"] == turn2
+                })
+                .all(|row| row["_is_merge"] == true),
+            "completed span inserted again"
+        );
         assert_provenance(
             &rows[before..],
             &turn3,
@@ -499,38 +507,33 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
     }
 
     let data_dir = tmp.path().join("data");
-    let journal = source_journal_path(&data_dir, "claude-code", session);
-    let acknowledged_history = std::fs::read(&journal).unwrap();
-    assert!(std::str::from_utf8(&acknowledged_history)
+    let state = data_dir.join("pipeline").join("pipeline.sqlite");
+    let origins = |spans: &[&str]| -> Vec<String> {
+        let conn = rusqlite::Connection::open(&state).unwrap();
+        let mut found = Vec::new();
+        for span in spans {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM origins WHERE span_id = ?1",
+                    [span],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if count > 0 {
+                found.push((*span).to_string());
+            }
+        }
+        found
+    };
+    assert_eq!(origins(&[&root, &old_turn]).len(), 2);
+    // Simulate spans delivered before provenance was recorded: every
+    // completion stays, but no birth snapshot exists. Missing provenance is not
+    // a snapshot of null versions.
+    rusqlite::Connection::open(&state)
         .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .any(|record| {
-            record["_bt_record_type"] == "delivery_checkpoint"
-                && record["through"].as_u64().is_some_and(|offset| offset > 0)
-        }));
-    let ledger_paths: Vec<_> = std::fs::read_dir(data_dir.join("delivery-ledger"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(ledger_paths.len(), 1);
-    let ledger_path = &ledger_paths[0];
-    let mut ledger: Value = serde_json::from_slice(&std::fs::read(ledger_path).unwrap()).unwrap();
-    let completed = ledger["completed_span_ids"].clone();
-    for span in [&root, &old_turn] {
-        assert!(completed.as_array().unwrap().contains(&json!(span)));
-        assert!(ledger["span_origins"].get(span.as_str()).is_some());
-    }
-    // Simulate the old schema, preserving all completion/late-merge IDs and
-    // journal checkpoints. Missing provenance is not a snapshot of null versions.
-    let ledger_object = ledger.as_object_mut().unwrap();
-    ledger_object.remove("span_origins");
-    ledger_object.remove("root_origins");
-    assert_eq!(ledger["completed_span_ids"], completed);
-    assert!(ledger.get("span_origins").is_none());
-    assert!(ledger.get("root_origins").is_none());
-    std::fs::write(ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
-    assert_eq!(std::fs::read(&journal).unwrap(), acknowledged_history);
+        .execute("DELETE FROM origins", [])
+        .unwrap();
+    assert!(origins(&[&root, &old_turn]).is_empty());
 
     let second = Daemon::start(tmp.path(), &server, "bt2").await;
     let mut late_stop = capture("Stop", "v2", "native2", 2_000);
@@ -606,16 +609,12 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
             "legacy origin was invented after recovery: {row}"
         );
     }
-    let ledger: Value = serde_json::from_slice(&std::fs::read(ledger_path).unwrap()).unwrap();
-    for key in ["span_origins", "root_origins"] {
-        for span in [&root, &old_turn] {
-            assert!(
-                ledger[key].get(span.as_str()).is_none(),
-                "legacy birth snapshot was invented in {key}: {ledger}"
-            );
-        }
-    }
-    assert!(ledger["span_origins"].get(fresh_turn.as_str()).is_some());
+    let recorded = origins(&[&root, &old_turn, &fresh_turn]);
+    assert_eq!(
+        recorded,
+        vec![fresh_turn.clone()],
+        "legacy birth snapshot was invented"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -634,11 +633,9 @@ async fn newer_capture_replays_unacknowledged_root_with_its_journaled_plugin_ver
     );
     // Seed the capture-before-dispatch crash window after startup recovery has
     // finished. The newer live event, not startup, must trigger history replay.
-    let journal = source_journal_path(&tmp.path().join("data"), "claude-code", session);
-    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
-    let mut raw = serde_json::to_vec(&birth.redacted()).unwrap();
-    raw.push(b'\n');
-    std::fs::write(journal, raw).unwrap();
+    bt_daemon::seed_journaled_event(&tmp.path().join("data"), &birth.redacted())
+        .await
+        .unwrap();
     daemon
         .send(&event(
             session,

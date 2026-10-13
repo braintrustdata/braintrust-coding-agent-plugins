@@ -1,3 +1,5 @@
+#[path = "support/route_neutrality.rs"]
+mod route_neutrality;
 #[path = "support/span_identity.rs"]
 mod span_identity;
 
@@ -987,4 +989,68 @@ fn pi_llm_metadata_selects_request_configuration_across_provider_payloads() {
     );
     // A request without tools omits metadata.tools rather than emitting [].
     assert_eq!(config(60), json!({}));
+}
+
+#[test]
+fn pi_rows_are_route_neutral_and_overlaid_per_route() {
+    let events = vec![
+        event("session_start", 1, json!({"reason":"new"})),
+        event("before_agent_start", 2, json!({"prompt":"inspect"})),
+        event(
+            "context",
+            3,
+            json!({"messages":[{"role":"user","content":"inspect"}]}),
+        ),
+        event(
+            "message_end",
+            4,
+            json!({"message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"text","text":"done"}],"usage":{"input":5,"output":2,"totalTokens":7}}}),
+        ),
+        event(
+            "tool_execution_start",
+            5,
+            json!({"toolCallId":"call-1","toolName":"read","args":{"path":"README.md"}}),
+        ),
+        event(
+            "tool_execution_end",
+            6,
+            json!({"toolCallId":"call-1","toolName":"read","result":"contents","isError":false}),
+        ),
+        event("agent_end", 7, json!({"messages":[]})),
+        event("session_shutdown", 8, json!({"reason":"quit"})),
+    ];
+    let (neutral, attached) =
+        route_neutrality::assert_route_neutral("pi", "pi-session", |tr, ctx| {
+            let mut ops = Vec::new();
+            for event in &events {
+                ops.extend(tr.handle(event, ctx).unwrap());
+            }
+            ops.extend(tr.finalize(ctx).unwrap());
+            ops
+        });
+    let root = |ops: &[SpanOp]| -> SpanRow {
+        ops.iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.name == "Pi" => Some(row.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let neutral_root = root(&neutral);
+    assert!(neutral_root.defer_until_child);
+    assert!(neutral_root.parent_span_ids.is_empty() && neutral_root.tags.is_none());
+    assert!(neutral.iter().all(|op| {
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+        row.root_span_id == neutral_root.span_id
+    }));
+    let attached_root = root(&attached);
+    assert_eq!(
+        attached_root.parent_span_ids,
+        [route_neutrality::ROUTE_PARENT]
+    );
+    assert_eq!(attached_root.tags, Some(vec!["route-a".to_string()]));
+    let metadata = attached_root.metadata.as_ref().unwrap();
+    assert_eq!(metadata["team"], "a");
+    assert_eq!(metadata["source"], "pi");
+    assert!(metadata.get("_bt_internal").is_none());
 }

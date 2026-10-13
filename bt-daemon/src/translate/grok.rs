@@ -8,7 +8,8 @@ use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
 use super::tool::nonempty_error_text;
 use super::{
-    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
+    local_username, AgentTranslator, RouteSlots, SessionCtx, SpanOp, SpanRow, SpanType,
+    TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
@@ -201,7 +202,6 @@ struct GrokTranslator {
     session_id: String,
     session_span_id: String,
     root_span_id: String,
-    session_parent_span_ids: Vec<String>,
     root_open: bool,
     root_closed: bool,
     root_generation: u32,
@@ -232,7 +232,6 @@ impl GrokTranslator {
             session_id: session_id.to_string(),
             session_span_id: root.clone(),
             root_span_id: root,
-            session_parent_span_ids: Vec::new(),
             root_open: false,
             root_closed: false,
             root_generation: 0,
@@ -272,13 +271,7 @@ impl GrokTranslator {
         self.last_ts_ms = 0;
     }
 
-    fn ensure_root(
-        &mut self,
-        ts_ms: i64,
-        event: &Envelope,
-        ctx: &SessionCtx,
-        ops: &mut Vec<SpanOp>,
-    ) {
+    fn ensure_root(&mut self, ts_ms: i64, event: &Envelope, ops: &mut Vec<SpanOp>) {
         if self.root_open {
             return;
         }
@@ -289,7 +282,7 @@ impl GrokTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: self.session_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
-                parent_span_ids: self.session_parent_span_ids.clone(),
+                route_slots: RouteSlots::ATTACH,
                 end_ms: Some(ts_ms),
                 metadata: Some(json!({
                     "resumed": true,
@@ -300,23 +293,9 @@ impl GrokTranslator {
             }));
             return;
         }
-        let attached = ctx
-            .config
-            .as_ref()
-            .map(|config| config.attached_span_ids())
-            .unwrap_or_default();
-        self.root_span_id = attached.1.unwrap_or_else(|| self.session_span_id.clone());
-        self.session_parent_span_ids = attached.0.clone().into_iter().collect();
         self.root_open = true;
 
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|config| config.additional_metadata.as_ref())
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        metadata.retain(|key, _| !key.starts_with("_bt_"));
+        let mut metadata = Map::new();
         metadata.insert("source".into(), json!("grok"));
         metadata.insert("session_id".into(), json!(self.session_id));
         metadata.insert("trace_source".into(), json!("session_transcript"));
@@ -335,11 +314,15 @@ impl GrokTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: self.session_parent_span_ids.clone(),
             name: "Grok".into(),
             span_type: SpanType::Task,
             start_ms: Some(ts_ms),
             metadata: Some(Value::Object(metadata)),
+            // Grok roots have never carried route tags.
+            route_slots: RouteSlots {
+                tags: false,
+                ..RouteSlots::ROOT
+            },
             ..Default::default()
         }));
     }
@@ -399,7 +382,6 @@ impl GrokTranslator {
         record: &Value,
         record_end_offset: u64,
         event: &Envelope,
-        ctx: &SessionCtx,
         ops: &mut Vec<SpanOp>,
     ) {
         let Some(params) = record.get("params") else {
@@ -460,7 +442,7 @@ impl GrokTranslator {
                 }
                 self.emitted_turns.insert(turn_key.clone());
                 self.close_incomplete_turn(ts_ms, "new_turn", None, false, false, ops);
-                self.ensure_root(ts_ms, event, ctx, ops);
+                self.ensure_root(ts_ms, event, ops);
                 self.turn_seq = next_number;
                 let span_id = ids::span_id(&self.session_id, &format!("turn:{turn_key}"));
                 let model = meta
@@ -1148,11 +1130,7 @@ impl GrokTranslator {
         complete
     }
 
-    fn process_transcripts(
-        &mut self,
-        event: &Envelope,
-        ctx: &SessionCtx,
-    ) -> anyhow::Result<(Vec<SpanOp>, bool)> {
+    fn process_transcripts(&mut self, event: &Envelope) -> anyhow::Result<(Vec<SpanOp>, bool)> {
         let mut ops = Vec::new();
         let Some(mirrors) = event.payload.get("_bt_grok_transcript_mirrors") else {
             return Ok((ops, true));
@@ -1168,7 +1146,7 @@ impl GrokTranslator {
         self.updates = updates.cursor;
         self.process_system_prompt(mirrors.get("system_prompt"), &mut ops);
         for record in updates.records {
-            self.process_update(&record.value, record.end_offset, event, ctx, &mut ops);
+            self.process_update(&record.value, record.end_offset, event, &mut ops);
         }
         let events_complete = self.process_event_enrichment(mirrors.get("events"), &mut ops);
         Ok((ops, updates_complete && events_complete))
@@ -1219,7 +1197,7 @@ impl GrokTranslator {
                     ops.push(SpanOp::Merge(SpanRow {
                         span_id: self.session_span_id.clone(),
                         root_span_id: self.root_span_id.clone(),
-                        parent_span_ids: self.session_parent_span_ids.clone(),
+                        route_slots: RouteSlots::ATTACH,
                         end_ms: Some(terminal_ms),
                         late_merge_key: Some(format!("session:terminal:{}", self.root_generation)),
                         ..Default::default()
@@ -1232,7 +1210,7 @@ impl GrokTranslator {
 }
 
 impl AgentTranslator for GrokTranslator {
-    fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn handle(&mut self, event: &Envelope, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),
             "Grok translator has pending catch-up work; drain it before handling another event"
@@ -1240,7 +1218,7 @@ impl AgentTranslator for GrokTranslator {
         if let Some(cwd) = event.payload.get("cwd").and_then(Value::as_str) {
             self.cwd = Some(cwd.to_string());
         }
-        let (mut ops, complete) = self.process_transcripts(event, ctx)?;
+        let (mut ops, complete) = self.process_transcripts(event)?;
         if complete {
             self.finish_hook(event, &mut ops);
         } else {
@@ -1252,11 +1230,11 @@ impl AgentTranslator for GrokTranslator {
         Ok(ops)
     }
 
-    fn drain_pending(&mut self, ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
+    fn drain_pending(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
         let Some(pending) = self.pending.clone() else {
             return Ok(None);
         };
-        let (mut ops, complete) = self.process_transcripts(&pending.event, ctx)?;
+        let (mut ops, complete) = self.process_transcripts(&pending.event)?;
         if complete {
             self.pending = None;
             self.finish_hook(&pending.event, &mut ops);
@@ -1278,7 +1256,7 @@ impl AgentTranslator for GrokTranslator {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: self.session_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
-                parent_span_ids: self.session_parent_span_ids.clone(),
+                route_slots: RouteSlots::ATTACH,
                 end_ms: Some(self.last_ts_ms),
                 late_merge_key: Some(format!("session:finalize:{}", self.root_generation)),
                 ..Default::default()

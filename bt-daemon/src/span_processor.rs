@@ -17,7 +17,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const STACK_LIMIT_BYTES: usize = 512 * 1024;
-const CALL_TIMEOUT: Duration = Duration::from_millis(50);
+/// Per-call execution deadline. A plugin that exceeds it fails like any other
+/// plugin exception, with the same file-specific recovery evidence.
+const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
@@ -143,7 +145,7 @@ impl Engine {
         operation: Operation,
         source: &str,
         session_id: &str,
-    ) -> anyhow::Result<SpanRow> {
+    ) -> anyhow::Result<Option<SpanRow>> {
         let function = self.load(path)?;
         let context = PluginContext {
             operation,
@@ -152,7 +154,7 @@ impl Engine {
             env: &self.env,
         };
         self.arm_deadline();
-        let result = self.context.with(|ctx| -> anyhow::Result<SpanRow> {
+        let result = self.context.with(|ctx| -> anyhow::Result<Option<SpanRow>> {
             let function = function.restore(&ctx)?;
             let row = rquickjs_serde::to_value(ctx.clone(), row)?;
             let context = rquickjs_serde::to_value(ctx.clone(), &context)?;
@@ -163,7 +165,11 @@ impl Engine {
             if result.as_promise().is_some() {
                 anyhow::bail!("plugin returned a Promise; span plugins must be synchronous");
             }
-            Ok(rquickjs_serde::from_value_strict(result)?)
+            // Returning `null` or `undefined` is an explicit filter decision.
+            if result.is_null() || result.is_undefined() {
+                return Ok(None);
+            }
+            Ok(Some(rquickjs_serde::from_value_strict(result)?))
         });
         self.deadline_ms.store(0, Ordering::Relaxed);
         result
@@ -182,16 +188,19 @@ impl Engine {
 #[derive(Debug)]
 pub struct PluginFailure {
     pub path: PathBuf,
+    /// Position of the failing plugin in the configured chain.
+    pub index: usize,
     pub message: String,
-    /// Only the first failure on this worker needs to be logged and persisted.
-    pub newly_seen: bool,
 }
 
 pub struct ProcessResult {
     /// `None` means the operation was withheld because every configured plugin
-    /// is mandatory and one did not complete successfully.
+    /// is mandatory and one did not complete successfully, or because a plugin
+    /// filtered it (`filtered`).
     pub op: Option<SpanOp>,
     pub failure: Option<PluginFailure>,
+    /// A plugin explicitly filtered the operation by returning `null`.
+    pub filtered: bool,
 }
 
 /// Apply an ordered plugin chain on the worker thread currently executing the
@@ -208,6 +217,7 @@ pub fn process(
         return Ok(ProcessResult {
             op: Some(op.clone()),
             failure: None,
+            filtered: false,
         });
     }
     let (operation, mut row) = match op {
@@ -220,18 +230,19 @@ pub fn process(
         row.parent_span_ids.clone(),
     );
     let mut failure = None;
+    let mut filtered = false;
     ENGINE.with_borrow_mut(|slot| -> anyhow::Result<()> {
         if slot.is_none() {
             *slot = Some(Engine::new()?);
         }
         let engine = slot.as_mut().expect("engine initialized");
-        for plugin in plugins {
+        for (index, plugin) in plugins.iter().enumerate() {
             if let Some(failed) = engine.failed_plugins.get(plugin).cloned() {
                 if failed.fingerprint == plugin_fingerprint(plugin) {
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
+                        index,
                         message: failed.message,
-                        newly_seen: false,
                     });
                     break;
                 }
@@ -239,7 +250,11 @@ pub fn process(
             }
             let candidate = engine.call(plugin, &row, operation, source, session_id);
             let mut candidate = match candidate {
-                Ok(candidate)
+                Ok(None) => {
+                    filtered = true;
+                    break;
+                }
+                Ok(Some(candidate))
                     if (
                         candidate.span_id.as_str(),
                         candidate.root_span_id.as_str(),
@@ -252,15 +267,15 @@ pub fn process(
                 {
                     candidate
                 }
-                Ok(_) => {
+                Ok(Some(_)) => {
                     let message = "changed immutable span identity fields".to_owned();
                     engine
                         .failed_plugins
                         .insert(plugin.clone(), failed_plugin(plugin, &message));
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
+                        index,
                         message,
-                        newly_seen: true,
                     });
                     break;
                 }
@@ -271,24 +286,28 @@ pub fn process(
                         .insert(plugin.clone(), failed_plugin(plugin, &message));
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
+                        index,
                         message,
-                        newly_seen: true,
                     });
                     break;
                 }
             };
-            // Turn identity belongs to the translator, not the JSON transform.
+            // Turn identity and root deferral belong to the translator, not
+            // the JSON transform.
             candidate.is_turn = row.is_turn;
+            candidate.defer_until_child = row.defer_until_child;
+            candidate.route_slots = row.route_slots;
             row = candidate;
         }
         Ok(())
     })?;
     Ok(ProcessResult {
-        op: failure.is_none().then_some(match op {
+        op: (failure.is_none() && !filtered).then_some(match op {
             SpanOp::Insert(_) => SpanOp::Insert(row),
             SpanOp::Merge(_) => SpanOp::Merge(row),
         }),
         failure,
+        filtered,
     })
 }
 
@@ -454,14 +473,12 @@ mod tests {
         let first_result = process(&plugins, &SpanOp::Insert(row()), "codex", "session").unwrap();
         let first_failure = first_result.failure.unwrap();
         assert_eq!(first_failure.path, broken);
-        assert!(first_failure.newly_seen);
         assert!(first_failure.message.contains("Error: broken"));
         assert!(first_result.op.is_none());
 
         let second_result = process(&plugins, &SpanOp::Insert(row()), "codex", "session").unwrap();
         let second_failure = second_result.failure.unwrap();
         assert_eq!(second_failure.path, broken);
-        assert!(!second_failure.newly_seen);
         assert_eq!(second_failure.message, first_failure.message);
         assert!(second_result.op.is_none());
     }

@@ -8,7 +8,7 @@ mod hooks;
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
+    local_username, AgentTranslator, RouteSlots, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
 };
 use crate::{ids, wire::Envelope};
@@ -209,8 +209,6 @@ impl TranscriptCursor {
 struct CursorTranslator {
     namespace: String,
     root: String,
-    trace_root: String,
-    root_parents: Vec<String>,
     started: bool,
     last_ms: i64,
     cwd: Option<String>,
@@ -239,9 +237,7 @@ impl CursorTranslator {
         let root = ids::span_id(namespace, "session");
         Self {
             namespace: namespace.into(),
-            trace_root: root.clone(),
             root,
-            root_parents: Vec::new(),
             started: false,
             last_ms: 0,
             cwd: None,
@@ -271,7 +267,7 @@ impl CursorTranslator {
         let turn_span_id = (parent != self.root).then(|| parent.clone());
         SpanRow {
             span_id: id,
-            root_span_id: self.trace_root.clone(),
+            root_span_id: self.root.clone(),
             parent_span_ids: vec![parent],
             turn_span_id,
             name: name.into(),
@@ -301,8 +297,8 @@ impl CursorTranslator {
             if previous_cwd != self.cwd {
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id: self.root.clone(),
-                    root_span_id: self.trace_root.clone(),
-                    parent_span_ids: self.root_parents.clone(),
+                    root_span_id: self.root.clone(),
+                    route_slots: RouteSlots::ATTACH,
                     name: "Cursor session".into(),
                     span_type: SpanType::Task,
                     metadata: Some(json!({"workspace":self.cwd})),
@@ -312,13 +308,6 @@ impl CursorTranslator {
             return;
         }
         self.started = true;
-        let (parent, root) = ctx
-            .config
-            .as_ref()
-            .map(|c| c.attached_span_ids())
-            .unwrap_or_default();
-        self.trace_root = root.unwrap_or_else(|| self.root.clone());
-        self.root_parents = parent.into_iter().collect();
         let mut metadata = json!({"source":"cursor", "session_id":ctx.session_id,
             "username":local_username(), "os":std::env::consts::OS, "workspace":self.cwd,
             "trace_cursor_version":e.source_version, "trace_plugin_version":e.plugin_version});
@@ -327,13 +316,12 @@ impl CursorTranslator {
         }
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.root.clone(),
-            root_span_id: self.trace_root.clone(),
-            parent_span_ids: self.root_parents.clone(),
+            root_span_id: self.root.clone(),
             name: "Cursor session".into(),
             span_type: SpanType::Task,
             start_ms: Some(e.ts_ms),
             metadata: Some(metadata),
-            tags: root_tags(ctx),
+            route_slots: RouteSlots::ROOT,
             ..Default::default()
         }));
     }
@@ -1399,7 +1387,8 @@ impl CursorTranslator {
             "Cursor session",
             SpanType::Task,
         );
-        row.parent_span_ids = self.root_parents.clone();
+        row.parent_span_ids = Vec::new();
+        row.route_slots = RouteSlots::ATTACH;
         row.end_ms = Some(e.ts_ms);
         row.metadata = Some(json!({"status":end.reason,"final_status":end.final_status}));
         row.output = self
@@ -1441,10 +1430,9 @@ impl CursorTranslator {
             ..Default::default()
         };
     }
-    fn enrich(&self, ops: &mut [SpanOp], ctx: &SessionCtx) {
+    fn enrich(&self, ops: &mut [SpanOp]) {
         self.git.enrich_rows(self.cwd.as_deref(), ops);
         for op in ops {
-            let root_insert = matches!(op, SpanOp::Insert(row) if row.span_id == self.root);
             let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
             if let Some(metadata) = row.metadata.as_mut().and_then(Value::as_object_mut) {
                 // Only the reviewed Cursor fields reach span metadata. Raw
@@ -1460,22 +1448,6 @@ impl CursorTranslator {
                                 | "is_interrupt"
                         ) && value == &json!(false))
                 });
-                if root_insert {
-                    // Destination metadata is an explicit user customization,
-                    // rather than additional automatically captured hook data.
-                    if let Some(additional) = ctx
-                        .config
-                        .as_ref()
-                        .and_then(|c| c.additional_metadata.as_ref())
-                        .and_then(Value::as_object)
-                    {
-                        for (key, value) in additional {
-                            if !key.starts_with("_bt_") {
-                                metadata.entry(key.clone()).or_insert_with(|| value.clone());
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1496,10 +1468,10 @@ impl AgentTranslator for CursorTranslator {
         } else {
             self.pending = Some(e.clone());
         }
-        self.enrich(&mut ops, ctx);
+        self.enrich(&mut ops);
         Ok(ops)
     }
-    fn drain_pending(&mut self, ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
+    fn drain_pending(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
         let Some(e) = self.pending.take() else {
             return Ok(None);
         };
@@ -1511,10 +1483,10 @@ impl AgentTranslator for CursorTranslator {
         } else {
             self.pending = Some(e);
         }
-        self.enrich(&mut ops, ctx);
+        self.enrich(&mut ops);
         Ok(Some(ops))
     }
-    fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let mut ops = Vec::new();
         self.close_turn(self.last_ms, Some("capture_ended"), None, &mut ops);
         let tools = std::mem::take(&mut self.tools);
@@ -1530,15 +1502,15 @@ impl AgentTranslator for CursorTranslator {
         if self.started {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: self.root.clone(),
-                root_span_id: self.trace_root.clone(),
-                parent_span_ids: self.root_parents.clone(),
+                root_span_id: self.root.clone(),
+                route_slots: RouteSlots::ATTACH,
                 name: "Cursor session".into(),
                 span_type: SpanType::Task,
                 end_ms: Some(self.last_ms),
                 ..Default::default()
             }));
         }
-        self.enrich(&mut ops, ctx);
+        self.enrich(&mut ops);
         Ok(ops)
     }
 }

@@ -7,6 +7,8 @@
     reason = "Test fixtures intentionally launch raw children."
 )]
 
+#[path = "support/route_neutrality.rs"]
+mod route_neutrality;
 #[path = "support/span_identity.rs"]
 mod span_identity;
 
@@ -1797,4 +1799,86 @@ fn codex_root_source_merge_after_stop_keeps_external_parent() {
         "post-Stop root merge dropped the external parent"
     );
     assert_merges_preserve_insert_identity(&ops);
+}
+
+#[test]
+fn codex_rows_are_route_neutral_and_overlaid_per_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main_t = tmp.path().join("main.jsonl");
+    let sub_t = tmp.path().join("sub.jsonl");
+    write_transcript(&main_t);
+    append(
+        &main_t,
+        json!({ "timestamp": "2026-01-01T00:00:11Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t2" } }),
+    );
+    append(
+        &main_t,
+        json!({ "timestamp": "2026-01-01T00:00:12Z", "type": "response_item", "payload": { "type": "function_call", "call_id": "c2", "name": "spawn_agent", "arguments": "{}" } }),
+    );
+    for v in [
+        json!({ "timestamp": "2026-01-01T00:00:13Z", "type": "session_meta", "payload": { "id": "a1", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:14Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "st1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:15Z", "type": "event_msg", "payload": { "type": "task_complete", "last_agent_message": "done" } }),
+    ] {
+        append(&sub_t, v);
+    }
+    let main_p = main_t.to_str().unwrap();
+    let mirror = json!({
+        "path": "/rollouts/subagent-a1.jsonl",
+        "mirror": sub_t.to_str().unwrap(),
+        "through": std::fs::metadata(&sub_t).unwrap().len(),
+    });
+
+    let (neutral, attached) = route_neutrality::assert_route_neutral(
+        "codex",
+        "neutral",
+        |tr, ctx| {
+            let mut ops = Vec::new();
+            for (event, extra) in [
+                (
+                    "SessionStart",
+                    json!({ "source": "startup", "permission_mode": "auto" }),
+                ),
+                (
+                    "PostToolUse",
+                    json!({ "tool_name": "spawn_agent", "tool_use_id": "c2", "tool_response": { "agent_id": "a1" } }),
+                ),
+                (
+                    "SubagentStart",
+                    json!({ "agent_id": "a1", "transcript_path": "/rollouts/subagent-a1.jsonl", "agent_type": "reviewer", "_bt_transcript_mirror": mirror }),
+                ),
+                (
+                    "SubagentStop",
+                    json!({ "agent_id": "a1", "agent_transcript_path": "/rollouts/subagent-a1.jsonl", "_bt_transcript_mirror": mirror }),
+                ),
+                ("Stop", json!({})),
+            ] {
+                ops.extend(
+                    tr.handle(&envelope("neutral", event, main_p, extra), ctx)
+                        .unwrap(),
+                );
+            }
+            ops.extend(tr.flush(ctx).unwrap());
+            ops
+        },
+    );
+
+    let neutral = reduce(neutral);
+    let root = find(&neutral, SpanType::Task, "codex: myapp");
+    assert!(root.parent_span_ids.is_empty() && root.tags.is_none());
+    assert!(root.metadata.as_ref().unwrap().get("project").is_none());
+    assert!(neutral.values().all(|row| row.root_span_id == root.span_id));
+    let subagent = find(&neutral, SpanType::Task, "subagent: a1");
+    assert!(subagent.tags.is_none());
+
+    let attached = reduce(attached);
+    let root = find(&attached, SpanType::Task, "codex: myapp");
+    assert_eq!(root.parent_span_ids, vec![route_neutrality::ROUTE_PARENT]);
+    assert_eq!(root.tags, Some(vec!["route-a".to_string()]));
+    let metadata = root.metadata.as_ref().unwrap();
+    assert_eq!(metadata["team"], "a");
+    assert_eq!(metadata["source"], "codex");
+    assert!(metadata.get("_bt_internal").is_none());
+    let subagent = find(&attached, SpanType::Task, "subagent: a1");
+    assert_eq!(subagent.tags, Some(vec!["route-a".to_string()]));
 }

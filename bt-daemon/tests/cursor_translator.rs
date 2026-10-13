@@ -1,5 +1,7 @@
 //! Independent reducer checks. Real fixtures retain native receipt times and IDs;
 //! explicitly synthetic cases exercise documented schemas and recovery edges.
+#[path = "support/route_neutrality.rs"]
+mod route_neutrality;
 #[path = "support/span_identity.rs"]
 mod span_identity;
 
@@ -1925,4 +1927,84 @@ fn unexpected_transcript_record_types_fail_the_event() {
         error.starts_with("unexpected cursor transcript record format"),
         "{error}"
     );
+}
+
+#[test]
+fn cursor_rows_are_route_neutral_and_overlaid_per_route() {
+    let contents =
+        std::fs::read_to_string(fixture("interactive-multi-turn-success", "hooks.ndjson")).unwrap();
+    let records: Vec<Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let session = records[0]["payload"]["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut events: Vec<Envelope> = records
+        .iter()
+        .map(|record| {
+            let payload = record["payload"].clone();
+            let mut envelope = event(
+                payload["hook_event_name"].as_str().unwrap(),
+                record["received_at_ms"].as_i64().unwrap(),
+                payload.clone(),
+            );
+            envelope.payload = payload;
+            envelope.session_id = session.clone();
+            envelope
+        })
+        .collect();
+    // A workspace change updates the session root after it is created.
+    let mut moved = events.last().unwrap().clone();
+    moved.event = "beforeSubmitPrompt".into();
+    moved.payload["hook_event_name"] = json!("beforeSubmitPrompt");
+    moved.payload["generation_id"] = json!("moved");
+    moved.payload["prompt"] = json!("again");
+    moved.payload["workspace_roots"] = json!(["/moved/workspace"]);
+    moved.payload["cwd"] = json!("/moved/workspace");
+    moved.ts_ms += 1;
+    events.push(moved);
+    let (neutral, attached) =
+        route_neutrality::assert_route_neutral("cursor", &session, |tr, ctx| {
+            let mut ops = Vec::new();
+            for event in &events {
+                ops.extend(tr.handle(event, ctx).unwrap());
+                while let Some(batch) = tr.drain_pending(ctx).unwrap() {
+                    ops.extend(batch);
+                }
+            }
+            ops.extend(tr.finalize(ctx).unwrap());
+            ops
+        });
+    let root = |ops: &[SpanOp]| {
+        ops.iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.name == "Cursor session" => Some(row.clone()),
+                _ => None,
+            })
+            .expect("root insert")
+    };
+    let neutral_root = root(&neutral);
+    assert!(neutral_root.parent_span_ids.is_empty() && neutral_root.tags.is_none());
+    assert!(neutral.iter().all(|op| {
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+        row.root_span_id == neutral_root.span_id
+    }));
+    let attached_root = root(&attached);
+    assert_eq!(
+        attached_root.parent_span_ids,
+        [route_neutrality::ROUTE_PARENT]
+    );
+    assert_eq!(attached_root.tags, Some(vec!["route-a".to_string()]));
+    let metadata = attached_root.metadata.as_ref().unwrap();
+    assert_eq!(metadata["team"], "a");
+    assert_eq!(metadata["source"], "cursor");
+    assert!(metadata.get("_bt_internal").is_none());
+    assert!(attached.iter().all(|op| match op {
+        SpanOp::Merge(row) if row.span_id == attached_root.span_id => {
+            row.parent_span_ids == [route_neutrality::ROUTE_PARENT]
+        }
+        _ => true,
+    }));
 }

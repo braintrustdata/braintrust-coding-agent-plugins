@@ -158,35 +158,6 @@ pub async fn capture_generation(
     Ok((path, from + copied))
 }
 
-/// Best-effort age-based collection, mirroring journal GC. Mirrors are only
-/// useful for as long as their journal survives.
-pub async fn gc_old_mirrors(data_dir: &Path, max_age: std::time::Duration) {
-    let dir = mirror_dir(data_dir);
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if !matches!(
-            path.extension().and_then(|value| value.to_str()),
-            Some("jsonl" | "current")
-        ) {
-            continue;
-        }
-        let old = entry
-            .metadata()
-            .await
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > max_age);
-        if old {
-            let _ = tokio::fs::remove_file(&path).await;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

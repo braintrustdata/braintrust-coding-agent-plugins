@@ -5,14 +5,14 @@ use super::git::GitMetadataCache;
 use super::recent::RecentSet;
 use super::tool::{error_text, with_tool_approval, ToolApproval};
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
+    local_username, AgentTranslator, RouteSlots, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -332,8 +332,11 @@ fn properties<T: DeserializeOwned>(payload: &Value, field: &str) -> Option<T> {
 #[derive(Default)]
 struct NativeSession {
     root_span_id: String,
-    effective_root_span_id: String,
+    /// Root of this native session's trace: its top-level ancestor's span.
+    trace_root_span_id: String,
     parent_span_ids: Vec<String>,
+    /// A top-level native session, whose root an attached route parents.
+    top_level: bool,
     parent_session_id: Option<String>,
     /// For child sessions, the user turn in the root session that spawned them.
     owner_turn_span_id: Option<String>,
@@ -368,6 +371,15 @@ impl NativeSession {
         self.owner_turn_span_id
             .clone()
             .or_else(|| self.current_turn_span_id.clone())
+    }
+
+    /// Route slots for later updates to this session's root span.
+    fn root_slots(&self) -> RouteSlots {
+        if self.top_level {
+            RouteSlots::ATTACH
+        } else {
+            RouteSlots::default()
+        }
     }
 }
 
@@ -495,11 +507,11 @@ struct OpenCodeTranslator {
 }
 
 impl AgentTranslator for OpenCodeTranslator {
-    fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn handle(&mut self, event: &Envelope, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut ops = match event.event.as_str() {
-            "session.created" => self.session_created(event, ctx),
-            "chat.message" => self.chat_message(event, ctx),
+            "session.created" => self.session_created(event),
+            "chat.message" => self.chat_message(event),
             "experimental.chat.system.transform" => self.system_prompt(event),
             "message.part.updated" => properties::<PartEvent>(&event.payload, "part")
                 .map(|part| self.part_updated(part, event.ts_ms))
@@ -509,7 +521,7 @@ impl AgentTranslator for OpenCodeTranslator {
                 .unwrap_or_default(),
             "tool.execute.before" => decode::<ToolBeforePayload>(&event.payload)
                 .map(ToolBefore::from)
-                .map(|tool| self.tool_before(tool, event.ts_ms, ctx))
+                .map(|tool| self.tool_before(tool, event.ts_ms))
                 .unwrap_or_default(),
             "tool.execute.after" => decode::<ToolAfterPayload>(&event.payload)
                 .map(ToolAfter::from)
@@ -556,7 +568,7 @@ impl AgentTranslator for OpenCodeTranslator {
 }
 
 impl OpenCodeTranslator {
-    fn session_created(&mut self, event: &Envelope, ctx: &SessionCtx) -> Vec<SpanOp> {
+    fn session_created(&mut self, event: &Envelope) -> Vec<SpanOp> {
         let info = event
             .payload
             .pointer("/properties/info")
@@ -576,7 +588,7 @@ impl OpenCodeTranslator {
             .and_then(|v| v.get("parentID"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        self.open_session(&native_id, parent_id.as_deref(), info, event.ts_ms, ctx)
+        self.open_session(&native_id, parent_id.as_deref(), info, event.ts_ms)
     }
 
     fn open_session(
@@ -585,48 +597,43 @@ impl OpenCodeTranslator {
         parent_id: Option<&str>,
         info: Option<&Value>,
         ts: i64,
-        ctx: &SessionCtx,
     ) -> Vec<SpanOp> {
         if self.sessions.contains_key(native_id) {
             return Vec::new();
         }
         let root_span_id = ids::span_id(&self.daemon_session_id, &format!("session:{native_id}"));
-        let (effective_root_span_id, parent_span_ids, name) = if let Some(parent_id) = parent_id {
-            if let Some(parent) = self.sessions.get(parent_id) {
-                let title = info
-                    .and_then(|v| v.get("title"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("Subagent");
-                (
-                    parent.effective_root_span_id.clone(),
-                    parent.current_turn_span_id.clone().into_iter().collect(),
-                    subagent_name(title),
-                )
+        let (trace_root_span_id, parent_span_ids, name, top_level) =
+            if let Some(parent_id) = parent_id {
+                if let Some(parent) = self.sessions.get(parent_id) {
+                    let title = info
+                        .and_then(|v| v.get("title"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Subagent");
+                    (
+                        parent.trace_root_span_id.clone(),
+                        parent.current_turn_span_id.clone().into_iter().collect(),
+                        subagent_name(title),
+                        false,
+                    )
+                } else {
+                    (
+                        root_span_id.clone(),
+                        Vec::new(),
+                        "Subagent".to_string(),
+                        false,
+                    )
+                }
             } else {
-                (root_span_id.clone(), Vec::new(), "Subagent".to_string())
-            }
-        } else {
-            let external = ctx
-                .config
-                .as_ref()
-                .map(|c| c.attached_span_ids())
-                .unwrap_or_default();
-            (
-                external.1.unwrap_or_else(|| root_span_id.clone()),
-                external.0.into_iter().collect(),
-                "OpenCode".to_string(),
-            )
-        };
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|c| c.additional_metadata.as_ref())
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+                (
+                    root_span_id.clone(),
+                    Vec::new(),
+                    "OpenCode".to_string(),
+                    true,
+                )
+            };
+        let mut metadata = Map::new();
         metadata.insert("session_id".into(), Value::String(native_id.to_string()));
         metadata.insert("source".into(), Value::String("opencode".into()));
-        metadata.insert("_bt_defer_root".into(), Value::Bool(true));
         metadata.insert("username".into(), Value::String(local_username()));
         if let Some(parent) = parent_id {
             metadata.insert("parent_session_id".into(), Value::String(parent.into()));
@@ -639,8 +646,9 @@ impl OpenCodeTranslator {
             native_id.to_string(),
             NativeSession {
                 root_span_id: root_span_id.clone(),
-                effective_root_span_id: effective_root_span_id.clone(),
+                trace_root_span_id: trace_root_span_id.clone(),
                 parent_span_ids: parent_span_ids.clone(),
+                top_level,
                 parent_session_id: parent_id.map(str::to_owned),
                 owner_turn_span_id: owner_turn_span_id.clone(),
                 ..Default::default()
@@ -648,23 +656,27 @@ impl OpenCodeTranslator {
         );
         vec![SpanOp::Insert(SpanRow {
             span_id: root_span_id,
-            root_span_id: effective_root_span_id,
+            root_span_id: trace_root_span_id,
             parent_span_ids,
             turn_span_id: owner_turn_span_id,
             name,
             span_type: SpanType::Task,
             start_ms: Some(ts),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
+            defer_until_child: true,
+            route_slots: RouteSlots {
+                attach: top_level,
+                ..RouteSlots::ROOT
+            },
             ..Default::default()
         })]
     }
 
-    fn chat_message(&mut self, event: &Envelope, ctx: &SessionCtx) -> Vec<SpanOp> {
+    fn chat_message(&mut self, event: &Envelope) -> Vec<SpanOp> {
         let Some(sid) = native_session_id(&event.payload) else {
             return Vec::new();
         };
-        let mut ops = self.open_session(&sid, None, None, event.ts_ms, ctx);
+        let mut ops = self.open_session(&sid, None, None, event.ts_ms);
         let Some(state) = self.sessions.get_mut(&sid) else {
             return ops;
         };
@@ -675,15 +687,16 @@ impl OpenCodeTranslator {
             state.root_idle = false;
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: state.root_span_id.clone(),
-                root_span_id: state.effective_root_span_id.clone(),
+                root_span_id: state.trace_root_span_id.clone(),
                 parent_span_ids: state.parent_span_ids.clone(),
+                route_slots: state.root_slots(),
                 ..Default::default()
             }));
         }
         if let Some(turn) = state.current_turn_span_id.take() {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn,
-                root_span_id: state.effective_root_span_id.clone(),
+                root_span_id: state.trace_root_span_id.clone(),
                 parent_span_ids: vec![state.root_span_id.clone()],
                 end_ms: Some(event.ts_ms),
                 output: state.current_output.take().map(Value::String),
@@ -762,7 +775,7 @@ impl OpenCodeTranslator {
         let skills = explicit_skills(&input);
         ops.push(SpanOp::Insert(SpanRow {
             span_id: turn_id.clone(),
-            root_span_id: state.effective_root_span_id.clone(),
+            root_span_id: state.trace_root_span_id.clone(),
             parent_span_ids: vec![state.root_span_id.clone()],
             name: format!("Turn {}", state.turn_number),
             span_type: SpanType::Task,
@@ -970,7 +983,7 @@ impl OpenCodeTranslator {
         let model = info.model_id.as_deref().unwrap_or("unknown");
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("llm:{sid}:{mid}")),
-            root_span_id: state.effective_root_span_id.clone(),
+            root_span_id: state.trace_root_span_id.clone(),
             turn_span_id: Some(
                 state
                     .owner_turn_span_id
@@ -1001,7 +1014,7 @@ impl OpenCodeTranslator {
         })]
     }
 
-    fn tool_before(&mut self, event: ToolBefore, ts_ms: i64, _ctx: &SessionCtx) -> Vec<SpanOp> {
+    fn tool_before(&mut self, event: ToolBefore, ts_ms: i64) -> Vec<SpanOp> {
         let sid = event.input.session_id;
         let Some(call) = event.input.call_id else {
             return vec![];
@@ -1022,7 +1035,7 @@ impl OpenCodeTranslator {
             s.tool_names.insert(call.clone(), tool.clone());
             return vec![SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
-                root_span_id: s.effective_root_span_id.clone(),
+                root_span_id: s.trace_root_span_id.clone(),
                 turn_span_id: s.turn_owner(),
                 parent_span_ids: vec![turn],
                 name: tool.clone(),
@@ -1098,7 +1111,7 @@ impl OpenCodeTranslator {
         let parent_span_id = s.tool_parent_span_ids.remove(&call).unwrap_or(turn);
         let row = SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
-            root_span_id: s.effective_root_span_id.clone(),
+            root_span_id: s.trace_root_span_id.clone(),
             parent_span_ids: vec![parent_span_id],
             turn_span_id: (!had_start).then(|| s.turn_owner()).flatten(),
             name,
@@ -1225,7 +1238,7 @@ impl OpenCodeTranslator {
         }
         let row = SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
-            root_span_id: s.effective_root_span_id.clone(),
+            root_span_id: s.trace_root_span_id.clone(),
             parent_span_ids: vec![parent_span_id],
             turn_span_id: (!had_start).then(|| s.turn_owner()).flatten(),
             name: title.unwrap_or(tool),
@@ -1280,7 +1293,7 @@ impl OpenCodeTranslator {
                 .collect();
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
-                root_span_id: s.effective_root_span_id.clone(),
+                root_span_id: s.trace_root_span_id.clone(),
                 parent_span_ids,
                 end_ms: Some(ts),
                 metadata: Some(with_tool_approval(
@@ -1297,7 +1310,7 @@ impl OpenCodeTranslator {
         if let Some(turn) = s.current_turn_span_id.take() {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn,
-                root_span_id: s.effective_root_span_id.clone(),
+                root_span_id: s.trace_root_span_id.clone(),
                 parent_span_ids: vec![s.root_span_id.clone()],
                 end_ms: Some(ts),
                 output: s.current_output.take().map(Value::String),
@@ -1307,8 +1320,9 @@ impl OpenCodeTranslator {
         }
         if close_root || s.parent_session_id.is_some() {
             ops.push(SpanOp::Merge(SpanRow {
+                route_slots: s.root_slots(),
                 span_id: s.root_span_id,
-                root_span_id: s.effective_root_span_id,
+                root_span_id: s.trace_root_span_id,
                 parent_span_ids: s.parent_span_ids,
                 end_ms: Some(ts),
                 metadata: Some(
@@ -1323,8 +1337,9 @@ impl OpenCodeTranslator {
             // current without dropping the state needed for the next turn.
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: s.root_span_id.clone(),
-                root_span_id: s.effective_root_span_id.clone(),
+                root_span_id: s.trace_root_span_id.clone(),
                 parent_span_ids: s.parent_span_ids.clone(),
+                route_slots: s.root_slots(),
                 end_ms: Some(ts),
                 metadata: Some(
                     json!({"total_turns":s.turn_number,"total_tool_calls":s.tool_call_count}),

@@ -228,56 +228,26 @@ pub(super) async fn handle_request(
         }
         method::SESSION_FLUSH => {
             let p = parse!(FlushParams);
-            // Explicit flushes wait for the daemon-owned ingress queue. Hook
-            // capture never waits on this barrier.
-            daemon.settle_ingress().await;
+            // Explicit flushes wait for assembly to register every captured
+            // route. Hook capture never waits on this.
+            daemon.settle_assembly().await;
             if let Err(error) =
                 resolve_pending_sessions(daemon, |env| env.session_id == p.session_id).await
             {
                 return Response::err(id, RpcError::new(error_code::INTERNAL, error));
             }
-            let delivery_keys: Vec<_> = daemon
-                .sessions
-                .lock()
-                .unwrap()
-                .keys()
-                .filter(|key| key.session_id == p.session_id)
-                .cloned()
-                .collect();
-            let accepted_sessions = delivery_keys.len() as u64;
-            let mut flushed = true;
-            let mut pending = 0u64;
-            for key in delivery_keys {
-                if let Err(error) = daemon.refresh_session_before_flush(&key).await {
-                    return Response::err(
-                        id,
-                        RpcError::new(
-                            error_code::INTERNAL,
-                            format!("session auth refresh failed: {error}"),
-                        ),
-                    );
-                }
-                let session = { daemon.sessions.lock().unwrap().get(&key).cloned() };
-                if let Some(session) = session {
-                    let (route_flushed, route_pending) =
-                        session.flush(Duration::from_millis(p.timeout_ms)).await;
-                    flushed &= route_flushed;
-                    pending = pending.saturating_add(route_pending);
-                }
-            }
-            Response::ok(
-                id,
-                serde_json::to_value(FlushResult {
-                    flushed,
-                    pending,
-                    accepted_sessions,
-                })
-                .unwrap(),
-            )
+            let result = daemon
+                .flush_partitions(
+                    daemon.partitions_for_session(&p.session_id).await,
+                    None,
+                    Duration::from_millis(p.timeout_ms),
+                )
+                .await;
+            Response::ok(id, serde_json::to_value(result).unwrap())
         }
         method::MANAGED_RUN_FLUSH => {
             let params = parse!(ManagedRunFlushParams);
-            daemon.settle_ingress().await;
+            daemon.settle_assembly().await;
             if let Err(error) = resolve_pending_sessions(daemon, |env| {
                 env.managed_run_id.as_deref() == Some(params.managed_run_id.as_str())
             })
@@ -290,8 +260,8 @@ pub(super) async fn handle_request(
         }
         method::STATUS_GET => {
             let p = parse!(StatusParams);
-            daemon.settle_ingress().await;
-            Response::ok(id, serde_json::to_value(daemon.status(p)).unwrap())
+            daemon.settle_assembly().await;
+            Response::ok(id, serde_json::to_value(daemon.status(p).await).unwrap())
         }
         method::AUTH_DIAGNOSE => {
             let p = parse!(AuthDiagnoseParams);
@@ -334,34 +304,166 @@ pub(super) fn client_may_shutdown(client: Option<&ClientInfo>, daemon_version: &
         .is_none_or(|ordering| !ordering.is_lt())
 }
 
+fn recovery_status(
+    stage: &str,
+    record: &crate::pipeline::recovery::FailureRecord,
+) -> crate::wire::RecoveryStatus {
+    crate::wire::RecoveryStatus {
+        stage: stage.to_string(),
+        cause: record.failure.cause.label().to_string(),
+        diagnostic: record.failure.diagnostic.clone(),
+        guidance: record.failure.guidance.clone(),
+        automatic: record.failure.automatic,
+        occurrences: record.occurrences,
+        first_seen_ms: record.first_seen_ms,
+        last_seen_ms: record.last_seen_ms,
+        next_attempt_ms: record.next_attempt_ms,
+    }
+}
+
 impl Daemon {
-    pub(super) fn status(&self, p: StatusParams) -> StatusResult {
-        let map = self.sessions.lock().unwrap();
-        let mut sessions: Vec<_> = map
-            .iter()
-            .filter(|(key, _)| {
-                p.session_id
-                    .as_ref()
-                    .is_none_or(|want| want == &key.session_id)
-            })
-            .map(|(key, s)| SessionStatus {
-                session_id: key.session_id.clone(),
-                source: s.source.clone(),
-                route: serde_json::from_str(&key.route).ok(),
-                queued: s.counters.queued.load(Ordering::Relaxed),
-                spans_emitted: s.counters.spans_emitted.load(Ordering::Relaxed),
-                permalink: s.permalink.lock().unwrap().clone(),
-                last_error: s.last_error.lock().unwrap().clone(),
-            })
+    /// Every partition of a native session id, across sources, loading any
+    /// that are on disk but idle.
+    pub(super) async fn partitions_for_session(&self, session_id: &str) -> Vec<PartitionId> {
+        let mut partitions: Vec<PartitionId> = self
+            .pipeline
+            .runtimes()
+            .into_iter()
+            .map(|runtime| runtime.partition.clone())
+            .filter(|partition| partition.session_id == session_id)
             .collect();
-        for (key, (source, error)) in self.auth_errors.lock().unwrap().iter() {
+        if let Ok(rows) = self
+            .pipeline
+            .store
+            .read(crate::pipeline::store::partitions)
+            .await
+        {
+            for row in rows {
+                if row.partition.session_id == session_id && !partitions.contains(&row.partition) {
+                    partitions.push(row.partition);
+                }
+            }
+        }
+        partitions
+    }
+
+    /// Append a barrier to each partition and wait for every branch to reach
+    /// it. `finalize` selects a terminal finalization instead of a checkpoint.
+    pub(super) async fn flush_partitions(
+        &self,
+        partitions: Vec<PartitionId>,
+        finalize: Option<crate::pipeline::types::FinalizeKind>,
+        timeout: Duration,
+    ) -> FlushResult {
+        let mut result = FlushResult {
+            flushed: true,
+            pending: 0,
+            accepted_sessions: 0,
+        };
+        let mut waits = Vec::new();
+        for partition in partitions {
+            let runtime = match self.pipeline.partition(&partition).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!(%partition, %error, "flush could not load partition");
+                    result.flushed = false;
+                    continue;
+                }
+            };
+            result.accepted_sessions += runtime.branch_list().len() as u64;
+            match self.pipeline.control(&partition, finalize).await {
+                Ok(barrier) => waits.push((runtime, barrier)),
+                Err(error) => {
+                    tracing::warn!(%partition, %error, "flush barrier not captured");
+                    result.flushed = false;
+                }
+            }
+        }
+        for (runtime, barrier) in waits {
+            let (reached, pending) = self
+                .pipeline
+                .wait_barrier(&runtime, &barrier, timeout)
+                .await;
+            result.flushed &= reached;
+            result.pending = result.pending.saturating_add(pending);
+        }
+        result
+    }
+
+    pub(super) async fn status(&self, p: StatusParams) -> StatusResult {
+        let mut sessions = Vec::new();
+        for runtime in self.pipeline.runtimes() {
+            let partition = &runtime.partition;
+            if p.session_id
+                .as_ref()
+                .is_some_and(|want| want != &partition.session_id)
+            {
+                continue;
+            }
+            let translation = runtime.translation.borrow().clone();
+            let events_tail = self.pipeline.events.tail(partition).await.unwrap_or(0);
+            let untranslated = events_tail.saturating_sub(translation.receipt);
+            let spans_tail = *runtime.spans_changed.borrow();
+            for branch in runtime.branch_list() {
+                let view = branch.view.borrow().clone();
+                let config = branch.config.borrow().clone();
+                let backlog = if view.head == 0 {
+                    0
+                } else {
+                    spans_tail.saturating_sub(view.delivered_through.max(view.head - 1))
+                };
+                let recovery = translation
+                    .recovering
+                    .as_ref()
+                    .map(|record| recovery_status("translation", record))
+                    .or_else(|| {
+                        view.recovering.as_ref().map(|record| {
+                            recovery_status(
+                                if view.backfilling {
+                                    "backfill"
+                                } else {
+                                    "delivery"
+                                },
+                                record,
+                            )
+                        })
+                    });
+                sessions.push(SessionStatus {
+                    session_id: partition.session_id.clone(),
+                    source: partition.source.clone(),
+                    route: Some(config.session_route(&branch.key)),
+                    queued: untranslated + backlog,
+                    spans_emitted: view.spans_emitted,
+                    permalink: view.permalink.clone(),
+                    last_error: recovery
+                        .as_ref()
+                        .map(|recovery| format!("{}; {}", recovery.diagnostic, recovery.guidance)),
+                    recovery,
+                    held_root: view.held_root,
+                });
+            }
+            if runtime.branch_list().is_empty() {
+                if let Some(record) = &translation.recovering {
+                    let recovery = recovery_status("translation", record);
+                    sessions.push(SessionStatus {
+                        session_id: partition.session_id.clone(),
+                        source: partition.source.clone(),
+                        route: None,
+                        queued: untranslated,
+                        spans_emitted: 0,
+                        permalink: None,
+                        last_error: Some(format!("{}; {}", recovery.diagnostic, recovery.guidance)),
+                        recovery: Some(recovery),
+                        held_root: false,
+                    });
+                }
+            }
+        }
+        for (key, (source, error)) in self.route_errors.lock().unwrap().iter() {
             if p.session_id
                 .as_ref()
                 .is_some_and(|want| want != &key.session_id)
             {
-                continue;
-            }
-            if map.contains_key(key) {
                 continue;
             }
             sessions.push(SessionStatus {
@@ -372,6 +474,8 @@ impl Daemon {
                 spans_emitted: 0,
                 permalink: None,
                 last_error: Some(error.clone()),
+                recovery: None,
+                held_root: false,
             });
         }
         for state in self.pending_sessions.lock().unwrap().values() {
@@ -385,22 +489,15 @@ impl Daemon {
                 continue;
             }
             let route = state.linked_route.as_ref().or(first.env.route.as_ref());
-            let existing = sessions.iter_mut().find(|session| {
-                session.session_id == first.env.session_id
-                    && session.source == first.env.source
-                    && match (session.route.as_ref(), route) {
-                        (Some(left), Some(right)) => left.same_route(right),
-                        (None, None) => true,
-                        _ => false,
-                    }
-            });
             let message = if state.decided() {
-                "correlation resolved; journaled events awaiting delivery"
+                "correlation resolved; delivery registering"
             } else {
                 "awaiting parent process confirmation; standalone fallback within 5 seconds"
             };
+            let existing = sessions.iter_mut().find(|session| {
+                session.session_id == first.env.session_id && session.source == first.env.source
+            });
             if let Some(session) = existing {
-                session.queued = session.queued.saturating_add(state.events.len() as u64);
                 if session.last_error.is_none() {
                     session.last_error = Some(message.to_string());
                 }
@@ -413,6 +510,8 @@ impl Daemon {
                     spans_emitted: 0,
                     permalink: None,
                     last_error: Some(message.to_string()),
+                    recovery: None,
+                    held_root: false,
                 });
             }
         }

@@ -482,15 +482,7 @@ fn direct_pending_parent(
 }
 
 fn is_provisional_root(op: &SpanOp) -> bool {
-    let SpanOp::Insert(row) = op else {
-        return false;
-    };
-    row.metadata
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("_bt_defer_root"))
-        .and_then(Value::as_bool)
-        == Some(true)
+    matches!(op, SpanOp::Insert(row) if row.defer_until_child)
 }
 
 fn full_span(
@@ -658,6 +650,8 @@ fn build_log(row: &SpanRow, source: &str, is_merge: bool) -> anyhow::Result<Span
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // Deferral is carried by `SpanRow::defer_until_child`; never deliver the
+    // legacy internal marker if an older journal or plugin supplied it.
     metadata.remove("_bt_defer_root");
     builder = builder.metadata(metadata);
     let mut metrics = row
@@ -681,6 +675,9 @@ fn build_log(row: &SpanRow, source: &str, is_merge: bool) -> anyhow::Result<Span
     }
     if let Some(err) = &row.error {
         builder = builder.error(Value::String(err.clone()));
+    } else if row.clear_error {
+        // Replace a temporary failure marker with the recovered span.
+        builder = builder.error(Value::Null);
     }
     if let Some(tags) = &row.tags {
         if !tags.is_empty() {

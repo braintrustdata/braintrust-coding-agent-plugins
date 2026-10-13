@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionConfig, TraceDestination};
 use bt_daemon::{
-    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, source_journal_path,
-    AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs, ServeOptions, Sink,
+    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, AuthLease,
+    AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs, ServeOptions, Sink,
     SinkFactory, SpanOp, SpanRow, SpanType, StatusArgs,
 };
 use std::collections::HashMap;
@@ -33,9 +33,30 @@ struct RecordedSession {
 #[derive(Default)]
 struct RecordingSinkFactory {
     sessions: Mutex<HashMap<String, Arc<RecordedSession>>>,
+    /// Every sink created, with its session id. A session delivering to
+    /// several routes has one sink per route.
+    all: Mutex<Vec<(String, Arc<RecordedSession>)>>,
 }
 
 impl RecordingSinkFactory {
+    /// The sink of `session` whose route delivers to `project`.
+    fn session_for_project(&self, session_id: &str, project: &str) -> Arc<RecordedSession> {
+        self.all
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(session, _)| session == session_id)
+            .map(|(_, record)| record.clone())
+            .find(|record| {
+                record.configs.lock().unwrap().iter().any(|config| {
+                    matches!(&config.destination, Some(TraceDestination::ProjectLogs {
+                        project_name: Some(name), ..
+                    }) if name == project)
+                })
+            })
+            .unwrap_or_else(|| panic!("no {project} sink created for session {session_id}"))
+    }
+
     fn session(&self, session_id: &str) -> Arc<RecordedSession> {
         self.sessions
             .lock()
@@ -56,6 +77,10 @@ impl SinkFactory for RecordingSinkFactory {
             .lock()
             .unwrap()
             .insert(session_id.into(), record.clone());
+        self.all
+            .lock()
+            .unwrap()
+            .push((session_id.into(), record.clone()));
         Ok(Box::new(RecordingSink { record }))
     }
 }
@@ -894,11 +919,37 @@ async fn resolved_child_link_survives_daemon_restart() {
     .await;
     flush("restart-child", &socket).await;
 
-    let child = second_recording.session("restart-child");
-    assert!(child.configs.lock().unwrap().iter().any(|config| matches!(
-        config.destination,
-        Some(TraceDestination::ParentSpan { .. })
-    )));
+    // The persisted decision keeps routing the resumed child under its parent.
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("restart-child".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !status.sessions.is_empty()
+            && status.sessions.iter().all(|session| matches!(
+                session
+                    .route
+                    .as_ref()
+                    .and_then(|route| route.destination.as_ref()),
+                Some(TraceDestination::ParentSpan { .. })
+            )),
+        "{:?}",
+        status.sessions
+    );
+    assert!(second_recording
+        .sessions
+        .lock()
+        .unwrap()
+        .get("restart-child")
+        .is_none_or(
+            |child| child.configs.lock().unwrap().iter().all(|config| matches!(
+                config.destination,
+                Some(TraceDestination::ParentSpan { .. })
+            ))
+        ));
     shutdown_daemon(&socket).await.unwrap();
     second_daemon.await.unwrap();
 }
@@ -959,7 +1010,11 @@ async fn session_fallback_survives_daemon_restart() {
     );
     forward(child_start.remove(0), &socket, &host).await;
     flush("pending-child", &socket).await;
-    assert_attached_to_session(first_recording.as_ref(), "pending-parent", "pending-child");
+    // The child's provisional root is held until its first work, but its route
+    // is already decided under the parent session.
+    let parent_rows = inserted_rows(&first_recording.session("pending-parent"));
+    let parent_root = session_root(&parent_rows, "pending-parent", "parent session");
+    assert_routed_under(&socket, "pending-child", &parent_root.span_id).await;
     shutdown_daemon(&socket).await.unwrap();
     first_daemon.await.unwrap();
 
@@ -1299,14 +1354,13 @@ async fn ipc_initialize_pid_is_captured_without_hook_metadata() {
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
 
-    let journal = tokio::fs::read_to_string(source_journal_path(
+    let row = bt_daemon::read_journaled_events(
         &tmp.path().join("data"),
         "claude-code",
         "automatic-process-capture",
-    ))
-    .await
-    .unwrap();
-    let row: serde_json::Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    )
+    .unwrap()
+    .remove(0);
     let chain = row
         .pointer("/capture/process_chain")
         .and_then(serde_json::Value::as_array)
@@ -2743,16 +2797,20 @@ async fn one_native_parent_session_selects_the_childs_delivery_route() {
         }
         let route = events[0].route.clone().unwrap();
         forward_all(&mut events, &socket, &host).await;
-        run_status(StatusArgs {
-            socket: Some(socket.clone()),
-            session_id: Some(parent_session.into()),
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        // Keep both sinks: the fixture's session lookup retains only the latest.
-        parents.push((route, recording.session(parent_session)));
+        flush(parent_session, &socket).await;
+        parents.push((route, project));
     }
+    // Translation is shared: each route of the parent session receives every
+    // turn, so each route's sink is found by its destination.
+    let parents: Vec<_> = parents
+        .into_iter()
+        .map(|(route, project)| {
+            (
+                route,
+                recording.session_for_project(parent_session, project),
+            )
+        })
+        .collect();
 
     // Exercise both immediate adapter linkage and frozen command-hook linkage.
     for (index, (route, parent)) in parents.iter().enumerate() {
@@ -2786,7 +2844,8 @@ async fn one_native_parent_session_selects_the_childs_delivery_route() {
         }
     }
 
-    // Different routes to the same destination must not pick a parent arbitrarily.
+    // A route is its auth and destination; changing its tags reconfigures the
+    // same branch rather than creating a second candidate parent route.
     let mut duplicate = fixtures.start_turn(
         AgentKind::Claude,
         parent_session,
@@ -2800,10 +2859,8 @@ async fn one_native_parent_session_selects_the_childs_delivery_route() {
         event.route = Some(route);
     }
     forward_all(&mut duplicate, &socket, &host).await;
-    for (session, project) in [
-        ("ambiguous-route-child", "project-a"),
-        ("unmatched-route-child", "project-c"),
-    ] {
+    // A destination no parent route delivers to must not pick a parent.
+    for (session, project) in [("unmatched-route-child", "project-c")] {
         let mut events = fixtures.start_turn(
             AgentKind::Pi,
             session,
@@ -2901,19 +2958,16 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         .await
         .unwrap();
         let (path, saved) = stored_pending_child(&data_dir, "bounded-child").await;
-        let journal_path =
-            bt_daemon::source_journal_path(&data_dir, "claude-code", "bounded-child");
-        let journal = tokio::fs::read(&journal_path).await.unwrap();
+        // Snapshot durable pipeline state (journals, heads, ledger) while the
+        // child is still undelivered.
+        let snapshot = tmp.path().join("pipeline-snapshot");
+        copy_dir(&data_dir.join("pipeline"), &snapshot);
         shutdown_daemon(&socket).await.unwrap();
         daemon.await.unwrap();
-        // Restore the accepted-but-undelivered checkpoint, as after an abrupt
-        // process exit. Shutdown itself is covered separately above.
-        tokio::fs::write(&journal_path, journal).await.unwrap();
-        // Graceful shutdown delivered the buffered spans. Roll back its local
-        // delivery acknowledgements as well as the journal to model a crash.
-        tokio::fs::remove_dir_all(data_dir.join("delivery-ledger"))
-            .await
-            .unwrap();
+        // Graceful shutdown delivered the buffered spans. Restore the snapshot
+        // to model an abrupt process exit before that delivery.
+        std::fs::remove_dir_all(data_dir.join("pipeline")).unwrap();
+        copy_dir(&snapshot, &data_dir.join("pipeline"));
         let mut legacy_route = original_route.clone();
         legacy_route.destination = Some(external_parent());
         // A decided legacy link already put earlier rows in that parent's
@@ -3002,6 +3056,19 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
                     == serde_json::to_value(&expected_destination).unwrap()));
             shutdown_daemon(&socket).await.unwrap();
             again.await.unwrap();
+        }
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
         }
     }
 }
@@ -3192,6 +3259,26 @@ fn assert_pair_linked(
         attached.root_span_id.as_deref(),
         Some(parent_root.root_span_id.as_str()),
         "{label}: sink attachment chose a different trace root"
+    );
+}
+
+/// The child's registered delivery route attaches under `span_id`.
+async fn assert_routed_under(socket: &Path, child_session: &str, span_id: &str) {
+    let status = run_status(StatusArgs {
+        socket: Some(socket.to_path_buf()),
+        session_id: Some(child_session.into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        status.sessions.iter().any(|session| matches!(
+            session.route.as_ref().and_then(|route| route.destination.as_ref()),
+            Some(TraceDestination::ParentSpan { components })
+                if components.span_id.as_deref() == Some(span_id)
+        )),
+        "{child_session} is not routed under {span_id}: {:?}",
+        status.sessions
     );
 }
 

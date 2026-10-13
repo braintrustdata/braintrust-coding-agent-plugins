@@ -8,7 +8,6 @@ mod correlation_store;
 mod ingress;
 mod maintenance;
 mod managed_run;
-mod recovery;
 mod rpc;
 mod sessions;
 
@@ -18,12 +17,12 @@ pub(crate) use correlation_store::persist_active_parent_snapshot;
 use correlation_store::*;
 use ingress::*;
 use maintenance::*;
-use recovery::*;
 use rpc::*;
 use sessions::*;
 
-use crate::dispatch::{hydrate_transcript_reference, ReplayPlan, Session, SessionOptions};
-use crate::journal::{self, JournalWriter};
+use crate::journal;
+use crate::pipeline::runtime::{Pipeline, PipelineOptions};
+use crate::pipeline::types::PartitionId;
 use crate::sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, SinkFactory};
 use crate::translate::Registry;
 use crate::transport::{self, Listener, ServerStream};
@@ -93,30 +92,19 @@ pub trait AuthProvider: Send + Sync {
     ) -> anyhow::Result<AuthLease>;
 }
 
-#[derive(Clone)]
-struct SessionAuthState {
-    route: SessionRoute,
-    lease: AuthLease,
-}
-
 pub struct Daemon {
     version: String,
     data_dir: PathBuf,
     translators: Arc<Registry>,
-    sink_factory: Arc<dyn SinkFactory>,
     auth_provider: Option<Arc<dyn AuthProvider>>,
-    session_auth: tokio::sync::Mutex<HashMap<DeliveryKey, SessionAuthState>>,
-    route_aliases: Mutex<HashMap<DeliveryKey, DeliveryKey>>,
-    /// Serializes only capture-side journal appends for a source session.
+    pipeline: Arc<Pipeline>,
+    /// Serializes capture-side journal appends and transcript mirroring for a
+    /// source session. Never held across translation or delivery.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Serializes daemon-side routing and actor creation independently of
-    /// capture, which must never inherit actor or sink backpressure.
-    dispatch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    journals: Mutex<HashMap<String, Arc<tokio::sync::Mutex<JournalWriter>>>>,
     claude_transcripts: Mutex<HashMap<DeliveryKey, ClaudeTranscriptObservation>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
-    auth_errors: Mutex<HashMap<DeliveryKey, (String, String)>>,
-    sessions: Mutex<HashMap<DeliveryKey, Arc<Session>>>,
+    /// Routes that cannot be registered at all (for example, no destination).
+    route_errors: Mutex<HashMap<DeliveryKey, (String, String)>>,
     correlation: Arc<crate::correlation::CorrelationRegistry>,
     automatic_links: Mutex<HashMap<String, SessionRoute>>,
     standalone_links: Mutex<HashSet<String>>,
@@ -124,13 +112,11 @@ pub struct Daemon {
     pending_reconcile_lock: tokio::sync::Mutex<()>,
     correlation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     correlation_changed: Arc<Notify>,
-    ingress_tx: mpsc::Sender<IngressMsg>,
-    ingress_overflow: AtomicBool,
-    ingress_dispatched: Mutex<HashMap<DeliveryKey, u64>>,
+    assembly_tx: mpsc::UnboundedSender<AssemblyMsg>,
     started: Instant,
     last_activity: Mutex<Instant>,
     /// Prevents a shutdown drain from racing capture that has passed the
-    /// quiescing check but has not yet appended and queued its event.
+    /// quiescing check but has not yet appended its event.
     capture_gate: tokio::sync::RwLock<()>,
     quiescing: AtomicBool,
     drained: tokio::sync::Mutex<bool>,
@@ -139,33 +125,38 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    fn new(opts: ServeOptions, data_dir: PathBuf) -> Arc<Self> {
-        let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_QUEUE_CAPACITY);
+    fn new(opts: ServeOptions, data_dir: PathBuf) -> anyhow::Result<Arc<Self>> {
+        let (assembly_tx, assembly_rx) = mpsc::unbounded_channel();
+        let correlation = Arc::new(crate::correlation::CorrelationRegistry::default());
+        let route_auth = Arc::new(auth::DaemonAuth::new(opts.auth_provider.clone()));
+        let pipeline = Pipeline::open(PipelineOptions {
+            data_dir: data_dir.clone(),
+            state_dir: None,
+            version: opts.version.clone(),
+            translators: opts.translators.clone(),
+            sink_factory: opts.sink_factory.clone(),
+            auth: route_auth.clone(),
+            correlation: Some(correlation.clone()),
+            assembly_gate: true,
+        })?;
         let daemon = Arc::new(Daemon {
             version: opts.version,
             data_dir,
             translators: opts.translators,
-            sink_factory: opts.sink_factory,
             auth_provider: opts.auth_provider,
-            session_auth: tokio::sync::Mutex::new(HashMap::new()),
-            route_aliases: Mutex::new(HashMap::new()),
+            pipeline,
             session_locks: Mutex::new(HashMap::new()),
-            dispatch_locks: Mutex::new(HashMap::new()),
-            journals: Mutex::new(HashMap::new()),
             claude_transcripts: Mutex::new(HashMap::new()),
             managed_run_sessions: Mutex::new(HashMap::new()),
-            auth_errors: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
-            correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
+            route_errors: Mutex::new(HashMap::new()),
+            correlation,
             automatic_links: Mutex::new(HashMap::new()),
             standalone_links: Mutex::new(HashSet::new()),
             pending_sessions: Mutex::new(HashMap::new()),
             pending_reconcile_lock: tokio::sync::Mutex::new(()),
             correlation_locks: Mutex::new(HashMap::new()),
             correlation_changed: Arc::new(Notify::new()),
-            ingress_tx,
-            ingress_overflow: AtomicBool::new(false),
-            ingress_dispatched: Mutex::new(HashMap::new()),
+            assembly_tx,
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
             capture_gate: tokio::sync::RwLock::new(()),
@@ -174,33 +165,38 @@ impl Daemon {
             shutting_down: AtomicBool::new(false),
             shutdown: Notify::new(),
         });
-        spawn_ingress_worker(daemon.clone(), ingress_rx);
-        daemon
+        spawn_assembly_worker(daemon.clone(), assembly_rx);
+        Ok(daemon)
     }
 
     fn touch(&self) {
         *self.last_activity.lock().unwrap() = Instant::now();
     }
 
-    /// Queued work, excluding pending sessions whose handoff failed. Those are
-    /// durable on disk and resume after a restart, so they must not keep an
-    /// otherwise idle daemon alive forever.
-    fn total_queued(&self) -> u64 {
-        let dispatched: u64 = self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
-            .map(|s| s.counters.queued.load(Ordering::Relaxed))
-            .sum();
-        dispatched.saturating_add(
+    /// Work that is actively progressing. Work held by a recovering machine is
+    /// durable and resumes after a restart, so it must not keep an otherwise
+    /// idle daemon alive forever.
+    async fn active_work(&self) -> u64 {
+        let mut total = 0u64;
+        for runtime in self.pipeline.runtimes() {
+            if runtime.translation.borrow().recovering.is_some()
+                || runtime
+                    .branch_list()
+                    .iter()
+                    .all(|branch| branch.view.borrow().recovering.is_some())
+                    && !runtime.branch_list().is_empty()
+            {
+                continue;
+            }
+            total = total.saturating_add(self.pipeline.pending_work(&runtime).await);
+        }
+        total.saturating_add(
             self.pending_sessions
                 .lock()
                 .unwrap()
                 .values()
-                .filter(|state| !state.delivery_failed)
-                .map(|state| state.events.len() as u64)
-                .sum(),
+                .filter(|state| !state.decided())
+                .count() as u64,
         )
     }
 
@@ -245,11 +241,14 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
     };
     tracing::info!(socket = %socket.display(), "bt-daemon listening");
 
-    let daemon = Daemon::new(opts, data_dir);
-    collect_garbage(&daemon.data_dir).await;
+    let daemon = Daemon::new(opts, data_dir)?;
+    if let Err(error) = crate::pipeline::migrate::import_legacy_journals(&daemon.pipeline).await {
+        tracing::warn!(%error, "legacy journal import incomplete; it resumes on the next start");
+    }
+    collect_garbage(&daemon).await;
     restore_active_parent_snapshots(&daemon.data_dir, &daemon.correlation).await;
     restore_pending_sessions(&daemon).await;
-    recover_unprocessed_journals(&daemon).await;
+    resume_pending_partitions(&daemon).await;
     spawn_pending_reconciler(daemon.clone());
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
     spawn_idle_watchdog(daemon.clone(), idle_timeout);

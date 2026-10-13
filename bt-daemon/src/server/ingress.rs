@@ -1,41 +1,37 @@
-//! The ingress queue between hook capture and session dispatch. Capture only
-//! journals and enqueues; the worker routes events to session actors, using
-//! the journals as overflow when the queue is full.
+//! Capture and assembly.
+//!
+//! Capture durably appends a native observation to its partition's event
+//! journal and acknowledges the hook; nothing downstream participates in the
+//! acknowledgement. The assembly worker then processes captured events in
+//! order: it settles correlation for new sessions and registers each event's
+//! (effective) route as a delivery branch. Assembly keeps its own durable
+//! cursor on the event journal, so a crash between capture and registration
+//! resumes registration at startup.
 
 use super::*;
+use crate::pipeline::store;
+use crate::pipeline::types::{ConsumerId, JournalId, RouteKey, RouteOrigin};
 
-pub(super) enum IngressMsg {
+pub(super) enum AssemblyMsg {
     Event(Box<PendingEvent>),
     Barrier(oneshot::Sender<()>),
 }
 
-/// The hook path never waits for this queue. Once it fills, the append-only
-/// journals become the overflow queue and the worker catches them up in place.
-pub(super) const INGRESS_QUEUE_CAPACITY: usize = 64;
+/// Assembly's durable progress on an event journal.
+pub(super) fn assembly_consumer() -> String {
+    "assembly".to_string()
+}
 
-pub(super) fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::Receiver<IngressMsg>) {
+pub(super) fn spawn_assembly_worker(
+    daemon: Arc<Daemon>,
+    mut rx: mpsc::UnboundedReceiver<AssemblyMsg>,
+) {
     tokio::spawn(async move {
-        loop {
-            if daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
-                recover_ingress_overflow(&daemon).await;
-                continue;
-            }
-            let Some(msg) = rx.recv().await else {
-                break;
-            };
+        while let Some(msg) = rx.recv().await {
             match msg {
-                IngressMsg::Event(event) => {
-                    dispatch_ingress_event(&daemon, *event).await;
-                }
-                IngressMsg::Barrier(reply) => {
-                    loop {
-                        daemon.settle_session_actors().await;
-                        let _ = retry_pending_sessions(&daemon).await;
-                        if !daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
-                            break;
-                        }
-                        recover_ingress_overflow(&daemon).await;
-                    }
+                AssemblyMsg::Event(event) => assemble_event(&daemon, *event).await,
+                AssemblyMsg::Barrier(reply) => {
+                    let _ = retry_pending_sessions(&daemon).await;
                     let _ = reply.send(());
                 }
             }
@@ -43,130 +39,108 @@ pub(super) fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::Receiver<I
     });
 }
 
-pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
-    let ingress_key =
-        event.env.route.as_ref().and_then(|route| {
-            DeliveryKey::new(&event.env.source, &event.env.session_id, route).ok()
-        });
-    if ingress_key.as_ref().is_some_and(|key| {
-        daemon
-            .ingress_dispatched
-            .lock()
-            .unwrap()
-            .get(key)
-            .is_some_and(|through| *through >= event.journal_through)
-    }) {
-        return;
-    }
-
-    let journal_through = event.journal_through;
-    // A child may arrive immediately after a parent's tool hook. Catch prior
-    // session actors up before resolving a new session, entirely in the daemon.
-    // Only an undecided session resolves a parent. Antigravity marks every
-    // invocation as a start, so skip the all-session barrier once decided.
+pub(super) async fn assemble_event(daemon: &Arc<Daemon>, event: PendingEvent) {
+    let partition = PartitionId::new(&event.env.source, &event.env.session_id);
+    let node = event.journal_through;
+    // A child may arrive immediately after a parent's tool hook. Before
+    // resolving an undecided session, let every other session's translation
+    // catch up to what was captured before it. Delivery is irrelevant.
     if is_session_start(&event.env.source, &event.env.event)
         && !daemon.correlation_decided(&automatic_link_key(&event.env))
     {
-        daemon.settle_session_actors().await;
+        daemon.settle_translation(&partition).await;
     }
-    match accept_event(daemon, event).await {
-        Ok(()) => {
-            if let Some(key) = ingress_key {
-                let mut dispatched = daemon.ingress_dispatched.lock().unwrap();
-                let through = dispatched.entry(key).or_default();
-                *through = (*through).max(journal_through);
-            }
-        }
-        Err(error) => {
-            tracing::warn!(%error, "journaled ingress event could not be dispatched");
-        }
+    if let Err(error) = accept_event(daemon, event).await {
+        tracing::warn!(%partition, %error, "captured event could not be assembled");
+        daemon.pipeline.mark_assembled(&partition, node);
+    }
+    // Registration failures are reported through status; the event itself
+    // remains durable and translated regardless.
+    let jkey = JournalId::events(&partition).key();
+    let consumer = assembly_consumer();
+    if let Err(error) = daemon
+        .pipeline
+        .store
+        .write(move |tx| store::advance_head(tx, &jkey, &consumer, node + 1))
+        .await
+    {
+        tracing::warn!(%partition, %error, "assembly cursor not persisted");
     }
 }
 
-/// Drain events omitted from the bounded in-memory queue. The queue contains
-/// only a latency fast path; journals remain the complete source of ingress.
-pub(super) async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
-    let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
-        return;
-    };
-    let mut recovered = 0usize;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
-            continue;
-        }
-        let recorded_len = journal::JournalReader::recorded_len(&path).await;
-        let Ok(Some(mut checkpoints)) = journal::JournalReader::open(&path, recorded_len).await
-        else {
-            continue;
-        };
-        let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
-        while let Ok(Some(entry)) = checkpoints.next_record().await {
-            if let journal::JournalRecord::DeliveryCheckpoint { route, through } = entry.record {
-                let key = serde_json::to_string(&route).unwrap_or_default();
-                let acknowledged = acknowledged_by_route.entry(key).or_default();
-                *acknowledged = (*acknowledged).max(through);
-            }
-        }
+/// Register an event's effective route as a delivery branch.
+pub(super) async fn accept_resolved_event(
+    daemon: &Arc<Daemon>,
+    event: PendingEvent,
+) -> Result<(), String> {
+    let partition = PartitionId::new(&event.env.source, &event.env.session_id);
+    let node = event.journal_through;
+    let result = register_event_route(daemon, event).await;
+    // Translation of this event may proceed whether or not a route could be
+    // registered; registration problems are reported through status.
+    daemon.pipeline.mark_assembled(&partition, node);
+    result
+}
 
-        let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded_len).await else {
-            continue;
-        };
-        let mut before = 0u64;
-        while let Ok(Some(entry)) = reader.next_record().await {
-            let through = entry.through;
-            let journal::JournalRecord::Event(redacted) = entry.record else {
-                before = through;
-                continue;
-            };
-            let mut env = journal::envelope_from_redacted(redacted);
-            let Some(source) = daemon.translators.canonical_source(&env.source) else {
-                before = through;
-                continue;
-            };
-            env.source = source.to_string();
-            let Some(route) = env.route.as_ref() else {
-                before = through;
-                continue;
-            };
-            let route_json = recovered_delivery_route(daemon, &env)
-                .await
-                .as_ref()
-                .and_then(|route| serde_json::to_string(route).ok())
-                .unwrap_or_else(|| serde_json::to_string(route).unwrap_or_default());
-            let key = match DeliveryKey::new(&env.source, &env.session_id, route) {
-                Ok(key) => key,
-                Err(_) => {
-                    before = through;
-                    continue;
-                }
-            };
-            let dispatched = daemon
-                .ingress_dispatched
-                .lock()
-                .unwrap()
-                .get(&key)
-                .copied()
-                .unwrap_or(0);
-            let acknowledged = acknowledged_by_route.get(&route_json).copied().unwrap_or(0);
-            if through > dispatched.max(acknowledged) {
-                dispatch_ingress_event(
-                    daemon,
-                    PendingEvent {
-                        env,
-                        replay_through: before,
-                        journal_through: through,
-                    },
-                )
-                .await;
-                recovered += 1;
-            }
-            before = through;
+async fn register_event_route(daemon: &Arc<Daemon>, event: PendingEvent) -> Result<(), String> {
+    let env = event.env;
+    let route = env
+        .route
+        .clone()
+        .ok_or_else(|| "event is missing its session route".to_string())?;
+    let delivery_key = DeliveryKey::new(&env.source, &env.session_id, &route)
+        .map_err(|error| error.to_string())?;
+    if route.destination.is_none() {
+        let message = "session route is missing its trace destination; select a project or destination during `bt trace setup` or `bt trace run`".to_string();
+        daemon
+            .route_errors
+            .lock()
+            .unwrap()
+            .insert(delivery_key, (env.source.clone(), message.clone()));
+        return Err(message);
+    }
+    let partition = PartitionId::new(&env.source, &env.session_id);
+    let route_key = RouteKey::live(&route);
+    let correlation_key = crate::pipeline::translation::correlation_key(&partition, &route_key);
+    if crate::capture::is_tool_lifecycle_event(&env.event) {
+        if let Err(error) = mark_active_parent_snapshot_dirty(
+            &daemon.data_dir,
+            &correlation_key,
+            &daemon.correlation,
+        )
+        .await
+        {
+            tracing::warn!(session_id = %env.session_id, %error, "active parent snapshot could not be marked dirty");
         }
     }
-    if recovered > 0 {
-        tracing::info!(recovered, "drained journal-backed ingress overflow");
+    daemon.correlation.observe_session(
+        &correlation_key,
+        &env.source,
+        env.capture.as_ref(),
+        is_session_start(&env.source, &env.event),
+    );
+    daemon
+        .pipeline
+        .register_route(&partition, &route, RouteOrigin::Live, None)
+        .await
+        .map_err(|error| format!("route registration failed: {error:#}"))?;
+    daemon.route_errors.lock().unwrap().remove(&delivery_key);
+    if let Some(managed_run_id) = &env.managed_run_id {
+        daemon
+            .persist_managed_run_session(managed_run_id, &delivery_key, &route)
+            .await;
     }
+    tracing::debug!(source = %env.source, event = %env.event, session_id = %env.session_id, "route assembled");
+    Ok(())
+}
+
+pub(super) fn is_session_start(source: &str, event: &str) -> bool {
+    matches!(event, "SessionStart" | "session_start" | "session.created")
+        || (source == "cursor" && event == "sessionStart")
+        // Antigravity has no dedicated session-start or resume hook. Its
+        // PreInvocation is the earliest hook in each invocation and is the
+        // only opportunity to refresh a resumed conversation's process.
+        || (source == "antigravity" && event == "PreInvocation")
 }
 
 pub(super) fn spawn_pending_reconciler(daemon: Arc<Daemon>) {
@@ -186,93 +160,155 @@ pub(super) fn spawn_pending_reconciler(daemon: Arc<Daemon>) {
     });
 }
 
-pub(super) async fn accept_resolved_event(
-    daemon: &Arc<Daemon>,
-    event: PendingEvent,
-) -> Result<(), String> {
-    let PendingEvent {
-        mut env,
-        replay_through,
-        journal_through,
-    } = event;
-    // Every fresh Claude capture carries a bounded observation marker. Older
-    // persisted ingress must never consume live bytes while rebuilding state.
-    if env.source == "claude-code" && env.payload.get("_bt_claude_transcript_mirrors").is_none() {
-        if let Some(payload) = env.payload.as_object_mut() {
-            payload.insert("_bt_transcript_replay".to_string(), serde_json::json!(true));
+/// Load every partition that holds pending work, and finish assembling any
+/// event captured before a crash but never assembled.
+pub(super) async fn resume_pending_partitions(daemon: &Arc<Daemon>) {
+    let pipeline = &daemon.pipeline;
+    let rows = match pipeline.store.read(store::partitions).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "partition index unreadable; nothing resumed");
+            return;
         }
-    }
-    let schedule_flush = crate::hook::should_flush_ingress_event(&env)
-        || (env.source == "claude-code" && env.event == "TranscriptUpdate");
-    let source = env.source.clone();
-    let event = env.event.clone();
-    let session_id = env.session_id.clone();
-    let managed_run_id = env.managed_run_id.clone();
-    let route = env.route.clone();
-    tracing::info!(source, event, session_id, "event received");
-    let session_lock = daemon.dispatch_lock(&source, &session_id);
-    let _session_guard = session_lock.lock().await;
-
-    let result = async {
-        let delivery_key = daemon
-            .configure_event(&mut env)
-            .await
-            .map_err(|error| format!("session auth failed: {error}"))?;
-        if crate::dispatch::is_tool_lifecycle_event(&env.event) {
-            if let Err(error) = mark_active_parent_snapshot_dirty(
-                &daemon.data_dir,
-                &delivery_key.correlation_key(),
-                &daemon.correlation,
-            )
-            .await
-            {
-                tracing::warn!(session_id = %env.session_id, %error, "active parent snapshot could not be marked dirty");
+    };
+    let known: Vec<PartitionId> = rows.iter().map(|row| row.partition.clone()).collect();
+    let mut resumed = 0usize;
+    // Event journals are the source of truth: one whose index entry is gone is
+    // adopted and translated from its first event.
+    let adopted = pipeline.events.unindexed_partitions(&known);
+    let partitions = rows.into_iter().map(|row| row.partition).chain(adopted);
+    for partition in partitions {
+        let pending = match pipeline_pending(pipeline, &partition).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%partition, %error, "partition state unreadable; resuming it");
+                Pending {
+                    work: true,
+                    assembly_from: None,
+                }
             }
+        };
+        if !pending.work && pending.assembly_from.is_none() {
+            continue;
         }
-        let session = daemon
-            .session_for(&env, &delivery_key, replay_through)
-            .await
-            .map_err(|error| format!("session init failed: {error}"))?;
-        daemon
-            .correlation
-            .observe_session(&delivery_key.correlation_key(), &env.source, env.capture.as_ref(),
-                is_session_start(&env.source, &env.event));
-        session
-            .enqueue(env, journal_through)
-            .await
-            .map_err(|error| format!("enqueue failed: {error}"))?;
-        Ok(delivery_key)
-    }
-    .await;
-
-    match &result {
-        Ok(delivery_key) => {
-            if let (Some(managed_run_id), Some(route)) = (managed_run_id, route) {
-                daemon
-                    .persist_managed_run_session(&managed_run_id, delivery_key, &route)
-                    .await;
-            }
-            tracing::info!(source, event, session_id, "event accepted")
+        if let Err(error) = pipeline.partition(&partition).await {
+            tracing::warn!(%partition, %error, "partition could not be resumed");
+            continue;
         }
-        Err(error) => tracing::warn!(source, event, session_id, error, "event rejected"),
+        resumed += 1;
+        if let Some(from) = pending.assembly_from {
+            reassemble(daemon, &partition, from).await;
+        }
     }
-    if result.is_ok() && schedule_flush {
-        // Deferred terminal events need the same flush as immediate events;
-        // there may have been no session actor when ingress first accepted them.
-        daemon
-            .enqueue_source_session_flush(&source, &session_id, Duration::from_secs(10))
-            .await;
+    if resumed > 0 {
+        tracing::info!(resumed, "resumed partitions with pending work");
     }
-    result.map(|_| ())
 }
 
-pub(super) fn is_session_start(source: &str, event: &str) -> bool {
-    matches!(event, "SessionStart" | "session_start" | "session.created")
-        || (source == "cursor" && event == "sessionStart")
-        // Antigravity has no dedicated session-start or resume hook. Its
-        // PreInvocation is the earliest hook in each invocation and is the
-        // only opportunity to refresh a resumed conversation's process.
-        || (source == "antigravity" && event == "PreInvocation")
+pub(super) struct Pending {
+    pub(super) work: bool,
+    /// First event never assembled, if any.
+    pub(super) assembly_from: Option<u64>,
+}
+
+/// Whether a partition holds pending work: untranslated events, undelivered
+/// spans, a failure, or a backfill.
+pub(super) async fn pipeline_pending(
+    pipeline: &Arc<Pipeline>,
+    partition: &PartitionId,
+) -> anyhow::Result<Pending> {
+    let events_tail = pipeline.events.tail(partition).await?;
+    let events = JournalId::events(partition).key();
+    let spans = JournalId::spans(partition).key();
+    let pkey = partition.key();
+    let (work, assembly_head) = pipeline
+        .store
+        .read(move |conn| {
+            let receipt = store::head(conn, &events, &ConsumerId::Translation.key())?
+                .unwrap_or(1)
+                .saturating_sub(1);
+            let assembly = store::head(conn, &events, &assembly_consumer())?.unwrap_or(1);
+            let spans_tail = store::journal_tail(conn, &spans)?;
+            let mut work = receipt < events_tail;
+            for (_, state) in store::branches(conn, &pkey)? {
+                let record: crate::pipeline::runtime::BranchRecord = serde_json::from_str(&state)?;
+                if record.phase != crate::pipeline::runtime::Phase::Live
+                    || record.delivered_through < spans_tail
+                {
+                    let head = store::head(conn, &spans, &ConsumerId::branch(&record.key).key())?
+                        .unwrap_or(1);
+                    if head <= spans_tail || record.phase != crate::pipeline::runtime::Phase::Live {
+                        work = true;
+                    }
+                }
+            }
+            work |= !store::backfills(conn, &pkey)?.is_empty();
+            work |= store::failures(conn)?
+                .iter()
+                .any(|(jkey, _, _)| jkey.starts_with(&format!("{pkey}\u{1f}")));
+            Ok((work, assembly))
+        })
+        .await?;
+    let assembly_from = if assembly_head <= events_tail {
+        // Controls follow events in the journal; only an unassembled native
+        // event needs assembly.
+        let mut cursor = pipeline.events.cursor(partition);
+        let unassembled = tokio::task::spawn_blocking(move || {
+            cursor.seek(assembly_head)?;
+            while let Some((_, input)) = cursor.read_one()? {
+                if matches!(input, crate::pipeline::types::TranslationInput::Native(_)) {
+                    return anyhow::Ok(true);
+                }
+            }
+            anyhow::Ok(false)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))??;
+        unassembled.then_some(assembly_head)
+    } else {
+        None
+    };
+    Ok(Pending {
+        work,
+        assembly_from,
+    })
+}
+
+/// Assemble events captured but never assembled before a restart.
+async fn reassemble(daemon: &Arc<Daemon>, partition: &PartitionId, from: u64) {
+    let mut cursor = daemon.pipeline.events.cursor(partition);
+    let events = tokio::task::spawn_blocking(move || {
+        cursor.seek(from)?;
+        let mut events = Vec::new();
+        while let Some((node, input)) = cursor.read_one()? {
+            if let crate::pipeline::types::TranslationInput::Native(env) = input {
+                events.push((node, *env));
+            }
+        }
+        anyhow::Ok(events)
+    })
+    .await;
+    let events = match events {
+        Ok(Ok(events)) => events,
+        Ok(Err(error)) => {
+            tracing::warn!(%partition, %error, "unassembled events unreadable");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%partition, %error, "unassembled event read failed");
+            return;
+        }
+    };
+    for (node, env) in events {
+        let env = crate::journal::envelope_from_redacted(env);
+        let _ = daemon
+            .assembly_tx
+            .send(AssemblyMsg::Event(Box::new(PendingEvent {
+                env,
+                replay_through: 0,
+                journal_through: node,
+            })));
+    }
 }
 
 impl Daemon {
@@ -286,57 +322,87 @@ impl Daemon {
             .canonical_source(&env.source)
             .ok_or_else(|| format!("unsupported coding-agent source {:?}", env.source))?
             .to_string();
+        if env.session_id.is_empty() {
+            return Err("event has an empty session id".to_string());
+        }
         self.touch();
         let lock = self.session_lock(&env.source, &env.session_id);
         let _guard = lock.lock().await;
-        hydrate_transcript_reference(&self.data_dir, &mut env).await;
+        crate::capture::hydrate_transcript_reference(&self.data_dir, &mut env).await;
         self.journal_and_enqueue(env).await
     }
 
-    /// Caller holds the source-session capture lock; frozen observations enter
-    /// the same durable queue as hooks without reacquiring that lock.
-    pub(super) async fn journal_and_enqueue(&self, mut env: Envelope) -> Result<bool, String> {
-        let (replay_through, journal_through) = self
-            .append_to_journal(&mut env)
+    /// Caller holds the source-session capture lock. Durably append, then
+    /// hand the event to assembly without waiting for it.
+    pub(super) async fn journal_and_enqueue(&self, env: Envelope) -> Result<bool, String> {
+        let (_, node) = self
+            .pipeline
+            .capture(&env)
             .await
-            .map_err(|error| format!("journal failed: {error}"))?;
+            .map_err(|error| format!("journal failed: {error:#}"))?;
         self.remember_claude_transcripts(&env);
-        match self
-            .ingress_tx
-            .try_send(IngressMsg::Event(Box::new(PendingEvent {
+        // A route's flush mode decides where checkpoints go. They follow the
+        // event in journal order; nothing waits for them here.
+        let checkpoint = crate::hook::should_flush_ingress_event(&env)
+            || (env.source == "claude-code" && env.event == "TranscriptUpdate");
+        if checkpoint {
+            let partition = PartitionId::new(&env.source, &env.session_id);
+            if let Err(error) = self.pipeline.control(&partition, None).await {
+                tracing::warn!(%partition, %error, "turn-end checkpoint not captured");
+            }
+        }
+        if self
+            .assembly_tx
+            .send(AssemblyMsg::Event(Box::new(PendingEvent {
                 env,
-                replay_through,
-                journal_through,
-            }))) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.ingress_overflow.store(true, Ordering::Release);
-                tracing::debug!("ingress queue full; journal will be drained by daemon worker");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!("journaled event will be recovered after daemon restart");
-            }
+                replay_through: 0,
+                journal_through: node,
+            })))
+            .is_err()
+        {
+            tracing::warn!("captured event will be assembled after daemon restart");
         }
         Ok(true)
     }
 
-    pub(super) async fn ingress_barrier(&self) {
+    /// Wait until assembly has processed everything captured so far.
+    pub(super) async fn settle_assembly(&self) {
         let (tx, rx) = oneshot::channel();
-        if self.ingress_tx.send(IngressMsg::Barrier(tx)).await.is_ok() {
+        if self.assembly_tx.send(AssemblyMsg::Barrier(tx)).is_ok() {
             let _ = rx.await;
         }
     }
 
-    pub(super) async fn settle_ingress(self: &Arc<Self>) {
-        self.ingress_barrier().await;
-        self.settle_session_actors().await;
-        let _ = retry_pending_sessions(self).await;
-    }
-
-    pub(super) async fn settle_session_actors(&self) {
-        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
-        for session in sessions {
-            session.barrier().await;
+    /// Wait, bounded by the correlation wait, until every other partition's
+    /// translation has handed off everything captured so far. A recovering
+    /// translation does not extend the wait.
+    pub(super) async fn settle_translation(&self, except: &PartitionId) {
+        let deadline = tokio::time::Instant::now() + CORRELATION_WAIT;
+        for runtime in self.pipeline.runtimes() {
+            if &runtime.partition == except {
+                continue;
+            }
+            let Ok(tail) = self.pipeline.events.tail(&runtime.partition).await else {
+                continue;
+            };
+            // Only events already assembled can have been translated: assembly
+            // is sequential, so these are exactly those captured earlier.
+            let tail = tail.min(*runtime.assembled.borrow());
+            let mut view = runtime.translation.subscribe();
+            loop {
+                {
+                    let current = view.borrow_and_update();
+                    if current.receipt >= tail || current.recovering.is_some() {
+                        break;
+                    }
+                }
+                if tokio::time::timeout_at(deadline, view.changed())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
         }
     }
 }

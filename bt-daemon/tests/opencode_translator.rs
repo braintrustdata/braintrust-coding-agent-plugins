@@ -1,3 +1,5 @@
+#[path = "support/route_neutrality.rs"]
+mod route_neutrality;
 #[path = "support/span_identity.rs"]
 mod span_identity;
 
@@ -866,4 +868,90 @@ fn opencode_idle_root_merge_keeps_external_parent() {
         "idle root merge dropped the external parent"
     );
     assert_merges_preserve_insert_identity(&ops);
+}
+
+#[test]
+fn opencode_rows_are_route_neutral_and_overlaid_per_route() {
+    let events = vec![
+        event(
+            "session.created",
+            1,
+            json!({"properties":{"info":{"id":"parent"}}}),
+        ),
+        event(
+            "chat.message",
+            2,
+            json!({"input":{"sessionID":"parent"},"output":{"parts":[{"type":"text","text":"delegate"}]}}),
+        ),
+        event(
+            "session.created",
+            3,
+            json!({"properties":{"info":{"id":"child","parentID":"parent","title":"find docs (@research subagent)"}}}),
+        ),
+        event(
+            "tool.execute.before",
+            4,
+            json!({"input":{"sessionID":"child","callID":"call-1","tool":"read"},"output":{"args":{"path":"README.md"}}}),
+        ),
+        event(
+            "tool.execute.after",
+            5,
+            json!({"input":{"sessionID":"child","callID":"call-1","tool":"read"},"result":{"title":"Read","output":"contents"}}),
+        ),
+        event(
+            "session.deleted",
+            6,
+            json!({"properties":{"sessionID":"child"}}),
+        ),
+        event(
+            "session.idle",
+            7,
+            json!({"properties":{"sessionID":"parent"}}),
+        ),
+        event(
+            "chat.message",
+            8,
+            json!({"input":{"sessionID":"parent"},"output":{"parts":[{"type":"text","text":"again"}]}}),
+        ),
+        event(
+            "session.deleted",
+            9,
+            json!({"properties":{"sessionID":"parent"}}),
+        ),
+    ];
+    let (neutral, attached) =
+        route_neutrality::assert_route_neutral("opencode", "root-session", |tr, ctx| {
+            let mut ops = Vec::new();
+            for event in &events {
+                ops.extend(tr.handle(event, ctx).unwrap());
+            }
+            ops.extend(tr.finalize(ctx).unwrap());
+            ops
+        });
+    let insert = |ops: &[SpanOp], name: &str| -> SpanRow {
+        ops.iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.name == name => Some(row.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let root = insert(&neutral, "OpenCode");
+    let child = insert(&neutral, "research: find docs");
+    assert!(root.defer_until_child && child.defer_until_child);
+    assert!(root.parent_span_ids.is_empty() && root.tags.is_none());
+    assert!(child.tags.is_none());
+    assert_eq!(child.root_span_id, root.span_id);
+
+    let root = insert(&attached, "OpenCode");
+    let child = insert(&attached, "research: find docs");
+    assert_eq!(root.parent_span_ids, [route_neutrality::ROUTE_PARENT]);
+    assert_ne!(child.parent_span_ids, [route_neutrality::ROUTE_PARENT]);
+    for row in [&root, &child] {
+        assert_eq!(row.tags, Some(vec!["route-a".to_string()]));
+        let metadata = row.metadata.as_ref().unwrap();
+        assert_eq!(metadata["team"], "a");
+        assert_eq!(metadata["source"], "opencode");
+        assert!(metadata.get("_bt_internal").is_none());
+    }
 }

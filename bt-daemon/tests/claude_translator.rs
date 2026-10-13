@@ -3,12 +3,14 @@
     reason = "Test fixtures intentionally launch raw children."
 )]
 
+#[path = "support/route_neutrality.rs"]
+mod route_neutrality;
 #[path = "support/span_identity.rs"]
 mod span_identity;
 
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, Envelope, SessionRoute, TraceDestination};
-use bt_daemon::{Registry, SessionCtx, SpanOp, SpanRow, SpanType};
+use bt_daemon::{AgentTranslator, Registry, SessionCtx, SpanOp, SpanRow, SpanType};
 use serde_json::{json, Value};
 use span_identity::{assert_merges_preserve_insert_identity, assert_turn_lineage};
 use std::collections::HashMap;
@@ -49,18 +51,12 @@ fn replay(name: &str) -> Vec<SpanOp> {
     replay_from(name, Source::Mirror)
 }
 
-fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
+fn fixture_events(name: &str, source: Source) -> (String, Vec<Envelope>) {
     let dir = fixture(name);
     let contents = std::fs::read_to_string(dir.join("events.ndjson")).unwrap();
     let first: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
     let session_id = first["payload"]["session_id"].as_str().unwrap();
-    let registry = Registry::default_agents();
-    let mut translator = registry.create("claude-code", session_id);
-    let ctx = SessionCtx {
-        session_id: session_id.to_string(),
-        config: None,
-    };
-    let mut ops = Vec::new();
+    let mut events = Vec::new();
 
     for line in contents.lines() {
         let record: Value = serde_json::from_str(line).unwrap();
@@ -108,16 +104,39 @@ fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
             config: None,
             capture: None,
         };
-        ops.extend(translator.handle(&env, &ctx).unwrap());
-        while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+        events.push(env);
+    }
+    (session_id.to_string(), events)
+}
+
+fn replay_events(
+    translator: &mut dyn AgentTranslator,
+    ctx: &SessionCtx,
+    events: &[Envelope],
+) -> Vec<SpanOp> {
+    let mut ops = Vec::new();
+    for env in events {
+        ops.extend(translator.handle(env, ctx).unwrap());
+        while let Some(batch) = translator.drain_pending(ctx).unwrap() {
             ops.extend(batch);
         }
     }
-    ops.extend(translator.flush(&ctx).unwrap());
-    while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+    ops.extend(translator.flush(ctx).unwrap());
+    while let Some(batch) = translator.drain_pending(ctx).unwrap() {
         ops.extend(batch);
     }
     ops
+}
+
+fn replay_from(name: &str, source: Source) -> Vec<SpanOp> {
+    let (session_id, events) = fixture_events(name, source);
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", &session_id);
+    let ctx = SessionCtx {
+        session_id,
+        config: None,
+    };
+    replay_events(translator.as_mut(), &ctx, &events)
 }
 
 fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
@@ -2477,4 +2496,35 @@ fn claude_finalization_drains_observed_late_response() {
     assert_eq!(llm.parent_span_ids, vec![turn.span_id.clone()]);
     assert_eq!(llm.output.as_ref().unwrap()["content"], "late answer");
     assert_eq!(llm.metrics.as_ref().unwrap()["completion_tokens"], 7);
+}
+
+#[test]
+fn claude_rows_are_route_neutral_and_overlaid_per_route() {
+    let (session_id, events) = fixture_events("subagent-compact", Source::Mirror);
+    let (neutral, attached) =
+        route_neutrality::assert_route_neutral("claude-code", &session_id, |tr, ctx| {
+            replay_events(tr, ctx, &events)
+        });
+    let root = root_insert(&neutral);
+    assert!(root.parent_span_ids.is_empty() && root.tags.is_none());
+    assert!(reduce(neutral.clone())
+        .values()
+        .all(|row| row.root_span_id == root.span_id));
+    let root = root_insert(&attached);
+    assert_eq!(root.parent_span_ids, [route_neutrality::ROUTE_PARENT]);
+    assert_eq!(root.tags, Some(vec!["route-a".to_string()]));
+    let metadata = root.metadata.as_ref().unwrap();
+    assert_eq!(metadata["team"], "a");
+    assert_eq!(metadata["source"], "claude-code");
+    assert_eq!(metadata["session_id"], session_id.as_str());
+    assert!(metadata.get("_bt_internal").is_none());
+}
+
+fn root_insert(ops: &[SpanOp]) -> &SpanRow {
+    ops.iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name.starts_with("Claude Code:") => Some(row),
+            _ => None,
+        })
+        .expect("session root insert")
 }

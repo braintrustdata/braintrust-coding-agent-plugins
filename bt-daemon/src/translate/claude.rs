@@ -10,7 +10,7 @@ use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
 use super::tool::{add_tool_approval, explicit_skill_metadata, nonempty_error_text, ToolApproval};
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
+    local_username, AgentTranslator, RouteSlots, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
 };
 use crate::ids;
@@ -255,7 +255,6 @@ struct ClaudeTranslator {
     session_id: String,
     session_span_id: String,
     root_span_id: String,
-    session_parent_span_ids: Vec<String>,
     root_open: bool,
     root_end_ms: Option<i64>,
     turn: Option<Turn>,
@@ -302,7 +301,6 @@ impl ClaudeTranslator {
             session_id: session_id.to_string(),
             session_span_id: root.clone(),
             root_span_id: root,
-            session_parent_span_ids: Vec::new(),
             root_open: false,
             root_end_ms: None,
             turn: None,
@@ -353,25 +351,9 @@ impl ClaudeTranslator {
             return;
         }
         self.root_open = true;
-        let (parent_span_id, root_span_id) = ctx
-            .config
-            .as_ref()
-            .map(|config| config.attached_span_ids())
-            .unwrap_or_default();
-        if let Some(root) = root_span_id {
-            self.root_span_id = root.clone();
-        }
-        self.session_parent_span_ids = parent_span_id.into_iter().collect();
         let cwd = hook.cwd.clone().unwrap_or_default();
         let workspace = basename(&cwd);
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|c| c.additional_metadata.clone())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-        // Internal routing settings must never appear as user metadata.
-        metadata.retain(|key, _| !key.starts_with("_bt_"));
+        let mut metadata = Map::new();
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("workspace".into(), json!(cwd));
         metadata.insert("source".into(), json!("claude-code"));
@@ -404,13 +386,12 @@ impl ClaudeTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: self.session_parent_span_ids.clone(),
             name: format!("Claude Code: {workspace}"),
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
             input: Some(json!(format!("Session: {workspace}"))),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
+            route_slots: RouteSlots::ROOT,
             ..Default::default()
         }));
     }
@@ -1204,7 +1185,7 @@ impl ClaudeTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: self.session_parent_span_ids.clone(),
+            route_slots: RouteSlots::ATTACH,
             end_ms: Some(end_ms),
             late_merge_key: Some(format!("session:stop:{end_ms}")),
             ..Default::default()
@@ -1285,7 +1266,7 @@ impl AgentTranslator for ClaudeTranslator {
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id: self.session_span_id.clone(),
                     root_span_id: self.root_span_id.clone(),
-                    parent_span_ids: self.session_parent_span_ids.clone(),
+                    route_slots: RouteSlots::ATTACH,
                     metadata: Some(json!({ "claude_code_version": version })),
                     ..Default::default()
                 }));

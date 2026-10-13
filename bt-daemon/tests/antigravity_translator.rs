@@ -1,3 +1,5 @@
+#[path = "support/route_neutrality.rs"]
+mod route_neutrality;
 #[path = "support/span_identity.rs"]
 mod span_identity;
 
@@ -876,4 +878,52 @@ fn resumed_process_reuses_invocation_zero_without_reparenting_to_turn_one() {
     assert_eq!(tool.name, "list_directory");
     assert_eq!(tool.parent_span_ids, vec![turn_one.span_id.clone()]);
     assert_eq!(tool.metadata.as_ref().unwrap()["tool_approval"], "approved");
+}
+
+#[test]
+fn antigravity_rows_are_route_neutral_and_overlaid_per_route() {
+    let records = vec![
+        json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "COMPLETED", "content": "List the files"}),
+        json!({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "COMPLETED", "content": "Inspecting.", "tool_calls": [{"name":"run_command","args":{"CommandLine":"ls"}}]}),
+        json!({"step_index": 2, "source": "MODEL", "type": "CORTEX_STEP_TYPE_RUN_COMMAND", "status": "COMPLETED", "content": "README.md", "tool_calls": [{"name": "run_command", "args": {"CommandLine":"ls"}, "result": "README.md"}]}),
+    ];
+    let (transcript, boundary) = jsonl(&records);
+    let path = "/tmp/conversation/transcript.jsonl";
+    let events = [
+        ("PreInvocation", 100, boundary[0], json!({"invocationNum":0,"initialNumSteps":1})),
+        ("PostInvocation", 200, boundary[1], json!({"invocationNum":0,"initialNumSteps":1})),
+        ("PostToolUse", 300, boundary[2], json!({"stepIdx":2,"error":""})),
+        ("Stop", 400, boundary[2], json!({"executionNum": 0, "terminationReason": "model_stop", "error": "", "fullyIdle": true})),
+    ]
+    .map(|(name, ts, through, extra)| event(name, ts, path, &transcript, through, extra));
+    let (neutral, attached) =
+        route_neutrality::assert_route_neutral("antigravity", "conversation-1", |tr, ctx| {
+            let mut ops = Vec::new();
+            for event in &events {
+                ops.extend(tr.handle(event, ctx).unwrap());
+            }
+            ops.extend(tr.finalize(ctx).unwrap());
+            ops
+        });
+    let root = |ops: &[SpanOp]| -> SpanRow {
+        ops.iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.name == "Antigravity: demo" => Some(row.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let neutral_root = root(&neutral);
+    assert!(neutral_root.defer_until_child);
+    assert!(neutral_root.parent_span_ids.is_empty() && neutral_root.tags.is_none());
+    let attached_root = root(&attached);
+    assert_eq!(
+        attached_root.parent_span_ids,
+        [route_neutrality::ROUTE_PARENT]
+    );
+    assert_eq!(attached_root.tags, Some(vec!["route-a".to_string()]));
+    let metadata = attached_root.metadata.as_ref().unwrap();
+    assert_eq!(metadata["team"], "a");
+    assert_eq!(metadata["source"], "antigravity");
+    assert!(metadata.get("_bt_internal").is_none());
 }

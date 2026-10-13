@@ -417,32 +417,22 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
     ] {
         send_with_flush_mode(&socket, event, ts_ms, payload, FlushMode::FlushOnTurnEnd).await;
     }
-    let journal = source_journal_path(&data, "cursor", "cursor-recovery");
     // Ingress acknowledges capture before the out-of-band sink flush finishes.
-    // Wait for delivery and its checkpoint without requesting an explicit flush.
+    // Wait for delivery and its head advance without requesting an explicit flush.
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let delivered = buffered.lock().unwrap().delivered.iter().any(|op| {
                 matches!(op, SpanOp::Merge(row) if row.output == Some(json!("late final answer")))
             });
-            let text = std::fs::read_to_string(&journal).unwrap_or_default();
-            let mut position = 0;
-            let mut response_through = None;
-            let mut checkpoint_through = 0;
-            for line in text.split_inclusive('\n') {
-                position += line.len() as u64;
-                let Ok(row) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                if row["event"] == "afterAgentResponse" {
-                    response_through = Some(position);
-                }
-                if row.get("_bt_record_type").is_some() {
-                    checkpoint_through =
-                        checkpoint_through.max(row["through"].as_u64().unwrap_or(0));
-                }
-            }
-            if delivered && response_through.is_some_and(|offset| checkpoint_through >= offset) {
+            let drained = bt_daemon::run_status(bt_daemon::StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: Some("cursor-recovery".into()),
+            })
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|status| status.sessions.iter().all(|session| session.queued == 0));
+            if delivered && drained {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -650,7 +640,7 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
         .iter()
         .all(|row| row["parent_span_ids"].as_array().unwrap().len() == 1));
     let journal = source_journal_path(&data, "cursor", "cursor-recovery");
-    let persisted = rows(&journal);
+    let persisted = bt_daemon::read_journaled_events(&data, "cursor", "cursor-recovery").unwrap();
     let observations = persisted
         .iter()
         .filter(|row| row["event"] == "stop")
@@ -667,14 +657,16 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
         .unwrap()
         .contains("cursor-test-secret"));
 
-    // Simulate a delivery loss: retain accepted ingress, discard sink receipts.
-    let pending = persisted
-        .iter()
-        .filter(|row| row.get("_bt_record_type").is_none())
-        .map(|row| format!("{row}\n"))
-        .collect::<String>();
-    std::fs::write(&journal, pending).unwrap();
-    std::fs::remove_dir_all(data.join("delivery-ledger")).unwrap();
+    // Simulate a delivery loss: keep the event journal, lose every receipt,
+    // head and span. The journal alone rebuilds the session.
+    let pipeline_dir = data.join("pipeline");
+    for entry in std::fs::read_dir(&pipeline_dir).unwrap().flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("pipeline.sqlite") {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let _ = std::fs::remove_dir_all(data.join("delivery-ledger"));
     std::fs::remove_file(&native).unwrap();
     std::fs::remove_file(&output).unwrap();
     let recovered_daemon = start(&data, &socket).await;

@@ -1,17 +1,18 @@
-//! Transcript import: run native transcript records through the translators
-//! and a sink without a daemon, recording deliveries in the ledger.
+//! Transcript import: each imported session is a partition with its own
+//! import route, fed by a transcript backfill and delivered by the same route
+//! machine as live traffic, in a pipeline private to the importing process.
 
 use anyhow::Context;
 use braintrust_sdk_rust::SpanComponents;
 use std::path::PathBuf;
 
 use crate::args::{ImportArgs, ImportSource, ParentObjectType};
+use crate::pipeline::runtime::{BackfillSource, ResolvedAuth, RouteAuth};
+use crate::pipeline::types::{PartitionId, RouteOrigin};
 use crate::route::resolve_span_plugin_paths;
-use crate::wire::{self, Envelope, SessionConfig};
-use crate::{
-    delivery_ledger, paths, transcript_import, AgentTranslator, ImportSummary, ServeOptions,
-    SessionCtx, Sink, SpanOp,
-};
+use crate::wire::{self, SessionConfig};
+use crate::{paths, transcript_import, ImportSummary, ServeOptions};
+use std::sync::Arc;
 
 /// Import a native coding-agent transcript through the normal translators and
 /// sink. This is separate from daemon journal recovery: import creates traces
@@ -193,38 +194,21 @@ async fn import_transcript_with_ledger(
     attach: bool,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
-    let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
-    if attach {
-        tail.allow_incomplete_final_record_on_shutdown();
-    }
-    let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
-    let mut finalizing = !attach;
-    loop {
-        let entries = tail.poll(finalizing)?;
-        if tail.take_translator_reset() {
-            processor.reset_translators();
-        }
-        processor.process(entries).await?;
-        if finalizing {
-            break;
-        }
-        tokio::select! {
-            result = &mut shutdown => {
-                result?;
-                finalizing = true;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
-        }
-    }
-    processor.finish().await
+    import_files(
+        std::slice::from_ref(&file.to_path_buf()),
+        source,
+        opts,
+        config,
+        attach,
+        ledger_dir,
+    )
+    .await
 }
 
-/// Import multiple completed native transcripts through one processor.
+/// Import multiple completed native transcripts through one pipeline.
 ///
-/// This shares translator and sink setup while keeping each native session's
-/// correlation state isolated by session id.
+/// Each native session is its own partition, so correlation state stays
+/// isolated by session id.
 pub async fn import_transcripts(
     files: &[PathBuf],
     source: ImportSource,
@@ -241,261 +225,181 @@ async fn import_transcripts_with_ledger(
     config: Option<SessionConfig>,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
-    let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
-    let mut summaries = Vec::new();
+    import_files(files, source, opts, config, false, ledger_dir).await
+}
+
+/// Credentials of an import: the resolved configuration the caller supplied.
+struct ImportAuth {
+    auth: wire::BackendAuth,
+}
+
+#[async_trait::async_trait]
+impl RouteAuth for ImportAuth {
+    async fn resolve(
+        &self,
+        _source: &str,
+        route: &wire::SessionRoute,
+        _reason: crate::AuthResolveReason,
+    ) -> anyhow::Result<ResolvedAuth> {
+        Ok(ResolvedAuth {
+            config: route.with_auth(self.auth.clone()),
+            expires_at_ms: None,
+        })
+    }
+}
+
+/// One import: every session in the files is a partition with its own
+/// import route, fed by a transcript backfill and delivered by the same
+/// route machine as live traffic. The pipeline's state is private to this
+/// process (`<data dir>/import`, or a temporary directory without a data
+/// directory), so it never contends with a running daemon.
+async fn import_files(
+    files: &[PathBuf],
+    source: ImportSource,
+    opts: ServeOptions,
+    config: Option<SessionConfig>,
+    attach: bool,
+    data_dir: Option<PathBuf>,
+) -> anyhow::Result<Vec<ImportSummary>> {
+    let scratch;
+    let (data_dir, state_dir) = match data_dir {
+        Some(dir) => {
+            paths::ensure_private_dir(&dir)?;
+            let state = dir.join("import");
+            (dir, state)
+        }
+        None => {
+            scratch = tempfile::tempdir()?;
+            (scratch.path().to_path_buf(), scratch.path().join("import"))
+        }
+    };
+    let auth = config
+        .as_ref()
+        .map(|config| config.auth.clone())
+        .unwrap_or(wire::BackendAuth {
+            token: String::new(),
+            api_url: None,
+            app_url: None,
+            org_name: None,
+            org_id: None,
+        });
+    let route = wire::SessionRoute {
+        auth: wire::AuthSelection::default(),
+        destination: config.as_ref().and_then(|c| c.destination.clone()),
+        flush_mode: config.as_ref().map(|c| c.flush_mode).unwrap_or_default(),
+        additional_metadata: config.as_ref().and_then(|c| c.additional_metadata.clone()),
+        tags: config.as_ref().map(|c| c.tags.clone()).unwrap_or_default(),
+        span_plugins: config
+            .as_ref()
+            .map(|c| c.span_plugins.clone())
+            .unwrap_or_default(),
+    };
+    let pipeline =
+        crate::pipeline::runtime::Pipeline::open(crate::pipeline::runtime::PipelineOptions {
+            data_dir,
+            state_dir: Some(state_dir),
+            version: opts.version.clone(),
+            translators: opts.translators.clone(),
+            sink_factory: opts.sink_factory.clone(),
+            auth: Arc::new(ImportAuth { auth }),
+            correlation: None,
+            assembly_gate: false,
+        })?;
+    let import_id = uuid::Uuid::new_v4().to_string();
+    let origin = RouteOrigin::Import(import_id);
+    let mut branches = Vec::new();
     for file in files {
-        let mut tail = transcript_import::TranscriptTail::new(file.clone(), source);
-        let entries = tail
-            .poll(true)
+        let sessions = transcript_sessions(file, source, attach)
             .with_context(|| format!("import transcript {}", file.display()))?;
-        let session_ids = entries
-            .iter()
-            .map(|entry| entry.session_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        processor.process(entries).await?;
-        for session_id in session_ids {
-            if let Some(summary) = processor.finish_session(&session_id).await? {
-                summaries.push(summary);
-            }
+        for (partition_source, session_id) in sessions {
+            let partition = PartitionId::new(partition_source, session_id);
+            let branch = pipeline
+                .register_route(
+                    &partition,
+                    &route,
+                    origin.clone(),
+                    Some(BackfillSource::Transcript {
+                        path: file.clone(),
+                        source,
+                        attach,
+                    }),
+                )
+                .await?;
+            branches.push((partition, branch));
         }
     }
-    summaries.extend(processor.finish().await?);
+    // An attached import follows its transcript until interrupted.
+    let finish = async {
+        if attach {
+            let _ = tokio::signal::ctrl_c().await;
+            for (_, branch) in &branches {
+                branch.finish_backfill.send_replace(true);
+            }
+        }
+        std::future::pending::<()>().await
+    };
+    tokio::pin!(finish);
+    let mut summaries = Vec::new();
+    for (partition, branch) in &branches {
+        let outcome = tokio::select! {
+            outcome = pipeline.wait_import(branch) => outcome,
+            _ = &mut finish => unreachable!("the finish future never completes"),
+        };
+        let view = match outcome {
+            Ok(view) => view,
+            Err(record) => {
+                for (partition, _) in &branches {
+                    pipeline.retire(partition).await;
+                }
+                anyhow::bail!(
+                    "import of {} stopped: {}",
+                    partition.session_id,
+                    record.summary()
+                );
+            }
+        };
+        summaries.push(ImportSummary {
+            session_id: partition.session_id.clone(),
+            destination: route.destination.clone(),
+            root_span_id: config
+                .as_ref()
+                .and_then(|config| config.attached_span_ids().1)
+                .or(view.root_span_id),
+            span_count: view.span_ids,
+            finalized: true,
+        });
+    }
+    for (partition, _) in &branches {
+        pipeline.retire(partition).await;
+    }
+    summaries.sort_by(|left, right| left.session_id.cmp(&right.session_id));
     Ok(summaries)
 }
 
-struct ImportLive {
-    source: String,
-    translator: Box<dyn AgentTranslator>,
-    sink: Box<dyn Sink>,
-    ctx: SessionCtx,
-    pending_ops: usize,
-    span_ids: std::collections::HashSet<String>,
-    root_span_id: Option<String>,
-    destination: Option<wire::TraceDestination>,
-    diagnostics_dir: Option<PathBuf>,
-}
-
-struct ImportProcessor {
-    sessions: std::collections::HashMap<String, ImportLive>,
-    opts: ServeOptions,
-    config: Option<SessionConfig>,
-    ledger_dir: Option<PathBuf>,
-}
-
-impl ImportProcessor {
-    /// Without a daemon, import is the entry point that creates the ledger's
-    /// data directory, so it must make that directory private itself.
-    fn new(
-        opts: ServeOptions,
-        config: Option<SessionConfig>,
-        ledger_dir: Option<PathBuf>,
-    ) -> anyhow::Result<Self> {
-        if let Some(dir) = &ledger_dir {
-            paths::ensure_private_dir(dir)?;
-        }
-        Ok(Self {
-            sessions: std::collections::HashMap::new(),
-            opts,
-            config,
-            ledger_dir,
-        })
+/// The `(source, session id)` of every native session in a transcript.
+fn transcript_sessions(
+    file: &std::path::Path,
+    source: ImportSource,
+    attach: bool,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
+    if attach {
+        tail.allow_incomplete_final_record_on_shutdown();
     }
-
-    async fn process(&mut self, entries: Vec<Envelope>) -> anyhow::Result<()> {
-        for mut env in entries {
-            env.config = self.config.clone();
-            let sid = env.session_id.clone();
-            let live = match self.sessions.get_mut(&sid) {
-                Some(live) => live,
-                None => {
-                    let translator = self.opts.translators.create(&env.source, &sid);
-                    let sink = self.opts.sink_factory.create(&sid, &env.source)?;
-                    let sink: Box<dyn Sink> = Box::new(
-                        delivery_ledger::LedgerSink::new(
-                            sink,
-                            self.ledger_dir.as_deref(),
-                            &env.source,
-                            &sid,
-                            env.config.as_ref(),
-                            &self.opts.version,
-                        )
-                        .await,
-                    );
-                    self.sessions.insert(
-                        sid.clone(),
-                        ImportLive {
-                            source: env.source.clone(),
-                            translator,
-                            sink,
-                            ctx: SessionCtx {
-                                session_id: sid.clone(),
-                                config: None,
-                            },
-                            pending_ops: 0,
-                            span_ids: std::collections::HashSet::new(),
-                            root_span_id: self
-                                .config
-                                .as_ref()
-                                .and_then(|config| config.attached_span_ids().1),
-                            destination: self
-                                .config
-                                .as_ref()
-                                .and_then(|config| config.destination.clone()),
-                            diagnostics_dir: self.ledger_dir.clone(),
-                        },
-                    );
-                    self.sessions.get_mut(&sid).unwrap()
-                }
-            };
-            if let Some(cfg) = &env.config {
-                live.sink.configure(cfg);
-                live.ctx.config = Some(cfg.clone());
-            }
-            live.sink
-                .set_capture_versions(env.plugin_version.as_deref(), env.source_version.as_deref());
-            let ops = live.translator.handle(&env, &live.ctx)?;
-            Self::emit_translator_batches(live, ops).await?;
-        }
-        Ok(())
-    }
-
-    fn reset_translators(&mut self) {
-        for (session_id, live) in &mut self.sessions {
-            live.translator = self.opts.translators.create(&live.source, session_id);
+    let entries = tail.poll(!attach)?;
+    let mut sessions = Vec::new();
+    for entry in entries {
+        let session = (entry.source, entry.session_id);
+        if !sessions.contains(&session) {
+            sessions.push(session);
         }
     }
-
-    async fn emit_translator_batches(
-        live: &mut ImportLive,
-        first: Vec<SpanOp>,
-    ) -> anyhow::Result<()> {
-        let mut next = Some(first);
-        while let Some(ops) = next {
-            // Imports can contain tens of thousands of SDK log commands. Bound the
-            // number queued between drains without serializing one network flush
-            // for every native turn boundary.
-            const FLUSH_OPS: usize = 500;
-            for chunk in ops.chunks(FLUSH_OPS) {
-                for op in chunk {
-                    let row = match op {
-                        SpanOp::Insert(row) | SpanOp::Merge(row) => row,
-                    };
-                    live.span_ids.insert(row.span_id.clone());
-                    if live.root_span_id.is_none() && !row.root_span_id.is_empty() {
-                        live.root_span_id = Some(row.root_span_id.clone());
-                    }
-                }
-                let plugins = live
-                    .ctx
-                    .config
-                    .as_ref()
-                    .map(|config| config.span_plugins.as_slice())
-                    .unwrap_or_default();
-                let mut transformed = Vec::with_capacity(chunk.len());
-                for op in chunk {
-                    match crate::span_processor::process(
-                        plugins,
-                        op,
-                        &live.source,
-                        &live.ctx.session_id,
-                    ) {
-                        Ok(result) => {
-                            if let Some(failure) = result.failure {
-                                if failure.newly_seen {
-                                    if let Some(data_dir) = &live.diagnostics_dir {
-                                        if let Err(error) = crate::plugin_diagnostics::record(
-                                            data_dir,
-                                            &live.source,
-                                            &failure.path,
-                                            &failure.message,
-                                        ) {
-                                            tracing::warn!(
-                                                session_id = %live.ctx.session_id,
-                                                "failed to persist span plugin diagnostic: {error}"
-                                            );
-                                        }
-                                    }
-                                    tracing::warn!(
-                                        session_id = %live.ctx.session_id,
-                                        plugin = %failure.path.display(),
-                                        error = %failure.message,
-                                        "span plugin failed during import; span operations are being discarded"
-                                    );
-                                }
-                            }
-                            if let Some(op) = result.op {
-                                transformed.push(op);
-                            }
-                        }
-                        Err(error) => {
-                            if let (Some(data_dir), Some(plugin)) =
-                                (&live.diagnostics_dir, plugins.first())
-                            {
-                                if let Err(diagnostic_error) = crate::plugin_diagnostics::record(
-                                    data_dir,
-                                    &live.source,
-                                    plugin,
-                                    &error.to_string(),
-                                ) {
-                                    tracing::warn!(
-                                        session_id = %live.ctx.session_id,
-                                        "failed to persist span plugin diagnostic: {diagnostic_error}"
-                                    );
-                                }
-                            }
-                            tracing::warn!(
-                                session_id = %live.ctx.session_id,
-                                %error,
-                                "span plugin processor failed during import; span operation discarded"
-                            );
-                        }
-                    }
-                }
-                if !transformed.is_empty() {
-                    live.sink.emit(&transformed).await?;
-                }
-                live.pending_ops += transformed.len();
-                if live.pending_ops >= FLUSH_OPS {
-                    live.sink.flush().await?;
-                    live.pending_ops = 0;
-                }
-            }
-            next = live.translator.drain_pending(&live.ctx)?;
-        }
-        Ok(())
-    }
-
-    async fn finish(self) -> anyhow::Result<Vec<ImportSummary>> {
-        let mut summaries = Vec::new();
-        for (sid, mut live) in self.sessions {
-            let ops = live.translator.flush(&live.ctx)?;
-            Self::emit_translator_batches(&mut live, ops).await?;
-            live.sink.flush().await?;
-            summaries.push(Self::summary(sid, live));
-        }
-        summaries.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-        Ok(summaries)
-    }
-
-    async fn finish_session(&mut self, session_id: &str) -> anyhow::Result<Option<ImportSummary>> {
-        let Some(mut live) = self.sessions.remove(session_id) else {
-            return Ok(None);
-        };
-        let ops = live.translator.flush(&live.ctx)?;
-        Self::emit_translator_batches(&mut live, ops).await?;
-        live.sink.flush().await?;
-        Ok(Some(Self::summary(session_id.to_string(), live)))
-    }
-
-    fn summary(session_id: String, live: ImportLive) -> ImportSummary {
-        ImportSummary {
-            session_id,
-            destination: live.destination,
-            root_span_id: live.root_span_id,
-            span_count: live.span_ids.len(),
-            finalized: true,
-        }
-    }
+    anyhow::ensure!(
+        !sessions.is_empty(),
+        "{} has no session records to import",
+        file.display()
+    );
+    Ok(sessions)
 }
 
 #[cfg(test)]
@@ -708,10 +612,10 @@ mod tests {
         );
     }
 
-    /// `bt trace import` writes the delivery ledger without a daemon, so it
+    /// `bt trace import` writes its delivery state without a daemon, so it
     /// must make the data directory private itself.
     #[tokio::test]
-    async fn import_keeps_the_delivery_ledger_private_to_the_owner() {
+    async fn import_keeps_its_delivery_state_private_to_the_owner() {
         let temp = tempfile::tempdir().unwrap();
         let shared = temp.path().join("shared");
         std::fs::create_dir(&shared).unwrap();
@@ -741,20 +645,18 @@ mod tests {
         .await
         .unwrap();
 
-        let ledger = std::fs::read_dir(data_dir.join("delivery-ledger"))
-            .unwrap()
-            .next()
-            .expect("a delivery ledger was written")
-            .unwrap()
-            .path();
-        assert!(ledger.is_file());
+        let state_dir = data_dir.join("import");
+        let ledger = state_dir.join("pipeline.sqlite");
+        assert!(ledger.is_file(), "the import's delivery state was written");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
+            for dir in [&data_dir, &state_dir] {
+                assert_eq!(
+                    std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
         }
         #[cfg(windows)]
         {
@@ -762,6 +664,7 @@ mod tests {
                 assert_only_owner_access, assert_owner_only, path_dacl_sddl,
             };
             assert_owner_only(&path_dacl_sddl(&data_dir), true);
+            assert_owner_only(&path_dacl_sddl(&state_dir), true);
             assert_only_owner_access(&path_dacl_sddl(&ledger));
         }
     }

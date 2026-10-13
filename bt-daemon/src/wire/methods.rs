@@ -103,6 +103,32 @@ pub struct SessionStatus {
     pub permalink: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// The machine holding this session's work, when it is recovering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryStatus>,
+    /// A provisional session root held until child work exists. Not a failure.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_root: bool,
+}
+
+/// A recovering machine: what holds the work and what will unblock it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryStatus {
+    /// `translation`, `delivery`, or `backfill`.
+    pub stage: String,
+    /// The failure category, such as `span plugin` or `credentials`.
+    pub cause: String,
+    /// Full local detail. Never sent to the backend.
+    pub diagnostic: String,
+    /// The action that unblocks it, or what it is waiting for.
+    pub guidance: String,
+    /// Whether it resumes without user action.
+    pub automatic: bool,
+    pub occurrences: u32,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

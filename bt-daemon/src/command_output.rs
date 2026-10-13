@@ -123,8 +123,20 @@ pub struct DaemonDiagnostic {
     /// Distinct latest errors the daemon recorded for this agent's sessions.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub session_errors: Vec<String>,
+    /// Work the daemon is holding because a stage failed, and what unblocks
+    /// it. Held work is never discarded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recoveries: Vec<DaemonRecovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// One session's held work, as reported by the daemon.
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonRecovery {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub status: crate::wire::RecoveryStatus,
 }
 
 impl DaemonDiagnostic {
@@ -270,6 +282,23 @@ impl TraceCommandOutput {
                 }
                 for error in &daemon.session_errors {
                     rendered.push_str(&format!("\nDaemon session error: {error}"));
+                }
+                for recovery in &daemon.recoveries {
+                    let status = &recovery.status;
+                    rendered.push_str(&format!(
+                        "\nHeld {} work for session {}: {} ({}; since {}, {} occurrence{})",
+                        status.stage,
+                        recovery.session_id,
+                        status.cause,
+                        if status.automatic {
+                            "retries automatically"
+                        } else {
+                            "needs your action"
+                        },
+                        render_timestamp(status.first_seen_ms),
+                        status.occurrences,
+                        if status.occurrences == 1 { "" } else { "s" },
+                    ));
                 }
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
@@ -532,6 +561,7 @@ mod tests {
                     error: Some("saved profile ID 'p' no longer exists".into()),
                 }),
                 session_errors: vec!["could not resolve Braintrust auth for codex".into()],
+                recoveries: Vec::new(),
                 error: None,
             },
             warnings: Vec::new(),

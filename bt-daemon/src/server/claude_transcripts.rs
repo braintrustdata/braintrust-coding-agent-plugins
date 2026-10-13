@@ -130,7 +130,7 @@ impl Daemon {
             }
             let mut env = observation.template;
             env.ts_ms = now_ms();
-            hydrate_transcript_reference(&self.data_dir, &mut env).await;
+            crate::capture::hydrate_transcript_reference(&self.data_dir, &mut env).await;
             let through = env
                 .payload
                 .get("_bt_claude_transcript_mirrors")

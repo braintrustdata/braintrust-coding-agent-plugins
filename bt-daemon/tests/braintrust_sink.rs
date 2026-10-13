@@ -63,6 +63,7 @@ fn row(
             source_version: None,
         }),
         is_turn: false,
+        ..Default::default()
     }
 }
 
@@ -272,7 +273,7 @@ async fn provisional_lifecycle_root_is_not_exported_without_work() {
     sink.configure(&session_config(&base));
 
     let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
-    root.metadata = Some(json!({"_bt_defer_root": true}));
+    root.defer_until_child = true;
     let closing = row("root", "root", &[], "", SpanType::Task, 1, Some(2));
     assert_eq!(
         sink.emit(&[SpanOp::Insert(root), SpanOp::Merge(closing)])
@@ -301,7 +302,7 @@ async fn provisional_root_survives_a_nonterminal_flush_until_work_arrives() {
     sink.configure(&session_config(&base));
 
     let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
-    root.metadata = Some(json!({"_bt_defer_root": true}));
+    root.defer_until_child = true;
     assert_eq!(sink.emit(&[SpanOp::Insert(root)]).await.unwrap(), 0);
     sink.flush().await.unwrap();
 
@@ -340,9 +341,9 @@ async fn work_releases_only_its_direct_provisional_root() {
     sink.configure(&session_config(&base));
 
     let mut root_a = row("root-a", "root-a", &[], "root A", SpanType::Task, 1, None);
-    root_a.metadata = Some(json!({"_bt_defer_root": true}));
+    root_a.defer_until_child = true;
     let mut root_b = row("root-b", "root-b", &[], "root B", SpanType::Task, 1, None);
-    root_b.metadata = Some(json!({"_bt_defer_root": true}));
+    root_b.defer_until_child = true;
     assert_eq!(
         sink.emit(&[SpanOp::Insert(root_a), SpanOp::Insert(root_b)])
             .await
@@ -381,6 +382,8 @@ async fn provisional_root_is_exported_before_its_first_work_row() {
     sink.configure(&session_config(&base));
 
     let mut root = row("root", "root", &[], "codex", SpanType::Task, 1, None);
+    root.defer_until_child = true;
+    // A legacy internal marker is still stripped before delivery.
     root.metadata = Some(json!({"_bt_defer_root": true, "source": "codex"}));
     let turn = row(
         "turn",

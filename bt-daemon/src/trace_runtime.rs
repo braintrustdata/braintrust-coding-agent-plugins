@@ -352,19 +352,28 @@ async fn diagnose_daemon(
         Ok(Err(error)) => return unreachable(error.to_string()),
         Ok(Ok(status)) => {
             let mut session_errors = Vec::new();
-            let errors = status
+            let mut recoveries = Vec::new();
+            for session in status
                 .sessions
                 .into_iter()
                 .filter(|session| is_same_agent(source, &session.source))
-                .filter_map(|session| session.last_error);
-            for error in errors {
-                if !session_errors.contains(&error) {
-                    session_errors.push(error);
+            {
+                if let Some(error) = session.last_error {
+                    if !session_errors.contains(&error) {
+                        session_errors.push(error);
+                    }
+                }
+                if let Some(status) = session.recovery {
+                    recoveries.push(crate::command_output::DaemonRecovery {
+                        session_id: session.session_id,
+                        status,
+                    });
                 }
             }
             DaemonDiagnostic {
                 version: Some(status.daemon_version),
                 session_errors,
+                recoveries,
                 ..DaemonDiagnostic::default()
             }
         }
@@ -1228,6 +1237,19 @@ mod tests {
             doctor_output_at(&host, DoctorArgs { agent }, &self.socket).await
         }
 
+        /// Run doctor once the daemon has tried the session's credentials: the
+        /// route reports its failure after capture is acknowledged.
+        async fn doctor_after_route_attempt(&self, agent: DoctorAgent) -> DoctorCommandOutput {
+            for _ in 0..250 {
+                let output = self.doctor(agent).await;
+                if !output.daemon.session_errors.is_empty() {
+                    return output;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            self.doctor(agent).await
+        }
+
         async fn forward_event(&self, source: &str, session_id: &str, route: SessionRoute) {
             let env = crate::wire::Envelope {
                 source: source.into(),
@@ -1270,7 +1292,7 @@ mod tests {
             .forward_event("codex", "rejected-session", SessionRoute::default())
             .await;
 
-        let output = daemon.doctor(DoctorAgent::Codex).await;
+        let output = daemon.doctor_after_route_attempt(DoctorAgent::Codex).await;
 
         // The shell's credential store is healthy, so its own check passes...
         assert_eq!(output.auth.status, "ready");
@@ -1341,7 +1363,7 @@ mod tests {
             .forward_event("claude-code", "wrong-org", route)
             .await;
 
-        let output = daemon.doctor(DoctorAgent::Claude).await;
+        let output = daemon.doctor_after_route_attempt(DoctorAgent::Claude).await;
 
         let daemon_auth = output.daemon.auth.as_ref().unwrap();
         assert_eq!(daemon_auth.status, "ready");
@@ -1486,6 +1508,7 @@ mod tests {
             version: Some(version.into()),
             auth: Some(auth),
             session_errors: vec![session_error.into()],
+            recoveries: Vec::new(),
             error: None,
         };
         let shell = diagnostic("ready", None);

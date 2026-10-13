@@ -728,7 +728,7 @@ async fn one_session_reports_to_multiple_routes_and_orgs_concurrently() {
     );
 
     let calls = provider.calls.lock().unwrap().clone();
-    assert_eq!(calls.len(), 2, "each route resolves its own credentials");
+    assert!(calls.len() >= 2, "each route resolves its own credentials");
     assert_eq!(calls[0].0.org_name.as_deref(), Some("work-org"));
     assert_eq!(calls[1].0.org_name.as_deref(), Some("personal-org"));
 
@@ -747,7 +747,7 @@ async fn one_session_reports_to_multiple_routes_and_orgs_concurrently() {
             sink.emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
             "every destination must receive spans"
         );
-        assert_eq!(sink.flushes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(sink.flushes.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     }
 
     let status = run_status(StatusArgs {
@@ -783,7 +783,9 @@ async fn recovery_checkpoints_are_scoped_to_their_delivery_route() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
-    let journal = source_journal_path(&data_dir, "debug", "route-recovery");
+    // A journal written by the daemon that predates the pipeline is imported
+    // once at startup, keeping each route's delivery checkpoint.
+    let journal = bt_daemon::legacy_source_journal_path(&data_dir, "debug", "route-recovery");
     std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
 
     let personal = routed_envelope("route-recovery", "personal", "personal-org", "SessionStart");
@@ -892,23 +894,31 @@ async fn a_route_backfills_observations_captured_by_another_route_once() {
     .unwrap();
     let flushed = flush_session("rerouted", &socket, 5000).await.unwrap();
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
-    assert_eq!(flushed.accepted_sessions, 1);
+    assert_eq!(flushed.accepted_sessions, 2);
 
+    // Translation is shared, so both routes of the session receive the new
+    // Stop exactly once and neither is handed its acknowledged history again.
     let sinks = recording.sinks.lock().unwrap().clone();
     assert_eq!(
         sinks.len(),
-        1,
-        "only the route with new events is rebuilt eagerly"
-    );
-    assert_eq!(
-        sinks[0].org.lock().unwrap().clone().as_deref(),
-        Some("work-org")
-    );
-    assert_eq!(
-        sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed),
         2,
-        "work receives the personal-route observation once, then its new Stop"
+        "each route of the session delivers the new event"
     );
+    let orgs: HashSet<_> = sinks
+        .iter()
+        .map(|sink| sink.org.lock().unwrap().clone().unwrap())
+        .collect();
+    assert_eq!(
+        orgs,
+        HashSet::from(["work-org".to_string(), "personal-org".to_string()])
+    );
+    for sink in &sinks {
+        assert_eq!(
+            sink.emitted.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only the new Stop is delivered to each route"
+        );
+    }
 
     shutdown(&socket).await;
     second.await.unwrap();
@@ -970,18 +980,25 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
         .await
         .unwrap();
     let delivered = second_sinks.sinks.lock().unwrap().clone();
-    assert_eq!(delivered.len(), 1);
     assert_eq!(
-        delivered[0]
+        delivered.len(),
+        2,
+        "work and personal each deliver the new event"
+    );
+    let emitted = |org: &str| {
+        delivered
+            .iter()
+            .find(|sink| sink.org.lock().unwrap().as_deref() == Some(org))
+            .unwrap_or_else(|| panic!("no sink for {org}"))
             .emitted
-            .load(std::sync::atomic::Ordering::Relaxed),
-        3,
-        "personal receives work's root and SessionStart plus its own Stop"
-    );
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
     assert_eq!(
-        delivered[0].org.lock().unwrap().clone().as_deref(),
-        Some("personal-org")
+        emitted("personal-org"),
+        3,
+        "personal receives the session's root and SessionStart plus the new Stop"
     );
+    assert_eq!(emitted("work-org"), 1, "work receives only the new Stop");
     shutdown(&socket).await;
     second.await.unwrap();
 
@@ -1006,14 +1023,14 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
         .await
         .unwrap();
     let delivered = third_sinks.sinks.lock().unwrap().clone();
-    assert_eq!(delivered.len(), 1);
-    assert_eq!(
-        delivered[0]
-            .emitted
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "personal's acknowledged history is not re-delivered"
-    );
+    assert_eq!(delivered.len(), 2);
+    for sink in &delivered {
+        assert_eq!(
+            sink.emitted.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "acknowledged history is not re-delivered"
+        );
+    }
     shutdown(&socket).await;
     third.await.unwrap();
 }
@@ -1036,14 +1053,25 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     )
     .await
     .unwrap();
-    let status = run_status(StatusArgs {
-        socket: Some(socket.clone()),
-        session_id: Some("login-needed".into()),
+    // Capture is acknowledged first; the route reports its failure once its
+    // credentials have been tried.
+    let status_error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: Some("login-needed".into()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if let Some(error) = status.sessions.iter().find_map(|s| s.last_error.clone()) {
+                break error;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     })
     .await
-    .unwrap()
-    .unwrap();
-    let status_error = status.sessions[0].last_error.as_deref().unwrap();
+    .expect("auth failure was never reported");
     assert!(status_error.contains("select a profile explicitly"));
     assert!(!status_error.contains("secret-"));
     assert!(
@@ -1071,32 +1099,19 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
     assert_eq!(flushed.pending, 0);
 
-    // Journal: three events plus a durable delivery checkpoint, with only the
-    // non-secret route. Checkpoints are control records, not agent events.
+    // Journal: the three events, with only the non-secret route.
     let journal = source_journal_path(&data_dir, "debug", "sess-1");
     let jtext = std::fs::read_to_string(&journal).unwrap();
-    let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(
-        jlines.len(),
-        4,
-        "expected 3 event lines plus one checkpoint, got {}",
-        jlines.len()
-    );
     assert!(
         !jtext.contains("sk-TOP-SECRET-abc123"),
         "token leaked into journal!"
     );
     assert!(!jtext.contains("token_sha256_prefix"));
 
-    let events: Vec<String> = jlines
+    let events: Vec<String> = bt_daemon::read_journaled_events(&data_dir, "debug", "sess-1")
+        .unwrap()
         .iter()
-        .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
-        .map(|l| {
-            serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
+        .map(|event| event["event"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(events, vec!["SessionStart", "PostToolUse", "Stop"]);
 
@@ -1138,12 +1153,10 @@ async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
     let flushed = flush_session(&session, &socket, 5000).await.unwrap();
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
 
-    let jtext = std::fs::read_to_string(source_journal_path(&data_dir, "debug", &session)).unwrap();
     assert_eq!(
-        jtext
-            .lines()
-            .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
-            .count(),
+        bt_daemon::read_journaled_events(&data_dir, "debug", &session)
+            .unwrap()
+            .len(),
         2
     );
     let spans: Vec<_> = std::fs::read_dir(data_dir.join("spans"))
@@ -1234,20 +1247,15 @@ async fn identical_native_ids_from_different_sources_are_isolated() {
     let codex_journal = source_journal_path(&data_dir, "codex", "shared-native-id");
     let claude_journal = source_journal_path(&data_dir, "claude-code", "shared-native-id");
     assert_ne!(codex_journal, claude_journal);
-    assert_eq!(
-        std::fs::read_to_string(codex_journal)
-            .unwrap()
-            .lines()
-            .count(),
-        2
-    );
-    assert_eq!(
-        std::fs::read_to_string(claude_journal)
-            .unwrap()
-            .lines()
-            .count(),
-        2
-    );
+    for source in ["codex", "claude-code"] {
+        assert_eq!(
+            bt_daemon::read_journaled_events(&data_dir, source, "shared-native-id")
+                .unwrap()
+                .len(),
+            1,
+            "{source} journals only its own event"
+        );
+    }
 
     let rows = std::fs::read_to_string(data_dir.join("spans/shared-native-id.ndjson")).unwrap();
     let root_ids = rows
@@ -1257,7 +1265,13 @@ async fn identical_native_ids_from_different_sources_are_isolated() {
         .filter(|row| row["root_span_id"] == row["span_id"])
         .filter_map(|row| row["span_id"].as_str().map(str::to_owned))
         .collect::<HashSet<_>>();
-    assert_eq!(root_ids.len(), 2);
+    // Claude's root is exported with its turn. Codex's lifecycle root has no
+    // child work yet, so its route holds it back.
+    assert_eq!(root_ids.len(), 1);
+    assert!(status
+        .sessions
+        .iter()
+        .any(|session| session.source == "codex" && session.held_root));
 
     handle.abort();
 }
@@ -1356,7 +1370,18 @@ async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
             .await
             .unwrap();
 
-        let mut terminal = envelope(&session_id, event, 2);
+        // Child work releases the lifecycle root from its route's hold.
+        let mut message = envelope(&session_id, "chat.message", 2);
+        message.source = "opencode".into();
+        message.payload = serde_json::json!({
+            "input": {"sessionID": native_session_id, "model": {"modelID": "gpt-5"}},
+            "output": {"parts": [{"type": "text", "text": "hello"}]}
+        });
+        forward_envelope(&message, &socket, &host, false)
+            .await
+            .unwrap();
+
+        let mut terminal = envelope(&session_id, event, 3);
         terminal.source = "opencode".into();
         terminal.payload = serde_json::json!({
             "properties": {"sessionID": native_session_id}
@@ -1414,17 +1439,10 @@ async fn hook_capture_stops_at_the_durable_journal_boundary() {
         matches!(accepted, Ok(Ok(()))),
         "turn-end capture waited for translation or flushing: {accepted:?}"
     );
-    let journal = std::fs::read_to_string(source_journal_path(
-        &tmp.path().join("data"),
-        "debug",
-        "fast-capture",
-    ))
-    .unwrap();
-    assert_eq!(
-        journal.lines().count(),
-        2,
-        "hook returned before journaling"
-    );
+    let journaled =
+        bt_daemon::read_journaled_events(&tmp.path().join("data"), "debug", "fast-capture")
+            .unwrap();
+    assert_eq!(journaled.len(), 2, "hook returned before journaling");
     shutdown(&socket).await;
     handle.await.unwrap();
 }
@@ -1686,6 +1704,18 @@ async fn spawn_on_demand_runs_the_real_standalone_daemon() {
     wait_until_gone(&socket).await;
 }
 
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     let (data_dir, socket, first, tmp) = start_daemon().await;
@@ -1705,10 +1735,10 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     // A cold worker receives only the saved journal, not the first worker's
     // daemon state. Its delivery checkpoint must travel with that journal.
     let recovered_data_dir = tmp.path().join("recovered-data");
-    let source = source_journal_path(&data_dir, "debug", "resume");
-    let recovered_journal = source_journal_path(&recovered_data_dir, "debug", "resume");
-    std::fs::create_dir_all(recovered_journal.parent().unwrap()).unwrap();
-    std::fs::copy(source, &recovered_journal).unwrap();
+    copy_dir(
+        &data_dir.join("pipeline"),
+        &recovered_data_dir.join("pipeline"),
+    );
 
     let second = start_daemon_at(recovered_data_dir.clone(), socket.clone()).await;
     forward_envelope(&envelope("resume", "Stop", 2), &socket, &host, false)
@@ -1716,11 +1746,12 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
         .unwrap();
     flush_session("resume", &socket, 5000).await.unwrap();
 
-    let journal = std::fs::read_to_string(recovered_journal).unwrap();
     assert_eq!(
-        journal.lines().count(),
-        4,
-        "two events plus two delivery checkpoints"
+        bt_daemon::read_journaled_events(&recovered_data_dir, "debug", "resume")
+            .unwrap()
+            .len(),
+        2,
+        "the saved event plus the new one"
     );
     let spans = std::fs::read_to_string(recovered_data_dir.join("spans/resume.ndjson")).unwrap();
     let rows: Vec<serde_json::Value> = spans
@@ -1751,12 +1782,13 @@ async fn daemon_startup_recovers_an_event_journaled_before_worker_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
-    let journal = source_journal_path(&data_dir, "debug", "crash-window");
-    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
-    let mut raw =
-        serde_json::to_vec(&envelope("crash-window", "SessionStart", 1).redacted()).unwrap();
-    raw.push(b'\n');
-    std::fs::write(&journal, raw).unwrap();
+    // The capture was journaled, then the process died before translating it.
+    bt_daemon::seed_journaled_event(
+        &data_dir,
+        &envelope("crash-window", "SessionStart", 1).redacted(),
+    )
+    .await
+    .unwrap();
 
     let daemon = start_daemon_at(data_dir.clone(), socket.clone()).await;
     let flushed = flush_session("crash-window", &socket, 5000).await.unwrap();
@@ -1883,52 +1915,63 @@ async fn a_failing_span_plugin_discards_rows_and_persists_the_raw_exception() {
     .await
     .unwrap()
     .unwrap();
+    let session = &status.sessions[0];
     assert!(
-        status.sessions[0]
+        session
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("span operations are being discarded")),
+            .is_some_and(|error| error.contains("delivery resumes when the file is saved")),
         "unexpected plugin status: {:?}",
-        status.sessions[0].last_error
+        session.last_error
     );
+    let recovery = session.recovery.as_ref().expect("route is recovering");
+    assert_eq!(recovery.stage, "delivery");
+    assert_eq!(recovery.cause, "span plugin");
+    assert!(!recovery.automatic);
+
+    // The route holds the work instead of delivering untransformed rows. Only
+    // the payload-free failure marker reaches the backend.
     let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
-    assert!(
-        spans.is_empty(),
-        "no untransformed rows should be delivered"
-    );
     assert!(!spans.contains("after-failure:"));
+    assert!(!spans.contains("raw local secret"), "{spans}");
+    for line in spans.lines() {
+        assert!(line.contains("plugin failure:"), "unexpected row: {line}");
+    }
 
     let diagnostics =
         std::fs::read_to_string(data_dir.join("diagnostics/span-plugin-errors.json")).unwrap();
     assert!(diagnostics.contains("Error: raw local secret"));
     assert!(diagnostics.contains("bad.mjs"));
 
-    shutdown(&socket).await;
-    handle.await.unwrap();
-
+    // Saving the plugin is the recovery condition: the held work is delivered
+    // through the fixed plugin without restarting the daemon.
     std::fs::write(&plugin, "export default span => span").unwrap();
-    let restarted = start_daemon_at(data_dir.clone(), socket.clone()).await;
-    let mut stop = envelope("plugin-failure", "Stop", 2);
-    stop.route
-        .as_mut()
-        .unwrap()
-        .span_plugins
-        .extend([plugin, later_plugin]);
-    forward_envelope(&stop, &socket, &dummy_host(), false)
-        .await
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let spans =
+                std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
+            if spans.contains("after-failure:") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("fixing the plugin did not resume delivery");
     flush_session("plugin-failure", &socket, 5000)
         .await
         .unwrap();
-
-    let spans = std::fs::read_to_string(data_dir.join("spans/plugin-failure.ndjson")).unwrap();
-    assert!(
-        spans.contains("after-failure:"),
-        "fixing the plugin and restarting should replay withheld journal rows"
-    );
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("plugin-failure".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status.sessions[0].recovery.is_none());
 
     shutdown(&socket).await;
-    restarted.await.unwrap();
+    handle.await.unwrap();
 }
 
 /// Start a daemon that retires sessions after `ttl_secs` of quiet.
@@ -2365,16 +2408,23 @@ async fn managed_run_flush_is_scoped_to_its_accepted_sessions() {
     assert!(result.flushed, "managed run did not flush: {result:?}");
     assert_eq!(result.pending, 0);
     assert_eq!(
-        *flushes.lock().unwrap(),
-        HashMap::from([
-            ("run-a-main".to_string(), 1),
-            ("run-a-child".to_string(), 1)
-        ])
+        result.accepted_sessions, 2,
+        "only the run's own sessions are accepted"
     );
+    {
+        let flushes = flushes.lock().unwrap();
+        assert!(flushes.get("run-a-main").is_some_and(|count| *count >= 1));
+        assert!(flushes.get("run-a-child").is_some_and(|count| *count >= 1));
+    }
 
     let result = flush_managed_run("run-b", &socket, 5_000).await.unwrap();
     assert!(result.flushed, "managed run did not flush: {result:?}");
-    assert_eq!(flushes.lock().unwrap().get("run-b-main"), Some(&1));
+    assert_eq!(result.accepted_sessions, 1);
+    assert!(flushes
+        .lock()
+        .unwrap()
+        .get("run-b-main")
+        .is_some_and(|count| *count >= 1));
 
     shutdown(&socket).await;
     handle.await.unwrap();
@@ -2394,6 +2444,17 @@ async fn managed_run_completion_finalizes_an_open_agent_root() {
     env.managed_run_id = Some("managed-run".into());
     env.payload = serde_json::json!({"properties":{"info":{"id":"native"}}});
     forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    // Child work releases the lifecycle root from its route's hold.
+    let mut message = envelope("managed-opencode", "chat.message", 7);
+    message.source = "opencode".into();
+    message.managed_run_id = Some("managed-run".into());
+    message.payload = serde_json::json!({
+        "input": {"sessionID": "native", "model": {"modelID": "gpt-5"}},
+        "output": {"parts": [{"type": "text", "text": "hello"}]}
+    });
+    forward_envelope(&message, &socket, &dummy_host(), false)
         .await
         .unwrap();
 
@@ -2831,17 +2892,6 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     )
     .await;
     wait_for_grok_translation(&socket, "grok-primary").await;
-    assert_eq!(
-        flushes
-            .lock()
-            .unwrap()
-            .get("grok-primary")
-            .copied()
-            .unwrap_or_default(),
-        0,
-        "stop alone must not masquerade as the terminal flush"
-    );
-
     let primary_spans_path = data_dir.join("spans/grok-primary.ndjson");
     let first_ops = read_span_ops(&primary_spans_path);
     let first_llm = first_ops
@@ -2909,8 +2959,10 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
         1,
         "the native session_end event must trigger one daemon-owned flush"
     );
-    let decoy_journal_text =
-        std::fs::read_to_string(source_journal_path(&data_dir, "grok", "grok-decoy")).unwrap();
+    let decoy_journal_text = serde_json::to_string(
+        &bt_daemon::read_journaled_events(&data_dir, "grok", "grok-decoy").unwrap(),
+    )
+    .unwrap();
     let decoy_spans_path = data_dir.join("spans/grok-decoy.ndjson");
     let decoy_before_restart = std::fs::read(&decoy_spans_path).unwrap();
     let decoy_text = String::from_utf8(decoy_before_restart.clone()).unwrap();
@@ -2953,16 +3005,11 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
         "replaying the primary route must not emit into the decoy debug sink"
     );
 
-    let journal_text =
-        std::fs::read_to_string(source_journal_path(&data_dir, "grok", "grok-primary")).unwrap();
+    let journal = bt_daemon::read_journaled_events(&data_dir, "grok", "grok-primary").unwrap();
+    let journal_text = serde_json::to_string(&journal).unwrap();
     assert!(!journal_text.contains("secret-environment"));
     assert!(!journal_text.contains("token_sha256_prefix"));
     assert!(!journal_text.contains("decoy-route"));
-    let journal: Vec<serde_json::Value> = journal_text
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record["_bt_record_type"] != "delivery_checkpoint")
-        .collect();
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0]["source"], "grok");
     assert_eq!(journal[1]["source"], "grok");

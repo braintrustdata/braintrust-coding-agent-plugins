@@ -16,11 +16,13 @@ mod decode;
 mod git;
 mod grok;
 mod opencode;
+mod overlay;
 mod pi;
 pub(crate) use pi::request_config as pi_request_config;
 mod recent;
 mod tool;
 mod turn_lineage;
+pub use overlay::RouteOverlay;
 pub use turn_lineage::TURN_SPAN_ID_KEY;
 
 use debug::DebugTranslatorFactory;
@@ -103,6 +105,54 @@ pub struct SpanRow {
     /// Delivery-owned creation snapshot, present on session roots and turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<OriginSnapshot>,
+    /// Delivery-owned: explicitly clear a previously published `error` (a
+    /// plugin failure marker) when this row has none of its own.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub clear_error: bool,
+    /// Translator-owned marker for a provisional session root that should be
+    /// delivered only once direct child work exists.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub defer_until_child: bool,
+    /// Where route-specific settings belong on this row. Translators are
+    /// route-neutral; each delivery branch fills these slots (see
+    /// [`overlay`]).
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub route_slots: RouteSlots,
+}
+
+/// Route-specific values a branch applies to a route-neutral row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct RouteSlots {
+    /// A top-level row: an attached destination's span becomes its parent.
+    pub attach: bool,
+    /// The route's additional metadata belongs under this row's own keys.
+    pub metadata: bool,
+    /// The route's tags belong on this row.
+    pub tags: bool,
+    /// The destination project name belongs in this row's metadata.
+    pub project: bool,
+}
+
+impl RouteSlots {
+    /// The slots of a session root row.
+    pub const ROOT: Self = Self {
+        attach: true,
+        metadata: true,
+        tags: true,
+        project: false,
+    };
+
+    /// The slots of a later update to a top-level row, such as a root merge.
+    pub const ATTACH: Self = Self {
+        attach: true,
+        metadata: false,
+        tags: false,
+        project: false,
+    };
 }
 
 /// A span operation. `Insert` creates (or replaces) a row; `Merge` updates an
@@ -122,14 +172,6 @@ pub struct SessionCtx {
     pub session_id: String,
     /// Latest config seen for this session (auth, project, span-attach ids).
     pub config: Option<SessionConfig>,
-}
-
-/// Tags configured for every root span in the current agent session.
-pub(crate) fn root_tags(ctx: &SessionCtx) -> Option<Vec<String>> {
-    ctx.config
-        .as_ref()
-        .map(|config| config.tags.clone())
-        .filter(|tags| !tags.is_empty())
 }
 
 /// A per-session state machine. One instance per session; `&mut self` so it
@@ -247,11 +289,34 @@ impl Registry {
         let canonical = self
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
+        Ok(Box::new(overlay::ConfiguredOverlay::new(
+            self.create_unrouted_with_session_namespace(canonical, session_namespace),
+        )))
+    }
+
+    /// The route-neutral translator chain, without the [`RouteOverlay`] a
+    /// caller-supplied [`SessionCtx::config`] would otherwise apply. Its rows
+    /// never depend on route configuration; a delivery branch overlays each
+    /// route itself.
+    #[doc(hidden)]
+    pub fn create_unrouted(&self, source: &str, session_id: &str) -> Box<dyn AgentTranslator> {
+        let canonical = self
+            .canonical_source(source)
+            .unwrap_or_else(|| panic!("unsupported coding-agent source {source:?}"));
+        let namespace = crate::ids::session_namespace(canonical, session_id);
+        self.create_unrouted_with_session_namespace(canonical, &namespace)
+    }
+
+    fn create_unrouted_with_session_namespace(
+        &self,
+        canonical: &str,
+        session_namespace: &str,
+    ) -> Box<dyn AgentTranslator> {
         let factory = self.factories.get(canonical);
         let factory = factory.expect("canonical source must have a factory");
-        Ok(Box::new(turn_lineage::TurnLineage::new(
+        Box::new(turn_lineage::TurnLineage::new(
             factory.create(session_namespace),
-        )))
+        ))
     }
 
     /// Create a known translator. Production ingress uses

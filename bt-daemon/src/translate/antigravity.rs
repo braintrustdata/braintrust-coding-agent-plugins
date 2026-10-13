@@ -8,7 +8,7 @@
 use super::git::GitMetadataCache;
 use super::tool::{with_tool_approval, without_nulls, ToolApproval};
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
+    local_username, AgentTranslator, RouteSlots, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
 };
 use crate::ids;
@@ -52,7 +52,6 @@ struct AntigravityTranslator {
     session_id: String,
     session_span_id: String,
     root_span_id: String,
-    session_parent_span_ids: Vec<String>,
     root_open: bool,
     root_ended: bool,
     turn: Option<Turn>,
@@ -74,7 +73,6 @@ impl AntigravityTranslator {
             session_id: session_id.to_string(),
             session_span_id: root.clone(),
             root_span_id: root,
-            session_parent_span_ids: Vec::new(),
             root_open: false,
             root_ended: false,
             turn: None,
@@ -95,33 +93,16 @@ impl AntigravityTranslator {
             return;
         }
         self.root_open = true;
-        let (parent_span_id, external_root_span_id) = ctx
-            .config
-            .as_ref()
-            .map(|config| config.attached_span_ids())
-            .unwrap_or_default();
-        if let Some(external_root) = external_root_span_id {
-            self.root_span_id = external_root;
-        }
-        self.session_parent_span_ids = parent_span_id.into_iter().collect();
-
         let workspace = event
             .payload
             .get("workspacePaths")
             .and_then(Value::as_array)
             .and_then(|paths| paths.first())
             .and_then(Value::as_str);
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|config| config.additional_metadata.clone())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        metadata.retain(|key, _| !key.starts_with("_bt_"));
+        let mut metadata = Map::new();
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("conversation_id".into(), json!(ctx.session_id));
         metadata.insert("source".into(), json!("antigravity"));
-        metadata.insert("_bt_defer_root".into(), json!(true));
         metadata.insert("username".into(), json!(local_username()));
         if let Some(model) = string_field(&event.payload, "modelName") {
             metadata.insert("model".into(), json!(model));
@@ -144,12 +125,12 @@ impl AntigravityTranslator {
         ops.push(SpanOp::Insert(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: self.session_parent_span_ids.clone(),
             name: format!("Antigravity: {label}"),
             span_type: SpanType::Task,
             start_ms: Some(event.ts_ms),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
+            defer_until_child: true,
+            route_slots: RouteSlots::ROOT,
             ..Default::default()
         }));
     }
@@ -501,7 +482,7 @@ impl AntigravityTranslator {
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.session_span_id.clone(),
             root_span_id: self.root_span_id.clone(),
-            parent_span_ids: self.session_parent_span_ids.clone(),
+            route_slots: RouteSlots::ATTACH,
             end_ms: Some(ts_ms),
             error,
             ..Default::default()

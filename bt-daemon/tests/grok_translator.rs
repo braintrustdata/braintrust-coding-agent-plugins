@@ -3,6 +3,8 @@
     reason = "Test fixtures intentionally launch raw children."
 )]
 
+#[path = "support/route_neutrality.rs"]
+mod route_neutrality;
 #[path = "support/span_identity.rs"]
 mod span_identity;
 
@@ -1306,4 +1308,51 @@ fn grok_failed_tools_keep_the_native_failure_cause() {
             .and_then(|row| row.error.as_deref());
         assert_eq!(error, Some(expected), "{call}");
     }
+}
+
+#[test]
+fn grok_rows_are_route_neutral_and_overlaid_per_route() {
+    let updates = std::fs::metadata(fixture("updates.jsonl")).unwrap().len();
+    let events = std::fs::metadata(fixture("events.jsonl")).unwrap().len();
+    let wake = envelope(updates, events);
+    let mut end = envelope(updates, events);
+    end.event = "SessionEnd".into();
+    end.ts_ms = 2_000;
+    let (neutral, attached) =
+        route_neutrality::assert_route_neutral("grok", "grok-session", |tr, ctx| {
+            let mut ops = Vec::new();
+            for event in [&wake, &end] {
+                ops.extend(tr.handle(event, ctx).unwrap());
+                while let Some(batch) = tr.drain_pending(ctx).unwrap() {
+                    ops.extend(batch);
+                }
+            }
+            ops.extend(tr.finalize(ctx).unwrap());
+            ops
+        });
+    let root = |ops: &[SpanOp]| {
+        ops.iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.name == "Grok" => Some(row.clone()),
+                _ => None,
+            })
+            .expect("root insert")
+    };
+    let neutral_root = root(&neutral);
+    assert!(neutral_root.parent_span_ids.is_empty());
+    assert!(neutral.iter().all(|op| {
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+        row.root_span_id == neutral_root.span_id
+    }));
+    let attached_root = root(&attached);
+    assert_eq!(
+        attached_root.parent_span_ids,
+        [route_neutrality::ROUTE_PARENT]
+    );
+    // Grok session roots have never carried route tags.
+    assert_eq!(attached_root.tags, None);
+    let metadata = attached_root.metadata.as_ref().unwrap();
+    assert_eq!(metadata["team"], "a");
+    assert_eq!(metadata["source"], "grok");
+    assert!(metadata.get("_bt_internal").is_none());
 }

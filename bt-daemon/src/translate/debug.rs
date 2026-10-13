@@ -66,6 +66,7 @@ impl AgentTranslator for DebugTranslator {
                 tags: None,
                 is_turn: false,
                 origin: None,
+                ..Default::default()
             }));
         }
 
@@ -90,6 +91,7 @@ impl AgentTranslator for DebugTranslator {
             tags: None,
             is_turn: false,
             origin: None,
+            ..Default::default()
         }));
 
         Ok(ops)

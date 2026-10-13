@@ -14,15 +14,16 @@ pub mod paths;
 
 mod agents;
 mod args;
+mod capture;
 mod client;
 mod command_output;
 mod correlation;
 mod delivery_ledger;
-mod dispatch;
 mod hook;
 mod ids;
 mod journal;
 mod managed_run;
+mod pipeline;
 mod plugin_diagnostics;
 pub(crate) mod process;
 mod route;
@@ -54,8 +55,69 @@ pub use command_output::{
     OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
 };
 pub use hook::run_hook;
+/// The native observations journaled for one source session, in order, as
+/// JSON envelopes. Daemon controls (checkpoints, finalization) are omitted.
 #[doc(hidden)]
-pub use journal::source_journal_path;
+pub fn read_journaled_events(
+    data_dir: &std::path::Path,
+    source: &str,
+    session_id: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let partition = pipeline::types::PartitionId::new(source, session_id);
+    let store = pipeline::events::EventStore::new(&pipeline::runtime::pipeline_dir(data_dir));
+    let mut cursor = store.cursor(&partition);
+    let mut events = Vec::new();
+    while let Some((_, input)) = cursor.read_one()? {
+        if let pipeline::types::TranslationInput::Native(env) = input {
+            events.push(serde_json::to_value(*env)?);
+        }
+    }
+    Ok(events)
+}
+
+/// Append one captured event to a session's event journal without a daemon,
+/// as a capture that was journaled and then lost its process.
+#[doc(hidden)]
+pub async fn seed_journaled_event(
+    data_dir: &std::path::Path,
+    event: &wire::RedactedEnvelope,
+) -> anyhow::Result<()> {
+    let partition = pipeline::types::PartitionId::new(&event.source, &event.session_id);
+    let store = pipeline::events::EventStore::new(&pipeline::runtime::pipeline_dir(data_dir));
+    std::fs::create_dir_all(pipeline::events::events_dir(
+        &pipeline::runtime::pipeline_dir(data_dir),
+    ))?;
+    store
+        .append(
+            &partition,
+            pipeline::types::TranslationInput::Native(Box::new(event.clone())),
+        )
+        .await?;
+    Ok(())
+}
+
+/// The per-session journal file written before the pipeline existed.
+#[doc(hidden)]
+pub fn legacy_source_journal_path(
+    data_dir: &std::path::Path,
+    source: &str,
+    session_id: &str,
+) -> std::path::PathBuf {
+    journal::source_journal_path(data_dir, source, session_id)
+}
+
+/// The event journal file of one source session.
+#[doc(hidden)]
+pub fn source_journal_path(
+    data_dir: &std::path::Path,
+    source: &str,
+    session_id: &str,
+) -> std::path::PathBuf {
+    pipeline::events::event_path(
+        &pipeline::runtime::pipeline_dir(data_dir),
+        &pipeline::types::PartitionId::new(source, session_id),
+    )
+}
 pub use managed_run::run_traced;
 pub use plugin_diagnostics::PluginDiagnostic;
 pub use server::{
@@ -73,6 +135,6 @@ pub use trace_runtime::{
 };
 pub use transcript_import::{import_transcript, import_transcripts, run_import};
 pub use translate::{
-    AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, SpanRow, SpanType,
+    AgentTranslator, OriginSnapshot, Registry, RouteOverlay, SessionCtx, SpanOp, SpanRow, SpanType,
     TURN_SPAN_ID_KEY,
 };

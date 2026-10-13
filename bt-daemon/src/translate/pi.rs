@@ -6,7 +6,7 @@ use super::tool::{
     error_text, explicit_skill_metadata, with_tool_approval, without_nulls, ToolApproval,
 };
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
+    local_username, AgentTranslator, RouteSlots, SessionCtx, SpanOp, SpanRow, SpanType,
     TranslatorFactory,
 };
 use crate::ids;
@@ -22,8 +22,8 @@ impl TranslatorFactory for crate::agents::Pi {
         Box::new(PiTranslator {
             session_id: session_id.into(),
             root_span_id: ids::span_id(session_id, "root"),
-            effective_root_span_id: String::new(),
-            external_parent: None,
+            trace_root_span_id: String::new(),
+            legacy_parent: None,
             opened: false,
             legacy_root_adopted: false,
             turn: None,
@@ -321,8 +321,10 @@ struct ToolStart {
 struct PiTranslator {
     session_id: String,
     root_span_id: String,
-    effective_root_span_id: String,
-    external_parent: Option<String>,
+    /// Root of this session's trace: its own root, or a legacy extension's.
+    trace_root_span_id: String,
+    /// The parent a legacy extension already gave this session's root.
+    legacy_parent: Option<String>,
     opened: bool,
     // A legacy state file remains available after migration, so its counters
     // are initialization input only. Later reopen/replay events must retain
@@ -474,7 +476,7 @@ impl PiTranslator {
                     &self.session_id,
                     &format!("llm:{}:{}", self.turn_seq, self.llm_seq),
                 ),
-                root_span_id: self.effective_root_span_id.clone(),
+                root_span_id: self.trace_root_span_id.clone(),
                 parent_span_ids: vec![turn.clone()],
                 turn_span_id: Some(turn.clone()),
                 name: "llm".into(),
@@ -492,7 +494,7 @@ impl PiTranslator {
             self.total_tools += 1;
             ops.push(SpanOp::Insert(SpanRow {
                 span_id: self.tool_span_id(&call),
-                root_span_id: self.effective_root_span_id.clone(),
+                root_span_id: self.trace_root_span_id.clone(),
                 parent_span_ids: vec![self.tool_parent(turn, tool.parent_call.as_deref())],
                 turn_span_id: Some(turn.clone()),
                 name: tool.name.clone(),
@@ -523,8 +525,8 @@ impl PiTranslator {
         }
         if let Some(legacy) = legacy_continuation(&envelope.payload) {
             self.root_span_id = legacy.root_span_id;
-            self.effective_root_span_id = legacy.trace_root_span_id;
-            self.external_parent = legacy.parent_span_id;
+            self.trace_root_span_id = legacy.trace_root_span_id;
+            self.legacy_parent = legacy.parent_span_id;
             self.turn_seq = legacy.total_turns;
             self.total_tools = legacy.total_tool_calls;
             self.legacy_root_adopted = true;
@@ -533,26 +535,11 @@ impl PiTranslator {
             // descendants and terminal aggregate merges from this point on.
             return Vec::new();
         }
-        let attached = ctx
-            .config
-            .as_ref()
-            .map(|c| c.attached_span_ids())
-            .unwrap_or_default();
-        self.external_parent = attached.0;
-        self.effective_root_span_id = attached
-            .1
-            .or_else(|| self.external_parent.clone())
-            .unwrap_or_else(|| self.root_span_id.clone());
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|c| c.additional_metadata.as_ref())
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        self.legacy_parent = None;
+        self.trace_root_span_id = self.root_span_id.clone();
+        let mut metadata = Map::new();
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("source".into(), json!("pi"));
-        metadata.insert("_bt_defer_root".into(), json!(true));
         metadata.insert("username".into(), json!(local_username()));
         metadata.insert("pi_version".into(), json!(envelope.source_version));
         metadata.insert(
@@ -581,13 +568,13 @@ impl PiTranslator {
         );
         vec![SpanOp::Insert(SpanRow {
             span_id: self.root_span_id.clone(),
-            root_span_id: self.effective_root_span_id.clone(),
-            parent_span_ids: self.external_parent.clone().into_iter().collect(),
+            root_span_id: self.trace_root_span_id.clone(),
             name: "Pi".into(),
             span_type: SpanType::Task,
             start_ms: Some(envelope.ts_ms),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
+            defer_until_child: true,
+            route_slots: RouteSlots::ROOT,
             ..Default::default()
         })]
     }
@@ -611,7 +598,7 @@ impl PiTranslator {
         self.turn = Some((id.clone(), skills));
         ops.push(SpanOp::Insert(SpanRow {
             span_id: id.clone(),
-            root_span_id: self.effective_root_span_id.clone(),
+            root_span_id: self.trace_root_span_id.clone(),
             parent_span_ids: vec![self.root_span_id.clone()],
             name: format!("Turn {}", self.turn_seq),
             span_type: SpanType::Task,
@@ -739,7 +726,7 @@ impl PiTranslator {
                 &self.session_id,
                 &format!("llm:{}:{}", self.turn_seq, self.llm_seq),
             ),
-            root_span_id: self.effective_root_span_id.clone(),
+            root_span_id: self.trace_root_span_id.clone(),
             parent_span_ids: vec![turn.clone()],
             turn_span_id: Some(turn.clone()),
             name: model.clone().unwrap_or_else(|| "llm".into()),
@@ -797,7 +784,7 @@ impl PiTranslator {
         );
         vec![SpanOp::Insert(SpanRow {
             span_id: self.tool_span_id(&id),
-            root_span_id: self.effective_root_span_id.clone(),
+            root_span_id: self.trace_root_span_id.clone(),
             parent_span_ids: vec![parent],
             turn_span_id: Some(turn.clone()),
             name: name.clone(),
@@ -837,7 +824,7 @@ impl PiTranslator {
             .is_some_and(|skill| requested_skills.contains(&skill.name));
         let row = SpanRow {
             span_id: self.tool_span_id(&call),
-            root_span_id: self.effective_root_span_id.clone(),
+            root_span_id: self.trace_root_span_id.clone(),
             parent_span_ids: vec![self.tool_parent(turn, tracked.parent_call.as_deref())],
             turn_span_id: pending.is_none().then(|| turn.clone()),
             name,
@@ -887,7 +874,7 @@ impl PiTranslator {
         });
         vec![SpanOp::Insert(SpanRow {
             span_id: id,
-            root_span_id: self.effective_root_span_id.clone(),
+            root_span_id: self.trace_root_span_id.clone(),
             parent_span_ids: vec![self.root_span_id.clone()],
             name: name.into(),
             span_type: SpanType::Task,
@@ -917,7 +904,7 @@ impl PiTranslator {
         };
         vec![SpanOp::Merge(SpanRow {
             span_id: id,
-            root_span_id: self.effective_root_span_id.clone(),
+            root_span_id: self.trace_root_span_id.clone(),
             parent_span_ids: vec![self.root_span_id.clone()],
             end_ms: Some(ts),
             error,
@@ -931,8 +918,9 @@ impl PiTranslator {
         self.branch_summary = None;
         SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
-            root_span_id: self.effective_root_span_id.clone(),
-            parent_span_ids: self.external_parent.clone().into_iter().collect(),
+            root_span_id: self.trace_root_span_id.clone(),
+            parent_span_ids: self.legacy_parent.clone().into_iter().collect(),
+            route_slots: RouteSlots::ATTACH,
             end_ms: Some(ts),
             metadata: Some(
                 json!({"total_turns":self.turn_seq,"total_tool_calls":self.total_tools}),

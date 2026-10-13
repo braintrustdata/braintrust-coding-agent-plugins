@@ -56,34 +56,6 @@ pub fn source_journal_path(data_dir: &Path, source: &str, session_id: &str) -> P
     journal_dir(data_dir).join(format!("{prefix}{session}{suffix}"))
 }
 
-/// Return the source-qualified journal, copying the legacy session-only file
-/// on first use so an upgrade retains replay history. The legacy file remains
-/// untouched for rollback and is no longer appended after migration.
-pub async fn ensure_source_journal(
-    data_dir: &Path,
-    source: &str,
-    session_id: &str,
-) -> anyhow::Result<PathBuf> {
-    let path = source_journal_path(data_dir, source, session_id);
-    if tokio::fs::metadata(&path).await.is_ok() {
-        return Ok(path);
-    }
-    let legacy = journal_path(data_dir, session_id);
-    // A legacy name too long for the filesystem was never written.
-    if legacy.file_name().map_or(0, |name| name.len()) > MAX_FILE_NAME_BYTES {
-        return Ok(path);
-    }
-    match tokio::fs::metadata(&legacy).await {
-        Ok(_) => {
-            tokio::fs::create_dir_all(journal_dir(data_dir)).await?;
-            tokio::fs::copy(&legacy, &path).await?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(path)
-}
-
 pub fn managed_run_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("managed-runs")
 }
@@ -217,76 +189,6 @@ pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) 
     }
 }
 
-/// Append-only journal writer for one session.
-pub struct JournalWriter {
-    file: tokio::fs::File,
-    position: u64,
-    pi_context: Vec<serde_json::Value>,
-}
-
-impl JournalWriter {
-    pub async fn open_path(path: &Path) -> anyhow::Result<Self> {
-        if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        let position = file.metadata().await?.len();
-        Ok(Self {
-            file,
-            position,
-            pi_context: Vec::new(),
-        })
-    }
-
-    pub(crate) fn position(&self) -> u64 {
-        self.position
-    }
-
-    /// Append one event in redacted form and flush to the OS. Not fsync'd per
-    /// event (that would dominate hook latency); an OS crash can lose the last
-    /// few lines, which replay tolerates.
-    ///
-    /// The journal is a durability record and is never capped or truncated:
-    /// dropping entries would silently cost recovery fidelity. Its size is
-    /// bounded instead by writing each transcript byte once (see
-    /// [`crate::transcript_mirror`]) and by age-based GC, and replay reads it
-    /// as a stream so a large journal never becomes a large allocation.
-    pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<u64> {
-        let mut redacted = env.redacted();
-        compact_pi_payload(&mut redacted, &mut self.pi_context);
-        let mut line = serde_json::to_vec(&redacted)?;
-        line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.flush().await?;
-        self.position += line.len() as u64;
-        Ok(self.position)
-    }
-
-    /// Record that the sink durably accepted every event through this byte
-    /// offset for one route. It lives in the event journal so a cold worker
-    /// restores delivery knowledge together with translator state.
-    pub async fn append_delivery_checkpoint(
-        &mut self,
-        route: &SessionRoute,
-        through: u64,
-    ) -> anyhow::Result<()> {
-        let mut line = serde_json::to_vec(&DeliveryCheckpointRecord {
-            record_type: "delivery_checkpoint".into(),
-            route: route.clone(),
-            through,
-        })?;
-        line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.flush().await?;
-        self.position += line.len() as u64;
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeliveryCheckpointRecord {
     #[serde(rename = "_bt_record_type")]
@@ -415,33 +317,14 @@ impl JournalReader {
             }));
         }
     }
-
-    /// The latest acknowledged event offset for `route` in the portion of the
-    /// journal being recovered. Older journals contain no checkpoints and
-    /// therefore retain their existing replay behavior.
-    pub async fn acknowledged_through(path: &Path, through: u64, route: &SessionRoute) -> u64 {
-        let Ok(Some(mut reader)) = Self::open(path, through).await else {
-            return 0;
-        };
-        let mut acknowledged = 0;
-        while let Ok(Some(entry)) = reader.next_record().await {
-            if let JournalRecord::DeliveryCheckpoint {
-                route: candidate,
-                through,
-            } = entry.record
-            {
-                if candidate.same_route(route) {
-                    acknowledged = acknowledged.max(through);
-                }
-            }
-        }
-        acknowledged
-    }
 }
 
 const PI_MESSAGES_DELTA: &str = "_bt_messages_delta";
 
-fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_json::Value>) {
+pub(crate) fn compact_pi_payload(
+    event: &mut RedactedEnvelope,
+    previous: &mut Vec<serde_json::Value>,
+) {
     if event.source != "pi" {
         return;
     }
@@ -503,7 +386,7 @@ fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_jso
     }
 }
 
-fn expand_pi_payload(
+pub(crate) fn expand_pi_payload(
     event: &mut RedactedEnvelope,
     previous: &mut Vec<serde_json::Value>,
 ) -> anyhow::Result<()> {
@@ -607,173 +490,6 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
 mod tests {
     use super::*;
 
-    fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
-        Envelope {
-            source: "pi".into(),
-            source_version: None,
-            plugin_version: None,
-            session_id: "pi-session".into(),
-            event: "context".into(),
-            ts_ms,
-            managed_run_id: None,
-            capture: None,
-            payload: serde_json::json!({"event":{"type":"context","messages":messages}}),
-            route: None,
-            config: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn pi_context_history_is_delta_encoded_and_replayed() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pi.ndjson");
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let mut messages = Vec::new();
-        let mut naive_bytes = 0usize;
-        for index in 0..20 {
-            messages.push(serde_json::json!({
-                "role":"user",
-                "content": format!("{index}:{}", "x".repeat(4096)),
-            }));
-            let event = pi_context(messages.clone(), index);
-            naive_bytes += serde_json::to_vec(&event.redacted()).unwrap().len() + 1;
-            writer.append(&event).await.unwrap();
-        }
-        let compacted = vec![
-            serde_json::json!({"role":"compactionSummary","summary":"bounded"}),
-            serde_json::json!({"role":"user","content":"after"}),
-        ];
-        let event = pi_context(compacted.clone(), 20);
-        naive_bytes += serde_json::to_vec(&event.redacted()).unwrap().len() + 1;
-        writer.append(&event).await.unwrap();
-        drop(writer);
-
-        let stored = tokio::fs::read(&path).await.unwrap();
-        assert!(
-            stored.len() < naive_bytes / 3,
-            "Pi journal did not eliminate cumulative context copies: stored={} naive={naive_bytes}",
-            stored.len()
-        );
-        assert!(!String::from_utf8_lossy(&stored).contains("\"messages\""));
-
-        let through = stored.len() as u64;
-        let mut reader = JournalReader::open(&path, through).await.unwrap().unwrap();
-        let mut contexts = Vec::new();
-        while let Some(entry) = reader.next_entry().await.unwrap() {
-            contexts.push(
-                entry
-                    .payload
-                    .pointer("/event/messages")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap(),
-            );
-        }
-        assert_eq!(contexts.len(), 21);
-        assert_eq!(contexts[19].len(), 20);
-        assert_eq!(contexts[20], compacted);
-    }
-
-    #[tokio::test]
-    async fn pi_streaming_updates_do_not_persist_growing_partial_messages() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pi.ndjson");
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let marker = "growing-partial-marker".repeat(4096);
-        let event = Envelope {
-            source: "pi".into(),
-            source_version: None,
-            plugin_version: None,
-            session_id: "pi-session".into(),
-            event: "message_update".into(),
-            ts_ms: 1,
-            managed_run_id: None,
-            capture: None,
-            payload: serde_json::json!({
-                "event": {
-                    "type": "message_update",
-                    "assistantMessageEvent": {
-                        "type": "text_delta",
-                        "partial": marker,
-                    },
-                    "message": {"role": "assistant", "content": marker},
-                }
-            }),
-            route: None,
-            config: None,
-        };
-        writer.append(&event).await.unwrap();
-        drop(writer);
-
-        let stored = tokio::fs::read(&path).await.unwrap();
-        assert!(!String::from_utf8_lossy(&stored).contains("growing-partial-marker"));
-
-        let mut reader = JournalReader::open(&path, stored.len() as u64)
-            .await
-            .unwrap()
-            .unwrap();
-        let replayed = reader.next_entry().await.unwrap().unwrap();
-        assert_eq!(
-            replayed
-                .payload
-                .pointer("/event/assistantMessageEvent/type"),
-            Some(&serde_json::json!("text_delta"))
-        );
-    }
-
-    #[tokio::test]
-    async fn pi_provider_requests_persist_only_request_configuration() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pi.ndjson");
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let event = Envelope {
-            source: "pi".into(),
-            source_version: None,
-            plugin_version: None,
-            session_id: "pi-session".into(),
-            event: "before_provider_request".into(),
-            ts_ms: 1,
-            managed_run_id: None,
-            capture: None,
-            payload: serde_json::json!({
-                "event": {
-                    "type": "before_provider_request",
-                    "payload": {
-                        "system": "system-prompt-marker",
-                        "messages": [{"role": "user", "content": "message-marker"}],
-                        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
-                        "max_tokens": 1024,
-                    },
-                }
-            }),
-            route: None,
-            config: None,
-        };
-        writer.append(&event).await.unwrap();
-        drop(writer);
-
-        let stored = tokio::fs::read(&path).await.unwrap();
-        let stored_text = String::from_utf8_lossy(&stored);
-        assert!(!stored_text.contains("system-prompt-marker"));
-        assert!(!stored_text.contains("message-marker"));
-
-        let mut reader = JournalReader::open(&path, stored.len() as u64)
-            .await
-            .unwrap()
-            .unwrap();
-        let replayed = reader.next_entry().await.unwrap().unwrap();
-        assert_eq!(
-            replayed.payload.pointer("/event/payload"),
-            Some(&serde_json::json!({
-                "max_tokens": 1024,
-                "tools": [{"type": "function", "function": {
-                    "name": "read",
-                    "parameters": {"type": "object"},
-                }}],
-            }))
-        );
-    }
-
     #[test]
     fn pi_journaled_request_configuration_replays_unchanged() {
         let schema = serde_json::json!({"type": "object"});
@@ -805,37 +521,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn source_journals_are_distinct_and_migrate_legacy_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let legacy = journal_path(temp.path(), "same/session");
-        tokio::fs::create_dir_all(legacy.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&legacy, b"legacy\n").await.unwrap();
-
-        let codex = ensure_source_journal(temp.path(), "codex", "same/session")
-            .await
-            .unwrap();
-        let claude = ensure_source_journal(temp.path(), "claude-code", "same/session")
-            .await
-            .unwrap();
-        assert_ne!(codex, claude);
-        assert_eq!(tokio::fs::read(&codex).await.unwrap(), b"legacy\n");
-        assert_eq!(tokio::fs::read(&claude).await.unwrap(), b"legacy\n");
-        assert_eq!(tokio::fs::read(&legacy).await.unwrap(), b"legacy\n");
-    }
-
-    #[tokio::test]
-    async fn long_session_ids_get_distinct_bounded_journals() {
+    #[test]
+    fn long_session_ids_get_distinct_bounded_journals() {
         let temp = tempfile::tempdir().unwrap();
         let shared = "x".repeat(400);
-        let first = ensure_source_journal(temp.path(), "pi", &format!("a{shared}"))
-            .await
-            .unwrap();
-        let second = ensure_source_journal(temp.path(), "pi", &format!("b{shared}"))
-            .await
-            .unwrap();
+        let first = source_journal_path(temp.path(), "pi", &format!("a{shared}"));
+        let second = source_journal_path(temp.path(), "pi", &format!("b{shared}"));
         assert_ne!(first, second);
         for path in [&first, &second] {
             assert!(path.file_name().unwrap().len() <= MAX_FILE_NAME_BYTES);
@@ -855,11 +546,13 @@ mod tests {
     async fn legacy_managed_run_records_recover_source_from_the_old_journal() {
         let temp = tempfile::tempdir().unwrap();
         let route = SessionRoute::default();
-        let mut writer = JournalWriter::open_path(&journal_path(temp.path(), "legacy"))
+        let path = journal_path(temp.path(), "legacy");
+        tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        writer
-            .append(&Envelope {
+        let mut lines = Vec::new();
+        for envelope in [
+            Envelope {
                 source: "codex".into(),
                 source_version: None,
                 plugin_version: None,
@@ -871,11 +564,8 @@ mod tests {
                 route: Some(route.clone()),
                 config: None,
                 capture: None,
-            })
-            .await
-            .unwrap();
-        writer
-            .append(&Envelope {
+            },
+            Envelope {
                 source: "claude".into(),
                 source_version: None,
                 plugin_version: None,
@@ -887,9 +577,12 @@ mod tests {
                 route: Some(route.clone()),
                 config: None,
                 capture: None,
-            })
-            .await
-            .unwrap();
+            },
+        ] {
+            lines.extend(serde_json::to_vec(&envelope.redacted()).unwrap());
+            lines.push(b'\n');
+        }
+        tokio::fs::write(&path, lines).await.unwrap();
         assert_eq!(
             legacy_journal_source(temp.path(), "legacy", &route).await,
             Some("codex".into())
