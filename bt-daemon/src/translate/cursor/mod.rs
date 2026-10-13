@@ -58,6 +58,7 @@ const CURSOR_METADATA_FIELDS: &[&str] = &[
     "subagent_type",
     "subagent_id",
     "spawning_tool_call_id",
+    "native_duration_ms",
     "recursive_activity_verified",
     "observation_only",
     "completion_observed",
@@ -1181,17 +1182,32 @@ impl CursorTranslator {
             .filter(|id| self.subagents.contains_key(*id))
             .map(str::to_owned)
             .or_else(|| {
-                hook.subagent_id
-                    .is_none()
-                    .then(|| {
-                        (self.subagents.len() == 1)
-                            .then(|| self.subagents.keys().next().cloned())
-                            .flatten()
-                    })
-                    .flatten()
+                if hook.subagent_id.is_some()
+                    || (hook.task.is_none() && hook.subagent_type.is_none())
+                {
+                    return None;
+                }
+                let mut matching_ids = self.subagents.iter().filter_map(|(id, row)| {
+                    let task_matches = hook.task.as_ref().is_none_or(|task| {
+                        row.input.as_ref().and_then(Value::as_str) == Some(task.as_str())
+                    });
+                    let type_matches = hook.subagent_type.as_ref().is_none_or(|kind| {
+                        row.metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("subagent_type"))
+                            .and_then(Value::as_str)
+                            == Some(kind.as_str())
+                    });
+                    (task_matches && type_matches).then(|| id.clone())
+                });
+                let candidate = matching_ids.next()?;
+                matching_ids.next().is_none().then_some(candidate)
             });
         if let Some(id) = correlated_id {
             if let Some(mut row) = self.subagents.remove(&id) {
+                if let Some(duration) = hook.duration_ms.and_then(|ms| i64::try_from(ms).ok()) {
+                    row.start_ms = Some(e.ts_ms.saturating_sub(duration));
+                }
                 row.end_ms = Some(e.ts_ms.max(row.start_ms.unwrap_or(e.ts_ms)));
                 row.output = hook.summary.as_ref().map(|summary| json!(summary));
                 let metadata = row.metadata.get_or_insert_with(|| json!({}));
@@ -1200,7 +1216,7 @@ impl CursorTranslator {
                     metadata["stop_correlated_without_id"] = json!(true);
                 }
                 if let Some(duration) = hook.duration_ms {
-                    metadata["duration_ms"] = json!(duration);
+                    metadata["native_duration_ms"] = json!(duration);
                 }
                 row.error = error;
                 ops.push(SpanOp::Merge(row));
@@ -1244,7 +1260,7 @@ impl CursorTranslator {
             "subagent_id": hook.subagent_id,
             "subagent_type": hook.subagent_type,
             "description": hook.description,
-            "duration_ms": hook.duration_ms,
+            "native_duration_ms": hook.duration_ms,
             "recursive_activity_verified": false,
             "start_time_estimated": true,
             "result_completeness": "terminal_observation_only",
