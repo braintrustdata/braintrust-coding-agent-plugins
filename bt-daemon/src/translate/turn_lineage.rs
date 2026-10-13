@@ -65,6 +65,21 @@ impl AgentTranslator for TurnLineage {
         Ok(stamp(self.inner.finalize(ctx)?))
     }
 
+    fn checkpoint_at(
+        &mut self,
+        ctx: &SessionCtx,
+        bounds: &std::collections::HashMap<String, u64>,
+    ) -> anyhow::Result<Vec<SpanOp>> {
+        Ok(stamp(self.inner.checkpoint_at(ctx, bounds)?))
+    }
+    fn finalize_at(
+        &mut self,
+        ctx: &SessionCtx,
+        bounds: &std::collections::HashMap<String, u64>,
+    ) -> anyhow::Result<Vec<SpanOp>> {
+        Ok(stamp(self.inner.finalize_at(ctx, bounds)?))
+    }
+
     fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         Ok(stamp(self.inner.flush(ctx)?))
     }

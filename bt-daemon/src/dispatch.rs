@@ -7,14 +7,14 @@
 //! event is durably journaled. Translation, correlation, and delivery here are
 //! entirely out-of-band from hook execution.
 
-use crate::delivery_ledger::LedgerSink;
-use crate::journal::JournalWriter;
-use crate::pipeline::routing::RoutingSink;
-use crate::pipeline::{Completion, Delivery};
+use crate::pipeline::{
+    consumer::{Consumer, ConsumerOptions},
+    translation::Translation,
+};
 use crate::sink::SinkFactory;
-use crate::translate::{Registry, SessionCtx};
-use crate::wire::{Envelope, SessionRoute};
+use crate::translate::Registry;
 use parking_lot::Mutex;
+use crate::wire::Envelope;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,10 +45,6 @@ enum SessionMsg {
 /// Where to rebuild a session's translator state from, streamed at startup.
 pub struct ReplayPlan {
     pub journal_path: PathBuf,
-    /// Replay stops here — the journal's length when this session was
-    /// created, so the event creating it is not replayed and then delivered
-    /// a second time from the queue.
-    pub through: u64,
     /// Events through this offset reached the backend before the prior daemon
     /// stopped. Replay still rebuilds translator state from them, but must not
     /// deliver them again.
@@ -57,17 +53,12 @@ pub struct ReplayPlan {
 
 pub(crate) struct SessionOptions {
     pub session_id: String,
-    pub translator_session_id: String,
     pub source: String,
     pub bt_version: String,
-    pub replay: Option<ReplayPlan>,
     pub config: crate::wire::SessionConfig,
-    pub correlation_key: String,
-    pub route: SessionRoute,
-    pub correlation: Arc<crate::correlation::CorrelationRegistry>,
     pub data_dir: PathBuf,
-    pub journal: Arc<tokio::sync::Mutex<JournalWriter>>,
-    pub correlation_changed: Arc<tokio::sync::Notify>,
+    pub translation: Arc<Translation>,
+    pub cursor: crate::pipeline::journal::Cursor,
 }
 
 /// Handle to one live session: its queue plus observable counters/state.
@@ -76,6 +67,8 @@ pub struct Session {
     tx: mpsc::Sender<SessionMsg>,
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
+    source_progress: Arc<crate::pipeline::translation::Progress>,
+    pub source_error: Arc<Mutex<Option<String>>>,
     pub permalink: Arc<Mutex<Option<String>>>,
     last_activity: Mutex<Instant>,
 }
@@ -84,63 +77,131 @@ impl Session {
     /// Spawn a session's actor task and return its handle.
     pub fn spawn(
         options: SessionOptions,
-        translators: Arc<Registry>,
+        _translators: Arc<Registry>,
         sink_factory: Arc<dyn SinkFactory>,
     ) -> Arc<Session> {
-        let SessionOptions {
-            session_id,
-            translator_session_id,
-            source,
-            bt_version,
-            replay,
-            config,
-            correlation_key,
-            route,
-            correlation,
-            data_dir,
-            journal,
-            correlation_changed,
-        } = options;
-        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let counters = Arc::new(Counters::default());
         let last_error = Arc::new(Mutex::new(None));
         let permalink = Arc::new(Mutex::new(None));
-
-        let actor = SessionActor {
-            session_id: session_id.clone(),
-            translator_session_id,
-            source: source.clone(),
-            bt_version,
-            translators,
-            sink_factory,
-            counters: counters.clone(),
-            last_error: last_error.clone(),
-            permalink: permalink.clone(),
-            replay,
-            config,
-            correlation_key,
-            route,
-            correlation,
-            data_dir,
-            journal,
-            correlation_changed,
-        };
-        tokio::spawn(actor.run(rx));
+        let source = options.source.clone();
+        let route = Consumer::spawn(
+            options.translation.journal.clone(),
+            options.cursor,
+            ConsumerOptions {
+                source: options.source.clone(),
+                session_id: options.session_id.clone(),
+                version: options.bt_version,
+                data_dir: options.data_dir,
+                config: options.config,
+                counters: counters.clone(),
+                error: last_error.clone(),
+                permalink: permalink.clone(),
+                factory: sink_factory,
+            },
+        );
+        let producer = options.translation;
+        let source_error = producer.error.clone();
+        let source_progress = producer.progress.clone();
+        let errors = last_error.clone();
+        let queued = counters.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let finalize = matches!(&message, SessionMsg::Finalize(_));
+                match message {
+                    SessionMsg::Event(env, through) => {
+                        if let Some(config) = env.config {
+                            route.configure(config);
+                        }
+                        if let Err(error) = producer.advance(through).await {
+                            *errors.lock().unwrap() = Some(error.to_string());
+                        }
+                    }
+                    SessionMsg::Configure(config, reply) => {
+                        route.configure(*config);
+                        let _ = reply.send(());
+                    }
+                    SessionMsg::Barrier(reply) => {
+                        let _ = producer.barrier().await;
+                        let _ = reply.send(());
+                    }
+                    SessionMsg::Flush(reply) | SessionMsg::Finalize(reply) => {
+                        let kind = if finalize {
+                            crate::journal::ControlKind::Finalize
+                        } else {
+                            crate::journal::ControlKind::Checkpoint
+                        };
+                        let target = producer.control(kind).await;
+                        let route = route.clone();
+                        let queued = queued.clone();
+                        let errors = errors.clone();
+                        tokio::spawn(async move {
+                            let mut reply = reply;
+                            let waiting = async {
+                                match target {
+                                    Ok(tail) => match route.through(tail).await {
+                                        Ok(()) => 0,
+                                        Err(error) => {
+                                            *errors.lock().unwrap() = Some(error);
+                                            queued.queued.load(Ordering::Relaxed).max(1)
+                                        }
+                                    },
+                                    Err(error) => {
+                                        *errors.lock().unwrap() = Some(error);
+                                        queued.queued.load(Ordering::Relaxed).max(1)
+                                    }
+                                }
+                            };
+                            tokio::select! { _=reply.closed()=>{}, pending=waiting=> { let _=reply.send(pending); } }
+                        });
+                    }
+                    SessionMsg::Shutdown(reply) => {
+                        if producer.routes.fetch_sub(1, Ordering::Relaxed) == 1 {
+                            // Process retirement is not a native session end.
+                            if let Ok(tail) =
+                                producer.control(crate::journal::ControlKind::Retire).await
+                            {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    route.through(tail),
+                                )
+                                .await;
+                            }
+                        }
+                        route.shutdown().await;
+                        if producer.routes.load(Ordering::Relaxed) == 0 {
+                            producer.shutdown().await;
+                        }
+                        let _ = reply.send(());
+                        break;
+                    }
+                }
+            }
+        });
 
         Arc::new(Session {
             source,
             tx,
             counters,
             last_error,
+            source_error,
+            source_progress,
             permalink,
             last_activity: Mutex::new(Instant::now()),
         })
     }
 
+    pub(crate) fn pending(&self) -> u64 {
+        self.counters
+            .queued
+            .load(Ordering::Relaxed)
+            .saturating_add(self.source_progress.pending())
+    }
+
     /// Queue a journaled event without waiting for translation or delivery.
     pub async fn enqueue(&self, env: Envelope, journal_through: u64) -> anyhow::Result<()> {
         self.touch();
-        self.counters.queued.fetch_add(1, Ordering::Relaxed);
+
         self.tx
             .send(SessionMsg::Event(Box::new(env), journal_through))
             .await
@@ -451,522 +512,6 @@ async fn capture_grok_transcript_pass(
     }
 }
 
-struct SessionActor {
-    session_id: String,
-    translator_session_id: String,
-    source: String,
-    bt_version: String,
-    translators: Arc<Registry>,
-    sink_factory: Arc<dyn SinkFactory>,
-    counters: Arc<Counters>,
-    last_error: Arc<Mutex<Option<String>>>,
-    permalink: Arc<Mutex<Option<String>>>,
-    replay: Option<ReplayPlan>,
-    config: crate::wire::SessionConfig,
-    correlation_key: String,
-    route: SessionRoute,
-    correlation: Arc<crate::correlation::CorrelationRegistry>,
-    data_dir: PathBuf,
-    journal: Arc<tokio::sync::Mutex<JournalWriter>>,
-    correlation_changed: Arc<tokio::sync::Notify>,
-}
-
-#[derive(Clone, Copy)]
-enum BatchMode {
-    Live,
-    Replay,
-    Checkpoint,
-    TerminalFinalize,
-    ShutdownFinalize,
-}
-
-impl BatchMode {
-    fn errors(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Live => ("translate failed", "sink emit failed"),
-            Self::Replay => ("journal replay failed", "sink replay emit failed"),
-            Self::Checkpoint => (
-                "translate checkpoint failed",
-                "sink emit (checkpoint) failed",
-            ),
-            Self::TerminalFinalize | Self::ShutdownFinalize => (
-                "translate finalization failed",
-                "sink emit (finalization) failed",
-            ),
-        }
-    }
-
-    fn observes_correlation(self) -> bool {
-        !matches!(self, Self::ShutdownFinalize)
-    }
-}
-
-impl SessionActor {
-    async fn run(self, mut rx: mpsc::Receiver<SessionMsg>) {
-        let mut translator = match self
-            .translators
-            .create_checked_with_session_namespace(&self.source, &self.translator_session_id)
-        {
-            Ok(translator) => translator,
-            Err(error) => {
-                self.set_error(format!("translator init failed: {error}"));
-                return;
-            }
-        };
-        let sink = match self.sink_factory.create(&self.session_id, &self.source) {
-            Ok(s) => s,
-            Err(e) => {
-                self.set_error(format!("sink init failed: {e}"));
-                // Still drain the queue so the daemon's counters settle and
-                // callers waiting on flush don't hang.
-                while let Some(msg) = rx.recv().await {
-                    match msg {
-                        SessionMsg::Event(_, _) => {
-                            self.counters.queued.fetch_sub(1, Ordering::Relaxed);
-                        }
-                        SessionMsg::Configure(_, r) => {
-                            let _ = r.send(());
-                        }
-                        SessionMsg::Barrier(r) => {
-                            let _ = r.send(());
-                        }
-                        SessionMsg::Flush(r) => {
-                            let _ = r.send(0);
-                        }
-                        SessionMsg::Finalize(r) => {
-                            let _ = r.send(0);
-                        }
-                        SessionMsg::Shutdown(r) => {
-                            let _ = r.send(());
-                            break;
-                        }
-                    }
-                }
-                return;
-            }
-        };
-        let sink: Box<dyn crate::sink::Sink> = Box::new(
-            LedgerSink::new(
-                sink,
-                Some(&self.data_dir),
-                &self.source,
-                &self.session_id,
-                Some(&self.config),
-                &self.bt_version,
-            )
-            .await,
-        );
-        let mut sink: Box<dyn crate::sink::Sink> = Box::new(RoutingSink::spawn(
-            sink,
-            self.source.clone(),
-            self.session_id.clone(),
-            self.data_dir.clone(),
-            self.last_error.clone(),
-        ));
-        let mut ctx = SessionCtx {
-            session_id: self.session_id.clone(),
-            config: Some(self.config.clone()),
-        };
-        sink.configure(&self.config);
-        self.refresh_permalink(sink.as_ref());
-        // Rebuild translator state before accepting the first new event.
-        // Stable span ids make this both crash recovery and a complete copy
-        // when an existing source session is sent to another destination.
-        let mut acknowledged_through = self
-            .replay
-            .as_ref()
-            .map_or(0, |plan| plan.acknowledged_through);
-        let mut pending_through = acknowledged_through;
-        // A failed sink write makes the contiguous delivery boundary unknown.
-        // Keep the journal conservative for this actor generation rather than
-        // checkpointing past an event that may need recovery delivery.
-        let mut checkpointable = self.replay_into(&mut translator, &mut sink, &ctx).await;
-
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                SessionMsg::Event(env, journal_through) => {
-                    let correlation_barrier = is_tool_lifecycle_event(&env.event);
-                    if let Some(cfg) = &env.config {
-                        sink.configure(cfg);
-                        ctx.config = Some(cfg.clone());
-                        self.refresh_permalink(sink.as_ref());
-                    }
-                    sink.set_capture_versions(
-                        env.plugin_version.as_deref(),
-                        env.source_version.as_deref(),
-                    );
-                    let translated = translator.handle(&env, &ctx);
-                    let (correlation_changed, delivered) = self
-                        .emit_translator_batches(
-                            &mut translator,
-                            &mut sink,
-                            &ctx,
-                            translated,
-                            BatchMode::Live,
-                        )
-                        .await;
-                    if correlation_changed || correlation_barrier {
-                        if let Err(error) = crate::server::persist_active_parent_snapshot(
-                            &self.data_dir,
-                            &self.correlation_key,
-                            &self.correlation,
-                        )
-                        .await
-                        {
-                            self.set_error(error);
-                        }
-                        self.correlation_changed.notify_one();
-                    }
-                    self.counters.queued.fetch_sub(1, Ordering::Relaxed);
-                    if delivered && checkpointable {
-                        pending_through = pending_through.max(journal_through);
-                    } else {
-                        checkpointable = false;
-                    }
-                }
-                SessionMsg::Configure(config, reply) => {
-                    sink.configure(&config);
-                    ctx.config = Some(*config);
-                    self.refresh_permalink(sink.as_ref());
-                    let _ = reply.send(());
-                }
-                SessionMsg::Barrier(reply) => {
-                    let _ = reply.send(());
-                }
-                SessionMsg::Flush(reply) => {
-                    checkpointable &= self
-                        .checkpoint_and_flush(&mut translator, &mut sink, &ctx)
-                        .await;
-                    if checkpointable {
-                        checkpointable &= self
-                            .record_delivery_checkpoint(
-                                &mut sink,
-                                pending_through,
-                                &mut acknowledged_through,
-                            )
-                            .await;
-                    }
-                    let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
-                }
-                SessionMsg::Finalize(reply) => {
-                    checkpointable &= self
-                        .finalize_and_flush(
-                            &mut translator,
-                            &mut sink,
-                            &ctx,
-                            BatchMode::TerminalFinalize,
-                        )
-                        .await;
-                    if checkpointable {
-                        checkpointable &= self
-                            .record_delivery_checkpoint(
-                                &mut sink,
-                                pending_through,
-                                &mut acknowledged_through,
-                            )
-                            .await;
-                    }
-                    let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
-                }
-                SessionMsg::Shutdown(reply) => {
-                    checkpointable &= self
-                        .finalize_and_flush(
-                            &mut translator,
-                            &mut sink,
-                            &ctx,
-                            BatchMode::ShutdownFinalize,
-                        )
-                        .await;
-                    if checkpointable {
-                        self.record_delivery_checkpoint(
-                            &mut sink,
-                            pending_through,
-                            &mut acknowledged_through,
-                        )
-                        .await;
-                    }
-                    let _ = reply.send(());
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Emit a translator result and every bounded continuation it schedules.
-    /// A continuation may be empty (for example, irrelevant rollout rows), so
-    /// only `None` signals that the translator is fully caught up.
-    async fn emit_translator_batches(
-        &self,
-        translator: &mut Box<dyn crate::translate::AgentTranslator>,
-        sink: &mut Box<dyn crate::sink::Sink>,
-        ctx: &SessionCtx,
-        first: anyhow::Result<Vec<crate::translate::SpanOp>>,
-        mode: BatchMode,
-    ) -> (bool, bool) {
-        let (translate_error, emit_error) = mode.errors();
-        let Some(config) = ctx.config.as_ref() else {
-            self.set_error("session configuration is missing".into());
-            return (false, false);
-        };
-        let mut next = match first {
-            Ok(ops) => Some(ops),
-            Err(e) => {
-                self.set_error(format!("{translate_error}: {e}"));
-                return (false, false);
-            }
-        };
-        let mut correlation_changed = false;
-        let mut delivered = true;
-        while let Some(ops) = next {
-            if !ops.is_empty() {
-                if mode.observes_correlation() {
-                    let changed = self.observe_ops(&ops, config);
-                    correlation_changed |= changed;
-                    if changed {
-                        self.persist_correlation_if_changed(true).await;
-                    }
-                }
-                if !ops.is_empty() {
-                    match sink.emit(&ops).await {
-                        Ok(n) => {
-                            self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            delivered = false;
-                            if let Some(failure) =
-                                e.downcast_ref::<crate::pipeline::routing::EmitFailure>()
-                            {
-                                self.counters
-                                    .spans_emitted
-                                    .fetch_add(failure.emitted, Ordering::Relaxed);
-                                if failure.report {
-                                    self.set_error(format!("{emit_error}: {e}"));
-                                }
-                            } else {
-                                self.set_error(format!("{emit_error}: {e}"));
-                            }
-                        }
-                    }
-                }
-            }
-            next = match translator.drain_pending(ctx) {
-                Ok(next) => next,
-                Err(e) => {
-                    self.set_error(format!("{translate_error}: {e}"));
-                    delivered = false;
-                    None
-                }
-            };
-        }
-        (correlation_changed, delivered)
-    }
-
-    /// Stream the journal through the translator, emitting each entry's spans
-    /// as they are produced. Nothing is accumulated across entries: peak
-    /// memory is one journal entry and the ops it yields, so recovering a
-    /// long session costs the same as running it.
-    async fn replay_into(
-        &self,
-        translator: &mut Box<dyn crate::translate::AgentTranslator>,
-        sink: &mut Box<dyn crate::sink::Sink>,
-        ctx: &SessionCtx,
-    ) -> bool {
-        let Some(plan) = &self.replay else {
-            return true;
-        };
-        let mut reader = match crate::journal::JournalReader::open(&plan.journal_path, plan.through)
-            .await
-        {
-            Ok(Some(reader)) => reader,
-            Ok(None) => return true,
-            Err(error) => {
-                tracing::warn!(session_id = %self.session_id, "journal replay skipped: {error}");
-                return false;
-            }
-        };
-        let mut delivered = true;
-        loop {
-            let entry = match reader.next_record().await {
-                Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(session_id = %self.session_id, "journal replay stopped: {error}");
-                    delivered = false;
-                    break;
-                }
-            };
-            let entry_through = entry.through;
-            let crate::journal::JournalRecord::Event(entry) = entry.record else {
-                continue;
-            };
-            let mut env = crate::journal::envelope_from_redacted(entry);
-            let Some(canonical_source) = self.translators.canonical_source(&env.source) else {
-                continue;
-            };
-            if canonical_source != self.source {
-                continue;
-            }
-            env.source = self.source.clone();
-            if env.source == "claude-code" {
-                if let Some(payload) = env.payload.as_object_mut() {
-                    payload.insert("_bt_transcript_replay".to_string(), serde_json::json!(true));
-                }
-            }
-            sink.set_capture_versions(env.plugin_version.as_deref(), env.source_version.as_deref());
-            let translated = translator.handle(&env, ctx);
-            if entry_through <= plan.acknowledged_through {
-                self.replay_without_delivery(translator, ctx, translated)
-                    .await;
-            } else {
-                let (_, replayed) = self
-                    .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Replay)
-                    .await;
-                delivered &= replayed;
-            }
-        }
-        delivered
-    }
-
-    /// Continue a replayed translator exactly as usual but deliberately omit
-    /// sink delivery for entries recorded as durably accepted. This lets every
-    /// agent recover correlation/open-span state without retriggering backend
-    /// side effects such as online scoring.
-    async fn replay_without_delivery(
-        &self,
-        translator: &mut Box<dyn crate::translate::AgentTranslator>,
-        ctx: &SessionCtx,
-        first: anyhow::Result<Vec<crate::translate::SpanOp>>,
-    ) {
-        let Some(config) = ctx.config.as_ref() else {
-            self.set_error("session configuration is missing".into());
-            return;
-        };
-        let mut next = match first {
-            Ok(ops) => Some(ops),
-            Err(error) => {
-                self.set_error(format!("journal replay failed: {error}"));
-                return;
-            }
-        };
-        while let Some(ops) = next {
-            if !ops.is_empty() {
-                let _ = self.observe_ops(&ops, config);
-            }
-            next = match translator.drain_pending(ctx) {
-                Ok(next) => next,
-                Err(error) => {
-                    self.set_error(format!("journal replay failed: {error}"));
-                    None
-                }
-            };
-        }
-    }
-
-    async fn checkpoint_and_flush(
-        &self,
-        translator: &mut Box<dyn crate::translate::AgentTranslator>,
-        sink: &mut Box<dyn crate::sink::Sink>,
-        ctx: &SessionCtx,
-    ) -> bool {
-        let translated = translator.checkpoint(ctx);
-        let (correlation_changed, delivered) = self
-            .emit_translator_batches(translator, sink, ctx, translated, BatchMode::Checkpoint)
-            .await;
-        self.persist_correlation_if_changed(correlation_changed)
-            .await;
-        delivered
-    }
-
-    async fn finalize_and_flush(
-        &self,
-        translator: &mut Box<dyn crate::translate::AgentTranslator>,
-        sink: &mut Box<dyn crate::sink::Sink>,
-        ctx: &SessionCtx,
-        mode: BatchMode,
-    ) -> bool {
-        let translated = translator.finalize(ctx);
-        let (correlation_changed, delivered) = self
-            .emit_translator_batches(translator, sink, ctx, translated, mode)
-            .await;
-        self.persist_correlation_if_changed(correlation_changed)
-            .await;
-        delivered
-    }
-
-    fn observe_ops(
-        &self,
-        ops: &[crate::translate::SpanOp],
-        config: &crate::wire::SessionConfig,
-    ) -> bool {
-        let mut routed = ops.to_vec();
-        crate::pipeline::prepare::Prepare::new(&self.source).apply(&mut routed, config);
-        self.correlation
-            .observe_ops(&self.correlation_key, &self.route, config, &routed)
-    }
-
-    async fn persist_correlation_if_changed(&self, changed: bool) {
-        if !changed {
-            return;
-        }
-        if let Err(error) = crate::server::persist_active_parent_snapshot(
-            &self.data_dir,
-            &self.correlation_key,
-            &self.correlation,
-        )
-        .await
-        {
-            self.set_error(error);
-        }
-    }
-
-    /// False means delivery was rejected and this actor must never advance its
-    /// contiguous event boundary. Deferred delivery and failed checkpoint writes
-    /// leave accepted work eligible for a later checkpoint.
-    async fn record_delivery_checkpoint(
-        &self,
-        sink: &mut Box<dyn crate::sink::Sink>,
-        through: u64,
-        acknowledged_through: &mut u64,
-    ) -> bool {
-        if let Err(error) = sink.flush().await {
-            self.set_error(format!("sink flush failed: {error}"));
-            return false;
-        }
-        self.refresh_permalink(sink.as_ref());
-        if sink.has_pending_delivery() || through <= *acknowledged_through {
-            return true;
-        }
-        let pending = Delivery::new(
-            through,
-            EventCompletion {
-                journal: self.journal.clone(),
-                route: self.route.clone(),
-                through,
-            },
-        );
-        match pending.into_completed().await {
-            Ok(through) => *acknowledged_through = through,
-            Err(failed) => self.set_error(format!(
-                "delivery checkpoint at {} failed: {}",
-                failed.delivery.value(),
-                failed.error
-            )),
-        }
-        true
-    }
-
-    fn refresh_permalink(&self, sink: &dyn crate::sink::Sink) {
-        if let Some(link) = sink.permalink() {
-            *self.permalink.lock() = Some(link);
-        }
-    }
-
-    fn set_error(&self, msg: String) {
-        tracing::warn!(session_id = %self.session_id, "{msg}");
-        *self.last_error.lock() = Some(msg);
-    }
-}
-
 pub(crate) fn is_tool_lifecycle_event(event: &str) -> bool {
     matches!(
         event,
@@ -981,23 +526,6 @@ pub(crate) fn is_tool_lifecycle_event(event: &str) -> bool {
             | "tool.execute.before"
             | "tool.execute.after"
     )
-}
-
-struct EventCompletion {
-    journal: Arc<tokio::sync::Mutex<JournalWriter>>,
-    route: SessionRoute,
-    through: u64,
-}
-
-#[async_trait::async_trait]
-impl Completion for EventCompletion {
-    async fn complete(&mut self) -> anyhow::Result<()> {
-        self.journal
-            .lock()
-            .await
-            .append_delivery_checkpoint(&self.route, self.through)
-            .await
-    }
 }
 
 #[cfg(test)]
@@ -1044,6 +572,8 @@ mod tests {
             tx,
             counters: Arc::new(Counters::default()),
             last_error: Arc::new(Mutex::new(None)),
+            source_error: Arc::new(Mutex::new(None)),
+            source_progress: Arc::new(crate::pipeline::translation::Progress::default()),
             permalink: Arc::new(Mutex::new(None)),
             last_activity: Mutex::new(Instant::now()),
         };

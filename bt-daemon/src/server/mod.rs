@@ -120,6 +120,7 @@ pub struct Daemon {
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
     auth_errors: Mutex<HashMap<DeliveryKey, (String, String)>>,
     sessions: Mutex<HashMap<DeliveryKey, Arc<Session>>>,
+    translations: Mutex<HashMap<String, Arc<crate::pipeline::translation::Translation>>>,
     correlation: Arc<crate::correlation::CorrelationRegistry>,
     automatic_links: Mutex<HashMap<String, SessionRoute>>,
     standalone_links: Mutex<HashSet<String>>,
@@ -159,6 +160,7 @@ impl Daemon {
             managed_run_sessions: Mutex::new(HashMap::new()),
             auth_errors: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            translations: Mutex::new(HashMap::new()),
             correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
             automatic_links: Mutex::new(HashMap::new()),
             standalone_links: Mutex::new(HashSet::new()),
@@ -193,7 +195,7 @@ impl Daemon {
             .sessions
             .lock()
             .values()
-            .map(|s| s.counters.queued.load(Ordering::Relaxed))
+            .map(|s| s.pending())
             .sum();
         dispatched.saturating_add(
             self.pending_sessions

@@ -69,7 +69,7 @@ impl RoutingSink {
         let (tx, mut rx) = mpsc::channel::<Delivery<Request>>(16);
         tokio::spawn(async move {
             let mut prepare = super::prepare::Prepare::new(&source);
-            while let Some(delivery) = InputPort::receive(&mut rx).await {
+            while let Ok(Some(delivery)) = InputPort::receive(&mut rx).await {
                 let request = delivery.value();
                 sink.configure(&request.config);
                 sink.set_capture_versions(

@@ -14,7 +14,6 @@ pub(crate) trait Completion: Send {
 }
 
 pub(crate) struct Unfinished<T> {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub delivery: Delivery<T>,
     pub error: anyhow::Error,
 }
@@ -55,7 +54,7 @@ impl<T> Delivery<T> {
 #[async_trait::async_trait]
 pub(crate) trait InputPort: Send {
     type Item: Send;
-    async fn receive(&mut self) -> Option<Delivery<Self::Item>>;
+    async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>>;
 }
 
 // async_trait adds a redundant must_use annotation to its boxed futures.
@@ -69,8 +68,8 @@ pub(crate) trait OutputPort: Send {
 #[async_trait::async_trait]
 impl<T: Send + 'static> InputPort for mpsc::Receiver<Delivery<T>> {
     type Item = T;
-    async fn receive(&mut self) -> Option<Delivery<T>> {
-        self.recv().await
+    async fn receive(&mut self) -> anyhow::Result<Option<Delivery<T>>> {
+        Ok(self.recv().await)
     }
 }
 

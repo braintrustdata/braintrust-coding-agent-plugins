@@ -12,7 +12,17 @@ pub(super) const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(super) async fn collect_garbage(data_dir: &std::path::Path) {
     journal::gc_old_journals(data_dir, RETENTION).await;
     journal::gc_old_managed_runs(data_dir, RETENTION).await;
-    crate::transcript_mirror::gc_old_mirrors(data_dir, RETENTION).await;
+    // Durable partitions may still need any recorded transcript prefix.
+    let mut partitions = tokio::fs::read_dir(data_dir.join("pipeline")).await.ok();
+    let mut retained = false;
+    if let Some(entries) = partitions.as_mut() {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            retained |= entry.path().extension().and_then(|ext| ext.to_str()) == Some("sqlite");
+        }
+    }
+    if !retained {
+        crate::transcript_mirror::gc_old_mirrors(data_dir, RETENTION).await;
+    }
     gc_old_correlation_states(data_dir, RETENTION).await;
 }
 
@@ -113,9 +123,42 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     if let Err(error) = resolve_pending_sessions(daemon, |_| true).await {
         tracing::warn!(%error, "pending correlation events retained for recovery during shutdown");
     }
-    let sessions: Vec<Arc<Session>> = daemon.sessions.lock().values().cloned().collect();
+    // Publish shared retirement output before stopping any route subscriber.
+    let sources: Vec<_> = daemon
+        .translations
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    for source in sources {
+        let _ = source.control(crate::journal::ControlKind::Retire).await;
+    }
+    let sessions: Vec<Arc<Session>> = daemon.sessions.lock().unwrap().values().cloned().collect();
     for s in sessions {
         s.shutdown().await;
+    }
+    let sources: Vec<_> = daemon
+        .translations
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    for source in sources {
+        source.shutdown().await;
+    }
+    daemon.sessions.lock().unwrap().clear();
+    daemon.translations.lock().unwrap().clear();
+    daemon.journals.lock().unwrap().clear();
+    let (reply, done) = oneshot::channel();
+    if daemon
+        .ingress_tx
+        .send(super::ingress::IngressMsg::Stop(reply))
+        .await
+        .is_ok()
+    {
+        let _ = done.await;
     }
     *drained = true;
 }

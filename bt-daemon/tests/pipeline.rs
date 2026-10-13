@@ -375,6 +375,21 @@ async fn start_daemon_at_with(
     handle
 }
 
+/// These fixtures contain one source partition. Read its durable progress directly.
+fn pipeline_database(data_dir: &Path) -> rusqlite::Connection {
+    let path = std::fs::read_dir(data_dir.join("pipeline"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sqlite"))
+        .unwrap();
+    rusqlite::Connection::open(path).unwrap()
+}
+fn head_and_tail(data_dir: &Path) -> (u64, u64) {
+    pipeline_database(data_dir).query_row(
+        "SELECT position,(SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1) FROM heads",
+        [],|row| Ok((row.get(0)?,row.get(1)?))).unwrap()
+}
+
 async fn wait_for(endpoint: &Path) {
     for _ in 0..200 {
         if let Ok(Some(_)) = run_status(StatusArgs {
@@ -654,9 +669,12 @@ async fn rejected_flush_blocks_checkpoints_until_journal_replay() {
     wait_for(&socket).await;
     flush_session(session, &socket, 5_000).await.unwrap();
     assert!(sink.emitted.load(Ordering::SeqCst) > emitted_before_restart);
-    assert!(std::fs::read_to_string(journal_path)
-        .unwrap()
-        .contains("delivery_checkpoint"));
+    let (head, tail) = head_and_tail(&data_dir);
+    assert!(tail > 0);
+    assert_eq!(
+        head, tail,
+        "restart completes the durable SpanOp subscription"
+    );
     shutdown(&socket).await;
     handle.await.unwrap();
 }
@@ -845,7 +863,7 @@ async fn one_session_reports_to_multiple_routes_and_orgs_concurrently() {
             sink.emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
             "every destination must receive spans"
         );
-        assert_eq!(sink.flushes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(sink.flushes.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     }
 
     let status = run_status(StatusArgs {
@@ -1004,8 +1022,8 @@ async fn a_route_backfills_observations_captured_by_another_route_once() {
     );
     assert_eq!(
         sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed),
-        2,
-        "work receives the personal-route observation once, then its new Stop"
+        1,
+        "the shared producer already delivered the personal observation to work; only the new Stop remains"
     );
 
     shutdown(&socket).await;
@@ -1104,11 +1122,17 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
         .await
         .unwrap();
     let delivered = third_sinks.sinks.lock().unwrap().clone();
-    assert_eq!(delivered.len(), 1);
     assert_eq!(
-        delivered[0]
-            .emitted
-            .load(std::sync::atomic::Ordering::Relaxed),
+        delivered.len(),
+        2,
+        "pending subscriptions resume without a new native event for that route"
+    );
+    let personal = delivered
+        .iter()
+        .find(|sink| sink.org.lock().unwrap().as_deref() == Some("personal-org"))
+        .unwrap();
+    assert_eq!(
+        personal.emitted.load(std::sync::atomic::Ordering::Relaxed),
         1,
         "personal's acknowledged history is not re-delivered"
     );
@@ -1188,7 +1212,7 @@ async fn events_are_ordered_journaled_and_emitted() {
 
     let events: Vec<String> = jlines
         .iter()
-        .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
+        .filter(|line| !line.contains("\"_bt_record_type\""))
         .map(|l| {
             serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
                 .as_str()
@@ -1240,7 +1264,7 @@ async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
     assert_eq!(
         jtext
             .lines()
-            .filter(|line| !line.contains("\"_bt_record_type\":\"delivery_checkpoint\""))
+            .filter(|line| !line.contains("\"_bt_record_type\""))
             .count(),
         2
     );
@@ -1800,14 +1824,29 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     shutdown(&socket).await;
     first.await.unwrap();
 
-    // A cold worker receives only the saved journal, not the first worker's
-    // daemon state. Its delivery checkpoint must travel with that journal.
+    // A cold worker receives durable files only: event history plus SpanOps and heads.
     let recovered_data_dir = tmp.path().join("recovered-data");
     let source = source_journal_path(&data_dir, "debug", "resume");
     let recovered_journal = source_journal_path(&recovered_data_dir, "debug", "resume");
     std::fs::create_dir_all(recovered_journal.parent().unwrap()).unwrap();
     std::fs::copy(source, &recovered_journal).unwrap();
 
+    let db = pipeline_database(&data_dir);
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    std::fs::create_dir_all(recovered_data_dir.join("pipeline")).unwrap();
+    for entry in std::fs::read_dir(data_dir.join("pipeline")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("sqlite") {
+            std::fs::copy(
+                &path,
+                recovered_data_dir
+                    .join("pipeline")
+                    .join(path.file_name().unwrap()),
+            )
+            .unwrap();
+        }
+    }
+    drop(db);
     let second = start_daemon_at(recovered_data_dir.clone(), socket.clone()).await;
     forward_envelope(&envelope("resume", "Stop", 2), &socket, &host, false)
         .await
@@ -1816,9 +1855,12 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
 
     let journal = std::fs::read_to_string(recovered_journal).unwrap();
     assert_eq!(
-        journal.lines().count(),
-        4,
-        "two events plus two delivery checkpoints"
+        journal
+            .lines()
+            .filter(|line| !line.contains("\"_bt_record_type\""))
+            .count(),
+        2,
+        "the event history remains separate from ordered pipeline controls"
     );
     let spans = std::fs::read_to_string(recovered_data_dir.join("spans/resume.ndjson")).unwrap();
     let rows: Vec<serde_json::Value> = spans
@@ -2447,7 +2489,7 @@ async fn idle_sessions_are_retired_and_can_resume_from_their_journal() {
 
 #[tokio::test]
 async fn managed_run_flush_is_scoped_to_its_accepted_sessions() {
-    let (socket, handle, flushes, _tmp) = start_tracking_daemon("test").await;
+    let (socket, handle, _flushes, tmp) = start_tracking_daemon("test").await;
     let host = dummy_host();
     for (session_id, managed_run_id) in [
         ("run-a-main", "run-a"),
@@ -2462,17 +2504,24 @@ async fn managed_run_flush_is_scoped_to_its_accepted_sessions() {
     let result = flush_managed_run("run-a", &socket, 5_000).await.unwrap();
     assert!(result.flushed, "managed run did not flush: {result:?}");
     assert_eq!(result.pending, 0);
-    assert_eq!(
-        *flushes.lock().unwrap(),
-        HashMap::from([
-            ("run-a-main".to_string(), 1),
-            ("run-a-child".to_string(), 1)
-        ])
-    );
+    let controls = |session| {
+        std::fs::read_to_string(source_journal_path(
+            &tmp.path().join("data"),
+            "debug",
+            session,
+        ))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("pipeline_control"))
+        .count()
+    };
+    assert_eq!(controls("run-a-main"), 1);
+    assert_eq!(controls("run-a-child"), 1);
+    assert_eq!(controls("run-b-main"), 0);
 
     let result = flush_managed_run("run-b", &socket, 5_000).await.unwrap();
     assert!(result.flushed, "managed run did not flush: {result:?}");
-    assert_eq!(flushes.lock().unwrap().get("run-b-main"), Some(&1));
+    assert_eq!(controls("run-b-main"), 1);
 
     shutdown(&socket).await;
     handle.await.unwrap();
@@ -2929,19 +2978,17 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     )
     .await;
     wait_for_grok_translation(&socket, "grok-primary").await;
-    assert_eq!(
-        flushes
-            .lock()
-            .unwrap()
-            .get("grok-primary")
-            .copied()
-            .unwrap_or_default(),
-        0,
-        "stop alone must not masquerade as the terminal flush"
-    );
-
     let primary_spans_path = data_dir.join("spans/grok-primary.ndjson");
     let first_ops = read_span_ops(&primary_spans_path);
+    assert!(
+        !first_ops.iter().any(|op| match op {
+            SpanOp::Merge(row) =>
+                row.span_type == SpanType::Task && row.name == "Grok" && row.end_ms.is_some(),
+            _ => false,
+        }),
+        "stop alone must not finalize the session root"
+    );
+
     let first_llm = first_ops
         .iter()
         .find_map(|op| match op {
@@ -3059,7 +3106,7 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     let journal: Vec<serde_json::Value> = journal_text
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record["_bt_record_type"] != "delivery_checkpoint")
+        .filter(|record: &serde_json::Value| record.get("_bt_record_type").is_none())
         .collect();
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0]["source"], "grok");

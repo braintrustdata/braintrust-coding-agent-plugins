@@ -1,9 +1,6 @@
 //! Concrete durable channel: one ordered SpanOp log and a head per route.
 use super::{Completion, Delivery};
-use crate::{
-    translate::{OriginSnapshot, SpanOp},
-    wire::SessionRoute,
-};
+use crate::{translate::SpanOp, wire::SessionRoute};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -65,11 +62,12 @@ impl SpanJournal {
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            anyhow::ensure!(version <= 1, "unsupported SpanOp journal schema {version}");
+            anyhow::ensure!(version <= 2, "unsupported SpanOp journal schema {version}");
             db.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS batches (
-                    input INTEGER PRIMARY KEY, committed INTEGER NOT NULL DEFAULT 0);
+                    input INTEGER PRIMARY KEY, committed INTEGER NOT NULL DEFAULT 0,
+                    observation INTEGER NOT NULL DEFAULT 1);
                 CREATE TABLE IF NOT EXISTS ops (
                     position INTEGER PRIMARY KEY AUTOINCREMENT,
                     input INTEGER NOT NULL, value BLOB NOT NULL);
@@ -77,8 +75,14 @@ impl SpanJournal {
                 CREATE TABLE IF NOT EXISTS heads (
                     route TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
                     failure TEXT);
-                PRAGMA user_version=1;",
+                ",
             )?;
+            if version == 1 {
+                db.execute_batch(
+                    "ALTER TABLE batches ADD COLUMN observation INTEGER NOT NULL DEFAULT 1",
+                )?;
+            }
+            db.execute_batch("PRAGMA user_version=2; COMMIT")?;
             Ok(db)
         })
         .await??;
@@ -115,7 +119,7 @@ impl SpanJournal {
     }
 
     /// Restart abandons only invisible chunks; a committed identity is never rewritten.
-    pub async fn begin(&self, input: u64) -> anyhow::Result<bool> {
+    pub async fn begin(&self, input: u64, observation: bool) -> anyhow::Result<bool> {
         self.with_db(move |db| {
             let tx = db.transaction()?;
             let done: Option<bool> = tx
@@ -130,8 +134,8 @@ impl SpanJournal {
             }
             tx.execute("DELETE FROM ops WHERE input=?", [input])?;
             tx.execute(
-                "INSERT OR REPLACE INTO batches(input,committed) VALUES (?,0)",
-                [input],
+                "INSERT OR REPLACE INTO batches(input,committed,observation) VALUES (?,0,?)",
+                params![input, observation],
             )?;
             tx.commit()?;
             Ok(true)
@@ -174,6 +178,15 @@ impl SpanJournal {
                     |r| r.get(0),
                 )?;
                 anyhow::ensure!(input >= previous, "translation commits must be ordered");
+                let earlier: u64 = tx.query_row(
+                    "SELECT count(*) FROM batches WHERE committed=0 AND input<?",
+                    [input],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    earlier == 0,
+                    "translation cannot publish past an unfinished input"
+                );
                 anyhow::ensure!(
                     tx.execute("UPDATE batches SET committed=1 WHERE input=?", [input])? == 1,
                     "missing translation batch"
@@ -230,6 +243,14 @@ impl SpanJournal {
         })
     }
 
+    pub async fn read_after(&self, after: u64, limit: usize) -> anyhow::Result<Vec<(u64, SpanOp)>> {
+        self.with_db(move |db| {
+            let mut statement = db.prepare("SELECT position,value FROM ops JOIN batches USING(input) WHERE committed=1 AND observation=1 AND position>? ORDER BY position LIMIT ?")?;
+            let rows = statement.query_map(params![after,limit as u64], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,Vec<u8>>(1)?)))?;
+            rows.map(|row| { let (position,bytes)=row?; Ok((position,StoredOp::decode(&bytes)?)) }).collect()
+        }).await
+    }
+
     pub async fn tail(&self) -> anyhow::Result<u64> {
         self.with_db(|db| {
             Ok(db.query_row(
@@ -240,6 +261,19 @@ impl SpanJournal {
             )?)
         })
         .await
+    }
+
+    /// A completed subscription can remain dormant until its source has new work.
+    pub async fn route_complete(&self, route: &SessionRoute, input: u64) -> anyhow::Result<bool> {
+        let route = serde_json::to_string(route)?;
+        self.with_db(move |db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM heads WHERE route=? AND failure IS NULL
+                AND position >= (SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1))
+                AND (SELECT coalesce(max(input),0) FROM batches WHERE committed=1)>=?",
+                params![route,input], |row| row.get(0),
+            )?)
+        }).await
     }
 
     pub async fn failure(&self, route: &str) -> anyhow::Result<Option<String>> {
@@ -314,6 +348,25 @@ impl Cursor {
         )))
     }
 
+    pub fn position(&self) -> u64 {
+        self.read
+    }
+    pub fn completed_position(&self) -> u64 {
+        self.completed
+    }
+    /// Terminal handling can aggregate its fully handled contiguous read prefix.
+    pub fn pending_prefix(&self) -> Delivery<()> {
+        Delivery::new(
+            (),
+            HeadCompletion {
+                journal: self.journal.clone(),
+                route: self.route.clone(),
+                expected: self.completed,
+                through: self.read,
+            },
+        )
+    }
+
     pub async fn rewind(&mut self) -> anyhow::Result<()> {
         let key = self.route.clone();
         self.completed = self
@@ -332,6 +385,19 @@ impl Cursor {
 
     pub async fn changed(&mut self) {
         let _ = self.changes.changed().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl super::delivery::InputPort for Cursor {
+    type Item = Vec<SpanOp>;
+    async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
+        loop {
+            if let Some(delivery) = self.next_batch(128).await? {
+                return Ok(Some(delivery));
+            }
+            self.changed().await;
+        }
     }
 }
 
@@ -370,7 +436,7 @@ impl Completion for HeadCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::SpanRow;
+    use crate::translate::{OriginSnapshot, SpanRow};
 
     fn op(name: &str) -> SpanOp {
         SpanOp::Insert(SpanRow {
@@ -395,11 +461,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparatory_schema_upgrades_without_changing_committed_positions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0); INSERT INTO batches VALUES(10,1); PRAGMA user_version=1;").unwrap();
+        drop(db);
+        let journal = SpanJournal::open(&path).await.unwrap();
+        assert_eq!(journal.translated_through().await.unwrap(), 10);
+        journal.begin(20, false).await.unwrap();
+        journal.append(20, &[op("retirement")]).await.unwrap();
+        journal.commit(20).await.unwrap();
+        assert!(
+            journal.read_after(0, 8).await.unwrap().is_empty(),
+            "retirement output is not a native correlation observation"
+        );
+        let mut route = journal.subscribe(&route("a"), 0).await.unwrap();
+        assert_eq!(
+            route.next_batch(8).await.unwrap().unwrap().value().len(),
+            1,
+            "all published output still reaches durable delivery subscribers"
+        );
+    }
+
+    #[tokio::test]
     async fn invisible_chunks_empty_commit_and_restart_preserve_the_boundary() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
         let journal = SpanJournal::open(&path).await.unwrap();
-        journal.begin(10).await.unwrap();
+        journal.begin(10, true).await.unwrap();
         journal.append(10, &[op("abandoned")]).await.unwrap();
         let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
         assert!(reader.next_batch(8).await.unwrap().is_none());
@@ -407,11 +497,11 @@ mod tests {
         drop(journal);
         let journal = SpanJournal::open(&path).await.unwrap();
         assert_eq!(journal.translated_through().await.unwrap(), 0);
-        journal.begin(10).await.unwrap();
+        journal.begin(10, true).await.unwrap();
         journal.append(10, &[op("retained")]).await.unwrap();
         journal.commit(10).await.unwrap();
-        assert!(!journal.begin(10).await.unwrap());
-        journal.begin(20).await.unwrap();
+        assert!(!journal.begin(10, true).await.unwrap());
+        journal.begin(20, true).await.unwrap();
         journal.commit(20).await.unwrap();
         assert_eq!(journal.translated_through().await.unwrap(), 20);
         let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
@@ -431,7 +521,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
         let journal = SpanJournal::open(&path).await.unwrap();
-        journal.begin(10).await.unwrap();
+        journal.begin(10, true).await.unwrap();
         journal.append(10, &[op("one"), op("two")]).await.unwrap();
         journal.commit(10).await.unwrap();
         let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
@@ -467,7 +557,7 @@ mod tests {
             .await
             .unwrap();
         let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
-        journal.begin(10).await.unwrap();
+        journal.begin(10, true).await.unwrap();
         journal.append(10, &[op("one")]).await.unwrap();
         journal.commit(10).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), reader.changed())
