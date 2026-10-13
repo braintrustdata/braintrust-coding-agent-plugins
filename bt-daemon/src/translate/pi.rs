@@ -27,6 +27,8 @@ impl TranslatorFactory for crate::agents::Pi {
             opened: false,
             legacy_root_adopted: false,
             turn: None,
+            turn_output: None,
+            last_turn_output: None,
             turn_seq: 0,
             llm_seq: 0,
             total_tools: 0,
@@ -330,6 +332,8 @@ struct PiTranslator {
     legacy_root_adopted: bool,
     /// The open turn's span id and the skills its prompt explicitly requested.
     turn: Option<(String, Vec<String>)>,
+    turn_output: Option<Value>,
+    last_turn_output: Option<Value>,
     turn_seq: u32,
     llm_seq: u32,
     total_tools: u32,
@@ -699,10 +703,11 @@ impl PiTranslator {
         let completion = usage.output;
         let total = usage.total_tokens.unwrap_or(prompt + completion);
         let output = normalize_assistant(&message);
-        let error = message
-            .error_message
-            .clone()
-            .filter(|_| matches!(message.stop_reason.as_deref(), Some("error" | "aborted")));
+        let failed = matches!(message.stop_reason.as_deref(), Some("error" | "aborted"));
+        let error = failed.then(|| message.error_message.clone()).flatten();
+        if !failed {
+            self.turn_output = Some(output.clone());
+        }
         let ttft = pending
             .first_token_ms
             .map(|first| (first - pending.start_ms) as f64 / 1000.0);
@@ -915,11 +920,16 @@ impl PiTranslator {
         let Some((id, _)) = turn else {
             return vec![];
         };
+        let output = self.turn_output.take();
+        if output.is_some() {
+            self.last_turn_output = output.clone();
+        }
         vec![SpanOp::Merge(SpanRow {
             span_id: id,
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![self.root_span_id.clone()],
             end_ms: Some(ts),
+            output,
             error,
             ..Default::default()
         })]
@@ -934,6 +944,7 @@ impl PiTranslator {
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: self.external_parent.clone().into_iter().collect(),
             end_ms: Some(ts),
+            output: self.last_turn_output.take(),
             metadata: Some(
                 json!({"total_turns":self.turn_seq,"total_tool_calls":self.total_tools}),
             ),

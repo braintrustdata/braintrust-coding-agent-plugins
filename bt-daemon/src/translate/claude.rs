@@ -292,6 +292,7 @@ struct ClaudeTranslator {
     git: Arc<GitMetadataCache>,
     current_cwd: Option<String>,
     last_turn_cwd: Option<String>,
+    last_turn_output: Option<Value>,
     last_ts_ms: i64,
 }
 
@@ -338,6 +339,7 @@ impl ClaudeTranslator {
             git,
             current_cwd: None,
             last_turn_cwd: None,
+            last_turn_output: None,
             last_ts_ms: 0,
         }
     }
@@ -1143,17 +1145,21 @@ impl ClaudeTranslator {
         );
         let turn = self.turn.take().expect("active turn");
         let end_ms = self.execution_end(&turn, event.ts_ms, ops);
+        let output = event
+            .payload
+            .get("last_assistant_message")
+            .cloned()
+            .or_else(|| event.payload.get("output").cloned());
+        if output.as_ref().is_some_and(|output| !output.is_null()) {
+            self.last_turn_output = output.clone();
+        }
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn_id.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: vec![turn.parent_id],
             end_ms: Some(end_ms),
             late_merge_key: Some(format!("execution:stop:{}", event.ts_ms)),
-            output: event
-                .payload
-                .get("last_assistant_message")
-                .cloned()
-                .or_else(|| event.payload.get("output").cloned()),
+            output,
             error,
             ..Default::default()
         }));
@@ -1206,6 +1212,7 @@ impl ClaudeTranslator {
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: self.session_parent_span_ids.clone(),
             end_ms: Some(end_ms),
+            output: self.last_turn_output.clone(),
             late_merge_key: Some(format!("session:stop:{end_ms}")),
             ..Default::default()
         }));
