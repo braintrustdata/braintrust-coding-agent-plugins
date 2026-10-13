@@ -7,6 +7,10 @@
 //! Every failure holds only the machine it belongs to, in a persisted
 //! `Recovering` state, until its scenario-specific recovery condition holds.
 
+// Failures are cold-path values carried to the machine that records them;
+// boxing each one would only add noise to every stage signature.
+#![allow(clippy::result_large_err)]
+
 pub(crate) mod backfill;
 pub(crate) mod codec;
 pub(crate) mod events;

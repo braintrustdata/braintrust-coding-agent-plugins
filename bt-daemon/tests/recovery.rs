@@ -13,7 +13,6 @@ use bt_daemon::{
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,7 +43,7 @@ impl AuthProvider for Auth {
 #[derive(Default)]
 struct Scripted {
     /// Flushes to fail before succeeding, per project.
-    failures: Mutex<std::collections::HashMap<String, Arc<AtomicU32>>>,
+    failures: Mutex<std::collections::HashMap<String, Arc<Mutex<u32>>>>,
     /// Projects whose flush always fails.
     blocked: Mutex<HashSet<String>>,
     accepted: Mutex<std::collections::HashMap<String, Vec<SpanOp>>>,
@@ -55,7 +54,7 @@ impl Scripted {
         self.failures
             .lock()
             .unwrap()
-            .insert(project.into(), Arc::new(AtomicU32::new(count)));
+            .insert(project.into(), Arc::new(Mutex::new(count)));
     }
 
     fn span_ids(&self, project: &str) -> BTreeSet<String> {
@@ -109,10 +108,9 @@ impl Sink for ScriptedSink {
             anyhow::bail!("backend unreachable");
         }
         if let Some(remaining) = self.script.failures.lock().unwrap().get(&self.project) {
-            if remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
+            let mut remaining = remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
                 self.pending.clear();
                 anyhow::bail!("connection reset");
             }

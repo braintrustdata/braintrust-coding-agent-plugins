@@ -84,7 +84,7 @@ const READ_POOL: usize = 4;
 
 pub(crate) struct Store {
     path: PathBuf,
-    writer: Mutex<Connection>,
+    writer: Mutex<Option<Connection>>,
     readers: Mutex<Vec<Connection>>,
 }
 
@@ -105,7 +105,7 @@ impl Store {
         writer.execute_batch(SCHEMA)?;
         Ok(Arc::new(Self {
             path: path.to_path_buf(),
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Some(writer)),
             readers: Mutex::new(Vec::new()),
         }))
     }
@@ -127,11 +127,24 @@ impl Store {
     where
         F: FnOnce(&Transaction<'_>) -> anyhow::Result<R>,
     {
-        let mut conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("the pipeline database is closed"))?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let result = f(&tx)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Release every connection, and with them the database files. Later
+    /// writes fail; reads reopen. Called once the pipeline has stopped.
+    pub(crate) fn close(&self) {
+        self.readers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     pub(crate) async fn read<R, F>(self: &Arc<Self>, f: F) -> anyhow::Result<R>

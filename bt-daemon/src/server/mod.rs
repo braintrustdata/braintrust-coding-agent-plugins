@@ -262,6 +262,7 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
 
     // Graceful drain regardless of why we stopped.
     drain_all(&daemon).await;
+    daemon.pipeline.store.close();
     transport::cleanup(&socket);
     accept_result
 }

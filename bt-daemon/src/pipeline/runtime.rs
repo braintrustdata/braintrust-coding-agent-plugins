@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
 /// Resolves live credentials for a branch. Credentials never leave memory.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(crate) trait RouteAuth: Send + Sync {
     async fn resolve(
