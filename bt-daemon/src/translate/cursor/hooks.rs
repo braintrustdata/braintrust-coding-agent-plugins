@@ -298,10 +298,16 @@ pub(super) struct SubagentStartHook {
 
 #[derive(Deserialize)]
 pub(super) struct SubagentStopHook {
-    pub subagent_id: String,
-    pub subagent_type: String,
-    pub status: String,
+    /// Cursor's documented stop payload omits this identifier. Some versions
+    /// may include it, so use it when present and correlate without it only
+    /// when there is exactly one open child.
+    pub subagent_id: Option<String>,
+    pub subagent_type: Option<String>,
+    pub task: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<String>,
     pub summary: Option<String>,
+    pub duration_ms: Option<u64>,
 }
 
 /// Hooks that carry a richer result for a tool already reported by the
