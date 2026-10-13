@@ -599,12 +599,59 @@ pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
             }
             None => false,
         };
-        if old && !protected {
+        if old && !protected && legacy_collectible(data_dir, &path).await {
             if let Err(e) = tokio::fs::remove_file(&path).await {
                 tracing::warn!(path = %path.display(), "failed to remove stale journal: {e}");
             }
         }
     }
+}
+
+// Pre-SpanOp journals can be collected only with explicit completion evidence.
+// Unknown or uncheckpointed history stays available for migration/reconstruction.
+async fn legacy_collectible(data_dir: &Path, path: &Path) -> bool {
+    let Ok(Some(mut reader)) =
+        JournalReader::open(path, JournalReader::recorded_len(path).await).await
+    else {
+        return false;
+    };
+    let mut observed = std::collections::HashMap::<String, u64>::new();
+    let mut completed = std::collections::HashMap::<String, u64>::new();
+    loop {
+        match reader.next_record().await {
+            Ok(Some(entry)) => match entry.record {
+                JournalRecord::Event(event) => {
+                    let partition = data_dir.join("pipeline").join(format!(
+                        "{}.sqlite",
+                        crate::ids::session_storage_id(&event.source, &event.session_id)
+                    ));
+                    if tokio::fs::try_exists(partition).await.unwrap_or(true) {
+                        return false;
+                    }
+                    let Some(route) = event.route else {
+                        return false;
+                    };
+                    observed.insert(
+                        serde_json::to_string(&route).unwrap_or_default(),
+                        entry.through,
+                    );
+                }
+                JournalRecord::DeliveryCheckpoint { route, through } => {
+                    completed
+                        .entry(serde_json::to_string(&route).unwrap_or_default())
+                        .and_modify(|previous| *previous = (*previous).max(through))
+                        .or_insert(through);
+                }
+                JournalRecord::Control(_) => return false,
+            },
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+    !observed.is_empty()
+        && observed
+            .iter()
+            .all(|(route, through)| completed.get(route).copied().unwrap_or(0) >= *through)
 }
 
 /// Reconstruct a translator-usable [`Envelope`] from a redacted journal entry.

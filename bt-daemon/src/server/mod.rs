@@ -108,7 +108,7 @@ pub struct Daemon {
     translators: Arc<Registry>,
     sink_factory: Arc<dyn SinkFactory>,
     auth_provider: Option<Arc<dyn AuthProvider>>,
-    session_auth: tokio::sync::Mutex<HashMap<DeliveryKey, SessionAuthState>>,
+    session_auth: Arc<tokio::sync::Mutex<HashMap<DeliveryKey, SessionAuthState>>>,
     route_aliases: Mutex<HashMap<DeliveryKey, DeliveryKey>>,
     /// Serializes only capture-side journal appends for a source session.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -151,7 +151,7 @@ impl Daemon {
             translators: opts.translators,
             sink_factory: opts.sink_factory,
             auth_provider: opts.auth_provider,
-            session_auth: tokio::sync::Mutex::new(HashMap::new()),
+            session_auth: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             route_aliases: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
             dispatch_locks: Mutex::new(HashMap::new()),
@@ -241,9 +241,9 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
     tracing::info!(socket = %socket.display(), "bt-daemon listening");
 
     let daemon = Daemon::new(opts, data_dir);
-    collect_garbage(&daemon.data_dir).await;
     restore_active_parent_snapshots(&daemon.data_dir, &daemon.correlation).await;
     restore_pending_sessions(&daemon).await;
+    collect_garbage(&daemon).await;
     recover_unprocessed_journals(&daemon).await;
     spawn_pending_reconciler(daemon.clone());
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);

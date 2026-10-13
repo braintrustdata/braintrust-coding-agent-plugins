@@ -263,8 +263,7 @@ impl std::error::Error for CommitFailure {
 }
 
 /// Wrap a sink with destination-scoped terminal-span suppression. If durable
-/// ledger state cannot be loaded, callers retain normal delivery rather than
-/// risking lost trace data.
+/// ledger state cannot be loaded, retain input until its recovery condition is met.
 pub(crate) struct LedgerSink {
     inner: Box<dyn Sink>,
     ledger: Option<DeliveryLedger>,
@@ -284,15 +283,10 @@ impl LedgerSink {
         session_id: &str,
         config: Option<&SessionConfig>,
         bt_version: &str,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let loaded = match (data_dir, config) {
             (Some(data_dir), Some(config)) if config.destination.is_some() => {
-                DeliveryLedger::load(data_dir, source, session_id, config)
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(source, session_id, "delivery ledger unavailable: {error}")
-                    })
-                    .ok()
+                Some(DeliveryLedger::load(data_dir, source, session_id, config).await?)
             }
             _ => None,
         };
@@ -300,7 +294,7 @@ impl LedgerSink {
             Some((ledger, origins)) => (Some(ledger), origins),
             None => (None, HashMap::new()),
         };
-        Self {
+        Ok(Self {
             inner,
             ledger,
             span_origins,
@@ -309,7 +303,7 @@ impl LedgerSink {
             source_version: None,
             bt_version: bt_version.to_owned(),
             attached_parent: config.and_then(|config| config.attached_span_ids().0),
-        }
+        })
     }
 }
 
@@ -604,7 +598,8 @@ mod tests {
             Some(&config),
             "bt1",
         )
-        .await;
+        .await
+        .unwrap();
         first.set_capture_versions(None, Some("native1"));
         let turn = SpanRow {
             span_id: "turn-1".into(),
@@ -652,7 +647,8 @@ mod tests {
             Some(&config),
             "bt2",
         )
-        .await;
+        .await
+        .unwrap();
         recovered.set_capture_versions(Some("v2"), Some("native2"));
         recovered
             .emit(&[
@@ -936,7 +932,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         first.emit(&[terminal("span-1")]).await.unwrap();
         first.flush().await.unwrap();
         assert_eq!(first_output.lock().len(), 1);
@@ -955,7 +952,8 @@ mod tests {
             Some(&same_destination),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(repeated.emit(&[terminal("span-1")]).await.unwrap(), 0);
         assert_eq!(repeated.emit(&[partial_merge("span-1")]).await.unwrap(), 0);
         repeated.flush().await.unwrap();
@@ -974,7 +972,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(first.emit(&[terminal("span-1")]).await.unwrap(), 1);
         first.flush().await.unwrap();
 
@@ -987,7 +986,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             second
                 .emit(&[late_merge("span-1", "output")])
@@ -1017,7 +1017,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             third.emit(&[late_merge("span-1", "output")]).await.unwrap(),
             0
@@ -1040,7 +1041,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             first
                 .emit(&[late_terminal_merge("root", "session:stop:3", 3)])
@@ -1059,7 +1061,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             resumed
                 .emit(&[late_terminal_merge("root", "session:stop:3", 3)])
@@ -1092,7 +1095,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         initial.emit(&[terminal("span-1")]).await.unwrap();
         initial.flush().await.unwrap();
 
@@ -1108,7 +1112,8 @@ mod tests {
             Some(&config("project-b")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(replay.emit(&[terminal("span-1")]).await.unwrap(), 1);
         replay.flush().await.unwrap();
         assert_eq!(replay_output.lock().len(), 1);
@@ -1125,7 +1130,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         let mut authoritative = terminal("span-1");
         let SpanOp::Insert(row) = &mut authoritative else {
             unreachable!();
@@ -1143,7 +1149,8 @@ mod tests {
             Some(&config("project-a")),
             "test",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(repeated.emit(&[terminal("span-1")]).await.unwrap(), 0);
         assert_eq!(
             repeated

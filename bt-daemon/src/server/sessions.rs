@@ -128,14 +128,13 @@ impl Daemon {
             SessionOptions {
                 translation,
                 cursor,
-                auth_provider: self.auth_provider.clone(),
+                auth_provider: self.route_auth_provider(key),
                 session_id: env.session_id.clone(),
                 source: env.source.clone(),
                 bt_version: self.version.clone(),
                 config,
                 data_dir: self.data_dir.clone(),
             },
-            self.translators.clone(),
             self.sink_factory.clone(),
         );
         map.insert(key.clone(), session.clone());
