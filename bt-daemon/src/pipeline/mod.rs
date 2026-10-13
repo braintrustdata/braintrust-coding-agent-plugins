@@ -5,6 +5,8 @@ pub(crate) mod plugins;
 
 pub(crate) use delivery::{Completion, Delivery};
 
+// async_trait adds a redundant must_use annotation to its boxed futures.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(crate) trait Stage: Send {
     type Input: Sync;

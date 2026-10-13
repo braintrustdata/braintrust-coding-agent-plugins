@@ -9,6 +9,8 @@ pub(crate) struct Delivery<T> {
     completion: Box<dyn Completion>,
 }
 
+// async_trait adds a redundant must_use annotation to its boxed futures.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(crate) trait Completion: Send {
     async fn complete(&mut self) -> anyhow::Result<()>;
@@ -49,12 +51,16 @@ impl<T> Delivery<T> {
     }
 }
 
+// async_trait adds a redundant must_use annotation to its boxed futures.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(crate) trait InputPort: Send {
     type Item: Send;
     async fn receive(&mut self) -> Option<Delivery<Self::Item>>;
 }
 
+// async_trait adds a redundant must_use annotation to its boxed futures.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(crate) trait OutputPort: Send {
     type Item: Send;
