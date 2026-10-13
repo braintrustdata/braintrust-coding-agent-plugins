@@ -1398,7 +1398,8 @@ fn codex_user_image_parts_are_preserved_in_turn_and_llm_inputs() {
         json!({ "timestamp": "2026-01-01T00:00:03.500Z", "type": "event_msg", "payload": { "type": "user_message", "message": "Describe this" } }),
         json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item", "payload": { "type": "message", "role": "user", "content": [
             { "type": "input_text", "text": "Describe this" },
-            { "type": "input_image", "image_url": inline_image }
+            { "type": "input_image", "image_url": inline_image, "detail": "high" },
+            { "type": "image_url", "image_url": { "url": inline_image, "detail": "low" } }
         ] } }),
         json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "A test image." }] } }),
         json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 10, "output_tokens": 2 } } } }),
@@ -1433,7 +1434,8 @@ fn codex_user_image_parts_are_preserved_in_turn_and_llm_inputs() {
         first_turn.input,
         Some(json!([
             { "type": "text", "text": "Describe this" },
-            { "type": "image_url", "image_url": { "url": inline_image } }
+            { "type": "image_url", "image_url": { "url": inline_image, "detail": "high" } },
+            { "type": "image_url", "image_url": { "url": inline_image, "detail": "low" } }
         ]))
     );
     let first_llm = rows

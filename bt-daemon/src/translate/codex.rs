@@ -1678,7 +1678,7 @@ fn message_content(payload: &Value) -> (String, Option<Value>) {
                         "type": "image_url",
                         "image_url": { "url": url },
                     });
-                    if let Some(detail) = part.get("detail") {
+                    if let Some(detail) = part.get("detail").or_else(|| image_url.get("detail")) {
                         normalized["image_url"]["detail"] = detail.clone();
                     }
                     Some(normalized)
