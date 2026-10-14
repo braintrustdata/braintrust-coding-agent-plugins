@@ -88,7 +88,7 @@ pub(super) fn spawn_idle_watchdog(daemon: Arc<Daemon>, idle_timeout: Duration) {
                 _ = daemon.shutdown.notified() => return,
                 _ = tokio::time::sleep(tick) => {}
             }
-            let idle_for = daemon.last_activity.lock().unwrap().elapsed();
+            let idle_for = daemon.last_activity.lock().elapsed();
             if idle_for >= idle_timeout
                 && daemon.total_queued() == 0
                 && !daemon.correlation.has_any_active_tools()
@@ -113,7 +113,7 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     if let Err(error) = resolve_pending_sessions(daemon, |_| true).await {
         tracing::warn!(%error, "pending correlation events retained for recovery during shutdown");
     }
-    let sessions: Vec<Arc<Session>> = daemon.sessions.lock().unwrap().values().cloned().collect();
+    let sessions: Vec<Arc<Session>> = daemon.sessions.lock().values().cloned().collect();
     for s in sessions {
         s.shutdown().await;
     }

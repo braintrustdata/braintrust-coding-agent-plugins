@@ -131,12 +131,12 @@ pub(super) async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> R
     let key = automatic_link_key(&event.env);
     let lock = daemon.correlation_lock(&key);
     let _guard = lock.lock().await;
-    let mut state = daemon.pending_sessions.lock().unwrap().get(&key).cloned();
+    let mut state = daemon.pending_sessions.lock().get(&key).cloned();
     if state.is_none() {
-        if daemon.standalone_links.lock().unwrap().contains(&key) {
+        if daemon.standalone_links.lock().contains(&key) {
             return accept_resolved_event(daemon, event).await;
         }
-        let route = daemon.automatic_links.lock().unwrap().get(&key).cloned();
+        let route = daemon.automatic_links.lock().get(&key).cloned();
         if let Some(route) = route {
             let mut event = event;
             event.env.route = Some(route);
@@ -305,24 +305,18 @@ pub(super) async fn store_correlation(
         daemon
             .pending_sessions
             .lock()
-            .unwrap()
             .insert(key.to_string(), state.clone());
     }
     write_correlation_state(&daemon.data_dir, key, state).await?;
     if state.events.is_empty() {
-        daemon.pending_sessions.lock().unwrap().remove(key);
+        daemon.pending_sessions.lock().remove(key);
         if let Some(route) = &state.linked_route {
             daemon
                 .automatic_links
                 .lock()
-                .unwrap()
                 .insert(key.to_string(), route.clone());
         } else if state.standalone {
-            daemon
-                .standalone_links
-                .lock()
-                .unwrap()
-                .insert(key.to_string());
+            daemon.standalone_links.lock().insert(key.to_string());
         }
     }
     Ok(())
@@ -356,7 +350,6 @@ pub(super) async fn finish_correlation(
         daemon
             .pending_sessions
             .lock()
-            .unwrap()
             .insert(key.to_string(), state);
     }
     result
@@ -371,18 +364,12 @@ pub(super) async fn resolve_pending_sessions(
     force: impl Fn(&Envelope) -> bool + Send + Sync,
 ) -> Result<(), String> {
     let _reconcile_guard = daemon.pending_reconcile_lock.lock().await;
-    let keys: Vec<_> = daemon
-        .pending_sessions
-        .lock()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
+    let keys: Vec<_> = daemon.pending_sessions.lock().keys().cloned().collect();
     let mut failure = None;
     for key in keys {
         let lock = daemon.correlation_lock(&key);
         let _guard = lock.lock().await;
-        let Some(mut state) = daemon.pending_sessions.lock().unwrap().get(&key).cloned() else {
+        let Some(mut state) = daemon.pending_sessions.lock().get(&key).cloned() else {
             continue;
         };
         let forced = state.events.first().is_some_and(|event| force(&event.env));
@@ -552,7 +539,7 @@ pub(super) async fn restore_pending_sessions(daemon: &Arc<Daemon>) {
         else {
             continue;
         };
-        daemon.pending_sessions.lock().unwrap().insert(key, state);
+        daemon.pending_sessions.lock().insert(key, state);
         restored += 1;
     }
     if restored > 0 {
@@ -577,13 +564,12 @@ pub(super) async fn recovered_delivery_route(
     env: &Envelope,
 ) -> Option<SessionRoute> {
     let key = automatic_link_key(env);
-    if let Some(route) = daemon.automatic_links.lock().unwrap().get(&key).cloned() {
+    if let Some(route) = daemon.automatic_links.lock().get(&key).cloned() {
         return Some(route);
     }
     if let Some(route) = daemon
         .pending_sessions
         .lock()
-        .unwrap()
         .get(&key)
         .and_then(|state| state.linked_route.clone())
     {
@@ -597,7 +583,7 @@ pub(super) async fn recovered_delivery_route(
 
 impl Daemon {
     pub(super) fn correlation_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.correlation_locks.lock().unwrap();
+        let mut locks = self.correlation_locks.lock();
         locks
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -605,7 +591,6 @@ impl Daemon {
     }
 
     pub(super) fn correlation_decided(&self, key: &str) -> bool {
-        self.standalone_links.lock().unwrap().contains(key)
-            || self.automatic_links.lock().unwrap().contains_key(key)
+        self.standalone_links.lock().contains(key) || self.automatic_links.lock().contains_key(key)
     }
 }

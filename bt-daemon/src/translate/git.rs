@@ -1,8 +1,9 @@
 use super::{SpanOp, SpanRow};
+use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 const CACHE_CAPACITY: usize = 256;
@@ -102,7 +103,7 @@ impl GitMetadataCache {
             return Map::new();
         }
         let cwd = canonical_or_original(Path::new(cwd));
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
 
         if let Some(negative) = state.negative.get(&cwd) {
             if negative.observed_at.elapsed() < NEGATIVE_TTL {

@@ -224,7 +224,9 @@ pub fn process(
         if slot.is_none() {
             *slot = Some(Engine::new()?);
         }
-        let engine = slot.as_mut().expect("engine initialized");
+        let engine = slot
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("span processor engine was not initialized"))?;
         for plugin in plugins {
             if let Some(failed) = engine.failed_plugins.get(plugin).cloned() {
                 if failed.fingerprint == plugin_fingerprint(plugin) {
@@ -314,7 +316,9 @@ pub fn validate(plugins: &[PathBuf]) -> anyhow::Result<()> {
         if slot.is_none() {
             *slot = Some(Engine::new()?);
         }
-        let engine = slot.as_mut().expect("engine initialized");
+        let engine = slot
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("span processor engine was not initialized"))?;
         for plugin in plugins {
             engine.load(plugin)?;
         }

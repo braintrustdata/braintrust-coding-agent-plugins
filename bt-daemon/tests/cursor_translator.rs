@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Integration test assertions and fixtures fail immediately on unexpected values."
+)]
+
 //! Independent reducer checks. Real fixtures retain native receipt times and IDs;
 //! explicitly synthetic cases exercise documented schemas and recovery edges.
 #[path = "support/span_identity.rs"]

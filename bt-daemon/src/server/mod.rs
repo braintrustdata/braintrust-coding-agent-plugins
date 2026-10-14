@@ -36,6 +36,10 @@ use crate::wire::{
 use crate::wire::{AuthSelection, BackendAuth, SessionRoute};
 use crate::{paths, ServeArgs};
 use async_trait::async_trait;
+// Bookkeeping locks use the same non-poisoning policy as our Tokio locks.
+// Critical sections mutate internal state and never invoke translators or sinks;
+// recoverable failures are handled outside the guard through Result.
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -43,7 +47,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -179,7 +182,7 @@ impl Daemon {
     }
 
     fn touch(&self) {
-        *self.last_activity.lock().unwrap() = Instant::now();
+        *self.last_activity.lock() = Instant::now();
     }
 
     /// Queued work, excluding pending sessions whose handoff failed. Those are
@@ -189,14 +192,12 @@ impl Daemon {
         let dispatched: u64 = self
             .sessions
             .lock()
-            .unwrap()
             .values()
             .map(|s| s.counters.queued.load(Ordering::Relaxed))
             .sum();
         dispatched.saturating_add(
             self.pending_sessions
                 .lock()
-                .unwrap()
                 .values()
                 .filter(|state| !state.delivery_failed)
                 .map(|state| state.events.len() as u64)

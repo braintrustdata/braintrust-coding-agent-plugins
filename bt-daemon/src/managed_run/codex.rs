@@ -20,10 +20,12 @@ pub(super) const CODEX_RUN_HOOK_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
-fn codex_managed_run_args(unix_command: &str, windows_command: &str) -> Vec<OsString> {
-    let unix_command = serde_json::to_string(unix_command).expect("serialize hook command");
-    let windows_command =
-        serde_json::to_string(windows_command).expect("serialize Windows hook command");
+fn codex_managed_run_args(
+    unix_command: &str,
+    windows_command: &str,
+) -> anyhow::Result<Vec<OsString>> {
+    let unix_command = serde_json::to_string(unix_command)?;
+    let windows_command = serde_json::to_string(windows_command)?;
     let mut args = vec![OsString::from("--enable"), OsString::from("hooks")];
     for event in CODEX_RUN_HOOK_EVENTS {
         args.push(OsString::from("-c"));
@@ -31,7 +33,7 @@ fn codex_managed_run_args(unix_command: &str, windows_command: &str) -> Vec<OsSt
             "hooks.{event}=[{{hooks=[{{type=\"command\",command={unix_command},commandWindows={windows_command}}}]}}]"
         )));
     }
-    args
+    Ok(args)
 }
 
 impl ManagedRun for Codex {
@@ -60,7 +62,7 @@ impl ManagedRun for Codex {
         let unix_command = managed_hook_shell_command(hook_command, "codex", false)?;
         let windows_command = managed_hook_shell_command(hook_command, "codex", true)?;
         Ok(Injection {
-            args: codex_managed_run_args(&unix_command, &windows_command),
+            args: codex_managed_run_args(&unix_command, &windows_command)?,
             ..Injection::default()
         })
     }

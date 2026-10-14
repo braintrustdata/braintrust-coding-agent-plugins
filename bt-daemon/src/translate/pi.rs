@@ -610,7 +610,9 @@ impl PiTranslator {
             "thinking_level": self.thinking_level,
         }));
         if let Some(Value::Object(fields)) = explicit_skill_metadata(&skills) {
-            metadata.as_object_mut().unwrap().extend(fields);
+            if let Some(metadata) = metadata.as_object_mut() {
+                metadata.extend(fields);
+            }
         }
         self.turn = Some((id.clone(), skills));
         ops.push(SpanOp::Insert(SpanRow {

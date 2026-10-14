@@ -88,7 +88,9 @@ impl TailSession for Tail {
                 self.active_turn = Some(active);
             }
             if len != self.last_len {
-                let mut checkpoint = events.last().cloned().unwrap();
+                let mut checkpoint = events.last().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("transcript import is missing its terminal envelope")
+                })?;
                 checkpoint.event = "ImportCheckpoint".into();
                 if let Some(payload) = checkpoint.payload.as_object_mut() {
                     payload.insert("hook_event_name".into(), json!("ImportCheckpoint"));
@@ -97,7 +99,9 @@ impl TailSession for Tail {
             }
         }
         if finalize {
-            out.push(events.last().cloned().unwrap());
+            out.push(events.last().cloned().ok_or_else(|| {
+                anyhow::anyhow!("transcript import is missing its terminal envelope")
+            })?);
         }
         self.last_len = len;
         Ok(out)

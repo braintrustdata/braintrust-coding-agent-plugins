@@ -449,7 +449,9 @@ impl GrokTranslator {
                     .is_some_and(|turn| turn.key == turn_key)
                 {
                     if let Some(content) = update.get("content") {
-                        let turn = self.current_turn.as_mut().expect("turn checked above");
+                        let Some(turn) = self.current_turn.as_mut() else {
+                            return;
+                        };
                         turn.user_input.push(content_value(content));
                         turn.user_input_dirty = true;
                     }
@@ -534,7 +536,9 @@ impl GrokTranslator {
                         Some("llm:new_stream".into()),
                         ops,
                     );
-                    let turn = self.current_turn.as_ref().expect("turn checked above");
+                    let Some(turn) = self.current_turn.as_ref() else {
+                        return;
+                    };
                     let sequence = turn.llm_span_ids.len() + 1;
                     let llm_parent_span_id = turn.span_id.clone();
                     let turn_key = turn.key.clone();
@@ -592,11 +596,9 @@ impl GrokTranslator {
                         metadata: Some(Value::Object(metadata)),
                         ..Default::default()
                     }));
-                    self.current_turn
-                        .as_mut()
-                        .expect("turn checked above")
-                        .llm_span_ids
-                        .push(span_id.clone());
+                    if let Some(turn) = self.current_turn.as_mut() {
+                        turn.llm_span_ids.push(span_id.clone());
+                    }
                     self.open_llm = Some(OpenLlm {
                         span_id,
                         parent_span_id: llm_parent_span_id,
@@ -629,11 +631,9 @@ impl GrokTranslator {
                         }
                     }
                     if !is_reasoning {
-                        self.current_turn
-                            .as_mut()
-                            .expect("turn checked above")
-                            .assistant_output
-                            .push(content.clone());
+                        if let Some(turn) = self.current_turn.as_mut() {
+                            turn.assistant_output.push(content.clone());
+                        }
                     }
                 }
             }
@@ -1101,8 +1101,9 @@ impl GrokTranslator {
         let Some(prompt) = prompt else {
             return;
         };
-        let input = first_llm_input(Some(&prompt), self.first_llm_user_input.as_ref())
-            .expect("system prompt produces LLM input");
+        let Some(input) = first_llm_input(Some(&prompt), self.first_llm_user_input.as_ref()) else {
+            return;
+        };
         self.system_prompt = Some(prompt);
         if let Some(span_id) = self.first_llm_span_id.clone() {
             let mut metadata = Map::new();

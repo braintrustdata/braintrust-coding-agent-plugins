@@ -271,7 +271,7 @@ async fn main() {
         Command::Status(args) => match run_status(args).await {
             Ok(status) => {
                 let output = TraceCommandOutput::status(status);
-                println!("{}", output.render(OutputFormat::from(cli.json)).unwrap());
+                println!("{}", render_output(&output, cli.json));
             }
             Err(e) => {
                 eprintln!("bt-daemon status: {e}");
@@ -284,9 +284,7 @@ async fn main() {
             match run_import(args, opts, None).await {
                 Ok(summaries) => println!(
                     "{}",
-                    TraceCommandOutput::import(summaries)
-                        .render(OutputFormat::from(cli.json))
-                        .unwrap()
+                    render_output(&TraceCommandOutput::import(summaries), cli.json)
                 ),
                 Err(e) => {
                     eprintln!("bt-daemon import: {e}");
@@ -310,6 +308,16 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+}
+
+fn render_output(output: &TraceCommandOutput, json: bool) -> String {
+    match output.render(OutputFormat::from(json)) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("bt-daemon output: {error}");
+            std::process::exit(1);
         }
     }
 }

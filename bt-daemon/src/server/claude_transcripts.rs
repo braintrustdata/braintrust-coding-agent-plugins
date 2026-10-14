@@ -19,7 +19,6 @@ impl Daemon {
         if env.event == "SessionEnd" {
             self.claude_transcripts
                 .lock()
-                .unwrap()
                 .retain(|key, _| key.source != env.source || key.session_id != env.session_id);
             return;
         }
@@ -60,7 +59,7 @@ impl Daemon {
             route: env.route.clone(),
             config: None,
         };
-        let mut observations = self.claude_transcripts.lock().unwrap();
+        let mut observations = self.claude_transcripts.lock();
         let previous = observations
             .get(&key)
             .filter(|observation| {
@@ -101,7 +100,6 @@ impl Daemon {
         let keys: Vec<_> = self
             .claude_transcripts
             .lock()
-            .unwrap()
             .keys()
             .filter(|key| {
                 only.is_none_or(|only| {
@@ -115,13 +113,19 @@ impl Daemon {
             // destination. Never hold this lock across an ingress barrier.
             let lock = self.session_lock(&key.source, &key.session_id);
             let _guard = lock.lock().await;
-            let observation = self.claude_transcripts.lock().unwrap().get(&key).cloned();
+            let observation = self.claude_transcripts.lock().get(&key).cloned();
             let Some(observation) = observation else {
                 continue;
             };
-            let path = observation.template.payload["transcript_path"]
-                .as_str()
-                .unwrap();
+            let Some(path) = observation
+                .template
+                .payload
+                .get("transcript_path")
+                .and_then(Value::as_str)
+            else {
+                tracing::warn!(session_id = %key.session_id, "Claude transcript observation has no transcript path");
+                continue;
+            };
             let Ok(metadata) = tokio::fs::metadata(path).await else {
                 continue;
             };
@@ -134,7 +138,7 @@ impl Daemon {
             let through = env
                 .payload
                 .get("_bt_claude_transcript_mirrors")
-                .and_then(|mirrors| mirrors.get(env.payload["transcript_path"].as_str().unwrap()))
+                .and_then(|mirrors| mirrors.get(env.payload.get("transcript_path")?.as_str()?))
                 .and_then(|mirror| mirror.get("through"))
                 .and_then(Value::as_u64);
             if through.is_none() || through == observation.through {

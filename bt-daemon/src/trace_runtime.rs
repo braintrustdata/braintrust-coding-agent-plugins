@@ -1095,6 +1095,7 @@ mod tests {
         // Isolate environment-based ownership from concurrently running tests.
         let temp = tempfile::tempdir().unwrap();
         let (_, command) = crate::setup::cursor::persistent_specs()
+            .unwrap()
             .iter()
             .find(|(event, _)| event == "stop")
             .unwrap();

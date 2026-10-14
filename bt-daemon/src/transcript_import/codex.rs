@@ -66,7 +66,10 @@ impl TailSession for Tail {
                 .map(|event| (*event).clone()),
         );
         self.checkpoints = checkpoints.len();
-        let mut tail = events.last().cloned().unwrap();
+        let mut tail = events
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("transcript import is missing its terminal envelope"))?;
         if finalize {
             out.extend(
                 middle

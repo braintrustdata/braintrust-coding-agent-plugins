@@ -1088,13 +1088,10 @@ impl CodexTranslator {
             .get("arguments")
             .cloned()
             .or_else(|| payload.get("input").cloned());
-        let args_string = input
-            .as_ref()
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                serde_json::to_string(input.as_ref().unwrap_or(&Value::Null)).unwrap()
-            });
+        let args_string = match input.as_ref().and_then(Value::as_str) {
+            Some(text) => text.to_string(),
+            None => input.as_ref().unwrap_or(&Value::Null).to_string(),
+        };
         let tool_call_message = json!({
             "role": "assistant",
             "content": Value::Null,
@@ -1296,7 +1293,9 @@ impl CodexTranslator {
             .as_ref()
             .is_some_and(|llm| llm.turn_id == turn_id)
         {
-            let llm = scope.open_llm.take().expect("checked above");
+            let Some(llm) = scope.open_llm.take() else {
+                return;
+            };
             let output = if llm.output_preset {
                 None
             } else {
@@ -1819,6 +1818,16 @@ fn string_candidates(args: Option<&Value>) -> Vec<String> {
     candidates
 }
 
+fn compile_skill_regex(pattern: &str) -> Option<Regex> {
+    match Regex::new(pattern) {
+        Ok(regex) => Some(regex),
+        Err(error) => {
+            tracing::error!(%error, pattern, "could not compile skill metadata pattern");
+            None
+        }
+    }
+}
+
 fn detect_skill(tool_name: &str, args: Option<&Value>) -> Option<SkillLoad> {
     if tool_name == "skills.read" {
         if let Some(object) = args_object(args) {
@@ -1832,12 +1841,14 @@ fn detect_skill(tool_name: &str, args: Option<&Value>) -> Option<SkillLoad> {
             });
         }
     }
-    static SKILL_PATH: OnceLock<Regex> = OnceLock::new();
-    static SCRIPT_PATH: OnceLock<Regex> = OnceLock::new();
-    let skill_path =
-        SKILL_PATH.get_or_init(|| Regex::new(r#"(?i)([^\s"']*SKILL\.md)"#).expect("regex"));
+    static SKILL_PATH: OnceLock<Option<Regex>> = OnceLock::new();
+    static SCRIPT_PATH: OnceLock<Option<Regex>> = OnceLock::new();
+    let skill_path = SKILL_PATH
+        .get_or_init(|| compile_skill_regex(r#"(?i)([^\s"']*SKILL\.md)"#))
+        .as_ref()?;
     let script_path = SCRIPT_PATH
-        .get_or_init(|| Regex::new(r#"(?i)([^\s"']*[\\/]scripts[\\/][^\s"']+)"#).expect("regex"));
+        .get_or_init(|| compile_skill_regex(r#"(?i)([^\s"']*[\\/]scripts[\\/][^\s"']+)"#))
+        .as_ref()?;
     for candidate in string_candidates(args) {
         if let Some(path) = skill_path
             .captures(&candidate)
@@ -1894,10 +1905,10 @@ fn permission_info(args: Option<&Value>) -> Option<Value> {
 }
 
 fn explicit_skill_names(text: &str) -> Vec<String> {
-    static EXPLICIT_SKILLS: OnceLock<Vec<Regex>> = OnceLock::new();
-    static SKILL_XML: OnceLock<Regex> = OnceLock::new();
-    static SKILL_XML_NAME: OnceLock<Regex> = OnceLock::new();
-    static SKILL_FRONTMATTER_NAME: OnceLock<Regex> = OnceLock::new();
+    static EXPLICIT_SKILLS: OnceLock<Vec<Option<Regex>>> = OnceLock::new();
+    static SKILL_XML: OnceLock<Option<Regex>> = OnceLock::new();
+    static SKILL_XML_NAME: OnceLock<Option<Regex>> = OnceLock::new();
+    static SKILL_FRONTMATTER_NAME: OnceLock<Option<Regex>> = OnceLock::new();
     let patterns = EXPLICIT_SKILLS.get_or_init(|| {
         [
             r#"\$([A-Za-z0-9_.:-]+)"#,
@@ -1907,11 +1918,12 @@ fn explicit_skill_names(text: &str) -> Vec<String> {
             r#"UserInput::Skill\([^)]*(?:name|skill|id)\s*[:=]\s*["']?([A-Za-z0-9_.:-]+)"#,
         ]
         .into_iter()
-        .map(|pattern| Regex::new(pattern).expect("regex"))
+        .map(compile_skill_regex)
         .collect()
     });
     let mut names = Vec::new();
     for (index, pattern) in patterns.iter().enumerate() {
+        let Some(pattern) = pattern else { continue };
         for capture in pattern.captures_iter(text) {
             let Some(value) = capture.get(1).map(|capture| capture.as_str()) else {
                 continue;
@@ -1936,12 +1948,24 @@ fn explicit_skill_names(text: &str) -> Vec<String> {
             }
         }
     }
-    let xml = SKILL_XML
-        .get_or_init(|| Regex::new(r#"(?is)<skill\b([^>]*)>(.*?)</skill>"#).expect("regex"));
-    let attr_name = SKILL_XML_NAME
-        .get_or_init(|| Regex::new(r#"(?:name|id)=["']([^"']+)["']"#).expect("regex"));
-    let frontmatter_name = SKILL_FRONTMATTER_NAME
-        .get_or_init(|| Regex::new(r#"(?m)(?:^|\n)name:\s*([A-Za-z0-9_.:-]+)"#).expect("regex"));
+    let Some(xml) = SKILL_XML
+        .get_or_init(|| compile_skill_regex(r#"(?is)<skill\b([^>]*)>(.*?)</skill>"#))
+        .as_ref()
+    else {
+        return names;
+    };
+    let Some(attr_name) = SKILL_XML_NAME
+        .get_or_init(|| compile_skill_regex(r#"(?:name|id)=["']([^"']+)["']"#))
+        .as_ref()
+    else {
+        return names;
+    };
+    let Some(frontmatter_name) = SKILL_FRONTMATTER_NAME
+        .get_or_init(|| compile_skill_regex(r#"(?m)(?:^|\n)name:\s*([A-Za-z0-9_.:-]+)"#))
+        .as_ref()
+    else {
+        return names;
+    };
     for capture in xml.captures_iter(text) {
         let candidate = capture
             .get(1)

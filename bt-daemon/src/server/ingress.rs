@@ -52,7 +52,6 @@ pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingE
         daemon
             .ingress_dispatched
             .lock()
-            .unwrap()
             .get(key)
             .is_some_and(|through| *through >= event.journal_through)
     }) {
@@ -72,7 +71,7 @@ pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingE
     match accept_event(daemon, event).await {
         Ok(()) => {
             if let Some(key) = ingress_key {
-                let mut dispatched = daemon.ingress_dispatched.lock().unwrap();
+                let mut dispatched = daemon.ingress_dispatched.lock();
                 let through = dispatched.entry(key).or_default();
                 *through = (*through).max(journal_through);
             }
@@ -144,7 +143,6 @@ pub(super) async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
             let dispatched = daemon
                 .ingress_dispatched
                 .lock()
-                .unwrap()
                 .get(&key)
                 .copied()
                 .unwrap_or(0);
@@ -334,7 +332,7 @@ impl Daemon {
     }
 
     pub(super) async fn settle_session_actors(&self) {
-        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        let sessions: Vec<_> = self.sessions.lock().values().cloned().collect();
         for session in sessions {
             session.barrier().await;
         }

@@ -132,7 +132,9 @@ pub async fn capture_generation(
     let from = if changed {
         path = base.with_file_name(format!(
             "{}-{}.jsonl",
-            base.file_stem().unwrap().to_string_lossy(),
+            base.file_stem()
+                .ok_or_else(|| anyhow::anyhow!("transcript mirror path has no file stem"))?
+                .to_string_lossy(),
             Uuid::new_v4().simple()
         ));
         0
@@ -152,7 +154,10 @@ pub async fn capture_generation(
     mirror.sync_data().await?;
     tokio::fs::write(
         &current,
-        path.file_name().unwrap().to_string_lossy().as_bytes(),
+        path.file_name()
+            .ok_or_else(|| anyhow::anyhow!("transcript mirror path has no file name"))?
+            .to_string_lossy()
+            .as_bytes(),
     )
     .await?;
     Ok((path, from + copied))

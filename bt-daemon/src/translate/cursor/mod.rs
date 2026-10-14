@@ -442,7 +442,9 @@ impl CursorTranslator {
         if self.turn.is_none() {
             self.ensure_turn(ts, None, None, "hook_order", ops);
         }
-        let turn = self.turn.as_mut().unwrap();
+        let Some(turn) = self.turn.as_mut() else {
+            return;
+        };
         turn.model_seq += 1;
         let parent = turn.id.clone();
         let start = turn.boundary;
@@ -502,7 +504,9 @@ impl CursorTranslator {
             return;
         }
         self.ensure_model(ts, ops);
-        self.model_step.as_mut().unwrap().push(content);
+        if let Some(step) = self.model_step.as_mut() {
+            step.push(content);
+        }
     }
     fn close_model(&mut self, ts: i64, ops: &mut Vec<SpanOp>) {
         let Some(mut step) = self.model_step.take() else {
@@ -575,8 +579,8 @@ impl CursorTranslator {
         row.end_ms = copy.end;
         row.output = copy.output.map(|s| json!(s));
         row.metadata = Some(json!({"status":status}));
-        if matches!(status, Some("error" | "aborted")) {
-            row.error = Some(error_message.unwrap_or(status.unwrap()).into());
+        if let Some(status @ ("error" | "aborted")) = status {
+            row.error = Some(error_message.unwrap_or(status).into());
         }
         let turn_id = row.span_id.clone();
         ops.push(SpanOp::Merge(row));
@@ -631,7 +635,10 @@ impl CursorTranslator {
             if native_turn.is_none() {
                 self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
             }
-            let turn = native_turn.unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
+            let Some(turn) = native_turn.or_else(|| self.turn.as_ref().map(|turn| turn.id.clone()))
+            else {
+                return;
+            };
             let name = tool_hook.tool_name.as_str();
             let mut row = self.row(
                 ids::span_id(&self.namespace, &format!("tool:{call_id}")),
@@ -665,7 +672,9 @@ impl CursorTranslator {
             );
         }
         if !terminal {
-            let tool = self.tools.get(&key).unwrap();
+            let Some(tool) = self.tools.get(&key) else {
+                return;
+            };
             if self
                 .turn
                 .as_ref()
@@ -720,7 +729,9 @@ impl CursorTranslator {
                 self.close_model(boundary, ops);
             }
         }
-        let mut tool = self.remove_open_tool(&key).unwrap();
+        let Some(mut tool) = self.remove_open_tool(&key) else {
+            return;
+        };
         tool.ended = true;
         tool.row.end_ms = Some(e.ts_ms.max(tool.row.start_ms.unwrap_or(e.ts_ms)));
         let output = match phase {
@@ -733,7 +744,7 @@ impl CursorTranslator {
             .as_ref()
             .is_some_and(|m| m.get("result_source").is_some())
         {
-            tool.row.metadata.as_mut().unwrap()["native_tool_result"] =
+            tool.row.metadata.get_or_insert_with(|| json!({}))["native_tool_result"] =
                 output.unwrap_or(Value::Null);
         } else {
             tool.row.output = output;
@@ -779,7 +790,7 @@ impl CursorTranslator {
     }
     fn incomplete_tool(&mut self, mut tool: Tool, ts: i64, ops: &mut Vec<SpanOp>) {
         tool.row.end_ms = Some(ts.max(tool.row.start_ms.unwrap_or(ts)));
-        tool.row.metadata.as_mut().unwrap()["status"] = json!("incomplete");
+        tool.row.metadata.get_or_insert_with(|| json!({}))["status"] = json!("incomplete");
         tool.ended = true;
         ops.push(SpanOp::Merge(tool.row.clone()));
         self.completed.insert(tool.call_id.clone(), tool);
@@ -827,15 +838,18 @@ impl CursorTranslator {
             return;
         }
         let id = &candidates[0];
-        let mut copy = self
+        let Some(mut copy) = self
             .tools
             .get(id)
             .cloned()
             .or_else(|| self.completed.get(id).cloned())
-            .unwrap();
+        else {
+            return;
+        };
         if let Specialized::ReadFile(read) = hook {
-            copy.row.metadata.as_mut().unwrap()["pre_read_content"] = json!(read.content);
-            copy.row.metadata.as_mut().unwrap()["pre_read_content_source"] =
+            copy.row.metadata.get_or_insert_with(|| json!({}))["pre_read_content"] =
+                json!(read.content);
+            copy.row.metadata.get_or_insert_with(|| json!({}))["pre_read_content_source"] =
                 json!("beforeReadFile");
             ops.push(SpanOp::Merge(copy.row.clone()));
             if copy.ended {
@@ -848,8 +862,8 @@ impl CursorTranslator {
         if let Some(output) = hook.result() {
             let output = &output;
             copy.row.output = Some(output.clone());
-            copy.row.metadata.as_mut().unwrap()["result_source"] = json!(e.event);
-            copy.row.metadata.as_mut().unwrap()["result_completeness"] =
+            copy.row.metadata.get_or_insert_with(|| json!({}))["result_source"] = json!(e.event);
+            copy.row.metadata.get_or_insert_with(|| json!({}))["result_completeness"] =
                 json!("native_specialized_payload");
             copy.row.late_merge_key = Some(format!("cursor-specialized:{}:{}", id, e.event));
             ops.push(SpanOp::Merge(copy.row.clone()));
@@ -981,7 +995,9 @@ impl CursorTranslator {
                 })
                 .collect::<std::collections::BTreeSet<_>>();
             if native_matches.len() == 1 {
-                let id = native_matches.into_iter().next().unwrap();
+                let Some(id) = native_matches.into_iter().next() else {
+                    return;
+                };
                 self.transcript
                     .prompt_owners
                     .insert(self.transcript_users, (prompt.clone(), id.clone()));
@@ -1005,7 +1021,9 @@ impl CursorTranslator {
                             .is_some_and(|p| p.trim() == prompt.trim()))
             });
             if matching {
-                let turn = self.turn.as_mut().unwrap();
+                let Some(turn) = self.turn.as_mut() else {
+                    return;
+                };
                 let add = turn.prompt.is_none();
                 turn.prompt = Some(prompt.clone());
                 let id = turn.id.clone();
@@ -1026,18 +1044,12 @@ impl CursorTranslator {
             } else {
                 self.close_turn(ts, Some("transcript_boundary"), None, ops);
                 self.ensure_turn(ts, Some(prompt), None, "transcript_user_message", ops);
-                self.transcript.prompt_owners.insert(
-                    self.transcript_users,
-                    (
-                        self.turn
-                            .as_ref()
-                            .unwrap()
-                            .prompt
-                            .clone()
-                            .unwrap_or_default(),
-                        self.turn.as_ref().unwrap().id.clone(),
-                    ),
-                );
+                if let Some(turn) = &self.turn {
+                    self.transcript.prompt_owners.insert(
+                        self.transcript_users,
+                        (turn.prompt.clone().unwrap_or_default(), turn.id.clone()),
+                    );
+                }
             }
             self.transcript_unattributed = false;
             self.transcript_owner = self
@@ -1129,10 +1141,13 @@ impl CursorTranslator {
         }
         self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
         let spawn = hook.tool_call_id.as_deref();
-        let parent = spawn
+        let Some(parent) = spawn
             .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
             .map(|t| t.turn.clone())
-            .unwrap_or_else(|| self.turn.as_ref().unwrap().id.clone());
+            .or_else(|| self.turn.as_ref().map(|turn| turn.id.clone()))
+        else {
+            return;
+        };
         let mut row = self.row(
             ids::span_id(&self.namespace, &format!("subagent:{id}")),
             parent,
@@ -1157,7 +1172,7 @@ impl CursorTranslator {
         if let Some(mut row) = self.subagents.remove(id) {
             row.end_ms = Some(e.ts_ms.max(row.start_ms.unwrap_or(e.ts_ms)));
             row.output = hook.summary.as_ref().map(|summary| json!(summary));
-            row.metadata.as_mut().unwrap()["status"] = json!(hook.status);
+            row.metadata.get_or_insert_with(|| json!({}))["status"] = json!(hook.status);
             row.error = error;
             ops.push(SpanOp::Merge(row));
             return;
@@ -1166,7 +1181,9 @@ impl CursorTranslator {
         // observation as a useful, zero-duration span and mark the
         // unavailable start time explicitly.
         self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
-        let parent = self.turn.as_ref().unwrap().id.clone();
+        let Some(parent) = self.turn.as_ref().map(|turn| turn.id.clone()) else {
+            return;
+        };
         let mut row = self.row(
             ids::span_id(&self.namespace, &format!("subagent:{id}")),
             parent,
@@ -1228,15 +1245,13 @@ impl CursorTranslator {
             &format!("Turn {}", turn.ordinal),
             SpanType::Task,
         );
-        row.metrics = Some(Value::Object(turn.usage.clone()));
+        let metrics = Value::Object(turn.usage.clone());
+        let metrics_id = ids::span_id(&self.namespace, &metrics.to_string());
+        row.metrics = Some(metrics);
         row.metadata = Some(json!({"token_usage_scope":"turn"}));
         self.prompt_generations.insert(generation.into(), turn);
         // A stop/response can enrich a row already closed by a transcript boundary.
-        row.late_merge_key = Some(format!(
-            "cursor-turn-usage:{}:{}",
-            row.span_id,
-            ids::span_id(&self.namespace, &row.metrics.as_ref().unwrap().to_string())
-        ));
+        row.late_merge_key = Some(format!("cursor-turn-usage:{}:{}", row.span_id, metrics_id));
         ops.push(SpanOp::Merge(row));
     }
     fn reduce_hook(&mut self, e: &Envelope, hook: &Hook, ops: &mut Vec<SpanOp>) {
@@ -1524,7 +1539,7 @@ impl AgentTranslator for CursorTranslator {
         }
         for (_, mut row) in std::mem::take(&mut self.subagents) {
             row.end_ms = Some(self.last_ms.max(row.start_ms.unwrap_or(self.last_ms)));
-            row.metadata.as_mut().unwrap()["status"] = json!("incomplete");
+            row.metadata.get_or_insert_with(|| json!({}))["status"] = json!("incomplete");
             ops.push(SpanOp::Merge(row));
         }
         if self.started {

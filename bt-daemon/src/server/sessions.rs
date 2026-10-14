@@ -40,7 +40,7 @@ impl Daemon {
         replay_through: u64,
     ) -> anyhow::Result<Arc<Session>> {
         {
-            let map = self.sessions.lock().unwrap();
+            let map = self.sessions.lock();
             if let Some(session) = map.get(key) {
                 return Ok(session.clone());
             }
@@ -81,7 +81,7 @@ impl Daemon {
         let journal = self
             .journal_writer_for(&env.source, &env.session_id)
             .await?;
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
         }
@@ -117,7 +117,7 @@ impl Daemon {
         let lock = self.dispatch_lock(&key.source, &key.session_id);
         let _guard = lock.lock().await;
 
-        let session = { self.sessions.lock().unwrap().remove(key) };
+        let session = { self.sessions.lock().remove(key) };
         let Some(session) = session else {
             return;
         };
@@ -125,12 +125,11 @@ impl Daemon {
         self.correlation.retire_session(&key.correlation_key());
 
         self.session_auth.lock().await.remove(key);
-        self.auth_errors.lock().unwrap().remove(key);
+        self.auth_errors.lock().remove(key);
         self.route_aliases
             .lock()
-            .unwrap()
             .retain(|alias, target| alias != key && target != key);
-        self.managed_run_sessions.lock().unwrap().retain(|_, keys| {
+        self.managed_run_sessions.lock().retain(|_, keys| {
             keys.remove(key);
             !keys.is_empty()
         });
@@ -140,7 +139,6 @@ impl Daemon {
         let last = !self
             .sessions
             .lock()
-            .unwrap()
             .keys()
             .any(|other| other.source == key.source && other.session_id == key.session_id);
         if last {
@@ -149,28 +147,22 @@ impl Daemon {
             // lock for the brief writer-map cleanup after daemon work ends.
             let capture_lock = self.session_lock(&key.source, &key.session_id);
             let _capture_guard = capture_lock.lock().await;
-            self.claude_transcripts
-                .lock()
-                .unwrap()
-                .retain(|candidate, _| {
-                    candidate.source != key.source || candidate.session_id != key.session_id
-                });
-            self.journals.lock().unwrap().remove(&storage_key);
+            self.claude_transcripts.lock().retain(|candidate, _| {
+                candidate.source != key.source || candidate.session_id != key.session_id
+            });
+            self.journals.lock().remove(&storage_key);
             {
-                let mut locks = self.session_locks.lock().unwrap();
+                let mut locks = self.session_locks.lock();
                 // A waiting capture or observer must keep using this same
                 // lock, rather than race a newly allocated mirror writer.
                 if Arc::strong_count(&capture_lock) == 2 {
                     locks.remove(&storage_key);
                 }
             }
-            self.dispatch_locks.lock().unwrap().remove(&storage_key);
-            self.ingress_dispatched
-                .lock()
-                .unwrap()
-                .retain(|candidate, _| {
-                    candidate.source != key.source || candidate.session_id != key.session_id
-                });
+            self.dispatch_locks.lock().remove(&storage_key);
+            self.ingress_dispatched.lock().retain(|candidate, _| {
+                candidate.source != key.source || candidate.session_id != key.session_id
+            });
         }
         tracing::info!(session_id = %key.session_id, "session retired");
     }
@@ -180,7 +172,6 @@ impl Daemon {
     pub(super) fn idle_sessions(&self, idle_timeout: Duration) -> Vec<DeliveryKey> {
         self.sessions
             .lock()
-            .unwrap()
             .iter()
             .filter(|(_, session)| {
                 session.idle_for() >= idle_timeout
@@ -197,7 +188,7 @@ impl Daemon {
         session_id: &str,
     ) -> anyhow::Result<Arc<tokio::sync::Mutex<JournalWriter>>> {
         let storage_key = crate::ids::session_namespace(source, session_id);
-        if let Some(writer) = self.journals.lock().unwrap().get(&storage_key).cloned() {
+        if let Some(writer) = self.journals.lock().get(&storage_key).cloned() {
             return Ok(writer);
         }
         let path = journal::ensure_source_journal(&self.data_dir, source, session_id).await?;
@@ -207,7 +198,6 @@ impl Daemon {
         Ok(self
             .journals
             .lock()
-            .unwrap()
             .entry(storage_key)
             .or_insert_with(|| writer.clone())
             .clone())
@@ -231,7 +221,6 @@ impl Daemon {
         let storage_key = crate::ids::session_namespace(source, session_id);
         self.session_locks
             .lock()
-            .unwrap()
             .entry(storage_key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -245,7 +234,6 @@ impl Daemon {
         let storage_key = crate::ids::session_namespace(source, session_id);
         self.dispatch_locks
             .lock()
-            .unwrap()
             .entry(storage_key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()

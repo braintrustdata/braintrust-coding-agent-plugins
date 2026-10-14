@@ -402,9 +402,17 @@ impl Specialized {
         match self {
             Self::Shell(hook) => Some(Value::String(hook.output.clone())),
             Self::Mcp(hook) => Some(Value::String(hook.result_json.clone())),
-            Self::FileEdit(hook) => {
-                Some(serde_json::to_value(&hook.edits).expect("file edits serialize"))
-            }
+            Self::FileEdit(hook) => Some(Value::Array(
+                hook.edits
+                    .iter()
+                    .map(|edit| {
+                        let mut fields = Map::new();
+                        fields.insert("old_string".into(), Value::String(edit.old_string.clone()));
+                        fields.insert("new_string".into(), Value::String(edit.new_string.clone()));
+                        Value::Object(fields)
+                    })
+                    .collect(),
+            )),
             Self::ReadFile(_) => None,
         }
     }

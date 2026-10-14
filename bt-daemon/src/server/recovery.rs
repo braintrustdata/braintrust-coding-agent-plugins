@@ -6,7 +6,6 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
     let pending: HashSet<(String, String, u64)> = daemon
         .pending_sessions
         .lock()
-        .unwrap()
         .values()
         .flat_map(|state| {
             state.events.iter().map(|event| {
@@ -95,16 +94,22 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                 if let Some(key) = event.env.route.as_ref().and_then(|route| {
                     DeliveryKey::new(&event.env.source, &event.env.session_id, route).ok()
                 }) {
-                    let observation = daemon.claude_transcripts.lock().unwrap().get(&key).cloned();
+                    let observation = daemon.claude_transcripts.lock().get(&key).cloned();
                     if let Some(observation) = observation {
-                        let path = observation.template.payload["transcript_path"]
-                            .as_str()
-                            .unwrap();
+                        let Some(path) = observation
+                            .template
+                            .payload
+                            .get("transcript_path")
+                            .and_then(Value::as_str)
+                        else {
+                            tracing::warn!(session_id = %key.session_id, "Claude transcript observation has no transcript path");
+                            continue;
+                        };
                         let changed = tokio::fs::metadata(path)
                             .await
                             .is_ok_and(|metadata| observation.through != Some(metadata.len()));
                         if !changed {
-                            daemon.claude_transcripts.lock().unwrap().remove(&key);
+                            daemon.claude_transcripts.lock().remove(&key);
                         }
                     }
                 }

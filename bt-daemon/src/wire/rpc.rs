@@ -77,6 +77,20 @@ pub struct Response {
 }
 
 impl Response {
+    /// Serialize a successful result, returning an internal RPC error if serialization fails.
+    pub(crate) fn serialized(id: RequestId, result: impl Serialize) -> Self {
+        match serde_json::to_value(result) {
+            Ok(value) => Self::ok(id, value),
+            Err(error) => Self::err(
+                id,
+                RpcError::new(
+                    error_code::INTERNAL,
+                    format!("could not serialize RPC response: {error}"),
+                ),
+            ),
+        }
+    }
+
     pub fn ok(id: RequestId, result: serde_json::Value) -> Self {
         Self {
             jsonrpc: JsonRpcV2,
@@ -152,6 +166,38 @@ impl<'de> Deserialize<'de> for JsonRpcV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_serialization_failure_returns_internal_error() {
+        struct FailingResult;
+        impl Serialize for FailingResult {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("fixture serialization failure"))
+            }
+        }
+        let response = Response::serialized(RequestId::Int(17), FailingResult);
+        assert_eq!(response.id, RequestId::Int(17));
+        assert!(response.result.is_none());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, error_code::INTERNAL);
+        assert!(error.message.contains("fixture serialization failure"));
+        let line = Message::Response(Response::serialized(RequestId::Int(17), FailingResult))
+            .to_line()
+            .unwrap();
+        assert!(matches!(
+            Message::from_line(&line).unwrap(),
+            Message::Response(_)
+        ));
+    }
+
+    #[test]
+    fn result_serialization_preserves_successful_payload() {
+        let result = serde_json::json!({"accepted": true});
+        let response = Response::serialized(RequestId::Int(18), &result);
+        assert_eq!(response.id, RequestId::Int(18));
+        assert_eq!(response.result, Some(result));
+        assert!(response.error.is_none());
+    }
 
     #[test]
     fn request_round_trips() {

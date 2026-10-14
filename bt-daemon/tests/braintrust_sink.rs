@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Integration test assertions and fixtures fail immediately on unexpected values."
+)]
+
 //! Phase 2: the Braintrust sink actually delivers spans. Runs against a
 //! wiremock stand-in for the Braintrust backend (the endpoints the SDK hits
 //! with `skip_login`: GET /version, POST /api/project/register, POST /logs3).

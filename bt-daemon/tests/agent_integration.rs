@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Integration test assertions and fixtures fail immediately on unexpected values."
+)]
+
 mod support;
 
 use axum::http::StatusCode;
