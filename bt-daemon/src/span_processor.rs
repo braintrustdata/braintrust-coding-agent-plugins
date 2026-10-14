@@ -352,6 +352,34 @@ pub(crate) fn failed_digest(path: &Path) -> Option<[u8; 32]> {
     })
 }
 
+// Preserve the bytes actually loaded by predecessors, not a later filesystem
+// sample: an edit during a failing call must already qualify for recovery.
+pub(crate) fn chain_digests(paths: &[PathBuf], failed: &Path) -> Vec<Option<[u8; 32]>> {
+    ENGINE.with_borrow(|engine| {
+        let mut reached_failure = false;
+        paths
+            .iter()
+            .map(|path| {
+                if path == failed {
+                    reached_failure = true;
+                    engine
+                        .as_ref()
+                        .and_then(|engine| engine.failed_plugins.get(path))
+                        .and_then(|failed| failed.fingerprint)
+                        .map(|fingerprint| fingerprint.digest)
+                } else if !reached_failure {
+                    engine
+                        .as_ref()
+                        .and_then(|engine| engine.modules.get(path))
+                        .map(|module| module.fingerprint.digest)
+                } else {
+                    file_digest(path)
+                }
+            })
+            .collect()
+    })
+}
+
 /// Compile each module and verify that it default-exports a function. Explicit
 /// CLI commands call this before persisting or launching with a plugin chain.
 pub fn validate(plugins: &[PathBuf]) -> anyhow::Result<()> {
