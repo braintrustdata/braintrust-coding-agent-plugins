@@ -108,7 +108,7 @@ impl TailSession for Tail {
         let snapshot = self
             .snapshot
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("Cursor transcript snapshot was not initialized"))?
             .path()
             .join("transcript.jsonl");
         let mut file = std::fs::OpenOptions::new()

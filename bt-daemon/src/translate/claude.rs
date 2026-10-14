@@ -1143,7 +1143,7 @@ impl ClaudeTranslator {
             "Turn ended before tool completion",
             ops,
         );
-        let turn = self.turn.take().expect("active turn");
+        let Some(turn) = self.turn.take() else { return };
         let end_ms = self.execution_end(&turn, event.ts_ms, ops);
         let output = event
             .payload

@@ -11,7 +11,6 @@ impl Daemon {
     ) -> bool {
         self.managed_run_sessions
             .lock()
-            .unwrap()
             .entry(managed_run_id.to_string())
             .or_default()
             .insert(key.clone())
@@ -47,7 +46,6 @@ impl Daemon {
         let mut delivery_keys: HashSet<DeliveryKey> = self
             .managed_run_sessions
             .lock()
-            .unwrap()
             .get(&params.managed_run_id)
             .cloned()
             .unwrap_or_default();
@@ -66,7 +64,6 @@ impl Daemon {
                 let live: Vec<_> = self
                     .sessions
                     .lock()
-                    .unwrap()
                     .keys()
                     .filter(|key| {
                         key.session_id == record.session_id
@@ -113,7 +110,6 @@ impl Daemon {
             let _guard = lock.lock().await;
             self.claude_transcripts
                 .lock()
-                .unwrap()
                 .retain(|candidate, observation| {
                     candidate.source != key.source
                         || candidate.session_id != key.session_id
@@ -133,7 +129,7 @@ impl Daemon {
                 result.flushed = false;
                 continue;
             }
-            let session = { self.sessions.lock().unwrap().get(&key).cloned() };
+            let session = { self.sessions.lock().get(&key).cloned() };
             if let Some(session) = session {
                 let (flushed, pending) = session
                     .finalize(Duration::from_millis(params.timeout_ms))
@@ -158,7 +154,6 @@ impl Daemon {
         let sessions: Vec<_> = self
             .sessions
             .lock()
-            .unwrap()
             .iter()
             .filter(|(key, _)| key.source == source && key.session_id == session_id)
             .map(|(_, session)| session.clone())

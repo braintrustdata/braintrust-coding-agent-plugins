@@ -248,7 +248,9 @@ impl Registry {
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
         let factory = self.factories.get(canonical);
-        let factory = factory.expect("canonical source must have a factory");
+        let factory = factory.ok_or_else(|| {
+            anyhow::anyhow!("no translator factory for coding-agent source {canonical:?}")
+        })?;
         Ok(Box::new(turn_lineage::TurnLineage::new(
             factory.create(session_namespace),
         )))

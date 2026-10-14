@@ -12,9 +12,10 @@ use crate::journal::JournalWriter;
 use crate::sink::SinkFactory;
 use crate::translate::{Registry, SessionCtx};
 use crate::wire::{Envelope, SessionRoute};
+use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
@@ -145,7 +146,7 @@ impl Session {
     }
 
     fn touch(&self) {
-        *self.last_activity.lock().unwrap() = Instant::now();
+        *self.last_activity.lock() = Instant::now();
     }
 
     /// Wait until events already accepted by this daemon worker have updated
@@ -159,7 +160,7 @@ impl Session {
 
     /// How long since this session last saw traffic. Drives idle retirement.
     pub fn idle_for(&self) -> std::time::Duration {
-        self.last_activity.lock().unwrap().elapsed()
+        self.last_activity.lock().elapsed()
     }
 
     /// Insert a flush in actor order without waiting for backend delivery.
@@ -354,10 +355,12 @@ async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &
     if !env.payload.is_object() {
         env.payload = serde_json::json!({});
     }
-    env.payload.as_object_mut().unwrap().insert(
-        "_bt_claude_transcript_mirrors".to_string(),
-        serde_json::Value::Object(mirrors),
-    );
+    if let Some(payload) = env.payload.as_object_mut() {
+        payload.insert(
+            "_bt_claude_transcript_mirrors".to_string(),
+            serde_json::Value::Object(mirrors),
+        );
+    }
 }
 
 const GROK_TERMINAL_SNAPSHOT_ATTEMPTS: usize = 4;
@@ -690,6 +693,10 @@ impl SessionActor {
         mode: BatchMode,
     ) -> (bool, bool) {
         let (translate_error, emit_error) = mode.errors();
+        let Some(config) = ctx.config.as_ref() else {
+            self.set_error("session configuration is missing".into());
+            return (false, false);
+        };
         let mut next = match first {
             Ok(ops) => Some(ops),
             Err(e) => {
@@ -705,7 +712,7 @@ impl SessionActor {
                     let changed = self.correlation.observe_ops(
                         &self.correlation_key,
                         &self.route,
-                        ctx.config.as_ref().expect("session config"),
+                        config,
                         &ops,
                     );
                     correlation_changed |= changed;
@@ -873,6 +880,10 @@ impl SessionActor {
         ctx: &SessionCtx,
         first: anyhow::Result<Vec<crate::translate::SpanOp>>,
     ) {
+        let Some(config) = ctx.config.as_ref() else {
+            self.set_error("session configuration is missing".into());
+            return;
+        };
         let mut next = match first {
             Ok(ops) => Some(ops),
             Err(error) => {
@@ -882,12 +893,9 @@ impl SessionActor {
         };
         while let Some(ops) = next {
             if !ops.is_empty() {
-                let _ = self.correlation.observe_ops(
-                    &self.correlation_key,
-                    &self.route,
-                    ctx.config.as_ref().expect("session config"),
-                    &ops,
-                );
+                let _ =
+                    self.correlation
+                        .observe_ops(&self.correlation_key, &self.route, config, &ops);
             }
             next = match translator.drain_pending(ctx) {
                 Ok(next) => next,
@@ -981,13 +989,13 @@ impl SessionActor {
 
     fn refresh_permalink(&self, sink: &dyn crate::sink::Sink) {
         if let Some(link) = sink.permalink() {
-            *self.permalink.lock().unwrap() = Some(link);
+            *self.permalink.lock() = Some(link);
         }
     }
 
     fn set_error(&self, msg: String) {
         tracing::warn!(session_id = %self.session_id, "{msg}");
-        *self.last_error.lock().unwrap() = Some(msg);
+        *self.last_error.lock() = Some(msg);
     }
 }
 

@@ -13,10 +13,10 @@
 use crate::translate::{SpanOp, SpanRow, SpanType};
 use crate::wire::{CaptureContext, ProcessIdentity, SessionConfig, SessionRoute, TraceDestination};
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParentLink {
@@ -85,7 +85,7 @@ struct ActiveToolSnapshot {
 impl CorrelationRegistry {
     pub(crate) fn needs_process_capture(&self, source: &str, session_id: &str) -> bool {
         let prefix = format!("{source}\u{1f}{session_id}\u{1f}");
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         // Command hooks may need a second request to distinguish the agent
         // from their one-shot `bt` process. Once its mapping is established,
         // later hooks need no process walk until another SessionStart/resume.
@@ -107,7 +107,7 @@ impl CorrelationRegistry {
         capture: Option<&CaptureContext>,
         session_start: bool,
     ) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.live_sessions.insert(key.to_string());
         state.retired.remove(key);
         if session_start {
@@ -158,7 +158,7 @@ impl CorrelationRegistry {
     }
 
     pub(crate) fn active_parent_snapshot(&self, key: &str) -> Option<ActiveParentSnapshot> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         let tools: Vec<_> = state
             .active_tools
             .get(key)
@@ -215,7 +215,7 @@ impl CorrelationRegistry {
         {
             return false;
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let key = snapshot.correlation_key;
         for process in snapshot.processes.into_iter().filter(valid_process) {
             state
@@ -234,7 +234,9 @@ impl CorrelationRegistry {
         }
         let tools = state.active_tools.entry(key.clone()).or_default();
         for snapshot in restored_tools {
-            let span_id = snapshot.components.span_id.clone().unwrap();
+            let Some(span_id) = snapshot.components.span_id.clone() else {
+                continue;
+            };
             tools.insert(
                 span_id,
                 ActiveTool {
@@ -265,7 +267,7 @@ impl CorrelationRegistry {
         config: &SessionConfig,
         ops: &[SpanOp],
     ) -> bool {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let mut changed = false;
         for op in ops {
             let row = match op {
@@ -353,7 +355,7 @@ impl CorrelationRegistry {
         let Some(processes) = ancestors(capture, child_agent) else {
             return Resolution::Standalone;
         };
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         for process in processes.filter(|process| valid_process(process)) {
             let Some(sessions) = state.process_sessions.get(process) else {
                 continue;
@@ -438,7 +440,7 @@ impl CorrelationRegistry {
 
     #[cfg(test)]
     pub(crate) fn remove_session(&self, key: &str) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         forget_spans(&mut state, key);
         state.retired.remove(key);
         remove_process_mapping(&mut state, key);
@@ -448,7 +450,7 @@ impl CorrelationRegistry {
     /// Command-hook agents need two hooks to be relearned; a turn resuming
     /// after a long pause must still parent a child launched by its next tool.
     pub(crate) fn retire_session(&self, key: &str) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         forget_spans(&mut state, key);
         if state.session_processes.contains_key(key) {
             state.retired.insert(key.to_string());
@@ -458,7 +460,7 @@ impl CorrelationRegistry {
     /// Forget retired sessions whose agent processes have all exited.
     pub(crate) fn prune_retired(&self, alive: impl Fn(&ProcessIdentity) -> bool) {
         let retired: Vec<_> = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock();
             state
                 .retired
                 .iter()
@@ -479,7 +481,7 @@ impl CorrelationRegistry {
             .filter(|(_, processes)| !processes.iter().any(&alive))
             .map(|(key, _)| key)
             .collect();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         for key in exited {
             // A late event may have revived the session while we checked.
             if state.retired.remove(&key) {
@@ -491,14 +493,13 @@ impl CorrelationRegistry {
     pub(crate) fn has_active_tools(&self, key: &str) -> bool {
         self.state
             .lock()
-            .unwrap()
             .active_tools
             .get(key)
             .is_some_and(|tools| tools.values().any(|tool| tool.active))
     }
 
     pub(crate) fn has_any_active_tools(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state.live_sessions.iter().any(|key| {
             state
                 .active_tools
@@ -728,6 +729,24 @@ mod tests {
                 ..Default::default()
             })],
         );
+    }
+
+    #[test]
+    fn parent_registry_remains_usable_after_a_reader_unwinds() {
+        let registry = parent_registry();
+        open_span(&registry, "parent", "tool", SpanType::Tool);
+        let before = registry.active_parent_snapshot("parent").unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = registry.state.lock();
+            panic!("fixture reader failure");
+        }));
+        assert!(panic.is_err());
+        let after = registry.active_parent_snapshot("parent").unwrap();
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+        assert!(registry.has_any_active_tools());
     }
 
     fn parent_registry() -> CorrelationRegistry {

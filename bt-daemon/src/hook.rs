@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn cursor_capture_ownership_preserves_user_managed_and_uncovered_hooks() {
         let temp = tempfile::tempdir().unwrap();
-        let specs = crate::setup::cursor::persistent_specs();
+        let specs = crate::setup::cursor::persistent_specs().unwrap();
         let command = &specs.iter().find(|(event, _)| event == "stop").unwrap().1;
         let mut config = json!({"version":1,"hooks":{"stop":[{"command":command,"timeout":10,"failClosed":false}]}});
         let path = temp.path().join("hooks.json");

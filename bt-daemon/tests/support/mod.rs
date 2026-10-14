@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Integration test assertions and fixtures fail immediately on unexpected values."
+)]
 #![allow(dead_code)]
 #![allow(
     clippy::disallowed_methods,

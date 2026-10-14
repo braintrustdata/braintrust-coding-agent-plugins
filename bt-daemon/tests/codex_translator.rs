@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Integration test assertions and fixtures fail immediately on unexpected values."
+)]
+
 //! Phase 3 core: the Codex translator turns a transcript ("rollout" JSONL) plus
 //! hook triggers into a session → turn → {llm, tool} span tree. Mirrors the
 //! happy-path shape of the TS `event-processor` tests.

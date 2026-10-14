@@ -213,16 +213,13 @@ pub(super) async fn handle_request(
                     sources: daemon.translators.sources(),
                 },
             };
-            Response::ok(id, serde_json::to_value(result).unwrap())
+            Response::serialized(id, result)
         }
         method::EVENT_LOG => {
             let mut env = parse!(Envelope);
             attach_process_capture(daemon, &mut env, client.as_ref());
             match daemon.capture_event(env).await {
-                Ok(accepted) => Response::ok(
-                    id,
-                    serde_json::to_value(EventLogResult { accepted }).unwrap(),
-                ),
+                Ok(accepted) => Response::serialized(id, EventLogResult { accepted }),
                 Err(error) => Response::err(id, RpcError::new(error_code::INTERNAL, error)),
             }
         }
@@ -239,7 +236,6 @@ pub(super) async fn handle_request(
             let delivery_keys: Vec<_> = daemon
                 .sessions
                 .lock()
-                .unwrap()
                 .keys()
                 .filter(|key| key.session_id == p.session_id)
                 .cloned()
@@ -257,7 +253,7 @@ pub(super) async fn handle_request(
                         ),
                     );
                 }
-                let session = { daemon.sessions.lock().unwrap().get(&key).cloned() };
+                let session = { daemon.sessions.lock().get(&key).cloned() };
                 if let Some(session) = session {
                     let (route_flushed, route_pending) =
                         session.flush(Duration::from_millis(p.timeout_ms)).await;
@@ -265,14 +261,13 @@ pub(super) async fn handle_request(
                     pending = pending.saturating_add(route_pending);
                 }
             }
-            Response::ok(
+            Response::serialized(
                 id,
-                serde_json::to_value(FlushResult {
+                FlushResult {
                     flushed,
                     pending,
                     accepted_sessions,
-                })
-                .unwrap(),
+                },
             )
         }
         method::MANAGED_RUN_FLUSH => {
@@ -286,32 +281,23 @@ pub(super) async fn handle_request(
                 return Response::err(id, RpcError::new(error_code::INTERNAL, error));
             }
             let result = daemon.flush_managed_run(params).await;
-            Response::ok(id, serde_json::to_value(result).unwrap())
+            Response::serialized(id, result)
         }
         method::STATUS_GET => {
             let p = parse!(StatusParams);
             daemon.settle_ingress().await;
-            Response::ok(id, serde_json::to_value(daemon.status(p)).unwrap())
+            Response::serialized(id, daemon.status(p))
         }
         method::AUTH_DIAGNOSE => {
             let p = parse!(AuthDiagnoseParams);
-            Response::ok(
-                id,
-                serde_json::to_value(daemon.diagnose_auth(p.auth).await).unwrap(),
-            )
+            Response::serialized(id, daemon.diagnose_auth(p.auth).await)
         }
         method::DAEMON_SHUTDOWN => {
             if !client_may_shutdown(client.as_ref(), &daemon.version) {
-                return Response::ok(
-                    id,
-                    serde_json::to_value(ShutdownResult { ok: false }).unwrap(),
-                );
+                return Response::serialized(id, ShutdownResult { ok: false });
             }
             drain_all(daemon).await;
-            Response::ok(
-                id,
-                serde_json::to_value(ShutdownResult { ok: true }).unwrap(),
-            )
+            Response::serialized(id, ShutdownResult { ok: true })
         }
         other => Response::err(
             id,
@@ -336,7 +322,7 @@ pub(super) fn client_may_shutdown(client: Option<&ClientInfo>, daemon_version: &
 
 impl Daemon {
     pub(super) fn status(&self, p: StatusParams) -> StatusResult {
-        let map = self.sessions.lock().unwrap();
+        let map = self.sessions.lock();
         let mut sessions: Vec<_> = map
             .iter()
             .filter(|(key, _)| {
@@ -350,11 +336,11 @@ impl Daemon {
                 route: serde_json::from_str(&key.route).ok(),
                 queued: s.counters.queued.load(Ordering::Relaxed),
                 spans_emitted: s.counters.spans_emitted.load(Ordering::Relaxed),
-                permalink: s.permalink.lock().unwrap().clone(),
-                last_error: s.last_error.lock().unwrap().clone(),
+                permalink: s.permalink.lock().clone(),
+                last_error: s.last_error.lock().clone(),
             })
             .collect();
-        for (key, (source, error)) in self.auth_errors.lock().unwrap().iter() {
+        for (key, (source, error)) in self.auth_errors.lock().iter() {
             if p.session_id
                 .as_ref()
                 .is_some_and(|want| want != &key.session_id)
@@ -374,7 +360,7 @@ impl Daemon {
                 last_error: Some(error.clone()),
             });
         }
-        for state in self.pending_sessions.lock().unwrap().values() {
+        for state in self.pending_sessions.lock().values() {
             let Some(first) = state.events.first() else {
                 continue;
             };

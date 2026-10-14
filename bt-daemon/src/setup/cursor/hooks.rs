@@ -43,16 +43,34 @@ fn specs(marker: &str, windows: bool) -> Vec<(String, String)> {
 pub(crate) const USER_HOOK_ENV: &str = "BT_TRACE_CURSOR_USER_HOOK";
 const CAPTURE_MARKER: &str = "braintrust-cursor-capture";
 
-pub(crate) fn persistent_specs() -> &'static [(String, String)] {
-    static SPECS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
-    SPECS.get_or_init(|| capture_specs(cfg!(windows)))
+pub(crate) fn persistent_specs() -> anyhow::Result<&'static [(String, String)]> {
+    static SPECS: std::sync::OnceLock<Result<Vec<(String, String)>, String>> =
+        std::sync::OnceLock::new();
+    match SPECS.get_or_init(|| capture_specs(cfg!(windows)).map_err(|error| error.to_string())) {
+        Ok(specs) => Ok(specs),
+        Err(error) => Err(anyhow::anyhow!(
+            "invalid embedded Cursor hooks manifest: {error}"
+        )),
+    }
 }
 
-fn capture_specs(windows: bool) -> Vec<(String, String)> {
-    let manifest: Value = serde_json::from_str(super::HOOKS_MANIFEST)
-        .expect("embedded Cursor hooks manifest must be valid");
-    manifest["hooks"].as_object().unwrap().iter().map(|(event, entries)| {
-        let command = entries[0]["command"].as_str().unwrap();
+fn capture_specs(windows: bool) -> anyhow::Result<Vec<(String, String)>> {
+    capture_specs_from_manifest(super::HOOKS_MANIFEST, windows)
+}
+
+fn capture_specs_from_manifest(
+    manifest: &str,
+    windows: bool,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let manifest: Value = serde_json::from_str(manifest)?;
+    let hooks = manifest
+        .get("hooks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Cursor hooks must be an object"))?;
+    hooks.iter().map(|(event, entries)| {
+        let command = entries.as_array().and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("command")).and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Cursor hook {event:?} is missing its command"))?;
         let response = if event == "beforeSubmitPrompt" { r#"{"continue":true}"# } else { "{}" };
         let command = if windows {
             powershell_encoded_command(&format!(
@@ -61,7 +79,7 @@ fn capture_specs(windows: bool) -> Vec<(String, String)> {
         } else {
             format!("{USER_HOOK_ENV}=1 {command} >/dev/null 2>/dev/null || true; printf '%s\\n' '{response}' # {CAPTURE_MARKER}")
         };
-        (event.clone(), command)
+        Ok((event.clone(), command))
     }).collect()
 }
 
@@ -70,7 +88,10 @@ pub(crate) fn user_capture_hook_is_installed_at(config_dir: &Path, event: &str) 
     let Ok(config) = load_object(&config_dir.join("hooks.json")) else {
         return false;
     };
-    persistent_specs()
+    let Ok(specs) = persistent_specs() else {
+        return false;
+    };
+    specs
         .iter()
         .find(|(name, _)| name == event)
         .is_some_and(|(event, command)| capture_entry_is_registered(&config, event, command))
@@ -193,7 +214,7 @@ fn apply_specs(
                 anyhow::anyhow!("Cursor hooks must be a JSON object: {}", path.display())
             })?;
 
-        let persistent = specs == persistent_specs();
+        let persistent = specs == persistent_specs()?;
         if persistent {
             for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
                 entries.retain(|entry| {
@@ -258,7 +279,10 @@ pub(crate) fn capture_hooks_are_installed_at(config_dir: &Path) -> bool {
     let Ok(config) = load_object(&path) else {
         return false;
     };
-    persistent_specs()
+    let Ok(specs) = persistent_specs() else {
+        return false;
+    };
+    specs
         .iter()
         .all(|(event, command)| capture_entry_is_registered(&config, event, command))
 }
@@ -311,6 +335,23 @@ mod tests {
     use crate::setup::common::write_object_atomic_with;
 
     #[test]
+    fn invalid_capture_manifest_returns_an_error() {
+        for windows in [false, true] {
+            for manifest in [
+                "{",
+                r#"{"hooks":[]}"#,
+                r#"{"hooks":{"stop":[]}}"#,
+                r#"{"hooks":{"stop":[{"command":7}]}}"#,
+            ] {
+                assert!(
+                    capture_specs_from_manifest(manifest, windows).is_err(),
+                    "{manifest}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn persistent_setup_reconciles_changed_commands_and_retired_events() {
         for windows in [false, true] {
             for enable in [false, true] {
@@ -347,10 +388,10 @@ mod tests {
                 write_object_atomic_with(&path, config, FileAccess::Inherited).unwrap();
 
                 // Disable must clean an old install even before it is upgraded.
-                apply(&config_dir, persistent_specs(), enable).unwrap();
-                apply(&config_dir, persistent_specs(), enable).unwrap();
+                apply(&config_dir, persistent_specs().unwrap(), enable).unwrap();
+                apply(&config_dir, persistent_specs().unwrap(), enable).unwrap();
                 assert_eq!(capture_hooks_are_installed_at(&config_dir), enable);
-                for (event, _) in persistent_specs() {
+                for (event, _) in persistent_specs().unwrap() {
                     assert_eq!(
                         user_capture_hook_is_installed_at(&config_dir, event),
                         enable
@@ -362,6 +403,7 @@ mod tests {
                 let mut expected_stop = preserved.as_array().unwrap().clone();
                 if enable {
                     let (_, command) = persistent_specs()
+                        .unwrap()
                         .iter()
                         .find(|(event, _)| event == "stop")
                         .unwrap();
@@ -369,7 +411,7 @@ mod tests {
                 }
                 assert_eq!(config["hooks"]["stop"], Value::Array(expected_stop));
 
-                apply(&config_dir, persistent_specs(), false).unwrap();
+                apply(&config_dir, persistent_specs().unwrap(), false).unwrap();
                 assert!(!capture_hooks_are_installed_at(&config_dir));
                 let config = load_object(&path).unwrap();
                 assert_eq!(config["hooks"]["stop"], preserved);
@@ -389,7 +431,7 @@ mod tests {
         std::fs::write(&bt, "#!/bin/sh\ncat > \"$CAPTURE_PAYLOAD\"\nprintf '%s\\n' \"$BT_TRACE_CURSOR_USER_HOOK $*\" > \"$CAPTURE_ARGS\"\nprintf 'CLI help'\nexit 2\n").unwrap();
         std::fs::set_permissions(&bt, std::fs::Permissions::from_mode(0o755)).unwrap();
         let payload = br#"{"conversation_id":"session","hook_event_name":"stop"}"#;
-        for (event, command) in capture_specs(false) {
+        for (event, command) in capture_specs(false).unwrap() {
             let mut child = crate::subprocess::interactive_command("/bin/sh")
                 .args(["-c", &command])
                 .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
@@ -422,7 +464,7 @@ mod tests {
         use base64::Engine;
         let manifest: Value = serde_json::from_str(super::super::HOOKS_MANIFEST).unwrap();
         for windows in [false, true] {
-            let specs = capture_specs(windows);
+            let specs = capture_specs(windows).unwrap();
             assert_eq!(specs.len(), manifest["hooks"].as_object().unwrap().len());
             for (event, command) in specs {
                 let script = if windows {
@@ -459,7 +501,7 @@ mod tests {
     fn capture_health_requires_each_event() {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".cursor");
-        apply(&config_dir, persistent_specs(), true).unwrap();
+        apply(&config_dir, persistent_specs().unwrap(), true).unwrap();
         assert!(capture_hooks_are_installed_at(&config_dir));
 
         let hooks_path = config_dir.join("hooks.json");
@@ -560,7 +602,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".cursor");
 
-        apply(&config_dir, persistent_specs(), false).unwrap();
+        apply(&config_dir, persistent_specs().unwrap(), false).unwrap();
 
         assert!(!config_dir.exists());
     }

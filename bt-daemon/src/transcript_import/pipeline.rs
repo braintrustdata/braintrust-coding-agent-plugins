@@ -308,7 +308,7 @@ impl ImportProcessor {
             let live = match self.sessions.get_mut(&sid) {
                 Some(live) => live,
                 None => {
-                    let translator = self.opts.translators.create(&env.source, &sid);
+                    let translator = self.opts.translators.create_checked(&env.source, &sid)?;
                     let sink = self.opts.sink_factory.create(&sid, &env.source)?;
                     let sink: Box<dyn Sink> = Box::new(
                         delivery_ledger::LedgerSink::new(
@@ -344,7 +344,9 @@ impl ImportProcessor {
                             diagnostics_dir: self.ledger_dir.clone(),
                         },
                     );
-                    self.sessions.get_mut(&sid).unwrap()
+                    self.sessions.get_mut(&sid).ok_or_else(|| {
+                        anyhow::anyhow!("import session {sid:?} was not initialized")
+                    })?
                 }
             };
             if let Some(cfg) = &env.config {

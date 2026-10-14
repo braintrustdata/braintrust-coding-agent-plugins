@@ -114,7 +114,12 @@ impl DeliveryLedger {
     }
 
     async fn save(&self, span_origins: &HashMap<String, OriginSnapshot>) -> anyhow::Result<()> {
-        let parent = self.path.parent().expect("ledger path has a parent");
+        let parent = self.path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "delivery ledger path has no parent: {}",
+                self.path.display()
+            )
+        })?;
         tokio::fs::create_dir_all(parent).await?;
         let temp = self
             .path

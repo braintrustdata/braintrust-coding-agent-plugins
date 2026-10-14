@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Integration test assertions and fixtures fail immediately on unexpected values."
+)]
+
 //! Consumer-visible provenance through capture, journal replay, dispatch, and HTTP ingest.
 
 use async_trait::async_trait;

@@ -51,7 +51,6 @@ impl Daemon {
         let key = self
             .route_aliases
             .lock()
-            .unwrap()
             .get(&requested_key)
             .cloned()
             .unwrap_or_else(|| requested_key.clone());
@@ -109,7 +108,9 @@ impl Daemon {
             route.auth = lease.selection.clone();
             if let Err(error) = crate::settings::migrate_persisted_route(
                 &env.source,
-                env.route.as_ref().expect("route checked above"),
+                env.route.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("session route is missing during profile migration")
+                })?,
                 &route,
             ) {
                 tracing::warn!(source = %env.source, "could not migrate legacy profile route: {error}");
@@ -119,7 +120,6 @@ impl Daemon {
         if canonical_key != requested_key {
             self.route_aliases
                 .lock()
-                .unwrap()
                 .insert(requested_key, canonical_key.clone());
         }
         env.route = Some(route.clone());
@@ -128,7 +128,7 @@ impl Daemon {
             .lock()
             .await
             .insert(canonical_key.clone(), SessionAuthState { route, lease });
-        self.auth_errors.lock().unwrap().remove(&canonical_key);
+        self.auth_errors.lock().remove(&canonical_key);
         Ok(canonical_key)
     }
 
@@ -136,7 +136,6 @@ impl Daemon {
     pub(super) fn record_auth_error(&self, key: &DeliveryKey, source: &str, message: String) {
         self.auth_errors
             .lock()
-            .unwrap()
             .insert(key.clone(), (source.to_string(), message));
     }
 
@@ -200,7 +199,7 @@ impl Daemon {
                 lease,
             },
         );
-        let session = { self.sessions.lock().unwrap().get(key).cloned() };
+        let session = { self.sessions.lock().get(key).cloned() };
         if let Some(session) = session {
             session.configure(config).await?;
         }

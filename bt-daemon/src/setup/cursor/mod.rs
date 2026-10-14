@@ -336,7 +336,7 @@ fn with_capture_hooks(
     install: bool,
     change_plugin: impl FnOnce(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let specs = hooks::persistent_specs();
+    let specs = hooks::persistent_specs()?;
     hooks::validate(config_dir, specs, install)?;
     change_plugin(plugin_dir)?;
     hooks::apply(config_dir, specs, install)

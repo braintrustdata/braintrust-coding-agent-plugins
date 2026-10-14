@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Integration test assertions and fixtures fail immediately on unexpected values."
+)]
+
 //! Phase 1 end-to-end: hook client → UDS → dispatch → journal → translate →
 //! debug sink. Runs the daemon in-process on a temp socket (no process
 //! spawning, so it's deterministic).

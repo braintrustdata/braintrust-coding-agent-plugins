@@ -284,7 +284,9 @@ impl BraintrustSink {
 
     fn update_open(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         self.ensure_handle(client, row)?;
-        let handle = self.open.get(&row.span_id).expect("just inserted");
+        let handle = self.open.get(&row.span_id).ok_or_else(|| {
+            anyhow::anyhow!("span handle was not initialized for {}", row.span_id)
+        })?;
         handle.log(build_log(row, &self.source, false)?);
         if let Some(end) = row.end_ms {
             handle.end_with_time(ms_to_secs(end));
@@ -429,7 +431,7 @@ impl Sink for BraintrustSink {
                 let pending = self
                     .pending_roots
                     .remove(&root_id)
-                    .expect("pending root checked");
+                    .ok_or_else(|| anyhow::anyhow!("pending root {root_id} is missing"))?;
                 for pending_op in pending {
                     self.emit_op(&pending_op).await?;
                     n += 1;
@@ -458,14 +460,10 @@ impl Sink for BraintrustSink {
     }
 }
 
-fn span_id(op: &SpanOp) -> Option<&str> {
-    match op {
-        SpanOp::Insert(row) | SpanOp::Merge(row) => Some(&row.span_id),
-    }
-}
-
 fn op_span_id(op: &SpanOp) -> &str {
-    span_id(op).expect("span operation always has an id")
+    match op {
+        SpanOp::Insert(row) | SpanOp::Merge(row) => &row.span_id,
+    }
 }
 
 fn direct_pending_parent(

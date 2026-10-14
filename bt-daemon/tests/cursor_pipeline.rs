@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "Integration test assertions and fixtures fail immediately on unexpected values."
+)]
+
 //! Cursor hooks freeze native transcript observations before journal ingress.
 //! Recovery must use those mirrors even after native files change or disappear.
 
