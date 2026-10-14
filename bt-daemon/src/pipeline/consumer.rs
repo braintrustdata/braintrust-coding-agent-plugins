@@ -751,4 +751,56 @@ mod tests {
         assert_eq!(record.submitted.load(Ordering::SeqCst), 2);
         consumer.shutdown().await;
     }
+    #[tokio::test]
+    async fn editing_a_predecessor_releases_a_later_plugins_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first.mjs");
+        let last = tmp.path().join("last.mjs");
+        std::fs::write(&first, "export default span => ({...span,name:'bad'})").unwrap();
+        std::fs::write(&last,"export default span => {if(span.name==='bad') throw new Error('bad input'); return span}").unwrap();
+        let last_digest = crate::span_processor::file_digest(&last);
+        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        stored(&journal).await;
+        let route = SessionRoute {
+            span_plugins: vec![first.clone(), last.clone()],
+            ..Default::default()
+        };
+        let record = Arc::new(Recording::default());
+        let consumer = Consumer::spawn(
+            journal.clone(),
+            journal.subscribe(&route, 0).await.unwrap(),
+            options(tmp.path(), &route, record.clone()),
+        );
+        wait_for(|| consumer.error.lock().unwrap().is_some()).await;
+        let failure: Failure = serde_json::from_str(
+            &journal
+                .failure(&serde_json::to_string(&route).unwrap())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("unrelated.mjs"),
+            "export default span => span",
+        )
+        .unwrap();
+        let config = consumer.config.borrow().clone();
+        assert!(matches!(
+            (Recovery {
+                config: Some(&config),
+                version: "test"
+            })
+            .process(&failure)
+            .await,
+            RecoveryOutcome::Waiting
+        ));
+        std::fs::write(&first, "export default span => ({...span,name:'good'})").unwrap();
+        wait_for(|| *consumer.progress.borrow() == 1).await;
+        assert_eq!(crate::span_processor::file_digest(&last), last_digest);
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
+        consumer.shutdown().await;
+    }
 }

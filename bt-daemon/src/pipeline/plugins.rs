@@ -21,6 +21,7 @@ pub(crate) struct Plugins {
 pub(crate) struct PluginRejected {
     pub failure: crate::span_processor::PluginFailure,
     pub digest: Option<[u8; 32]>,
+    pub processors: Vec<Option<[u8; 32]>>,
 }
 impl std::fmt::Display for PluginRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -53,7 +54,11 @@ impl Stage for Plugins {
     async fn process(&mut self, input: &SpanOp) -> PluginOutcome {
         if let Some((paths, failure)) = &self.blocked {
             if paths == &self.paths
-                && span_processor::file_digest(&failure.failure.path) == failure.digest
+                && paths
+                    .iter()
+                    .map(|path| span_processor::file_digest(path))
+                    .collect::<Vec<_>>()
+                    == failure.processors
             {
                 let mut failure = failure.clone();
                 failure.failure.newly_seen = false;
@@ -65,7 +70,12 @@ impl Stage for Plugins {
             Ok(result) => match (result.op, result.failure) {
                 (_, Some(failure)) => {
                     let digest = span_processor::failed_digest(&failure.path);
-                    let failure = PluginRejected { failure, digest };
+                    let processors = span_processor::chain_digests(&self.paths, &failure.path);
+                    let failure = PluginRejected {
+                        failure,
+                        digest,
+                        processors,
+                    };
                     self.blocked = Some((self.paths.clone(), failure.clone()));
                     PluginOutcome::Failed(failure)
                 }

@@ -37,6 +37,8 @@ pub(crate) enum Condition {
         path: PathBuf,
         digest: Option<[u8; 32]>,
         chain: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        processors: Option<Vec<Option<[u8; 32]>>>,
     },
     Configuration {
         signature: String,
@@ -135,6 +137,7 @@ impl Failure {
                 path: plugin.failure.path.clone(),
                 digest: plugin.digest,
                 chain: chain(config),
+                processors: Some(plugin.processors.clone()),
             };
         } else if let Some(error) = error.downcast_ref::<braintrust_sdk_rust::BraintrustError>() {
             use braintrust_sdk_rust::BraintrustError;
@@ -251,9 +254,20 @@ impl Stage for Recovery<'_> {
                 path,
                 digest,
                 chain: previous,
+                processors,
             } => {
                 self.config.is_some_and(|config| chain(config) != *previous)
                     || crate::span_processor::file_digest(path) != *digest
+                    || processors.as_ref().is_some_and(|previous| {
+                        self.config.is_some_and(|config| {
+                            config
+                                .span_plugins
+                                .iter()
+                                .map(|path| crate::span_processor::file_digest(path))
+                                .collect::<Vec<_>>()
+                                != *previous
+                        })
+                    })
             }
             Condition::Configuration {
                 signature,
