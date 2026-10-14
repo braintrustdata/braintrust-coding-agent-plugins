@@ -50,7 +50,7 @@ impl Progress {
 
 pub(crate) struct Translation {
     tx: mpsc::Sender<Command>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub journal: SpanJournal,
     pub error: Arc<Mutex<Option<String>>>,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
@@ -114,7 +114,7 @@ impl Translation {
         let task = tokio::spawn(actor.run(rx));
         Ok(Arc::new(Self {
             tx,
-            task: Mutex::new(Some(task)),
+            task: tokio::sync::Mutex::new(Some(task)),
             journal,
             error,
             recovery,
@@ -124,9 +124,12 @@ impl Translation {
     }
     pub async fn shutdown(&self) {
         let _ = self.tx.send(Command::Stop).await;
-        let task = self.task.lock().take();
-        if let Some(task) = task {
+        let mut task = self.task.lock().await;
+        if let Some(task) = task.take() {
             let _ = task.await;
+        }
+        if let Err(error) = self.journal.close().await {
+            tracing::warn!(%error, "SpanOp journal could not be closed during source shutdown");
         }
     }
     pub async fn observe(&self, observer: Observation) -> anyhow::Result<()> {

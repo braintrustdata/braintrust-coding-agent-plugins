@@ -25,7 +25,7 @@ impl std::error::Error for BindingChanged {}
 
 #[derive(Clone)]
 pub(crate) struct SpanJournal {
-    connection: Arc<Mutex<Connection>>,
+    connection: Arc<Mutex<Option<Connection>>>,
     changed: watch::Sender<u64>,
 }
 
@@ -107,7 +107,7 @@ impl SpanJournal {
         .await??;
         let (changed, _) = watch::channel(0);
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection: Arc::new(Mutex::new(Some(connection))),
             changed,
         })
     }
@@ -121,7 +121,27 @@ impl SpanJournal {
             let mut db = db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("SpanOp storage lock poisoned"))?;
-            operation(&mut db)
+            operation(
+                db.as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("SpanOp journal is closed"))?,
+            )
+        })
+        .await?
+    }
+
+    /// Closing the shared cell also covers cancelled reads whose blocking
+    /// jobs can outlive their actor. Queued jobs cannot reopen the connection.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        let connection = self.connection.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let database = connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("SpanOp storage lock poisoned"))?
+                .take();
+            if let Some(database) = database {
+                database.close().map_err(|(_, error)| error)?;
+            }
+            Ok(())
         })
         .await?
     }
@@ -762,5 +782,34 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+    #[tokio::test]
+    async fn close_releases_storage_even_when_a_blocking_read_was_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spans.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let reader = journal.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let read = tokio::spawn(async move {
+            reader
+                .with_db(move |_| {
+                    let _ = entered.send(());
+                    blocked.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started.await.unwrap();
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        let closing = journal.clone();
+        let close = tokio::spawn(async move { closing.close().await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!close.is_finished());
+        release.send(()).unwrap();
+        close.await.unwrap().unwrap();
+        assert!(journal.tail().await.is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }
