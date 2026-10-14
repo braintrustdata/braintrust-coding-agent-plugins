@@ -265,14 +265,17 @@ impl SpanJournal {
 
     /// A completed subscription can remain dormant until its source has new work.
     pub async fn route_complete(&self, route: &SessionRoute, input: u64) -> anyhow::Result<bool> {
-        let route = serde_json::to_string(route)?;
+        let route = route.clone();
         self.with_db(move |db| {
-            Ok(db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM heads WHERE route=? AND failure IS NULL
-                AND position >= (SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1))
-                AND (SELECT coalesce(max(input),0) FROM batches WHERE committed=1)>=?",
-                params![route,input], |row| row.get(0),
-            )?)
+            let committed: u64 = db.query_row("SELECT coalesce(max(input),0) FROM batches WHERE committed=1",[],|r|r.get(0))?;
+            if committed < input {return Ok(false);}
+            let tail: u64 = db.query_row("SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1",[],|r|r.get(0))?;
+            let mut query = db.prepare("SELECT route FROM heads WHERE failure IS NULL AND position>=?")?;
+            for stored in query.query_map([tail],|r|r.get::<_,String>(0))? {
+                let stored: SessionRoute = serde_json::from_str(&stored?)?;
+                if stored.same_route(&route) {return Ok(true);}
+            }
+            Ok(false)
         }).await
     }
 
@@ -592,5 +595,34 @@ mod tests {
         assert!(journal.failure(&reader.route).await.unwrap().is_none());
         reader.rewind().await.unwrap();
         assert!(reader.next_batch(8).await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn a_completed_canonical_head_also_covers_its_legacy_named_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        journal.begin(10, true).await.unwrap();
+        journal.append(10, &[op("one")]).await.unwrap();
+        journal.commit(10).await.unwrap();
+        let mut legacy = route("work");
+        legacy.auth.profile = Some("work".into());
+        let mut canonical = legacy.clone();
+        canonical.auth.profile_id = Some("profile-id".into());
+        let mut head = journal.subscribe(&canonical, 0).await.unwrap();
+        head.next_batch(8)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_completed()
+            .await
+            .ok()
+            .unwrap();
+        assert!(journal.route_complete(&legacy, 10).await.unwrap());
+        let mut other_profile = canonical.clone();
+        other_profile.auth.profile_id = Some("different-id".into());
+        assert!(!journal.route_complete(&other_profile, 10).await.unwrap());
+        legacy.tags.push("different route".into());
+        assert!(!journal.route_complete(&legacy, 10).await.unwrap());
     }
 }

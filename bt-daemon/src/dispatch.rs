@@ -39,7 +39,7 @@ enum SessionMsg {
     Barrier(oneshot::Sender<()>),
     Flush(oneshot::Sender<u64>),
     Finalize(oneshot::Sender<u64>),
-    Shutdown(oneshot::Sender<()>),
+    Shutdown(Option<u64>, oneshot::Sender<()>),
 }
 
 /// Where to rebuild a session's translator state from, streamed at startup.
@@ -155,18 +155,22 @@ impl Session {
                             tokio::select! { _=reply.closed()=>{}, pending=waiting=> { let _=reply.send(pending); } }
                         });
                     }
-                    SessionMsg::Shutdown(reply) => {
-                        if producer.routes.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            // Process retirement is not a native session end.
-                            if let Ok(tail) =
-                                producer.control(crate::journal::ControlKind::Retire).await
-                            {
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(2),
-                                    route.through(tail),
-                                )
-                                .await;
-                            }
+                    SessionMsg::Shutdown(target, reply) => {
+                        let last = producer.routes.fetch_sub(1, Ordering::Relaxed) == 1;
+                        let target = match target {
+                            Some(tail) => Some(tail),
+                            None if last => producer
+                                .control(crate::journal::ControlKind::Retire)
+                                .await
+                                .ok(),
+                            None => None,
+                        };
+                        if let Some(tail) = target {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                route.through(tail),
+                            )
+                            .await;
                         }
                         route.shutdown().await;
                         if producer.routes.load(Ordering::Relaxed) == 0 {
@@ -279,8 +283,17 @@ impl Session {
     /// Drain, flush, and stop the actor (used on daemon shutdown and when an
     /// idle session is retired).
     pub async fn shutdown(&self) {
+        self.shutdown_through(None).await;
+    }
+
+    pub(crate) async fn shutdown_through(&self, tail: Option<u64>) {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.tx.send(SessionMsg::Shutdown(reply_tx)).await.is_ok() {
+        if self
+            .tx
+            .send(SessionMsg::Shutdown(tail, reply_tx))
+            .await
+            .is_ok()
+        {
             let _ = reply_rx.await;
         }
     }

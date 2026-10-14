@@ -123,20 +123,33 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     if let Err(error) = resolve_pending_sessions(daemon, |_| true).await {
         tracing::warn!(%error, "pending correlation events retained for recovery during shutdown");
     }
-    // Publish shared retirement output before stopping any route subscriber.
+    // Publish each source's retirement boundary once, then give every route
+    // a chance to consume it before its actor stops.
     let sources: Vec<_> = daemon
         .translations
         .lock()
         .unwrap()
-        .values()
-        .cloned()
+        .iter()
+        .map(|(key, source)| (key.clone(), source.clone()))
         .collect();
-    for source in sources {
-        let _ = source.control(crate::journal::ControlKind::Retire).await;
+    let mut targets = HashMap::new();
+    for (key, source) in sources {
+        if let Ok(tail) = source.control(crate::journal::ControlKind::Retire).await {
+            targets.insert(key, tail);
+        }
     }
-    let sessions: Vec<Arc<Session>> = daemon.sessions.lock().unwrap().values().cloned().collect();
-    for s in sessions {
-        s.shutdown().await;
+    let sessions: Vec<_> = daemon
+        .sessions
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(key, session)| (key.clone(), session.clone()))
+        .collect();
+    for (key, session) in sessions {
+        let target = targets
+            .get(&crate::ids::session_namespace(&key.source, &key.session_id))
+            .copied();
+        session.shutdown_through(target).await;
     }
     let sources: Vec<_> = daemon
         .translations
