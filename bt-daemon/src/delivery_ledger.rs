@@ -8,7 +8,7 @@
 //! destination still receives the full trace.
 
 use crate::sink::Sink;
-use crate::translate::{OriginSnapshot, SpanOp, SpanRow, SpanType};
+use crate::translate::{OriginSnapshot, SpanOp, SpanRow};
 use crate::wire::SessionConfig;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -232,16 +232,10 @@ impl Sink for LedgerSink {
             let row = match op {
                 SpanOp::Insert(row) | SpanOp::Merge(row) => row,
             };
-            let is_root = row.span_type == SpanType::Task
-                && match self.attached_parent.as_deref() {
-                    Some(parent) => {
-                        row.parent_span_ids.len() == 1
-                            && row.parent_span_ids[0] == parent
-                            && row.span_id != parent
-                    }
-                    None => row.parent_span_ids.is_empty(),
-                };
-            if is_insert && (is_root || row.is_turn) {
+            // Every span emitted by the integration has plugin provenance,
+            // including LLM, tool, compaction, and subagent spans. Never stamp
+            // an external parent that the session merely attaches to.
+            if is_insert && self.attached_parent.as_deref() != Some(row.span_id.as_str()) {
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     self.span_origins.entry(row.span_id.clone())
                 {
@@ -253,7 +247,7 @@ impl Sink for LedgerSink {
                     self.origins_dirty = true;
                 }
             }
-            // Stamp only known session roots and turns, including stateless updates.
+            // Repeat each span's birth snapshot, including stateless updates.
             // This also discards provenance supplied by a span-processing plugin.
             row.origin = self.span_origins.get(&row.span_id).cloned();
         }
@@ -298,7 +292,7 @@ impl Sink for LedgerSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::SpanRow;
+    use crate::translate::{SpanRow, SpanType};
     use crate::wire::{BackendAuth, FlushMode, TraceDestination};
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -377,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_turn_snapshot_survives_recovery_before_delivery_checkpoint() {
+    async fn open_span_snapshots_survive_recovery_before_delivery_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
         let config = config("project-a");
         let mut first = LedgerSink::new(
@@ -397,7 +391,25 @@ mod tests {
             is_turn: true,
             ..Default::default()
         };
-        first.emit(&[SpanOp::Insert(turn.clone())]).await.unwrap();
+        let llm = SpanRow {
+            span_id: "llm".into(),
+            span_type: SpanType::Llm,
+            is_turn: false,
+            ..turn.clone()
+        };
+        let tool = SpanRow {
+            span_id: "tool".into(),
+            span_type: SpanType::Tool,
+            ..llm.clone()
+        };
+        first
+            .emit(&[
+                SpanOp::Insert(turn.clone()),
+                SpanOp::Insert(llm.clone()),
+                SpanOp::Insert(tool.clone()),
+            ])
+            .await
+            .unwrap();
         // Lose in-memory state without flushing/checkpointing delivery.
         drop(first);
 
@@ -418,6 +430,10 @@ mod tests {
             .emit(&[
                 SpanOp::Insert(turn.clone()),
                 partial_merge("turn-1"),
+                SpanOp::Insert(llm),
+                partial_merge("llm"),
+                SpanOp::Insert(tool),
+                partial_merge("tool"),
                 SpanOp::Insert(SpanRow {
                     span_id: "turn-2".into(),
                     ..turn.clone()
@@ -431,23 +447,22 @@ mod tests {
             .await
             .unwrap();
         let rows = output.lock();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 8);
         for op in rows.iter() {
             let row = match op {
                 SpanOp::Insert(row) | SpanOp::Merge(row) => row,
             };
             let expected = match row.span_id.as_str() {
-                "turn-1" => Some(OriginSnapshot {
+                "turn-1" | "llm" | "tool" => Some(OriginSnapshot {
                     plugin_version: None,
                     source_version: Some("native1".into()),
                     bt_version: "bt1".into(),
                 }),
-                "turn-2" => Some(OriginSnapshot {
+                "turn-2" | "subagent-container" => Some(OriginSnapshot {
                     plugin_version: Some("v2".into()),
                     source_version: Some("native2".into()),
                     bt_version: "bt2".into(),
                 }),
-                "subagent-container" => None,
                 unexpected => panic!("unexpected span: {unexpected}"),
             };
             assert_eq!(row.origin, expected, "{}", row.span_id);

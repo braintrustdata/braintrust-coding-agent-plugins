@@ -247,8 +247,8 @@ downgrade it.
 }
 ```
 
-The shared delivery path snapshots provenance independently on the coding-agent
-session root and each turn:
+The shared delivery path snapshots provenance independently on every coding-agent
+span, including session roots, turns, LLM, tool, compaction, and subagent spans:
 `context.span_origin.name = "braintrust.plugin.<source>"`,
 `context.span_origin.version` is the span-creating event's capture package
 version, `context.span_origin.<source>.version` is its coding-agent
@@ -258,11 +258,11 @@ not a literal `agent` key. Unknown plugin and agent versions are explicit JSON
 `null`; they never fall back to another component's version. The
 destination-scoped delivery ledger persists each snapshot before export; later
 updates, resume, and replay reuse it unchanged, even across upgrades.
-New turns capture new snapshots instead of inheriting the root's versions.
+New spans capture new snapshots instead of inheriting the root's versions.
 Provisional roots retain their original snapshot while waiting for work.
-An unmaterialized root or turn replayed for a new destination uses its
-span-creating journaled event, not the event that triggered recovery. Other
-descendants do not receive these snapshots. Transcript backfills capture
+An unmaterialized span replayed for a new destination uses its
+span-creating journaled event, not the event that triggered recovery. No
+coding-agent span falls back to Rust SDK provenance. Transcript backfills capture
 versions available at materialization, not unrecorded historical versions. See the
 [span-origin contract](../../docs/coding-agent-tracing-plugin-spec.md#621-span-origin-versions).
 
@@ -270,7 +270,7 @@ For acknowledged spans from legacy ledgers without saved snapshots, stateless
 updates omit `context.span_origin` entirely, including SDK defaults and inherited
 parent origin fields. This preserves existing backend provenance without guessing
 historical versions; output, timing, and unrelated propagated context still merge
-normally. New turns receive fresh snapshots.
+normally. New spans receive fresh snapshots.
 
 Field notes:
 

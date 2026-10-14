@@ -242,32 +242,8 @@ fn turn_id(rows: &[Value], prompt_ts: i64) -> String {
         .to_owned()
 }
 
-fn assert_non_turn_provenance(rows: &[Value], root: &str, turns: &[&str]) {
-    let children: Vec<_> = rows
-        .iter()
-        .filter(|row| {
-            row["root_span_id"] == root
-                && row["span_id"] != root
-                && !turns.iter().any(|turn| row["span_id"] == *turn)
-        })
-        .collect();
-    assert!(!children.is_empty(), "expected ingested non-turn work");
-    for row in children {
-        if let Some(origin) = row["context"].get("span_origin") {
-            assert_eq!(origin["name"], "braintrust.sdk.rust");
-            assert!(origin.get("bt").is_none());
-            assert!(origin.get("claude-code").is_none());
-            assert!(origin.get("agent").is_none());
-            assert_ne!(origin["instrumentation"]["name"], "braintrust-plugin");
-        } else {
-            assert_eq!(row["_is_merge"], true, "insert omitted SDK origin: {row}");
-        }
-        assert!(row["metadata"].get("bt_daemon_version").is_none());
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn root_and_turn_birth_snapshots_survive_version_changes_and_daemon_restart() {
+async fn span_birth_snapshots_survive_version_changes_and_daemon_restart() {
     let server = mock_backend().await;
     let tmp = tempfile::tempdir().unwrap();
     let plugin = tmp.path().join("origin-plugin.mjs");
@@ -311,23 +287,6 @@ async fn root_and_turn_birth_snapshots_survive_version_changes_and_daemon_restar
             .filter(|row| row["root_span_id"] == root)
             .collect();
         let turn1 = turn_id(&session_rows, 1_000);
-        assert_provenance(
-            &session_rows,
-            &root,
-            "claude-code",
-            birth_plugin,
-            birth_source,
-            "bt1",
-        );
-        assert_provenance(
-            &session_rows,
-            &turn1,
-            "claude-code",
-            birth_plugin,
-            birth_source,
-            "bt1",
-        );
-
         // Opening a new turn also updates the previous turn. Neither unknown
         // nor known birth versions may be overwritten by this newer capture.
         first
@@ -360,40 +319,27 @@ async fn root_and_turn_birth_snapshots_survive_version_changes_and_daemon_restar
             .collect();
         let turn2 = turn_id(&session_rows, 2_000);
         assert_ne!(turn1, turn2);
-        assert_provenance(
-            &session_rows,
-            &root,
-            "claude-code",
-            birth_plugin,
-            birth_source,
-            "bt1",
-        );
-        assert_provenance(
-            &session_rows,
-            &turn1,
-            "claude-code",
-            birth_plugin,
-            birth_source,
-            "bt1",
-        );
-        assert_provenance(
-            &session_rows,
-            &turn2,
-            "claude-code",
-            Some("v2"),
-            Some("native2"),
-            "bt1",
-        );
-        assert_non_turn_provenance(&session_rows, &root, &[&turn1, &turn2]);
-        assert!(session_rows
+        let tool = session_rows
             .iter()
-            .any(|row| { row["span_id"] == turn2 && row["metadata"]["origin_plugin"] == true }));
-        sessions.push((session, birth_plugin, birth_source, root, turn1, turn2));
+            .find(|row| row["span_attributes"]["type"] == "tool")
+            .expect("tool span was not ingested")["span_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        sessions.push((
+            session,
+            birth_plugin,
+            birth_source,
+            root,
+            turn1,
+            turn2,
+            tool,
+        ));
     }
     first.stop().await;
 
     let second = Daemon::start(tmp.path(), &server, "bt2").await;
-    for (session, birth_plugin, birth_source, root, turn1, turn2) in sessions {
+    for (session, birth_plugin, birth_source, root, turn1, turn2, tool) in sessions {
         let before = logs3_rows(&server).await.len();
         second
             .send(&capture(
@@ -420,7 +366,9 @@ async fn root_and_turn_birth_snapshots_survive_version_changes_and_daemon_restar
         assert_ne!(turn3, turn2);
         // Graceful shutdown completed these spans; recovery must not redeliver them.
         assert!(rows[before..].iter().all(|row| {
-            row["span_id"] != root && row["span_id"] != turn1 && row["span_id"] != turn2
+            ![&root, &turn1, &turn2, &tool]
+                .iter()
+                .any(|span| row["span_id"] == **span)
         }));
         assert_provenance(
             &rows[before..],
@@ -430,33 +378,23 @@ async fn root_and_turn_birth_snapshots_survive_version_changes_and_daemon_restar
             Some("native3"),
             "bt2",
         );
-        // Check every exported update, including any replayed history, rather
-        // than just the final merged row visible to a consumer.
-        assert_provenance(
-            &rows,
-            &root,
-            "claude-code",
-            birth_plugin,
-            birth_source,
-            "bt1",
-        );
-        assert_provenance(
-            &rows,
-            &turn1,
-            "claude-code",
-            birth_plugin,
-            birth_source,
-            "bt1",
-        );
-        assert_provenance(
-            &rows,
-            &turn2,
-            "claude-code",
-            Some("v2"),
-            Some("native2"),
-            "bt1",
-        );
-        assert_non_turn_provenance(&rows, &root, &[&turn1, &turn2, &turn3]);
+        // Check all historical rows once: updates must retain birth versions,
+        // including the tool closed by an event with newer capture versions.
+        for (span, plugin_version, source_version) in [
+            (&root, birth_plugin, birth_source),
+            (&turn1, birth_plugin, birth_source),
+            (&turn2, Some("v2"), Some("native2")),
+            (&tool, Some("v2"), Some("native2")),
+        ] {
+            assert_provenance(
+                &rows,
+                span,
+                "claude-code",
+                plugin_version,
+                source_version,
+                "bt1",
+            );
+        }
         assert!(rows[before..]
             .iter()
             .any(|row| { row["span_id"] == turn3 && row["metadata"]["origin_plugin"] == true }));
