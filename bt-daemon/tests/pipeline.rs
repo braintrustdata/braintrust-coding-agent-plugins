@@ -3375,3 +3375,112 @@ async fn status_counts_rows_emitted_before_a_plugin_failure() {
     shutdown(&socket).await;
     handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Shared {
+        started: AtomicUsize,
+        release: tokio::sync::Semaphore,
+        delivered: Mutex<HashSet<String>>,
+    }
+    struct Factory(Arc<Shared>);
+    struct RouteSink {
+        shared: Arc<Shared>,
+        tag: String,
+    }
+    impl SinkFactory for Factory {
+        fn create(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Sink>> {
+            Ok(Box::new(RouteSink {
+                shared: self.0.clone(),
+                tag: String::new(),
+            }))
+        }
+    }
+    #[async_trait]
+    impl Sink for RouteSink {
+        fn configure(&mut self, config: &SessionConfig) {
+            self.tag = config.tags[0].clone();
+        }
+        async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+            if ops.iter().any(|op| match op {
+                SpanOp::Insert(row) | SpanOp::Merge(row) => {
+                    row.parent_span_ids.is_empty() && row.end_ms.is_some()
+                }
+            }) {
+                self.shared.started.fetch_add(1, Ordering::SeqCst);
+                self.shared.release.acquire().await.unwrap().forget();
+                self.shared
+                    .delivered
+                    .lock()
+                    .unwrap()
+                    .insert(self.tag.clone());
+            }
+            Ok(ops.len() as u64)
+        }
+        async fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let shared = Arc::new(Shared {
+        started: AtomicUsize::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        delivered: Mutex::new(HashSet::new()),
+    });
+    let mut opts = debug_serve_options("test", &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
+    opts.sink_factory = Arc::new(Factory(shared.clone()));
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let handle = tokio::spawn(async move { run_serve(args, opts).await.unwrap() });
+    wait_for(&socket).await;
+    for tag in ["left", "right"] {
+        let mut env = envelope("retirement-routes", "UserPromptSubmit", 1);
+        env.source = "claude-code".into();
+        env.payload = serde_json::json!({"session_id":env.session_id,"hook_event_name":"UserPromptSubmit","prompt":"work"});
+        env.route.as_mut().unwrap().tags = vec![tag.into()];
+        forward_envelope(&env, &socket, &dummy_host(), false)
+            .await
+            .unwrap();
+    }
+    assert!(
+        flush_session("retirement-routes", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    let gate = shared.clone();
+    let release = tokio::spawn(async move {
+        let all_started = tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.started.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        gate.release.add_permits(2);
+        all_started.unwrap();
+    });
+    shutdown(&socket).await;
+    handle.await.unwrap();
+    release.await.unwrap();
+    assert_eq!(
+        *shared.delivered.lock().unwrap(),
+        HashSet::from(["left".into(), "right".into()])
+    );
+    let (head, tail) = head_and_tail(&data_dir);
+    assert_eq!(
+        head, tail,
+        "every route durably completed the retirement output"
+    );
+}
