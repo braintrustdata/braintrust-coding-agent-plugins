@@ -1897,10 +1897,7 @@ fn malformed_hooks_fail_the_event_instead_of_dropping_fields() {
         ("beforeSubmitPrompt", json!({})),
         ("preToolUse", json!({"tool_name":"Shell", "tool_input":{}})),
         ("sessionEnd", json!({"reason":"completed"})),
-        (
-            "subagentStop",
-            json!({"subagent_type":"explore", "status":"completed"}),
-        ),
+        ("subagentStop", json!({"duration_ms":-1})),
     ] {
         let mut translator = Registry::default_agents().create("cursor", "test-session");
         let error = translator
