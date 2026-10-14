@@ -1386,6 +1386,112 @@ fn codex_hook_identified_compaction_is_not_a_user_turn() {
 }
 
 #[test]
+fn codex_user_image_parts_are_preserved_in_turn_and_llm_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let inline_image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let file_id = "file-codex-image-123";
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta", "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "turn_context", "payload": { "model": "gpt-5.5" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03.500Z", "type": "event_msg", "payload": { "type": "user_message", "message": "Describe this" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item", "payload": { "type": "message", "role": "user", "content": [
+            { "type": "input_text", "text": "Describe this" },
+            { "type": "input_image", "image_url": inline_image, "detail": "high" },
+            { "type": "image_url", "image_url": { "url": inline_image, "detail": "low" } }
+        ] } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "A test image." }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 10, "output_tokens": 2 } } } }),
+        json!({ "timestamp": "2026-01-01T00:00:07Z", "type": "event_msg", "payload": { "type": "task_complete", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:08Z", "type": "event_msg", "payload": { "type": "task_started", "turn_id": "t2" } }),
+        json!({ "timestamp": "2026-01-01T00:00:09Z", "type": "response_item", "payload": { "type": "message", "role": "user", "content": [
+            { "type": "input_image", "file_id": file_id }
+        ] } }),
+        json!({ "timestamp": "2026-01-01T00:00:10Z", "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "I can see the image." }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:11Z", "type": "event_msg", "payload": { "type": "token_count", "info": { "last_token_usage": { "input_tokens": 10, "output_tokens": 3 } } } }),
+    ] {
+        append(&transcript, record);
+    }
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let rows = reduce(
+        translator
+            .handle(
+                &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+
+    let first_turn = find(&rows, SpanType::Task, "turn: t1");
+    assert_eq!(
+        first_turn.input,
+        Some(json!([
+            { "type": "text", "text": "Describe this" },
+            { "type": "image_url", "image_url": { "url": inline_image, "detail": "high" } },
+            { "type": "image_url", "image_url": { "url": inline_image, "detail": "low" } }
+        ]))
+    );
+    let first_llm = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm
+                && row
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["turn_id"] == json!("t1"))
+        })
+        .unwrap();
+    assert!(first_llm
+        .input
+        .as_ref()
+        .unwrap()
+        .to_string()
+        .contains(inline_image));
+
+    let second_turn = find(&rows, SpanType::Task, "turn: t2");
+    assert_eq!(
+        second_turn.input,
+        Some(json!([{ "type": "input_image", "file_id": file_id }]))
+    );
+    let second_llm = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm
+                && row
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata["turn_id"] == json!("t2"))
+        })
+        .unwrap();
+    assert!(second_llm
+        .input
+        .as_ref()
+        .unwrap()
+        .to_string()
+        .contains(file_id));
+
+    let replay = translator
+        .handle(
+            &envelope("s", "Stop", transcript.to_str().unwrap(), json!({})),
+            &ctx,
+        )
+        .unwrap();
+    assert!(
+        !replay
+            .iter()
+            .any(|op| matches!(op, SpanOp::Insert(row) if row.span_type == SpanType::Llm)),
+        "re-reading the unchanged rollout must not re-emit media-bearing LLM spans"
+    );
+}
+
+#[test]
 fn codex_compaction_replaces_history_for_following_llms() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout.jsonl");
