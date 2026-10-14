@@ -25,10 +25,7 @@ enum Work {
     Flush,
     Complete(Delivery<()>),
 }
-enum State {
-    Processing,
-    Recovering(Failure, Work),
-}
+type Held = Box<(Failure, Work)>;
 
 pub(crate) struct Consumer {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -117,6 +114,96 @@ impl ConsumerOptions {
         config.auth = lease.auth;
         Ok(())
     }
+
+    fn storage(&self, error: &anyhow::Error, cursor: &Cursor, attempt: u32, work: Work) -> Held {
+        let mut failure = Failure::storage(
+            error,
+            cursor.completed_position() + 1,
+            &self.version,
+            attempt,
+        );
+        failure.boundary = match work {
+            Work::Complete(_) => Boundary::Completion,
+            Work::Flush => Boundary::Ledger,
+            Work::Resubmit => failure.boundary,
+        };
+        Box::new((failure, work))
+    }
+
+    fn routing(
+        &self,
+        error: &anyhow::Error,
+        cursor: &Cursor,
+        config: &SessionConfig,
+        attempt: u32,
+    ) -> Held {
+        if let Some(partial) = error.downcast_ref::<super::routing::EmitFailure>() {
+            self.counters
+                .spans_emitted
+                .fetch_add(partial.emitted, Ordering::Relaxed);
+            if partial.report {
+                tracing::warn!(session_id=%self.session_id, %error, "route processing failed");
+            }
+        }
+        Box::new((
+            Failure::routing(error, cursor.completed_position() + 1, config, attempt),
+            Work::Resubmit,
+        ))
+    }
+
+    // Normal delivery and recovery share the same acceptance/commit path. Only a
+    // rejected batch is resubmitted; accepted work retains its local retry point.
+    async fn finish(
+        &self,
+        cursor: &mut Cursor,
+        sink: &mut Option<RoutingSink>,
+        config: &SessionConfig,
+        attempt: u32,
+        work: Work,
+    ) -> Result<bool, Held> {
+        let completed = !matches!(work, Work::Resubmit);
+        let completion = match work {
+            Work::Resubmit => {
+                // The SDK consumed the rejected batch. Recreate its ledger too,
+                // so in-memory filtering cannot turn a retry into an empty ack.
+                *sink = None;
+                None
+            }
+            Work::Complete(delivery) => Some(delivery),
+            Work::Flush => {
+                let sink = sink.as_mut().expect("accepted delivery retains its sink");
+                sink.flush().await.map_err(|error| {
+                    if error.downcast_ref::<CommitFailure>().is_some() {
+                        self.storage(&error, cursor, attempt, Work::Flush)
+                    } else {
+                        self.routing(&error, cursor, config, attempt)
+                    }
+                })?;
+                *self.permalink.lock().unwrap() = sink.permalink();
+                // Deferred roots keep their prefix unresolved until a child
+                // releases them; the cursor can read ahead without buffering ops.
+                if sink.has_pending_delivery() {
+                    return Ok(false);
+                }
+                Some(cursor.pending_prefix())
+            }
+        };
+        if let Some(delivery) = completion {
+            delivery.into_completed().await.map_err(|unfinished| {
+                self.storage(
+                    &unfinished.error,
+                    cursor,
+                    attempt,
+                    Work::Complete(unfinished.delivery),
+                )
+            })?;
+        }
+        cursor
+            .rewind()
+            .await
+            .map_err(|error| self.storage(&error, cursor, attempt, Work::Resubmit))?;
+        Ok(completed)
+    }
 }
 
 impl Consumer {
@@ -132,342 +219,153 @@ impl Consumer {
             error: options.error.clone(),
         });
         let task = tokio::spawn(async move {
-            let mut sink: Option<RoutingSink> = None;
-            let restored = journal.failure(&cursor.route).await;
-            let mut state = match restored {
-                Ok(Some(raw)) => State::Recovering(
+            let mut sink = None;
+            let mut held = match journal.failure(&cursor.route).await {
+                Ok(Some(raw)) => Some(Box::new((
                     serde_json::from_str(&raw).unwrap_or_else(|_| {
                         Failure::legacy(raw, cursor.completed_position() + 1, &options.config)
                     }),
                     Work::Resubmit,
-                ),
-                Ok(None) => State::Processing,
-                Err(error) => State::Recovering(
-                    Failure::storage(&error, cursor.completed_position() + 1, &options.version, 0),
-                    Work::Resubmit,
-                ),
+                ))),
+                Ok(None) => None,
+                Err(error) => Some(options.storage(&error, &cursor, 0, Work::Resubmit)),
             };
             let mut attempts = 0;
             let mut recorded = None;
             let mut record_retry = 0;
             loop {
-                match state {
-                    State::Recovering(mut failure, work) => {
-                        if matches!(failure.boundary, Boundary::Completion)
-                            && cursor.completed_position()
-                                >= failure.through.unwrap_or(failure.position)
-                            && journal.set_failure(&cursor.route, None).await.is_ok()
-                        {
-                            *options.error.lock().unwrap() = None;
-                            *options.recovery.lock().unwrap() = None;
-                            state = State::Processing;
+                if let Some(pending) = held.take() {
+                    let (mut failure, work) = *pending;
+                    if matches!(failure.boundary, Boundary::Completion)
+                        && cursor.completed_position()
+                            >= failure.through.unwrap_or(failure.position)
+                        && journal.set_failure(&cursor.route, None).await.is_ok()
+                    {
+                        *options.error.lock().unwrap() = None;
+                        *options.recovery.lock().unwrap() = None;
+                        continue;
+                    }
+                    failure.through.get_or_insert(cursor.position());
+                    let encoded = serde_json::to_string(&failure).expect("failure evidence");
+                    if recorded.as_ref() != Some(&encoded)
+                        && super::recovery::now_ms() >= record_retry
+                    {
+                        if options.hold(&journal, &cursor, &mut failure).await {
+                            recorded = Some(encoded.clone());
+                        } else {
+                            record_retry = super::recovery::now_ms().saturating_add(1_000);
+                        }
+                    }
+                    progress.send_replace(cursor.completed_position());
+                    tokio::select! {
+                        _=stop.notified()=>break,
+                        _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},
+                        result=settings.changed()=>if result.is_err() { break; },
+                    }
+                    let mut current = settings.borrow_and_update().clone();
+                    if recorded.as_ref() != Some(&encoded)
+                        || matches!(
+                            (Recovery {
+                                config: Some(&current),
+                                version: &options.version
+                            })
+                            .process(&failure)
+                            .await,
+                            RecoveryOutcome::Waiting
+                        )
+                    {
+                        held = Some(Box::new((failure, work)));
+                        continue;
+                    }
+                    *options.recovery.lock().unwrap() = Some(failure.info(true));
+                    attempts = failure.attempt.saturating_add(1);
+                    if matches!(failure.boundary, Boundary::Credentials) {
+                        if let Err(error) = options.credentials(&cursor.route, &mut current).await {
+                            held = Some(Box::new((
+                                Failure::credentials(
+                                    cursor.completed_position() + 1,
+                                    error.to_string(),
+                                    attempts,
+                                ),
+                                work,
+                            )));
                             continue;
                         }
-                        failure.through.get_or_insert(cursor.position());
-                        let encoded = serde_json::to_string(&failure).expect("failure evidence");
-                        if recorded.as_ref() != Some(&encoded)
-                            && super::recovery::now_ms() >= record_retry
-                        {
-                            if options.hold(&journal, &cursor, &mut failure).await {
-                                recorded = Some(encoded.clone());
-                            } else {
-                                record_retry = super::recovery::now_ms().saturating_add(1_000);
+                        config.send_replace(current.clone());
+                    }
+                    match options
+                        .finish(&mut cursor, &mut sink, &current, attempts, work)
+                        .await
+                    {
+                        Ok(completed) => {
+                            progress.send_replace(cursor.completed_position());
+                            if completed {
+                                *options.error.lock().unwrap() = None;
+                                *options.recovery.lock().unwrap() = None;
+                                recorded = None;
                             }
                         }
+                        Err(failure) => held = Some(failure),
+                    }
+                    continue;
+                }
+                let attempt = async {
+                    let tail = journal.tail().await.map_err(|error| {
+                        options.storage(&error, &cursor, attempts, Work::Resubmit)
+                    })?;
+                    options.counters.queued.store(
+                        tail.saturating_sub(cursor.completed_position()),
+                        Ordering::Relaxed,
+                    );
+                    let received = tokio::select! {
+                        result=InputPort::receive(&mut cursor)=>result,
+                        result=settings.changed()=> {
+                            return if result.is_err() { Ok(None) } else { Ok(Some(false)) };
+                        },
+                    };
+                    let delivery = received.map_err(|error| {
+                        options.storage(&error, &cursor, attempts, Work::Resubmit)
+                    })?;
+                    let Some(delivery) = delivery else {
+                        return Ok(None);
+                    };
+                    let current = settings.borrow_and_update().clone();
+                    if sink.is_none() {
+                        sink = Some(options.sink(&current).await.map_err(|error| {
+                            options.routing(&error, &cursor, &current, attempts)
+                        })?);
+                    }
+                    let routing = sink.as_mut().expect("configured sink");
+                    routing.configure(&current);
+                    let count = routing
+                        .emit(delivery.value())
+                        .await
+                        .map_err(|error| options.routing(&error, &cursor, &current, attempts))?;
+                    options
+                        .counters
+                        .spans_emitted
+                        .fetch_add(count, Ordering::Relaxed);
+                    drop(delivery);
+                    options
+                        .finish(&mut cursor, &mut sink, &current, attempts, Work::Flush)
+                        .await
+                        .map(Some)
+                };
+                let result = tokio::select! {
+                    _=stop.notified()=>break,
+                    result=attempt=>result,
+                };
+                match result {
+                    Ok(None) => break,
+                    Ok(Some(false)) => {}
+                    Ok(Some(true)) => {
                         progress.send_replace(cursor.completed_position());
-                        tokio::select! {
-                            _=stop.notified()=>break,
-                            _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},
-                            result=settings.changed()=>if result.is_err() { break; },
-                        }
-                        let mut current = settings.borrow_and_update().clone();
-                        if recorded.as_ref() != Some(&encoded)
-                            || matches!(
-                                (Recovery {
-                                    config: Some(&current),
-                                    version: &options.version
-                                })
-                                .process(&failure)
-                                .await,
-                                RecoveryOutcome::Waiting
-                            )
-                        {
-                            state = State::Recovering(failure, work);
-                            continue;
-                        }
-                        *options.recovery.lock().unwrap() = Some(failure.info(true));
-                        attempts = failure.attempt.saturating_add(1);
-                        if matches!(failure.boundary, Boundary::Credentials) {
-                            if let Err(error) =
-                                options.credentials(&cursor.route, &mut current).await
-                            {
-                                state = State::Recovering(
-                                    Failure::credentials(
-                                        cursor.completed_position() + 1,
-                                        error.to_string(),
-                                        attempts,
-                                    ),
-                                    work,
-                                );
-                                continue;
-                            }
-                            config.send_replace(current.clone());
-                        }
-                        let retry = match work {
-                            Work::Complete(delivery) => match delivery.into_completed().await {
-                                Ok(()) => Ok(true),
-                                Err(unfinished) => {
-                                    let mut failure = Failure::storage(
-                                        &unfinished.error,
-                                        cursor.completed_position() + 1,
-                                        &options.version,
-                                        attempts,
-                                    );
-                                    failure.boundary = Boundary::Completion;
-                                    state = State::Recovering(
-                                        failure,
-                                        Work::Complete(unfinished.delivery),
-                                    );
-                                    continue;
-                                }
-                            },
-                            Work::Flush => sink
-                                .as_mut()
-                                .expect("accepted delivery retains its sink")
-                                .flush()
-                                .await
-                                .map(|()| true),
-                            Work::Resubmit => {
-                                sink = None;
-                                Ok(false)
-                            }
-                        };
-                        match retry {
-                            Ok(completed) => {
-                                if completed
-                                    && !sink
-                                        .as_ref()
-                                        .is_some_and(|sink| sink.has_pending_delivery())
-                                {
-                                    if let Err(unfinished) =
-                                        cursor.pending_prefix().into_completed().await
-                                    {
-                                        let mut failure = Failure::storage(
-                                            &unfinished.error,
-                                            cursor.completed_position() + 1,
-                                            &options.version,
-                                            attempts,
-                                        );
-                                        failure.boundary = Boundary::Completion;
-                                        state = State::Recovering(
-                                            failure,
-                                            Work::Complete(unfinished.delivery),
-                                        );
-                                        continue;
-                                    }
-                                }
-                                if let Err(error) = cursor.rewind().await {
-                                    state = State::Recovering(
-                                        Failure::storage(
-                                            &error,
-                                            cursor.completed_position() + 1,
-                                            &options.version,
-                                            attempts,
-                                        ),
-                                        Work::Resubmit,
-                                    );
-                                    continue;
-                                }
-                                progress.send_replace(cursor.completed_position());
-                                if completed {
-                                    *options.error.lock().unwrap() = None;
-                                    *options.recovery.lock().unwrap() = None;
-                                    recorded = None;
-                                }
-                                state = State::Processing;
-                            }
-                            Err(error) if error.downcast_ref::<CommitFailure>().is_some() => {
-                                let mut failure = Failure::storage(
-                                    &error,
-                                    cursor.completed_position() + 1,
-                                    &options.version,
-                                    attempts,
-                                );
-                                failure.boundary = Boundary::Ledger;
-                                state = State::Recovering(failure, Work::Flush);
-                            }
-                            Err(error) => {
-                                state = State::Recovering(
-                                    Failure::routing(
-                                        &error,
-                                        cursor.completed_position() + 1,
-                                        &current,
-                                        attempts,
-                                    ),
-                                    Work::Resubmit,
-                                );
-                            }
-                        }
+                        *options.error.lock().unwrap() = None;
+                        *options.recovery.lock().unwrap() = None;
+                        attempts = 0;
+                        recorded = None;
                     }
-                    State::Processing => {
-                        let tail = match journal.tail().await {
-                            Ok(tail) => tail,
-                            Err(error) => {
-                                state = State::Recovering(
-                                    Failure::storage(
-                                        &error,
-                                        cursor.completed_position() + 1,
-                                        &options.version,
-                                        attempts,
-                                    ),
-                                    Work::Resubmit,
-                                );
-                                continue;
-                            }
-                        };
-                        options.counters.queued.store(
-                            tail.saturating_sub(cursor.completed_position()),
-                            Ordering::Relaxed,
-                        );
-                        let received = tokio::select! {
-                            _=stop.notified()=>break,
-                            result=InputPort::receive(&mut cursor)=>result,
-                            result=settings.changed()=> { if result.is_err() {break;} state=State::Processing; continue; },
-                        };
-                        let delivery = match received {
-                            Ok(Some(delivery)) => delivery,
-                            Ok(None) => break,
-                            Err(error) => {
-                                state = State::Recovering(
-                                    Failure::storage(
-                                        &error,
-                                        cursor.completed_position() + 1,
-                                        &options.version,
-                                        attempts,
-                                    ),
-                                    Work::Resubmit,
-                                );
-                                continue;
-                            }
-                        };
-                        let current = settings.borrow_and_update().clone();
-                        if sink.is_none() {
-                            match options.sink(&current).await {
-                                Ok(created) => sink = Some(created),
-                                Err(error) => {
-                                    state = State::Recovering(
-                                        Failure::routing(
-                                            &error,
-                                            cursor.completed_position() + 1,
-                                            &current,
-                                            attempts,
-                                        ),
-                                        Work::Resubmit,
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        let sink = sink.as_mut().expect("configured sink");
-                        sink.configure(&current);
-                        let emitting = tokio::select! { _=stop.notified()=>break,result=sink.emit(delivery.value())=>result };
-                        match emitting {
-                            Ok(count) => {
-                                options
-                                    .counters
-                                    .spans_emitted
-                                    .fetch_add(count, Ordering::Relaxed);
-                            }
-                            Err(error) => {
-                                if let Some(partial) =
-                                    error.downcast_ref::<super::routing::EmitFailure>()
-                                {
-                                    options
-                                        .counters
-                                        .spans_emitted
-                                        .fetch_add(partial.emitted, Ordering::Relaxed);
-                                    if partial.report {
-                                        tracing::warn!(%error,session_id=%options.session_id,"route processing failed");
-                                    }
-                                }
-                                state = State::Recovering(
-                                    Failure::routing(
-                                        &error,
-                                        cursor.completed_position() + 1,
-                                        &current,
-                                        attempts,
-                                    ),
-                                    Work::Resubmit,
-                                );
-                                continue;
-                            }
-                        }
-                        let flushing =
-                            tokio::select! { _=stop.notified()=>break,result=sink.flush()=>result };
-                        if let Err(error) = flushing {
-                            state = if error.downcast_ref::<CommitFailure>().is_some() {
-                                let mut failure = Failure::storage(
-                                    &error,
-                                    cursor.completed_position() + 1,
-                                    &options.version,
-                                    attempts,
-                                );
-                                failure.boundary = Boundary::Ledger;
-                                State::Recovering(failure, Work::Flush)
-                            } else {
-                                State::Recovering(
-                                    Failure::routing(
-                                        &error,
-                                        cursor.completed_position() + 1,
-                                        &current,
-                                        attempts,
-                                    ),
-                                    Work::Resubmit,
-                                )
-                            };
-                            continue;
-                        }
-                        *options.permalink.lock().unwrap() = sink.permalink();
-                        drop(delivery);
-                        if !sink.has_pending_delivery() {
-                            match cursor.pending_prefix().into_completed().await {
-                                Ok(()) => {
-                                    if let Err(error) = cursor.rewind().await {
-                                        state = State::Recovering(
-                                            Failure::storage(
-                                                &error,
-                                                cursor.completed_position() + 1,
-                                                &options.version,
-                                                attempts,
-                                            ),
-                                            Work::Resubmit,
-                                        );
-                                        continue;
-                                    }
-                                    progress.send_replace(cursor.completed_position());
-                                    *options.error.lock().unwrap() = None;
-                                    *options.recovery.lock().unwrap() = None;
-                                    attempts = 0;
-                                    recorded = None;
-                                }
-                                Err(unfinished) => {
-                                    let mut failure = Failure::storage(
-                                        &unfinished.error,
-                                        cursor.completed_position() + 1,
-                                        &options.version,
-                                        attempts,
-                                    );
-                                    failure.boundary = Boundary::Completion;
-                                    state = State::Recovering(
-                                        failure,
-                                        Work::Complete(unfinished.delivery),
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        state = State::Processing;
-                    }
+                    Err(failure) => held = Some(failure),
                 }
             }
         });
