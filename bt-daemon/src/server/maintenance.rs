@@ -207,22 +207,20 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
         } {
             if let journal::JournalRecord::Event(event) = record.record {
                 mirrors(&event.payload, &mut protected);
-                if let Some(route) = &event.route {
-                    let key = DeliveryKey::new(&event.source, &event.session_id, route)?
-                        .correlation_key();
-                    protected.insert(correlation_state_path(data_dir, &key));
-                    protected.insert(active_parent_snapshot_path(data_dir, &key));
-                }
+                let env = journal::envelope_from_redacted(event);
+                let key = automatic_link_key(&env);
+                protected.insert(correlation_state_path(data_dir, &key));
+                protected.insert(active_parent_snapshot_path(data_dir, &key));
                 let storage = data_dir.join("pipeline").join(format!(
                     "{}.sqlite",
-                    crate::ids::session_storage_id(&event.source, &event.session_id)
+                    crate::ids::session_storage_id(&env.source, &env.session_id)
                 ));
-                if sources.insert((event.source.clone(), event.session_id.clone()))
+                if sources.insert((env.source.clone(), env.session_id.clone()))
                     && tokio::fs::try_exists(&storage).await?
                 {
                     let partition = crate::pipeline::journal::SpanJournal::open(&storage).await?;
                     for route in partition.routes().await? {
-                        let key = DeliveryKey::new(&event.source, &event.session_id, &route)?
+                        let key = DeliveryKey::new(&env.source, &env.session_id, &route)?
                             .correlation_key();
                         protected.insert(correlation_state_path(data_dir, &key));
                         protected.insert(active_parent_snapshot_path(data_dir, &key));
@@ -531,30 +529,48 @@ mod tests {
     }
     #[tokio::test]
     async fn retained_inputs_protect_only_their_reconstruction_references() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = crate::transcript_mirror::mirror_dir(tmp.path());
-        std::fs::create_dir_all(&dir).unwrap();
-        let retained = dir.join("retained.jsonl");
-        let obsolete = dir.join("obsolete.jsonl");
-        std::fs::write(&retained, "retained").unwrap();
-        std::fs::write(&obsolete, "obsolete").unwrap();
-        let mut env = event("test", SessionRoute::default());
-        env.payload = serde_json::json!({"_bt_transcript_mirror":{"mirror": retained,"through":8}});
-        let raw = journal::source_journal_path(tmp.path(), "debug", "test");
-        let mut writer = JournalWriter::open_path(&raw).await.unwrap();
-        writer.append(&env).await.unwrap();
-        drop(writer);
-        let key = DeliveryKey::new("debug", "test", env.route.as_ref().unwrap())
-            .unwrap()
-            .correlation_key();
-        let parent = active_parent_snapshot_path(tmp.path(), &key);
-        std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
-        std::fs::write(&parent, "retained parent").unwrap();
-        let protected = retained_references(tmp.path()).await.unwrap();
-        crate::transcript_mirror::gc_old_mirrors(tmp.path(), Duration::ZERO, &protected).await;
-        gc_old_correlation_dir(parent.parent().unwrap(), Duration::ZERO, &protected).await;
-        assert!(retained.exists());
-        assert!(parent.exists());
-        assert!(!obsolete.exists());
+        for routed in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = crate::transcript_mirror::mirror_dir(tmp.path());
+            std::fs::create_dir_all(&dir).unwrap();
+            let retained = dir.join("retained.jsonl");
+            let obsolete = dir.join("obsolete.jsonl");
+            std::fs::write(&retained, "retained").unwrap();
+            std::fs::write(&obsolete, "obsolete").unwrap();
+            let mut env = event("test", SessionRoute::default());
+            if !routed {
+                env.route = None;
+            }
+            env.payload =
+                serde_json::json!({"_bt_transcript_mirror":{"mirror": retained,"through":8}});
+            let raw = journal::source_journal_path(tmp.path(), "debug", "test");
+            let mut writer = JournalWriter::open_path(&raw).await.unwrap();
+            writer.append(&env).await.unwrap();
+            drop(writer);
+            let key = automatic_link_key(&env);
+            let state = PendingSession {
+                events: vec![PendingEvent {
+                    env,
+                    replay_through: 0,
+                    journal_through: 1,
+                }],
+                ..Default::default()
+            };
+            write_correlation_state(tmp.path(), &key, &state)
+                .await
+                .unwrap();
+            let parent = active_parent_snapshot_path(tmp.path(), &key);
+            std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+            std::fs::write(&parent, "retained parent").unwrap();
+            let protected = retained_references(tmp.path()).await.unwrap();
+            crate::transcript_mirror::gc_old_mirrors(tmp.path(), Duration::ZERO, &protected).await;
+            gc_old_correlation_dir(&tmp.path().join("correlation"), Duration::ZERO, &protected)
+                .await;
+            gc_old_correlation_dir(parent.parent().unwrap(), Duration::ZERO, &protected).await;
+            assert!(retained.exists());
+            assert!(parent.exists());
+            assert!(read_correlation_state(tmp.path(), &key).await.is_some());
+            assert!(!obsolete.exists());
+        }
     }
 }

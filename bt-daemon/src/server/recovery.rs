@@ -3,19 +3,11 @@
 use super::*;
 
 pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
-    let pending: HashSet<(String, String, u64)> = daemon
+    let pending: Vec<PendingEvent> = daemon
         .pending_sessions
         .lock()
         .values()
-        .flat_map(|state| {
-            state.events.iter().map(|event| {
-                (
-                    event.env.source.clone(),
-                    event.env.session_id.clone(),
-                    event.journal_through,
-                )
-            })
-        })
+        .flat_map(|state| state.events.iter().cloned())
         .collect();
     let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
         return;
@@ -118,11 +110,16 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             }
         }
         for mut event in latest_by_route.into_values() {
-            if pending.contains(&(
-                event.env.source.clone(),
-                event.env.session_id.clone(),
-                event.journal_through,
-            )) {
+            if pending.iter().any(|pending| {
+                pending.env.source == event.env.source
+                    && pending.env.session_id == event.env.session_id
+                    && pending.journal_through == event.journal_through
+                    && match (&pending.env.route, &event.env.route) {
+                        (Some(a), Some(b)) => a.same_route(b),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }) {
                 continue;
             }
             let recovered_route = recovered_delivery_route(daemon, &event.env).await;
@@ -200,5 +197,119 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             recovered,
             "queued unprocessed journal sessions for recovery"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translate::{SpanOp, SpanRow};
+
+    struct TestAuth;
+    #[async_trait::async_trait]
+    impl AuthProvider for TestAuth {
+        async fn resolve(
+            &self,
+            selection: &AuthSelection,
+            _: AuthResolveReason,
+        ) -> anyhow::Result<AuthLease> {
+            Ok(AuthLease {
+                selection: selection.clone(),
+                auth: BackendAuth {
+                    token: "test".into(),
+                    api_url: None,
+                    app_url: None,
+                    org_id: None,
+                    org_name: None,
+                },
+                expires_at_ms: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_capture_does_not_suppress_an_unrelated_durable_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = SessionRoute {
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: Some("project".into()),
+                project_name: None,
+            }),
+            ..Default::default()
+        };
+        let env: Envelope = serde_json::from_value(serde_json::json!({
+            "source":"debug", "session_id":"test", "event":"event", "ts_ms":1,
+            "payload":{}, "route":route,
+        }))
+        .unwrap();
+        let raw = journal::source_journal_path(tmp.path(), "debug", "test");
+        let mut writer = JournalWriter::open_path(&raw).await.unwrap();
+        let through = writer.append(&env).await.unwrap();
+        drop(writer);
+        let path = tmp.path().join("pipeline").join(format!(
+            "{}.sqlite",
+            crate::ids::session_storage_id("debug", "test"),
+        ));
+        let spans = crate::pipeline::journal::SpanJournal::open(&path)
+            .await
+            .unwrap();
+        spans.begin(through, true).await.unwrap();
+        spans
+            .append(
+                through,
+                &[SpanOp::Insert(SpanRow {
+                    span_id: "stored".into(),
+                    name: "stored".into(),
+                    root_span_id: "stored".into(),
+                    end_ms: Some(1),
+                    ..Default::default()
+                })],
+            )
+            .await
+            .unwrap();
+        spans.commit(through).await.unwrap();
+        spans.subscribe(&route, 0).await.unwrap();
+        let mut dormant = route.clone();
+        dormant.tags.push("dormant".into());
+        spans.subscribe(&dormant, 0).await.unwrap();
+
+        let mut options = debug_serve_options("test", tmp.path());
+        options.auth_provider = Some(Arc::new(TestAuth));
+        let daemon = Daemon::new(options, tmp.path().into());
+        let pending_key = automatic_link_key(&env);
+        daemon.pending_sessions.lock().unwrap().insert(
+            pending_key.clone(),
+            PendingSession {
+                deadline: Some(Instant::now() + Duration::from_secs(60)),
+                events: vec![PendingEvent {
+                    env,
+                    replay_through: 0,
+                    journal_through: through,
+                }],
+                ..Default::default()
+            },
+        );
+        recover_unprocessed_journals(&daemon).await;
+        daemon.ingress_barrier().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !spans.route_complete(&dormant, through).await.unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!spans.route_complete(&route, through).await.unwrap());
+        assert_eq!(
+            daemon.pending_sessions.lock().unwrap()[&pending_key]
+                .events
+                .len(),
+            1
+        );
+        assert!(daemon
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key(&DeliveryKey::new("debug", "test", &dormant).unwrap()));
+        super::super::maintenance::drain_all(&daemon).await;
     }
 }
