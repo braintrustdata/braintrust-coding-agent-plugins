@@ -13,19 +13,29 @@ use crate::wire::SessionConfig;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt};
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct LedgerFile {
-    #[serde(default, alias = "terminal_span_ids")]
+    #[serde(
+        default,
+        alias = "terminal_span_ids",
+        skip_serializing_if = "HashSet::is_empty"
+    )]
     completed_span_ids: HashSet<String>,
-    #[serde(default, alias = "late_merge_span_ids")]
+    #[serde(
+        default,
+        alias = "late_merge_span_ids",
+        skip_serializing_if = "HashSet::is_empty"
+    )]
     late_merge_ids: HashSet<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     span_origins: HashMap<String, OriginSnapshot>,
 }
 
 struct DeliveryLedger {
     path: PathBuf,
+    journal_len: u64,
     known: HashSet<String>,
     pending: HashSet<String>,
     known_late_merges: HashSet<String>,
@@ -52,14 +62,44 @@ impl DeliveryLedger {
             crate::ids::session_storage_id(source, session_id),
             &fingerprint_id[..32]
         ));
-        let persisted = match tokio::fs::read(&path).await {
+        // Retain the old atomic JSON checkpoint as the base for upgrades.
+        let mut persisted = match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice::<LedgerFile>(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => LedgerFile::default(),
             Err(error) => return Err(error.into()),
         };
+        let path = path.with_extension("ndjson");
+        let mut journal_len = 0;
+        match tokio::fs::File::open(&path).await {
+            Ok(file) => {
+                let mut reader = tokio::io::BufReader::new(file);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    let read = reader.read_until(b'\n', &mut line).await?;
+                    if read == 0 || line.last() != Some(&b'\n') {
+                        // A crash can leave a partial final record. Only complete
+                        // records precede delivery; discard the tail on append.
+                        break;
+                    }
+                    let update: LedgerFile = serde_json::from_slice(&line)?;
+                    persisted
+                        .completed_span_ids
+                        .extend(update.completed_span_ids);
+                    persisted.late_merge_ids.extend(update.late_merge_ids);
+                    for (span, origin) in update.span_origins {
+                        persisted.span_origins.entry(span).or_insert(origin);
+                    }
+                    journal_len += read as u64;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok((
             Self {
                 path,
+                journal_len,
                 known: persisted.completed_span_ids,
                 pending: HashSet::new(),
                 known_late_merges: persisted.late_merge_ids,
@@ -100,20 +140,25 @@ impl DeliveryLedger {
         }
     }
 
-    async fn commit(
-        &mut self,
-        span_origins: &HashMap<String, OriginSnapshot>,
-    ) -> anyhow::Result<()> {
+    async fn commit(&mut self) -> anyhow::Result<()> {
         if self.pending.is_empty() && self.pending_late_merges.is_empty() {
             return Ok(());
         }
+        // Only new acknowledgements are serialized. Retain pending state until
+        // the write succeeds so a failed append can be retried on the next flush.
+        self.append(&LedgerFile {
+            completed_span_ids: self.pending.clone(),
+            late_merge_ids: self.pending_late_merges.clone(),
+            ..Default::default()
+        })
+        .await?;
         self.known.extend(self.pending.drain());
         self.known_late_merges
             .extend(self.pending_late_merges.drain());
-        self.save(span_origins).await
+        Ok(())
     }
 
-    async fn save(&self, span_origins: &HashMap<String, OriginSnapshot>) -> anyhow::Result<()> {
+    async fn append(&mut self, update: &LedgerFile) -> anyhow::Result<()> {
         let parent = self.path.parent().ok_or_else(|| {
             anyhow::anyhow!(
                 "delivery ledger path has no parent: {}",
@@ -121,28 +166,24 @@ impl DeliveryLedger {
             )
         })?;
         tokio::fs::create_dir_all(parent).await?;
-        let temp = self
-            .path
-            .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(
-            &temp,
-            serde_json::to_vec(&LedgerFile {
-                completed_span_ids: self.known.clone(),
-                late_merge_ids: self.known_late_merges.clone(),
-                span_origins: span_origins.clone(),
-            })?,
-        )
-        .await?;
-        if let Err(first_error) = tokio::fs::rename(&temp, &self.path).await {
-            let _ = tokio::fs::remove_file(&self.path).await;
-            tokio::fs::rename(&temp, &self.path)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "replace delivery ledger failed: {first_error}; retry failed: {error}"
-                    )
-                })?;
-        }
+        let mut line = serde_json::to_vec(update)?;
+        line.push(b'\n');
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)
+            .await?;
+        // Remove an incomplete tail from recovery or a failed write before
+        // retrying. Successful prior records are never rewritten.
+        file.set_len(self.journal_len).await?;
+        file.seek(std::io::SeekFrom::Start(self.journal_len))
+            .await?;
+        file.write_all(&line).await?;
+        // Match the event journal's process-crash durability: flush to the OS
+        // before delivery without fsync on every hook event.
+        file.flush().await?;
+        self.journal_len += line.len() as u64;
         Ok(())
     }
 }
@@ -158,7 +199,7 @@ pub(crate) struct LedgerSink {
     inner: Box<dyn Sink>,
     ledger: Option<DeliveryLedger>,
     span_origins: HashMap<String, OriginSnapshot>,
-    origins_dirty: bool,
+    pending_origins: HashMap<String, OriginSnapshot>,
     plugin_version: Option<String>,
     source_version: Option<String>,
     bt_version: String,
@@ -193,7 +234,7 @@ impl LedgerSink {
             inner,
             ledger,
             span_origins,
-            origins_dirty: false,
+            pending_origins: HashMap::new(),
             plugin_version: None,
             source_version: None,
             bt_version: bt_version.to_owned(),
@@ -239,26 +280,35 @@ impl Sink for LedgerSink {
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     self.span_origins.entry(row.span_id.clone())
                 {
-                    entry.insert(OriginSnapshot {
+                    let origin = OriginSnapshot {
                         plugin_version: self.plugin_version.clone(),
                         bt_version: self.bt_version.clone(),
                         source_version: self.source_version.clone(),
-                    });
-                    self.origins_dirty = true;
+                    };
+                    if self.ledger.is_some() {
+                        self.pending_origins
+                            .insert(row.span_id.clone(), origin.clone());
+                    }
+                    entry.insert(origin);
                 }
             }
             // Repeat each span's birth snapshot, including stateless updates.
             // This also discards provenance supplied by a span-processing plugin.
             row.origin = self.span_origins.get(&row.span_id).cloned();
         }
-        if self.origins_dirty {
+        if !self.pending_origins.is_empty() {
             // Persist birth versions before the SDK can queue a span. A crash
             // between delivery and its checkpoint must not change its provenance.
             // Do not acknowledge pending span deliveries before the sink flushes.
-            if let Some(ledger) = &self.ledger {
-                ledger.save(&self.span_origins).await?;
+            if let Some(ledger) = &mut self.ledger {
+                ledger
+                    .append(&LedgerFile {
+                        span_origins: self.pending_origins.clone(),
+                        ..Default::default()
+                    })
+                    .await?;
             }
-            self.origins_dirty = false;
+            self.pending_origins.clear();
         }
         let emitted = self.inner.emit(&filtered).await?;
         // A deferred lifecycle root has not reached the backend yet. Do not
@@ -275,7 +325,7 @@ impl Sink for LedgerSink {
     async fn flush(&mut self) -> anyhow::Result<()> {
         self.inner.flush().await?;
         if let Some(ledger) = &mut self.ledger {
-            ledger.commit(&self.span_origins).await?;
+            ledger.commit().await?;
         }
         Ok(())
     }
@@ -410,8 +460,14 @@ mod tests {
             ])
             .await
             .unwrap();
-        // Lose in-memory state without flushing/checkpointing delivery.
+        let ledger_path = first.ledger.as_ref().unwrap().path.clone();
+        let before_crash = tokio::fs::read(&ledger_path).await.unwrap();
+        // Lose in-memory state before delivery checkpointing and interrupt the
+        // next append. Recovery must retain complete records and repair the tail.
         drop(first);
+        let mut interrupted = before_crash.clone();
+        interrupted.extend_from_slice(b"{\"span_origins\":");
+        tokio::fs::write(&ledger_path, interrupted).await.unwrap();
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let mut recovered = LedgerSink::new(
@@ -446,6 +502,13 @@ mod tests {
             ])
             .await
             .unwrap();
+        let after_recovery = tokio::fs::read(&ledger_path).await.unwrap();
+        assert!(after_recovery.starts_with(&before_crash));
+        let new_origins: LedgerFile =
+            serde_json::from_slice(&after_recovery[before_crash.len()..]).unwrap();
+        assert_eq!(new_origins.span_origins.len(), 2);
+        assert!(new_origins.span_origins.contains_key("turn-2"));
+        assert!(new_origins.span_origins.contains_key("subagent-container"));
         let rows = output.lock();
         assert_eq!(rows.len(), 8);
         for op in rows.iter() {
@@ -467,6 +530,91 @@ mod tests {
             };
             assert_eq!(row.origin, expected, "{}", row.span_id);
         }
+    }
+
+    #[tokio::test]
+    async fn ledger_appends_only_new_spans_and_retries_before_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let config = config("project-a");
+        let mut sink = LedgerSink::new(
+            Box::new(RecordingSink {
+                emitted: output.clone(),
+            }),
+            Some(temp.path()),
+            "codex",
+            "session-1",
+            Some(&config),
+            "bt1",
+        )
+        .await;
+        sink.set_capture_versions(Some("v1"), Some("native1"));
+        let path = sink.ledger.as_ref().unwrap().path.clone();
+        // Block persistence: nothing may reach the sink until origins are saved.
+        tokio::fs::create_dir_all(&path).await.unwrap();
+        assert!(sink.emit(&[terminal("span-0")]).await.is_err());
+        assert!(output.lock().is_empty());
+        sink.set_capture_versions(Some("v2"), Some("native2"));
+        tokio::fs::remove_dir(&path).await.unwrap();
+        for i in 0..256 {
+            sink.emit(&[terminal(&format!("span-{i}"))]).await.unwrap();
+            sink.flush().await.unwrap();
+        }
+        // Every origin and completion is serialized once, regardless of how
+        // many prior spans exist. No growing snapshots or checkpoint rewrites.
+        let data = tokio::fs::read_to_string(&path).await.unwrap();
+        let records: Vec<LedgerFile> = data
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 512);
+        for records in records.as_chunks::<2>().0 {
+            assert_eq!(records[0].span_origins.len(), 1);
+            assert!(records[0].completed_span_ids.is_empty());
+            assert_eq!(records[1].completed_span_ids.len(), 1);
+            assert!(records[1].span_origins.is_empty());
+        }
+        let mut recovered = LedgerSink::new(
+            Box::new(RecordingSink::default()),
+            Some(temp.path()),
+            "codex",
+            "session-1",
+            Some(&config),
+            "bt2",
+        )
+        .await;
+        assert_eq!(recovered.span_origins.len(), 256);
+        assert_eq!(
+            recovered.span_origins["span-0"].plugin_version.as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            recovered.span_origins["span-1"].plugin_version.as_deref(),
+            Some("v2")
+        );
+        assert_eq!(recovered.emit(&[terminal("span-0")]).await.unwrap(), 0);
+        // Simulate upgrading a JSON checkpoint with versions and completion IDs.
+        let (ledger, origins) = DeliveryLedger::load(temp.path(), "codex", "session-1", &config)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            path.with_extension("json"),
+            serde_json::to_vec(&LedgerFile {
+                completed_span_ids: ledger.known,
+                late_merge_ids: ledger.known_late_merges,
+                span_origins: origins,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
+        let (legacy, origins) = DeliveryLedger::load(temp.path(), "codex", "session-1", &config)
+            .await
+            .unwrap();
+        assert_eq!(legacy.known.len(), 256);
+        assert_eq!(origins.len(), 256);
+        assert_eq!(origins["span-0"].plugin_version.as_deref(), Some("v1"));
     }
 
     #[tokio::test]

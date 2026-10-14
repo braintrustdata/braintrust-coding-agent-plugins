@@ -258,6 +258,9 @@ not a literal `agent` key. Unknown plugin and agent versions are explicit JSON
 `null`; they never fall back to another component's version. The
 destination-scoped delivery ledger persists each snapshot before export; later
 updates, resume, and replay reuse it unchanged, even across upgrades.
+New snapshots and delivery acknowledgements are appended as NDJSON records,
+without rewriting prior entries. Recovery combines any legacy JSON checkpoint
+with those records and discards an incomplete final record from an interrupted write.
 New spans capture new snapshots instead of inheriting the root's versions.
 Provisional roots retain their original snapshot while waiting for work.
 An unmaterialized span replayed for a new destination uses its
