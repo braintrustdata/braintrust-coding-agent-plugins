@@ -1750,7 +1750,24 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
 
     let shutdown_socket = socket.clone();
     let shutdown_task = tokio::spawn(async move { shutdown_daemon(&shutdown_socket).await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for proof that the server received shutdown and began draining.
+    // A fixed sleep can expire before the client sends its request on busy CI.
+    let journal_path = source_journal_path(&data_dir, "debug", "drained-shutdown");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let journal = tokio::fs::read_to_string(&journal_path).await.unwrap();
+            if journal.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                    record["_bt_record_type"] == "pipeline_control" && record["kind"] == "retire"
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon did not begin shutdown");
     assert!(
         !shutdown_task.is_finished(),
         "shutdown returned before the sink drained"
@@ -1770,7 +1787,7 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
     shutdown_task.abort();
     let _ = shutdown_task.await;
     gate.notify_one();
-    tokio::time::timeout(Duration::from_secs(2), handle)
+    tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("daemon stayed alive after the shutdown client disconnected")
         .unwrap();
