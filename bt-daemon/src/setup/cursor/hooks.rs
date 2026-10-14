@@ -91,14 +91,13 @@ fn cursor_hook_response(event: &str) -> &'static str {
     }
 }
 
-fn capture_hook_entry(event: &str, command: &str) -> Value {
-    let manifest: Value = serde_json::from_str(super::HOOKS_MANIFEST)
-        .expect("embedded Cursor hooks manifest must be valid");
+pub(crate) fn capture_hook_entry(event: &str, command: &str) -> anyhow::Result<Value> {
+    let manifest: Value = serde_json::from_str(super::HOOKS_MANIFEST)?;
     let mut entry = hook_entry(command);
     if let Some(matcher) = manifest["hooks"][event][0]["matcher"].as_str() {
         entry["matcher"] = Value::String(matcher.to_owned());
     }
-    entry
+    Ok(entry)
 }
 
 /// Suppress a plugin registration only when this event has a user capture hook.
@@ -116,7 +115,9 @@ pub(crate) fn user_capture_hook_is_installed_at(config_dir: &Path, event: &str) 
 }
 
 fn capture_entry_is_registered(config: &Map<String, Value>, event: &str, command: &str) -> bool {
-    let expected = capture_hook_entry(event, command);
+    let Ok(expected) = capture_hook_entry(event, command) else {
+        return false;
+    };
     config
         .get("hooks")
         .and_then(|hooks| hooks.get(event))
@@ -245,7 +246,7 @@ fn apply_specs(
             let Some(entries) = hooks.get_mut(event) else {
                 if enable {
                     let entry = if persistent {
-                        capture_hook_entry(event, command)
+                        capture_hook_entry(event, command)?
                     } else {
                         hook_entry(command)
                     };
@@ -264,7 +265,7 @@ fn apply_specs(
             });
             if enable {
                 entries.push(if persistent {
-                    capture_hook_entry(event, command)
+                    capture_hook_entry(event, command)?
                 } else {
                     hook_entry(command)
                 });
@@ -431,7 +432,7 @@ mod tests {
                         .iter()
                         .find(|(event, _)| event == "stop")
                         .unwrap();
-                    expected_stop.push(capture_hook_entry("stop", command));
+                    expected_stop.push(capture_hook_entry("stop", command).unwrap());
                 }
                 assert_eq!(config["hooks"]["stop"], Value::Array(expected_stop));
 

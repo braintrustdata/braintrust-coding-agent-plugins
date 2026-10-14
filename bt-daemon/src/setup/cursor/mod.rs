@@ -9,7 +9,7 @@ pub(crate) use hooks::{
 };
 
 #[cfg(test)]
-pub(crate) use hooks::persistent_specs;
+pub(crate) use hooks::{capture_hook_entry, persistent_specs};
 
 use crate::agents::Cursor;
 use crate::paths;

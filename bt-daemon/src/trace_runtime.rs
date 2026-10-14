@@ -653,11 +653,23 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             run_serve(serve_args, serve_options(&host)).await
         }
         TraceCommand::Hook(hook_args) => {
-            if crate::hook::suppress_hook(&hook_args) {
-                return Ok(());
+            // Cursor permission hooks must emit a response on this production
+            // entry point too. Keep it outside capture and route resolution so
+            // tracing failures cannot leave Cursor waiting on an empty reply.
+            let response = (hook_args.source == "cursor")
+                .then(|| crate::hook::cursor_hook_response_for_event(hook_args.event.as_deref()));
+            let result = async {
+                if crate::hook::suppress_hook(&hook_args) {
+                    return Ok(());
+                }
+                let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
+                run_hook_command(hook_args, &host, settings).await
             }
-            let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
-            run_hook_command(hook_args, &host, settings).await
+            .await;
+            if let Some(response) = response {
+                println!("{response}");
+            }
+            result
         }
         TraceCommand::Status(status_args) => print_output(
             TraceCommandOutput::status(run_status(status_args).await?),
@@ -1101,7 +1113,7 @@ mod tests {
             .unwrap();
         std::fs::write(
             temp.path().join("hooks.json"),
-            serde_json::json!({"hooks": {"stop": [{"command": command}]}}).to_string(),
+            serde_json::json!({"hooks": {"stop": [{"command": command, "timeout": 10, "failClosed": false}]}}).to_string(),
         )
         .unwrap();
         let settings = temp.path().join("settings.json");

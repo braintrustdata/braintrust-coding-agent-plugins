@@ -143,7 +143,7 @@ fn cursor_plugin_hook_is_redundant(
         }
 }
 
-fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
+pub(crate) fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
     match event {
         Some("beforeSubmitPrompt") => r#"{"continue":true}"#,
         Some("preToolUse" | "subagentStart") => r#"{"permission":"allow"}"#,
@@ -417,7 +417,8 @@ mod tests {
             false
         ));
         for (event, command) in specs {
-            config["hooks"][event] = json!([{"command":command,"timeout":10,"failClosed":false}]);
+            config["hooks"][event] =
+                json!([crate::setup::cursor::capture_hook_entry(event, command).unwrap()]);
         }
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(cursor_plugin_hook_is_redundant(
