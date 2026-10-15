@@ -4,6 +4,7 @@ pub(crate) mod delivery;
 pub(crate) mod plugins;
 pub(crate) mod prepare;
 pub(crate) mod routing;
+pub(crate) mod submission;
 
 pub(crate) use delivery::{Completion, Delivery};
 
