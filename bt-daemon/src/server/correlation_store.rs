@@ -354,11 +354,9 @@ pub(super) async fn finish_correlation(
             .events
             .first()
             .map_or(0, |event| event.journal_through);
-        state.recovery = Some(crate::pipeline::recovery::Failure::credentials(
-            position,
-            error.clone(),
-            attempt,
-        ));
+        state.recovery = Some(
+            crate::pipeline::recovery::Failure::credentials(error.clone(), attempt).at(position),
+        );
         if let Err(error) = store_correlation(daemon, key, &state).await {
             tracing::warn!(%error,"pending recovery evidence could not be persisted");
         }

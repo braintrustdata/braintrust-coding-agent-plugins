@@ -176,10 +176,8 @@ impl Translation {
         &self,
         route: &SessionRoute,
         legacy_through: u64,
-    ) -> anyhow::Result<Box<dyn super::journal::RouteInputPort>> {
-        Ok(Box::new(
-            self.journal.subscribe(route, legacy_through).await?,
-        ))
+    ) -> anyhow::Result<super::journal::Cursor> {
+        self.journal.subscribe(route, legacy_through).await
     }
 }
 
@@ -368,7 +366,7 @@ impl Producer {
                 &self.options.version,
             )
         } else {
-            Failure::storage(&error, position, &self.options.version, attempt)
+            Failure::storage(&error, &self.options.version, attempt).at(position)
         };
         failure.through = self
             .publication
