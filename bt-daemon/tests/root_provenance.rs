@@ -490,6 +490,7 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
     let ledger_paths: Vec<_> = std::fs::read_dir(data_dir.join("delivery-ledger"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "ndjson"))
         .collect();
     assert_eq!(ledger_paths.len(), 1);
     let ledger_path = ledger_paths[0].with_extension("json");

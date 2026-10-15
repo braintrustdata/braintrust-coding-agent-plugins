@@ -33,6 +33,11 @@ struct LedgerFile {
     span_origins: HashMap<String, OriginSnapshot>,
 }
 
+// Closing this file releases the OS lock, including on cancellation or errors.
+struct LedgerLock {
+    _file: std::fs::File,
+}
+
 struct DeliveryLedger {
     path: PathBuf,
     journal_len: u64,
@@ -68,60 +73,105 @@ impl DeliveryLedger {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => LedgerFile::default(),
             Err(error) => return Err(error.into()),
         };
-        let path = path.with_extension("ndjson");
-        let mut journal_len = 0;
-        match tokio::fs::File::open(&path).await {
-            Ok(file) => {
-                let mut reader = tokio::io::BufReader::new(file);
-                let mut line = Vec::new();
-                loop {
-                    line.clear();
-                    let read = reader.read_until(b'\n', &mut line).await?;
-                    if read == 0 || line.last() != Some(&b'\n') {
-                        // A crash can leave a partial final record. Only complete
-                        // records precede delivery; discard the tail on append.
-                        break;
-                    }
-                    let update: LedgerFile = serde_json::from_slice(&line)?;
-                    persisted
-                        .completed_span_ids
-                        .extend(update.completed_span_ids);
-                    persisted.late_merge_ids.extend(update.late_merge_ids);
-                    for (span, origin) in update.span_origins {
-                        persisted.span_origins.entry(span).or_insert(origin);
-                    }
-                    journal_len += read as u64;
+        let mut ledger = Self {
+            path: path.with_extension("ndjson"),
+            journal_len: 0,
+            known: persisted.completed_span_ids,
+            pending: HashSet::new(),
+            known_late_merges: persisted.late_merge_ids,
+            pending_late_merges: HashSet::new(),
+        };
+        let lock = ledger.lock().await?;
+        ledger
+            .refresh(&mut persisted.span_origins, &mut HashMap::new(), &lock)
+            .await?;
+        Ok((ledger, persisted.span_origins))
+    }
+
+    async fn lock(&self) -> anyhow::Result<LedgerLock> {
+        // The stable sidecar protects reads, tail repair, and writes together.
+        // Acquire on the blocking pool so a competing process cannot block a
+        // Tokio executor thread. Keep ledger I/O on separate handles for Windows.
+        let path = self.path.with_extension("lock");
+        tokio::task::spawn_blocking(move || {
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("ledger lock has no parent"))?;
+            std::fs::create_dir_all(parent)?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?;
+            fs2::FileExt::lock_exclusive(&file)?;
+            Ok(LedgerLock { _file: file })
+        })
+        .await?
+    }
+
+    async fn refresh(
+        &mut self,
+        origins: &mut HashMap<String, OriginSnapshot>,
+        pending_origins: &mut HashMap<String, OriginSnapshot>,
+        _lock: &LedgerLock,
+    ) -> anyhow::Result<()> {
+        let file = match tokio::fs::File::open(&self.path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.journal_len == 0 => {
+                return Ok(())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            file.metadata().await?.len() >= self.journal_len,
+            "delivery ledger was truncated outside its lock"
+        );
+        let mut reader = tokio::io::BufReader::new(file);
+        reader
+            .seek(std::io::SeekFrom::Start(self.journal_len))
+            .await?;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line).await?;
+            if read == 0 || line.last() != Some(&b'\n') {
+                // An incomplete record is safe to repair while holding the lock:
+                // it cannot belong to another writer's in-progress append.
+                break;
+            }
+            let update: LedgerFile = serde_json::from_slice(&line)?;
+            self.known.extend(update.completed_span_ids);
+            self.known_late_merges.extend(update.late_merge_ids);
+            for (span, origin) in update.span_origins {
+                if pending_origins.remove(&span).is_some() {
+                    // Another writer persisted first while this writer's
+                    // candidate snapshot was waiting to be retried.
+                    origins.insert(span, origin);
+                } else {
+                    origins.entry(span).or_insert(origin);
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            self.journal_len += read as u64;
         }
-        Ok((
-            Self {
-                path,
-                journal_len,
-                known: persisted.completed_span_ids,
-                pending: HashSet::new(),
-                known_late_merges: persisted.late_merge_ids,
-                pending_late_merges: HashSet::new(),
-            },
-            persisted.span_origins,
-        ))
+        Ok(())
+    }
+
+    fn should_emit(&self, op: &SpanOp) -> bool {
+        let row = match op {
+            SpanOp::Insert(row) | SpanOp::Merge(row) => row,
+        };
+        if let Some(key) = &row.late_merge_key {
+            let id = late_merge_id(row, key);
+            !self.known_late_merges.contains(&id) && !self.pending_late_merges.contains(&id)
+        } else {
+            !self.known.contains(&row.span_id) && !self.pending.contains(&row.span_id)
+        }
     }
 
     fn filter(&self, ops: &[SpanOp]) -> Vec<SpanOp> {
         ops.iter()
-            .filter(|op| {
-                let row = match op {
-                    SpanOp::Insert(row) | SpanOp::Merge(row) => row,
-                };
-                if let Some(key) = &row.late_merge_key {
-                    let id = late_merge_id(row, key);
-                    !self.known_late_merges.contains(&id) && !self.pending_late_merges.contains(&id)
-                } else {
-                    !self.known.contains(&row.span_id) && !self.pending.contains(&row.span_id)
-                }
-            })
+            .filter(|op| self.should_emit(op))
             .cloned()
             .collect()
     }
@@ -140,17 +190,23 @@ impl DeliveryLedger {
         }
     }
 
-    async fn commit(&mut self) -> anyhow::Result<()> {
+    async fn commit(&mut self, lock: &LedgerLock) -> anyhow::Result<()> {
+        self.pending.retain(|id| !self.known.contains(id));
+        self.pending_late_merges
+            .retain(|id| !self.known_late_merges.contains(id));
         if self.pending.is_empty() && self.pending_late_merges.is_empty() {
             return Ok(());
         }
         // Only new acknowledgements are serialized. Retain pending state until
         // the write succeeds so a failed append can be retried on the next flush.
-        self.append(&LedgerFile {
-            completed_span_ids: self.pending.clone(),
-            late_merge_ids: self.pending_late_merges.clone(),
-            ..Default::default()
-        })
+        self.append(
+            &LedgerFile {
+                completed_span_ids: self.pending.clone(),
+                late_merge_ids: self.pending_late_merges.clone(),
+                ..Default::default()
+            },
+            lock,
+        )
         .await?;
         self.known.extend(self.pending.drain());
         self.known_late_merges
@@ -158,7 +214,7 @@ impl DeliveryLedger {
         Ok(())
     }
 
-    async fn append(&mut self, update: &LedgerFile) -> anyhow::Result<()> {
+    async fn append(&mut self, update: &LedgerFile, _lock: &LedgerLock) -> anyhow::Result<()> {
         let parent = self.path.parent().ok_or_else(|| {
             anyhow::anyhow!(
                 "delivery ledger path has no parent: {}",
@@ -292,6 +348,36 @@ impl Sink for LedgerSink {
                     entry.insert(origin);
                 }
             }
+        }
+        // Retain this event's candidate versions even if persistence fails, but
+        // reconcile them with authoritative snapshots before any row is sent.
+        let lock = if let Some(ledger) = &mut self.ledger {
+            let lock = ledger.lock().await?;
+            ledger
+                .refresh(&mut self.span_origins, &mut self.pending_origins, &lock)
+                .await?;
+            self.pending_origins.retain(|span, _| {
+                if ledger.known.contains(span) {
+                    // A peer may have acknowledged a legacy span without an
+                    // origin. Do not invent provenance for an already-saved row.
+                    self.span_origins.remove(span);
+                    false
+                } else {
+                    true
+                }
+            });
+            filtered.retain(|op| ledger.should_emit(op));
+            Some(lock)
+        } else {
+            None
+        };
+        if filtered.is_empty() {
+            return Ok(0);
+        }
+        for op in &mut filtered {
+            let row = match op {
+                SpanOp::Insert(row) | SpanOp::Merge(row) => row,
+            };
             // Repeat each span's birth snapshot, including stateless updates.
             // This also discards provenance supplied by a span-processing plugin.
             row.origin = self.span_origins.get(&row.span_id).cloned();
@@ -300,16 +386,21 @@ impl Sink for LedgerSink {
             // Persist birth versions before the SDK can queue a span. A crash
             // between delivery and its checkpoint must not change its provenance.
             // Do not acknowledge pending span deliveries before the sink flushes.
-            if let Some(ledger) = &mut self.ledger {
+            if let (Some(ledger), Some(lock)) = (&mut self.ledger, &lock) {
                 ledger
-                    .append(&LedgerFile {
-                        span_origins: self.pending_origins.clone(),
-                        ..Default::default()
-                    })
+                    .append(
+                        &LedgerFile {
+                            span_origins: self.pending_origins.clone(),
+                            ..Default::default()
+                        },
+                        lock,
+                    )
                     .await?;
             }
             self.pending_origins.clear();
         }
+        // Never hold a cross-process file lock over SDK/network delivery.
+        drop(lock);
         let emitted = self.inner.emit(&filtered).await?;
         // A deferred lifecycle root has not reached the backend yet. Do not
         // record it as delivered: a subsequent cold-worker replay needs to
@@ -325,7 +416,11 @@ impl Sink for LedgerSink {
     async fn flush(&mut self) -> anyhow::Result<()> {
         self.inner.flush().await?;
         if let Some(ledger) = &mut self.ledger {
-            ledger.commit().await?;
+            let lock = ledger.lock().await?;
+            ledger
+                .refresh(&mut self.span_origins, &mut self.pending_origins, &lock)
+                .await?;
+            ledger.commit(&lock).await?;
         }
         Ok(())
     }
@@ -615,6 +710,138 @@ mod tests {
         assert_eq!(legacy.known.len(), 256);
         assert_eq!(origins.len(), 256);
         assert_eq!(origins["span-0"].plugin_version.as_deref(), Some("v1"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_processes_preserve_origins_and_delivery_records() {
+        const CHILD_DIR: &str = "BRAINTRUST_TEST_LEDGER_WRITER_DIR";
+        const TEST: &str =
+            "delivery_ledger::tests::concurrent_processes_preserve_origins_and_delivery_records";
+        async fn wait_for(path: &Path) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !path.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("other ledger writer did not reach its barrier");
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let child_dir = std::env::var_os(CHILD_DIR).map(PathBuf::from);
+        let dir = child_dir.as_deref().unwrap_or(temp.path());
+        let is_child = child_dir.is_some();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let config = config("project-a");
+        let mut sink = LedgerSink::new(
+            Box::new(RecordingSink {
+                emitted: output.clone(),
+            }),
+            Some(dir),
+            "codex",
+            "session-1",
+            Some(&config),
+            if is_child { "bt2" } else { "bt1" },
+        )
+        .await;
+        sink.set_capture_versions(
+            Some(if is_child { "v2" } else { "v1" }),
+            Some(if is_child { "native2" } else { "native1" }),
+        );
+        let shared = SpanOp::Insert(SpanRow {
+            span_id: "shared".into(),
+            root_span_id: "root".into(),
+            span_type: SpanType::Tool,
+            ..Default::default()
+        });
+        if is_child {
+            // Both writers load the same empty ledger. The parent then persists
+            // work before this writer acts on its now-stale length and maps.
+            std::fs::write(dir.join("ready"), b"").unwrap();
+            wait_for(&dir.join("go")).await;
+            sink.emit(&[shared]).await.unwrap();
+            {
+                let rows = output.lock();
+                let SpanOp::Insert(row) = &rows[0] else {
+                    panic!("expected shared tool")
+                };
+                assert_eq!(
+                    row.origin.as_ref().unwrap().plugin_version.as_deref(),
+                    Some("v1"),
+                    "a stale writer must reuse the first persisted origin"
+                );
+            }
+            assert_eq!(sink.emit(&[terminal("parent-only")]).await.unwrap(), 0);
+            assert_eq!(
+                sink.emit(&[late_merge("parent-only", "usage")])
+                    .await
+                    .unwrap(),
+                0
+            );
+        } else {
+            let command = crate::subprocess::background_command(std::env::current_exe().unwrap());
+            let mut child = tokio::process::Command::from(command);
+            child
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD_DIR, dir)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let child = child.spawn().unwrap();
+            wait_for(&dir.join("ready")).await;
+            sink.emit(&[
+                shared,
+                terminal("parent-only"),
+                late_merge("parent-only", "usage"),
+            ])
+            .await
+            .unwrap();
+            sink.flush().await.unwrap();
+            std::fs::write(dir.join("go"), b"").unwrap();
+            // Exercise overlapping OS-level writes, not just two objects sharing
+            // an in-process mutex. Each operation must survive either ordering.
+            for i in 0..32 {
+                sink.emit(&[terminal(&format!("parent-{i}"))])
+                    .await
+                    .unwrap();
+                sink.flush().await.unwrap();
+            }
+            let child_output =
+                tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+                    .await
+                    .expect("child ledger writer stalled")
+                    .unwrap();
+            assert!(
+                child_output.status.success(),
+                "child writer failed: {}\n{}",
+                String::from_utf8_lossy(&child_output.stdout),
+                String::from_utf8_lossy(&child_output.stderr)
+            );
+            assert_eq!(
+                sink.emit(&[terminal("child-0")]).await.unwrap(),
+                0,
+                "an already-open parent must observe the child's acknowledgement"
+            );
+            let (ledger, origins) = DeliveryLedger::load(dir, "codex", "session-1", &config)
+                .await
+                .unwrap();
+            assert_eq!(origins["shared"].plugin_version.as_deref(), Some("v1"));
+            assert_eq!(origins["shared"].bt_version, "bt1");
+            assert_eq!(origins["shared"].source_version.as_deref(), Some("native1"));
+            assert!(ledger.known.contains("parent-only"));
+            assert!(ledger.known_late_merges.contains("parent-only\u{1f}usage"));
+            for i in 0..32 {
+                for (writer, version) in [("parent", "v1"), ("child", "v2")] {
+                    let span = format!("{writer}-{i}");
+                    assert!(ledger.known.contains(&span), "lost completion: {span}");
+                    assert_eq!(origins[&span].plugin_version.as_deref(), Some(version));
+                }
+            }
+            return;
+        }
+        for i in 0..32 {
+            sink.emit(&[terminal(&format!("child-{i}"))]).await.unwrap();
+            sink.flush().await.unwrap();
+        }
     }
 
     #[tokio::test]

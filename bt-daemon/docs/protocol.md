@@ -261,6 +261,8 @@ updates, resume, and replay reuse it unchanged, even across upgrades.
 New snapshots and delivery acknowledgements are appended as NDJSON records,
 without rewriting prior entries. Recovery combines any legacy JSON checkpoint
 with those records and discards an incomplete final record from an interrupted write.
+A per-ledger OS file lock serializes state refresh, origin selection, tail repair,
+and append across daemon and import processes. SDK delivery runs outside the lock.
 New spans capture new snapshots instead of inheriting the root's versions.
 Provisional roots retain their original snapshot while waiting for work.
 An unmaterialized span replayed for a new destination uses its
