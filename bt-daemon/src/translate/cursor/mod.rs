@@ -56,6 +56,9 @@ const CURSOR_METADATA_FIELDS: &[&str] = &[
     "is_interrupt",
     "tool_approval",
     "subagent_type",
+    "subagent_id",
+    "spawning_tool_call_id",
+    "native_duration_ms",
     "recursive_activity_verified",
     "observation_only",
     "completion_observed",
@@ -1141,10 +1144,14 @@ impl CursorTranslator {
         }
         self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
         let spawn = hook.tool_call_id.as_deref();
-        let Some(parent) = spawn
+        let Some((parent, turn)) = spawn
             .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
-            .map(|t| t.turn.clone())
-            .or_else(|| self.turn.as_ref().map(|turn| turn.id.clone()))
+            .map(|t| (t.row.span_id.clone(), t.turn.clone()))
+            .or_else(|| {
+                self.turn
+                    .as_ref()
+                    .map(|turn| (turn.id.clone(), turn.id.clone()))
+            })
         else {
             return;
         };
@@ -1154,6 +1161,7 @@ impl CursorTranslator {
             "Cursor subagent",
             SpanType::Task,
         );
+        row.turn_span_id = Some(turn);
         row.start_ms = Some(e.ts_ms);
         row.input = Some(json!(hook.task));
         row.metadata = Some(
@@ -1166,22 +1174,75 @@ impl CursorTranslator {
         ops.push(SpanOp::Insert(row));
     }
     fn subagent_stop(&mut self, e: &Envelope, hook: &SubagentStopHook, ops: &mut Vec<SpanOp>) {
-        let id = hook.subagent_id.as_str();
-        let error =
-            matches!(hook.status.as_str(), "error" | "aborted").then(|| hook.status.clone());
-        if let Some(mut row) = self.subagents.remove(id) {
-            row.end_ms = Some(e.ts_ms.max(row.start_ms.unwrap_or(e.ts_ms)));
-            row.output = hook.summary.as_ref().map(|summary| json!(summary));
-            row.metadata.get_or_insert_with(|| json!({}))["status"] = json!(hook.status);
-            row.error = error;
-            ops.push(SpanOp::Merge(row));
-            return;
+        let status = hook.status.as_deref().unwrap_or("unknown");
+        let error = matches!(status, "error" | "aborted").then(|| status.to_owned());
+        let correlated_id = hook
+            .subagent_id
+            .as_deref()
+            .filter(|id| self.subagents.contains_key(*id))
+            .map(str::to_owned)
+            .or_else(|| {
+                if hook.subagent_id.is_some()
+                    || (hook.task.is_none() && hook.subagent_type.is_none())
+                {
+                    return None;
+                }
+                let mut matching_ids = self.subagents.iter().filter_map(|(id, row)| {
+                    let task_matches = hook.task.as_ref().is_none_or(|task| {
+                        row.input.as_ref().and_then(Value::as_str) == Some(task.as_str())
+                    });
+                    let type_matches = hook.subagent_type.as_ref().is_none_or(|kind| {
+                        row.metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("subagent_type"))
+                            .and_then(Value::as_str)
+                            == Some(kind.as_str())
+                    });
+                    (task_matches && type_matches).then(|| id.clone())
+                });
+                let candidate = matching_ids.next()?;
+                matching_ids.next().is_none().then_some(candidate)
+            });
+        if let Some(id) = correlated_id {
+            if let Some(mut row) = self.subagents.remove(&id) {
+                if let Some(duration) = hook.duration_ms.and_then(|ms| i64::try_from(ms).ok()) {
+                    row.start_ms = Some(e.ts_ms.saturating_sub(duration));
+                }
+                row.end_ms = Some(e.ts_ms.max(row.start_ms.unwrap_or(e.ts_ms)));
+                row.output = hook.summary.as_ref().map(|summary| json!(summary));
+                let metadata = row.metadata.get_or_insert_with(|| json!({}));
+                metadata["status"] = json!(status);
+                if hook.subagent_id.is_none() {
+                    metadata["stop_correlated_without_id"] = json!(true);
+                }
+                if let Some(duration) = hook.duration_ms {
+                    metadata["native_duration_ms"] = json!(duration);
+                }
+                row.error = error;
+                ops.push(SpanOp::Merge(row));
+                return;
+            }
         }
-        // The shipped plugin registers only the stop hook. Keep the terminal
-        // observation as a useful, zero-duration span and mark the
-        // unavailable start time explicitly.
+        // The documented stop payload omits an ID. If no unique open start is
+        // available, retain the terminal result as an observation rather than
+        // guessing which child it belongs to.
         self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
-        let Some(parent) = self.turn.as_ref().map(|turn| turn.id.clone()) else {
+        let Some((id, parent)) = self.turn.as_ref().map(|turn| {
+            let id = hook.subagent_id.clone().unwrap_or_else(|| {
+                ids::span_id(
+                    &self.namespace,
+                    &format!(
+                        "subagent-stop-observation:{}:{}:{}:{}:{}",
+                        e.ts_ms,
+                        status,
+                        hook.subagent_type.as_deref().unwrap_or(""),
+                        hook.task.as_deref().unwrap_or(""),
+                        hook.summary.as_deref().unwrap_or("")
+                    ),
+                )
+            });
+            (id, turn.id.clone())
+        }) else {
             return;
         };
         let mut row = self.row(
@@ -1190,16 +1251,21 @@ impl CursorTranslator {
             "Cursor subagent",
             SpanType::Task,
         );
-        row.start_ms = Some(e.ts_ms);
+        let duration = hook.duration_ms.and_then(|ms| i64::try_from(ms).ok());
+        row.start_ms = Some(duration.map_or(e.ts_ms, |duration| e.ts_ms.saturating_sub(duration)));
         row.end_ms = Some(e.ts_ms);
+        row.input = hook.task.as_ref().map(|task| json!(task));
         row.output = hook.summary.as_ref().map(|summary| json!(summary));
         row.metadata = Some(json!({
-            "subagent_id": id,
+            "subagent_id": hook.subagent_id,
             "subagent_type": hook.subagent_type,
+            "description": hook.description,
+            "native_duration_ms": hook.duration_ms,
             "recursive_activity_verified": false,
             "start_time_estimated": true,
             "result_completeness": "terminal_observation_only",
-            "status": hook.status,
+            "stop_correlation": if hook.subagent_id.is_some() { "id_unmatched" } else { "ambiguous_or_missing_start" },
+            "status": status,
         }));
         row.error = error;
         ops.push(SpanOp::Insert(row));

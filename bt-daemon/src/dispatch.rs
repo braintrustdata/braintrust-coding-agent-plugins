@@ -363,7 +363,7 @@ async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &
     }
 }
 
-const GROK_TERMINAL_SNAPSHOT_ATTEMPTS: usize = 4;
+const GROK_TERMINAL_SNAPSHOT_ATTEMPTS: usize = 8;
 const GROK_TERMINAL_SNAPSHOT_QUIET_PERIOD: std::time::Duration =
     std::time::Duration::from_millis(10);
 

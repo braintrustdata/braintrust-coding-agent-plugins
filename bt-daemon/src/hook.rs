@@ -143,11 +143,11 @@ fn cursor_plugin_hook_is_redundant(
         }
 }
 
-fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
-    if event == Some("beforeSubmitPrompt") {
-        r#"{"continue":true}"#
-    } else {
-        "{}"
+pub(crate) fn cursor_hook_response_for_event(event: Option<&str>) -> &'static str {
+    match event {
+        Some("beforeSubmitPrompt") => r#"{"continue":true}"#,
+        Some("preToolUse" | "subagentStart") => r#"{"permission":"allow"}"#,
+        _ => "{}",
     }
 }
 
@@ -417,7 +417,8 @@ mod tests {
             false
         ));
         for (event, command) in specs {
-            config["hooks"][event] = json!([{"command":command,"timeout":10,"failClosed":false}]);
+            config["hooks"][event] =
+                json!([crate::setup::cursor::capture_hook_entry(event, command).unwrap()]);
         }
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(cursor_plugin_hook_is_redundant(
@@ -434,6 +435,16 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn cursor_permission_hooks_allow_actions_after_capture() {
+        for event in ["preToolUse", "subagentStart"] {
+            assert_eq!(
+                cursor_hook_response_for_event(Some(event)),
+                r#"{"permission":"allow"}"#
+            );
+        }
     }
 
     #[test]

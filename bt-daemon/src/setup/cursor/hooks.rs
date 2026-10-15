@@ -71,7 +71,7 @@ fn capture_specs_from_manifest(
         let command = entries.as_array().and_then(|entries| entries.first())
             .and_then(|entry| entry.get("command")).and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Cursor hook {event:?} is missing its command"))?;
-        let response = if event == "beforeSubmitPrompt" { r#"{"continue":true}"# } else { "{}" };
+        let response = cursor_hook_response(event);
         let command = if windows {
             powershell_encoded_command(&format!(
                 "$env:{USER_HOOK_ENV} = '1'; try {{ & {command} *> $null }} catch {{}}; [Console]::Out.WriteLine('{response}') # {CAPTURE_MARKER}"
@@ -81,6 +81,23 @@ fn capture_specs_from_manifest(
         };
         Ok((event.clone(), command))
     }).collect()
+}
+
+fn cursor_hook_response(event: &str) -> &'static str {
+    match event {
+        "beforeSubmitPrompt" => r#"{"continue":true}"#,
+        "preToolUse" | "subagentStart" => r#"{"permission":"allow"}"#,
+        _ => "{}",
+    }
+}
+
+pub(crate) fn capture_hook_entry(event: &str, command: &str) -> anyhow::Result<Value> {
+    let manifest: Value = serde_json::from_str(super::HOOKS_MANIFEST)?;
+    let mut entry = hook_entry(command);
+    if let Some(matcher) = manifest["hooks"][event][0]["matcher"].as_str() {
+        entry["matcher"] = Value::String(matcher.to_owned());
+    }
+    Ok(entry)
 }
 
 /// Suppress a plugin registration only when this event has a user capture hook.
@@ -98,15 +115,14 @@ pub(crate) fn user_capture_hook_is_installed_at(config_dir: &Path, event: &str) 
 }
 
 fn capture_entry_is_registered(config: &Map<String, Value>, event: &str, command: &str) -> bool {
+    let Ok(expected) = capture_hook_entry(event, command) else {
+        return false;
+    };
     config
         .get("hooks")
         .and_then(|hooks| hooks.get(event))
         .and_then(Value::as_array)
-        .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.get("command").and_then(Value::as_str) == Some(command))
-        })
+        .is_some_and(|entries| entries.iter().any(|entry| entry == &expected))
 }
 
 fn powershell_encoded_command(script: &str) -> String {
@@ -229,7 +245,12 @@ fn apply_specs(
         for (event, command) in specs {
             let Some(entries) = hooks.get_mut(event) else {
                 if enable {
-                    hooks.insert(event.clone(), Value::Array(vec![hook_entry(command)]));
+                    let entry = if persistent {
+                        capture_hook_entry(event, command)?
+                    } else {
+                        hook_entry(command)
+                    };
+                    hooks.insert(event.clone(), Value::Array(vec![entry]));
                 }
                 continue;
             };
@@ -243,7 +264,11 @@ fn apply_specs(
                 entry.get("command").and_then(Value::as_str) != Some(command.as_str())
             });
             if enable {
-                entries.push(hook_entry(command));
+                entries.push(if persistent {
+                    capture_hook_entry(event, command)?
+                } else {
+                    hook_entry(command)
+                });
             }
         }
     }
@@ -407,7 +432,7 @@ mod tests {
                         .iter()
                         .find(|(event, _)| event == "stop")
                         .unwrap();
-                    expected_stop.push(hook_entry(command));
+                    expected_stop.push(capture_hook_entry("stop", command).unwrap());
                 }
                 assert_eq!(config["hooks"]["stop"], Value::Array(expected_stop));
 
@@ -445,11 +470,7 @@ mod tests {
             child.stdin.take().unwrap().write_all(payload).unwrap();
             let result = child.wait_with_output().unwrap();
             assert!(result.status.success());
-            let response = if event == "beforeSubmitPrompt" {
-                "{\"continue\":true}\n"
-            } else {
-                "{}\n"
-            };
+            let response = format!("{}\n", cursor_hook_response(&event));
             assert_eq!(result.stdout, response.as_bytes());
             assert!(result.stderr.is_empty());
             assert_eq!(std::fs::read(temp.path().join("payload")).unwrap(), payload);
@@ -488,11 +509,7 @@ mod tests {
                 assert!(script.contains(&format!("--event {event}")));
                 assert!(script.contains(USER_HOOK_ENV));
                 assert!(script.contains(CAPTURE_MARKER));
-                assert!(script.contains(if event == "beforeSubmitPrompt" {
-                    r#"{"continue":true}"#
-                } else {
-                    "{}"
-                }));
+                assert!(script.contains(cursor_hook_response(&event)));
             }
         }
     }
