@@ -46,7 +46,7 @@ pub(crate) struct SessionOptions {
     pub config: crate::wire::SessionConfig,
     pub data_dir: PathBuf,
     pub translation: Arc<Translation>,
-    pub cursor: crate::pipeline::journal::Cursor,
+    pub input: Box<dyn crate::pipeline::journal::RouteInputPort>,
     pub auth_provider: Option<Arc<dyn crate::AuthProvider>>,
 }
 
@@ -75,11 +75,12 @@ impl Session {
         let source = options.source.clone();
         let observer_key = format!(
             "{}\u{1f}{}\u{1f}{}",
-            options.source, options.session_id, options.cursor.route
+            options.source,
+            options.session_id,
+            options.input.route_key()
         );
         let route = Consumer::spawn(
-            options.translation.journal.clone(),
-            options.cursor,
+            options.input,
             ConsumerOptions {
                 source: options.source.clone(),
                 session_id: options.session_id.clone(),

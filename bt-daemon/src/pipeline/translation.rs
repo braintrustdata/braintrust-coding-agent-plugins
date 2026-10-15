@@ -51,7 +51,7 @@ impl Progress {
 pub(crate) struct Translation {
     tx: mpsc::Sender<Command>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    pub journal: SpanJournal,
+    journal: SpanJournal,
     pub error: Arc<Mutex<Option<String>>>,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub routes: AtomicUsize,
@@ -168,6 +168,18 @@ impl Translation {
             .map_err(|_| "translation actor is gone".to_owned())?;
         rx.await
             .map_err(|_| "translation control lost".to_owned())?
+    }
+
+    /// Connect a route to the committed SpanOp stream without exposing its
+    /// storage adapter to the route actor.
+    pub async fn subscribe(
+        &self,
+        route: &SessionRoute,
+        legacy_through: u64,
+    ) -> anyhow::Result<Box<dyn super::journal::RouteInputPort>> {
+        Ok(Box::new(
+            self.journal.subscribe(route, legacy_through).await?,
+        ))
     }
 }
 
