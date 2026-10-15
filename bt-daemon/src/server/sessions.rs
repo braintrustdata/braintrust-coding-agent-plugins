@@ -128,6 +128,7 @@ impl Daemon {
             SessionOptions {
                 translation,
                 input,
+                route: route.clone(),
                 auth_provider: self.route_auth_provider(key),
                 session_id: env.session_id.clone(),
                 source: env.source.clone(),

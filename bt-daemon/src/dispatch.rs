@@ -25,7 +25,6 @@ const QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Default)]
 pub struct Counters {
-    pub queued: AtomicU64,
     pub spans_emitted: AtomicU64,
 }
 
@@ -44,9 +43,10 @@ pub(crate) struct SessionOptions {
     pub source: String,
     pub bt_version: String,
     pub config: crate::wire::SessionConfig,
+    pub route: crate::wire::SessionRoute,
     pub data_dir: PathBuf,
     pub translation: Arc<Translation>,
-    pub input: Box<dyn crate::pipeline::journal::RouteInputPort>,
+    pub input: crate::pipeline::journal::Cursor,
     pub auth_provider: Option<Arc<dyn crate::AuthProvider>>,
 }
 
@@ -57,6 +57,7 @@ pub struct Session {
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
     source_progress: Arc<crate::pipeline::translation::Progress>,
+    route_progress: crate::pipeline::journal::Progress,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub source_recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub source_error: Arc<Mutex<Option<String>>>,
@@ -73,20 +74,28 @@ impl Session {
         let last_error = Arc::new(Mutex::new(None));
         let permalink = Arc::new(Mutex::new(None));
         let source = options.source.clone();
+        let (config, settings) = tokio::sync::watch::channel(options.config);
+        let subscription = options.input.into_input(
+            settings,
+            options.bt_version.clone(),
+            last_error.clone(),
+            recovery.clone(),
+        );
         let observer_key = format!(
             "{}\u{1f}{}\u{1f}{}",
             options.source,
             options.session_id,
-            options.input.route_key()
+            serde_json::to_string(&options.route).expect("serializable route")
         );
         let route = Consumer::spawn(
-            options.input,
+            subscription.input,
             ConsumerOptions {
                 source: options.source.clone(),
                 session_id: options.session_id.clone(),
                 version: options.bt_version,
                 data_dir: options.data_dir,
-                config: options.config,
+                config,
+                route: options.route,
                 counters: counters.clone(),
                 error: last_error.clone(),
                 permalink: permalink.clone(),
@@ -101,7 +110,8 @@ impl Session {
         let source_progress = producer.progress.clone();
         let errors = last_error.clone();
         let source_errors = source_error.clone();
-        let queued = counters.clone();
+        let route_progress = subscription.progress;
+        let progress = route_progress.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 let finalize = matches!(&message, SessionMsg::Finalize(_));
@@ -129,24 +139,23 @@ impl Session {
                             crate::journal::ControlKind::Checkpoint
                         };
                         let target = producer.control(kind).await;
-                        let route = route.clone();
-                        let queued = queued.clone();
+                        let progress = progress.clone();
                         let errors = errors.clone();
                         let source_errors = source_errors.clone();
                         tokio::spawn(async move {
                             let mut reply = reply;
                             let waiting = async {
                                 match target {
-                                    Ok(tail) => match route.through(tail).await {
+                                    Ok(tail) => match progress.through(tail, &errors).await {
                                         Ok(()) => 0,
                                         Err(error) => {
                                             *errors.lock() = Some(error);
-                                            queued.queued.load(Ordering::Relaxed).max(1)
+                                            progress.pending().max(1)
                                         }
                                     },
                                     Err(error) => {
                                         *source_errors.lock() = Some(error);
-                                        queued.queued.load(Ordering::Relaxed).max(1)
+                                        progress.pending().max(1)
                                     }
                                 }
                             };
@@ -166,7 +175,7 @@ impl Session {
                         if let Some(tail) = target {
                             let _ = tokio::time::timeout(
                                 std::time::Duration::from_secs(2),
-                                route.through(tail),
+                                progress.through(tail, &errors),
                             )
                             .await;
                         }
@@ -189,6 +198,7 @@ impl Session {
             last_error,
             source_error,
             source_progress,
+            route_progress,
             recovery,
             source_recovery,
             permalink,
@@ -197,9 +207,8 @@ impl Session {
     }
 
     pub(crate) fn pending(&self) -> u64 {
-        self.counters
-            .queued
-            .load(Ordering::Relaxed)
+        self.route_progress
+            .pending()
             .saturating_add(self.source_progress.pending())
     }
 
@@ -246,11 +255,11 @@ impl Session {
     /// Returns `(flushed, pending)`.
     pub async fn flush(&self, timeout: std::time::Duration) -> (bool, u64) {
         let Ok(reply_rx) = self.enqueue_flush().await else {
-            return (false, self.counters.queued.load(Ordering::Relaxed));
+            return (false, self.pending());
         };
         match tokio::time::timeout(timeout, reply_rx).await {
             Ok(Ok(pending)) => (pending == 0, pending),
-            _ => (false, self.counters.queued.load(Ordering::Relaxed)),
+            _ => (false, self.pending()),
         }
     }
 
@@ -260,11 +269,11 @@ impl Session {
         self.touch();
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.tx.send(SessionMsg::Finalize(reply_tx)).await.is_err() {
-            return (false, self.counters.queued.load(Ordering::Relaxed));
+            return (false, self.pending());
         }
         match tokio::time::timeout(timeout, reply_rx).await {
             Ok(Ok(pending)) => (pending == 0, pending),
-            _ => (false, self.counters.queued.load(Ordering::Relaxed)),
+            _ => (false, self.pending()),
         }
     }
 
@@ -590,6 +599,7 @@ mod tests {
             recovery: Arc::new(Mutex::new(None)),
             source_recovery: Arc::new(Mutex::new(None)),
             source_progress: Arc::new(crate::pipeline::translation::Progress::default()),
+            route_progress: crate::pipeline::journal::Progress::default(),
             permalink: Arc::new(Mutex::new(None)),
             last_activity: Mutex::new(Instant::now()),
         };

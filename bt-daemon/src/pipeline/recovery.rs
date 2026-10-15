@@ -98,6 +98,12 @@ fn configuration(config: &SessionConfig) -> String {
 }
 
 impl Failure {
+    /// Source adapters attach their own diagnostic location to stage failures.
+    pub fn at(mut self, position: u64) -> Self {
+        self.position = position;
+        self
+    }
+
     pub fn delay(boundary: Boundary, position: u64, reason: String, attempt: u32) -> Self {
         let delay = 250i64.saturating_mul(1i64 << attempt.min(8)).min(30_000);
         Self {
@@ -123,16 +129,11 @@ impl Failure {
             },
         }
     }
-    pub fn routing(
-        error: &anyhow::Error,
-        position: u64,
-        config: &SessionConfig,
-        attempt: u32,
-    ) -> Self {
+    pub fn routing(error: &anyhow::Error, config: &SessionConfig, attempt: u32) -> Self {
         let error = error
             .downcast_ref::<super::routing::EmitFailure>()
             .map_or(error, |failure| &failure.cause);
-        let mut failure = Self::delay(Boundary::Sink, position, format!("{error:#}"), attempt);
+        let mut failure = Self::delay(Boundary::Sink, 0, format!("{error:#}"), attempt);
         if let Some(plugin) = error.downcast_ref::<PluginRejected>() {
             failure.boundary = Boundary::Plugin;
             failure.condition = Condition::Plugin {
@@ -178,8 +179,8 @@ impl Failure {
         }
         failure
     }
-    pub fn credentials(position: u64, reason: String, attempt: u32) -> Self {
-        let mut failure = Self::delay(Boundary::Credentials, position, reason, attempt);
+    pub fn credentials(reason: String, attempt: u32) -> Self {
+        let mut failure = Self::delay(Boundary::Credentials, 0, reason, attempt);
         if let Condition::Delay { recheck_ms } = failure.condition {
             failure.condition = Condition::Credentials { recheck_ms };
         }
@@ -198,12 +199,12 @@ impl Failure {
             },
         }
     }
-    pub fn storage(error: &anyhow::Error, position: u64, version: &str, attempt: u32) -> Self {
+    pub fn storage(error: &anyhow::Error, version: &str, attempt: u32) -> Self {
         if error.downcast_ref::<serde_json::Error>().is_some() || error.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
             matches!(error,rusqlite::Error::SqliteFailure(code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseCorrupt|rusqlite::ErrorCode::NotADatabase))
         }) {
-            Self::revision(Boundary::Journal,position,error.to_string(),version)
-        } else { Self::delay(Boundary::Journal,position,error.to_string(),attempt) }
+            Self::revision(Boundary::Journal,0,error.to_string(),version)
+        } else { Self::delay(Boundary::Journal,0,error.to_string(),attempt) }
     }
     pub fn info(&self, eligible: bool) -> RecoveryInfo {
         let retry = match &self.condition {
@@ -237,6 +238,13 @@ impl Failure {
         )
     }
 }
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+impl std::error::Error for Failure {}
 
 pub(crate) enum RecoveryOutcome {
     Waiting,
