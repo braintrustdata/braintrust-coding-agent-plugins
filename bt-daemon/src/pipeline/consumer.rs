@@ -1,7 +1,7 @@
 //! One route owns processing and recovery at its durable SpanOp head.
 use super::{
     delivery::InputPort,
-    journal::{Cursor, SpanJournal},
+    journal::RouteInputPort,
     recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
     routing::RoutingSink,
     Delivery, Stage,
@@ -70,16 +70,11 @@ impl ConsumerOptions {
         sink.configure(config);
         Ok(sink)
     }
-    async fn hold(&self, journal: &SpanJournal, cursor: &Cursor, failure: &mut Failure) -> bool {
-        failure.through.get_or_insert(cursor.position());
+    async fn hold(&self, input: &dyn RouteInputPort, failure: &mut Failure) -> bool {
+        failure.through.get_or_insert(input.position());
         *self.error.lock() = Some(failure.message());
         *self.recovery.lock() = Some(failure.info(false));
-        if let Err(error) = async {
-            let encoded = serde_json::to_string(failure)?;
-            journal.set_failure(&cursor.route, Some(encoded)).await
-        }
-        .await
-        {
+        if let Err(error) = input.set_recovery(Some(failure)).await {
             tracing::warn!(%error,"route recovery evidence could not be persisted; original failure retained");
             return false;
         }
@@ -114,10 +109,16 @@ impl ConsumerOptions {
         Ok(())
     }
 
-    fn storage(&self, error: &anyhow::Error, cursor: &Cursor, attempt: u32, work: Work) -> Held {
+    fn storage(
+        &self,
+        error: &anyhow::Error,
+        input: &dyn RouteInputPort,
+        attempt: u32,
+        work: Work,
+    ) -> Held {
         let mut failure = Failure::storage(
             error,
-            cursor.completed_position() + 1,
+            input.completed_position() + 1,
             &self.version,
             attempt,
         );
@@ -132,7 +133,7 @@ impl ConsumerOptions {
     fn routing(
         &self,
         error: &anyhow::Error,
-        cursor: &Cursor,
+        input: &dyn RouteInputPort,
         config: &SessionConfig,
         attempt: u32,
     ) -> Held {
@@ -145,7 +146,7 @@ impl ConsumerOptions {
             }
         }
         Box::new((
-            Failure::routing(error, cursor.completed_position() + 1, config, attempt),
+            Failure::routing(error, input.completed_position() + 1, config, attempt),
             Work::Resubmit,
         ))
     }
@@ -154,7 +155,7 @@ impl ConsumerOptions {
     // rejected batch is resubmitted; accepted work retains its local retry point.
     async fn finish(
         &self,
-        cursor: &mut Cursor,
+        input: &mut dyn RouteInputPort,
         sink: &mut Option<RoutingSink>,
         config: &SessionConfig,
         attempt: u32,
@@ -180,9 +181,9 @@ impl ConsumerOptions {
                 })?;
                 sink.flush().await.map_err(|error| {
                     if error.downcast_ref::<CommitFailure>().is_some() {
-                        self.storage(&error, cursor, attempt, Work::Flush)
+                        self.storage(&error, input, attempt, Work::Flush)
                     } else {
-                        self.routing(&error, cursor, config, attempt)
+                        self.routing(&error, input, config, attempt)
                     }
                 })?;
                 *self.permalink.lock() = sink.permalink();
@@ -191,31 +192,31 @@ impl ConsumerOptions {
                 if sink.has_pending_delivery() {
                     return Ok(false);
                 }
-                Some(cursor.pending_prefix())
+                Some(input.pending_prefix())
             }
         };
         if let Some(delivery) = completion {
             delivery.into_completed().await.map_err(|unfinished| {
                 self.storage(
                     &unfinished.error,
-                    cursor,
+                    input,
                     attempt,
                     Work::Complete(unfinished.delivery),
                 )
             })?;
         }
-        cursor
+        input
             .rewind()
             .await
-            .map_err(|error| self.storage(&error, cursor, attempt, Work::Resubmit))?;
+            .map_err(|error| self.storage(&error, input, attempt, Work::Resubmit))?;
         Ok(completed)
     }
 }
 
 impl Consumer {
-    pub fn spawn(journal: SpanJournal, mut cursor: Cursor, options: ConsumerOptions) -> Arc<Self> {
+    pub fn spawn(mut input: Box<dyn RouteInputPort>, options: ConsumerOptions) -> Arc<Self> {
         let (config, mut settings) = watch::channel(options.config.clone());
-        let (progress, receive) = watch::channel(cursor.position());
+        let (progress, receive) = watch::channel(input.position());
         let stop = Arc::new(Notify::new());
         let handle = Arc::new(Self {
             task: Mutex::new(None),
@@ -226,15 +227,10 @@ impl Consumer {
         });
         let task = tokio::spawn(async move {
             let mut sink = None;
-            let mut held = match journal.failure(&cursor.route).await {
-                Ok(Some(raw)) => Some(Box::new((
-                    serde_json::from_str(&raw).unwrap_or_else(|_| {
-                        Failure::legacy(raw, cursor.completed_position() + 1, &options.config)
-                    }),
-                    Work::Resubmit,
-                ))),
+            let mut held = match input.recovery(&options.config).await {
+                Ok(Some(failure)) => Some(Box::new((failure, Work::Resubmit))),
                 Ok(None) => None,
-                Err(error) => Some(options.storage(&error, &cursor, 0, Work::Resubmit)),
+                Err(error) => Some(options.storage(&error, &input, 0, Work::Resubmit)),
             };
             let mut attempts = 0;
             let mut recorded = None;
@@ -243,15 +239,14 @@ impl Consumer {
                 if let Some(pending) = held.take() {
                     let (mut failure, work) = *pending;
                     if matches!(failure.boundary, Boundary::Completion)
-                        && cursor.completed_position()
-                            >= failure.through.unwrap_or(failure.position)
-                        && journal.set_failure(&cursor.route, None).await.is_ok()
+                        && input.completed_position() >= failure.through.unwrap_or(failure.position)
+                        && input.set_recovery(None).await.is_ok()
                     {
                         *options.error.lock() = None;
                         *options.recovery.lock() = None;
                         continue;
                     }
-                    failure.through.get_or_insert(cursor.position());
+                    failure.through.get_or_insert(input.position());
                     let encoded = match serde_json::to_string(&failure) {
                         Ok(encoded) => encoded,
                         Err(error) => {
@@ -273,13 +268,13 @@ impl Consumer {
                     if recorded.as_ref() != Some(&encoded)
                         && super::recovery::now_ms() >= record_retry
                     {
-                        if options.hold(&journal, &cursor, &mut failure).await {
+                        if options.hold(&input, &mut failure).await {
                             recorded = Some(encoded.clone());
                         } else {
                             record_retry = super::recovery::now_ms().saturating_add(1_000);
                         }
                     }
-                    progress.send_replace(cursor.completed_position());
+                    progress.send_replace(input.completed_position());
                     tokio::select! {
                         _=stop.notified()=>break,
                         _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},
@@ -303,10 +298,12 @@ impl Consumer {
                     *options.recovery.lock() = Some(failure.info(true));
                     attempts = failure.attempt.saturating_add(1);
                     if matches!(failure.boundary, Boundary::Credentials) {
-                        if let Err(error) = options.credentials(&cursor.route, &mut current).await {
+                        if let Err(error) =
+                            options.credentials(input.route_key(), &mut current).await
+                        {
                             held = Some(Box::new((
                                 Failure::credentials(
-                                    cursor.completed_position() + 1,
+                                    input.completed_position() + 1,
                                     error.to_string(),
                                     attempts,
                                 ),
@@ -317,11 +314,11 @@ impl Consumer {
                         config.send_replace(current.clone());
                     }
                     match options
-                        .finish(&mut cursor, &mut sink, &current, attempts, work)
+                        .finish(&mut input, &mut sink, &current, attempts, work)
                         .await
                     {
                         Ok(completed) => {
-                            progress.send_replace(cursor.completed_position());
+                            progress.send_replace(input.completed_position());
                             if completed {
                                 *options.error.lock() = None;
                                 *options.recovery.lock() = None;
@@ -333,57 +330,54 @@ impl Consumer {
                     continue;
                 }
                 let attempt = async {
-                    let tail = journal.tail().await.map_err(|error| {
-                        options.storage(&error, &cursor, attempts, Work::Resubmit)
+                    let tail = input.tail().await.map_err(|error| {
+                        options.storage(&error, &input, attempts, Work::Resubmit)
                     })?;
                     options.counters.queued.store(
-                        tail.saturating_sub(cursor.completed_position()),
+                        tail.saturating_sub(input.completed_position()),
                         Ordering::Relaxed,
                     );
                     let received = tokio::select! {
-                        result=InputPort::receive(&mut cursor)=>result,
+                        result=InputPort::receive(&mut input)=>result,
                         result=settings.changed()=> {
                             return if result.is_err() { Ok(None) } else { Ok(Some(false)) };
                         },
                     };
                     let delivery = received.map_err(|error| {
-                        options.storage(&error, &cursor, attempts, Work::Resubmit)
+                        options.storage(&error, &input, attempts, Work::Resubmit)
                     })?;
                     let Some(delivery) = delivery else {
                         return Ok(None);
                     };
                     let current = settings.borrow_and_update().clone();
                     if sink.is_none() {
-                        journal
-                            .bind(&cursor.route, &current)
-                            .await
-                            .map_err(|error| {
-                                if error
-                                    .downcast_ref::<super::journal::BindingChanged>()
-                                    .is_some()
-                                {
-                                    Box::new((
-                                        Failure::legacy(
-                                            error.to_string(),
-                                            cursor.completed_position() + 1,
-                                            &current,
-                                        ),
-                                        Work::Resubmit,
-                                    ))
-                                } else {
-                                    options.storage(&error, &cursor, attempts, Work::Resubmit)
-                                }
-                            })?;
+                        input.bind(&current).await.map_err(|error| {
+                            if error
+                                .downcast_ref::<super::journal::RouteBindingChanged>()
+                                .is_some()
+                            {
+                                Box::new((
+                                    Failure::legacy(
+                                        error.to_string(),
+                                        input.completed_position() + 1,
+                                        &current,
+                                    ),
+                                    Work::Resubmit,
+                                ))
+                            } else {
+                                options.storage(&error, &input, attempts, Work::Resubmit)
+                            }
+                        })?;
                         sink = Some(options.sink(&current).await.map_err(|error| {
                             if error.downcast_ref::<std::io::Error>().is_some()
                                 || error.downcast_ref::<serde_json::Error>().is_some()
                             {
                                 let mut held =
-                                    options.storage(&error, &cursor, attempts, Work::Resubmit);
+                                    options.storage(&error, &input, attempts, Work::Resubmit);
                                 held.0.boundary = Boundary::Ledger;
                                 held
                             } else {
-                                options.routing(&error, &cursor, &current, attempts)
+                                options.routing(&error, &input, &current, attempts)
                             }
                         })?);
                     }
@@ -399,14 +393,14 @@ impl Consumer {
                     let count = routing
                         .emit(delivery.value())
                         .await
-                        .map_err(|error| options.routing(&error, &cursor, &current, attempts))?;
+                        .map_err(|error| options.routing(&error, &input, &current, attempts))?;
                     options
                         .counters
                         .spans_emitted
                         .fetch_add(count, Ordering::Relaxed);
                     drop(delivery);
                     options
-                        .finish(&mut cursor, &mut sink, &current, attempts, Work::Flush)
+                        .finish(&mut input, &mut sink, &current, attempts, Work::Flush)
                         .await
                         .map(Some)
                 };
@@ -418,7 +412,7 @@ impl Consumer {
                     Ok(None) => break,
                     Ok(Some(false)) => {}
                     Ok(Some(true)) => {
-                        progress.send_replace(cursor.completed_position());
+                        progress.send_replace(input.completed_position());
                         *options.error.lock() = None;
                         *options.recovery.lock() = None;
                         attempts = 0;
@@ -468,6 +462,7 @@ impl Consumer {
 mod tests {
     use super::*;
     use crate::{
+        pipeline::journal::SpanJournal,
         translate::{SpanOp, SpanRow},
         wire::BackendAuth,
     };
@@ -587,8 +582,7 @@ mod tests {
         record.reject.store(true, Ordering::SeqCst);
         let cursor = journal.subscribe(&route, 0).await.unwrap();
         let consumer = Consumer::spawn(
-            journal.clone(),
-            cursor,
+            Box::new(cursor),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| record.accepted.load(Ordering::SeqCst) == 1).await;
@@ -638,8 +632,7 @@ mod tests {
         db.execute_batch("CREATE TRIGGER fail_head BEFORE UPDATE OF position ON heads BEGIN SELECT RAISE(FAIL,'injected head failure'); END;").unwrap();
         let record = Arc::new(Recording::default());
         let consumer = Consumer::spawn(
-            journal.clone(),
-            cursor,
+            Box::new(cursor),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| consumer.error.lock().is_some()).await;
@@ -667,8 +660,7 @@ mod tests {
         let key = serde_json::to_string(&route).unwrap();
         let record = Arc::new(Recording::default());
         let consumer = Consumer::spawn(
-            journal.clone(),
-            journal.subscribe(&route, 0).await.unwrap(),
+            Box::new(journal.subscribe(&route, 0).await.unwrap()),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| consumer.error.lock().is_some()).await;
@@ -676,8 +668,7 @@ mod tests {
         let evidence = journal.failure(&key).await.unwrap().unwrap();
         assert!(!evidence.contains("never-persist-this"));
         let consumer = Consumer::spawn(
-            journal.clone(),
-            journal.subscribe(&route, 0).await.unwrap(),
+            Box::new(journal.subscribe(&route, 0).await.unwrap()),
             options(tmp.path(), &route, record.clone()),
         );
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -725,11 +716,7 @@ mod tests {
         let refreshed = Arc::new(AtomicU64::new(0));
         let mut opts = options(tmp.path(), &route, record.clone());
         opts.auth_provider = Some(Arc::new(RefreshAuth(refreshed.clone())));
-        let consumer = Consumer::spawn(
-            journal.clone(),
-            journal.subscribe(&route, 0).await.unwrap(),
-            opts,
-        );
+        let consumer = Consumer::spawn(Box::new(journal.subscribe(&route, 0).await.unwrap()), opts);
         wait_for(|| *consumer.progress.borrow() == 1).await;
         assert_eq!(refreshed.load(Ordering::SeqCst), 1);
         assert_eq!(consumer.config.borrow().auth.token, "fresh");
@@ -773,11 +760,7 @@ mod tests {
             crate::BraintrustSinkConfig::default(),
         ));
         let mut config = opts.config.clone();
-        let consumer = Consumer::spawn(
-            journal.clone(),
-            journal.subscribe(&route, 0).await.unwrap(),
-            opts,
-        );
+        let consumer = Consumer::spawn(Box::new(journal.subscribe(&route, 0).await.unwrap()), opts);
         wait_for(|| consumer.error.lock().is_some()).await;
         assert_eq!(*consumer.progress.borrow(), 0);
         drop(rejection);
@@ -817,8 +800,7 @@ mod tests {
         };
         let record = Arc::new(Recording::default());
         let consumer = Consumer::spawn(
-            journal.clone(),
-            journal.subscribe(&route, 0).await.unwrap(),
+            Box::new(journal.subscribe(&route, 0).await.unwrap()),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| consumer.error.lock().is_some()).await;

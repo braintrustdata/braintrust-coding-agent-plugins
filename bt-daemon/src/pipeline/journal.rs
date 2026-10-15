@@ -1,5 +1,5 @@
 //! Concrete durable channel: one ordered SpanOp log and a head per route.
-use super::{Completion, Delivery};
+use super::{recovery::Failure, Completion, Delivery};
 use crate::{
     translate::SpanOp,
     wire::{SessionConfig, SessionRoute},
@@ -428,6 +428,65 @@ pub(crate) struct Cursor {
     changes: watch::Receiver<u64>,
 }
 
+/// The route-facing view of the durable SpanOp channel.
+///
+/// Consumers depend on delivery and head operations, while `SpanJournal` and
+/// SQLite remain private to this adapter.
+#[async_trait::async_trait]
+pub(crate) trait RouteInputPort:
+    super::delivery::InputPort<Item = Vec<SpanOp>> + Sync
+{
+    fn route_key(&self) -> &str;
+    fn position(&self) -> u64;
+    fn completed_position(&self) -> u64;
+    fn pending_prefix(&self) -> Delivery<()>;
+    async fn rewind(&mut self) -> anyhow::Result<()>;
+    async fn tail(&self) -> anyhow::Result<u64>;
+    async fn recovery(&self, config: &SessionConfig) -> anyhow::Result<Option<Failure>>;
+    async fn set_recovery(&self, failure: Option<&Failure>) -> anyhow::Result<()>;
+    async fn bind(&self, config: &SessionConfig) -> anyhow::Result<()>;
+}
+
+#[derive(Debug)]
+pub(crate) struct RouteBindingChanged;
+impl std::fmt::Display for RouteBindingChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("durable route binding changed")
+    }
+}
+impl std::error::Error for RouteBindingChanged {}
+
+#[async_trait::async_trait]
+impl<T: RouteInputPort + ?Sized> RouteInputPort for Box<T> {
+    fn route_key(&self) -> &str {
+        (**self).route_key()
+    }
+    fn position(&self) -> u64 {
+        (**self).position()
+    }
+    fn completed_position(&self) -> u64 {
+        (**self).completed_position()
+    }
+    fn pending_prefix(&self) -> Delivery<()> {
+        (**self).pending_prefix()
+    }
+    async fn rewind(&mut self) -> anyhow::Result<()> {
+        (**self).rewind().await
+    }
+    async fn tail(&self) -> anyhow::Result<u64> {
+        (**self).tail().await
+    }
+    async fn recovery(&self, config: &SessionConfig) -> anyhow::Result<Option<Failure>> {
+        (**self).recovery(config).await
+    }
+    async fn set_recovery(&self, failure: Option<&Failure>) -> anyhow::Result<()> {
+        (**self).set_recovery(failure).await
+    }
+    async fn bind(&self, config: &SessionConfig) -> anyhow::Result<()> {
+        (**self).bind(config).await
+    }
+}
+
 impl Cursor {
     pub async fn next_batch(
         &mut self,
@@ -517,6 +576,55 @@ impl super::delivery::InputPort for Cursor {
             }
             self.changed().await;
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl RouteInputPort for Cursor {
+    fn route_key(&self) -> &str {
+        &self.route
+    }
+    fn position(&self) -> u64 {
+        Cursor::position(self)
+    }
+    fn completed_position(&self) -> u64 {
+        Cursor::completed_position(self)
+    }
+    fn pending_prefix(&self) -> Delivery<()> {
+        Cursor::pending_prefix(self)
+    }
+    async fn rewind(&mut self) -> anyhow::Result<()> {
+        Cursor::rewind(self).await
+    }
+    async fn tail(&self) -> anyhow::Result<u64> {
+        self.journal.tail().await
+    }
+    async fn recovery(&self, config: &SessionConfig) -> anyhow::Result<Option<Failure>> {
+        let Some(raw) = self.journal.failure(&self.route).await? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&raw).unwrap_or_else(|_| {
+            Failure::legacy(raw, self.completed_position() + 1, config)
+        })))
+    }
+    async fn set_recovery(&self, failure: Option<&Failure>) -> anyhow::Result<()> {
+        let failure = failure
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
+        self.journal.set_failure(&self.route, failure).await
+    }
+    async fn bind(&self, config: &SessionConfig) -> anyhow::Result<()> {
+        self.journal
+            .bind(&self.route, config)
+            .await
+            .map_err(|error| {
+                if error.downcast_ref::<BindingChanged>().is_some() {
+                    anyhow::Error::new(RouteBindingChanged)
+                } else {
+                    error
+                }
+            })
     }
 }
 

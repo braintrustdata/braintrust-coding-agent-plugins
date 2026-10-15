@@ -74,6 +74,14 @@ impl<T: Send + 'static> InputPort for mpsc::Receiver<Delivery<T>> {
 }
 
 #[async_trait::async_trait]
+impl<T: InputPort + ?Sized> InputPort for Box<T> {
+    type Item = T::Item;
+    async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
+        (**self).receive().await
+    }
+}
+
+#[async_trait::async_trait]
 impl<T: Send + 'static> OutputPort for mpsc::Sender<Delivery<T>> {
     type Item = T;
     async fn send(&mut self, delivery: Delivery<T>) -> Result<(), Delivery<T>> {

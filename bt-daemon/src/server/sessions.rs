@@ -119,7 +119,7 @@ impl Daemon {
         // Materialize historical output before seeding a released completion boundary.
         translation.advance(replay_through).await?;
         let _ = translation.barrier().await;
-        let cursor = translation.journal.subscribe(route, legacy_through).await?;
+        let input = translation.subscribe(route, legacy_through).await?;
         let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
@@ -127,7 +127,7 @@ impl Daemon {
         let session = Session::spawn(
             SessionOptions {
                 translation,
-                cursor,
+                input,
                 auth_provider: self.route_auth_provider(key),
                 session_id: env.session_id.clone(),
                 source: env.source.clone(),
