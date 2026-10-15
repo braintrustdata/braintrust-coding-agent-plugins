@@ -433,6 +433,7 @@ pub(crate) struct Cursor {
 /// Consumers depend on delivery and head operations, while `SpanJournal` and
 /// SQLite remain private to this adapter.
 #[async_trait::async_trait]
+#[allow(clippy::double_must_use)] // async_trait marks its boxed future returns as must_use.
 pub(crate) trait RouteInputPort:
     super::delivery::InputPort<Item = Vec<SpanOp>> + Sync
 {
