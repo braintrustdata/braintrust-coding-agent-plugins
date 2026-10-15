@@ -123,7 +123,7 @@ impl ConsumerOptions {
     }
 
     fn routing(&self, error: &anyhow::Error, config: &SessionConfig, attempt: u32) -> Held {
-        if let Some(partial) = error.downcast_ref::<super::routing::EmitFailure>() {
+        if let Some(partial) = error.downcast_ref::<super::recovery::RouteFailure>() {
             self.counters
                 .spans_emitted
                 .fetch_add(partial.emitted, Ordering::Relaxed);

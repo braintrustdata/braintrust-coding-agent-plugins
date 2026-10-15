@@ -2,6 +2,7 @@
 use super::delivery::{Delivery, InputPort, OutputPort};
 use super::plugins::{PluginOutcome, Plugins};
 use super::prepare::Prepare;
+use super::recovery::{RetryCondition, RouteFailure};
 use super::submission::{
     Input as SubmissionInput, Operation, Outcome as SubmissionOutcome, Submission,
 };
@@ -20,24 +21,6 @@ struct Response {
     result: anyhow::Result<u64>,
     pending: bool,
     permalink: Option<String>,
-}
-
-/// Rows accepted before a mandatory plugin failed still count as emitted.
-#[derive(Debug)]
-pub(crate) struct EmitFailure {
-    pub emitted: u64,
-    pub report: bool,
-    pub cause: anyhow::Error,
-}
-impl std::fmt::Display for EmitFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.cause.fmt(f)
-    }
-}
-impl std::error::Error for EmitFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.cause.as_ref())
-    }
 }
 
 struct Forward;
@@ -94,11 +77,18 @@ impl RoutingSink {
                                             tracing::warn!(%diagnostic, "plugin diagnostic could not be saved");
                                         }
                                     }
-                                    failure = Some(anyhow::Error::new(error));
+                                    failure = Some((
+                                        anyhow::Error::new(error.clone()),
+                                        RetryCondition::Plugin {
+                                            path: error.failure.path.clone(),
+                                            digest: error.digest,
+                                            processors: error.processors.clone(),
+                                        },
+                                    ));
                                 }
                                 PluginOutcome::Unavailable(error) => {
                                     report = true;
-                                    failure = Some(error);
+                                    failure = Some((error, RetryCondition::Transient));
                                 }
                             }
                         }
@@ -114,14 +104,22 @@ impl RoutingSink {
                             unreachable!("emit request returned a flush outcome")
                         };
                         match (emitted, failure) {
-                            (Err(error), _) => (Err(error), state),
-                            (Ok(emitted), Some(cause)) => (
-                                Err(EmitFailure {
+                            (Err(error), _) => (
+                                Err(anyhow::Error::new(RouteFailure {
+                                    cause: error.cause,
+                                    retry: error.retry,
+                                    emitted: 0,
+                                    report: false,
+                                })),
+                                state,
+                            ),
+                            (Ok(emitted), Some((cause, retry))) => (
+                                Err(anyhow::Error::new(RouteFailure {
+                                    cause,
+                                    retry,
                                     emitted,
                                     report,
-                                    cause,
-                                }
-                                .into()),
+                                })),
                                 state,
                             ),
                             (Ok(emitted), None) => (Ok(emitted), state),
@@ -137,7 +135,17 @@ impl RoutingSink {
                         else {
                             unreachable!("flush request returned an emit outcome")
                         };
-                        (result.map(|()| 0), state)
+                        (
+                            result.map(|()| 0).map_err(|error| {
+                                anyhow::Error::new(RouteFailure {
+                                    cause: error.cause,
+                                    retry: error.retry,
+                                    emitted: 0,
+                                    report: false,
+                                })
+                            }),
+                            state,
+                        )
                     }
                 };
                 if let Err(error) = &result {
@@ -268,12 +276,12 @@ mod tests {
             })
         };
         let failure = sink.emit(&[op("accept"), op("reject")]).await.unwrap_err();
-        let first = failure.downcast_ref::<EmitFailure>().unwrap();
+        let first = failure.downcast_ref::<RouteFailure>().unwrap();
         assert_eq!(first.emitted, 1);
         assert!(first.report);
         assert_eq!(emitted.load(Ordering::Relaxed), 1);
         let failure = sink.emit(&[op("accept")]).await.unwrap_err();
-        let cached = failure.downcast_ref::<EmitFailure>().unwrap();
+        let cached = failure.downcast_ref::<RouteFailure>().unwrap();
         assert_eq!(cached.emitted, 0);
         assert!(
             !cached.report,
