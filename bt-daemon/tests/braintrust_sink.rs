@@ -387,8 +387,8 @@ async fn span_updates_preserve_name_linkage_and_origin() {
     let server = mock_backend().await;
     let base = server.uri();
     let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
-    // Cover span kinds, a hyphenated source, known versions, and explicit nulls
-    // without repeating the same lifecycle for every source/kind combination.
+    // Exercise every agent, with span kinds and version availability spread
+    // across the cases instead of repeating every source/kind combination.
     for (source, span_type, plugin_version, source_version) in [
         (
             "codex",
@@ -397,6 +397,15 @@ async fn span_updates_preserve_name_linkage_and_origin() {
             Some("native-version"),
         ),
         ("claude-code", SpanType::Llm, None, Some("native-version")),
+        (
+            "grok",
+            SpanType::Task,
+            Some("1.2.3"),
+            Some("native-version"),
+        ),
+        ("opencode", SpanType::Tool, Some("1.2.3"), None),
+        ("pi", SpanType::Llm, Some("1.2.3"), Some("native-version")),
+        ("cursor", SpanType::Tool, None, Some("native-version")),
         ("antigravity", SpanType::Task, None, None),
     ] {
         let span_id = format!("span-{source}");
