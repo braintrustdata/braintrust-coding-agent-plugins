@@ -1750,7 +1750,24 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
 
     let shutdown_socket = socket.clone();
     let shutdown_task = tokio::spawn(async move { shutdown_daemon(&shutdown_socket).await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for proof that the server received shutdown and began draining.
+    // A fixed sleep can expire before the client sends its request on busy CI.
+    let journal_path = source_journal_path(&data_dir, "debug", "drained-shutdown");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let journal = tokio::fs::read_to_string(&journal_path).await.unwrap();
+            if journal.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                    record["_bt_record_type"] == "pipeline_control" && record["kind"] == "retire"
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon did not begin shutdown");
     assert!(
         !shutdown_task.is_finished(),
         "shutdown returned before the sink drained"
@@ -1770,7 +1787,7 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
     shutdown_task.abort();
     let _ = shutdown_task.await;
     gate.notify_one();
-    tokio::time::timeout(Duration::from_secs(2), handle)
+    tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("daemon stayed alive after the shutdown client disconnected")
         .unwrap();
@@ -3519,6 +3536,84 @@ async fn missing_credentials_recover_without_another_native_event() {
             .await
             .unwrap()
             .flushed
+    );
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_restores_a_durable_head_absent_from_captured_routes() {
+    let provider = Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    });
+    let (data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
+    let env = envelope("durable-subscription", "SessionStart", 1);
+    forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    assert!(
+        flush_session("durable-subscription", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    shutdown(&socket).await;
+    handle.await.unwrap();
+    let path = std::fs::read_dir(data_dir.join("pipeline"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
+        .unwrap();
+    let mut dormant = env.route.unwrap();
+    dormant.tags = vec!["dormant".into()];
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "INSERT INTO heads(route,position) VALUES(?,0)",
+        [serde_json::to_string(&dormant).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let handle = start_daemon_at_with(
+        data_dir.clone(),
+        socket.clone(),
+        provider,
+        recording.clone(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sinks = recording.sinks.lock().unwrap().clone();
+            if sinks
+                .iter()
+                .any(|sink| sink.emitted.load(std::sync::atomic::Ordering::SeqCst) > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        recording.sinks.lock().unwrap().len(),
+        1,
+        "only the dormant head has unresolved work"
+    );
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("durable-subscription".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status.sessions.len(), 1);
+    assert_eq!(
+        status.sessions[0].route.as_ref().unwrap().tags,
+        dormant.tags
     );
     shutdown(&socket).await;
     handle.await.unwrap();

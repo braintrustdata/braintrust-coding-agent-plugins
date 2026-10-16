@@ -165,7 +165,11 @@ pub async fn capture_generation(
 
 /// Best-effort age-based collection, mirroring journal GC. Mirrors are only
 /// useful for as long as their journal survives.
-pub async fn gc_old_mirrors(data_dir: &Path, max_age: std::time::Duration) {
+pub(crate) async fn gc_old_mirrors(
+    data_dir: &Path,
+    max_age: std::time::Duration,
+    protected: &std::collections::HashSet<PathBuf>,
+) {
     let dir = mirror_dir(data_dir);
     let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
         return;
@@ -186,7 +190,7 @@ pub async fn gc_old_mirrors(data_dir: &Path, max_age: std::time::Duration) {
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > max_age);
-        if old {
+        if old && !protected.contains(&path) {
             let _ = tokio::fs::remove_file(&path).await;
         }
     }

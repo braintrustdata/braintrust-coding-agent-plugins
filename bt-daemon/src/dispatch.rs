@@ -1,7 +1,4 @@
-//! Per-session dispatch. Each session owns an ordered queue and a single actor
-//! task that runs its translator + sink serially, so events for one session
-//! are processed strictly in arrival order. Different sessions run
-//! concurrently.
+//! Session facade over ordered source publication and independent route delivery.
 //!
 //! Hook acknowledgement happens before this layer, immediately after the raw
 //! event is durably journaled. Translation, correlation, and delivery here are
@@ -12,7 +9,6 @@ use crate::pipeline::{
     translation::Translation,
 };
 use crate::sink::SinkFactory;
-use crate::translate::Registry;
 use crate::wire::Envelope;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -70,17 +66,17 @@ pub struct Session {
 
 impl Session {
     /// Spawn a session's actor task and return its handle.
-    pub fn spawn(
-        options: SessionOptions,
-        _translators: Arc<Registry>,
-        sink_factory: Arc<dyn SinkFactory>,
-    ) -> Arc<Session> {
+    pub fn spawn(options: SessionOptions, sink_factory: Arc<dyn SinkFactory>) -> Arc<Session> {
         let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let counters = Arc::new(Counters::default());
         let recovery = Arc::new(Mutex::new(None));
         let last_error = Arc::new(Mutex::new(None));
         let permalink = Arc::new(Mutex::new(None));
         let source = options.source.clone();
+        let observer_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            options.source, options.session_id, options.cursor.route
+        );
         let route = Consumer::spawn(
             options.translation.journal.clone(),
             options.cursor,
@@ -103,6 +99,7 @@ impl Session {
         let source_recovery = producer.recovery.clone();
         let source_progress = producer.progress.clone();
         let errors = last_error.clone();
+        let source_errors = source_error.clone();
         let queued = counters.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
@@ -113,7 +110,7 @@ impl Session {
                             route.configure(config);
                         }
                         if let Err(error) = producer.advance(through).await {
-                            *errors.lock() = Some(error.to_string());
+                            *source_errors.lock() = Some(error.to_string());
                         }
                     }
                     SessionMsg::Configure(config, reply) => {
@@ -134,6 +131,7 @@ impl Session {
                         let route = route.clone();
                         let queued = queued.clone();
                         let errors = errors.clone();
+                        let source_errors = source_errors.clone();
                         tokio::spawn(async move {
                             let mut reply = reply;
                             let waiting = async {
@@ -146,7 +144,7 @@ impl Session {
                                         }
                                     },
                                     Err(error) => {
-                                        *errors.lock() = Some(error);
+                                        *source_errors.lock() = Some(error);
                                         queued.queued.load(Ordering::Relaxed).max(1)
                                     }
                                 }
@@ -171,6 +169,7 @@ impl Session {
                             )
                             .await;
                         }
+                        producer.unobserve(observer_key.clone()).await;
                         route.shutdown().await;
                         if producer.routes.load(Ordering::Relaxed) == 0 {
                             producer.shutdown().await;

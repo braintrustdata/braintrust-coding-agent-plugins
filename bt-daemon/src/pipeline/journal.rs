@@ -1,6 +1,9 @@
 //! Concrete durable channel: one ordered SpanOp log and a head per route.
 use super::{Completion, Delivery};
-use crate::{translate::SpanOp, wire::SessionRoute};
+use crate::{
+    translate::SpanOp,
+    wire::{SessionConfig, SessionRoute},
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,9 +12,20 @@ use std::{
 };
 use tokio::sync::watch;
 
+#[derive(Debug)]
+pub(crate) struct BindingChanged;
+impl std::fmt::Display for BindingChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "credential resolution changed the durable head's pinned backend or organization",
+        )
+    }
+}
+impl std::error::Error for BindingChanged {}
+
 #[derive(Clone)]
 pub(crate) struct SpanJournal {
-    connection: Arc<Mutex<Connection>>,
+    connection: Arc<Mutex<Option<Connection>>>,
     changed: watch::Sender<u64>,
 }
 
@@ -62,34 +76,38 @@ impl SpanJournal {
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            anyhow::ensure!(version <= 2, "unsupported SpanOp journal schema {version}");
-            db.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS batches (
-                    input INTEGER PRIMARY KEY, committed INTEGER NOT NULL DEFAULT 0,
-                    observation INTEGER NOT NULL DEFAULT 1);
-                CREATE TABLE IF NOT EXISTS ops (
-                    position INTEGER PRIMARY KEY AUTOINCREMENT,
-                    input INTEGER NOT NULL, value BLOB NOT NULL);
-                CREATE INDEX IF NOT EXISTS ops_input ON ops(input);
-                CREATE TABLE IF NOT EXISTS heads (
-                    route TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
-                    failure TEXT);
-                CREATE TABLE IF NOT EXISTS recovery (id INTEGER PRIMARY KEY CHECK(id=1),failure TEXT);
-                ",
-            )?;
-            if version == 1 {
+            anyhow::ensure!(version <= 3, "unsupported SpanOp journal schema {version}");
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+            if version < 3 {
                 db.execute_batch(
-                    "ALTER TABLE batches ADD COLUMN observation INTEGER NOT NULL DEFAULT 1",
+                    "BEGIN IMMEDIATE;
+                    CREATE TABLE IF NOT EXISTS batches (
+                        input INTEGER PRIMARY KEY, committed INTEGER NOT NULL DEFAULT 0,
+                        observation INTEGER NOT NULL DEFAULT 1);
+                    CREATE TABLE IF NOT EXISTS ops (
+                        position INTEGER PRIMARY KEY AUTOINCREMENT,
+                        input INTEGER NOT NULL, value BLOB NOT NULL);
+                    CREATE INDEX IF NOT EXISTS ops_input ON ops(input);
+                    CREATE TABLE IF NOT EXISTS heads (
+                        route TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
+                        failure TEXT);
+                    CREATE TABLE IF NOT EXISTS recovery (id INTEGER PRIMARY KEY CHECK(id=1),failure TEXT);
+                    ",
                 )?;
+                if version == 1 {
+                    db.execute_batch(
+                        "ALTER TABLE batches ADD COLUMN observation INTEGER NOT NULL DEFAULT 1",
+                    )?;
+                }
+                db.execute_batch("ALTER TABLE heads ADD COLUMN binding TEXT")?;
+                db.execute_batch("PRAGMA user_version=3; COMMIT")?;
             }
-            db.execute_batch("PRAGMA user_version=2; COMMIT")?;
             Ok(db)
         })
         .await??;
         let (changed, _) = watch::channel(0);
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection: Arc::new(Mutex::new(Some(connection))),
             changed,
         })
     }
@@ -103,7 +121,27 @@ impl SpanJournal {
             let mut db = db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("SpanOp storage lock poisoned"))?;
-            operation(&mut db)
+            operation(
+                db.as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("SpanOp journal is closed"))?,
+            )
+        })
+        .await?
+    }
+
+    /// Closing the shared cell also covers cancelled reads whose blocking
+    /// jobs can outlive their actor. Queued jobs cannot reopen the connection.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        let connection = self.connection.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let database = connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("SpanOp storage lock poisoned"))?
+                .take();
+            if let Some(database) = database {
+                database.close().map_err(|(_, error)| error)?;
+            }
+            Ok(())
         })
         .await?
     }
@@ -278,6 +316,61 @@ impl SpanJournal {
             }
             Ok(false)
         }).await
+    }
+
+    /// Tokens can change; a durable head's backend and organization cannot.
+    pub async fn bind(&self, route: &str, config: &SessionConfig) -> anyhow::Result<()> {
+        let route = route.to_owned();
+        let binding = serde_json::to_string(&serde_json::json!({
+            "api_url": config.auth.api_url.as_deref().unwrap_or("https://api.braintrust.dev"),
+            "org_id":config.auth.org_id,"org_name":config.auth.org_name,
+        }))?;
+        self.with_db(move |db| {
+            let previous: Option<String> =
+                db.query_row("SELECT binding FROM heads WHERE route=?", [&route], |r| {
+                    r.get(0)
+                })?;
+            anyhow::ensure!(
+                previous
+                    .as_ref()
+                    .is_none_or(|previous| previous == &binding),
+                BindingChanged
+            );
+            if previous.is_none() {
+                db.execute(
+                    "UPDATE heads SET binding=? WHERE route=?",
+                    params![binding, route],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+    pub async fn routes(&self) -> anyhow::Result<Vec<SessionRoute>> {
+        self.with_db(|db| {
+            let mut query = db.prepare("SELECT route FROM heads ORDER BY route")?;
+            let rows = query
+                .query_map([], |r| r.get::<_, String>(0))?
+                .map(|route| Ok(serde_json::from_str(&route?)?))
+                .collect();
+            rows
+        })
+        .await
+    }
+    /// Whole-partition retention only; an empty subscriber set is not completion.
+    pub async fn collectible(&self, input: u64) -> anyhow::Result<bool> {
+        self.with_db(move |db| Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM heads)
+            AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position < (SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1))
+            AND NOT EXISTS(SELECT 1 FROM recovery WHERE failure IS NOT NULL)
+            AND NOT EXISTS(SELECT 1 FROM batches WHERE committed=0)
+            AND (SELECT coalesce(max(input),0) FROM batches WHERE committed=1)>=?",[input],|r|r.get(0))?)).await
+    }
+    pub async fn close_storage(&self) -> anyhow::Result<()> {
+        self.with_db(|db| {
+            db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn source_failure(&self) -> anyhow::Result<Option<String>> {
@@ -647,5 +740,76 @@ mod tests {
         assert!(!journal.route_complete(&other_profile, 10).await.unwrap());
         legacy.tags.push("different route".into());
         assert!(!journal.route_complete(&legacy, 10).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn schema_two_heads_upgrade_and_keep_a_nonsecret_backend_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE heads(route TEXT PRIMARY KEY,position INTEGER NOT NULL DEFAULT 0,failure TEXT); PRAGMA user_version=2;").unwrap();
+        let route = route("canonical");
+        let key = serde_json::to_string(&route).unwrap();
+        db.execute("INSERT INTO heads(route,position) VALUES(?,7)", [&key])
+            .unwrap();
+        drop(db);
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let mut config = route.with_auth(crate::wire::BackendAuth {
+            token: "secret-a".into(),
+            api_url: Some("https://one.test".into()),
+            app_url: None,
+            org_id: Some("org".into()),
+            org_name: None,
+        });
+        journal.bind(&key, &config).await.unwrap();
+        config.auth.token = "secret-b".into();
+        journal.bind(&key, &config).await.unwrap();
+        config.auth.api_url = Some("https://other.test".into());
+        assert!(journal
+            .bind(&key, &config)
+            .await
+            .unwrap_err()
+            .downcast_ref::<BindingChanged>()
+            .is_some());
+        let restored = journal.subscribe(&route, 0).await.unwrap();
+        assert_eq!(restored.completed_position(), 7);
+        journal
+            .with_db(|db| {
+                let binding: String =
+                    db.query_row("SELECT binding FROM heads", [], |r| r.get(0))?;
+                assert!(!binding.contains("secret-"));
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn close_releases_storage_even_when_a_blocking_read_was_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spans.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let reader = journal.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let read = tokio::spawn(async move {
+            reader
+                .with_db(move |_| {
+                    let _ = entered.send(());
+                    blocked.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started.await.unwrap();
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        let closing = journal.clone();
+        let close = tokio::spawn(async move { closing.close().await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!close.is_finished());
+        release.send(()).unwrap();
+        close.await.unwrap().unwrap();
+        assert!(journal.tail().await.is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }
