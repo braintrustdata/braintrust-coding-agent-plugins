@@ -3,6 +3,7 @@
 pub(crate) mod delivery;
 pub(crate) mod plugins;
 pub(crate) mod prepare;
+pub(crate) mod roots;
 pub(crate) mod routing;
 pub(crate) mod submission;
 

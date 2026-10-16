@@ -965,7 +965,26 @@ async fn session_fallback_survives_daemon_restart() {
     );
     forward(child_start.remove(0), &socket, &host).await;
     flush("pending-child", &socket).await;
-    assert_attached_to_session(first_recording.as_ref(), "pending-parent", "pending-child");
+    // Correlation is decided before work arrives, but the empty child's root
+    // is still a candidate rather than a sink delivery.
+    assert!(!first_recording
+        .sessions
+        .lock()
+        .unwrap()
+        .contains_key("pending-child"));
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("pending-child".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status
+        .sessions
+        .iter()
+        .any(|session| session.route.as_ref().is_some_and(|route| {
+            matches!(route.destination, Some(TraceDestination::ParentSpan { .. }))
+        })));
     shutdown_daemon(&socket).await.unwrap();
     first_daemon.await.unwrap();
 

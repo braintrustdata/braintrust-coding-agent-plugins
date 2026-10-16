@@ -1308,6 +1308,7 @@ async fn unknown_sources_are_rejected_before_journaling() {
 
 #[tokio::test]
 async fn identical_native_ids_from_different_sources_are_isolated() {
+    use std::io::Write;
     let (data_dir, socket, handle, tmp) = start_daemon().await;
     let host = dummy_host();
     let codex_transcript = tmp.path().join("codex-rollout.jsonl");
@@ -1327,6 +1328,21 @@ async fn identical_native_ids_from_different_sources_are_isolated() {
     )
     .unwrap();
     let mut codex = envelope("shared-native-id", "SessionStart", 1);
+    // Both sources need actual work; an empty Codex session stays hidden.
+    let mut transcript = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&codex_transcript)
+        .unwrap();
+    writeln!(
+        transcript,
+        "{}",
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:00:02Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "turn"}
+        })
+    )
+    .unwrap();
     codex.source = "codex".into();
     codex.payload = serde_json::json!({
         "session_id": "shared-native-id",
@@ -1492,6 +1508,41 @@ async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
         forward_envelope(&start, &socket, &host, false)
             .await
             .unwrap();
+
+        let mut work = start.clone();
+        work.event = "chat.message".into();
+        work.payload = serde_json::json!({
+            "input": {"sessionID": native_session_id},
+            "output": {"parts": [{"type": "text", "text": "hello"}]}
+        });
+        forward_envelope(&work, &socket, &host, false)
+            .await
+            .unwrap();
+
+        // Observe the work flush separately, so it cannot satisfy the terminal
+        // event's assertion below.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if flushes
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Disposal adds no translated rows; its work was already flushed.
+        // The other lifecycle events must also deliver their terminal updates.
+        if event != "server.instance.disposed" {
+            flushes.lock().unwrap().insert(session_id.clone(), 0);
+        }
 
         let mut terminal = envelope(&session_id, event, 2);
         terminal.source = "opencode".into();
@@ -2587,6 +2638,16 @@ async fn managed_run_completion_finalizes_an_open_agent_root() {
     env.managed_run_id = Some("managed-run".into());
     env.payload = serde_json::json!({"properties":{"info":{"id":"native"}}});
     forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+
+    let mut work = env.clone();
+    work.event = "chat.message".into();
+    work.payload = serde_json::json!({
+        "input": {"sessionID": "native"},
+        "output": {"parts": [{"type": "text", "text": "hello"}]}
+    });
+    forward_envelope(&work, &socket, &dummy_host(), false)
         .await
         .unwrap();
 
