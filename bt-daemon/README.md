@@ -158,10 +158,10 @@ bt trace run --plugin ./local.mjs codex -- "summarize this change"
 bt trace import codex SESSION_ID --plugin ./sanitize-history.mjs
 ```
 
-The journal stores raw input events, not transformed spans. After daemon
-recovery, replayed events therefore pass through the resumed session's current
-route: ordinary sessions use the current globally configured plugins, while a
-managed session continues using only that run's isolated plugins.
+The daemon journals raw input events and canonical SpanOps produced by translation.
+Route settings and plugins are applied after SpanOp persistence, so routing retries
+reuse the saved operations without rerunning translation. Ordinary sessions use
+their configured plugins; managed sessions retain their run's isolated plugin chain.
 
 `context.operation` is `"insert"` or `"merge"`; `context.source` and
 `context.session_id` identify the translated event stream; and `context.env`
@@ -173,12 +173,12 @@ The environment map is captured from the daemon process when each worker-local
 span processor is constructed. Plugins execute in bounded, thread-local
 QuickJS runtimes with no filesystem or network host APIs. Modules must be
 self-contained and transforms must be stateless: module globals belong to a
-worker thread, not a session. Every configured plugin is mandatory. If any
-plugin fails, the daemon discards that span operation instead of delivering
-untransformed data, and that worker continues discarding operations that would
-use the failed plugin. Modifying the plugin file causes workers to retry it. The
-raw event remains journaled, so restarting the daemon after fixing the plugin
-replays the withheld data through the current chain.
+worker thread, not a session. Every configured plugin is mandatory. A plugin
+failure holds the affected route at its earliest unresolved SpanOp; other routes
+continue independently. The daemon persists the failure and waits for the failed
+file or another plugin in its configured chain to change, or for the chain itself
+to change. It then retries from the SpanOp journal without requiring a restart or
+another agent event. Restarting alone does not retry an unchanged failing chain.
 
 Plugin failures are deduplicated in the daemon's private local state, including
 the raw QuickJS exception and stack. Inspect them with:
@@ -297,9 +297,17 @@ different profiles, organizations, projects, experiments, or parent spans.
 ## Recovery and storage
 
 Capture requests return after the event is flushed to its journal. Daemon
-workers handle authentication, translation, and delivery. Restart recovery
-replays journaled events with deterministic span IDs, so repeated delivery
-updates the same spans.
+workers handle authentication, translation, and delivery. Translation commits
+canonical SpanOps and its consumed event position to a SQLite journal. Each route
+has an independent durable head that advances only after checked sink acceptance
+or intentional filtering. Plugin, authentication, and delivery recovery resumes
+from unresolved SpanOps without replaying translation. Retries use deterministic
+span IDs, so repeated delivery updates the same spans.
+
+Failures retain their reason and retry condition, including across restarts.
+The daemon waits for the relevant plugin/configuration change, fresh credentials,
+or retry delay before trying again. `bt trace doctor` reports the affected stage,
+pending position, reason, and retry eligibility.
 
 Claude, Codex, and Cursor events reference daemon-owned transcript mirrors. Cursor
 preserves separate immutable generations when its native transcript is rewritten.
@@ -308,13 +316,18 @@ separate updates and events mirrors. Replay does not depend on the original
 transcript staying at its old path.
 
 The daemon streams journals and transcripts, applies queue backpressure, and
-retires idle sessions. Retired sessions are rebuilt from their journals when
-another event arrives. Journals and mirrors preserve conversation content;
-credentials are excluded from journaled routing data.
+retires idle sessions. Retirement preserves unresolved work and route heads;
+startup resumes pending subscriptions without waiting for another event.
+Translators rebuild their in-memory state from committed input when more
+translation is needed, suppressing already committed output. Journals and mirrors
+preserve conversation content; credentials are excluded from journaled routing data.
 
-Recovery files are removed after seven days without modification. Cleanup runs
-at startup and hourly while the daemon is running. This retention period is
-currently fixed in `src/server.rs`.
+Completed, inactive session partitions become eligible for cleanup after seven
+days without modification. Cleanup also requires translation to be caught up,
+all captured routes to have registered heads, every head to be complete, and no
+pending recovery. Retained event logs protect the transcript mirrors and
+correlation state needed for reconstruction. Cleanup runs at startup and hourly;
+the retention period is fixed in `src/server/maintenance.rs`.
 
 ## Platform and integration coverage
 
