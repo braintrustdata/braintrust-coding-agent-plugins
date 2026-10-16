@@ -10,9 +10,9 @@ use crate::trace_command::{DoctorAgent, DoctorArgs, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
     braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
-    run_traced, shutdown_daemon, AuthDiagnostic, AuthLease, AuthProvider, AuthResolveReason,
-    BraintrustSinkConfig, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, HostInfo,
-    OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
+    run_traced_with_host, shutdown_daemon, AuthDiagnostic, AuthLease, AuthProvider,
+    AuthResolveReason, BraintrustSinkConfig, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput,
+    HostInfo, OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
     TraceCommandOutput,
 };
 use async_trait::async_trait;
@@ -533,7 +533,9 @@ async fn doctor_output_at(
         warnings.push(warning);
     }
     if args.agent == DoctorAgent::Muse {
-        warnings.extend(crate::setup::muse_doctor_warnings(&paths::muse_config_dir()));
+        warnings.extend(crate::setup::muse::muse_doctor_warnings(
+            &paths::muse_config_dir(),
+        ));
     }
 
     let (route, route_source) = match settings.route {
@@ -678,6 +680,14 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 if crate::hook::suppress_hook(&hook_args) {
                     return Ok(());
                 }
+                if hook_args.managed_context.is_some() {
+                    return crate::hook::run_hook_with_route(
+                        hook_args,
+                        SessionRoute::default(),
+                        host_info(&host),
+                    )
+                    .await;
+                }
                 let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
                 run_hook_command(hook_args, &host, settings).await
             }
@@ -736,7 +746,8 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             apply_additional_metadata(&mut route, run_args.additional_metadata.as_deref())?;
             apply_tags(&mut route, &run_args.tags)?;
             let hook_command = child_command(&host.command, "hook");
-            let status = run_traced(run_args, hook_command, route).await?;
+            let status =
+                run_traced_with_host(run_args, hook_command, route, host_info(&host)).await?;
             if status.success() {
                 Ok(())
             } else {
@@ -1092,6 +1103,7 @@ mod tests {
             flush_timeout_ms: 10_000,
             additional_metadata: None,
             managed_run_hook: false,
+            managed_context: None,
         }
     }
 

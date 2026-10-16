@@ -152,13 +152,22 @@ pub async fn ensure_daemon(
     host: &HostInfo,
     no_spawn: bool,
 ) -> anyhow::Result<ClientStream> {
+    ensure_daemon_in(socket, host, no_spawn, None).await
+}
+
+pub(crate) async fn ensure_daemon_in(
+    socket: &Path,
+    host: &HostInfo,
+    no_spawn: bool,
+    data_dir: Option<&Path>,
+) -> anyhow::Result<ClientStream> {
     if let Ok(s) = connect(socket).await {
         return Ok(s);
     }
     if no_spawn {
         anyhow::bail!("no daemon at {} and --no-spawn is set", socket.display());
     }
-    spawn_daemon(host, socket)?;
+    spawn_daemon(host, socket, data_dir)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -172,13 +181,15 @@ pub async fn ensure_daemon(
     anyhow::bail!("daemon did not come up at {}", socket.display())
 }
 
-fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
+fn spawn_daemon(host: &HostInfo, socket: &Path, data_dir_arg: Option<&Path>) -> anyhow::Result<()> {
     let (exe, rest) = host
         .serve_argv
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("empty serve_argv"))?;
 
-    let data_dir = crate::paths::data_dir(None);
+    let data_dir = data_dir_arg
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::paths::data_dir(None));
     let _ = crate::paths::ensure_private_dir(&data_dir);
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -191,6 +202,10 @@ fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
         let mut args = rest.to_vec();
         args.push("--socket".into());
         args.push(socket.as_os_str().to_owned());
+        if let Some(data_dir) = data_dir_arg {
+            args.push("--data-dir".into());
+            args.push(data_dir.as_os_str().to_owned());
+        }
         // A hook's stdout/stderr are pipes owned by the agent. Windows normally
         // inherits every inheritable handle, even when the daemon's standard
         // streams are redirected to serve.log. The daemon must not keep those
@@ -204,6 +219,9 @@ fn spawn_daemon(host: &HostInfo, socket: &Path) -> anyhow::Result<()> {
         let mut cmd = crate::subprocess::detached_daemon_command(exe);
         cmd.args(rest);
         cmd.arg("--socket").arg(socket);
+        if let Some(data_dir) = data_dir_arg {
+            cmd.arg("--data-dir").arg(data_dir);
+        }
         cmd.stdin(Stdio::null());
         match log {
             Some(f) => {

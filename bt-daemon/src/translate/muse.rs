@@ -16,20 +16,9 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub struct MuseTranslatorFactory {
-    git: Arc<GitMetadataCache>,
-}
-impl MuseTranslatorFactory {
-    pub(super) fn new(git: Arc<GitMetadataCache>) -> Self {
-        Self { git }
-    }
-}
-impl TranslatorFactory for MuseTranslatorFactory {
-    fn source(&self) -> &str {
-        "muse"
-    }
+impl TranslatorFactory for crate::agents::Muse {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(MuseTranslator::new(session_id, self.git.clone()))
+        Box::new(MuseTranslator::new(session_id, GitMetadataCache::shared()))
     }
 }
 
@@ -37,6 +26,7 @@ impl TranslatorFactory for MuseTranslatorFactory {
 struct OpenOp {
     id: String,
     parents: Vec<String>,
+    turn_span_id: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -183,6 +173,7 @@ impl MuseTranslator {
             span_id: open.id,
             root_span_id: root_span_id.into(),
             parent_span_ids: open.parents,
+            turn_span_id: open.turn_span_id,
             end_ms: Some(ts),
             output,
             metrics,
@@ -202,6 +193,7 @@ impl MuseTranslator {
                     span_id: open.id,
                     root_span_id: self.effective_root_id.clone(),
                     parent_span_ids: open.parents,
+                    turn_span_id: open.turn_span_id,
                     end_ms: Some(ts),
                     error: error.map(str::to_owned),
                     ..Default::default()
@@ -227,6 +219,7 @@ impl MuseTranslator {
             OpenOp {
                 id: row.span_id.clone(),
                 parents: row.parent_span_ids.clone(),
+                turn_span_id: row.turn_span_id.clone(),
             },
         );
         vec![SpanOp::Insert(row)]
@@ -291,6 +284,11 @@ impl AgentTranslator for MuseTranslator {
                             span_type: SpanType::Task,
                             start_ms: Some(e.ts_ms),
                             input: p.get("prompt").cloned(),
+                            is_turn: true,
+                            turn_span_id: Some(ids::span_id(
+                                &self.session_id,
+                                &format!("turn:{id}"),
+                            )),
                             ..Default::default()
                         },
                     ));
@@ -321,7 +319,8 @@ impl AgentTranslator for MuseTranslator {
                         SpanRow {
                             span_id: ids::span_id(&self.session_id, &format!("llm:{id}")),
                             root_span_id: self.effective_root_id.clone(),
-                            parent_span_ids: vec![parent],
+                            parent_span_ids: vec![parent.clone()],
+                            turn_span_id: (parent != self.root_id).then_some(parent),
                             name: p
                                 .get("model")
                                 .and_then(Value::as_str)
@@ -516,6 +515,24 @@ mod tests {
             |op| matches!(op, SpanOp::Insert(row) if row.name == "Turn" && row.end_ms.is_none())
         ));
         let llm_start = translator.handle(&events[2], &ctx).unwrap();
+        let turn_id = turn_start
+            .iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.is_turn => Some(row.span_id.clone()),
+                _ => None,
+            })
+            .expect("native user turn marker");
+        for op in turn_start.iter().chain(llm_start.iter()) {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            if row.span_id != root_id {
+                assert_eq!(
+                    row.metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get(super::super::TURN_SPAN_ID_KEY)),
+                    Some(&json!(turn_id))
+                );
+            }
+        }
         let llm_id = llm_start
             .iter()
             .find_map(|op| match op {

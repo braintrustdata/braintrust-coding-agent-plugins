@@ -10,6 +10,7 @@ mod codex;
 mod common;
 pub(crate) mod cursor;
 mod grok;
+pub(crate) mod muse;
 mod opencode;
 pub(crate) mod pi;
 

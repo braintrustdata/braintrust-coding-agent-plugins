@@ -25,7 +25,7 @@ use bt_daemon::{
     Registry, ServeArgs, ServeOptions, Sink, SinkFactory, SpanOp, StatusArgs,
 };
 #[cfg(all(feature = "cli", unix))]
-use bt_daemon::{run_traced, RunArgs, RunHookCommand, RunSource, SpanType};
+use bt_daemon::{run_traced_with_host as run_traced, RunArgs, RunHookCommand, RunSource, SpanType};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -2979,9 +2979,6 @@ async fn muse_managed_run_starts_its_isolated_daemon_before_sanitized_hooks() {
     .unwrap();
     assert!(status.success());
 }
-
-#[cfg(all(feature = "cli", unix))]
-type CreatedDebugSinks = Arc<Mutex<Vec<(String, String, Option<String>)>>>;
 
 #[cfg(all(feature = "cli", unix))]
 struct FlushTrackingDebugSinkFactory {

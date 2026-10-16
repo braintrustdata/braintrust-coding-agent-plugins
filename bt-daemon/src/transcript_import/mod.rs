@@ -1,3 +1,4 @@
+use crate::agents::{registrar, Agent};
 use crate::wire::Envelope;
 use crate::ImportSource;
 use anyhow::{bail, Context};
@@ -9,98 +10,172 @@ use std::path::{Path, PathBuf};
 mod antigravity;
 mod claude;
 mod codex;
+mod cursor;
 pub(crate) mod muse;
+mod pipeline;
+
+pub use pipeline::{import_transcript, import_transcripts, run_import};
+
+/// Importing one agent's native transcripts. Implemented in each agent's
+/// module here and registered in [`crate::agents`].
+pub(crate) trait TranscriptImport: Agent {
+    /// Every session transcript the agent has saved under `home`.
+    fn discover(&self, home: &Path) -> anyhow::Result<Vec<PathBuf>>;
+    /// The saved transcript for one session under `home`.
+    fn find(&self, home: &Path, session_id: &str) -> anyhow::Result<PathBuf>;
+    /// State for following one growing transcript.
+    fn tail(&self) -> Box<dyn TailSession>;
+}
+
+/// Where an agent saves its transcripts and how they are named. Each agent
+/// builds one privately; this holds the search shared by all of them.
+pub(super) struct TranscriptLayout {
+    pub display_name: &'static str,
+    /// Directories searched recursively for `.jsonl` transcripts.
+    pub roots: Vec<PathBuf>,
+    /// The session a transcript belongs to, if the path is one.
+    pub session_id: fn(&Path) -> Option<String>,
+    /// Whether a path is named for a session id.
+    pub filename_matches: fn(&Path, &str) -> bool,
+}
+
+/// Follows one growing transcript, turning the records read so far into
+/// synthetic hook events and emitting only those not emitted before.
+pub(crate) trait TailSession: Send {
+    /// Synthetic hook events for every record read so far.
+    fn envelopes(
+        &mut self,
+        path: &Path,
+        records: &IncrementalRecords,
+    ) -> anyhow::Result<Vec<Envelope>>;
+
+    /// The events from `events` to emit now. `finalize` ends the session.
+    fn poll(
+        &mut self,
+        events: Vec<Envelope>,
+        len: u64,
+        finalize: bool,
+    ) -> anyhow::Result<Vec<Envelope>>;
+
+    /// Whether a rewritten transcript continues with the same translator
+    /// instead of starting a new one. If so, the fresh tail that replaces this
+    /// one receives [`Self::rewritten`].
+    fn keeps_translator_on_rewrite(&self) -> bool {
+        false
+    }
+
+    /// Called on a fresh tail after a rewrite, with the records from before
+    /// and after it, when [`Self::keeps_translator_on_rewrite`] is true.
+    fn rewritten(&mut self, _previous: &[Value], _current: &[Value]) {}
+
+    /// Whether an attached import may stop at a final record that is still
+    /// being written when it shuts down.
+    fn tolerates_incomplete_final_record(&self) -> bool {
+        false
+    }
+}
+
+fn importer(source: ImportSource) -> &'static dyn TranscriptImport {
+    let name = source.identity().id;
+    registrar()
+        .import
+        .get(name)
+        .unwrap_or_else(|| panic!("no transcript import is registered for {name}"))
+}
 
 pub(crate) fn resolve_transcripts(
     session_ids: &[String],
     all: bool,
     source: ImportSource,
 ) -> anyhow::Result<Vec<PathBuf>> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let importer = importer(source);
     match (all, session_ids.is_empty()) {
-        (true, true) => discover_transcripts(source),
+        (true, true) => importer.discover(&home),
         (false, false) => session_ids
             .iter()
-            .map(|session_id| resolve_transcript(session_id, source))
+            .map(|session_id| importer.find(&home, session_id))
             .collect(),
         (true, false) => bail!("--all cannot be combined with explicit session ids"),
         (false, true) => bail!("provide at least one session id or use --all"),
     }
 }
 
-pub(crate) fn resolve_transcript(
-    session_id: &str,
-    source: ImportSource,
-) -> anyhow::Result<PathBuf> {
-    validate_session_id(session_id)?;
-    resolve_transcript_in(session_id, source, &transcript_roots(source))
-}
-
-fn transcript_roots(source: ImportSource) -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    match source {
-        ImportSource::Codex => codex::roots(&home),
-        ImportSource::Muse => Vec::new(),
-        ImportSource::Claude => claude::roots(&home),
-        ImportSource::Antigravity => antigravity::roots(&home),
-    }
-}
-
-fn discover_transcripts(source: ImportSource) -> anyhow::Result<Vec<PathBuf>> {
-    let roots = transcript_roots(source);
-    discover_transcripts_in(source, &roots)
-}
-
-fn discover_transcripts_in(
-    source: ImportSource,
-    roots: &[PathBuf],
-) -> anyhow::Result<Vec<PathBuf>> {
-    let mut candidates = Vec::new();
-    for root in roots {
-        find_jsonl_files(root, &mut candidates);
-    }
-    candidates.sort();
-    candidates.dedup();
-
-    let mut sessions = BTreeMap::<String, Vec<PathBuf>>::new();
-    for path in candidates {
-        let Some(session_id) = transcript_session_id(&path, source) else {
-            continue;
-        };
-        sessions.entry(session_id).or_default().push(path);
-    }
-    if sessions.is_empty() {
-        let locations = roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "no {} transcripts found; searched {locations}",
-            source_name(source)
-        );
+impl TranscriptLayout {
+    /// One transcript per session found under the roots, in path order.
+    pub fn discover(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut sessions = BTreeMap::<String, Vec<PathBuf>>::new();
+        for path in self.candidates() {
+            if let Some(session_id) = (self.session_id)(&path) {
+                sessions.entry(session_id).or_default().push(path);
+            }
+        }
+        if sessions.is_empty() {
+            bail!(
+                "no {} transcripts found; searched {}",
+                self.display_name,
+                self.locations()
+            );
+        }
+        sessions
+            .into_iter()
+            .map(|(session_id, paths)| self.single(&session_id, paths))
+            .collect()
     }
 
-    let mut resolved = Vec::with_capacity(sessions.len());
-    for (session_id, paths) in sessions {
-        match paths.as_slice() {
-            [path] => resolved.push(path.clone()),
-            paths => {
-                let locations = paths
+    /// The one transcript named for `session_id`.
+    pub fn find(&self, session_id: &str) -> anyhow::Result<PathBuf> {
+        validate_session_id(session_id)?;
+        let matches: Vec<_> = self
+            .candidates()
+            .into_iter()
+            .filter(|path| (self.filename_matches)(path, session_id))
+            .collect();
+        if matches.is_empty() {
+            bail!(
+                "no {} transcript found for session {session_id}; searched {}",
+                self.display_name,
+                self.locations()
+            );
+        }
+        self.single(session_id, matches)
+    }
+
+    fn candidates(&self) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        for root in &self.roots {
+            find_jsonl_files(root, &mut candidates);
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    fn single(&self, session_id: &str, paths: Vec<PathBuf>) -> anyhow::Result<PathBuf> {
+        match <[PathBuf; 1]>::try_from(paths) {
+            Ok([path]) => Ok(path),
+            Err(paths) => bail!(
+                "multiple {} transcripts found for session {session_id}: {}",
+                self.display_name,
+                paths
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
-                    .join(", ");
-                bail!(
-                    "multiple {} transcripts found for session {session_id}: {locations}",
-                    source_name(source)
-                );
-            }
+                    .join(", ")
+            ),
         }
     }
-    Ok(resolved)
+
+    fn locations(&self) -> String {
+        self.roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
@@ -123,62 +198,7 @@ fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
     }
 }
 
-fn transcript_session_id(path: &Path, source: ImportSource) -> Option<String> {
-    match source {
-        ImportSource::Codex => codex::transcript_session_id(path),
-        ImportSource::Muse => None,
-        ImportSource::Claude => claude::transcript_session_id(path),
-        ImportSource::Antigravity => antigravity::transcript_session_id(path),
-    }
-}
-
-fn resolve_transcript_in(
-    session_id: &str,
-    source: ImportSource,
-    roots: &[PathBuf],
-) -> anyhow::Result<PathBuf> {
-    validate_session_id(session_id)?;
-    let mut matches = Vec::new();
-    for root in roots {
-        let mut candidates = Vec::new();
-        find_jsonl_files(root, &mut candidates);
-        matches.extend(candidates.into_iter().filter(|path| match source {
-            ImportSource::Codex => codex::filename_matches(path, session_id),
-            ImportSource::Muse => false,
-            ImportSource::Claude => claude::filename_matches(path, session_id),
-            ImportSource::Antigravity => antigravity::filename_matches(path, session_id),
-        }));
-    }
-    matches.sort();
-    matches.dedup();
-    match matches.as_slice() {
-        [path] => Ok(path.clone()),
-        [] => {
-            let locations = roots
-                .iter()
-                .map(|root| root.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "no {} transcript found for session {session_id}; searched {locations}",
-                source_name(source)
-            )
-        }
-        paths => {
-            let locations = paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "multiple {} transcripts found for session {session_id}: {locations}",
-                source_name(source)
-            )
-        }
-    }
-}
-
-pub(crate) fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
+fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
     if session_id.is_empty()
         || !session_id
             .bytes()
@@ -189,47 +209,20 @@ pub(crate) fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn source_name(source: ImportSource) -> &'static str {
-    match source {
-        ImportSource::Codex => "Codex",
-        ImportSource::Muse => "Muse Code",
-        ImportSource::Claude => "Claude Code",
-        ImportSource::Antigravity => "Google Antigravity",
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn transcript_envelopes(
     path: &Path,
     source: ImportSource,
 ) -> anyhow::Result<Vec<Envelope>> {
     let mut records = IncrementalRecords::default();
-    records.refresh(path, true)?;
-    envelopes_from_records(path, source, &records)
+    records.refresh_with_final_partial(path, true, false)?;
+    importer(source).tail().envelopes(path, &records)
 }
 
-fn envelopes_from_records(
-    path: &Path,
-    source: ImportSource,
-    records: &IncrementalRecords,
-) -> anyhow::Result<Vec<Envelope>> {
-    match source {
-        ImportSource::Codex => codex::envelopes(path, &records.values),
-        ImportSource::Muse => muse::envelopes(path),
-        ImportSource::Claude => claude::envelopes(
-            path,
-            &records.values,
-            &records.end_offsets,
-            records.read_offset,
-        ),
-        ImportSource::Antigravity => {
-            antigravity::envelopes(path, &records.values, &records.end_offsets)
-        }
-    }
-}
-
+/// The records of a transcript read so far, re-read incrementally as it
+/// grows.
 #[derive(Default)]
-struct IncrementalRecords {
+pub(crate) struct IncrementalRecords {
     values: Vec<Value>,
     end_offsets: Vec<u64>,
     read_offset: u64,
@@ -246,7 +239,12 @@ enum Refresh {
 }
 
 impl IncrementalRecords {
-    fn refresh(&mut self, path: &Path, finalize: bool) -> anyhow::Result<Refresh> {
+    fn refresh_with_final_partial(
+        &mut self,
+        path: &Path,
+        finalize: bool,
+        allow_incomplete_final_record: bool,
+    ) -> anyhow::Result<Refresh> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("read transcript metadata {}", path.display()))?;
         let len = metadata.len();
@@ -298,7 +296,13 @@ impl IncrementalRecords {
                         values.push(value);
                         end_offsets.push(offset);
                     }
-                    Err(_) if !finalize && offset == len && !line.ends_with('\n') => break,
+                    Err(_)
+                        if (allow_incomplete_final_record || !finalize)
+                            && offset == len
+                            && !line.ends_with('\n') =>
+                    {
+                        break
+                    }
                     Err(error) => {
                         return Err(error).with_context(|| {
                             format!("parse transcript {} line {}", path.display(), line_count)
@@ -350,43 +354,44 @@ fn read_anchor(path: &Path, through: u64, max_len: usize) -> anyhow::Result<Vec<
 /// turn/session; ordinary polls keep the newest turn open.
 pub(crate) struct TranscriptTail {
     path: PathBuf,
-    source: ImportSource,
-    state: TailState,
+    importer: &'static dyn TranscriptImport,
+    session: Box<dyn TailSession>,
     records: IncrementalRecords,
     retry_envelopes: bool,
     translator_reset: bool,
-}
-
-enum TailState {
-    Codex(codex::Tail),
-    Muse,
-    Claude(claude::Tail),
-    Antigravity(antigravity::Tail),
+    allow_incomplete_final_record: bool,
 }
 
 impl TranscriptTail {
     pub(crate) fn new(path: PathBuf, source: ImportSource) -> Self {
+        let importer = importer(source);
         Self {
             path,
-            source,
-            state: Self::new_state(source),
+            importer,
+            session: importer.tail(),
             records: IncrementalRecords::default(),
             retry_envelopes: false,
             translator_reset: false,
+            allow_incomplete_final_record: false,
         }
     }
 
-    fn new_state(source: ImportSource) -> TailState {
-        match source {
-            ImportSource::Codex => TailState::Codex(codex::Tail::default()),
-            ImportSource::Muse => TailState::Muse,
-            ImportSource::Claude => TailState::Claude(claude::Tail::default()),
-            ImportSource::Antigravity => TailState::Antigravity(antigravity::Tail::default()),
-        }
+    pub(crate) fn allow_incomplete_final_record_on_shutdown(&mut self) {
+        self.allow_incomplete_final_record = true;
     }
 
     pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
-        let refresh = match self.records.refresh(&self.path, finalize) {
+        let keeps_translator = self.session.keeps_translator_on_rewrite();
+        let previous_records = if keeps_translator {
+            self.records.values.clone()
+        } else {
+            Vec::new()
+        };
+        let refresh = match self.records.refresh_with_final_partial(
+            &self.path,
+            finalize,
+            self.session.tolerates_incomplete_final_record() && self.allow_incomplete_final_record,
+        ) {
             Ok(refresh) => refresh,
             Err(_) if !finalize => return Ok(Vec::new()),
             Err(error) => return Err(error),
@@ -395,10 +400,15 @@ impl TranscriptTail {
             return Ok(Vec::new());
         }
         if refresh == Refresh::Reset {
-            self.state = Self::new_state(self.source);
-            self.translator_reset = true;
+            self.session = self.importer.tail();
+            if keeps_translator {
+                self.session
+                    .rewritten(&previous_records, &self.records.values);
+            } else {
+                self.translator_reset = true;
+            }
         }
-        let events = match envelopes_from_records(&self.path, self.source, &self.records) {
+        let events = match self.session.envelopes(&self.path, &self.records) {
             Ok(events) => events,
             Err(_) if !finalize => {
                 self.retry_envelopes = true;
@@ -410,12 +420,7 @@ impl TranscriptTail {
         let len = std::fs::metadata(&self.path)
             .with_context(|| format!("read transcript metadata {}", self.path.display()))?
             .len();
-        match &mut self.state {
-            TailState::Codex(state) => state.poll(events, len, finalize),
-            TailState::Muse => Ok(events),
-            TailState::Claude(state) => state.poll(events, len, finalize),
-            TailState::Antigravity(state) => state.poll(events, len, finalize),
-        }
+        self.session.poll(events, len, finalize)
     }
 
     pub(crate) fn take_translator_reset(&mut self) -> bool {
@@ -526,7 +531,7 @@ mod tests {
         std::fs::write(&transcript, "{}\n").unwrap();
 
         assert_eq!(
-            resolve_transcript_in("session-123", ImportSource::Codex, &[root]).unwrap(),
+            codex::layout(vec![root]).find("session-123").unwrap(),
             transcript
         );
     }
@@ -542,7 +547,7 @@ mod tests {
         std::fs::write(&transcript, "{}\n").unwrap();
 
         assert_eq!(
-            resolve_transcript_in("session-123", ImportSource::Claude, &[root]).unwrap(),
+            claude::layout(vec![root]).find("session-123").unwrap(),
             transcript
         );
     }
@@ -563,19 +568,252 @@ mod tests {
         std::fs::write(unrelated, "{}\n").unwrap();
 
         assert_eq!(
-            resolve_transcript_in("conversation-123", ImportSource::Antigravity, &[root]).unwrap(),
+            antigravity::layout(vec![root])
+                .find("conversation-123")
+                .unwrap(),
             transcript
         );
     }
 
     #[test]
-    fn rejects_unsafe_session_ids() {
-        let error = resolve_transcript_in(
-            "../session",
-            ImportSource::Codex,
-            &[PathBuf::from("unused")],
+    fn finds_cursor_transcripts_by_nested_session_identity_and_ignores_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        let transcript = root
+            .join("workspace")
+            .join("agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, r#"{"role":"user","message":{"content":"hi"}}"#).unwrap();
+        let subagent = root
+            .join("workspace")
+            .join("agent-transcripts/agent-session-123/agent-session-123.jsonl");
+        std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
+        std::fs::write(&subagent, "{}\n").unwrap();
+
+        assert_eq!(
+            cursor::layout(vec![root.clone()])
+                .find("session-123")
+                .unwrap(),
+            transcript
+        );
+        assert_eq!(
+            cursor::layout(vec![root]).discover().unwrap(),
+            vec![transcript]
+        );
+    }
+
+    #[test]
+    fn cursor_import_emits_only_supported_transcript_enrichment_and_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let contents = concat!(
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"question\"}]}}\n",
+            "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"a.txt\"}}]}}\n",
+            "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]}}\n",
+            "{\"type\":\"turn_ended\",\"status\":\"success\"}\n"
+        );
+        std::fs::write(&transcript, contents).unwrap();
+        let events = transcript_envelopes(&transcript, ImportSource::Cursor).unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["_bt_importStart", "_bt_importCheckpoint", "_bt_importStop"]
+        );
+        assert!(events.iter().all(|event| event.source == "cursor"));
+        assert_eq!(
+            events[1].payload["_bt_transcript_mirror"]["through"],
+            contents.len() as u64
+        );
+        assert_eq!(
+            events[1].payload["historical_fidelity"],
+            "user_and_assistant_text_and_terminal_status"
+        );
+        assert_eq!(events[2].payload["status"], "success");
+        assert_eq!(events[1].payload["start_time_estimated"], true);
+    }
+
+    #[test]
+    fn cursor_import_preserves_terminal_error_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"question\"}}\n{\"type\":\"turn_ended\",\"status\":\"error\",\"error\":\"WritableIterable is closed\"}\n",
         )
-        .unwrap_err();
+        .unwrap();
+
+        let events = transcript_envelopes(&transcript, ImportSource::Cursor).unwrap();
+        let stop = events
+            .iter()
+            .find(|event| event.event == "_bt_importStop")
+            .unwrap();
+        assert_eq!(stop.payload["status"], "error");
+        assert_eq!(stop.payload["error_message"], "WritableIterable is closed");
+    }
+
+    #[test]
+    fn cursor_attach_tails_growth_without_repeating_boundaries_or_checkpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let first_record = b"{\"role\":\"user\",\"message\":{\"content\":\"one\"}}\n";
+        std::fs::write(&transcript, first_record).unwrap();
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        let first = tail.poll(false).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["_bt_importStart", "_bt_importCheckpoint"]
+        );
+        let snapshot = first[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(PathBuf::from(&snapshot), transcript);
+        assert_eq!(
+            first[1].payload["_bt_transcript_mirror"]["through"],
+            first_record.len() as u64
+        );
+        assert!(tail.poll(false).unwrap().is_empty());
+
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"role\":\"assistant\",\"message\":{\"content\":\"two\"}}\n")
+            .unwrap();
+        let grown = tail.poll(false).unwrap();
+        assert_eq!(
+            grown
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["_bt_importCheckpoint"]
+        );
+        assert_eq!(
+            grown[0].payload["_bt_transcript_mirror"]["mirror"],
+            snapshot
+        );
+        assert_eq!(
+            std::fs::read_to_string(&snapshot).unwrap().lines().count(),
+            2
+        );
+        assert_eq!(
+            tail.poll(true)
+                .unwrap()
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["_bt_importStop"]
+        );
+        std::fs::write(&transcript, b"replacement transcript\n").unwrap();
+        let snapshot_contents = std::fs::read_to_string(&snapshot).unwrap();
+        assert!(snapshot_contents.contains("\"content\":\"one\""));
+        assert!(snapshot_contents.contains("\"content\":\"two\""));
+    }
+
+    #[test]
+    fn cursor_transcript_replacement_rotates_snapshot_without_resetting_translator() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"the original longer prompt\"}}\n",
+        )
+        .unwrap();
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        let first = tail.poll(false).unwrap();
+        let first_snapshot = first[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"latest\"}}\n",
+        )
+        .unwrap();
+        let replacement = tail.poll(false).unwrap();
+        assert_eq!(replacement[0].event, "_bt_importStart");
+        assert_eq!(replacement[1].event, "_bt_importCheckpoint");
+        let replacement_snapshot = replacement[1].payload["_bt_transcript_mirror"]["mirror"]
+            .as_str()
+            .unwrap();
+        assert_ne!(first_snapshot, replacement_snapshot);
+        assert!(!tail.take_translator_reset());
+    }
+
+    #[test]
+    fn cursor_attach_finalizes_after_an_incomplete_trailing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp
+            .path()
+            .join("workspace/agent-transcripts/session-123/session-123.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":\"complete\"}}\n",
+        )
+        .unwrap();
+
+        let mut tail = TranscriptTail::new(transcript.clone(), ImportSource::Cursor);
+        tail.allow_incomplete_final_record_on_shutdown();
+        assert_eq!(
+            tail.poll(false).unwrap().last().unwrap().event,
+            "_bt_importCheckpoint"
+        );
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"role\":\"assistant\",\"message\":")
+            .unwrap();
+
+        let final_events = tail.poll(true).unwrap();
+        assert_eq!(
+            final_events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["_bt_importCheckpoint", "_bt_importStop"]
+        );
+    }
+
+    #[test]
+    fn completed_import_still_rejects_an_incomplete_trailing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"complete\"}\n{\"partial\"").unwrap();
+
+        let error = IncrementalRecords::default()
+            .refresh_with_final_partial(&transcript, true, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("parse transcript"));
+    }
+
+    #[test]
+    fn rejects_unsafe_session_ids() {
+        let error = codex::layout(vec![PathBuf::from("unused")])
+            .find("../session")
+            .unwrap_err();
         assert!(error.to_string().contains("invalid session id"));
     }
 
@@ -587,18 +825,16 @@ mod tests {
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
 
-        let missing = resolve_transcript_in(
-            "missing",
-            ImportSource::Claude,
-            &[first.clone(), second.clone()],
-        )
-        .unwrap_err();
+        let missing = claude::layout(vec![first.clone(), second.clone()])
+            .find("missing")
+            .unwrap_err();
         assert!(missing.to_string().contains("no Claude Code transcript"));
 
         std::fs::write(first.join("duplicate.jsonl"), "{}\n").unwrap();
         std::fs::write(second.join("duplicate.jsonl"), "{}\n").unwrap();
-        let ambiguous =
-            resolve_transcript_in("duplicate", ImportSource::Claude, &[first, second]).unwrap_err();
+        let ambiguous = claude::layout(vec![first, second])
+            .find("duplicate")
+            .unwrap_err();
         assert!(ambiguous
             .to_string()
             .contains("multiple Claude Code transcripts"));
@@ -631,7 +867,7 @@ mod tests {
         std::fs::write(root.join("not-a-transcript.jsonl"), "{}\n").unwrap();
 
         assert_eq!(
-            discover_transcripts_in(ImportSource::Codex, &[root]).unwrap(),
+            codex::layout(vec![root]).discover().unwrap(),
             vec![first, second]
         );
     }
@@ -657,13 +893,15 @@ mod tests {
         std::fs::write(project.join("notes.jsonl"), "{}\n").unwrap();
 
         assert_eq!(
-            discover_transcripts_in(ImportSource::Claude, &[root]).unwrap(),
+            claude::layout(vec![root]).discover().unwrap(),
             vec![transcript]
         );
     }
 
     #[test]
-    fn claude_import_emits_related_subagent_lifecycle_inside_parent_turn() {
+    fn claude_import_keeps_delayed_child_and_native_handback_under_launching_turn() {
+        use crate::translate::{Registry, SessionCtx, SpanOp, SpanType};
+
         let temp = tempfile::tempdir().unwrap();
         let transcript = temp.path().join("session-a.jsonl");
         let subagent = temp.path().join("session-a/subagents/agent-child-a.jsonl");
@@ -671,8 +909,12 @@ mod tests {
         let records = [
             json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:01Z","message":{"content":"delegate"}}),
             json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"call-a","name":"Agent","input":{"subagent_type":"reviewer"}}]}}),
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:03Z","message":{"content":"unrelated question"}}),
             json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:05Z","toolUseResult":{"agentId":"child-a"},"message":{"content":[{"type":"tool_result","tool_use_id":"call-a","content":"done"}]}}),
             json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:06Z","message":{"content":[{"type":"text","text":"complete"}]}}),
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:07Z","origin":{"kind":"peer","handback":true,"senderTaskId":"child-a","from":"child-a","name":"reviewer"},"message":{"content":"Another Claude session sent a message:\n<agent-message from=\"child-a\">reviewed</agent-message>\nThis agent is working inside the same session."}}),
+            json!({"type":"assistant","sessionId":"session-a","timestamp":"2026-01-01T00:00:08Z","message":{"id":"handback-response","content":[{"type":"text","text":"accepted review"}]}}),
+            json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:09Z","message":{"content":"next human question"}}),
         ];
         std::fs::write(
             &transcript,
@@ -690,27 +932,72 @@ mod tests {
         .unwrap();
 
         let events = transcript_envelopes(&transcript, ImportSource::Claude).unwrap();
-        let names = events
+        let context = SessionCtx {
+            session_id: "session-a".into(),
+            config: None,
+        };
+        let mut translator = Registry::default_agents().create("claude-code", "session-a");
+        let mut ops = Vec::new();
+        for event in &events {
+            ops.extend(translator.handle(event, &context).unwrap());
+            while let Some(pending) = translator.drain_pending(&context).unwrap() {
+                ops.extend(pending);
+            }
+        }
+        ops.extend(translator.finalize(&context).unwrap());
+        while let Some(pending) = translator.drain_pending(&context).unwrap() {
+            ops.extend(pending);
+        }
+        let inserts = ops
             .iter()
-            .map(|event| event.event.as_str())
+            .filter_map(|op| match op {
+                SpanOp::Insert(row) => Some(row),
+                SpanOp::Merge(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let turns = inserts
+            .iter()
+            .filter(|row| row.name.starts_with("Turn "))
             .collect::<Vec<_>>();
         assert_eq!(
-            names,
-            vec![
-                "SessionStart",
-                "UserPromptSubmit",
-                "SubagentStart",
-                "SubagentStop",
-                "Stop",
-                "SessionEnd"
-            ]
+            turns
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Turn 1", "Turn 2", "Turn 3"]
         );
-        assert_eq!(events[2].payload["agent_id"], json!("child-a"));
-        assert_eq!(events[2].payload["agent_type"], json!("reviewer"));
+        let launch = turns[0];
+        let child = inserts
+            .iter()
+            .find(|row| {
+                row.span_type == SpanType::Task
+                    && row
+                        .metadata
+                        .as_ref()
+                        .and_then(|value| value.get("agent_id"))
+                        == Some(&json!("child-a"))
+            })
+            .unwrap();
+        assert_eq!(child.parent_span_ids, std::slice::from_ref(&launch.span_id));
+        let continuation = inserts
+            .iter()
+            .find(|row| {
+                row.metadata
+                    .as_ref()
+                    .and_then(|value| value.get("turn_trigger"))
+                    == Some(&json!("agent_message"))
+            })
+            .unwrap();
         assert_eq!(
-            Path::new(events[3].payload["agent_transcript_path"].as_str().unwrap()),
-            subagent
+            continuation.parent_span_ids,
+            std::slice::from_ref(&launch.span_id)
         );
+        assert!(ops.iter().any(|op| match op {
+            SpanOp::Insert(row) | SpanOp::Merge(row) => {
+                row.span_id == continuation.span_id
+                    && row.output.as_ref() == Some(&json!("accepted review"))
+            }
+        }));
     }
 
     #[test]
@@ -994,7 +1281,12 @@ mod tests {
         let path = temp.path().join("session.jsonl");
         std::fs::write(&path, "{\"type\":\"session_meta\"").unwrap();
         let mut records = IncrementalRecords::default();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Unchanged);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Unchanged
+        );
         assert!(records.values.is_empty());
 
         std::fs::write(
@@ -1002,11 +1294,21 @@ mod tests {
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
         )
         .unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Appended);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Appended
+        );
         assert_eq!(records.values.len(), 1);
 
         std::fs::write(&path, "{\"type\":\"event_msg\"}\n").unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Reset);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Reset
+        );
         assert_eq!(records.values, vec![json!({"type":"event_msg"})]);
 
         std::fs::write(
@@ -1014,7 +1316,12 @@ mod tests {
             "{\"type\":\"replacement_with_a_longer_prefix\"}\n{\"type\":\"second\"}\n",
         )
         .unwrap();
-        assert_eq!(records.refresh(&path, false).unwrap(), Refresh::Reset);
+        assert_eq!(
+            records
+                .refresh_with_final_partial(&path, false, false)
+                .unwrap(),
+            Refresh::Reset
+        );
         assert_eq!(
             records.values,
             vec![
