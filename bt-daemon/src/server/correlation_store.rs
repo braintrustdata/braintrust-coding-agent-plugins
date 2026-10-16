@@ -28,10 +28,8 @@ pub(super) struct PendingSession {
     pub(super) first_seen_ms: i64,
     #[serde(skip)]
     pub(super) deadline: Option<Instant>,
-    // Discovery expiry is not an authentication/delivery retry loop. A failed
-    // handoff stays visible until a new event, explicit flush, or restart.
-    #[serde(skip)]
-    pub(super) delivery_failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) recovery: Option<crate::pipeline::recovery::Failure>,
     #[serde(default)]
     pub(super) events: Vec<PendingEvent>,
 }
@@ -45,7 +43,7 @@ impl Default for PendingSession {
             parent: None,
             first_seen_ms: 0,
             deadline: None,
-            delivery_failed: false,
+            recovery: None,
             events: Vec::new(),
         }
     }
@@ -150,6 +148,9 @@ pub(super) async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> R
             // Queue behind any earlier events whose handoff failed so a
             // second failure keeps this event visible and retryable too.
             state.events.push(event);
+            if state.recovery.is_some() {
+                return store_correlation(daemon, &key, &state).await;
+            }
             return finish_correlation(daemon, &key, state).await;
         }
 
@@ -328,8 +329,11 @@ pub(super) async fn finish_correlation(
     mut state: PendingSession,
 ) -> Result<(), String> {
     state.parent = None;
-    state.delivery_failed = false;
-    let result = async {
+    let attempt = state
+        .recovery
+        .take()
+        .map_or(0, |failure| failure.attempt.saturating_add(1));
+    let result: Result<(), String> = async {
         // Persist the final route before delivering any events. A crash may
         // replay deterministic rows, but must never select a different parent.
         store_correlation(daemon, key, &state).await?;
@@ -345,8 +349,19 @@ pub(super) async fn finish_correlation(
         Ok(())
     }
     .await;
-    if result.is_err() {
-        state.delivery_failed = true;
+    if let Err(error) = &result {
+        let position = state
+            .events
+            .first()
+            .map_or(0, |event| event.journal_through);
+        state.recovery = Some(crate::pipeline::recovery::Failure::credentials(
+            position,
+            error.clone(),
+            attempt,
+        ));
+        if let Err(error) = store_correlation(daemon, key, &state).await {
+            tracing::warn!(%error,"pending recovery evidence could not be persisted");
+        }
         daemon
             .pending_sessions
             .lock()
@@ -373,8 +388,22 @@ pub(super) async fn resolve_pending_sessions(
             continue;
         };
         let forced = state.events.first().is_some_and(|event| force(&event.env));
-        if state.delivery_failed && !forced {
-            continue;
+        if let Some(failure) = &state.recovery {
+            use crate::pipeline::{
+                recovery::{Recovery, RecoveryOutcome},
+                Stage,
+            };
+            if matches!(
+                (Recovery {
+                    config: None,
+                    version: &daemon.version
+                })
+                .process(failure)
+                .await,
+                RecoveryOutcome::Waiting
+            ) {
+                continue;
+            }
         }
         if !state.decided() && (state.expired() || forced) {
             state.standalone = true;

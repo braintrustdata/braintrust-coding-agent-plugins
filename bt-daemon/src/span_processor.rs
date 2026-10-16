@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const STACK_LIMIT_BYTES: usize = 512 * 1024;
@@ -42,6 +42,7 @@ struct Engine {
     modules: HashMap<PathBuf, CachedModule>,
     failed_plugins: HashMap<PathBuf, FailedPlugin>,
     env: BTreeMap<String, String>,
+    last_fingerprint: Option<PluginFingerprint>,
     context: Context,
     started: Instant,
     deadline_ms: Arc<AtomicU64>,
@@ -50,8 +51,7 @@ struct Engine {
 }
 
 struct CachedModule {
-    modified: Option<SystemTime>,
-    len: u64,
+    fingerprint: PluginFingerprint,
     function: Persistent<Function<'static>>,
 }
 
@@ -63,8 +63,7 @@ struct FailedPlugin {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PluginFingerprint {
-    modified: Option<SystemTime>,
-    len: u64,
+    digest: [u8; 32],
 }
 
 impl Engine {
@@ -85,6 +84,7 @@ impl Engine {
             modules: HashMap::new(),
             failed_plugins: HashMap::new(),
             env: environment(),
+            last_fingerprint: None,
             context,
             started,
             deadline_ms,
@@ -93,16 +93,18 @@ impl Engine {
     }
 
     fn load(&mut self, path: &Path) -> anyhow::Result<Persistent<Function<'static>>> {
-        let metadata = std::fs::metadata(path)
-            .map_err(|error| anyhow::anyhow!("failed to inspect {}: {error}", path.display()))?;
-        let modified = metadata.modified().ok();
+        self.last_fingerprint = None;
+        let source = std::fs::read(path)
+            .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+        let fingerprint = PluginFingerprint {
+            digest: Sha256::digest(&source).into(),
+        };
+        self.last_fingerprint = Some(fingerprint);
         if let Some(module) = self.modules.get(path) {
-            if module.modified == modified && module.len == metadata.len() {
+            if module.fingerprint == fingerprint {
                 return Ok(module.function.clone());
             }
         }
-        let source = std::fs::read(path)
-            .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
         let digest = Sha256::digest(&source);
         let name = format!("bt-span-plugin:{digest:x}");
         self.arm_deadline();
@@ -128,8 +130,7 @@ impl Engine {
         self.modules.insert(
             path.to_path_buf(),
             CachedModule {
-                modified,
-                len: metadata.len(),
+                fingerprint,
                 function: function.clone(),
             },
         );
@@ -179,7 +180,7 @@ impl Engine {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PluginFailure {
     pub path: PathBuf,
     pub message: String,
@@ -203,6 +204,25 @@ pub fn process(
     op: &SpanOp,
     source: &str,
     session_id: &str,
+) -> anyhow::Result<ProcessResult> {
+    process_inner(plugins, op, source, session_id, true)
+}
+
+pub(crate) fn process_isolated(
+    plugins: &[PathBuf],
+    op: &SpanOp,
+    source: &str,
+    session_id: &str,
+) -> anyhow::Result<ProcessResult> {
+    process_inner(plugins, op, source, session_id, false)
+}
+
+fn process_inner(
+    plugins: &[PathBuf],
+    op: &SpanOp,
+    source: &str,
+    session_id: &str,
+    use_failed_cache: bool,
 ) -> anyhow::Result<ProcessResult> {
     if plugins.is_empty() {
         return Ok(ProcessResult {
@@ -228,7 +248,12 @@ pub fn process(
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("span processor engine was not initialized"))?;
         for plugin in plugins {
-            if let Some(failed) = engine.failed_plugins.get(plugin).cloned() {
+            if let Some(failed) = engine
+                .failed_plugins
+                .get(plugin)
+                .cloned()
+                .filter(|_| use_failed_cache)
+            {
                 if failed.fingerprint == plugin_fingerprint(plugin) {
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
@@ -256,9 +281,10 @@ pub fn process(
                 }
                 Ok(_) => {
                     let message = "changed immutable span identity fields".to_owned();
-                    engine
-                        .failed_plugins
-                        .insert(plugin.clone(), failed_plugin(plugin, &message));
+                    engine.failed_plugins.insert(
+                        plugin.clone(),
+                        failed_plugin(engine.last_fingerprint, &message),
+                    );
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
                         message,
@@ -268,9 +294,10 @@ pub fn process(
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    engine
-                        .failed_plugins
-                        .insert(plugin.clone(), failed_plugin(plugin, &message));
+                    engine.failed_plugins.insert(
+                        plugin.clone(),
+                        failed_plugin(engine.last_fingerprint, &message),
+                    );
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
                         message,
@@ -297,18 +324,59 @@ pub fn process(
     })
 }
 
-fn failed_plugin(path: &Path, message: &str) -> FailedPlugin {
+fn failed_plugin(fingerprint: Option<PluginFingerprint>, message: &str) -> FailedPlugin {
     FailedPlugin {
-        fingerprint: plugin_fingerprint(path),
+        fingerprint,
         message: message.to_owned(),
     }
 }
 
 fn plugin_fingerprint(path: &Path) -> Option<PluginFingerprint> {
-    let metadata = std::fs::metadata(path).ok()?;
     Some(PluginFingerprint {
-        modified: metadata.modified().ok(),
-        len: metadata.len(),
+        digest: Sha256::digest(std::fs::read(path).ok()?).into(),
+    })
+}
+
+pub(crate) fn file_digest(path: &Path) -> Option<[u8; 32]> {
+    plugin_fingerprint(path).map(|fingerprint| fingerprint.digest)
+}
+
+pub(crate) fn failed_digest(path: &Path) -> Option<[u8; 32]> {
+    ENGINE.with_borrow(|engine| {
+        engine
+            .as_ref()?
+            .failed_plugins
+            .get(path)?
+            .fingerprint
+            .map(|f| f.digest)
+    })
+}
+
+// Preserve the bytes actually loaded by predecessors, not a later filesystem
+// sample: an edit during a failing call must already qualify for recovery.
+pub(crate) fn chain_digests(paths: &[PathBuf], failed: &Path) -> Vec<Option<[u8; 32]>> {
+    ENGINE.with_borrow(|engine| {
+        let mut reached_failure = false;
+        paths
+            .iter()
+            .map(|path| {
+                if path == failed {
+                    reached_failure = true;
+                    engine
+                        .as_ref()
+                        .and_then(|engine| engine.failed_plugins.get(path))
+                        .and_then(|failed| failed.fingerprint)
+                        .map(|fingerprint| fingerprint.digest)
+                } else if !reached_failure {
+                    engine
+                        .as_ref()
+                        .and_then(|engine| engine.modules.get(path))
+                        .map(|module| module.fingerprint.digest)
+                } else {
+                    file_digest(path)
+                }
+            })
+            .collect()
     })
 }
 

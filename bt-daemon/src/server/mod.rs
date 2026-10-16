@@ -22,7 +22,7 @@ use recovery::*;
 use rpc::*;
 use sessions::*;
 
-use crate::dispatch::{hydrate_transcript_reference, ReplayPlan, Session, SessionOptions};
+use crate::dispatch::{hydrate_transcript_reference, Session, SessionOptions};
 use crate::journal::{self, JournalWriter};
 use crate::sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, SinkFactory};
 use crate::translate::Registry;
@@ -187,16 +187,13 @@ impl Daemon {
         *self.last_activity.lock() = Instant::now();
     }
 
-    /// Queued work, excluding pending sessions whose handoff failed. Those are
-    /// durable on disk and resume after a restart, so they must not keep an
-    /// otherwise idle daemon alive forever.
+    /// Unresolved work keeps automatic recovery alive.
     fn total_queued(&self) -> u64 {
         let dispatched: u64 = self.sessions.lock().values().map(|s| s.pending()).sum();
         dispatched.saturating_add(
             self.pending_sessions
                 .lock()
                 .values()
-                .filter(|state| !state.delivery_failed)
                 .map(|state| state.events.len() as u64)
                 .sum(),
         )

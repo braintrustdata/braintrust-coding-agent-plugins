@@ -33,6 +33,51 @@ impl DeliveryKey {
 }
 
 impl Daemon {
+    pub(super) async fn translation_for(
+        &self,
+        env: &Envelope,
+    ) -> anyhow::Result<Arc<crate::pipeline::translation::Translation>> {
+        let event_path =
+            journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
+        let namespace =
+            if journal::legacy_journal_has_session(&self.data_dir, &env.source, &env.session_id)
+                .await
+            {
+                env.session_id.clone()
+            } else {
+                crate::ids::session_namespace(&env.source, &env.session_id)
+            };
+        let journal = self
+            .journal_writer_for(&env.source, &env.session_id)
+            .await?;
+        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
+        let existing = self.translations.lock().get(&storage_key).cloned();
+        Ok(match existing {
+            Some(translation) => translation,
+            None => {
+                let translation = crate::pipeline::translation::Translation::spawn(
+                    crate::pipeline::translation::TranslationOptions {
+                        source: env.source.clone(),
+                        session_id: env.session_id.clone(),
+                        namespace: namespace.clone(),
+                        version: self.version.clone(),
+                        data_dir: self.data_dir.clone(),
+                        events: journal.clone(),
+                        event_path: event_path.clone(),
+                        registry: self.translators.clone(),
+                        correlation: self.correlation.clone(),
+                        correlation_changed: self.correlation_changed.clone(),
+                    },
+                )
+                .await?;
+                self.translations
+                    .lock()
+                    .insert(storage_key, translation.clone());
+                translation
+            }
+        })
+    }
+
     pub(super) async fn session_for(
         &self,
         env: &Envelope,
@@ -60,52 +105,10 @@ impl Daemon {
         // delivery checkpoint controlling which rows reach its sink.
         let journal_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
-        let translator_session_id =
-            if journal::legacy_journal_has_session(&self.data_dir, &env.source, &env.session_id)
-                .await
-            {
-                env.session_id.clone()
-            } else {
-                crate::ids::session_namespace(&env.source, &env.session_id)
-            };
-        let replay = ReplayPlan {
-            acknowledged_through: journal::JournalReader::acknowledged_through(
-                &journal_path,
-                replay_through,
-                route,
-            )
-            .await,
-            journal_path,
-        };
-        let journal = self
-            .journal_writer_for(&env.source, &env.session_id)
-            .await?;
-        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
-        let existing = self.translations.lock().get(&storage_key).cloned();
-        let translation = match existing {
-            Some(translation) => translation,
-            None => {
-                let translation = crate::pipeline::translation::Translation::spawn(
-                    crate::pipeline::translation::TranslationOptions {
-                        source: env.source.clone(),
-                        session_id: env.session_id.clone(),
-                        namespace: translator_session_id.clone(),
-                        version: self.version.clone(),
-                        data_dir: self.data_dir.clone(),
-                        events: journal.clone(),
-                        event_path: replay.journal_path.clone(),
-                        registry: self.translators.clone(),
-                        correlation: self.correlation.clone(),
-                        correlation_changed: self.correlation_changed.clone(),
-                    },
-                )
-                .await?;
-                self.translations
-                    .lock()
-                    .insert(storage_key, translation.clone());
-                translation
-            }
-        };
+        let legacy_through =
+            journal::JournalReader::acknowledged_through(&journal_path, replay_through, route)
+                .await;
+        let translation = self.translation_for(env).await?;
         translation
             .observe(crate::pipeline::translation::Observation {
                 key: key.correlation_key(),
@@ -116,10 +119,7 @@ impl Daemon {
         // Materialize historical output before seeding a released completion boundary.
         translation.advance(replay_through).await?;
         let _ = translation.barrier().await;
-        let cursor = translation
-            .journal
-            .subscribe(route, replay.acknowledged_through)
-            .await?;
+        let cursor = translation.journal.subscribe(route, legacy_through).await?;
         let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
@@ -128,6 +128,7 @@ impl Daemon {
             SessionOptions {
                 translation,
                 cursor,
+                auth_provider: self.auth_provider.clone(),
                 session_id: env.session_id.clone(),
                 source: env.source.clone(),
                 bt_version: self.version.clone(),
