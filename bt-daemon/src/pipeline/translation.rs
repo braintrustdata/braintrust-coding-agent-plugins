@@ -671,6 +671,22 @@ impl Producer {
     }
 
     async fn observe_history(&mut self, observer: &Observation) -> anyhow::Result<()> {
+        // Candidates have no delivery position yet, but their birth records
+        // identify the session for correlation. Defensive retirement updates
+        // are not native observations and must not close a recreated observer.
+        for ops in self.journal.root_candidates().await?.into_values() {
+            let births = ops
+                .into_iter()
+                .filter(|op| matches!(op, SpanOp::Insert(_)))
+                .collect::<Vec<_>>();
+            Self::observe(
+                &self.options,
+                &mut self.pending_snapshots,
+                &births,
+                observer,
+            )
+            .await?;
+        }
         let mut after = 0;
         loop {
             let rows = self.journal.read_after(after, 128).await?;
@@ -716,6 +732,76 @@ impl Producer {
 mod tests {
     use super::*;
     use crate::{pipeline::delivery::InputPort, translate::SpanRow};
+
+    #[tokio::test]
+    async fn recreated_observer_restores_a_staged_session_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_path = tmp.path().join("events.ndjson");
+        let correlation = Arc::new(crate::correlation::CorrelationRegistry::default());
+        let translation = Translation::spawn(TranslationOptions {
+            source: "debug".into(),
+            session_id: "staged".into(),
+            namespace: "staged".into(),
+            version: "test".into(),
+            data_dir: tmp.path().into(),
+            events: Arc::new(tokio::sync::Mutex::new(
+                JournalWriter::open_path(&event_path).await.unwrap(),
+            )),
+            event_path,
+            registry: Arc::new(Registry::default_agents()),
+            correlation: correlation.clone(),
+            correlation_changed: Arc::new(Notify::new()),
+        })
+        .await
+        .unwrap();
+        let mut roots = Roots::default();
+        roots
+            .process(&vec![
+                SpanOp::Insert(SpanRow {
+                    span_id: "root".into(),
+                    root_span_id: "root".into(),
+                    metadata: Some(serde_json::json!({"_bt_defer_root":true})),
+                    ..Default::default()
+                }),
+                SpanOp::Merge(SpanRow {
+                    span_id: "root".into(),
+                    end_ms: Some(1),
+                    ..Default::default()
+                }),
+            ])
+            .await;
+        translation.journal.begin(10, false).await.unwrap();
+        translation
+            .journal
+            .commit_with_roots(10, roots.pending())
+            .await
+            .unwrap();
+        let route = SessionRoute::default();
+        let observer = Observation {
+            key: "observer".into(),
+            config: route.with_auth(crate::wire::BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: Some("org".into()),
+                org_id: None,
+            }),
+            route,
+        };
+        for _ in 0..2 {
+            translation.observe(observer.clone()).await.unwrap();
+            translation.barrier().await.unwrap();
+            // A retired producer's defensive terminal update must not close
+            // the newly restored session fallback.
+            assert!(
+                correlation.active_parent_snapshot(&observer.key).is_some(),
+                "staged root must restore the session fallback"
+            );
+            translation.unobserve(observer.key.clone()).await;
+            correlation.remove_session(&observer.key);
+        }
+        translation.shutdown().await;
+    }
 
     #[tokio::test]
     async fn routing_resume_does_not_read_or_translate_the_committed_event_prefix() {
