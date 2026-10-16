@@ -153,6 +153,22 @@ pub trait AgentTranslator: Send {
         Ok(Vec::new())
     }
 
+    /// Ordered daemon controls bound external observations during replay.
+    fn checkpoint_at(
+        &mut self,
+        ctx: &SessionCtx,
+        _bounds: &HashMap<String, u64>,
+    ) -> anyhow::Result<Vec<SpanOp>> {
+        self.checkpoint(ctx)
+    }
+    fn finalize_at(
+        &mut self,
+        ctx: &SessionCtx,
+        _bounds: &HashMap<String, u64>,
+    ) -> anyhow::Result<Vec<SpanOp>> {
+        self.finalize(ctx)
+    }
+
     /// Backward-compatible terminal flush used by transcript import callers.
     /// Live delivery barriers use [`Self::checkpoint`] instead.
     fn flush(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {

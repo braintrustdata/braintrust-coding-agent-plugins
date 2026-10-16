@@ -336,11 +336,11 @@ impl Sink for LedgerSink {
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     self.span_origins.entry(row.span_id.clone())
                 {
-                    let origin = OriginSnapshot {
+                    let origin = row.origin.clone().unwrap_or_else(|| OriginSnapshot {
                         plugin_version: self.plugin_version.clone(),
                         bt_version: self.bt_version.clone(),
                         source_version: self.source_version.clone(),
-                    };
+                    });
                     if self.ledger.is_some() {
                         self.pending_origins
                             .insert(row.span_id.clone(), origin.clone());

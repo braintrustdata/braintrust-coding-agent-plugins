@@ -228,6 +228,7 @@ enum PendingWork {
     },
     CatchUp {
         paths: Vec<String>,
+        bounds: Option<std::collections::HashMap<String, u64>>,
         next_path: usize,
         finalize: bool,
     },
@@ -351,12 +352,19 @@ impl AgentTranslator for CodexTranslator {
             }
             PendingWork::CatchUp {
                 paths,
+                bounds,
                 mut next_path,
                 finalize,
             } => {
                 while next_path < paths.len() {
                     let path = &paths[next_path];
-                    if self.catch_up_chunk(path, 0, None, None, &mut ops) {
+                    if self.catch_up_chunk(
+                        path,
+                        0,
+                        None,
+                        bounds.as_ref().and_then(|b| b.get(path).copied()),
+                        &mut ops,
+                    ) {
                         if finalize {
                             if let Some(mut scope) = self.scopes.remove(path) {
                                 self.close_dangling(&mut scope, None, &mut ops);
@@ -370,6 +378,7 @@ impl AgentTranslator for CodexTranslator {
                     if !ops.is_empty() || next_path < paths.len() {
                         self.pending = (next_path < paths.len()).then_some(PendingWork::CatchUp {
                             paths,
+                            bounds,
                             next_path,
                             finalize,
                         });
@@ -382,11 +391,25 @@ impl AgentTranslator for CodexTranslator {
     }
 
     fn checkpoint(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
-        self.start_catch_up(ctx, false)
+        self.start_catch_up(ctx, false, None)
     }
 
     fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
-        self.start_catch_up(ctx, true)
+        self.start_catch_up(ctx, true, None)
+    }
+    fn checkpoint_at(
+        &mut self,
+        ctx: &SessionCtx,
+        bounds: &std::collections::HashMap<String, u64>,
+    ) -> anyhow::Result<Vec<SpanOp>> {
+        self.start_catch_up(ctx, false, Some(bounds))
+    }
+    fn finalize_at(
+        &mut self,
+        ctx: &SessionCtx,
+        bounds: &std::collections::HashMap<String, u64>,
+    ) -> anyhow::Result<Vec<SpanOp>> {
+        self.start_catch_up(ctx, true, Some(bounds))
     }
 }
 
@@ -405,7 +428,12 @@ impl CodexTranslator {
         }
     }
 
-    fn start_catch_up(&mut self, ctx: &SessionCtx, finalize: bool) -> anyhow::Result<Vec<SpanOp>> {
+    fn start_catch_up(
+        &mut self,
+        ctx: &SessionCtx,
+        finalize: bool,
+        bounds: Option<&std::collections::HashMap<String, u64>>,
+    ) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),
             "Codex translator has pending catch-up work; drain it before checkpointing"
@@ -418,6 +446,7 @@ impl CodexTranslator {
         }
         self.pending = Some(PendingWork::CatchUp {
             paths,
+            bounds: bounds.cloned(),
             next_path: 0,
             finalize,
         });

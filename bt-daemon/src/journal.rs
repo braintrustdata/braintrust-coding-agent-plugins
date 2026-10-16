@@ -246,9 +246,7 @@ impl JournalWriter {
         self.position
     }
 
-    /// Append one event in redacted form and flush to the OS. Not fsync'd per
-    /// event (that would dominate hook latency); an OS crash can lose the last
-    /// few lines, which replay tolerates.
+    /// Append one redacted event and confirm its durable write before capture acknowledges it.
     ///
     /// The journal is a durability record and is never capped or truncated:
     /// dropping entries would silently cost recovery fidelity. Its size is
@@ -262,28 +260,24 @@ impl JournalWriter {
         line.push(b'\n');
         self.file.write_all(&line).await?;
         self.file.flush().await?;
+        self.file.sync_data().await?;
         self.position += line.len() as u64;
         Ok(self.position)
     }
 
-    /// Record that the sink durably accepted every event through this byte
-    /// offset for one route. It lives in the event journal so a cold worker
-    /// restores delivery knowledge together with translator state.
-    pub async fn append_delivery_checkpoint(
+    pub(crate) async fn append_control(
         &mut self,
-        route: &SessionRoute,
-        through: u64,
-    ) -> anyhow::Result<()> {
-        let mut line = serde_json::to_vec(&DeliveryCheckpointRecord {
-            record_type: "delivery_checkpoint".into(),
-            route: route.clone(),
-            through,
-        })?;
+        control: &PipelineControl,
+    ) -> anyhow::Result<u64> {
+        let mut value = serde_json::to_value(control)?;
+        value["_bt_record_type"] = "pipeline_control".into();
+        let mut line = serde_json::to_vec(&value)?;
         line.push(b'\n');
         self.file.write_all(&line).await?;
         self.file.flush().await?;
+        self.file.sync_data().await?;
         self.position += line.len() as u64;
-        Ok(())
+        Ok(self.position)
     }
 }
 
@@ -301,7 +295,22 @@ struct DeliveryCheckpointRecord {
 #[allow(clippy::large_enum_variant)]
 pub enum JournalRecord {
     Event(RedactedEnvelope),
+    Control(PipelineControl),
     DeliveryCheckpoint { route: SessionRoute, through: u64 },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlKind {
+    Checkpoint,
+    Finalize,
+    Retire,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineControl {
+    pub kind: ControlKind,
+    pub bounds: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug)]
@@ -400,6 +409,12 @@ impl JournalReader {
                     route: checkpoint.route,
                     through: checkpoint.through,
                 }
+            } else if value
+                .get("_bt_record_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("pipeline_control")
+            {
+                JournalRecord::Control(serde_json::from_value(value)?)
             } else {
                 let mut event = serde_json::from_value(value).map_err(|error| {
                     anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
@@ -414,6 +429,13 @@ impl JournalReader {
                 through: self.position,
             }));
         }
+    }
+
+    pub(crate) fn extend(&mut self, through: u64) {
+        let buffered = self.reader.buffer().len() as u64;
+        self.reader
+            .get_mut()
+            .set_limit(through.saturating_sub(self.position + buffered));
     }
 
     /// The latest acknowledged event offset for `route` in the portion of the
@@ -565,7 +587,19 @@ pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
             .and_then(|m| m.modified().ok())
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > max_age);
-        if old {
+        let partition = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit("--").next());
+        let protected = match partition {
+            Some(id) => {
+                tokio::fs::try_exists(data_dir.join("pipeline").join(format!("{id}.sqlite")))
+                    .await
+                    .unwrap_or(true)
+            }
+            None => false,
+        };
+        if old && !protected {
             if let Err(e) = tokio::fs::remove_file(&path).await {
                 tracing::warn!(path = %path.display(), "failed to remove stale journal: {e}");
             }
