@@ -8,13 +8,14 @@ use crate::{
     translate::SpanOp,
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
 };
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex as StorageMutex,
     },
 };
 use tokio::sync::watch;
@@ -32,7 +33,7 @@ impl std::error::Error for BindingChanged {}
 
 #[derive(Clone)]
 pub(crate) struct SpanJournal {
-    connection: Arc<Mutex<Option<Connection>>>,
+    connection: Arc<StorageMutex<Option<Connection>>>,
     changed: watch::Sender<u64>,
 }
 
@@ -114,7 +115,7 @@ impl SpanJournal {
         let (connection, tail) = connection;
         let (changed, _) = watch::channel(tail);
         Ok(Self {
-            connection: Arc::new(Mutex::new(Some(connection))),
+            connection: Arc::new(StorageMutex::new(Some(connection))),
             changed,
         })
     }
@@ -479,7 +480,7 @@ impl Progress {
             if *completed.borrow_and_update() >= target {
                 return Ok(());
             }
-            if let Some(error) = error.lock().unwrap().clone() {
+            if let Some(error) = error.lock().clone() {
                 return Err(error);
             }
             tokio::select! {
@@ -644,8 +645,8 @@ impl Cursor {
                     {
                         self.journal.set_failure(&self.route, None).await?;
                     } else {
-                        *self.error.lock().unwrap() = Some(failure.message());
-                        *self.recovery.lock().unwrap() = Some(failure.info(false));
+                        *self.error.lock() = Some(failure.message());
+                        *self.recovery.lock() = Some(failure.info(false));
                         if matches!(
                             (Recovery {
                                 config: config.as_ref(),
@@ -658,7 +659,7 @@ impl Cursor {
                             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             continue;
                         }
-                        *self.recovery.lock().unwrap() = Some(failure.info(true));
+                        *self.recovery.lock() = Some(failure.info(true));
                     }
                 }
             }
@@ -736,16 +737,16 @@ impl Completion for HeadCompletion {
             .map(|head| {
                 self.acknowledged = true;
                 self.progress.send_replace(head);
-                *self.error.lock().unwrap() = None;
-                *self.recovery.lock().unwrap() = None;
+                *self.error.lock() = None;
+                *self.recovery.lock() = None;
             })
     }
 
     async fn failed(&mut self, failure: &mut Failure) -> anyhow::Result<()> {
         failure.position = self.expected + 1;
         failure.through = Some(self.through);
-        *self.error.lock().unwrap() = Some(failure.message());
-        *self.recovery.lock().unwrap() = Some(failure.info(false));
+        *self.error.lock() = Some(failure.message());
+        *self.recovery.lock() = Some(failure.info(false));
         self.journal
             .set_failure(&self.route, Some(serde_json::to_string(failure)?))
             .await
@@ -795,7 +796,7 @@ mod tests {
         drop(delivery);
         // Cancel a receive while its storage read is pending, as a concurrent
         // configuration update does. The replay obligation must survive it.
-        let storage = journal.connection.lock().unwrap();
+        let storage = journal.connection.lock();
         let mut cancelled = Box::pin(input.receive());
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(std::future::Future::poll(cancelled.as_mut(), &mut context).is_pending());

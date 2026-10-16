@@ -126,6 +126,7 @@ impl Daemon {
         }
         let session = Session::spawn(
             SessionOptions {
+                observer_key: key.correlation_key(),
                 translation,
                 input,
                 route: route.clone(),

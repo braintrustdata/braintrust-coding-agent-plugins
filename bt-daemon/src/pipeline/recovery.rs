@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Boundary {
     Plugin,
@@ -30,7 +30,7 @@ impl std::fmt::Display for Boundary {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "when", rename_all = "snake_case")]
 pub(crate) enum Condition {
     Plugin {
@@ -55,7 +55,7 @@ pub(crate) enum Condition {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Failure {
     pub boundary: Boundary,
     pub position: u64,

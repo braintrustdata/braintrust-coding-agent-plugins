@@ -13,10 +13,11 @@ use crate::{
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
     AuthProvider, AuthResolveReason,
 };
+use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{atomic::Ordering, Arc},
 };
 use tokio::sync::{watch, Notify};
 
@@ -74,8 +75,8 @@ impl ConsumerOptions {
             Some(delivery) => delivery.failed(failure).await,
             None => Ok(()), // Input errors are reported by the source itself.
         };
-        *self.error.lock().unwrap() = Some(failure.message());
-        *self.recovery.lock().unwrap() = Some(failure.info(false));
+        *self.error.lock() = Some(failure.message());
+        *self.recovery.lock() = Some(failure.info(false));
         if let Err(error) = result {
             tracing::warn!(%error,"delivery recovery evidence could not be reported; original failure retained");
             return false;
@@ -152,7 +153,13 @@ impl ConsumerOptions {
                 return Ok(false);
             }
             Work::Flush => {
-                let sink = sink.as_mut().expect("accepted delivery retains its sink");
+                let sink = sink.as_mut().ok_or_else(|| {
+                    self.storage(
+                        &anyhow::anyhow!("accepted delivery has no sink"),
+                        attempt,
+                        Work::Flush,
+                    )
+                })?;
                 sink.flush().await.map_err(|error| {
                     if error.downcast_ref::<CommitFailure>().is_some() {
                         self.storage(&error, attempt, Work::Flush)
@@ -160,7 +167,7 @@ impl ConsumerOptions {
                         self.routing(&error, config, attempt)
                     }
                 })?;
-                *self.permalink.lock().unwrap() = sink.permalink();
+                *self.permalink.lock() = sink.permalink();
                 if sink.has_pending_delivery() {
                     return Ok(false);
                 }
@@ -200,13 +207,13 @@ impl Consumer {
             loop {
                 if let Some(waiting) = held.take() {
                     let (mut failure, work) = *waiting;
-                    let mut encoded = serde_json::to_string(&failure).expect("failure evidence");
-                    if recorded.as_ref() != Some(&encoded)
+                    let mut reported = failure.clone();
+                    if recorded.as_ref() != Some(&reported)
                         && super::recovery::now_ms() >= record_retry
                     {
                         if options.hold(&mut pending, &mut failure).await {
-                            encoded = serde_json::to_string(&failure).expect("failure evidence");
-                            recorded = Some(encoded.clone());
+                            reported = failure.clone();
+                            recorded = Some(reported.clone());
                         } else {
                             record_retry = super::recovery::now_ms().saturating_add(1_000);
                         }
@@ -217,7 +224,7 @@ impl Consumer {
                         result=settings.changed()=>if result.is_err() { break; },
                     }
                     let mut current = settings.borrow_and_update().clone();
-                    if recorded.as_ref() != Some(&encoded)
+                    if recorded.as_ref() != Some(&reported)
                         || matches!(
                             (Recovery {
                                 config: Some(&current),
@@ -231,7 +238,7 @@ impl Consumer {
                         held = Some(Box::new((failure, work)));
                         continue;
                     }
-                    *options.recovery.lock().unwrap() = Some(failure.info(true));
+                    *options.recovery.lock() = Some(failure.info(true));
                     attempts = failure.attempt.saturating_add(1);
                     if matches!(failure.boundary, Boundary::Credentials) {
                         if let Err(error) = options.credentials(&mut current).await {
@@ -249,8 +256,8 @@ impl Consumer {
                     {
                         Ok(completed) => {
                             if completed {
-                                *options.error.lock().unwrap() = None;
-                                *options.recovery.lock().unwrap() = None;
+                                *options.error.lock() = None;
+                                *options.recovery.lock() = None;
                                 recorded = None;
                             }
                         }
@@ -289,7 +296,13 @@ impl Consumer {
                                 }
                             })?);
                         }
-                        let routing = sink.as_mut().expect("configured sink");
+                        let routing = sink.as_mut().ok_or_else(|| {
+                            options.storage(
+                                &anyhow::anyhow!("configured sink is missing"),
+                                attempts,
+                                Work::Resubmit,
+                            )
+                        })?;
                         routing.configure(&current);
                         routing
                             .emit(ops)
@@ -316,8 +329,8 @@ impl Consumer {
                     Ok(None) => break,
                     Ok(Some(false)) => {}
                     Ok(Some(true)) => {
-                        *options.error.lock().unwrap() = None;
-                        *options.recovery.lock().unwrap() = None;
+                        *options.error.lock() = None;
+                        *options.recovery.lock() = None;
                         attempts = 0;
                         recorded = None;
                     }
@@ -325,7 +338,7 @@ impl Consumer {
                 }
             }
         });
-        *handle.task.lock().unwrap() = Some(task);
+        *handle.task.lock() = Some(task);
         handle
     }
     pub fn configure(&self, config: SessionConfig) {
@@ -339,7 +352,7 @@ impl Consumer {
     }
     pub async fn shutdown(&self) {
         self.stop.notify_one();
-        let task = self.task.lock().unwrap().take();
+        let task = self.task.lock().take();
         if let Some(task) = task {
             let _ = task.await;
         }
@@ -362,6 +375,7 @@ mod tests {
         accepted: AtomicU64,
         reject: AtomicBool,
         unauthorized: AtomicBool,
+        commit_fail: AtomicBool,
         defer_until: AtomicU64,
     }
     struct Factory(Arc<Recording>);
@@ -404,6 +418,9 @@ mod tests {
                 .into());
             }
             self.record.accepted.fetch_add(pending, Ordering::SeqCst);
+            if self.record.commit_fail.swap(false, Ordering::SeqCst) {
+                return Err(CommitFailure(anyhow::anyhow!("injected ledger failure")).into());
+            }
             Ok(())
         }
         fn has_pending_delivery(&self) -> bool {
@@ -517,7 +534,7 @@ mod tests {
         wait_for(|| record.accepted.load(Ordering::SeqCst) == 1).await;
         wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.submitted.load(Ordering::SeqCst), 2);
-        assert!(error.lock().unwrap().is_none());
+        assert!(error.lock().is_none());
         assert!(journal
             .failure(&serde_json::to_string(&route).unwrap())
             .await
@@ -597,6 +614,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ledger_recovery_does_not_resubmit_accepted_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        stored(&journal).await;
+        let route = SessionRoute::default();
+        let record = Arc::new(Recording::default());
+        record.commit_fail.store(true, Ordering::SeqCst);
+        let (consumer, progress, error) = spawn(
+            journal.subscribe(&route, 0).await.unwrap(),
+            options(tmp.path(), &route, record.clone()),
+        );
+        wait_for(|| error.lock().is_some()).await;
+        assert_eq!(progress.completed(), 0);
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
+        wait_for(|| progress.completed() == 1).await;
+        assert_eq!(record.submitted.load(Ordering::SeqCst), 1);
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
+        consumer.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn head_write_recovery_retries_only_completion() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
@@ -609,7 +649,7 @@ mod tests {
         let record = Arc::new(Recording::default());
         let (consumer, progress, error) =
             spawn(cursor, options(tmp.path(), &route, record.clone()));
-        wait_for(|| error.lock().unwrap().is_some()).await;
+        wait_for(|| error.lock().is_some()).await;
         assert_eq!(progress.completed(), 0);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
         db.execute_batch("DROP TRIGGER fail_head").unwrap();
@@ -637,7 +677,7 @@ mod tests {
             journal.subscribe(&route, 0).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
-        wait_for(|| error.lock().unwrap().is_some()).await;
+        wait_for(|| error.lock().is_some()).await;
         consumer.shutdown().await;
         let evidence = journal.failure(&key).await.unwrap().unwrap();
         assert!(!evidence.contains("never-persist-this"));
@@ -756,7 +796,7 @@ mod tests {
         ));
         let mut config = opts.config.borrow().clone();
         let (consumer, progress, error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
-        wait_for(|| error.lock().unwrap().is_some()).await;
+        wait_for(|| error.lock().is_some()).await;
         assert_eq!(progress.completed(), 0);
         drop(rejection);
         Mock::given(method("POST"))
@@ -773,7 +813,7 @@ mod tests {
         config.tags.push("corrected".into());
         consumer.configure(config);
         wait_for(|| progress.completed() == 1).await;
-        assert!(error.lock().unwrap().is_none());
+        assert!(error.lock().is_none());
         consumer.shutdown().await;
     }
 
@@ -798,7 +838,7 @@ mod tests {
             journal.subscribe(&route, 0).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
-        wait_for(|| error.lock().unwrap().is_some()).await;
+        wait_for(|| error.lock().is_some()).await;
         let failure: Failure = serde_json::from_str(
             &journal
                 .failure(&serde_json::to_string(&route).unwrap())
