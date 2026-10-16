@@ -50,7 +50,7 @@ pub enum SpanType {
     Tool,
 }
 
-/// Immutable versions captured when a session root or turn is first created.
+/// Immutable versions captured when a coding-agent span is first created.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginSnapshot {
     pub plugin_version: Option<String>,
@@ -100,7 +100,7 @@ pub struct SpanRow {
     /// Translator-owned marker for turn creation, not other task spans.
     #[serde(skip)]
     pub is_turn: bool,
-    /// Delivery-owned creation snapshot, present on session roots and turns.
+    /// Delivery-owned creation snapshot, present on each coding-agent span.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<OriginSnapshot>,
 }

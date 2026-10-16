@@ -258,10 +258,10 @@ activity reuses the native session identifier.
 #### 6.2.1 Span-origin versions
 
 The shared delivery path MUST snapshot `context.span_origin` independently when
-a coding-agent session root or turn span is first created. This is span-creation
-provenance, not a record of every version used within a turn. Other descendants
-do not receive these snapshots; ordinary SDK provenance is independent of this
-contract. Translators identify turns explicitly, not by task type or display name.
+each coding-agent span is first created, including session roots, turns, LLM,
+tool, compaction, and subagent spans. This is span-creation provenance, not a
+record of every version used within a turn. No coding-agent span may fall back
+to the underlying SDK's identity or version.
 
 | Field | Required value |
 |-------|----------------|
@@ -297,11 +297,11 @@ Each snapshot MUST remain unchanged on later events, span updates, plugin or
 agent upgrades, daemon restarts, and resume. Updates MAY repeat the original
 snapshot to prevent SDK defaults from overwriting it, but MUST NOT substitute
 current versions. Unknown plugin and coding-agent versions MUST remain `null`
-even if a later event supplies a version. Each new turn MUST capture its own
+even if a later event supplies a version. Each new span MUST capture its own
 snapshot rather than inherit the session root's versions.
 
 Actor creation is not span creation. When journal replay creates a previously
-unmaterialized root or turn, its plugin and agent versions MUST come from the
+unmaterialized span, its plugin and agent versions MUST come from the
 journaled event creating that span, not the newer event that triggered recovery.
 If a snapshot already exists for that span and destination, replay MUST reuse
 it, including its original `bt.version`. A new destination creates its own
@@ -315,16 +315,15 @@ Updates to those spans MUST preserve their existing backend provenance: omit
 origin, write `null`, or invent historical versions from the current daemon.
 Missing snapshots are distinct from snapshots containing unknown versions.
 Updates MUST still deliver their output, metrics, and other context normally;
-new turns capture fresh snapshots under the rules above.
+new spans capture fresh snapshots under the rules above.
 
-A turn later reclassified as compaction retains its creation snapshot. Tasks
-already known to represent compaction or subagent containers are not turns.
+A turn later reclassified as compaction retains its creation snapshot.
 
 A provisional root MUST retain the snapshot taken when it was created, even if
 delivery waits for a later descendant event. When tracing attaches to an
 external parent, this contract applies to the coding-agent session root below
-that parent and its turns; it MUST NOT modify the external root. Existing
-instrumentation and environment provenance MUST be preserved.
+that parent and all its descendants; it MUST NOT modify the external root.
+Existing instrumentation and environment provenance MUST be preserved.
 
 ### 6.3 Turns
 
@@ -582,7 +581,7 @@ features that require native evidence remain conditional under section 3.
 | 1. Foundation         | ROUTE-01 | Project routing                             | A session can resolve and pin a Braintrust project destination without placing credentials in agent configuration.                                                                     |
 | 2. Minimum trace      | TRACE-01 | Deterministic session root                  | A replay-safe task span represents the session, preserves external attachment, and can be extended after process shutdown or resume.                                                   |
 | 2. Minimum trace      | TRACE-02 | Per-turn task spans                         | Each user request has a child task span containing native input, final output, timing, and completion status when observable.                                                          |
-| 2. Minimum trace      | META-01  | Session, version, and workspace metadata    | The root includes available native session ID, agent version, cwd, workspace, execution mode, and transcript provenance; roots and turns independently snapshot plugin, `bt`, and coding-agent versions per section 6.2.1. |
+| 2. Minimum trace      | META-01  | Session, version, and workspace metadata    | The root includes available native session ID, agent version, cwd, workspace, execution mode, and transcript provenance; all coding-agent spans independently snapshot plugin, `bt`, and coding-agent versions per section 6.2.1. |
 | 2. Minimum trace      | REL-02   | Deterministic IDs and duplicate handling    | Stable native identities and deterministic fallbacks make duplicate delivery and journal replay converge on the same logical spans.                                                    |
 | 2. Minimum trace      | REL-03   | Bounded correlation state                   | Prompt, operation, transcript, and deduplication state have explicit bounds without dropping currently open work silently.                                                             |
 | 2. Minimum trace      | TRACE-14 | Concurrent activity correlation             | Overlapping turns and operations correlate by native identity rather than a single implicit current slot; ambiguous ancestry fails safe.                                               |
