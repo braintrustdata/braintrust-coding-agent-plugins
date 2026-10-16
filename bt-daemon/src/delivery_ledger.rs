@@ -430,11 +430,15 @@ impl Sink for LedgerSink {
     async fn flush(&mut self) -> anyhow::Result<()> {
         self.inner.flush().await?;
         if let Some(ledger) = &mut self.ledger {
-            let lock = ledger.lock().await?;
-            ledger
-                .refresh(&mut self.span_origins, &mut self.pending_origins, &lock)
-                .await?;
-            ledger.commit(&lock).await?;
+            async {
+                let lock = ledger.lock().await?;
+                ledger
+                    .refresh(&mut self.span_origins, &mut self.pending_origins, &lock)
+                    .await?;
+                ledger.commit(&lock).await
+            }
+            .await
+            .map_err(|error| anyhow::Error::new(CommitFailure(error)))?;
         }
         Ok(())
     }
@@ -527,6 +531,65 @@ mod tests {
             late_merge_key: Some(key.into()),
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn post_acceptance_ledger_failures_retain_pending_completion() {
+        for phase in ["lock", "refresh", "append"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = config("accepted");
+            let mut sink = LedgerSink::new(
+                Box::new(RecordingSink::default()),
+                Some(tmp.path()),
+                "debug",
+                "test",
+                Some(&config),
+                "test",
+            )
+            .await;
+            sink.emit(&[terminal("one")]).await.unwrap();
+            let path = sink.ledger.as_ref().unwrap().path.clone();
+            let original = std::fs::read(&path).unwrap();
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            match phase {
+                "lock" => {
+                    std::fs::remove_file(path.with_extension("lock")).unwrap();
+                    std::fs::create_dir(path.with_extension("lock")).unwrap();
+                }
+                "refresh" => {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"invalid JSON\n")
+                        .unwrap();
+                }
+                "append" => {
+                    let mut readonly = permissions.clone();
+                    readonly.set_readonly(true);
+                    std::fs::set_permissions(&path, readonly).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = sink.flush().await.unwrap_err();
+            assert!(
+                error.downcast_ref::<CommitFailure>().is_some(),
+                "{phase}: {error:#}"
+            );
+            assert!(sink.ledger.as_ref().unwrap().pending.contains("one"));
+            match phase {
+                "lock" => std::fs::remove_dir(path.with_extension("lock")).unwrap(),
+                "refresh" => std::fs::write(&path, &original).unwrap(),
+                "append" => std::fs::set_permissions(&path, permissions).unwrap(),
+                _ => unreachable!(),
+            }
+            sink.flush().await.unwrap();
+            let (restored, _) = DeliveryLedger::load(tmp.path(), "debug", "test", &config)
+                .await
+                .unwrap();
+            assert!(restored.known.contains("one"), "{phase}");
+        }
     }
 
     #[tokio::test]

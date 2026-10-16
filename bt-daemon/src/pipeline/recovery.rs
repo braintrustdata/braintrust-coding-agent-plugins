@@ -73,11 +73,8 @@ pub(crate) fn now_ms() -> i64 {
         .as_millis()
         .min(i64::MAX as u128) as i64
 }
-fn digest(value: &impl Serialize) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(value).expect("serializable condition evidence"))
-    )
+fn digest(value: &impl std::fmt::Debug) -> String {
+    format!("{:x}", Sha256::digest(format!("{value:?}")))
 }
 fn chain(config: &SessionConfig) -> String {
     digest(&config.span_plugins)
@@ -86,7 +83,12 @@ fn configuration(config: &SessionConfig) -> String {
     let processors: Vec<_> = config
         .span_plugins
         .iter()
-        .map(|path| (path, crate::span_processor::file_digest(path)))
+        .map(|path| {
+            (
+                format!("{path:?}"),
+                crate::span_processor::file_digest(path),
+            )
+        })
         .collect();
     digest(
         &serde_json::json!({"destination":config.destination,"metadata":config.additional_metadata,
