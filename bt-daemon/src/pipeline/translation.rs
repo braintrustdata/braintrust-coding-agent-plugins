@@ -201,9 +201,23 @@ impl Producer {
         let mut attempts = 0;
         loop {
             if let State::Recovering(mut failure) = self.state {
-                *self.error.lock().unwrap() = Some(failure.message());
-                *self.recovery.lock().unwrap() = Some(failure.info(false));
-                let encoded = serde_json::to_string(&failure).expect("source failure evidence");
+                *self.error.lock() = Some(failure.message());
+                *self.recovery.lock() = Some(failure.info(false));
+                let encoded = match serde_json::to_string(&failure) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        self.state = State::Recovering(Failure::revision(
+                            Boundary::Journal,
+                            failure.position,
+                            format!(
+                                "{}; recovery evidence cannot be encoded: {error}",
+                                failure.message()
+                            ),
+                            &self.options.version,
+                        ));
+                        continue;
+                    }
+                };
                 if recorded.as_ref() != Some(&encoded) && super::recovery::now_ms() >= record_retry
                 {
                     match self.journal.set_source_failure(Some(encoded.clone())).await {
@@ -242,7 +256,7 @@ impl Producer {
                 {
                     continue;
                 }
-                *self.recovery.lock().unwrap() = Some(failure.info(true));
+                *self.recovery.lock() = Some(failure.info(true));
                 attempts = failure.attempt.saturating_add(1);
                 self.state = State::Processing;
                 let result = async {
@@ -267,8 +281,8 @@ impl Producer {
                     self.state = State::Recovering(self.failure(error, attempts));
                     continue;
                 }
-                *self.error.lock().unwrap() = None;
-                *self.recovery.lock().unwrap() = None;
+                *self.error.lock() = None;
+                *self.recovery.lock() = None;
                 recorded = None;
                 attempts = 0;
                 continue;
@@ -513,7 +527,10 @@ impl Producer {
     /// Each chunk stays owned until its local write succeeds. A commit retry
     /// cannot call translation or advance to the following event.
     async fn publish(&mut self) -> anyhow::Result<()> {
-        let mut pending = self.publication.take().expect("pending publication");
+        let mut pending = self
+            .publication
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pending publication is missing"))?;
         let result = async {
             let publish = pending.input > self.committed;
             let ctx = SessionCtx {
@@ -532,16 +549,14 @@ impl Producer {
                     for op in ops.iter_mut() {
                         let insert = matches!(op, SpanOp::Insert(_));
                         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                        if insert
-                            && (row.is_turn
-                                || (row.span_type == SpanType::Task
-                                    && row.parent_span_ids.is_empty()))
-                        {
-                            if let Some(capture) = &pending.capture {
-                                self.origins
-                                    .entry(row.span_id.clone())
-                                    .or_insert_with(|| capture.clone());
-                            }
+                        if insert {
+                            self.origins.entry(row.span_id.clone()).or_insert_with(|| {
+                                pending.capture.clone().unwrap_or_else(|| OriginSnapshot {
+                                    plugin_version: None,
+                                    source_version: None,
+                                    bt_version: self.options.version.clone(),
+                                })
+                            });
                         }
                         row.origin = self.origins.get(&row.span_id).cloned();
                     }
@@ -731,6 +746,7 @@ mod tests {
             reader: None,
             observers: Vec::new(),
             origins: HashMap::new(),
+            capture: None,
             bounds: HashMap::new(),
             position: 0,
             committed: 0,

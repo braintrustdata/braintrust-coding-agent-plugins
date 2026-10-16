@@ -51,7 +51,7 @@ impl Daemon {
             .journal_writer_for(&env.source, &env.session_id)
             .await?;
         let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
-        let existing = self.translations.lock().unwrap().get(&storage_key).cloned();
+        let existing = self.translations.lock().get(&storage_key).cloned();
         Ok(match existing {
             Some(translation) => translation,
             None => {
@@ -72,7 +72,6 @@ impl Daemon {
                 .await?;
                 self.translations
                     .lock()
-                    .unwrap()
                     .insert(storage_key, translation.clone());
                 translation
             }
@@ -121,7 +120,7 @@ impl Daemon {
         translation.advance(replay_through).await?;
         let _ = translation.barrier().await;
         let cursor = translation.journal.subscribe(route, legacy_through).await?;
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
         }

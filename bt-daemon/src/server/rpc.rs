@@ -338,9 +338,8 @@ impl Daemon {
                 recovery: s
                     .recovery
                     .lock()
-                    .unwrap()
                     .clone()
-                    .or_else(|| s.source_recovery.lock().unwrap().clone()),
+                    .or_else(|| s.source_recovery.lock().clone()),
                 spans_emitted: s.counters.spans_emitted.load(Ordering::Relaxed),
                 permalink: s.permalink.lock().clone(),
                 last_error: s

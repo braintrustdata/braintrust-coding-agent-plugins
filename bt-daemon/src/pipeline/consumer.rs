@@ -72,14 +72,13 @@ impl ConsumerOptions {
     }
     async fn hold(&self, journal: &SpanJournal, cursor: &Cursor, failure: &mut Failure) -> bool {
         failure.through.get_or_insert(cursor.position());
-        *self.error.lock().unwrap() = Some(failure.message());
-        *self.recovery.lock().unwrap() = Some(failure.info(false));
-        if let Err(error) = journal
-            .set_failure(
-                &cursor.route,
-                Some(serde_json::to_string(failure).expect("failure evidence")),
-            )
-            .await
+        *self.error.lock() = Some(failure.message());
+        *self.recovery.lock() = Some(failure.info(false));
+        if let Err(error) = async {
+            let encoded = serde_json::to_string(failure)?;
+            journal.set_failure(&cursor.route, Some(encoded)).await
+        }
+        .await
         {
             tracing::warn!(%error,"route recovery evidence could not be persisted; original failure retained");
             return false;
@@ -171,7 +170,14 @@ impl ConsumerOptions {
             }
             Work::Complete(delivery) => Some(delivery),
             Work::Flush => {
-                let sink = sink.as_mut().expect("accepted delivery retains its sink");
+                let sink = sink.as_mut().ok_or_else(|| {
+                    self.storage(
+                        &anyhow::anyhow!("accepted delivery has no sink"),
+                        cursor,
+                        attempt,
+                        Work::Flush,
+                    )
+                })?;
                 sink.flush().await.map_err(|error| {
                     if error.downcast_ref::<CommitFailure>().is_some() {
                         self.storage(&error, cursor, attempt, Work::Flush)
@@ -179,7 +185,7 @@ impl ConsumerOptions {
                         self.routing(&error, cursor, config, attempt)
                     }
                 })?;
-                *self.permalink.lock().unwrap() = sink.permalink();
+                *self.permalink.lock() = sink.permalink();
                 // Deferred roots keep their prefix unresolved until a child
                 // releases them; the cursor can read ahead without buffering ops.
                 if sink.has_pending_delivery() {
@@ -241,12 +247,29 @@ impl Consumer {
                             >= failure.through.unwrap_or(failure.position)
                         && journal.set_failure(&cursor.route, None).await.is_ok()
                     {
-                        *options.error.lock().unwrap() = None;
-                        *options.recovery.lock().unwrap() = None;
+                        *options.error.lock() = None;
+                        *options.recovery.lock() = None;
                         continue;
                     }
                     failure.through.get_or_insert(cursor.position());
-                    let encoded = serde_json::to_string(&failure).expect("failure evidence");
+                    let encoded = match serde_json::to_string(&failure) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            held = Some(Box::new((
+                                Failure::revision(
+                                    Boundary::Journal,
+                                    failure.position,
+                                    format!(
+                                        "{}; recovery evidence cannot be encoded: {error}",
+                                        failure.message()
+                                    ),
+                                    &options.version,
+                                ),
+                                work,
+                            )));
+                            continue;
+                        }
+                    };
                     if recorded.as_ref() != Some(&encoded)
                         && super::recovery::now_ms() >= record_retry
                     {
@@ -277,7 +300,7 @@ impl Consumer {
                         held = Some(Box::new((failure, work)));
                         continue;
                     }
-                    *options.recovery.lock().unwrap() = Some(failure.info(true));
+                    *options.recovery.lock() = Some(failure.info(true));
                     attempts = failure.attempt.saturating_add(1);
                     if matches!(failure.boundary, Boundary::Credentials) {
                         if let Err(error) = options.credentials(&cursor.route, &mut current).await {
@@ -300,8 +323,8 @@ impl Consumer {
                         Ok(completed) => {
                             progress.send_replace(cursor.completed_position());
                             if completed {
-                                *options.error.lock().unwrap() = None;
-                                *options.recovery.lock().unwrap() = None;
+                                *options.error.lock() = None;
+                                *options.recovery.lock() = None;
                                 recorded = None;
                             }
                         }
@@ -335,7 +358,14 @@ impl Consumer {
                             options.routing(&error, &cursor, &current, attempts)
                         })?);
                     }
-                    let routing = sink.as_mut().expect("configured sink");
+                    let routing = sink.as_mut().ok_or_else(|| {
+                        options.storage(
+                            &anyhow::anyhow!("configured sink is missing"),
+                            &cursor,
+                            attempts,
+                            Work::Resubmit,
+                        )
+                    })?;
                     routing.configure(&current);
                     let count = routing
                         .emit(delivery.value())
@@ -360,8 +390,8 @@ impl Consumer {
                     Ok(Some(false)) => {}
                     Ok(Some(true)) => {
                         progress.send_replace(cursor.completed_position());
-                        *options.error.lock().unwrap() = None;
-                        *options.recovery.lock().unwrap() = None;
+                        *options.error.lock() = None;
+                        *options.recovery.lock() = None;
                         attempts = 0;
                         recorded = None;
                     }
@@ -420,6 +450,7 @@ mod tests {
         accepted: AtomicU64,
         reject: AtomicBool,
         unauthorized: AtomicBool,
+        commit_fail: AtomicBool,
     }
     struct Factory(Arc<Recording>);
     struct CheckedSink {
@@ -458,6 +489,9 @@ mod tests {
                 .into());
             }
             self.record.accepted.fetch_add(pending, Ordering::SeqCst);
+            if self.record.commit_fail.swap(false, Ordering::SeqCst) {
+                return Err(CommitFailure(anyhow::anyhow!("injected ledger failure")).into());
+            }
             Ok(())
         }
     }
@@ -531,7 +565,7 @@ mod tests {
         wait_for(|| record.accepted.load(Ordering::SeqCst) == 1).await;
         wait_for(|| *consumer.progress.borrow() == 1).await;
         assert_eq!(record.submitted.load(Ordering::SeqCst), 2);
-        assert!(consumer.error.lock().unwrap().is_none());
+        assert!(consumer.error.lock().is_none());
         assert!(journal
             .failure(&serde_json::to_string(&route).unwrap())
             .await
@@ -539,6 +573,30 @@ mod tests {
             .is_none());
         consumer.shutdown().await;
     }
+    #[tokio::test]
+    async fn ledger_recovery_does_not_resubmit_accepted_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        stored(&journal).await;
+        let route = SessionRoute::default();
+        let record = Arc::new(Recording::default());
+        record.commit_fail.store(true, Ordering::SeqCst);
+        let consumer = Consumer::spawn(
+            journal.clone(),
+            journal.subscribe(&route, 0).await.unwrap(),
+            options(tmp.path(), &route, record.clone()),
+        );
+        wait_for(|| consumer.error.lock().is_some()).await;
+        assert_eq!(*consumer.progress.borrow(), 0);
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
+        wait_for(|| *consumer.progress.borrow() == 1).await;
+        assert_eq!(record.submitted.load(Ordering::SeqCst), 1);
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
+        consumer.shutdown().await;
+    }
+
     #[tokio::test]
     async fn head_write_recovery_retries_only_completion() {
         let tmp = tempfile::tempdir().unwrap();
@@ -555,7 +613,7 @@ mod tests {
             cursor,
             options(tmp.path(), &route, record.clone()),
         );
-        wait_for(|| consumer.error.lock().unwrap().is_some()).await;
+        wait_for(|| consumer.error.lock().is_some()).await;
         assert_eq!(*consumer.progress.borrow(), 0);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
         db.execute_batch("DROP TRIGGER fail_head").unwrap();
@@ -584,7 +642,7 @@ mod tests {
             journal.subscribe(&route, 0).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
-        wait_for(|| consumer.error.lock().unwrap().is_some()).await;
+        wait_for(|| consumer.error.lock().is_some()).await;
         consumer.shutdown().await;
         let evidence = journal.failure(&key).await.unwrap().unwrap();
         assert!(!evidence.contains("never-persist-this"));
@@ -671,7 +729,7 @@ mod tests {
             journal.subscribe(&route, 0).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
-        wait_for(|| consumer.error.lock().unwrap().is_some()).await;
+        wait_for(|| consumer.error.lock().is_some()).await;
         let failure: Failure = serde_json::from_str(
             &journal
                 .failure(&serde_json::to_string(&route).unwrap())
