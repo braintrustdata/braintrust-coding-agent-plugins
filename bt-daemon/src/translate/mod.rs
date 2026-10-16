@@ -124,14 +124,6 @@ pub struct SessionCtx {
     pub config: Option<SessionConfig>,
 }
 
-/// Tags configured for every root span in the current agent session.
-pub(crate) fn root_tags(ctx: &SessionCtx) -> Option<Vec<String>> {
-    ctx.config
-        .as_ref()
-        .map(|config| config.tags.clone())
-        .filter(|tags| !tags.is_empty())
-}
-
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
 pub trait AgentTranslator: Send {
@@ -236,7 +228,10 @@ impl Registry {
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
         let namespace = crate::ids::session_namespace(canonical, session_id);
-        self.create_checked_with_session_namespace(canonical, &namespace)
+        let translator = self.create_checked_with_session_namespace(canonical, &namespace)?;
+        Ok(Box::new(
+            crate::pipeline::prepare::ConfiguredTranslator::new(translator, canonical),
+        ))
     }
 
     pub(crate) fn create_checked_with_session_namespace(

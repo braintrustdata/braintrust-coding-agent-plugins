@@ -68,6 +68,7 @@ impl RoutingSink {
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Delivery<Request>>(16);
         tokio::spawn(async move {
+            let mut prepare = super::prepare::Prepare::new(&source);
             while let Some(delivery) = InputPort::receive(&mut rx).await {
                 let request = delivery.value();
                 sink.configure(&request.config);
@@ -77,6 +78,8 @@ impl RoutingSink {
                 );
                 let result = match &request.operation {
                     Operation::Emit(ops) => {
+                        let mut ops = ops.clone();
+                        prepare.apply(&mut ops, &request.config);
                         let mut stage = Plugins {
                             paths: request.config.span_plugins.clone(),
                             source: source.clone(),
@@ -85,7 +88,7 @@ impl RoutingSink {
                         let mut prepared = Vec::with_capacity(ops.len());
                         let mut failure = None;
                         let mut report = false;
-                        for op in ops {
+                        for op in &ops {
                             match stage.process(op).await {
                                 PluginOutcome::Prepared(op) => prepared.push(*op),
                                 PluginOutcome::Filtered => {}

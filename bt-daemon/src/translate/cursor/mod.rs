@@ -8,8 +8,7 @@ mod hooks;
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
-    TranslatorFactory,
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::{ids, wire::Envelope};
 use hooks::{
@@ -315,13 +314,8 @@ impl CursorTranslator {
             return;
         }
         self.started = true;
-        let (parent, root) = ctx
-            .config
-            .as_ref()
-            .map(|c| c.attached_span_ids())
-            .unwrap_or_default();
-        self.trace_root = root.unwrap_or_else(|| self.root.clone());
-        self.root_parents = parent.into_iter().collect();
+        self.trace_root = self.root.clone();
+        self.root_parents.clear();
         let mut metadata = json!({"source":"cursor", "session_id":ctx.session_id,
             "username":local_username(), "os":std::env::consts::OS, "workspace":self.cwd,
             "trace_cursor_version":e.source_version, "trace_plugin_version":e.plugin_version});
@@ -336,7 +330,7 @@ impl CursorTranslator {
             span_type: SpanType::Task,
             start_ms: Some(e.ts_ms),
             metadata: Some(metadata),
-            tags: root_tags(ctx),
+            tags: None,
             ..Default::default()
         }));
     }
@@ -1522,10 +1516,9 @@ impl CursorTranslator {
             ..Default::default()
         };
     }
-    fn enrich(&self, ops: &mut [SpanOp], ctx: &SessionCtx) {
+    fn enrich(&self, ops: &mut [SpanOp], _ctx: &SessionCtx) {
         self.git.enrich_rows(self.cwd.as_deref(), ops);
         for op in ops {
-            let root_insert = matches!(op, SpanOp::Insert(row) if row.span_id == self.root);
             let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
             if let Some(metadata) = row.metadata.as_mut().and_then(Value::as_object_mut) {
                 // Only the reviewed Cursor fields reach span metadata. Raw
@@ -1541,22 +1534,6 @@ impl CursorTranslator {
                                 | "is_interrupt"
                         ) && value == &json!(false))
                 });
-                if root_insert {
-                    // Destination metadata is an explicit user customization,
-                    // rather than additional automatically captured hook data.
-                    if let Some(additional) = ctx
-                        .config
-                        .as_ref()
-                        .and_then(|c| c.additional_metadata.as_ref())
-                        .and_then(Value::as_object)
-                    {
-                        for (key, value) in additional {
-                            if !key.starts_with("_bt_") {
-                                metadata.entry(key.clone()).or_insert_with(|| value.clone());
-                            }
-                        }
-                    }
-                }
             }
         }
     }
