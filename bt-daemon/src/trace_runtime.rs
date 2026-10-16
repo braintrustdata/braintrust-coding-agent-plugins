@@ -17,7 +17,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -489,18 +489,26 @@ fn daemon_warnings(
 }
 
 async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorCommandOutput {
-    doctor_output_at(host, args, &paths::socket_path(None)).await
+    let source = args.agent.identity().id;
+    doctor_output_at(
+        host,
+        args,
+        &paths::socket_path(None),
+        paths::agent_settings_path(source, None),
+        crate::settings::AgentSettings::load(source),
+    )
+    .await
 }
 
 async fn doctor_output_at(
     host: &TraceHostContext,
     args: DoctorArgs,
     socket: &Path,
+    settings_path: PathBuf,
+    settings: crate::settings::AgentSettings,
 ) -> DoctorCommandOutput {
     let source = args.agent.identity().id;
-    let settings_path = paths::agent_settings_path(source, None);
     let settings_present = settings_path.exists();
-    let settings = crate::settings::AgentSettings::load(source);
     let enabled = settings.tracing_enabled();
     let mut warnings = Vec::new();
 
@@ -1304,7 +1312,16 @@ mod tests {
             agent: DoctorAgent,
         ) -> DoctorCommandOutput {
             let host = test_host(Arc::new(shell));
-            doctor_output_at(&host, DoctorArgs { agent }, &self.socket).await
+            // Use fixture settings rather than the developer's installed route
+            // or a managed run's invocation settings.
+            doctor_output_at(
+                &host,
+                DoctorArgs { agent },
+                &self.socket,
+                self._dir.path().join("braintrust.json"),
+                crate::settings::AgentSettings::default(),
+            )
+            .await
         }
 
         async fn forward_event(&self, source: &str, session_id: &str, route: SessionRoute) {
@@ -1512,6 +1529,8 @@ mod tests {
                 agent: DoctorAgent::Codex,
             },
             &socket,
+            temp.path().join("braintrust.json"),
+            crate::settings::AgentSettings::default(),
         )
         .await;
 
@@ -1535,6 +1554,8 @@ mod tests {
                 agent: DoctorAgent::Codex,
             },
             &test_endpoint(temp.path()),
+            temp.path().join("braintrust.json"),
+            crate::settings::AgentSettings::default(),
         )
         .await;
         assert_eq!(output.daemon.status, DaemonStatus::NotRunning);

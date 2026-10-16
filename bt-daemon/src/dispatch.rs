@@ -1151,16 +1151,8 @@ mod tests {
             .await
             .unwrap();
         let updates = session.join("updates.jsonl");
-        tokio::fs::write(&updates, b"{\"update\":1}\n")
-            .await
-            .unwrap();
-        let writer_path = updates.clone();
-        let writer = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            tokio::fs::write(&writer_path, b"{\"update\":1}\n{\"update\":2}\n")
-                .await
-                .unwrap();
-        });
+        let initial = b"{\"update\":1}\n";
+        tokio::fs::write(&updates, initial).await.unwrap();
         let mut env = Envelope {
             source: "grok".into(),
             source_version: None,
@@ -1177,8 +1169,31 @@ mod tests {
             config: None,
         };
 
-        hydrate_transcript_reference(tmp.path(), &mut env).await;
-        writer.await.unwrap();
+        let mirror = crate::transcript_mirror::mirror_path(
+            tmp.path(),
+            &crate::ids::session_namespace("grok", "session-1"),
+            updates.to_str().unwrap(),
+        );
+        {
+            let hydration = hydrate_transcript_reference(tmp.path(), &mut env);
+            tokio::pin!(hydration);
+            tokio::select! {
+                biased;
+                () = async {
+                    // Append after the first copy, before polling hydration again.
+                    // A delayed task can miss the entire capture window on busy CI.
+                    while !std::fs::metadata(&mirror).is_ok_and(|meta| meta.len() == initial.len() as u64) {
+                        tokio::task::yield_now().await;
+                    }
+                    std::fs::write(&updates, b"{\"update\":1}\n{\"update\":2}\n").unwrap();
+                } => {},
+                () = &mut hydration => panic!("terminal hydration did not wait for another capture"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("initial transcript capture did not complete");
+                },
+            }
+            hydration.await;
+        }
 
         let update_mirror = &env.payload["_bt_grok_transcript_mirrors"]["updates"];
         assert_eq!(
