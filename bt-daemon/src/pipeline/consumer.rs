@@ -161,7 +161,7 @@ impl ConsumerOptions {
                     )
                 })?;
                 sink.flush().await.map_err(|error| {
-                    if error.downcast_ref::<CommitFailure>().is_some() {
+                    if error.chain().any(|cause| cause.is::<CommitFailure>()) {
                         self.storage(&error, attempt, Work::Flush)
                     } else {
                         self.routing(&error, config, attempt)
