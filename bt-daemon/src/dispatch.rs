@@ -9,6 +9,8 @@
 
 use crate::delivery_ledger::LedgerSink;
 use crate::journal::JournalWriter;
+use crate::pipeline::plugins::{PluginOutcome, Plugins};
+use crate::pipeline::{Completion, Delivery, Stage};
 use crate::sink::SinkFactory;
 use crate::translate::{Registry, SessionCtx};
 use crate::wire::{Envelope, SessionRoute};
@@ -629,12 +631,13 @@ impl SessionActor {
                         .checkpoint_and_flush(&mut translator, &mut sink, &ctx)
                         .await;
                     if checkpointable {
-                        self.record_delivery_checkpoint(
-                            &mut sink,
-                            pending_through,
-                            &mut acknowledged_through,
-                        )
-                        .await;
+                        checkpointable &= self
+                            .record_delivery_checkpoint(
+                                &mut sink,
+                                pending_through,
+                                &mut acknowledged_through,
+                            )
+                            .await;
                     }
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
@@ -648,12 +651,13 @@ impl SessionActor {
                         )
                         .await;
                     if checkpointable {
-                        self.record_delivery_checkpoint(
-                            &mut sink,
-                            pending_through,
-                            &mut acknowledged_through,
-                        )
-                        .await;
+                        checkpointable &= self
+                            .record_delivery_checkpoint(
+                                &mut sink,
+                                pending_through,
+                                &mut acknowledged_through,
+                            )
+                            .await;
                     }
                     let _ = reply.send(self.counters.queued.load(Ordering::Relaxed));
                 }
@@ -725,58 +729,38 @@ impl SessionActor {
                     .as_ref()
                     .map(|config| config.span_plugins.as_slice())
                     .unwrap_or_default();
+                let mut stage = Plugins {
+                    paths: plugin_paths.to_vec(),
+                    source: self.source.clone(),
+                    session_id: self.session_id.clone(),
+                };
                 let mut processed = Vec::with_capacity(ops.len());
                 for op in &ops {
-                    match crate::span_processor::process(
-                        plugin_paths,
-                        op,
-                        &self.source,
-                        &self.session_id,
-                    ) {
-                        Ok(result) => {
-                            if let Some(failure) = result.failure {
-                                delivered = false;
-                                if failure.newly_seen {
-                                    if let Err(error) = crate::plugin_diagnostics::record(
-                                        &self.data_dir,
-                                        &self.source,
-                                        &failure.path,
-                                        &failure.message,
-                                    ) {
-                                        tracing::warn!(
-                                            session_id = %self.session_id,
-                                            "failed to persist span plugin diagnostic: {error}"
-                                        );
-                                    }
-                                    self.set_error(format!(
-                                        "span plugin {} failed; span operations are being discarded: {}",
-                                        failure.path.display(),
-                                        failure.message
-                                    ));
-                                }
-                            }
-                            if let Some(op) = result.op {
-                                processed.push(op);
-                            }
-                        }
-                        Err(error) => {
+                    match stage.process(op).await {
+                        PluginOutcome::Prepared(op) => processed.push(*op),
+                        PluginOutcome::Filtered => {}
+                        PluginOutcome::Failed(failure) => {
                             delivered = false;
-                            if let Some(plugin) = plugin_paths.first() {
-                                if let Err(diagnostic_error) = crate::plugin_diagnostics::record(
+                            if failure.newly_seen {
+                                if let Err(error) = crate::plugin_diagnostics::record(
                                     &self.data_dir,
                                     &self.source,
-                                    plugin,
-                                    &error.to_string(),
+                                    &failure.path,
+                                    &failure.message,
                                 ) {
-                                    tracing::warn!(
-                                        session_id = %self.session_id,
-                                        "failed to persist span plugin diagnostic: {diagnostic_error}"
-                                    );
+                                    tracing::warn!(session_id = %self.session_id,
+                                        "failed to persist span plugin diagnostic: {error}");
                                 }
+                                self.set_error(format!(
+                                    "span plugin {} failed; span operations are being discarded: {}",
+                                    failure.path.display(),
+                                    failure.message
+                                ));
                             }
-                            self.set_error(format!(
-                                "span plugin processor failed; span operation discarded: {error}"
-                            ));
+                        }
+                        PluginOutcome::Unavailable(error) => {
+                            delivered = false;
+                            self.set_error(format!("span plugin processor failed: {error}"));
                         }
                     }
                 }
@@ -953,38 +937,36 @@ impl SessionActor {
         }
     }
 
-    async fn flush_sink(&self, sink: &mut Box<dyn crate::sink::Sink>) -> bool {
-        if let Err(e) = sink.flush().await {
-            self.set_error(format!("sink flush failed: {e}"));
-            return false;
-        }
-        self.refresh_permalink(sink.as_ref());
-        !sink.has_pending_delivery()
-    }
-
+    /// False means delivery was rejected and this actor must never advance its
+    /// contiguous event boundary. Deferred delivery and failed checkpoint writes
+    /// leave accepted work eligible for a later checkpoint.
     async fn record_delivery_checkpoint(
         &self,
         sink: &mut Box<dyn crate::sink::Sink>,
         through: u64,
         acknowledged_through: &mut u64,
-    ) {
-        if !self.flush_sink(sink).await {
-            return;
+    ) -> bool {
+        if let Err(error) = sink.flush().await {
+            self.set_error(format!("sink flush failed: {error}"));
+            return false;
         }
-        if through <= *acknowledged_through {
-            return;
+        self.refresh_permalink(sink.as_ref());
+        if sink.has_pending_delivery() || through <= *acknowledged_through {
+            return true;
         }
-        if let Err(error) = self
-            .journal
-            .lock()
-            .await
-            .append_delivery_checkpoint(&self.route, through)
-            .await
-        {
-            self.set_error(format!("delivery checkpoint failed: {error}"));
-        } else {
-            *acknowledged_through = through;
+        let pending = Delivery::new(
+            through,
+            EventCompletion {
+                journal: self.journal.clone(),
+                route: self.route.clone(),
+                through,
+            },
+        );
+        match pending.into_completed().await {
+            Ok(through) => *acknowledged_through = through,
+            Err(failed) => self.set_error(format!("delivery checkpoint failed: {}", failed.error)),
         }
+        true
     }
 
     fn refresh_permalink(&self, sink: &dyn crate::sink::Sink) {
@@ -1013,6 +995,23 @@ pub(crate) fn is_tool_lifecycle_event(event: &str) -> bool {
             | "tool.execute.before"
             | "tool.execute.after"
     )
+}
+
+struct EventCompletion {
+    journal: Arc<tokio::sync::Mutex<JournalWriter>>,
+    route: SessionRoute,
+    through: u64,
+}
+
+#[async_trait::async_trait]
+impl Completion for EventCompletion {
+    async fn complete(&mut self) -> anyhow::Result<()> {
+        self.journal
+            .lock()
+            .await
+            .append_delivery_checkpoint(&self.route, self.through)
+            .await
+    }
 }
 
 #[cfg(test)]
