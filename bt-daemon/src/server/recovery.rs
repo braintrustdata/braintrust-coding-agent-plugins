@@ -87,6 +87,13 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                 continue;
             };
             for route in routes {
+                let route_key = match serde_json::to_string(&route) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        tracing::warn!(%error, "durable route cannot be encoded for recovery");
+                        continue;
+                    }
+                };
                 let matching = latest_by_route
                     .iter()
                     .find(|(_, event)| {
@@ -103,10 +110,7 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                     .and_then(|key| latest_by_route.remove(&key))
                     .unwrap_or_else(|| template.clone());
                 event.env.route = Some(route.clone());
-                latest_by_route.insert(
-                    serde_json::to_string(&route).expect("persisted route"),
-                    event,
-                );
+                latest_by_route.insert(route_key, event);
             }
         }
         for mut event in latest_by_route.into_values() {
@@ -277,7 +281,7 @@ mod tests {
         options.auth_provider = Some(Arc::new(TestAuth));
         let daemon = Daemon::new(options, tmp.path().into());
         let pending_key = automatic_link_key(&env);
-        daemon.pending_sessions.lock().unwrap().insert(
+        daemon.pending_sessions.lock().insert(
             pending_key.clone(),
             PendingSession {
                 deadline: Some(Instant::now() + Duration::from_secs(60)),
@@ -299,16 +303,10 @@ mod tests {
         .await
         .unwrap();
         assert!(!spans.route_complete(&route, through).await.unwrap());
-        assert_eq!(
-            daemon.pending_sessions.lock().unwrap()[&pending_key]
-                .events
-                .len(),
-            1
-        );
+        assert_eq!(daemon.pending_sessions.lock()[&pending_key].events.len(), 1);
         assert!(daemon
             .sessions
             .lock()
-            .unwrap()
             .contains_key(&DeliveryKey::new("debug", "test", &dormant).unwrap()));
         super::super::maintenance::drain_all(&daemon).await;
     }

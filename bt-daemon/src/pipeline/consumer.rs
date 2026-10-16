@@ -778,7 +778,7 @@ mod tests {
             journal.subscribe(&route, 0).await.unwrap(),
             opts,
         );
-        wait_for(|| consumer.error.lock().unwrap().is_some()).await;
+        wait_for(|| consumer.error.lock().is_some()).await;
         assert_eq!(*consumer.progress.borrow(), 0);
         drop(rejection);
         Mock::given(method("POST"))
@@ -795,7 +795,7 @@ mod tests {
         config.tags.push("corrected".into());
         consumer.configure(config);
         wait_for(|| *consumer.progress.borrow() == 1).await;
-        assert!(consumer.error.lock().unwrap().is_none());
+        assert!(consumer.error.lock().is_none());
         consumer.shutdown().await;
     }
 

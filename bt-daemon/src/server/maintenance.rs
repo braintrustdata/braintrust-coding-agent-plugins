@@ -73,8 +73,8 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         let lock = daemon.session_lock(&first.source, &first.session_id);
         let _guard = lock.lock().await;
         let namespace = crate::ids::session_namespace(&first.source, &first.session_id);
-        if daemon.journals.lock().unwrap().contains_key(&namespace)
-            || daemon.translations.lock().unwrap().contains_key(&namespace)
+        if daemon.journals.lock().contains_key(&namespace)
+            || daemon.translations.lock().contains_key(&namespace)
         {
             continue;
         }
@@ -87,16 +87,11 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         let Ok(routes) = partition.routes().await else {
             continue;
         };
-        let pending = daemon
-            .pending_sessions
-            .lock()
-            .unwrap()
-            .values()
-            .any(|state| {
-                state.events.iter().any(|event| {
-                    event.env.source == first.source && event.env.session_id == first.session_id
-                })
-            });
+        let pending = daemon.pending_sessions.lock().values().any(|state| {
+            state.events.iter().any(|event| {
+                event.env.source == first.source && event.env.session_id == first.session_id
+            })
+        });
         if pending || !captured_routes_registered(&daemon.data_dir, &path, recorded, &routes).await
         {
             continue;
