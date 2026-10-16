@@ -58,7 +58,10 @@ impl SpanJournal {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let path = path.to_owned();
         let connection = tokio::task::spawn_blocking(move || -> anyhow::Result<Connection> {
-            std::fs::create_dir_all(path.parent().expect("journal parent"))?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("SpanOp journal path has no parent"))?;
+            std::fs::create_dir_all(parent)?;
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -292,10 +295,9 @@ impl Cursor {
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
             })
             .await?;
-        if rows.is_empty() {
+        let Some(&(through, _)) = rows.last() else {
             return Ok(None);
-        }
-        let through = rows.last().expect("nonempty rows").0;
+        };
         let ops = rows
             .into_iter()
             .map(|(_, bytes)| StoredOp::decode(&bytes))
