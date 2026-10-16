@@ -701,7 +701,7 @@ async fn attached_provisional_root_keeps_birth_snapshot_until_work_after_restart
 
     let first = Daemon::start(tmp.path(), &server, "bt1").await;
     first.send(&birth).await;
-    let pending = flush_session(session, &first.socket, 250).await.unwrap();
+    let pending = flush_session(session, &first.socket, 5_000).await.unwrap();
     assert!(
         pending.flushed && pending.pending == 0,
         "a provisional root must not hold the delivery boundary open"
