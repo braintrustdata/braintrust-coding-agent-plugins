@@ -3,10 +3,8 @@ use super::delivery::{Delivery, InputPort, OutputPort};
 use super::plugins::{PluginOutcome, Plugins};
 use super::{Completion, Stage};
 use crate::{sink::Sink, translate::SpanOp, wire::SessionConfig};
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use parking_lot::Mutex;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
 struct Request {
@@ -132,13 +130,18 @@ impl RoutingSink {
                     Operation::Flush => sink.flush().await.map(|()| 0),
                 };
                 if let Err(error) = &result {
-                    *last_error.lock().unwrap() = Some(error.to_string());
+                    *last_error.lock() = Some(error.to_string());
                 }
-                let request = delivery
-                    .into_completed()
-                    .await
-                    .ok()
-                    .expect("volatile delivery");
+                let request = match delivery.into_completed().await {
+                    Ok(request) => request,
+                    Err(failed) => {
+                        *last_error.lock() =
+                            Some(format!("routing completion failed: {}", failed.error));
+                        // Dropping the unfinished request closes its reply; the
+                        // caller receives an error instead of a success response.
+                        continue;
+                    }
+                };
                 let _ = request.reply.send(Response {
                     result,
                     pending: sink.has_pending_delivery(),
@@ -270,7 +273,7 @@ mod tests {
             !cached.report,
             "cached failures must not request another warning"
         );
-        assert!(error.lock().unwrap().as_ref().unwrap().contains("rejected"));
+        assert!(error.lock().as_ref().unwrap().contains("rejected"));
         assert_eq!(emitted.load(Ordering::Relaxed), 1);
     }
 }
