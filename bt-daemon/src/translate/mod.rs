@@ -15,6 +15,7 @@ mod debug;
 mod decode;
 mod git;
 mod grok;
+mod muse;
 mod opencode;
 mod pi;
 pub(crate) use pi::request_config as pi_request_config;
@@ -280,6 +281,7 @@ mod tests {
                 "cursor",
                 "debug",
                 "grok",
+                "muse",
                 "opencode",
                 "pi"
             ]
@@ -295,6 +297,7 @@ mod tests {
             ("open-code", "opencode"),
             ("opencode", "opencode"),
             ("codex", "codex"),
+            ("muse-code", "muse"),
             ("debug", "debug"),
         ] {
             assert_eq!(registry.canonical_source(alias), Some(source));

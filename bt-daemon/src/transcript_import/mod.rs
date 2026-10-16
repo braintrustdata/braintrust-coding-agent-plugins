@@ -11,6 +11,7 @@ mod antigravity;
 mod claude;
 mod codex;
 mod cursor;
+pub(crate) mod muse;
 mod pipeline;
 
 pub use pipeline::{import_transcript, import_transcripts, run_import};

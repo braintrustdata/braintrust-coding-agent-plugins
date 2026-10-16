@@ -96,6 +96,9 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
         if suppress_hook(&args) {
             return Ok(());
         }
+        if args.managed_context.is_some() {
+            return run_hook_with_route(args, route, host).await;
+        }
         let settings = settings::AgentSettings::load_for_hook(&args.source)?;
         if !settings.tracing_enabled() {
             return Ok(());
@@ -185,6 +188,21 @@ async fn capture_hook(
     mut route: SessionRoute,
     host: HostInfo,
 ) -> anyhow::Result<()> {
+    let managed_context = if let Some(path) = &args.managed_context {
+        if crate::translate::canonical_source_name(&args.source) != "muse" || !args.managed_run_hook
+        {
+            anyhow::bail!("managed context is only valid for an injected Muse hook");
+        }
+        let context: crate::managed_run::muse::MuseManagedContext =
+            serde_json::from_slice(&tokio::fs::read(path).await?)?;
+        if context.managed_run_id.is_empty() || context.route.destination.is_none() {
+            anyhow::bail!("Muse managed hook context is incomplete");
+        }
+        route = context.route.clone();
+        Some(context)
+    } else {
+        None
+    };
     let mut payload = read_stdin_json()?;
 
     resolve_dynamic_hook_versions(&mut args, &payload);
@@ -208,10 +226,22 @@ async fn capture_hook(
         anyhow::bail!("trace destination is not configured for {}", args.source);
     }
     apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
-    let env = build_hook_envelope(&args, route, payload, session_id, event);
+    let mut env = build_hook_envelope(&args, route, payload, session_id, event);
+    if let Some(context) = &managed_context {
+        env.managed_run_id = Some(context.managed_run_id.clone());
+    }
 
-    let socket = paths::socket_path(args.socket.as_deref());
-    forward_envelope(&env, &socket, &host, args.no_spawn).await?;
+    let socket = managed_context
+        .as_ref()
+        .map(|context| context.socket.clone())
+        .unwrap_or_else(|| paths::socket_path(args.socket.as_deref()));
+    forward_envelope(
+        &env,
+        &socket,
+        &host,
+        args.no_spawn || managed_context.is_some(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -358,6 +388,35 @@ mod tests {
     use crate::client::initialize_params;
     use clap::Parser;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn muse_managed_hook_rejects_missing_context_before_reading_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = HookCli::try_parse_from([
+            "test",
+            "--source",
+            "muse",
+            "--managed-run-hook",
+            "--managed-context",
+            temp.path().join("missing.json").to_str().unwrap(),
+        ])
+        .unwrap()
+        .args;
+        let error = run_hook(
+            args,
+            SessionRoute::default(),
+            HostInfo {
+                serve_argv: Vec::new(),
+                version: "test".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
 
     #[derive(Debug, Parser)]
     struct HookCli {

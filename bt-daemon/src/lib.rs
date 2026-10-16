@@ -57,7 +57,7 @@ pub use command_output::{
 pub use hook::run_hook;
 #[doc(hidden)]
 pub use journal::source_journal_path;
-pub use managed_run::run_traced;
+pub use managed_run::{run_traced, run_traced_with_host};
 pub use plugin_diagnostics::PluginDiagnostic;
 pub use server::{
     braintrust_serve_options, debug_serve_options, run_serve, AuthLease, AuthProvider,

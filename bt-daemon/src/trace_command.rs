@@ -64,6 +64,8 @@ pub struct DoctorArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DoctorAgent {
     Codex,
+    #[value(alias = "muse-code")]
+    Muse,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
     #[value(name = "opencode", alias = "open-code")]
@@ -78,6 +80,7 @@ impl DoctorAgent {
     pub(crate) fn identity(self) -> &'static Identity {
         match self {
             Self::Codex => agents::Codex.identity(),
+            Self::Muse => agents::Muse.identity(),
             Self::Claude => agents::Claude.identity(),
             Self::OpenCode => agents::OpenCode.identity(),
             Self::Pi => agents::Pi.identity(),
@@ -128,6 +131,9 @@ pub struct UpdateArgs {
 pub enum SetupAgent {
     /// Install the published Codex tracing plugin.
     Codex,
+    /// Install the Muse Code tracing hooks.
+    #[command(alias = "muse-code")]
+    Muse,
     /// Install the published Claude Code tracing plugin.
     Claude,
     /// Configure the published OpenCode tracing plugin.
@@ -147,6 +153,7 @@ impl SetupAgent {
     pub(crate) fn identity(self) -> &'static Identity {
         match self {
             Self::Codex => agents::Codex.identity(),
+            Self::Muse => agents::Muse.identity(),
             Self::Claude => agents::Claude.identity(),
             Self::OpenCode => agents::OpenCode.identity(),
             Self::Pi => agents::Pi.identity(),
