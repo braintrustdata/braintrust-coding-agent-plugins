@@ -39,6 +39,7 @@ enum SessionMsg {
 
 /// Where to rebuild a session's translator state from, streamed at startup.
 pub(crate) struct SessionOptions {
+    pub observer_key: String,
     pub session_id: String,
     pub source: String,
     pub bt_version: String,
@@ -81,12 +82,7 @@ impl Session {
             last_error.clone(),
             recovery.clone(),
         );
-        let observer_key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            options.source,
-            options.session_id,
-            serde_json::to_string(&options.route).expect("serializable route")
-        );
+        let observer_key = options.observer_key;
         let route = Consumer::spawn(
             subscription.input,
             ConsumerOptions {
