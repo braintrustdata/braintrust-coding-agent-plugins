@@ -1,7 +1,6 @@
-//! One route owns processing and recovery at its durable SpanOp head.
+//! Route processing consumes managed deliveries independently of their source.
 use super::{
     delivery::InputPort,
-    journal::{Cursor, SpanJournal},
     recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
     routing::RoutingSink,
     Delivery, Stage,
@@ -10,11 +9,13 @@ use crate::{
     delivery_ledger::{CommitFailure, LedgerSink},
     dispatch::Counters,
     sink::{Sink, SinkFactory},
+    translate::SpanOp,
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
     AuthProvider, AuthResolveReason,
 };
 use parking_lot::Mutex;
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{atomic::Ordering, Arc},
 };
@@ -23,23 +24,22 @@ use tokio::sync::{watch, Notify};
 enum Work {
     Resubmit,
     Flush,
-    Complete(Delivery<()>),
+    Complete,
 }
 type Held = Box<(Failure, Work)>;
 
 pub(crate) struct Consumer {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     config: watch::Sender<SessionConfig>,
-    progress: watch::Receiver<u64>,
     stop: Arc<Notify>,
-    error: Arc<Mutex<Option<String>>>,
 }
 pub(crate) struct ConsumerOptions {
     pub source: String,
     pub session_id: String,
     pub version: String,
     pub data_dir: PathBuf,
-    pub config: SessionConfig,
+    pub route: SessionRoute,
+    pub config: watch::Sender<SessionConfig>,
     pub counters: Arc<Counters>,
     pub error: Arc<Mutex<Option<String>>>,
     pub recovery: Arc<Mutex<Option<RecoveryInfo>>>,
@@ -70,27 +70,25 @@ impl ConsumerOptions {
         sink.configure(config);
         Ok(sink)
     }
-    async fn hold(&self, journal: &SpanJournal, cursor: &Cursor, failure: &mut Failure) -> bool {
-        failure.through.get_or_insert(cursor.position());
+    async fn hold(&self, pending: &mut VecDeque<Delivery<()>>, failure: &mut Failure) -> bool {
+        let result = match pending.front_mut() {
+            Some(delivery) => delivery.failed(failure).await,
+            None => Ok(()), // Input errors are reported by the source itself.
+        };
         *self.error.lock() = Some(failure.message());
         *self.recovery.lock() = Some(failure.info(false));
-        if let Err(error) = async {
-            let encoded = serde_json::to_string(failure)?;
-            journal.set_failure(&cursor.route, Some(encoded)).await
-        }
-        .await
-        {
-            tracing::warn!(%error,"route recovery evidence could not be persisted; original failure retained");
+        if let Err(error) = result {
+            tracing::warn!(%error,"delivery recovery evidence could not be reported; original failure retained");
             return false;
         }
         true
     }
-    async fn credentials(&self, route: &str, config: &mut SessionConfig) -> anyhow::Result<()> {
+    async fn credentials(&self, config: &mut SessionConfig) -> anyhow::Result<()> {
         let provider = self
             .auth_provider
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("daemon host has no auth provider"))?;
-        let route: SessionRoute = serde_json::from_str(route)?;
+        let route = &self.route;
         let lease = crate::server::resolve_route_auth(
             provider.as_ref(),
             &route.auth,
@@ -114,28 +112,17 @@ impl ConsumerOptions {
         Ok(())
     }
 
-    fn storage(&self, error: &anyhow::Error, cursor: &Cursor, attempt: u32, work: Work) -> Held {
-        let mut failure = Failure::storage(
-            error,
-            cursor.completed_position() + 1,
-            &self.version,
-            attempt,
-        );
+    fn storage(&self, error: &anyhow::Error, attempt: u32, work: Work) -> Held {
+        let mut failure = Failure::storage(error, &self.version, attempt);
         failure.boundary = match work {
-            Work::Complete(_) => Boundary::Completion,
+            Work::Complete => Boundary::Completion,
             Work::Flush => Boundary::Ledger,
             Work::Resubmit => failure.boundary,
         };
         Box::new((failure, work))
     }
 
-    fn routing(
-        &self,
-        error: &anyhow::Error,
-        cursor: &Cursor,
-        config: &SessionConfig,
-        attempt: u32,
-    ) -> Held {
+    fn routing(&self, error: &anyhow::Error, config: &SessionConfig, attempt: u32) -> Held {
         if let Some(partial) = error.downcast_ref::<super::routing::EmitFailure>() {
             self.counters
                 .spans_emitted
@@ -144,149 +131,100 @@ impl ConsumerOptions {
                 tracing::warn!(session_id=%self.session_id, %error, "route processing failed");
             }
         }
-        Box::new((
-            Failure::routing(error, cursor.completed_position() + 1, config, attempt),
-            Work::Resubmit,
-        ))
+        Box::new((Failure::routing(error, config, attempt), Work::Resubmit))
     }
 
-    // Normal delivery and recovery share the same acceptance/commit path. Only a
-    // rejected batch is resubmitted; accepted work retains its local retry point.
+    // Keep the original acknowledgement obligations until checked delivery has
+    // resolved every deferred row. Completion failures retry only acknowledgement.
     async fn finish(
         &self,
-        cursor: &mut Cursor,
+        pending: &mut VecDeque<Delivery<()>>,
         sink: &mut Option<RoutingSink>,
         config: &SessionConfig,
         attempt: u32,
         work: Work,
     ) -> Result<bool, Held> {
-        let completed = !matches!(work, Work::Resubmit);
-        let completion = match work {
+        match work {
             Work::Resubmit => {
-                // The SDK consumed the rejected batch. Recreate its ledger too,
-                // so in-memory filtering cannot turn a retry into an empty ack.
+                // Dropping unresolved obligations asks their source to replay.
+                // Recreate the consumed SDK batch and its in-memory ledger too.
                 *sink = None;
-                None
+                pending.clear();
+                return Ok(false);
             }
-            Work::Complete(delivery) => Some(delivery),
             Work::Flush => {
                 let sink = sink.as_mut().ok_or_else(|| {
                     self.storage(
                         &anyhow::anyhow!("accepted delivery has no sink"),
-                        cursor,
                         attempt,
                         Work::Flush,
                     )
                 })?;
                 sink.flush().await.map_err(|error| {
                     if error.downcast_ref::<CommitFailure>().is_some() {
-                        self.storage(&error, cursor, attempt, Work::Flush)
+                        self.storage(&error, attempt, Work::Flush)
                     } else {
-                        self.routing(&error, cursor, config, attempt)
+                        self.routing(&error, config, attempt)
                     }
                 })?;
                 *self.permalink.lock() = sink.permalink();
-                // Deferred roots keep their prefix unresolved until a child
-                // releases them; the cursor can read ahead without buffering ops.
                 if sink.has_pending_delivery() {
                     return Ok(false);
                 }
-                Some(cursor.pending_prefix())
             }
-        };
-        if let Some(delivery) = completion {
-            delivery.into_completed().await.map_err(|unfinished| {
-                self.storage(
-                    &unfinished.error,
-                    cursor,
-                    attempt,
-                    Work::Complete(unfinished.delivery),
-                )
-            })?;
+            Work::Complete => {}
         }
-        cursor
-            .rewind()
-            .await
-            .map_err(|error| self.storage(&error, cursor, attempt, Work::Resubmit))?;
-        Ok(completed)
+        while let Some(delivery) = pending.pop_front() {
+            if let Err(unfinished) = delivery.into_completed().await {
+                pending.push_front(unfinished.delivery);
+                return Err(self.storage(&unfinished.error, attempt, Work::Complete));
+            }
+        }
+        Ok(true)
     }
 }
 
 impl Consumer {
-    pub fn spawn(journal: SpanJournal, mut cursor: Cursor, options: ConsumerOptions) -> Arc<Self> {
-        let (config, mut settings) = watch::channel(options.config.clone());
-        let (progress, receive) = watch::channel(cursor.position());
+    pub fn spawn(
+        mut input: Box<dyn InputPort<Item = Vec<SpanOp>>>,
+        options: ConsumerOptions,
+    ) -> Arc<Self> {
+        let config = options.config.clone();
+        let mut settings = config.subscribe();
         let stop = Arc::new(Notify::new());
         let handle = Arc::new(Self {
             task: Mutex::new(None),
             config: config.clone(),
-            progress: receive,
             stop: stop.clone(),
-            error: options.error.clone(),
         });
         let task = tokio::spawn(async move {
             let mut sink = None;
-            let mut held = match journal.failure(&cursor.route).await {
-                Ok(Some(raw)) => Some(Box::new((
-                    serde_json::from_str(&raw).unwrap_or_else(|_| {
-                        Failure::legacy(raw, cursor.completed_position() + 1, &options.config)
-                    }),
-                    Work::Resubmit,
-                ))),
-                Ok(None) => None,
-                Err(error) => Some(options.storage(&error, &cursor, 0, Work::Resubmit)),
-            };
+            let mut pending = VecDeque::new();
+            let mut held: Option<Held> = None;
             let mut attempts = 0;
             let mut recorded = None;
             let mut record_retry = 0;
             loop {
-                if let Some(pending) = held.take() {
-                    let (mut failure, work) = *pending;
-                    if matches!(failure.boundary, Boundary::Completion)
-                        && cursor.completed_position()
-                            >= failure.through.unwrap_or(failure.position)
-                        && journal.set_failure(&cursor.route, None).await.is_ok()
-                    {
-                        *options.error.lock() = None;
-                        *options.recovery.lock() = None;
-                        continue;
-                    }
-                    failure.through.get_or_insert(cursor.position());
-                    let encoded = match serde_json::to_string(&failure) {
-                        Ok(encoded) => encoded,
-                        Err(error) => {
-                            held = Some(Box::new((
-                                Failure::revision(
-                                    Boundary::Journal,
-                                    failure.position,
-                                    format!(
-                                        "{}; recovery evidence cannot be encoded: {error}",
-                                        failure.message()
-                                    ),
-                                    &options.version,
-                                ),
-                                work,
-                            )));
-                            continue;
-                        }
-                    };
-                    if recorded.as_ref() != Some(&encoded)
+                if let Some(waiting) = held.take() {
+                    let (mut failure, work) = *waiting;
+                    let mut reported = failure.clone();
+                    if recorded.as_ref() != Some(&reported)
                         && super::recovery::now_ms() >= record_retry
                     {
-                        if options.hold(&journal, &cursor, &mut failure).await {
-                            recorded = Some(encoded.clone());
+                        if options.hold(&mut pending, &mut failure).await {
+                            reported = failure.clone();
+                            recorded = Some(reported.clone());
                         } else {
                             record_retry = super::recovery::now_ms().saturating_add(1_000);
                         }
                     }
-                    progress.send_replace(cursor.completed_position());
                     tokio::select! {
                         _=stop.notified()=>break,
                         _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},
                         result=settings.changed()=>if result.is_err() { break; },
                     }
                     let mut current = settings.borrow_and_update().clone();
-                    if recorded.as_ref() != Some(&encoded)
+                    if recorded.as_ref() != Some(&reported)
                         || matches!(
                             (Recovery {
                                 config: Some(&current),
@@ -303,13 +241,9 @@ impl Consumer {
                     *options.recovery.lock() = Some(failure.info(true));
                     attempts = failure.attempt.saturating_add(1);
                     if matches!(failure.boundary, Boundary::Credentials) {
-                        if let Err(error) = options.credentials(&cursor.route, &mut current).await {
+                        if let Err(error) = options.credentials(&mut current).await {
                             held = Some(Box::new((
-                                Failure::credentials(
-                                    cursor.completed_position() + 1,
-                                    error.to_string(),
-                                    attempts,
-                                ),
+                                Failure::credentials(error.to_string(), attempts),
                                 work,
                             )));
                             continue;
@@ -317,11 +251,10 @@ impl Consumer {
                         config.send_replace(current.clone());
                     }
                     match options
-                        .finish(&mut cursor, &mut sink, &current, attempts, work)
+                        .finish(&mut pending, &mut sink, &current, attempts, work)
                         .await
                     {
                         Ok(completed) => {
-                            progress.send_replace(cursor.completed_position());
                             if completed {
                                 *options.error.lock() = None;
                                 *options.recovery.lock() = None;
@@ -333,80 +266,58 @@ impl Consumer {
                     continue;
                 }
                 let attempt = async {
-                    let tail = journal.tail().await.map_err(|error| {
-                        options.storage(&error, &cursor, attempts, Work::Resubmit)
-                    })?;
-                    options.counters.queued.store(
-                        tail.saturating_sub(cursor.completed_position()),
-                        Ordering::Relaxed,
-                    );
                     let received = tokio::select! {
-                        result=InputPort::receive(&mut cursor)=>result,
+                        result=input.receive()=>result,
                         result=settings.changed()=> {
                             return if result.is_err() { Ok(None) } else { Ok(Some(false)) };
                         },
                     };
-                    let delivery = received.map_err(|error| {
-                        options.storage(&error, &cursor, attempts, Work::Resubmit)
+                    let delivery = received.map_err(|error| match error.downcast::<Failure>() {
+                        Ok(failure) => Box::new((failure, Work::Resubmit)),
+                        Err(error) => options.storage(&error, attempts, Work::Resubmit),
                     })?;
                     let Some(delivery) = delivery else {
                         return Ok(None);
                     };
                     let current = settings.borrow_and_update().clone();
-                    if sink.is_none() {
-                        journal
-                            .bind(&cursor.route, &current)
-                            .await
-                            .map_err(|error| {
-                                if error
-                                    .downcast_ref::<super::journal::BindingChanged>()
-                                    .is_some()
+                    let ops = delivery.value().as_slice();
+                    let result = async {
+                        if sink.is_none() {
+                            sink = Some(options.sink(&current).await.map_err(|error| {
+                                if error.downcast_ref::<std::io::Error>().is_some()
+                                    || error.downcast_ref::<serde_json::Error>().is_some()
                                 {
-                                    Box::new((
-                                        Failure::legacy(
-                                            error.to_string(),
-                                            cursor.completed_position() + 1,
-                                            &current,
-                                        ),
-                                        Work::Resubmit,
-                                    ))
+                                    let mut failure =
+                                        options.storage(&error, attempts, Work::Resubmit);
+                                    failure.0.boundary = Boundary::Ledger;
+                                    failure
                                 } else {
-                                    options.storage(&error, &cursor, attempts, Work::Resubmit)
+                                    options.routing(&error, &current, attempts)
                                 }
-                            })?;
-                        sink = Some(options.sink(&current).await.map_err(|error| {
-                            if error.downcast_ref::<std::io::Error>().is_some()
-                                || error.downcast_ref::<serde_json::Error>().is_some()
-                            {
-                                let mut held =
-                                    options.storage(&error, &cursor, attempts, Work::Resubmit);
-                                held.0.boundary = Boundary::Ledger;
-                                held
-                            } else {
-                                options.routing(&error, &cursor, &current, attempts)
-                            }
-                        })?);
+                            })?);
+                        }
+                        let routing = sink.as_mut().ok_or_else(|| {
+                            options.storage(
+                                &anyhow::anyhow!("configured sink is missing"),
+                                attempts,
+                                Work::Resubmit,
+                            )
+                        })?;
+                        routing.configure(&current);
+                        routing
+                            .emit(ops)
+                            .await
+                            .map_err(|error| options.routing(&error, &current, attempts))
                     }
-                    let routing = sink.as_mut().ok_or_else(|| {
-                        options.storage(
-                            &anyhow::anyhow!("configured sink is missing"),
-                            &cursor,
-                            attempts,
-                            Work::Resubmit,
-                        )
-                    })?;
-                    routing.configure(&current);
-                    let count = routing
-                        .emit(delivery.value())
-                        .await
-                        .map_err(|error| options.routing(&error, &cursor, &current, attempts))?;
+                    .await;
+                    pending.push_back(delivery.map(|_| ()));
+                    let count = result?;
                     options
                         .counters
                         .spans_emitted
                         .fetch_add(count, Ordering::Relaxed);
-                    drop(delivery);
                     options
-                        .finish(&mut cursor, &mut sink, &current, attempts, Work::Flush)
+                        .finish(&mut pending, &mut sink, &current, attempts, Work::Flush)
                         .await
                         .map(Some)
                 };
@@ -418,7 +329,6 @@ impl Consumer {
                     Ok(None) => break,
                     Ok(Some(false)) => {}
                     Ok(Some(true)) => {
-                        progress.send_replace(cursor.completed_position());
                         *options.error.lock() = None;
                         *options.recovery.lock() = None;
                         attempts = 0;
@@ -447,27 +357,13 @@ impl Consumer {
             let _ = task.await;
         }
     }
-    pub async fn through(&self, tail: u64) -> Result<(), String> {
-        let mut progress = self.progress.clone();
-        loop {
-            if *progress.borrow_and_update() >= tail {
-                return Ok(());
-            }
-            if let Some(error) = self.error.lock().clone() {
-                return Err(error);
-            }
-            progress
-                .changed()
-                .await
-                .map_err(|_| "routing actor is gone".to_owned())?;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        pipeline::journal::SpanJournal,
         translate::{SpanOp, SpanRow},
         wire::BackendAuth,
     };
@@ -480,6 +376,7 @@ mod tests {
         reject: AtomicBool,
         unauthorized: AtomicBool,
         commit_fail: AtomicBool,
+        defer_until: AtomicU64,
     }
     struct Factory(Arc<Recording>);
     struct CheckedSink {
@@ -504,6 +401,9 @@ mod tests {
             Ok(ops.len() as u64)
         }
         async fn flush(&mut self) -> anyhow::Result<()> {
+            if self.pending < self.record.defer_until.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             // The SDK consumes its pending batch even when delivery is rejected.
             let pending = std::mem::take(&mut self.pending);
             if self.record.reject.swap(false, Ordering::SeqCst) {
@@ -523,6 +423,9 @@ mod tests {
             }
             Ok(())
         }
+        fn has_pending_delivery(&self) -> bool {
+            self.pending > 0
+        }
     }
     fn options(
         dir: &std::path::Path,
@@ -534,13 +437,15 @@ mod tests {
             session_id: "test".into(),
             version: "test".into(),
             data_dir: dir.into(),
-            config: route.with_auth(BackendAuth {
+            route: route.clone(),
+            config: watch::channel(route.with_auth(BackendAuth {
                 token: "never-persist-this".into(),
                 api_url: None,
                 app_url: None,
                 org_id: None,
                 org_name: None,
-            }),
+            }))
+            .0,
             counters: Arc::new(Counters::default()),
             error: Arc::new(Mutex::new(None)),
             recovery: Arc::new(Mutex::new(None)),
@@ -548,6 +453,27 @@ mod tests {
             factory: Arc::new(Factory(record)),
             auth_provider: None,
         }
+    }
+    fn spawn(
+        cursor: crate::pipeline::journal::Cursor,
+        options: ConsumerOptions,
+    ) -> (
+        Arc<Consumer>,
+        crate::pipeline::journal::Progress,
+        Arc<Mutex<Option<String>>>,
+    ) {
+        let subscription = cursor.into_input(
+            options.config.subscribe(),
+            options.version.clone(),
+            options.error.clone(),
+            options.recovery.clone(),
+        );
+        let error = options.error.clone();
+        (
+            Consumer::spawn(subscription.input, options),
+            subscription.progress,
+            error,
+        )
     }
     async fn wait_for(mut predicate: impl FnMut() -> bool) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -586,22 +512,107 @@ mod tests {
         let record = Arc::new(Recording::default());
         record.reject.store(true, Ordering::SeqCst);
         let cursor = journal.subscribe(&route, 0).await.unwrap();
-        let consumer = Consumer::spawn(
-            journal.clone(),
-            cursor,
-            options(tmp.path(), &route, record.clone()),
+        let opts = options(tmp.path(), &route, record.clone());
+        let subscription = cursor.into_input(
+            opts.config.subscribe(),
+            opts.version.clone(),
+            opts.error.clone(),
+            opts.recovery.clone(),
         );
+        let progress = subscription.progress;
+        let mut input = subscription.input;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let forward = tokio::spawn(async move {
+            while let Ok(Some(delivery)) = input.receive().await {
+                if tx.send(delivery).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let error = opts.error.clone();
+        let consumer = Consumer::spawn(Box::new(rx), opts);
         wait_for(|| record.accepted.load(Ordering::SeqCst) == 1).await;
-        wait_for(|| *consumer.progress.borrow() == 1).await;
+        wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.submitted.load(Ordering::SeqCst), 2);
-        assert!(consumer.error.lock().is_none());
+        assert!(error.lock().is_none());
         assert!(journal
             .failure(&serde_json::to_string(&route).unwrap())
             .await
             .unwrap()
             .is_none());
         consumer.shutdown().await;
+        forward.abort();
+        let _ = forward.await;
+        journal.close().await.unwrap();
     }
+    struct Acknowledged(Arc<AtomicU64>);
+    #[async_trait::async_trait]
+    impl crate::pipeline::Completion for Acknowledged {
+        async fn complete(&mut self) -> anyhow::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_channel_uses_the_same_consumer_and_completion_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = Arc::new(Recording::default());
+        let acknowledged = Arc::new(AtomicU64::new(0));
+        let opts = options(tmp.path(), &SessionRoute::default(), record.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let consumer = Consumer::spawn(Box::new(rx), opts);
+        tx.send(Delivery::new(
+            vec![SpanOp::Insert(SpanRow {
+                span_id: "one".into(),
+                name: "one".into(),
+                root_span_id: "one".into(),
+                end_ms: Some(1),
+                ..Default::default()
+            })],
+            Acknowledged(acknowledged.clone()),
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("consumer stopped"));
+        wait_for(|| acknowledged.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
+        consumer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deferred_delivery_can_read_ahead_and_acknowledge_original_receipts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        let ops: Vec<_> = (0..129)
+            .map(|index| {
+                SpanOp::Insert(SpanRow {
+                    span_id: index.to_string(),
+                    name: index.to_string(),
+                    root_span_id: index.to_string(),
+                    end_ms: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        journal.begin(1, true).await.unwrap();
+        journal.append(1, &ops).await.unwrap();
+        journal.commit(1).await.unwrap();
+        let route = SessionRoute::default();
+        let record = Arc::new(Recording::default());
+        record.defer_until.store(129, Ordering::SeqCst);
+        let (consumer, progress, _error) = spawn(
+            journal.subscribe(&route, 0).await.unwrap(),
+            options(tmp.path(), &route, record.clone()),
+        );
+        wait_for(|| progress.completed() == 129).await;
+        assert_eq!(record.submitted.load(Ordering::SeqCst), 129);
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 129);
+        assert_eq!(progress.pending(), 0);
+        consumer.shutdown().await;
+    }
+
     #[tokio::test]
     async fn ledger_recovery_does_not_resubmit_accepted_work() {
         let tmp = tempfile::tempdir().unwrap();
@@ -612,15 +623,14 @@ mod tests {
         let route = SessionRoute::default();
         let record = Arc::new(Recording::default());
         record.commit_fail.store(true, Ordering::SeqCst);
-        let consumer = Consumer::spawn(
-            journal.clone(),
+        let (consumer, progress, error) = spawn(
             journal.subscribe(&route, 0).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
-        wait_for(|| consumer.error.lock().is_some()).await;
-        assert_eq!(*consumer.progress.borrow(), 0);
+        wait_for(|| error.lock().is_some()).await;
+        assert_eq!(progress.completed(), 0);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
-        wait_for(|| *consumer.progress.borrow() == 1).await;
+        wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.submitted.load(Ordering::SeqCst), 1);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
         consumer.shutdown().await;
@@ -637,16 +647,13 @@ mod tests {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch("CREATE TRIGGER fail_head BEFORE UPDATE OF position ON heads BEGIN SELECT RAISE(FAIL,'injected head failure'); END;").unwrap();
         let record = Arc::new(Recording::default());
-        let consumer = Consumer::spawn(
-            journal.clone(),
-            cursor,
-            options(tmp.path(), &route, record.clone()),
-        );
-        wait_for(|| consumer.error.lock().is_some()).await;
-        assert_eq!(*consumer.progress.borrow(), 0);
+        let (consumer, progress, error) =
+            spawn(cursor, options(tmp.path(), &route, record.clone()));
+        wait_for(|| error.lock().is_some()).await;
+        assert_eq!(progress.completed(), 0);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
         db.execute_batch("DROP TRIGGER fail_head").unwrap();
-        wait_for(|| *consumer.progress.borrow() == 1).await;
+        wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.submitted.load(Ordering::SeqCst), 1);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
         consumer.shutdown().await;
@@ -666,27 +673,44 @@ mod tests {
         };
         let key = serde_json::to_string(&route).unwrap();
         let record = Arc::new(Recording::default());
-        let consumer = Consumer::spawn(
-            journal.clone(),
+        let (consumer, _progress, error) = spawn(
             journal.subscribe(&route, 0).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
-        wait_for(|| consumer.error.lock().is_some()).await;
+        wait_for(|| error.lock().is_some()).await;
         consumer.shutdown().await;
         let evidence = journal.failure(&key).await.unwrap().unwrap();
         assert!(!evidence.contains("never-persist-this"));
-        let consumer = Consumer::spawn(
-            journal.clone(),
-            journal.subscribe(&route, 0).await.unwrap(),
-            options(tmp.path(), &route, record.clone()),
+        // Restart with an ordinary channel between the durable source and the
+        // same consumer. Historical failure gating belongs to the source.
+        let opts = options(tmp.path(), &route, record.clone());
+        let subscription = journal.subscribe(&route, 0).await.unwrap().into_input(
+            opts.config.subscribe(),
+            opts.version.clone(),
+            opts.error.clone(),
+            opts.recovery.clone(),
         );
+        let progress = subscription.progress;
+        let mut input = subscription.input;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let forward = tokio::spawn(async move {
+            while let Ok(Some(delivery)) = input.receive().await {
+                if tx.send(delivery).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let consumer = Consumer::spawn(Box::new(rx), opts);
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         assert_eq!(record.submitted.load(Ordering::SeqCst), 0);
         std::fs::write(&plugin, "export default span => span").unwrap();
-        wait_for(|| *consumer.progress.borrow() == 1).await;
+        wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
         assert!(journal.failure(&key).await.unwrap().is_none());
         consumer.shutdown().await;
+        forward.abort();
+        let _ = forward.await;
+        journal.close().await.unwrap();
     }
     struct RefreshAuth(Arc<AtomicU64>);
     #[async_trait::async_trait]
@@ -725,12 +749,8 @@ mod tests {
         let refreshed = Arc::new(AtomicU64::new(0));
         let mut opts = options(tmp.path(), &route, record.clone());
         opts.auth_provider = Some(Arc::new(RefreshAuth(refreshed.clone())));
-        let consumer = Consumer::spawn(
-            journal.clone(),
-            journal.subscribe(&route, 0).await.unwrap(),
-            opts,
-        );
-        wait_for(|| *consumer.progress.borrow() == 1).await;
+        let (consumer, progress, _error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        wait_for(|| progress.completed() == 1).await;
         assert_eq!(refreshed.load(Ordering::SeqCst), 1);
         assert_eq!(consumer.config.borrow().auth.token, "fresh");
         assert_eq!(record.submitted.load(Ordering::SeqCst), 2);
@@ -767,19 +787,17 @@ mod tests {
             ..Default::default()
         };
         let mut opts = options(tmp.path(), &route, Arc::new(Recording::default()));
-        opts.config.auth.api_url = Some(server.uri());
-        opts.config.auth.app_url = Some(server.uri());
+        opts.config.send_modify(|config| {
+            config.auth.api_url = Some(server.uri());
+            config.auth.app_url = Some(server.uri());
+        });
         opts.factory = Arc::new(crate::BraintrustSinkFactory::new(
             crate::BraintrustSinkConfig::default(),
         ));
-        let mut config = opts.config.clone();
-        let consumer = Consumer::spawn(
-            journal.clone(),
-            journal.subscribe(&route, 0).await.unwrap(),
-            opts,
-        );
-        wait_for(|| consumer.error.lock().is_some()).await;
-        assert_eq!(*consumer.progress.borrow(), 0);
+        let mut config = opts.config.borrow().clone();
+        let (consumer, progress, error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        wait_for(|| error.lock().is_some()).await;
+        assert_eq!(progress.completed(), 0);
         drop(rejection);
         Mock::given(method("POST"))
             .and(path("/logs3"))
@@ -791,11 +809,11 @@ mod tests {
         config.auth.token = "replacement-token".into();
         consumer.configure(config.clone());
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert_eq!(*consumer.progress.borrow(), 0);
+        assert_eq!(progress.completed(), 0);
         config.tags.push("corrected".into());
         consumer.configure(config);
-        wait_for(|| *consumer.progress.borrow() == 1).await;
-        assert!(consumer.error.lock().is_none());
+        wait_for(|| progress.completed() == 1).await;
+        assert!(error.lock().is_none());
         consumer.shutdown().await;
     }
 
@@ -816,12 +834,11 @@ mod tests {
             ..Default::default()
         };
         let record = Arc::new(Recording::default());
-        let consumer = Consumer::spawn(
-            journal.clone(),
+        let (consumer, progress, error) = spawn(
             journal.subscribe(&route, 0).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
-        wait_for(|| consumer.error.lock().is_some()).await;
+        wait_for(|| error.lock().is_some()).await;
         let failure: Failure = serde_json::from_str(
             &journal
                 .failure(&serde_json::to_string(&route).unwrap())
@@ -846,7 +863,7 @@ mod tests {
             RecoveryOutcome::Waiting
         ));
         std::fs::write(&first, "export default span => ({...span,name:'good'})").unwrap();
-        wait_for(|| *consumer.progress.borrow() == 1).await;
+        wait_for(|| progress.completed() == 1).await;
         assert_eq!(crate::span_processor::file_digest(&last), last_digest);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
         consumer.shutdown().await;

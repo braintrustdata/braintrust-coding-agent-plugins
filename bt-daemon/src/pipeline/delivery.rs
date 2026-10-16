@@ -1,6 +1,9 @@
+use super::recovery::Failure;
 use tokio::sync::mpsc;
 
 /// A message owns its completion obligation until terminal handling succeeds.
+/// Mapping or forwarding preserves it; dropping it never acknowledges the input.
+/// Recoverable sources may redeliver abandoned input.
 pub(crate) struct Delivery<T> {
     value: T,
     completion: Box<dyn Completion>,
@@ -11,6 +14,12 @@ pub(crate) struct Delivery<T> {
 #[async_trait::async_trait]
 pub(crate) trait Completion: Send {
     async fn complete(&mut self) -> anyhow::Result<()>;
+
+    /// Report a processing failure through the same obligation. Durable sources
+    /// retain the evidence; ordinary channels may simply discard the report.
+    async fn failed(&mut self, _failure: &mut Failure) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) struct Unfinished<T> {
@@ -30,12 +39,15 @@ impl<T> Delivery<T> {
         &self.value
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn map<U>(self, map: impl FnOnce(T) -> U) -> Delivery<U> {
         Delivery {
             value: map(self.value),
             completion: self.completion,
         }
+    }
+
+    pub async fn failed(&mut self, failure: &mut Failure) -> anyhow::Result<()> {
+        self.completion.failed(failure).await
     }
 
     pub async fn into_completed(mut self) -> Result<T, Unfinished<T>> {
@@ -70,6 +82,14 @@ impl<T: Send + 'static> InputPort for mpsc::Receiver<Delivery<T>> {
     type Item = T;
     async fn receive(&mut self) -> anyhow::Result<Option<Delivery<T>>> {
         Ok(self.recv().await)
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: InputPort + ?Sized> InputPort for Box<T> {
+    type Item = T::Item;
+    async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
+        (**self).receive().await
     }
 }
 
