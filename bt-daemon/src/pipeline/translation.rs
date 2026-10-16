@@ -3,15 +3,16 @@ use super::journal::SpanJournal;
 use super::prepare::Prepare;
 use crate::{
     journal::{ControlKind, JournalReader, JournalRecord, JournalWriter, PipelineControl},
-    translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, SpanType},
+    translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp},
     wire::{SessionConfig, SessionRoute},
 };
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
 };
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -86,6 +87,7 @@ impl Translation {
             reader: None,
             observers: Vec::new(),
             origins: HashMap::new(),
+            capture: None,
             bounds: HashMap::new(),
             position: 0,
             committed,
@@ -103,7 +105,7 @@ impl Translation {
     }
     pub async fn shutdown(&self) {
         let _ = self.tx.send(Command::Stop).await;
-        let task = self.task.lock().unwrap().take();
+        let task = self.task.lock().take();
         if let Some(task) = task {
             let _ = task.await;
         }
@@ -153,6 +155,7 @@ struct Producer {
     reader: Option<JournalReader>,
     observers: Vec<Observation>,
     origins: HashMap<String, OriginSnapshot>,
+    capture: Option<OriginSnapshot>,
     bounds: HashMap<String, u64>,
     position: u64,
     committed: u64,
@@ -182,7 +185,7 @@ impl Producer {
             };
             if let Err(error) = result {
                 self.held = true;
-                *self.error.lock().unwrap() =
+                *self.error.lock() =
                     Some(format!("translation held at {}: {error:#}", self.position));
             }
         }
@@ -193,7 +196,6 @@ impl Producer {
             return Err(self
                 .error
                 .lock()
-                .unwrap()
                 .clone()
                 .unwrap_or_else(|| "translation held".into()));
         }
@@ -275,7 +277,7 @@ impl Producer {
         while let Some(entry) = self
             .reader
             .as_mut()
-            .expect("reader initialized")
+            .ok_or_else(|| anyhow::anyhow!("event journal is missing"))?
             .next_record()
             .await?
         {
@@ -315,10 +317,11 @@ impl Producer {
                         source_version: env.source_version.clone(),
                         bt_version: self.options.version.clone(),
                     };
+                    self.capture = Some(capture.clone());
                     (
                         self.translator
                             .as_mut()
-                            .expect("translator initialized")
+                            .ok_or_else(|| anyhow::anyhow!("translator is missing"))?
                             .handle(&env, &ctx)?,
                         Some(capture),
                     )
@@ -330,13 +333,16 @@ impl Producer {
                         self.position = input;
                         continue;
                     }
-                    let translator = self.translator.as_mut().expect("translator initialized");
+                    let translator = self
+                        .translator
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
                     let ops = if !matches!(control.kind, ControlKind::Checkpoint) {
                         translator.finalize_at(&ctx, &control.bounds)?
                     } else {
                         translator.checkpoint_at(&ctx, &control.bounds)?
                     };
-                    (ops, None)
+                    (ops, self.capture.clone())
                 }
                 JournalRecord::DeliveryCheckpoint { .. } => {
                     if input > self.committed {
@@ -358,15 +364,14 @@ impl Producer {
                 for op in &mut ops {
                     let insert = matches!(op, SpanOp::Insert(_));
                     let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                    if insert
-                        && (row.is_turn
-                            || (row.span_type == SpanType::Task && row.parent_span_ids.is_empty()))
-                    {
-                        if let Some(capture) = &capture {
-                            self.origins
-                                .entry(row.span_id.clone())
-                                .or_insert_with(|| capture.clone());
-                        }
+                    if insert {
+                        self.origins.entry(row.span_id.clone()).or_insert_with(|| {
+                            capture.clone().unwrap_or_else(|| OriginSnapshot {
+                                plugin_version: None,
+                                source_version: None,
+                                bt_version: self.options.version.clone(),
+                            })
+                        });
                     }
                     row.origin = self.origins.get(&row.span_id).cloned();
                 }
@@ -381,7 +386,7 @@ impl Producer {
                 next = self
                     .translator
                     .as_mut()
-                    .expect("translator initialized")
+                    .ok_or_else(|| anyhow::anyhow!("translator is missing"))?
                     .drain_pending(&ctx)?;
             }
             if publish {
@@ -398,10 +403,10 @@ impl Producer {
         let mut after = 0;
         loop {
             let rows = self.journal.read_after(after, 128).await?;
-            if rows.is_empty() {
+            let Some(&(through, _)) = rows.last() else {
                 break;
-            }
-            after = rows.last().expect("nonempty").0;
+            };
+            after = through;
             let ops = rows.into_iter().map(|(_, op)| op).collect::<Vec<_>>();
             Self::observe(&self.options, &ops, observer).await?;
         }
@@ -485,7 +490,7 @@ mod tests {
         translation.advance(input).await.unwrap();
         assert_eq!(translation.barrier().await.unwrap(), tail);
         assert_eq!(translation.progress.pending(), 0);
-        assert!(translation.error.lock().unwrap().is_none());
+        assert!(translation.error.lock().is_none());
         let mut route = translation
             .journal
             .subscribe(&SessionRoute::default(), 0)

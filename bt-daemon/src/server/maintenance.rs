@@ -128,7 +128,6 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     let sources: Vec<_> = daemon
         .translations
         .lock()
-        .unwrap()
         .iter()
         .map(|(key, source)| (key.clone(), source.clone()))
         .collect();
@@ -141,7 +140,6 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     let sessions: Vec<_> = daemon
         .sessions
         .lock()
-        .unwrap()
         .iter()
         .map(|(key, session)| (key.clone(), session.clone()))
         .collect();
@@ -151,19 +149,13 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
             .copied();
         session.shutdown_through(target).await;
     }
-    let sources: Vec<_> = daemon
-        .translations
-        .lock()
-        .unwrap()
-        .values()
-        .cloned()
-        .collect();
+    let sources: Vec<_> = daemon.translations.lock().values().cloned().collect();
     for source in sources {
         source.shutdown().await;
     }
-    daemon.sessions.lock().unwrap().clear();
-    daemon.translations.lock().unwrap().clear();
-    daemon.journals.lock().unwrap().clear();
+    daemon.sessions.lock().clear();
+    daemon.translations.lock().clear();
+    daemon.journals.lock().clear();
     let (reply, done) = oneshot::channel();
     if daemon
         .ingress_tx

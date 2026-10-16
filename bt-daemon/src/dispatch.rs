@@ -13,8 +13,8 @@ use crate::pipeline::{
 };
 use crate::sink::SinkFactory;
 use crate::translate::Registry;
-use parking_lot::Mutex;
 use crate::wire::Envelope;
+use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -114,7 +114,7 @@ impl Session {
                             route.configure(config);
                         }
                         if let Err(error) = producer.advance(through).await {
-                            *errors.lock().unwrap() = Some(error.to_string());
+                            *errors.lock() = Some(error.to_string());
                         }
                     }
                     SessionMsg::Configure(config, reply) => {
@@ -142,12 +142,12 @@ impl Session {
                                     Ok(tail) => match route.through(tail).await {
                                         Ok(()) => 0,
                                         Err(error) => {
-                                            *errors.lock().unwrap() = Some(error);
+                                            *errors.lock() = Some(error);
                                             queued.queued.load(Ordering::Relaxed).max(1)
                                         }
                                     },
                                     Err(error) => {
-                                        *errors.lock().unwrap() = Some(error);
+                                        *errors.lock() = Some(error);
                                         queued.queued.load(Ordering::Relaxed).max(1)
                                     }
                                 }
