@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -82,7 +83,7 @@ impl SpanJournal {
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            anyhow::ensure!(version <= 3, "unsupported SpanOp journal schema {version}");
+            anyhow::ensure!(version <= 4, "unsupported SpanOp journal schema {version}");
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
             if version < 3 {
                 db.execute_batch(
@@ -107,6 +108,9 @@ impl SpanJournal {
                 }
                 db.execute_batch("ALTER TABLE heads ADD COLUMN binding TEXT")?;
                 db.execute_batch("PRAGMA user_version=3; COMMIT")?;
+            }
+            if version < 4 {
+                db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE root_candidates (span_id TEXT PRIMARY KEY, value BLOB NOT NULL); PRAGMA user_version=4; COMMIT")?;
             }
             let tail = db.query_row("SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1", [], |row| row.get(0))?;
             Ok((db, tail))
@@ -216,6 +220,56 @@ impl SpanJournal {
     }
 
     pub async fn commit(&self, input: u64) -> anyhow::Result<u64> {
+        self.commit_output(input, None).await
+    }
+
+    /// Root candidates and translated output share the consumed-input boundary.
+    pub async fn commit_with_roots(
+        &self,
+        input: u64,
+        roots: &BTreeMap<String, Vec<SpanOp>>,
+    ) -> anyhow::Result<u64> {
+        let roots = roots
+            .iter()
+            .map(|(id, ops)| {
+                let ops = ops
+                    .iter()
+                    .map(StoredOp::encode)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok((id.clone(), serde_json::to_vec(&ops)?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.commit_output(input, Some(roots)).await
+    }
+
+    pub async fn root_candidates(&self) -> anyhow::Result<BTreeMap<String, Vec<SpanOp>>> {
+        self.with_db(|db| {
+            let mut query = db.prepare("SELECT span_id,value FROM root_candidates")?;
+            let roots = query
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .map(|row| {
+                    let (id, bytes) = row?;
+                    let ops: Vec<Vec<u8>> = serde_json::from_slice(&bytes)?;
+                    Ok((
+                        id,
+                        ops.iter()
+                            .map(|bytes| StoredOp::decode(bytes))
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                    ))
+                })
+                .collect();
+            roots
+        })
+        .await
+    }
+
+    async fn commit_output(
+        &self,
+        input: u64,
+        roots: Option<Vec<(String, Vec<u8>)>>,
+    ) -> anyhow::Result<u64> {
         let tail = self
             .with_db(move |db| {
                 let tx = db.transaction()?;
@@ -238,6 +292,15 @@ impl SpanJournal {
                     tx.execute("UPDATE batches SET committed=1 WHERE input=?", [input])? == 1,
                     "missing translation batch"
                 );
+                if let Some(roots) = roots {
+                    tx.execute("DELETE FROM root_candidates", [])?;
+                    for (id, value) in roots {
+                        tx.execute(
+                            "INSERT INTO root_candidates(span_id,value) VALUES (?,?)",
+                            params![id, value],
+                        )?;
+                    }
+                }
                 let tail = tx.query_row(
                     "SELECT coalesce(max(position),0) FROM ops WHERE input<=?",
                     [input],
@@ -778,6 +841,67 @@ mod tests {
             tags: vec![name.into()],
             ..SessionRoute::default()
         }
+    }
+
+    #[tokio::test]
+    async fn root_candidates_commit_and_release_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("roots.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let mut roots = crate::pipeline::roots::Roots::default();
+        let mut root = op("root");
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut root;
+        row.metadata = Some(serde_json::json!({"_bt_defer_root": true}));
+        assert!(roots.process(&vec![root]).await.is_empty());
+        journal.begin(10, true).await.unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_roots BEFORE INSERT ON root_candidates BEGIN SELECT RAISE(FAIL,'root write'); END;").unwrap();
+        assert!(journal
+            .commit_with_roots(10, roots.pending())
+            .await
+            .is_err());
+        assert_eq!(journal.translated_through().await.unwrap(), 0);
+        assert!(journal.root_candidates().await.unwrap().is_empty());
+        db.execute_batch("DROP TRIGGER fail_roots").unwrap();
+        journal
+            .commit_with_roots(10, roots.pending())
+            .await
+            .unwrap();
+        journal.close().await.unwrap();
+
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let candidates = journal.root_candidates().await.unwrap();
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &candidates["root"][0];
+        assert_eq!(row.late_merge_key.as_deref(), Some("late"));
+        assert_eq!(
+            row.origin.as_ref().unwrap().plugin_version.as_deref(),
+            Some("capture")
+        );
+        let mut roots = crate::pipeline::roots::Roots::restore(candidates);
+        let child = SpanOp::Insert(SpanRow {
+            span_id: "turn".into(),
+            parent_span_ids: vec!["root".into()],
+            ..Default::default()
+        });
+        let ready = roots.process(&vec![child]).await;
+        assert_eq!(ready.len(), 2);
+        journal.begin(20, true).await.unwrap();
+        journal.append(20, &ready).await.unwrap();
+        db.execute_batch("CREATE TRIGGER fail_release BEFORE DELETE ON root_candidates BEGIN SELECT RAISE(FAIL,'release'); END;").unwrap();
+        assert!(journal
+            .commit_with_roots(20, roots.pending())
+            .await
+            .is_err());
+        assert_eq!(journal.translated_through().await.unwrap(), 10);
+        assert_eq!(journal.tail().await.unwrap(), 0);
+        assert_eq!(journal.root_candidates().await.unwrap().len(), 1);
+        db.execute_batch("DROP TRIGGER fail_release").unwrap();
+        journal
+            .commit_with_roots(20, roots.pending())
+            .await
+            .unwrap();
+        assert_eq!(journal.tail().await.unwrap(), 2);
+        assert!(journal.root_candidates().await.unwrap().is_empty());
     }
 
     #[tokio::test]

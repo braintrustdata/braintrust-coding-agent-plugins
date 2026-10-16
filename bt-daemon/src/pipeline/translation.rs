@@ -1,6 +1,7 @@
 //! One ordered source consumer. Output publication is independent of route delivery.
 use super::journal::SpanJournal;
 use super::prepare::Prepare;
+use super::roots::Roots;
 use super::{
     recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
     Stage,
@@ -102,6 +103,7 @@ impl Translation {
             reader: None,
             observers: Vec::new(),
             origins: HashMap::new(),
+            roots: Roots::default(),
             capture: None,
             pending_snapshots: HashSet::new(),
             bounds: HashMap::new(),
@@ -191,6 +193,7 @@ struct Publication {
     capture: Option<OriginSnapshot>,
     ops: Option<Vec<SpanOp>>,
     begun: bool,
+    prepared: bool,
     complete: bool,
 }
 
@@ -204,6 +207,7 @@ struct Producer {
     reader: Option<JournalReader>,
     observers: Vec<Observation>,
     origins: HashMap<String, OriginSnapshot>,
+    roots: Roots,
     capture: Option<OriginSnapshot>,
     pending_snapshots: HashSet<String>,
     bounds: HashMap<String, u64>,
@@ -421,6 +425,17 @@ impl Producer {
             return Ok(());
         }
         self.committed = self.journal.translated_through().await?;
+        self.roots = Roots::restore(self.journal.root_candidates().await?);
+        for ops in self.roots.pending().values() {
+            for op in ops {
+                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                if let Some(origin) = &row.origin {
+                    self.origins
+                        .entry(row.span_id.clone())
+                        .or_insert_with(|| origin.clone());
+                }
+            }
+        }
         // Load creation provenance so an upgrade cannot restamp old spans.
         let mut after = 0;
         loop {
@@ -557,6 +572,7 @@ impl Producer {
                 capture,
                 ops: Some(first),
                 begun: false,
+                prepared: false,
                 complete: false,
             });
             self.publish().await?;
@@ -588,31 +604,37 @@ impl Producer {
             }
             while !pending.complete {
                 if let Some(ops) = pending.ops.as_mut() {
-                    for op in ops.iter_mut() {
-                        let insert = matches!(op, SpanOp::Insert(_));
-                        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                        if insert {
-                            self.origins.entry(row.span_id.clone()).or_insert_with(|| {
-                                pending.capture.clone().unwrap_or_else(|| OriginSnapshot {
-                                    plugin_version: None,
-                                    source_version: None,
-                                    bt_version: self.options.version.clone(),
-                                })
-                            });
+                    if !pending.prepared {
+                        for op in ops.iter_mut() {
+                            let insert = matches!(op, SpanOp::Insert(_));
+                            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                            if insert {
+                                self.origins.entry(row.span_id.clone()).or_insert_with(|| {
+                                    pending.capture.clone().unwrap_or_else(|| OriginSnapshot {
+                                        plugin_version: None,
+                                        source_version: None,
+                                        bt_version: self.options.version.clone(),
+                                    })
+                                });
+                            }
+                            row.origin = self.origins.get(&row.span_id).cloned();
                         }
-                        row.origin = self.origins.get(&row.span_id).cloned();
-                    }
-                    self.phase = Boundary::Journal;
-                    if pending.observation {
-                        for observer in &self.observers {
-                            Self::observe(
-                                &self.options,
-                                &mut self.pending_snapshots,
-                                ops,
-                                observer,
-                            )
-                            .await?;
+                        self.phase = Boundary::Journal;
+                        if pending.observation {
+                            for observer in &self.observers {
+                                Self::observe(
+                                    &self.options,
+                                    &mut self.pending_snapshots,
+                                    ops,
+                                    observer,
+                                )
+                                .await?;
+                            }
                         }
+                        if publish {
+                            *ops = self.roots.process(ops).await;
+                        }
+                        pending.prepared = true;
                     }
                     if publish {
                         self.journal.append(pending.input, ops).await?;
@@ -626,10 +648,13 @@ impl Producer {
                     .ok_or_else(|| anyhow::anyhow!("translator is missing"))?
                     .drain_pending(&ctx)?;
                 pending.complete = pending.ops.is_none();
+                pending.prepared = false;
             }
             if publish {
                 self.phase = Boundary::Journal;
-                self.journal.commit(pending.input).await?;
+                self.journal
+                    .commit_with_roots(pending.input, self.roots.pending())
+                    .await?;
                 self.committed = pending.input;
                 self.progress
                     .committed
@@ -799,6 +824,7 @@ mod tests {
             reader: None,
             observers: Vec::new(),
             origins: HashMap::new(),
+            roots: Roots::default(),
             capture: None,
             pending_snapshots: HashSet::new(),
             bounds: HashMap::new(),
@@ -810,11 +836,19 @@ mod tests {
                 input: 10,
                 observation: true,
                 capture: None,
-                ops: Some(vec![SpanOp::Insert(SpanRow {
-                    span_id: "built".into(),
-                    ..Default::default()
-                })]),
+                ops: Some(vec![
+                    SpanOp::Insert(SpanRow {
+                        span_id: "unused-root".into(),
+                        metadata: Some(serde_json::json!({"_bt_defer_root": true})),
+                        ..Default::default()
+                    }),
+                    SpanOp::Insert(SpanRow {
+                        span_id: "built".into(),
+                        ..Default::default()
+                    }),
+                ]),
                 begun: false,
+                prepared: false,
                 complete: false,
             }),
         };
@@ -831,5 +865,11 @@ mod tests {
         assert_eq!(drains.load(Ordering::Relaxed), 1);
         assert_eq!(journal.translated_through().await.unwrap(), 10);
         assert_eq!(journal.tail().await.unwrap(), 1);
+        let roots = journal.root_candidates().await.unwrap();
+        assert_eq!(
+            roots["unused-root"].len(),
+            1,
+            "a local retry must not stage the root twice"
+        );
     }
 }
