@@ -3292,3 +3292,39 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     shutdown(&socket).await;
     second.await.unwrap();
 }
+
+#[tokio::test]
+async fn status_counts_rows_emitted_before_a_plugin_failure() {
+    let (data_dir, socket, handle, tmp) = start_daemon().await;
+    let plugin = tmp.path().join("partial.mjs");
+    std::fs::write(&plugin, "export default span => { if (span.name === 'SessionStart') throw new Error('rejected event'); return span; }").unwrap();
+    let mut env = envelope("partial-plugin", "SessionStart", 1);
+    env.route.as_mut().unwrap().span_plugins = vec![plugin];
+    forward_envelope(&env, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    flush_session("partial-plugin", &socket, 5_000)
+        .await
+        .unwrap();
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: Some("partial-plugin".into()),
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let rows = std::fs::read_to_string(data_dir.join("spans/partial-plugin.ndjson")).unwrap();
+    assert_eq!(
+        rows.lines().count(),
+        1,
+        "the root was emitted before the plugin rejected its event"
+    );
+    assert_eq!(status.sessions[0].spans_emitted, 1);
+    assert!(status.sessions[0]
+        .last_error
+        .as_ref()
+        .unwrap()
+        .contains("rejected event"));
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
