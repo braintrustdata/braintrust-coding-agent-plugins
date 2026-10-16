@@ -120,7 +120,7 @@ impl Daemon {
 
         let provider = self
             .route_auth_provider(&key)
-            .expect("auth provider checked");
+            .ok_or_else(|| anyhow::anyhow!("daemon host has no Braintrust auth provider"))?;
         let lease = resolve_route_auth(
             provider.as_ref(),
             &selection,

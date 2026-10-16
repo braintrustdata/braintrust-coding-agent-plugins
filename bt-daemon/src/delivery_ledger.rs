@@ -540,7 +540,8 @@ mod tests {
                 Some(&config),
                 "test",
             )
-            .await;
+            .await
+            .unwrap();
             sink.emit(&[terminal("one")]).await.unwrap();
             let path = sink.ledger.as_ref().unwrap().path.clone();
             let original = std::fs::read(&path).unwrap();
@@ -715,7 +716,8 @@ mod tests {
             Some(&config),
             "bt1",
         )
-        .await;
+        .await
+        .unwrap();
         sink.set_capture_versions(Some("v1"), Some("native1"));
         let path = sink.ledger.as_ref().unwrap().path.clone();
         // Block persistence: nothing may reach the sink until origins are saved.
@@ -750,7 +752,8 @@ mod tests {
             Some(&config),
             "bt2",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(recovered.span_origins.len(), 256);
         assert_eq!(
             recovered.span_origins["span-0"].plugin_version.as_deref(),
@@ -815,7 +818,8 @@ mod tests {
             Some(&config),
             if is_child { "bt2" } else { "bt1" },
         )
-        .await;
+        .await
+        .unwrap();
         sink.set_capture_versions(
             Some(if is_child { "v2" } else { "v1" }),
             Some(if is_child { "native2" } else { "native1" }),
