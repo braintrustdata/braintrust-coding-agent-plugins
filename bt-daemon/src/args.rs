@@ -85,6 +85,9 @@ pub struct HookArgs {
     /// not carry this flag and are suppressed for the managed child.
     #[arg(long, hide = true)]
     pub managed_run_hook: bool,
+    /// Private route context for Muse, whose hooks clear their environment.
+    #[arg(long, hide = true)]
+    pub managed_context: Option<PathBuf>,
 }
 
 /// Arguments for `status`.
@@ -179,6 +182,8 @@ pub struct ImportArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ImportSource {
     Codex,
+    #[value(alias = "muse-code")]
+    Muse,
     Cursor,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
@@ -199,6 +204,7 @@ impl ImportSource {
     pub(crate) fn identity(self) -> &'static Identity {
         match self {
             Self::Codex => agents::Codex.identity(),
+            Self::Muse => agents::Muse.identity(),
             Self::Cursor => agents::Cursor.identity(),
             Self::Claude => agents::Claude.identity(),
             Self::Antigravity => agents::Antigravity.identity(),
@@ -210,6 +216,7 @@ impl RunSource {
     pub(crate) fn identity(self) -> &'static Identity {
         match self {
             Self::Codex => agents::Codex.identity(),
+            Self::Muse => agents::Muse.identity(),
             Self::Cursor => agents::Cursor.identity(),
             Self::Claude => agents::Claude.identity(),
             Self::OpenCode => agents::OpenCode.identity(),
@@ -269,6 +276,8 @@ pub struct RunHookCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RunSource {
     Codex,
+    #[value(alias = "muse-code")]
+    Muse,
     Cursor,
     #[value(name = "claude", alias = "claude-code")]
     Claude,

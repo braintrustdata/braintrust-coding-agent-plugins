@@ -13,7 +13,9 @@ pub use shared::CowSpanOp;
 mod antigravity;
 mod claude;
 mod codex;
+pub(crate) mod cursor;
 mod debug;
+mod decode;
 mod git;
 mod grok;
 mod muse;
@@ -25,16 +27,12 @@ mod origins;
 mod recent;
 pub(crate) use origins::WeakOrigins;
 mod tool;
+mod turn_lineage;
+pub use turn_lineage::TURN_SPAN_ID_KEY;
 
-pub use antigravity::AntigravityTranslatorFactory;
-pub use claude::ClaudeTranslatorFactory;
-pub use codex::CodexTranslatorFactory;
-pub use debug::DebugTranslatorFactory;
-pub use grok::GrokTranslatorFactory;
-pub use muse::MuseTranslatorFactory;
-pub use opencode::OpenCodeTranslatorFactory;
-pub use pi::PiTranslatorFactory;
+use debug::DebugTranslatorFactory;
 
+use crate::agents::{registrar, Agent};
 use crate::wire::{Envelope, SessionConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -59,6 +57,14 @@ pub enum SpanType {
     Tool,
     /// A human response or approval interval, separate from agent execution.
     Wait,
+}
+
+/// Immutable versions captured when a coding-agent span is first created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginSnapshot {
+    pub plugin_version: Option<String>,
+    pub bt_version: String,
+    pub source_version: Option<String>,
 }
 
 /// A resolved span row, ready for a sink to insert or merge. Field set is the
@@ -91,6 +97,12 @@ pub struct SpanRow {
     #[serde(skip)]
     #[doc(hidden)]
     pub late_merge_key: Option<String>,
+    /// Span id of the user turn that owns this row, recorded by the translator
+    /// from its native turn tracking. [`turn_lineage`] publishes it as
+    /// `metadata.turn_span_id`.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub turn_span_id: Option<String>,
     /// Labels for filtering in Braintrust (e.g. `compaction`, `permission-request`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
@@ -174,15 +186,27 @@ pub trait AgentTranslator: Send {
     }
 }
 
-/// Builds translator instances for a given `source`.
-pub trait TranslatorFactory: Send + Sync {
-    fn source(&self) -> &str;
+/// Builds translator instances for an agent's hook source. Each agent type
+/// implements this in its translator module and registers itself in
+/// [`crate::agents`]; the source is the agent's [`Identity::source`].
+///
+/// [`Identity::source`]: crate::agents::Identity::source
+pub(crate) trait TranslatorFactory: Agent {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator>;
 }
 
 /// Maps canonical and supported alias source strings to translator factories.
 pub struct Registry {
-    factories: HashMap<String, Box<dyn TranslatorFactory>>,
+    factories: HashMap<String, Arc<dyn TranslatorFactory>>,
+}
+
+/// Map an agent name or alias to the source its hooks report. Unknown
+/// sources pass through.
+pub(crate) fn canonical_source_name(source: &str) -> &str {
+    registrar()
+        .translate
+        .get(source)
+        .map_or(source, |agent| agent.identity().source)
 }
 
 impl Registry {
@@ -191,20 +215,16 @@ impl Registry {
         let mut r = Registry {
             factories: HashMap::new(),
         };
-        r.register(Box::new(DebugTranslatorFactory));
-        let git = Arc::new(git::GitMetadataCache::default());
-        r.register(Box::new(AntigravityTranslatorFactory::new(git.clone())));
-        r.register(Box::new(ClaudeTranslatorFactory::new(git.clone())));
-        r.register(Box::new(CodexTranslatorFactory::new(git.clone())));
-        r.register(Box::new(GrokTranslatorFactory::new(git.clone())));
-        r.register(Box::new(MuseTranslatorFactory::new(git.clone())));
-        r.register(Box::new(OpenCodeTranslatorFactory::new(git.clone())));
-        r.register(Box::new(PiTranslatorFactory::new(git)));
+        r.insert(Arc::new(DebugTranslatorFactory));
+        for agent in registrar().translate.shared() {
+            r.insert(agent.clone());
+        }
         r
     }
 
-    pub fn register(&mut self, factory: Box<dyn TranslatorFactory>) {
-        self.factories.insert(factory.source().to_string(), factory);
+    fn insert(&mut self, factory: Arc<dyn TranslatorFactory>) {
+        self.factories
+            .insert(factory.identity().source.to_string(), factory);
     }
 
     /// Known sources, for the `initialize` capabilities list.
@@ -216,16 +236,11 @@ impl Registry {
 
     /// Resolve daemon source aliases to one stable identity.
     pub fn canonical_source<'a>(&'a self, source: &'a str) -> Option<&'a str> {
-        let canonical = match source {
-            "claude" | "claude-code" => "claude-code",
-            "open-code" | "opencode" => "opencode",
-            "antigravity" => "antigravity",
-            "codex" => "codex",
-            "grok" => "grok",
-            "muse" | "muse-code" => "muse",
-            "pi" => "pi",
-            "debug" => "debug",
-            _ => return None,
+        // Only agent sources and the debug translator are accepted.
+        let canonical = match registrar().translate.get(source) {
+            Some(agent) => agent.identity().source,
+            None if source == "debug" => "debug",
+            None => return None,
         };
         self.factories.contains_key(canonical).then_some(canonical)
     }
@@ -245,17 +260,21 @@ impl Registry {
         ))
     }
 
-    pub(crate) fn create_checked_with_session_key(
+    pub(crate) fn create_checked_with_session_namespace(
         &self,
         source: &str,
-        session_key: &str,
+        session_namespace: &str,
     ) -> anyhow::Result<Box<dyn AgentTranslator>> {
         let canonical = self
             .canonical_source(source)
             .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {source:?}"))?;
         let factory = self.factories.get(canonical);
-        let factory = factory.expect("canonical source must have a factory");
-        Ok(factory.create(session_key))
+        let factory = factory.ok_or_else(|| {
+            anyhow::anyhow!("no translator factory for coding-agent source {canonical:?}")
+        })?;
+        Ok(Box::new(turn_lineage::TurnLineage::new(
+            factory.create(session_namespace),
+        )))
     }
 
     /// Create a known translator. Production ingress uses
@@ -264,5 +283,47 @@ impl Registry {
     pub fn create(&self, source: &str, session_id: &str) -> Box<dyn AgentTranslator> {
         self.create_checked(source, session_id)
             .unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_agent_source_has_a_translator() {
+        assert_eq!(
+            Registry::default_agents().sources(),
+            [
+                "antigravity",
+                "claude-code",
+                "codex",
+                "cursor",
+                "debug",
+                "grok",
+                "muse",
+                "opencode",
+                "pi"
+            ]
+        );
+    }
+
+    #[test]
+    fn source_aliases_resolve_to_hook_sources() {
+        let registry = Registry::default_agents();
+        for (alias, source) in [
+            ("claude", "claude-code"),
+            ("claude-code", "claude-code"),
+            ("open-code", "opencode"),
+            ("opencode", "opencode"),
+            ("codex", "codex"),
+            ("muse-code", "muse"),
+            ("debug", "debug"),
+        ] {
+            assert_eq!(registry.canonical_source(alias), Some(source));
+        }
+        assert_eq!(registry.canonical_source("agy"), None);
+        assert_eq!(canonical_source_name("claude"), "claude-code");
+        assert_eq!(canonical_source_name("unknown"), "unknown");
     }
 }
