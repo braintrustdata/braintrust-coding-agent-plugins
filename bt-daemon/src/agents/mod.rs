@@ -10,6 +10,7 @@ mod claude;
 mod codex;
 mod cursor;
 mod grok;
+mod muse;
 mod opencode;
 mod pi;
 
@@ -18,6 +19,7 @@ pub(crate) use claude::Claude;
 pub(crate) use codex::Codex;
 pub(crate) use cursor::Cursor;
 pub(crate) use grok::Grok;
+pub(crate) use muse::Muse;
 pub(crate) use opencode::OpenCode;
 pub(crate) use pi::Pi;
 
@@ -103,6 +105,7 @@ pub(crate) fn registrar() -> &'static Registrar {
         Arc::new(Codex).register(&mut registrar);
         Arc::new(Cursor).register(&mut registrar);
         Arc::new(Grok).register(&mut registrar);
+        Arc::new(Muse).register(&mut registrar);
         Arc::new(OpenCode).register(&mut registrar);
         Arc::new(Pi).register(&mut registrar);
         registrar

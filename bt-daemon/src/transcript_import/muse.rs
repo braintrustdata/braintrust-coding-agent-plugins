@@ -257,7 +257,7 @@ where
             .event
             .as_ref()
             .ok_or_else(|| anyhow!("Muse run record has no event"))?;
-        let kind = kind.expect("recognized run event has kind");
+        let kind = kind.context("recognized Muse run event has no kind")?;
         let run_id = payload
             .run_id
             .as_deref()
@@ -349,9 +349,15 @@ where
                 {
                     self.start_model(&run_id, ts, None, Value::Null)?;
                 }
-                let run = self.runs.get_mut(&run_id).expect("model start creates run");
+                let run = self
+                    .runs
+                    .get_mut(&run_id)
+                    .context("Muse model start did not create a run")?;
                 run.last_assistant = Some(text.clone());
-                run.active_model.as_mut().expect("model exists").text = Some(text);
+                run.active_model
+                    .as_mut()
+                    .context("Muse run has no active model")?
+                    .text = Some(text);
             }
             "terminal" => {
                 let terminal = event
@@ -410,7 +416,10 @@ where
         }
         for run_id in self.runs.keys().cloned().collect::<Vec<_>>() {
             self.finish_model(&run_id, end_ts, Some("Run ended without a terminal event"))?;
-            let run = self.runs.remove(&run_id).expect("run exists");
+            let run = self
+                .runs
+                .remove(&run_id)
+                .context("Muse run disappeared while finalizing")?;
             self.emit(
                 "Stop",
                 end_ts,
@@ -441,6 +450,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn envelopes(path: &Path) -> Result<Vec<Envelope>> {
     let header = read_header(path)?;
     let session = single_session(&header, path)?;
@@ -452,6 +462,7 @@ pub(crate) fn session_id(path: &Path) -> Result<String> {
     Ok(single_session(&header, path)?.session_id.clone())
 }
 
+#[cfg(test)]
 pub(crate) fn envelopes_for_session(path: &Path, expected_id: &str) -> Result<Vec<Envelope>> {
     let mut events = Vec::new();
     for_each_envelope_for_session(path, expected_id, |event| {
@@ -461,6 +472,7 @@ pub(crate) fn envelopes_for_session(path: &Path, expected_id: &str) -> Result<Ve
     Ok(events)
 }
 
+#[cfg(test)]
 pub(crate) fn for_each_envelope_for_session<F>(
     path: &Path,
     expected_id: &str,

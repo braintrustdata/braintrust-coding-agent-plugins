@@ -291,7 +291,7 @@ pub(super) fn write_object_atomic_with(
     crate::settings::with_settings_lock(path, || write_object_atomic_unlocked(path, object, access))
 }
 
-fn write_object_atomic_unlocked(
+pub(super) fn write_object_atomic_unlocked(
     path: &Path,
     object: Map<String, Value>,
     access: FileAccess,

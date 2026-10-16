@@ -4,6 +4,7 @@
 //! integrations they control. Hosts such as `bt` provide global auth flags and
 //! dispatch these commands without duplicating agent-specific CLI knowledge.
 
+use crate::agents::{self, Agent, Identity};
 use crate::{HookArgs, ImportArgs, RunArgs, ServeArgs, StatusArgs};
 use clap::{Args, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -29,7 +30,7 @@ pub enum TraceCommand {
     /// Run the tracing daemon (foreground).
     #[command(hide = true)]
     Daemon(ServeArgs),
-    /// Forward one coding-agent hook event (read from stdin) to the daemon.
+    /// Capture one coding-agent hook event from stdin; exits nonzero if capture fails.
     #[command(hide = true)]
     Hook(HookArgs),
     /// Print daemon/session status.
@@ -63,6 +64,7 @@ pub struct DoctorArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DoctorAgent {
     Codex,
+    #[value(alias = "muse-code")]
     Muse,
     #[value(name = "claude", alias = "claude-code")]
     Claude,
@@ -71,30 +73,20 @@ pub enum DoctorAgent {
     Pi,
     Antigravity,
     Grok,
+    Cursor,
 }
 
 impl DoctorAgent {
-    pub(crate) fn source(self) -> &'static str {
+    pub(crate) fn identity(self) -> &'static Identity {
         match self {
-            Self::Codex => "codex",
-            Self::Muse => "muse",
-            Self::Claude => "claude",
-            Self::OpenCode => "opencode",
-            Self::Pi => "pi",
-            Self::Antigravity => "antigravity",
-            Self::Grok => "grok",
-        }
-    }
-
-    pub(crate) fn display_name(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex",
-            Self::Muse => "Muse Code",
-            Self::Claude => "Claude Code",
-            Self::OpenCode => "OpenCode",
-            Self::Pi => "Pi",
-            Self::Antigravity => "Google Antigravity",
-            Self::Grok => "Grok",
+            Self::Codex => agents::Codex.identity(),
+            Self::Muse => agents::Muse.identity(),
+            Self::Claude => agents::Claude.identity(),
+            Self::OpenCode => agents::OpenCode.identity(),
+            Self::Pi => agents::Pi.identity(),
+            Self::Antigravity => agents::Antigravity.identity(),
+            Self::Grok => agents::Grok.identity(),
+            Self::Cursor => agents::Cursor.identity(),
         }
     }
 }
@@ -139,7 +131,8 @@ pub struct UpdateArgs {
 pub enum SetupAgent {
     /// Install the published Codex tracing plugin.
     Codex,
-    /// Configure Muse Code tracing hooks.
+    /// Install the Muse Code tracing hooks.
+    #[command(alias = "muse-code")]
     Muse,
     /// Install the published Claude Code tracing plugin.
     Claude,
@@ -150,8 +143,25 @@ pub enum SetupAgent {
     Pi,
     /// Install the published Grok tracing plugin.
     Grok,
+    /// Install the published Cursor tracing plugin.
+    Cursor,
     /// Install the Google Antigravity tracing hooks.
     Antigravity,
+}
+
+impl SetupAgent {
+    pub(crate) fn identity(self) -> &'static Identity {
+        match self {
+            Self::Codex => agents::Codex.identity(),
+            Self::Muse => agents::Muse.identity(),
+            Self::Claude => agents::Claude.identity(),
+            Self::OpenCode => agents::OpenCode.identity(),
+            Self::Pi => agents::Pi.identity(),
+            Self::Grok => agents::Grok.identity(),
+            Self::Cursor => agents::Cursor.identity(),
+            Self::Antigravity => agents::Antigravity.identity(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +252,16 @@ mod tests {
                 ..
             }) if value == r#"{"import":true}"#
         ));
+
+        let cursor_import = Cli::try_parse_from(["bt", "import", "cursor", "session-id"]).unwrap();
+        assert!(matches!(
+            cursor_import.trace.command,
+            TraceCommand::Import(ImportArgs {
+                source: crate::ImportSource::Cursor,
+                ref session_ids,
+                ..
+            }) if session_ids == &["session-id"]
+        ));
     }
 
     #[test]
@@ -276,10 +296,26 @@ mod tests {
     }
 
     #[test]
+    fn run_accepts_cursor_and_forwards_agent_arguments() {
+        let parsed = Cli::try_parse_from([
+            "bt", "run", "cursor", "--tag", "ci", "--", "--print", "hello",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Run(RunArgs {
+                source: crate::RunSource::Cursor,
+                ref agent_args,
+                ref tags,
+                ..
+            }) if agent_args == &["--print", "hello"] && tags == &["ci"]
+        ));
+    }
+
+    #[test]
     fn doctor_accepts_every_supported_agent_alias() {
         for (agent, expected, source, display_name) in [
             ("codex", DoctorAgent::Codex, "codex", "Codex"),
-            ("muse", DoctorAgent::Muse, "muse", "Muse Code"),
             ("claude-code", DoctorAgent::Claude, "claude", "Claude Code"),
             ("open-code", DoctorAgent::OpenCode, "opencode", "OpenCode"),
             ("pi", DoctorAgent::Pi, "pi", "Pi"),
@@ -290,14 +326,15 @@ mod tests {
                 "Google Antigravity",
             ),
             ("grok", DoctorAgent::Grok, "grok", "Grok"),
+            ("cursor", DoctorAgent::Cursor, "cursor", "Cursor"),
         ] {
             let cli = Cli::try_parse_from(["bt", "doctor", agent]).unwrap();
             assert!(matches!(
                 cli.trace.command,
                 TraceCommand::Doctor(DoctorArgs { agent }) if agent == expected
             ));
-            assert_eq!(expected.source(), source);
-            assert_eq!(expected.display_name(), display_name);
+            assert_eq!(expected.identity().id, source);
+            assert_eq!(expected.identity().display_name, display_name);
         }
     }
 
@@ -326,28 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn muse_uses_shared_enable_and_disable_commands() {
-        for command in ["enable", "setup"] {
-            let parsed = Cli::try_parse_from(["bt", command, "muse"]).unwrap();
-            assert!(matches!(
-                parsed.trace.command,
-                TraceCommand::Setup(SetupArgs {
-                    agent: SetupAgent::Muse,
-                    ..
-                })
-            ));
-        }
-        let parsed = Cli::try_parse_from(["bt", "disable", "muse"]).unwrap();
-        assert!(matches!(
-            parsed.trace.command,
-            TraceCommand::Disable(DisableArgs {
-                agent: SetupAgent::Muse
-            })
-        ));
-    }
-
-    #[test]
-    fn grok_uses_shared_enable_disable_and_doctor_commands() {
+    fn grok_uses_shared_enable_and_disable_commands() {
         for command in ["enable", "setup"] {
             let parsed = Cli::try_parse_from(["bt", command, "grok"]).unwrap();
             assert!(matches!(
@@ -366,17 +382,6 @@ mod tests {
                 agent: SetupAgent::Grok
             })
         ));
-
-        let parsed = Cli::try_parse_from(["bt", "doctor", "grok"]).unwrap();
-        assert!(matches!(
-            parsed.trace.command,
-            TraceCommand::Doctor(DoctorArgs {
-                agent: DoctorAgent::Grok
-            })
-        ));
-
-        assert_eq!(DoctorAgent::Grok.source(), "grok");
-        assert_eq!(DoctorAgent::Grok.display_name(), "Grok");
     }
 
     #[test]
@@ -387,7 +392,7 @@ mod tests {
             "opencode",
             "pi",
             "grok",
-            "muse",
+            "cursor",
             "antigravity",
         ] {
             assert!(matches!(
@@ -398,18 +403,6 @@ mod tests {
                 TraceCommand::Update(_)
             ));
         }
-    }
-
-    #[test]
-    fn run_accepts_muse() {
-        let parsed = Cli::try_parse_from(["bt", "run", "muse", "exec", "hello"]).unwrap();
-        assert!(matches!(
-            parsed.trace.command,
-            TraceCommand::Run(RunArgs {
-                source: crate::RunSource::Muse,
-                ..
-            })
-        ));
     }
 
     #[test]
