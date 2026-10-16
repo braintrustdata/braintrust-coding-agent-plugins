@@ -50,9 +50,11 @@ bt login
 bt trace enable cursor --project my-coding-agent
 ```
 
-Setup installs or refreshes the local `braintrust` plugin, configures the hooks
-needed to trace Cursor sessions, and saves the selected route in
-`~/.cursor/braintrust.json`.
+Setup uses Git to install or refresh the local `braintrust` plugin from the latest
+published [distribution](https://github.com/braintrustdata/braintrust-cursor-extension),
+configures the hooks needed to trace Cursor sessions, and saves the selected route in
+`~/.cursor/braintrust.json`. Git and network access are required for setup and
+`bt trace update cursor`; a download failure preserves the previous installation.
 Reload the Cursor window after setup. Tracing uses the user hooks even when
 local plugin imports are unavailable. MCP access still requires an active plugin.
 
