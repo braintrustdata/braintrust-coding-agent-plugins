@@ -191,12 +191,7 @@ impl Daemon {
     /// durable on disk and resume after a restart, so they must not keep an
     /// otherwise idle daemon alive forever.
     fn total_queued(&self) -> u64 {
-        let dispatched: u64 = self
-            .sessions
-            .lock()
-            .values()
-            .map(|s| s.pending())
-            .sum();
+        let dispatched: u64 = self.sessions.lock().values().map(|s| s.pending()).sum();
         dispatched.saturating_add(
             self.pending_sessions
                 .lock()

@@ -81,7 +81,7 @@ impl Daemon {
             .journal_writer_for(&env.source, &env.session_id)
             .await?;
         let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
-        let existing = self.translations.lock().unwrap().get(&storage_key).cloned();
+        let existing = self.translations.lock().get(&storage_key).cloned();
         let translation = match existing {
             Some(translation) => translation,
             None => {
@@ -102,7 +102,6 @@ impl Daemon {
                 .await?;
                 self.translations
                     .lock()
-                    .unwrap()
                     .insert(storage_key, translation.clone());
                 translation
             }
@@ -121,7 +120,7 @@ impl Daemon {
             .journal
             .subscribe(route, replay.acknowledged_through)
             .await?;
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
         }
@@ -182,14 +181,11 @@ impl Daemon {
             // lock for the brief writer-map cleanup after daemon work ends.
             let capture_lock = self.session_lock(&key.source, &key.session_id);
             let _capture_guard = capture_lock.lock().await;
-            self.claude_transcripts
-                .lock()
-                .unwrap()
-                .retain(|candidate, _| {
-                    candidate.source != key.source || candidate.session_id != key.session_id
-                });
-            self.journals.lock().unwrap().remove(&storage_key);
-            self.translations.lock().unwrap().remove(&storage_key);
+            self.claude_transcripts.lock().retain(|candidate, _| {
+                candidate.source != key.source || candidate.session_id != key.session_id
+            });
+            self.journals.lock().remove(&storage_key);
+            self.translations.lock().remove(&storage_key);
             {
                 let mut locks = self.session_locks.lock();
                 // A waiting capture or observer must keep using this same

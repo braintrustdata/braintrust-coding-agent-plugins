@@ -336,13 +336,12 @@ impl Daemon {
                 route: serde_json::from_str(&key.route).ok(),
                 queued: s.pending(),
                 spans_emitted: s.counters.spans_emitted.load(Ordering::Relaxed),
-                permalink: s.permalink.lock().unwrap().clone(),
+                permalink: s.permalink.lock().clone(),
                 last_error: s
                     .last_error
                     .lock()
-                    .unwrap()
                     .clone()
-                    .or_else(|| s.source_error.lock().unwrap().clone()),
+                    .or_else(|| s.source_error.lock().clone()),
             })
             .collect();
         for (key, (source, error)) in self.auth_errors.lock().iter() {

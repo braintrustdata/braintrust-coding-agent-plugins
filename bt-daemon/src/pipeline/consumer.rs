@@ -10,9 +10,10 @@ use crate::{
     sink::{Sink, SinkFactory},
     wire::SessionConfig,
 };
+use parking_lot::Mutex;
 use std::{
     path::PathBuf,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{atomic::Ordering, Arc},
 };
 use tokio::sync::{watch, Notify};
 
@@ -73,7 +74,7 @@ impl Consumer {
                 );
                 let mut held = false;
                 if let Some(failure) = journal.failure(&cursor.route).await? {
-                    *options.error.lock().unwrap() = Some(failure);
+                    *options.error.lock() = Some(failure);
                 }
                 let mut completion: Option<Delivery<()>> = None;
                 loop {
@@ -120,7 +121,7 @@ impl Consumer {
                                         .counters
                                         .spans_emitted
                                         .fetch_add(count, Ordering::Relaxed);
-                                    *options.permalink.lock().unwrap() = sink.permalink();
+                                    *options.permalink.lock() = sink.permalink();
                                     // The journal retains a deferred prefix. No payloads or token list
                                     // need accumulate in memory while waiting for its releasing child.
                                     drop(delivery);
@@ -129,10 +130,10 @@ impl Consumer {
                                             Ok(()) => {
                                                 cursor.rewind().await?;
                                                 progress.send_replace(cursor.completed_position());
-                                                *options.error.lock().unwrap() = None;
+                                                *options.error.lock() = None;
                                             }
                                             Err(failure) => {
-                                                *options.error.lock().unwrap() = Some(format!(
+                                                *options.error.lock() = Some(format!(
                                                     "route completion held: {}",
                                                     failure.error
                                                 ));
@@ -155,9 +156,9 @@ impl Consumer {
                                             .spans_emitted
                                             .fetch_add(failure.emitted, Ordering::Relaxed);
                                     }
-                                    *options.error.lock().unwrap() =
+                                    *options.error.lock() =
                                         Some(format!("routing held: {error:#}"));
-                                    let failure = options.error.lock().unwrap().clone();
+                                    let failure = options.error.lock().clone();
                                     journal.set_failure(&cursor.route, failure).await?;
                                     held = true;
                                     progress.send_replace(cursor.completed_position());
@@ -173,11 +174,11 @@ impl Consumer {
                 }
             };
             if let Err(error) = task.await {
-                *options.error.lock().unwrap() = Some(format!("routing journal held: {error:#}"));
+                *options.error.lock() = Some(format!("routing journal held: {error:#}"));
                 progress.send_replace(cursor.completed_position());
             }
         });
-        *handle.task.lock().unwrap() = Some(task);
+        *handle.task.lock() = Some(task);
         handle
     }
     pub fn configure(&self, config: SessionConfig) {
@@ -191,7 +192,7 @@ impl Consumer {
     }
     pub async fn shutdown(&self) {
         self.stop.notify_one();
-        let task = self.task.lock().unwrap().take();
+        let task = self.task.lock().take();
         if let Some(task) = task {
             let _ = task.await;
         }
@@ -202,7 +203,7 @@ impl Consumer {
             if *progress.borrow_and_update() >= tail {
                 return Ok(());
             }
-            if let Some(error) = self.error.lock().unwrap().clone() {
+            if let Some(error) = self.error.lock().clone() {
                 return Err(error);
             }
             progress
