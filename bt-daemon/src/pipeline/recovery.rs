@@ -1,5 +1,5 @@
 //! Failure outcomes wait for explicit evidence before re-entering processing.
-use super::{plugins::PluginRejected, Stage};
+use super::Stage;
 use crate::wire::{RecoveryInfo, SessionConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +53,50 @@ pub(crate) enum Condition {
     Revision {
         version: String,
     },
+}
+
+/// Stage adapters classify failures before handing them to the shared recovery
+/// state. The retry runner consumes this value without knowing SDK/plugin types.
+#[derive(Debug, Clone)]
+pub(crate) enum RetryCondition {
+    Plugin {
+        path: PathBuf,
+        digest: Option<[u8; 32]>,
+        processors: Vec<Option<[u8; 32]>>,
+    },
+    Credentials,
+    Configuration {
+        recheck: bool,
+    },
+    Transient,
+}
+
+pub(crate) struct RouteFailure {
+    pub cause: anyhow::Error,
+    pub retry: RetryCondition,
+    pub emitted: u64,
+    pub report: bool,
+}
+
+impl std::fmt::Display for RouteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+impl std::fmt::Debug for RouteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteFailure")
+            .field("cause", &self.cause.to_string())
+            .field("retry", &self.retry)
+            .field("emitted", &self.emitted)
+            .field("report", &self.report)
+            .finish()
+    }
+}
+impl std::error::Error for RouteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -130,49 +174,36 @@ impl Failure {
         }
     }
     pub fn routing(error: &anyhow::Error, config: &SessionConfig, attempt: u32) -> Self {
-        let error = error
-            .downcast_ref::<super::routing::EmitFailure>()
-            .map_or(error, |failure| &failure.cause);
-        let mut failure = Self::delay(Boundary::Sink, 0, format!("{error:#}"), attempt);
-        if let Some(plugin) = error.downcast_ref::<PluginRejected>() {
-            failure.boundary = Boundary::Plugin;
-            failure.condition = Condition::Plugin {
-                path: plugin.failure.path.clone(),
-                digest: plugin.digest,
-                chain: chain(config),
-                processors: Some(plugin.processors.clone()),
-            };
-        } else if let Some(error) = error.downcast_ref::<braintrust_sdk_rust::BraintrustError>() {
-            use braintrust_sdk_rust::BraintrustError;
-            match error {
-                BraintrustError::Api { status: 401, .. } => {
-                    failure.boundary = Boundary::Credentials;
-                    failure.condition = Condition::Credentials {
-                        recheck_ms: now_ms().saturating_add(1_000),
-                    };
-                }
-                BraintrustError::Api {
-                    status: 403 | 404, ..
-                } => {
-                    failure.condition = Condition::Configuration {
-                        signature: configuration(config),
-                        recheck_ms: Some(now_ms().saturating_add(60_000)),
-                    }
-                }
-                BraintrustError::Api {
-                    status: 408 | 429 | 500..=599,
-                    ..
-                }
-                | BraintrustError::Http(_)
-                | BraintrustError::Network(_)
-                | BraintrustError::ChannelClosed => {}
-                _ => {
-                    failure.condition = Condition::Configuration {
-                        signature: configuration(config),
-                        recheck_ms: None,
-                    }
-                }
+        let classified = error.downcast_ref::<RouteFailure>();
+        let cause = classified.map_or(error, |failure| &failure.cause);
+        let mut failure = Self::delay(Boundary::Sink, 0, format!("{cause:#}"), attempt);
+        match classified.map(|failure| &failure.retry) {
+            Some(RetryCondition::Plugin {
+                path,
+                digest,
+                processors,
+            }) => {
+                failure.boundary = Boundary::Plugin;
+                failure.condition = Condition::Plugin {
+                    path: path.clone(),
+                    digest: *digest,
+                    chain: chain(config),
+                    processors: Some(processors.clone()),
+                };
             }
+            Some(RetryCondition::Credentials) => {
+                failure.boundary = Boundary::Credentials;
+                failure.condition = Condition::Credentials {
+                    recheck_ms: now_ms().saturating_add(1_000),
+                };
+            }
+            Some(RetryCondition::Configuration { recheck }) => {
+                failure.condition = Condition::Configuration {
+                    signature: configuration(config),
+                    recheck_ms: recheck.then(|| now_ms().saturating_add(60_000)),
+                };
+            }
+            Some(RetryCondition::Transient) | None => {}
         }
         if !config.auth.token.is_empty() {
             failure.reason = failure.reason.replace(&config.auth.token, "<redacted>");
