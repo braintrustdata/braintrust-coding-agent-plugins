@@ -75,11 +75,50 @@ impl Daemon {
                 route,
             )
             .await,
-            through: replay_through,
             journal_path,
         };
         let journal = self
             .journal_writer_for(&env.source, &env.session_id)
+            .await?;
+        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
+        let existing = self.translations.lock().get(&storage_key).cloned();
+        let translation = match existing {
+            Some(translation) => translation,
+            None => {
+                let translation = crate::pipeline::translation::Translation::spawn(
+                    crate::pipeline::translation::TranslationOptions {
+                        source: env.source.clone(),
+                        session_id: env.session_id.clone(),
+                        namespace: translator_session_id.clone(),
+                        version: self.version.clone(),
+                        data_dir: self.data_dir.clone(),
+                        events: journal.clone(),
+                        event_path: replay.journal_path.clone(),
+                        registry: self.translators.clone(),
+                        correlation: self.correlation.clone(),
+                        correlation_changed: self.correlation_changed.clone(),
+                    },
+                )
+                .await?;
+                self.translations
+                    .lock()
+                    .insert(storage_key, translation.clone());
+                translation
+            }
+        };
+        translation
+            .observe(crate::pipeline::translation::Observation {
+                key: key.correlation_key(),
+                route: route.clone(),
+                config: config.clone(),
+            })
+            .await?;
+        // Materialize historical output before seeding a released completion boundary.
+        translation.advance(replay_through).await?;
+        let _ = translation.barrier().await;
+        let cursor = translation
+            .journal
+            .subscribe(route, replay.acknowledged_through)
             .await?;
         let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
@@ -87,18 +126,13 @@ impl Daemon {
         }
         let session = Session::spawn(
             SessionOptions {
+                translation,
+                cursor,
                 session_id: env.session_id.clone(),
-                translator_session_id,
                 source: env.source.clone(),
                 bt_version: self.version.clone(),
-                replay: Some(replay),
                 config,
-                correlation_key: key.correlation_key(),
-                route: route.clone(),
-                correlation: self.correlation.clone(),
                 data_dir: self.data_dir.clone(),
-                journal,
-                correlation_changed: self.correlation_changed.clone(),
             },
             self.translators.clone(),
             self.sink_factory.clone(),
@@ -151,6 +185,7 @@ impl Daemon {
                 candidate.source != key.source || candidate.session_id != key.session_id
             });
             self.journals.lock().remove(&storage_key);
+            self.translations.lock().remove(&storage_key);
             {
                 let mut locks = self.session_locks.lock();
                 // A waiting capture or observer must keep using this same
@@ -173,10 +208,7 @@ impl Daemon {
         self.sessions
             .lock()
             .iter()
-            .filter(|(_, session)| {
-                session.idle_for() >= idle_timeout
-                    && session.counters.queued.load(Ordering::Relaxed) == 0
-            })
+            .filter(|(_, session)| session.idle_for() >= idle_timeout && session.pending() == 0)
             .filter(|(key, _)| !self.correlation.has_active_tools(&key.correlation_key()))
             .map(|(key, _)| key.clone())
             .collect()

@@ -174,6 +174,15 @@ impl SessionRoute {
     pub fn same_route(&self, other: &Self) -> bool {
         let mut left = self.clone();
         let mut right = other.clone();
+        if left
+            .auth
+            .profile_id
+            .as_ref()
+            .zip(right.auth.profile_id.as_ref())
+            .is_some_and(|(left, right)| left != right)
+        {
+            return false;
+        }
         // A stable-ID route is the canonical successor to an old named route.
         // Journals can legitimately contain both forms for the same session,
         // so replay compares their unchanged routing intent, not the newly

@@ -17,6 +17,7 @@ pub(crate) trait Stage: Send {
     async fn process(&mut self, input: &Self::Input) -> Self::Outcome;
 }
 
-// Storage is activated by the next stack layer after its crash contract is tested.
-#[cfg(test)]
-mod journal;
+pub(crate) mod journal;
+pub(crate) mod translation;
+
+pub(crate) mod consumer;

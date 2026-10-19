@@ -281,6 +281,9 @@ pub fn process(
             };
             // Turn identity belongs to the translator, not the JSON transform.
             candidate.is_turn = row.is_turn;
+            candidate.origin = row.origin.clone();
+            candidate.turn_span_id = row.turn_span_id.clone();
+            candidate.late_merge_key = row.late_merge_key.clone();
             row = candidate;
         }
         Ok(())

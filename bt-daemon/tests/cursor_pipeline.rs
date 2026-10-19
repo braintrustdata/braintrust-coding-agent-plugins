@@ -347,6 +347,15 @@ fn transcript(prompt: &str, response: &str) -> String {
     )
 }
 
+fn span_journal(data: &Path) -> rusqlite::Connection {
+    let path = std::fs::read_dir(data.join("pipeline"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sqlite"))
+        .unwrap();
+    rusqlite::Connection::open(path).unwrap()
+}
+
 fn rows(path: &Path) -> Vec<Value> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -437,7 +446,7 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
             let text = std::fs::read_to_string(&journal).unwrap_or_default();
             let mut position = 0;
             let mut response_through = None;
-            let mut checkpoint_through = 0;
+
             for line in text.split_inclusive('\n') {
                 position += line.len() as u64;
                 let Ok(row) = serde_json::from_str::<Value>(line) else {
@@ -446,12 +455,11 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
                 if row["event"] == "afterAgentResponse" {
                     response_through = Some(position);
                 }
-                if row.get("_bt_record_type").is_some() {
-                    checkpoint_through =
-                        checkpoint_through.max(row["through"].as_u64().unwrap_or(0));
-                }
             }
-            if delivered && response_through.is_some_and(|offset| checkpoint_through >= offset) {
+            let completed = delivered && response_through.is_some_and(|offset| {
+                span_journal(&data).query_row("SELECT min(position)>=(SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1) AND (SELECT coalesce(max(input),0) FROM batches WHERE committed=1)>=? FROM heads", [offset], |row|row.get::<_,bool>(0)).unwrap_or(false)
+            });
+            if delivered && completed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -676,13 +684,10 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
         .unwrap()
         .contains("cursor-test-secret"));
 
-    // Simulate a delivery loss: retain accepted ingress, discard sink receipts.
-    let pending = persisted
-        .iter()
-        .filter(|row| row.get("_bt_record_type").is_none())
-        .map(|row| format!("{row}\n"))
-        .collect::<String>();
-    std::fs::write(&journal, pending).unwrap();
+    // Simulate unresolved sink delivery while retaining both durable source stores.
+    span_journal(&data)
+        .execute("UPDATE heads SET position=0,failure=NULL", [])
+        .unwrap();
     std::fs::remove_dir_all(data.join("delivery-ledger")).unwrap();
     std::fs::remove_file(&native).unwrap();
     std::fs::remove_file(&output).unwrap();

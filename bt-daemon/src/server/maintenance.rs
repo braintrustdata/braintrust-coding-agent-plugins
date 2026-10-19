@@ -12,7 +12,17 @@ pub(super) const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(super) async fn collect_garbage(data_dir: &std::path::Path) {
     journal::gc_old_journals(data_dir, RETENTION).await;
     journal::gc_old_managed_runs(data_dir, RETENTION).await;
-    crate::transcript_mirror::gc_old_mirrors(data_dir, RETENTION).await;
+    // Durable partitions may still need any recorded transcript prefix.
+    let mut partitions = tokio::fs::read_dir(data_dir.join("pipeline")).await.ok();
+    let mut retained = false;
+    if let Some(entries) = partitions.as_mut() {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            retained |= entry.path().extension().and_then(|ext| ext.to_str()) == Some("sqlite");
+        }
+    }
+    if !retained {
+        crate::transcript_mirror::gc_old_mirrors(data_dir, RETENTION).await;
+    }
     gc_old_correlation_states(data_dir, RETENTION).await;
 }
 
@@ -113,9 +123,47 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     if let Err(error) = resolve_pending_sessions(daemon, |_| true).await {
         tracing::warn!(%error, "pending correlation events retained for recovery during shutdown");
     }
-    let sessions: Vec<Arc<Session>> = daemon.sessions.lock().values().cloned().collect();
-    for s in sessions {
-        s.shutdown().await;
+    // Publish each source's retirement boundary once, then give every route
+    // a chance to consume it before its actor stops.
+    let sources: Vec<_> = daemon
+        .translations
+        .lock()
+        .iter()
+        .map(|(key, source)| (key.clone(), source.clone()))
+        .collect();
+    let mut targets = HashMap::new();
+    for (key, source) in sources {
+        if let Ok(tail) = source.control(crate::journal::ControlKind::Retire).await {
+            targets.insert(key, tail);
+        }
+    }
+    let sessions: Vec<_> = daemon
+        .sessions
+        .lock()
+        .iter()
+        .map(|(key, session)| (key.clone(), session.clone()))
+        .collect();
+    for (key, session) in sessions {
+        let target = targets
+            .get(&crate::ids::session_namespace(&key.source, &key.session_id))
+            .copied();
+        session.shutdown_through(target).await;
+    }
+    let sources: Vec<_> = daemon.translations.lock().values().cloned().collect();
+    for source in sources {
+        source.shutdown().await;
+    }
+    daemon.sessions.lock().clear();
+    daemon.translations.lock().clear();
+    daemon.journals.lock().clear();
+    let (reply, done) = oneshot::channel();
+    if daemon
+        .ingress_tx
+        .send(super::ingress::IngressMsg::Stop(reply))
+        .await
+        .is_ok()
+    {
+        let _ = done.await;
     }
     *drained = true;
 }

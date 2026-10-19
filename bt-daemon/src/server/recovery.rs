@@ -64,6 +64,7 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                         );
                     }
                 }
+                journal::JournalRecord::Control(_) => {}
                 journal::JournalRecord::DeliveryCheckpoint { route, through } => {
                     let key = serde_json::to_string(&route).unwrap_or_default();
                     let acknowledged = acknowledged_by_route.entry(key).or_default();
@@ -72,7 +73,7 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             }
             before = through;
         }
-        for event in latest_by_route.into_values() {
+        for mut event in latest_by_route.into_values() {
             if pending.contains(&(
                 event.env.source.clone(),
                 event.env.session_id.clone(),
@@ -80,12 +81,33 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             )) {
                 continue;
             }
-            let route = recovered_delivery_route(daemon, &event.env)
-                .await
+            let recovered_route = recovered_delivery_route(daemon, &event.env).await;
+            let route = recovered_route
                 .as_ref()
                 .and_then(|route| serde_json::to_string(route).ok())
                 .unwrap_or_default();
-            if acknowledged_by_route.get(&route).copied().unwrap_or(0) < event.journal_through {
+            let span_path = daemon.data_dir.join("pipeline").join(format!(
+                "{}.sqlite",
+                crate::ids::session_storage_id(&event.env.source, &event.env.session_id)
+            ));
+            let completed = if tokio::fs::try_exists(&span_path).await.unwrap_or(false) {
+                match (
+                    crate::pipeline::journal::SpanJournal::open(&span_path).await,
+                    recovered_route.as_ref(),
+                ) {
+                    (Ok(journal), Some(route)) => journal
+                        .route_complete(route, recorded_len)
+                        .await
+                        .unwrap_or(false),
+                    _ => false,
+                }
+            } else {
+                acknowledged_by_route.get(&route).copied().unwrap_or(0) >= event.journal_through
+            };
+            if !completed {
+                // Ordered controls after the final native event also belong to recovery.
+                event.replay_through = recorded_len;
+                event.journal_through = recorded_len;
                 candidates.push(event);
             } else if event.env.source == "claude-code" {
                 // A fully delivered historical session has no actor to retire

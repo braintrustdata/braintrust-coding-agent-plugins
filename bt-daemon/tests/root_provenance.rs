@@ -398,12 +398,22 @@ async fn span_birth_snapshots_survive_version_changes_and_daemon_restart() {
         let turn3 = turn_id(&rows[before..], 3_000);
         assert_ne!(turn3, turn1);
         assert_ne!(turn3, turn2);
-        // Graceful shutdown completed these spans; recovery must not redeliver them.
-        assert!(rows[before..].iter().all(|row| {
-            ![&root, &turn1, &turn2, &tool]
-                .iter()
-                .any(|span| row["span_id"] == **span)
-        }));
+        // Journal resume does not repeat old inserts. Newly captured native
+        // closure may still refine defensive retirement timestamps.
+        for row in &rows[before..] {
+            if row["span_id"] == root {
+                assert_eq!(row["_is_merge"], true);
+                assert_eq!(row["metrics"]["end"], 4.0);
+            }
+            if row["span_id"] == turn2 {
+                assert_eq!(row["_is_merge"], true);
+                assert_eq!(row["metrics"]["end"], 3.0);
+            }
+            assert_ne!(
+                row["span_id"], turn1,
+                "fully resolved history must not be repeated"
+            );
+        }
         assert_provenance(
             &rows[before..],
             &turn3,
@@ -478,15 +488,19 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
 
     let data_dir = tmp.path().join("data");
     let journal = source_journal_path(&data_dir, "claude-code", session);
-    let acknowledged_history = std::fs::read(&journal).unwrap();
-    assert!(std::str::from_utf8(&acknowledged_history)
-        .unwrap()
+    // Model a released pre-SpanOp-journal daemon: accepted native history and
+    // a legacy delivery checkpoint, with no newer durable partition.
+    let raw = std::fs::read_to_string(&journal).unwrap();
+    let mut history = raw
         .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .any(|record| {
-            record["_bt_record_type"] == "delivery_checkpoint"
-                && record["through"].as_u64().is_some_and(|offset| offset > 0)
-        }));
+        .filter(|line| !line.contains("_bt_record_type"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let through = history.len() as u64;
+    history.push_str(&format!("{}\n",json!({"_bt_record_type":"delivery_checkpoint", "route":capture("UserPromptSubmit","v1","native1",1_000).route, "through":through})));
+    std::fs::write(&journal, &history).unwrap();
+    std::fs::remove_dir_all(data_dir.join("pipeline")).unwrap();
+    let acknowledged_history = history.into_bytes();
     let ledger_paths: Vec<_> = std::fs::read_dir(data_dir.join("delivery-ledger"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -687,7 +701,11 @@ async fn attached_provisional_root_keeps_birth_snapshot_until_work_after_restart
 
     let first = Daemon::start(tmp.path(), &server, "bt1").await;
     first.send(&birth).await;
-    first.flush(session).await;
+    let pending = flush_session(session, &first.socket, 250).await.unwrap();
+    assert!(
+        !pending.flushed && pending.pending > 0,
+        "a deferred root has not been delivered"
+    );
     assert!(
         logs3_rows(&server).await.is_empty(),
         "provisional root exported before work"
