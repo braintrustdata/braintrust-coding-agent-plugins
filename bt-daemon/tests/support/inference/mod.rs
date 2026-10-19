@@ -67,6 +67,11 @@ fn json_response(status: StatusCode, body: Value) -> axum::response::Response {
     (status, axum::Json(body)).into_response()
 }
 
+fn error_response(status: StatusCode, body: Value) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (status, [("x-should-retry", "false")], axum::Json(body)).into_response()
+}
+
 fn raw_response(
     status: StatusCode,
     content_type: &'static str,

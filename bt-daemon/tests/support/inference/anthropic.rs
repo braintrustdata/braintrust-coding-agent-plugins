@@ -1,4 +1,4 @@
-use super::{decode_json_body, json_response, raw_response, sse, MockReply, RequestContext};
+use super::{decode_json_body, error_response, raw_response, sse, MockReply, RequestContext};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -228,7 +228,7 @@ async fn messages(
 ) -> axum::response::Response {
     let body = match decode_json_body(&headers, &body) {
         Ok(body) => body,
-        Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error": error})),
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, json!({"error": error})),
     };
     let request = AnthropicRequest { body };
     state
@@ -248,7 +248,7 @@ async fn messages(
             "text/event-stream",
             sse(&turn.events(index)),
         ),
-        MockReply::HttpError { status, body } => json_response(status, body),
+        MockReply::HttpError { status, body } => error_response(status, body),
         MockReply::Raw {
             status,
             content_type,
