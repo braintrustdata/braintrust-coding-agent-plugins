@@ -135,6 +135,12 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
             }
             SpanOp::Merge(update) => {
                 let row = rows.entry(update.span_id.clone()).or_default();
+                if !update.name.is_empty() {
+                    row.name = update.name;
+                }
+                if update.input.is_some() {
+                    row.input = update.input;
+                }
                 if update.end_ms.is_some() {
                     row.end_ms = update.end_ms;
                 }
@@ -151,6 +157,15 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
         }
     }
     rows
+}
+
+fn tool_span<'a>(rows: &'a HashMap<String, SpanRow>, call_id: &str) -> &'a SpanRow {
+    rows.values()
+        .find(|row| {
+            row.span_type == SpanType::Tool
+                && row.metadata.as_ref().unwrap()["tool_call_id"] == call_id
+        })
+        .unwrap_or_else(|| panic!("no tool span for {call_id}"))
 }
 
 /// Recorded sessions, including subagents and compaction, attribute every span
@@ -725,8 +740,10 @@ fn claude_subagent_fixture_builds_nested_subagent_llms() {
     );
 }
 
+/// Hook-only tool spans: denials and failures are first-class spans, and only
+/// real execution failures populate `error`, even when stderr is non-empty.
 #[test]
-fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
+fn claude_tool_hook_outcomes_distinguish_denials_failures_and_successes() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -758,174 +775,82 @@ fn claude_permission_denied_and_failed_tools_are_first_class_spans() {
         config: None,
     };
     let event = |name: &str, payload: Value| claude_event("s", name, 1, payload);
-    let mut ops = translator
-        .handle(
-            &event(
-                "UserPromptSubmit",
-                json!({"session_id":"s","cwd":repo,"prompt":"go"}),
-            ),
-            &ctx,
-        )
-        .unwrap();
-    ops.extend(
-        translator
-            .handle(
-                &event(
-                    "PermissionDenied",
-                    json!({
-                        "session_id":"s",
-                        "tool_name":"Bash",
-                        "tool_use_id":"a",
-                        "tool_input":{"command":"no"},
-                        "permission":{"id":"p1","type":"tool","title":"Run command"},
-                        "error":"The user denied this tool request"
-                    }),
-                ),
-                &ctx,
-            )
-            .unwrap(),
-    );
-    ops.extend(
-        translator
-            .handle(
-                &event(
-                    "PostToolUse",
-                    json!({"session_id":"s","tool_name":"Write","tool_use_id":"c","tool_input":{"file_path":"x"},"tool_response":{"is_error":true,"stderr":"\ndisk full"}}),
-                ),
-                &ctx,
-            )
-            .unwrap(),
-    );
-    ops.extend(
-        translator
-            .handle(
-                &event(
-                    "PostToolUse",
-                    json!({"session_id":"s","tool_name":"mcp__github__issue_read","tool_use_id":"d","tool_input":{},"tool_response":{"isError":true,"content":[{"type":"text","text":"Could not resolve issue 355"}]}}),
-                ),
-                &ctx,
-            )
-            .unwrap(),
-    );
-    ops.extend(
-        translator
-            .handle(
-                &event(
-                    "PostToolUseFailure",
-                    json!({"session_id":"s","tool_name":"Read","tool_use_id":"b","tool_input":{"file_path":"x"},"error":"missing"}),
-                ),
-                &ctx,
-            )
-            .unwrap(),
-    );
-    let rows = reduce(ops);
-    let tools: Vec<_> = rows
-        .values()
-        .filter(|row| row.span_type == SpanType::Tool)
-        .collect();
-    assert_eq!(tools.len(), 4);
-    assert!(tools
-        .iter()
-        .any(|row| { row.metadata.as_ref().unwrap()["tool_approval"] == json!("denied") }));
-    let denied = tools
-        .iter()
-        .find(|row| row.metadata.as_ref().unwrap()["tool_approval"] == json!("denied"))
-        .unwrap();
-    assert_eq!(
-        denied.metadata.as_ref().unwrap()["permission_id"],
-        json!("p1")
-    );
-    assert_eq!(
-        denied.metadata.as_ref().unwrap()["permission_title"],
-        json!("Run command")
-    );
-    assert_eq!(denied.error, None, "permission denial is not tool failure");
-    assert!(tools
-        .iter()
-        .any(|row| row.error.as_deref() == Some("missing")));
-    assert!(tools
-        .iter()
-        .any(|row| row.error.as_deref() == Some("disk full")));
-    assert!(tools
-        .iter()
-        .any(|row| row.error.as_deref() == Some("Could not resolve issue 355")));
-    assert!(rows.values().all(|row| {
-        let metadata = row.metadata.as_ref().and_then(Value::as_object).unwrap();
-        metadata.get("git_origin_url") == Some(&json!("https://example.com/acme/app.git"))
-            && metadata.get("git_branch") == Some(&json!("main"))
-            && metadata.contains_key("git_commit_sha")
-    }));
-}
-
-#[test]
-fn claude_successful_tool_outputs_do_not_populate_error() {
-    let registry = Registry::default_agents();
-    let mut translator = registry.create("claude-code", "successful-tools");
-    let ctx = SessionCtx {
-        session_id: "successful-tools".into(),
-        config: None,
-    };
-    let event = |name: &str, ts_ms: i64, payload: Value| {
-        claude_event("successful-tools", name, ts_ms, payload)
-    };
-    let mut ops = translator
-        .handle(
-            &event(
-                "UserPromptSubmit",
-                10,
-                json!({"session_id":"successful-tools","prompt":"run tools"}),
-            ),
-            &ctx,
-        )
-        .unwrap();
+    let mut ops = Vec::new();
     for envelope in [
         event(
-            "PostToolUse",
-            20,
+            "UserPromptSubmit",
+            json!({"session_id":"s","cwd":repo,"prompt":"go"}),
+        ),
+        event(
+            "PermissionDenied",
             json!({
-                "session_id":"successful-tools",
+                "session_id":"s",
                 "tool_name":"Bash",
-                "tool_use_id":"bash-1",
-                "tool_input":{"command":"pwd"},
-                "tool_response":{
-                    "stdout":"/tmp",
-                    "stderr":"\nShell cwd was reset to /tmp",
-                    "interrupted":false
-                }
+                "tool_use_id":"denied",
+                "tool_input":{"command":"no"},
+                "permission":{"id":"p1","type":"tool","title":"Run command"},
+                "error":"The user denied this tool request"
             }),
         ),
         event(
+            "PostToolUseFailure",
+            json!({"session_id":"s","tool_name":"Read","tool_use_id":"failed","tool_input":{"file_path":"x"},"error":"missing"}),
+        ),
+        event(
             "PostToolUse",
-            30,
-            json!({
-                "session_id":"successful-tools",
-                "tool_name":"TaskStop",
-                "tool_use_id":"stop-1",
-                "tool_input":{"task_id":"abc"},
-                "tool_response":{
-                    "task_id":"abc",
-                    "message":"Successfully stopped task: abc"
-                }
-            }),
+            json!({"session_id":"s","tool_name":"Write","tool_use_id":"stderr-error","tool_input":{"file_path":"x"},"tool_response":{"is_error":true,"stderr":"\ndisk full"}}),
+        ),
+        event(
+            "PostToolUse",
+            json!({"session_id":"s","tool_name":"mcp__github__issue_read","tool_use_id":"mcp-error","tool_input":{},"tool_response":{"isError":true,"content":[{"type":"text","text":"Could not resolve issue 355"}]}}),
+        ),
+        event(
+            "PostToolUse",
+            json!({"session_id":"s","tool_name":"Bash","tool_use_id":"stderr-success","tool_input":{"command":"pwd"},"tool_response":{"stdout":"/tmp","stderr":"\nShell cwd was reset to /tmp","interrupted":false}}),
+        ),
+        event(
+            "PostToolUse",
+            json!({"session_id":"s","tool_name":"TaskStop","tool_use_id":"task-stop","tool_input":{"task_id":"abc"},"tool_response":{"task_id":"abc","message":"Successfully stopped task: abc"}}),
         ),
     ] {
         ops.extend(translator.handle(&envelope, &ctx).unwrap());
     }
 
     let rows = reduce(ops);
-    let tools = rows
-        .values()
-        .filter(|row| row.span_type == SpanType::Tool)
-        .collect::<Vec<_>>();
-    assert_eq!(tools.len(), 2);
-    assert!(tools.iter().all(|row| row.error.is_none()));
-    assert!(tools.iter().any(|row| {
-        row.metadata.as_ref().unwrap()["tool_name"] == json!("Bash")
-            && row.output.as_ref().unwrap()["stdout"] == json!("/tmp")
-    }));
-    assert!(tools.iter().any(|row| {
-        row.metadata.as_ref().unwrap()["tool_name"] == json!("TaskStop")
-            && row.output.as_ref().unwrap()["message"] == json!("Successfully stopped task: abc")
+    assert_eq!(
+        rows.values()
+            .filter(|row| row.span_type == SpanType::Tool)
+            .count(),
+        6
+    );
+    let tool = |call_id| tool_span(&rows, call_id);
+    let denied = tool("denied").metadata.as_ref().unwrap();
+    assert_eq!(denied["tool_approval"], json!("denied"));
+    assert_eq!(denied["permission_id"], json!("p1"));
+    assert_eq!(denied["permission_title"], json!("Run command"));
+    for (call_id, error) in [
+        ("denied", None),
+        ("failed", Some("missing")),
+        ("stderr-error", Some("disk full")),
+        ("mcp-error", Some("Could not resolve issue 355")),
+        ("stderr-success", None),
+        ("task-stop", None),
+    ] {
+        assert_eq!(tool(call_id).error.as_deref(), error, "{call_id}");
+    }
+    assert_eq!(
+        tool("stderr-success").output.as_ref().unwrap()["stdout"],
+        json!("/tmp")
+    );
+    assert_eq!(
+        tool("task-stop").output.as_ref().unwrap()["message"],
+        json!("Successfully stopped task: abc")
+    );
+    assert!(rows.values().all(|row| {
+        let metadata = row.metadata.as_ref().and_then(Value::as_object).unwrap();
+        metadata.get("git_origin_url") == Some(&json!("https://example.com/acme/app.git"))
+            && metadata.get("git_branch") == Some(&json!("main"))
+            && metadata.contains_key("git_commit_sha")
     }));
 }
 
@@ -1060,14 +985,7 @@ fn claude_recovered_tool_results_determine_outcome_without_boundary_errors() {
     }
 
     let rows = reduce(ops);
-    let by_call = |call_id: &str| {
-        rows.values()
-            .find(|row| {
-                row.span_type == SpanType::Tool
-                    && row.metadata.as_ref().unwrap()["tool_call_id"] == call_id
-            })
-            .unwrap()
-    };
+    let by_call = |call_id| tool_span(&rows, call_id);
     for call_id in [
         "success",
         "success-denial-text",
@@ -1158,13 +1076,7 @@ fn claude_unfinished_tools_are_cancelled_at_explicit_boundaries() {
 
     let rows = reduce(ops);
     for call_id in ["turn", "subagent", "session"] {
-        let tool = rows
-            .values()
-            .find(|row| {
-                row.span_type == SpanType::Tool
-                    && row.metadata.as_ref().unwrap()["tool_call_id"] == call_id
-            })
-            .unwrap();
+        let tool = tool_span(&rows, call_id);
         assert_eq!(tool.metadata.as_ref().unwrap()["cancelled"], true);
         assert_eq!(tool.error, None, "{call_id} should be a cancellation");
     }
@@ -1222,6 +1134,96 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
     );
     let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
     assert_eq!(turn.error.as_deref(), Some("model process exited"));
+}
+
+/// A PreToolUse hook may rewrite a call's arguments with `updatedInput`, and
+/// the permission check sees the rewritten call, so the terminal hook's
+/// `tool_input` (executed, failed, or denied) owns the span.
+#[test]
+fn claude_tool_spans_show_hook_rewritten_executed_input() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "rewrite");
+    let ctx = SessionCtx {
+        session_id: "rewrite".into(),
+        config: None,
+    };
+    let call = |name: &str, tool: &str, id: &str, input: Value| {
+        claude_event(
+            "rewrite",
+            name,
+            1,
+            json!({"session_id":"rewrite","tool_name":tool,"tool_use_id":id,"tool_input":input,"tool_response":{"stdout":"ran"},"error":"missing"}),
+        )
+    };
+    let mut ops = Vec::new();
+    for envelope in [
+        claude_event(
+            "rewrite",
+            "UserPromptSubmit",
+            1,
+            json!({"session_id":"rewrite","prompt":"go"}),
+        ),
+        call(
+            "PreToolUse",
+            "Bash",
+            "ok",
+            json!({"command":"rm -rf build"}),
+        ),
+        call("PostToolUse", "Bash", "ok", json!({"command":"ls build"})),
+        call(
+            "PreToolUse",
+            "Read",
+            "fail",
+            json!({"file_path":"/etc/secret"}),
+        ),
+        call(
+            "PostToolUseFailure",
+            "Read",
+            "fail",
+            json!({"file_path":"/tmp/public"}),
+        ),
+        call("PreToolUse", "Bash", "deny", json!({"command":"curl evil"})),
+        call(
+            "PermissionDenied",
+            "Bash",
+            "deny",
+            json!({"command":"curl safe"}),
+        ),
+        call("PreToolUse", "Bash", "same", json!({"command":"pwd"})),
+        call("PostToolUse", "Bash", "same", json!({"command":"pwd"})),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    // A replayed terminal hook must not restore the proposed input.
+    let replay = call(
+        "PostToolUse",
+        "Bash",
+        "ok",
+        json!({"command":"rm -rf build"}),
+    );
+    assert!(translator.handle(&replay, &ctx).unwrap().is_empty());
+
+    let rows = reduce(ops.clone());
+    for (call_id, name, input) in [
+        ("ok", "Terminal: ls build", json!({"command":"ls build"})),
+        ("fail", "Read: public", json!({"file_path":"/tmp/public"})),
+        (
+            "deny",
+            "Terminal: curl safe",
+            json!({"command":"curl safe"}),
+        ),
+        ("same", "Terminal: pwd", json!({"command":"pwd"})),
+    ] {
+        let tool = tool_span(&rows, call_id);
+        assert_eq!(tool.name, name);
+        assert_eq!(tool.input, Some(input), "{call_id}");
+    }
+    // An unrewritten call does not resend its (possibly large) input.
+    let same_id = &tool_span(&rows, "same").span_id;
+    assert!(ops.iter().all(|op| match op {
+        SpanOp::Merge(row) => &row.span_id != same_id || row.input.is_none(),
+        SpanOp::Insert(_) => true,
+    }));
 }
 
 #[test]
