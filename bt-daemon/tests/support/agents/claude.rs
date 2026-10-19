@@ -78,7 +78,6 @@ impl ClaudeAgent {
             ])
             .arg(plugin)
             .current_dir(world.workspace())
-            // Claude Code reads CLAUDE_CODE_MAX_RETRIES, not ANTHROPIC_MAX_RETRIES.
             .env("CLAUDE_CODE_MAX_RETRIES", "0")
             .env("DISABLE_AUTOUPDATER", "1")
             .env("DISABLE_TELEMETRY", "1")
