@@ -9,6 +9,7 @@ struct PublishedPlugin {
     files: BTreeMap<&'static str, String>,
     downloads: usize,
     fail: bool,
+    missing_git: bool,
 }
 
 impl PublishedPlugin {
@@ -43,6 +44,7 @@ impl PublishedPlugin {
             ]),
             downloads: 0,
             fail: false,
+            missing_git: false,
         }
     }
 
@@ -73,6 +75,13 @@ impl CommandRunner for PublishedPlugin {
             ]
         );
         self.downloads += 1;
+        if self.missing_git {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "git not found",
+            ))
+            .context("failed to run `git`");
+        }
         let destination = Path::new(args.last().unwrap());
         for (relative, contents) in &self.files {
             let path = destination.join(relative);
@@ -193,13 +202,39 @@ fn failed_download_or_invalid_distribution_preserves_the_installation() {
         );
     }
 
-    // A failed first install must not fall back to embedded content either.
+    // A network failure must not fall back to embedded content either.
     published.fail = true;
     let fresh_plugin = temp.path().join("fresh-plugin");
     let fresh_config = temp.path().join("fresh-config");
     assert!(enable_at(&mut published, &fresh_plugin, &fresh_config).is_err());
     assert!(!fresh_plugin.exists());
     assert!(!fresh_config.exists());
+}
+
+#[test]
+fn missing_git_installs_the_bundled_plugin_and_git_restores_published_updates() {
+    let temp = tempfile::tempdir().unwrap();
+    let plugin = temp.path().join(PLUGIN_NAME);
+    let config = temp.path().join(".cursor");
+    let mut published = PublishedPlugin::new();
+    published.missing_git = true;
+
+    enable_at(&mut published, &plugin, &config).unwrap();
+    update_at(&mut published, &plugin, &config).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(plugin.join(".cursor-plugin/plugin.json")).unwrap(),
+        PLUGIN_MANIFEST
+    );
+    assert_eq!(
+        std::fs::read_to_string(plugin.join("mcp.json")).unwrap(),
+        plugin_source!("cursor/content/mcp.json")
+    );
+    assert!(plugin.join("logo.svg").is_file());
+    assert!(capture_hooks_are_installed_at(&config));
+
+    published.missing_git = false;
+    update_at(&mut published, &plugin, &config).unwrap();
+    published.assert_installed_at(&plugin);
 }
 
 #[test]

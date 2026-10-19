@@ -1,5 +1,5 @@
-//! Cursor: the published plugin cloned into `~/.cursor/plugins/local/trace-cursor`,
-//! plus user-level capture hooks.
+//! Cursor: the published plugin cloned into `~/.cursor/plugins/local/trace-cursor`
+//! (or the bundled plugin when Git is missing), plus user-level capture hooks.
 
 mod hooks;
 
@@ -25,11 +25,38 @@ const PLUGIN_NAME: &str = "trace-cursor";
 const PLUGIN_SOURCE: &str = "braintrustdata/braintrust-cursor-extension";
 const LEGACY_PLUGIN_SOURCE: &str = "braintrustdata/braintrust-cursor-plugin";
 const MONOREPO_SOURCE: &str = "braintrustdata/braintrust-coding-agent-plugins";
-// Only used as a minimum version for diagnostics, never as install content.
 const PLUGIN_MANIFEST: &str = plugin_source!("cursor/content/.cursor-plugin/plugin.json");
 // User capture hooks follow the protocol supported by this daemon build.
 const HOOKS_MANIFEST: &str = plugin_source!("cursor/content/hooks/hooks.json");
 const PLUGIN_URL: &str = "https://github.com/braintrustdata/braintrust-cursor-extension.git";
+
+fn write_embedded_plugin_at(plugin: &Path) -> anyhow::Result<()> {
+    for (relative, contents) in [
+        (".cursor-plugin/plugin.json", PLUGIN_MANIFEST),
+        ("hooks/hooks.json", HOOKS_MANIFEST),
+        (
+            "hooks/trace.sh",
+            plugin_source!("cursor/content/hooks/trace.sh"),
+        ),
+        ("mcp.json", plugin_source!("cursor/content/mcp.json")),
+        ("logo.svg", plugin_source!("cursor/content/logo.svg")),
+        ("README.md", plugin_source!("cursor/content/README.md")),
+        ("LICENSE", plugin_source!("cursor/content/LICENSE")),
+    ] {
+        let path = plugin.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, contents)
+            .with_context(|| format!("failed to write bundled Cursor plugin file {relative}"))?;
+        #[cfg(unix)]
+        if relative == "hooks/trace.sh" {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(())
+}
 
 fn installed_manifest_at(plugin: &Path) -> Option<Value> {
     let raw = std::fs::read(plugin.join(".cursor-plugin/plugin.json")).ok()?;
@@ -109,7 +136,7 @@ impl Setup for Cursor {
 
 /// Fetch the published distribution into a staging directory beside
 /// `plugin_dir`, then swap it into place, restoring the previous plugin if
-/// the swap fails. Never fall back to the plugin embedded in this build.
+/// the swap fails. When Git is missing, stage the bundled plugin instead.
 fn install_plugin_at(runner: &mut dyn CommandRunner, plugin_dir: &Path) -> anyhow::Result<()> {
     let parent = plugin_dir.parent().ok_or_else(|| {
         anyhow::anyhow!("Cursor plugin path has no parent: {}", plugin_dir.display())
@@ -143,23 +170,35 @@ fn install_plugin_at(runner: &mut dyn CommandRunner, plugin_dir: &Path) -> anyho
     let destination = staged_plugin
         .to_str()
         .context("Cursor plugin staging path is not valid UTF-8")?;
-    runner
-        .run(
-            "git",
-            &[
-                "-c",
-                "core.autocrlf=false",
-                "clone",
-                "--depth",
-                "1",
-                "--",
-                PLUGIN_URL,
-                destination,
-            ],
-        )
-        .context(
+    match runner.run(
+        "git",
+        &[
+            "-c",
+            "core.autocrlf=false",
+            "clone",
+            "--depth",
+            "1",
+            "--",
+            PLUGIN_URL,
+            destination,
+        ],
+    ) {
+        Ok(()) => {}
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            eprintln!(
+                "warning: Git was not found on PATH; installing the Cursor plugin bundled with this bt build (v{}), which may be older than the latest published plugin. Install Git and run `bt trace update cursor` to get the latest version.",
+                package_version(PLUGIN_MANIFEST)?
+            );
+            write_embedded_plugin_at(&staged_plugin)?;
+        }
+        Err(error) => return Err(error).context(
             "failed to download the published Cursor plugin; install Git and check network access",
-        )?;
+        ),
+    }
     ensure_ours(
         &staged_plugin,
         "published Cursor plugin manifest is missing or unreadable",
