@@ -340,7 +340,22 @@ fn opencode_child_sessions_share_the_parent_trace_root() {
     let mut translator = registry.create("opencode", "root-session");
     let ctx = SessionCtx {
         session_id: "root-session".into(),
-        config: None,
+        config: Some(
+            SessionRoute {
+                tags: vec!["nested".into()],
+                additional_metadata: Some(
+                    json!({"team":"pipeline", "source":"override", "_bt_private":true}),
+                ),
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
     };
     let mut ops = translator
         .handle(
@@ -367,6 +382,20 @@ fn opencode_child_sessions_share_the_parent_trace_root() {
             .unwrap(),
     );
     assert!(assert_turn_lineage(&ops, |row| row.name.starts_with("Turn ")) >= 2);
+    let roots: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            SpanOp::Insert(row) if row.span_type == SpanType::Task && !row.is_turn => Some(row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(roots.len(), 2);
+    for root in roots {
+        let metadata = root.metadata.as_ref().unwrap();
+        assert_eq!(metadata["team"], "pipeline");
+        assert_eq!(metadata["source"], "opencode");
+        assert!(metadata.get("_bt_private").is_none());
+    }
     let rows = reduce(ops);
     let parent = rows.values().find(|r| r.name == "OpenCode").unwrap();
     let child = rows
@@ -375,6 +404,9 @@ fn opencode_child_sessions_share_the_parent_trace_root() {
         .unwrap();
     assert_eq!(child.root_span_id, parent.root_span_id);
     assert_eq!(child.parent_span_ids.len(), 1);
+    for root in [parent, child] {
+        assert_eq!(root.tags.as_ref().unwrap(), &["nested"]);
+    }
 }
 
 #[test]

@@ -6,8 +6,7 @@ use super::tool::{
     error_text, explicit_skill_metadata, with_tool_approval, without_nulls, ToolApproval,
 };
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
-    TranslatorFactory,
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
@@ -537,23 +536,9 @@ impl PiTranslator {
             // descendants and terminal aggregate merges from this point on.
             return Vec::new();
         }
-        let attached = ctx
-            .config
-            .as_ref()
-            .map(|c| c.attached_span_ids())
-            .unwrap_or_default();
-        self.external_parent = attached.0;
-        self.effective_root_span_id = attached
-            .1
-            .or_else(|| self.external_parent.clone())
-            .unwrap_or_else(|| self.root_span_id.clone());
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|c| c.additional_metadata.as_ref())
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        self.external_parent = None;
+        self.effective_root_span_id = self.root_span_id.clone();
+        let mut metadata = serde_json::Map::new();
         metadata.insert("session_id".into(), json!(ctx.session_id));
         metadata.insert("source".into(), json!("pi"));
         metadata.insert("_bt_defer_root".into(), json!(true));
@@ -591,7 +576,7 @@ impl PiTranslator {
             span_type: SpanType::Task,
             start_ms: Some(envelope.ts_ms),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
+            tags: None,
             ..Default::default()
         })]
     }

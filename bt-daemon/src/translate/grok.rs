@@ -276,7 +276,7 @@ impl GrokTranslator {
         &mut self,
         ts_ms: i64,
         event: &Envelope,
-        ctx: &SessionCtx,
+        _ctx: &SessionCtx,
         ops: &mut Vec<SpanOp>,
     ) {
         if self.root_open {
@@ -300,22 +300,11 @@ impl GrokTranslator {
             }));
             return;
         }
-        let attached = ctx
-            .config
-            .as_ref()
-            .map(|config| config.attached_span_ids())
-            .unwrap_or_default();
-        self.root_span_id = attached.1.unwrap_or_else(|| self.session_span_id.clone());
-        self.session_parent_span_ids = attached.0.clone().into_iter().collect();
+        self.root_span_id = self.session_span_id.clone();
+        self.session_parent_span_ids.clear();
         self.root_open = true;
 
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|config| config.additional_metadata.as_ref())
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        let mut metadata = serde_json::Map::new();
         metadata.retain(|key, _| !key.starts_with("_bt_"));
         metadata.insert("source".into(), json!("grok"));
         metadata.insert("session_id".into(), json!(self.session_id));

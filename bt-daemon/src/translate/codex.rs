@@ -120,9 +120,6 @@ impl TranslatorFactory for crate::agents::Codex {
             session_source: None,
             permission_mode: None,
             root_cwd: None,
-            project: None,
-            additional_metadata: Map::new(),
-            tags: Vec::new(),
             main_path: None,
             // The main scope is created lazily once we learn its transcript path.
             scopes: HashMap::new(),
@@ -247,9 +244,6 @@ struct CodexTranslator {
     session_source: Option<String>,
     permission_mode: Option<String>,
     root_cwd: Option<String>,
-    project: Option<String>,
-    additional_metadata: Map<String, Value>,
-    tags: Vec<String>,
     main_path: Option<String>,
     scopes: HashMap<String, Scope>,
     spawn_turn_by_call_id: RecentMap<String, String>,
@@ -262,30 +256,13 @@ struct CodexTranslator {
 }
 
 impl AgentTranslator for CodexTranslator {
-    fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn handle(&mut self, event: &Envelope, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),
             "Codex translator has pending catch-up work; drain it before handling another event"
         );
         let payload = &event.payload;
         let mut ops = Vec::new();
-
-        if let Some(config) = &ctx.config {
-            let attached = config.attached_span_ids();
-            self.external_parent_span_id = attached.0;
-            self.effective_root_span_id = attached
-                .1
-                .or_else(|| self.external_parent_span_id.clone())
-                .unwrap_or_else(|| self.root_span_id.clone());
-            self.project = config.project_name().map(ToOwned::to_owned);
-            self.additional_metadata = config
-                .additional_metadata
-                .as_ref()
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            self.tags = config.tags.clone();
-        }
 
         // --- hook-specific side effects (before catch-up) ---
         match event.event.as_str() {
@@ -753,7 +730,7 @@ impl CodexTranslator {
                 };
                 let cwd = str_field(payload, "cwd");
                 self.root_cwd = cwd.clone();
-                let mut md = self.additional_metadata.clone();
+                let mut md = Map::new();
                 for k in ["id", "cwd", "cli_version"] {
                     if let Some(v) = str_field(payload, k) {
                         md.insert(
@@ -782,9 +759,7 @@ impl CodexTranslator {
                 if let Some(m) = &scope.model {
                     md.insert("model".into(), json!(m));
                 }
-                if let Some(project) = &self.project {
-                    md.insert("project".into(), json!(project));
-                }
+
                 md.insert("username".into(), json!(local_username()));
                 scope.root_created = true;
                 ops.push(SpanOp::Insert(SpanRow {
@@ -800,7 +775,7 @@ impl CodexTranslator {
                         "source": self.session_source,
                     })),
                     metadata: Some(Value::Object(md)),
-                    tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
+                    tags: None,
                     ..Default::default()
                 }));
             }
@@ -827,7 +802,7 @@ impl CodexTranslator {
                         "agent_type": scope.agent_type,
                         "transcript_path": scope.path,
                     })),
-                    tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
+                    tags: None,
                     ..Default::default()
                 }));
             }

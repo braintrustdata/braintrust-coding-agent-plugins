@@ -10,8 +10,7 @@ use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
 use super::tool::{add_tool_approval, explicit_skill_metadata, nonempty_error_text, ToolApproval};
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
-    TranslatorFactory,
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
@@ -355,23 +354,9 @@ impl ClaudeTranslator {
             return;
         }
         self.root_open = true;
-        let (parent_span_id, root_span_id) = ctx
-            .config
-            .as_ref()
-            .map(|config| config.attached_span_ids())
-            .unwrap_or_default();
-        if let Some(root) = root_span_id {
-            self.root_span_id = root.clone();
-        }
-        self.session_parent_span_ids = parent_span_id.into_iter().collect();
         let cwd = hook.cwd.clone().unwrap_or_default();
         let workspace = basename(&cwd);
-        let mut metadata = ctx
-            .config
-            .as_ref()
-            .and_then(|c| c.additional_metadata.clone())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
+        let mut metadata = serde_json::Map::new();
         // Internal routing settings must never appear as user metadata.
         metadata.retain(|key, _| !key.starts_with("_bt_"));
         metadata.insert("session_id".into(), json!(ctx.session_id));
@@ -412,7 +397,7 @@ impl ClaudeTranslator {
             start_ms: Some(event.ts_ms),
             input: Some(json!(format!("Session: {workspace}"))),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
+            tags: None,
             ..Default::default()
         }));
     }
