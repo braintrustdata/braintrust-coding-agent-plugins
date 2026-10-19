@@ -9,8 +9,8 @@
 
 use crate::delivery_ledger::LedgerSink;
 use crate::journal::JournalWriter;
-use crate::pipeline::plugins::{PluginOutcome, Plugins};
-use crate::pipeline::{Completion, Delivery, Stage};
+use crate::pipeline::routing::RoutingSink;
+use crate::pipeline::{Completion, Delivery};
 use crate::sink::SinkFactory;
 use crate::translate::{Registry, SessionCtx};
 use crate::wire::{Envelope, SessionRoute};
@@ -545,7 +545,7 @@ impl SessionActor {
                 return;
             }
         };
-        let mut sink: Box<dyn crate::sink::Sink> = Box::new(
+        let sink: Box<dyn crate::sink::Sink> = Box::new(
             LedgerSink::new(
                 sink,
                 Some(&self.data_dir),
@@ -556,6 +556,13 @@ impl SessionActor {
             )
             .await,
         );
+        let mut sink: Box<dyn crate::sink::Sink> = Box::new(RoutingSink::spawn(
+            sink,
+            self.source.clone(),
+            self.session_id.clone(),
+            self.data_dir.clone(),
+            self.last_error.clone(),
+        ));
         let mut ctx = SessionCtx {
             session_id: self.session_id.clone(),
             config: Some(self.config.clone()),
@@ -724,54 +731,25 @@ impl SessionActor {
                         self.persist_correlation_if_changed(true).await;
                     }
                 }
-                let plugin_paths = ctx
-                    .config
-                    .as_ref()
-                    .map(|config| config.span_plugins.as_slice())
-                    .unwrap_or_default();
-                let mut stage = Plugins {
-                    paths: plugin_paths.to_vec(),
-                    source: self.source.clone(),
-                    session_id: self.session_id.clone(),
-                };
-                let mut processed = Vec::with_capacity(ops.len());
-                for op in &ops {
-                    match stage.process(op).await {
-                        PluginOutcome::Prepared(op) => processed.push(*op),
-                        PluginOutcome::Filtered => {}
-                        PluginOutcome::Failed(failure) => {
-                            delivered = false;
-                            if failure.newly_seen {
-                                if let Err(error) = crate::plugin_diagnostics::record(
-                                    &self.data_dir,
-                                    &self.source,
-                                    &failure.path,
-                                    &failure.message,
-                                ) {
-                                    tracing::warn!(session_id = %self.session_id,
-                                        "failed to persist span plugin diagnostic: {error}");
-                                }
-                                self.set_error(format!(
-                                    "span plugin {} failed; span operations are being discarded: {}",
-                                    failure.path.display(),
-                                    failure.message
-                                ));
-                            }
-                        }
-                        PluginOutcome::Unavailable(error) => {
-                            delivered = false;
-                            self.set_error(format!("span plugin processor failed: {error}"));
-                        }
-                    }
-                }
-                if !processed.is_empty() {
-                    match sink.emit(&processed).await {
+                if !ops.is_empty() {
+                    match sink.emit(&ops).await {
                         Ok(n) => {
                             self.counters.spans_emitted.fetch_add(n, Ordering::Relaxed);
                         }
                         Err(e) => {
                             delivered = false;
-                            self.set_error(format!("{emit_error}: {e}"));
+                            if let Some(failure) =
+                                e.downcast_ref::<crate::pipeline::routing::EmitFailure>()
+                            {
+                                self.counters
+                                    .spans_emitted
+                                    .fetch_add(failure.emitted, Ordering::Relaxed);
+                                if failure.report {
+                                    self.set_error(format!("{emit_error}: {e}"));
+                                }
+                            } else {
+                                self.set_error(format!("{emit_error}: {e}"));
+                            }
                         }
                     }
                 }
@@ -964,7 +942,11 @@ impl SessionActor {
         );
         match pending.into_completed().await {
             Ok(through) => *acknowledged_through = through,
-            Err(failed) => self.set_error(format!("delivery checkpoint failed: {}", failed.error)),
+            Err(failed) => self.set_error(format!(
+                "delivery checkpoint at {} failed: {}",
+                failed.delivery.value(),
+                failed.error
+            )),
         }
         true
     }

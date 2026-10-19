@@ -1,3 +1,5 @@
+use tokio::sync::mpsc;
+
 /// A message owns its completion obligation until terminal handling succeeds.
 pub(crate) struct Delivery<T> {
     value: T,
@@ -25,7 +27,6 @@ impl<T> Delivery<T> {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn value(&self) -> &T {
         &self.value
     }
@@ -46,6 +47,40 @@ impl<T> Delivery<T> {
                 error,
             }),
         }
+    }
+}
+
+// async_trait adds a redundant must_use annotation to its boxed futures.
+#[allow(clippy::double_must_use)]
+#[async_trait::async_trait]
+pub(crate) trait InputPort: Send {
+    type Item: Send;
+    async fn receive(&mut self) -> Option<Delivery<Self::Item>>;
+}
+
+// async_trait adds a redundant must_use annotation to its boxed futures.
+#[allow(clippy::double_must_use)]
+#[async_trait::async_trait]
+pub(crate) trait OutputPort: Send {
+    type Item: Send;
+    async fn send(&mut self, delivery: Delivery<Self::Item>) -> Result<(), Delivery<Self::Item>>;
+}
+
+#[async_trait::async_trait]
+impl<T: Send + 'static> InputPort for mpsc::Receiver<Delivery<T>> {
+    type Item = T;
+    async fn receive(&mut self) -> Option<Delivery<T>> {
+        self.recv().await
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: Send + 'static> OutputPort for mpsc::Sender<Delivery<T>> {
+    type Item = T;
+    async fn send(&mut self, delivery: Delivery<T>) -> Result<(), Delivery<T>> {
+        mpsc::Sender::send(self, delivery)
+            .await
+            .map_err(|error| error.0)
     }
 }
 
