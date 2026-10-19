@@ -79,6 +79,7 @@ impl ClaudeAgent {
             .arg(plugin)
             .current_dir(world.workspace())
             .env("CLAUDE_CODE_MAX_RETRIES", "0")
+            .env("ENABLE_TOOL_SEARCH", "false")
             .env("DISABLE_AUTOUPDATER", "1")
             .env("DISABLE_TELEMETRY", "1")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
