@@ -815,3 +815,91 @@ async fn experiment_sessions_use_experiment_object_type_and_id() {
         "experiment spans were routed as project logs: {bodies}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_backend_batch_is_not_a_successful_flush() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid row"))
+        .mount(&server)
+        .await;
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut sink = factory.create("rejected", "debug").unwrap();
+    let mut config = session_config(&server.uri());
+    config.destination = Some(TraceDestination::ProjectLogs {
+        project_id: Some("project".into()),
+        project_name: None,
+    });
+    sink.configure(&config);
+    sink.emit(&[SpanOp::Insert(row(
+        "rejected",
+        "rejected",
+        &[],
+        "rejected",
+        SpanType::Task,
+        1,
+        Some(2),
+    ))])
+    .await
+    .unwrap();
+    let flushed = sink.flush().await;
+    assert!(
+        flushed.is_err(),
+        "a rejected SDK batch must hold completion"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_route_does_not_poison_a_sibling_flush_on_the_same_backend() {
+    use wiremock::matchers::header;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(header("authorization", "Bearer sk-bad"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .and(header("authorization", "Bearer sk-good"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut bad = factory.create("bad", "debug").unwrap();
+    let mut good = factory.create("good", "debug").unwrap();
+    for (sink, token) in [(&mut bad, "sk-bad"), (&mut good, "sk-good")] {
+        let mut config = session_config(&server.uri());
+        config.auth.token = token.into();
+        config.destination = Some(TraceDestination::ProjectLogs {
+            project_id: Some("project".into()),
+            project_name: None,
+        });
+        sink.configure(&config);
+        sink.emit(&[SpanOp::Insert(row(
+            token,
+            token,
+            &[],
+            token,
+            SpanType::Task,
+            1,
+            Some(2),
+        ))])
+        .await
+        .unwrap();
+    }
+    let (bad_result, good_result) = tokio::join!(bad.flush(), good.flush());
+    assert!(bad_result.is_err());
+    good_result.unwrap();
+}
