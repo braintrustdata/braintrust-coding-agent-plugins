@@ -244,6 +244,12 @@ fn claude_real_fixture_matches_session_turn_tool_and_token_contract() {
     assert_eq!(tools.len(), 13);
     assert_eq!(llms.len(), 7, "one LLM span per unique requestId");
     assert!(turns.iter().all(|turn| turn.end_ms.is_some()));
+    assert!(
+        turns
+            .iter()
+            .all(|turn| turn.metadata.as_ref().unwrap()["effort"] == "xhigh"),
+        "effort reported after UserPromptSubmit still reaches its turn"
+    );
     assert!(tools.iter().all(|tool| {
         tool.metadata.as_ref().and_then(|m| m.get("tool_approval")) == Some(&json!("approved"))
     }));
@@ -449,21 +455,30 @@ fn claude_turns_capture_the_effective_permission_mode_and_effort() {
         event(
             "UserPromptSubmit",
             2,
-            json!({"cwd":"/workspace/demo", "prompt":"plan this", "permission_mode":"plan", "effort":{"level":"high"}}),
+            json!({"cwd":"/workspace/demo", "prompt":"plan this", "permission_mode":"plan"}),
         ),
+        // Claude reports effort on hooks after the prompt, not on UserPromptSubmit.
         event(
             "Stop",
             3,
-            json!({"cwd":"/workspace/demo", "permission_mode":"plan"}),
+            json!({"cwd":"/workspace/demo", "permission_mode":"plan", "effort":{"level":"high"}}),
         ),
         event(
             "UserPromptSubmit",
             4,
-            json!({"cwd":"/workspace/demo", "prompt":"implement it", "permission_mode":"acceptEdits", "effort":{"level":"max"}}),
+            json!({"cwd":"/workspace/demo", "prompt":"implement it", "permission_mode":"acceptEdits"}),
+        ),
+        event(
+            "PreToolUse",
+            5,
+            json!({
+                "cwd":"/workspace/demo", "permission_mode":"acceptEdits", "effort":{"level":"max"},
+                "tool_name":"Read", "tool_use_id":"read-1", "tool_input":{"file_path":"x"}
+            }),
         ),
         event(
             "SessionEnd",
-            5,
+            6,
             json!({"cwd":"/workspace/demo", "permission_mode":"acceptEdits"}),
         ),
     ] {

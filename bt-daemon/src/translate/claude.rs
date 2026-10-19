@@ -146,6 +146,7 @@ struct Turn {
     cwd: Option<String>,
     parent_id: String,
     user_turn_id: Option<String>,
+    effort: Option<String>,
 }
 
 struct PendingPrompt {
@@ -569,7 +570,27 @@ impl ClaudeTranslator {
             cwd: self.current_cwd.clone(),
             parent_id,
             user_turn_id,
+            effort: self.effort.clone(),
         });
+    }
+
+    /// Claude reports effort on later hooks, not reliably on UserPromptSubmit.
+    /// Merge a newly observed level into the active turn.
+    fn record_turn_effort(&mut self, ops: &mut Vec<SpanOp>) {
+        let Some(turn) = self.turn.as_mut() else {
+            return;
+        };
+        if self.effort.is_none() || turn.effort == self.effort {
+            return;
+        }
+        turn.effort = self.effort.clone();
+        ops.push(SpanOp::Merge(SpanRow {
+            span_id: turn.id.clone(),
+            root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![turn.parent_id.clone()],
+            metadata: Some(json!({ "effort": turn.effort })),
+            ..Default::default()
+        }));
     }
 
     // A stopped foreground response can still own background work. Retain its
@@ -1363,6 +1384,7 @@ impl AgentTranslator for ClaudeTranslator {
                 }));
             }
         }
+        self.record_turn_effort(&mut ops);
         // Root creation moved below the passive-hook gate. Enrich it before
         // handling the event so a later prompt can retain the prior turn's
         // cwd while flushing its deferred transcript rows.
