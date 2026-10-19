@@ -11,7 +11,7 @@ pub(crate) enum PluginOutcome {
 }
 
 pub(crate) struct Plugins {
-    pub paths: Vec<PathBuf>,
+    paths: Vec<PathBuf>,
     pub source: String,
     pub session_id: String,
     blocked: Option<(Vec<PathBuf>, PluginRejected)>,
@@ -43,6 +43,11 @@ impl Plugins {
             session_id: session_id.into(),
             blocked: None,
         }
+    }
+
+    pub fn configure(&mut self, paths: &[PathBuf]) {
+        self.paths.clear();
+        self.paths.extend_from_slice(paths);
     }
 }
 

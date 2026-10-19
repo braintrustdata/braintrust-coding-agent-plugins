@@ -1,6 +1,11 @@
 //! Routing owns its sink behind a bounded typed port. Session dispatch is its facade.
 use super::delivery::{Delivery, InputPort, OutputPort};
 use super::plugins::{PluginOutcome, Plugins};
+use super::prepare::Prepare;
+use super::recovery::{RetryCondition, RouteFailure};
+use super::submission::{
+    Input as SubmissionInput, Operation, Outcome as SubmissionOutcome, Submission,
+};
 use super::{Completion, Stage};
 use crate::{sink::Sink, translate::SpanOp, wire::SessionConfig};
 use parking_lot::Mutex;
@@ -12,33 +17,10 @@ struct Request {
     operation: Operation,
     reply: oneshot::Sender<Response>,
 }
-
-enum Operation {
-    Emit(Vec<SpanOp>),
-    Flush,
-}
 struct Response {
     result: anyhow::Result<u64>,
     pending: bool,
     permalink: Option<String>,
-}
-
-/// Rows accepted before a mandatory plugin failed still count as emitted.
-#[derive(Debug)]
-pub(crate) struct EmitFailure {
-    pub emitted: u64,
-    pub report: bool,
-    pub cause: anyhow::Error,
-}
-impl std::fmt::Display for EmitFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.cause.fmt(f)
-    }
-}
-impl std::error::Error for EmitFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.cause.as_ref())
-    }
 }
 
 struct Forward;
@@ -58,7 +40,7 @@ pub(crate) struct RoutingSink {
 
 impl RoutingSink {
     pub fn spawn(
-        mut sink: Box<dyn Sink>,
+        sink: Box<dyn Sink>,
         source: String,
         session_id: String,
         data_dir: PathBuf,
@@ -66,21 +48,21 @@ impl RoutingSink {
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Delivery<Request>>(16);
         tokio::spawn(async move {
-            let mut stage = Plugins::new(&source, &session_id);
-            let mut prepare = super::prepare::Prepare::new(&source);
+            let mut plugins = Plugins::new(&source, &session_id);
+            let mut prepare = Prepare::new(&source);
+            let mut submission = Submission::new(sink);
             while let Ok(Some(delivery)) = InputPort::receive(&mut rx).await {
                 let request = delivery.value();
-                sink.configure(&request.config);
-                let result = match &request.operation {
+                let (result, state) = match &request.operation {
                     Operation::Emit(ops) => {
                         let mut ops = ops.clone();
                         prepare.apply(&mut ops, &request.config);
-                        stage.paths = request.config.span_plugins.clone();
+                        plugins.configure(&request.config.span_plugins);
                         let mut prepared = Vec::with_capacity(ops.len());
                         let mut failure = None;
                         let mut report = false;
                         for op in &ops {
-                            match stage.process(op).await {
+                            match plugins.process(op).await {
                                 PluginOutcome::Prepared(op) => prepared.push(*op),
                                 PluginOutcome::Filtered => {}
                                 PluginOutcome::Failed(error) => {
@@ -95,31 +77,76 @@ impl RoutingSink {
                                             tracing::warn!(%diagnostic, "plugin diagnostic could not be saved");
                                         }
                                     }
-                                    failure = Some(anyhow::Error::new(error));
+                                    failure = Some((
+                                        anyhow::Error::new(error.clone()),
+                                        RetryCondition::Plugin {
+                                            path: error.failure.path.clone(),
+                                            digest: error.digest,
+                                            processors: error.processors.clone(),
+                                        },
+                                    ));
                                 }
                                 PluginOutcome::Unavailable(error) => {
                                     report = true;
-                                    failure = Some(error);
+                                    failure = Some((error, RetryCondition::Transient));
                                 }
                             }
                         }
-                        let emitted = if prepared.is_empty() {
-                            Ok(0)
-                        } else {
-                            sink.emit(&prepared).await
+                        let submit_input = SubmissionInput {
+                            config: request.config.clone(),
+                            operation: Operation::Emit(prepared),
+                        };
+                        let SubmissionOutcome::Emitted {
+                            result: emitted,
+                            state,
+                        } = submission.process(&submit_input).await
+                        else {
+                            unreachable!("emit request returned a flush outcome")
                         };
                         match (emitted, failure) {
-                            (Err(error), _) => Err(error),
-                            (Ok(emitted), Some(cause)) => Err(EmitFailure {
-                                emitted,
-                                report,
-                                cause,
-                            }
-                            .into()),
-                            (Ok(emitted), None) => Ok(emitted),
+                            (Err(error), _) => (
+                                Err(anyhow::Error::new(RouteFailure {
+                                    cause: error.cause,
+                                    retry: error.retry,
+                                    emitted: 0,
+                                    report: false,
+                                })),
+                                state,
+                            ),
+                            (Ok(emitted), Some((cause, retry))) => (
+                                Err(anyhow::Error::new(RouteFailure {
+                                    cause,
+                                    retry,
+                                    emitted,
+                                    report,
+                                })),
+                                state,
+                            ),
+                            (Ok(emitted), None) => (Ok(emitted), state),
                         }
                     }
-                    Operation::Flush => sink.flush().await.map(|()| 0),
+                    Operation::Flush => {
+                        let submit_input = SubmissionInput {
+                            config: request.config.clone(),
+                            operation: Operation::Flush,
+                        };
+                        let SubmissionOutcome::Flushed { result, state } =
+                            submission.process(&submit_input).await
+                        else {
+                            unreachable!("flush request returned an emit outcome")
+                        };
+                        (
+                            result.map(|()| 0).map_err(|error| {
+                                anyhow::Error::new(RouteFailure {
+                                    cause: error.cause,
+                                    retry: error.retry,
+                                    emitted: 0,
+                                    report: false,
+                                })
+                            }),
+                            state,
+                        )
+                    }
                 };
                 if let Err(error) = &result {
                     *last_error.lock() = Some(error.to_string());
@@ -136,8 +163,8 @@ impl RoutingSink {
                 };
                 let _ = request.reply.send(Response {
                     result,
-                    pending: sink.has_pending_delivery(),
-                    permalink: sink.permalink(),
+                    pending: state.pending,
+                    permalink: state.permalink,
                 });
             }
         });
@@ -249,12 +276,12 @@ mod tests {
             })
         };
         let failure = sink.emit(&[op("accept"), op("reject")]).await.unwrap_err();
-        let first = failure.downcast_ref::<EmitFailure>().unwrap();
+        let first = failure.downcast_ref::<RouteFailure>().unwrap();
         assert_eq!(first.emitted, 1);
         assert!(first.report);
         assert_eq!(emitted.load(Ordering::Relaxed), 1);
         let failure = sink.emit(&[op("accept")]).await.unwrap_err();
-        let cached = failure.downcast_ref::<EmitFailure>().unwrap();
+        let cached = failure.downcast_ref::<RouteFailure>().unwrap();
         assert_eq!(cached.emitted, 0);
         assert!(
             !cached.report,
