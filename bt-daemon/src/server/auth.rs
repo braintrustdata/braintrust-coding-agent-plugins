@@ -33,11 +33,53 @@ pub(crate) async fn resolve_route_auth(
     Ok(lease)
 }
 
+/// A route refresh updates the same in-memory lease cache used by later hooks.
+/// Persisted head identity remains independent of the credential itself.
+struct RouteAuthProvider {
+    provider: Arc<dyn AuthProvider>,
+    key: DeliveryKey,
+    states: Arc<tokio::sync::Mutex<HashMap<DeliveryKey, SessionAuthState>>>,
+}
+#[async_trait::async_trait]
+impl AuthProvider for RouteAuthProvider {
+    async fn resolve(
+        &self,
+        selection: &AuthSelection,
+        reason: AuthResolveReason,
+    ) -> anyhow::Result<AuthLease> {
+        let lease = self.provider.resolve(selection, reason).await?;
+        let mut states = self.states.lock().await;
+        if let Some(state) = states.get_mut(&self.key) {
+            anyhow::ensure!(
+                lease.selection == state.lease.selection,
+                "credential refresh changed the pinned auth selection"
+            );
+            anyhow::ensure!(
+                lease.auth.api_url == state.lease.auth.api_url
+                    && lease.auth.org_id == state.lease.auth.org_id
+                    && lease.auth.org_name == state.lease.auth.org_name,
+                "credential refresh changed the pinned backend or organization"
+            );
+            state.lease = lease.clone();
+        }
+        Ok(lease)
+    }
+}
+
 impl Daemon {
+    pub(super) fn route_auth_provider(&self, key: &DeliveryKey) -> Option<Arc<dyn AuthProvider>> {
+        self.auth_provider.as_ref().map(|provider| {
+            Arc::new(RouteAuthProvider {
+                provider: provider.clone(),
+                key: key.clone(),
+                states: self.session_auth.clone(),
+            }) as Arc<dyn AuthProvider>
+        })
+    }
     pub(super) async fn configure_event(&self, env: &mut Envelope) -> anyhow::Result<DeliveryKey> {
-        let Some(provider) = &self.auth_provider else {
+        if self.auth_provider.is_none() {
             anyhow::bail!("daemon host has no Braintrust auth provider");
-        };
+        }
         let requested_route = env
             .route
             .clone()
@@ -76,6 +118,9 @@ impl Daemon {
             }
         };
 
+        let provider = self
+            .route_auth_provider(&key)
+            .ok_or_else(|| anyhow::anyhow!("daemon host has no Braintrust auth provider"))?;
         let lease = resolve_route_auth(
             provider.as_ref(),
             &selection,
@@ -175,7 +220,7 @@ impl Daemon {
         &self,
         key: &DeliveryKey,
     ) -> anyhow::Result<()> {
-        let Some(provider) = &self.auth_provider else {
+        let Some(provider) = self.route_auth_provider(key) else {
             return Ok(());
         };
         let Some(state) = self.session_auth.lock().await.get(key).cloned() else {
@@ -188,21 +233,95 @@ impl Daemon {
         let lease = provider
             .resolve(&selection, AuthResolveReason::Expiring)
             .await?;
-        if lease.selection != state.lease.selection {
-            anyhow::bail!("credential refresh changed the session auth selection");
-        }
-        let config = state.route.with_auth(lease.auth.clone());
-        self.session_auth.lock().await.insert(
-            key.clone(),
-            SessionAuthState {
-                route: state.route,
-                lease,
-            },
-        );
+        let config = state.route.with_auth(lease.auth);
         let session = { self.sessions.lock().get(key).cloned() };
         if let Some(session) = session {
             session.configure(config).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Refresh(AuthLease);
+    #[async_trait::async_trait]
+    impl AuthProvider for Refresh {
+        async fn resolve(
+            &self,
+            _: &AuthSelection,
+            reason: AuthResolveReason,
+        ) -> anyhow::Result<AuthLease> {
+            assert_eq!(reason, AuthResolveReason::Expiring);
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn expiring_refreshes_preserve_backend_binding_and_accept_new_tokens() {
+        for trigger in ["flush", "event"] {
+            for change in ["backend", "org_id", "org_name", "token"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let route = SessionRoute {
+                    destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                        project_id: Some("project".into()),
+                        project_name: None,
+                    }),
+                    ..Default::default()
+                };
+                let lease = AuthLease {
+                    selection: route.auth.clone(),
+                    auth: BackendAuth {
+                        token: "old".into(),
+                        api_url: Some("https://original.test".into()),
+                        app_url: None,
+                        org_id: Some("original-id".into()),
+                        org_name: Some("original-name".into()),
+                    },
+                    expires_at_ms: Some(0),
+                };
+                let mut refreshed = lease.clone();
+                refreshed.auth.token = "new".into();
+                match change {
+                    "backend" => refreshed.auth.api_url = Some("https://other.test".into()),
+                    "org_id" => refreshed.auth.org_id = Some("other-id".into()),
+                    "org_name" => refreshed.auth.org_name = Some("other-name".into()),
+                    _ => {}
+                }
+                let mut options = debug_serve_options("test", tmp.path());
+                options.auth_provider = Some(Arc::new(Refresh(refreshed)));
+                let daemon = Daemon::new(options, tmp.path().into());
+                let key = DeliveryKey::new("debug", "test", &route).unwrap();
+                daemon.session_auth.lock().await.insert(
+                    key.clone(),
+                    SessionAuthState {
+                        route: route.clone(),
+                        lease: lease.clone(),
+                    },
+                );
+                let mut env: Envelope = serde_json::from_value(serde_json::json!({
+                    "source":"debug", "session_id":"test", "event":"event", "ts_ms":1,
+                    "payload":{}, "route":route,
+                }))
+                .unwrap();
+                let result = if trigger == "flush" {
+                    daemon.refresh_session_before_flush(&key).await
+                } else {
+                    daemon.configure_event(&mut env).await.map(|_| ())
+                };
+                assert_eq!(result.is_ok(), change == "token", "{trigger}: {change}");
+                let cached = daemon.session_auth.lock().await[&key].lease.clone();
+                assert_eq!(cached.auth.api_url, lease.auth.api_url);
+                assert_eq!(cached.auth.org_id, lease.auth.org_id);
+                assert_eq!(cached.auth.org_name, lease.auth.org_name);
+                assert_eq!(
+                    cached.auth.token,
+                    if change == "token" { "new" } else { "old" }
+                );
+                super::super::maintenance::drain_all(&daemon).await;
+            }
+        }
     }
 }

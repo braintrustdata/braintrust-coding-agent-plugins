@@ -217,8 +217,11 @@ pub(super) async fn accept_resolved_event(
             payload.insert("_bt_transcript_replay".to_string(), serde_json::json!(true));
         }
     }
-    let schedule_flush = crate::hook::should_flush_ingress_event(&env)
-        || (env.source == "claude-code" && env.event == "TranscriptUpdate");
+    // Startup resumes an existing boundary rather than inventing a new
+    // native/control observation that would require translator reconstruction.
+    let schedule_flush = journal_through > replay_through
+        && (crate::hook::should_flush_ingress_event(&env)
+            || (env.source == "claude-code" && env.event == "TranscriptUpdate"));
     let source = env.source.clone();
     let event = env.event.clone();
     let session_id = env.session_id.clone();

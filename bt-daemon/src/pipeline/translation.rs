@@ -12,7 +12,7 @@ use crate::{
 };
 use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -21,6 +21,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, Notify};
 
+#[derive(Clone)]
 pub(crate) struct Observation {
     pub key: String,
     pub route: SessionRoute,
@@ -30,6 +31,7 @@ pub(crate) struct Observation {
 enum Command {
     Observe(Box<Observation>),
     Advance(u64),
+    Unobserve(String),
     Stop,
     Barrier(oneshot::Sender<Result<u64, String>>),
     Control(ControlKind, oneshot::Sender<Result<u64, String>>),
@@ -48,7 +50,7 @@ impl Progress {
 
 pub(crate) struct Translation {
     tx: mpsc::Sender<Command>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub journal: SpanJournal,
     pub error: Arc<Mutex<Option<String>>>,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
@@ -101,6 +103,7 @@ impl Translation {
             observers: Vec::new(),
             origins: HashMap::new(),
             capture: None,
+            pending_snapshots: HashSet::new(),
             bounds: HashMap::new(),
             position: 0,
             committed,
@@ -111,7 +114,7 @@ impl Translation {
         let task = tokio::spawn(actor.run(rx));
         Ok(Arc::new(Self {
             tx,
-            task: Mutex::new(Some(task)),
+            task: tokio::sync::Mutex::new(Some(task)),
             journal,
             error,
             recovery,
@@ -121,9 +124,12 @@ impl Translation {
     }
     pub async fn shutdown(&self) {
         let _ = self.tx.send(Command::Stop).await;
-        let task = self.task.lock().take();
-        if let Some(task) = task {
+        let mut task = self.task.lock().await;
+        if let Some(task) = task.take() {
             let _ = task.await;
+        }
+        if let Err(error) = self.journal.close().await {
+            tracing::warn!(%error, "SpanOp journal could not be closed during source shutdown");
         }
     }
     pub async fn observe(&self, observer: Observation) -> anyhow::Result<()> {
@@ -132,6 +138,9 @@ impl Translation {
             .send(Command::Observe(Box::new(observer)))
             .await
             .map_err(|_| anyhow::anyhow!("translation actor is gone"))
+    }
+    pub async fn unobserve(&self, key: String) {
+        let _ = self.tx.send(Command::Unobserve(key)).await;
     }
     pub async fn advance(&self, through: u64) -> anyhow::Result<()> {
         self.progress
@@ -186,6 +195,7 @@ struct Producer {
     observers: Vec<Observation>,
     origins: HashMap<String, OriginSnapshot>,
     capture: Option<OriginSnapshot>,
+    pending_snapshots: HashSet<String>,
     bounds: HashMap<String, u64>,
     position: u64,
     committed: u64,
@@ -235,6 +245,7 @@ impl Producer {
                         Some(Command::Barrier(reply))=> { let _=reply.send(self.boundary().await); },
                         Some(Command::Observe(observer))=> { let _=self.observe_history(&observer).await; self.observers.push(*observer); },
                         Some(Command::Advance(_))=>{},
+                        Some(Command::Unobserve(key))=>self.observers.retain(|observer| observer.key != key),
                         Some(Command::Control(kind,reply))=> {
                             let result=self.append_control(kind).await;
                             if let Err(error)=result { tracing::warn!(%error,"ordered control could not be persisted while source is recovering"); }
@@ -260,12 +271,29 @@ impl Producer {
                 attempts = failure.attempt.saturating_add(1);
                 self.state = State::Processing;
                 let result = async {
+                    // Retry a failed correlation write before releasing the
+                    // canonical candidate, even if registry observation is idempotent.
+                    for key in self.pending_snapshots.clone() {
+                        self.phase = Boundary::Journal;
+                        crate::server::persist_active_parent_snapshot(
+                            &self.options.data_dir,
+                            &key,
+                            &self.options.correlation,
+                        )
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                        self.pending_snapshots.remove(&key);
+                    }
                     if self.publication.is_some() {
                         self.publish().await?;
                     } else if self.progress.requested.load(Ordering::Relaxed) > self.committed {
                         self.reader = None;
                         self.translator = None;
                         self.position = 0;
+                    } else {
+                        for observer in self.observers.clone() {
+                            self.observe_history(&observer).await?;
+                        }
                     }
                     self.advance(self.progress.requested.load(Ordering::Relaxed))
                         .await
@@ -299,6 +327,10 @@ impl Producer {
                     result
                 }
                 Command::Advance(through) => self.advance(through).await,
+                Command::Unobserve(key) => {
+                    self.observers.retain(|observer| observer.key != key);
+                    Ok(())
+                }
                 Command::Barrier(reply) => {
                     let _ = reply.send(self.boundary().await);
                     Ok(())
@@ -563,7 +595,13 @@ impl Producer {
                     self.phase = Boundary::Journal;
                     if pending.observation {
                         for observer in &self.observers {
-                            Self::observe(&self.options, ops, observer).await?;
+                            Self::observe(
+                                &self.options,
+                                &mut self.pending_snapshots,
+                                ops,
+                                observer,
+                            )
+                            .await?;
                         }
                     }
                     if publish {
@@ -606,12 +644,13 @@ impl Producer {
             };
             after = through;
             let ops = rows.into_iter().map(|(_, op)| op).collect::<Vec<_>>();
-            Self::observe(&self.options, &ops, observer).await?;
+            Self::observe(&self.options, &mut self.pending_snapshots, &ops, observer).await?;
         }
         Ok(())
     }
     async fn observe(
         options: &TranslationOptions,
+        pending_snapshots: &mut HashSet<String>,
         ops: &[SpanOp],
         observer: &Observation,
     ) -> anyhow::Result<()> {
@@ -621,6 +660,9 @@ impl Producer {
             .correlation
             .observe_ops(&observer.key, &observer.route, &observer.config, &ops)
         {
+            pending_snapshots.insert(observer.key.clone());
+        }
+        if pending_snapshots.contains(&observer.key) {
             crate::server::persist_active_parent_snapshot(
                 &options.data_dir,
                 &observer.key,
@@ -628,6 +670,7 @@ impl Producer {
             )
             .await
             .map_err(anyhow::Error::msg)?;
+            pending_snapshots.remove(&observer.key);
             options.correlation_changed.notify_one();
         }
         Ok(())
@@ -747,6 +790,7 @@ mod tests {
             observers: Vec::new(),
             origins: HashMap::new(),
             capture: None,
+            pending_snapshots: HashSet::new(),
             bounds: HashMap::new(),
             position: 0,
             committed: 0,
