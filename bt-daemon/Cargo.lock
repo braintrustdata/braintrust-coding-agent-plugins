@@ -239,7 +239,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=74e568dd30eb1654039dcc792f3327a8399deaba#74e568dd30eb1654039dcc792f3327a8399deaba"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=f2216fa0ceee132e02f1392c0e5af89ae762e9c8#f2216fa0ceee132e02f1392c0e5af89ae762e9c8"
 dependencies = [
  "anyhow",
  "arc-swap",

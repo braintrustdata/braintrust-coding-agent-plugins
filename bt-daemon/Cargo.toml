@@ -22,7 +22,7 @@ expect_used = "deny"
 
 [dependencies]
 # Keep this pinned exactly, matching the dependency policy used by `bt`.
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "74e568dd30eb1654039dcc792f3327a8399deaba" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "f2216fa0ceee132e02f1392c0e5af89ae762e9c8" }
 base64 = "0.22"
 anyhow = "1"
 parking_lot = "0.12"
