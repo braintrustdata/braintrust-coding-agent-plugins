@@ -68,6 +68,7 @@ impl RoutingSink {
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Delivery<Request>>(16);
         tokio::spawn(async move {
+            let mut stage = Plugins::new(&source, &session_id);
             let mut prepare = super::prepare::Prepare::new(&source);
             while let Ok(Some(delivery)) = InputPort::receive(&mut rx).await {
                 let request = delivery.value();
@@ -80,11 +81,7 @@ impl RoutingSink {
                     Operation::Emit(ops) => {
                         let mut ops = ops.clone();
                         prepare.apply(&mut ops, &request.config);
-                        let mut stage = Plugins {
-                            paths: request.config.span_plugins.clone(),
-                            source: source.clone(),
-                            session_id: session_id.clone(),
-                        };
+                        stage.paths = request.config.span_plugins.clone();
                         let mut prepared = Vec::with_capacity(ops.len());
                         let mut failure = None;
                         let mut report = false;
@@ -93,20 +90,18 @@ impl RoutingSink {
                                 PluginOutcome::Prepared(op) => prepared.push(*op),
                                 PluginOutcome::Filtered => {}
                                 PluginOutcome::Failed(error) => {
-                                    report |= error.newly_seen;
-                                    if error.newly_seen {
+                                    report |= error.failure.newly_seen;
+                                    if error.failure.newly_seen {
                                         if let Err(diagnostic) = crate::plugin_diagnostics::record(
                                             &data_dir,
                                             &source,
-                                            &error.path,
-                                            &error.message,
+                                            &error.failure.path,
+                                            &error.failure.message,
                                         ) {
                                             tracing::warn!(%diagnostic, "plugin diagnostic could not be saved");
                                         }
                                     }
-                                    failure = Some(anyhow::anyhow!(
-                                        "span plugin {} failed; span operations are being discarded: {}",
-                                        error.path.display(), error.message));
+                                    failure = Some(anyhow::Error::new(error));
                                 }
                                 PluginOutcome::Unavailable(error) => {
                                     report = true;

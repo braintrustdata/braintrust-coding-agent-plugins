@@ -356,7 +356,12 @@ async fn diagnose_daemon(
                 .sessions
                 .into_iter()
                 .filter(|session| is_same_agent(source, &session.source))
-                .filter_map(|session| session.last_error);
+                .filter_map(|session| {
+                    session.last_error.map(|error| match session.recovery {
+                        Some(recovery) => format!("{error}; retry eligible: {}", recovery.eligible),
+                        None => error,
+                    })
+                });
             for error in errors {
                 if !session_errors.contains(&error) {
                     session_errors.push(error);

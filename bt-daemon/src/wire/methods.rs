@@ -92,11 +92,22 @@ pub struct StatusResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryInfo {
+    pub stage: String,
+    pub position: u64,
+    pub reason: String,
+    pub retry: String,
+    pub eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStatus {
     pub session_id: String,
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<crate::wire::SessionRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryInfo>,
     pub queued: u64,
     pub spans_emitted: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
