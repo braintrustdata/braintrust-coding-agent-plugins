@@ -1,14 +1,22 @@
 //! Concrete durable channel: one ordered SpanOp log and a head per route.
-use super::{Completion, Delivery};
+use super::{
+    delivery::InputPort,
+    recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
+    Completion, Delivery, Stage,
+};
 use crate::{
     translate::SpanOp,
-    wire::{SessionConfig, SessionRoute},
+    wire::{RecoveryInfo, SessionConfig, SessionRoute},
 };
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StorageMutex,
+    },
 };
 use tokio::sync::watch;
 
@@ -25,7 +33,7 @@ impl std::error::Error for BindingChanged {}
 
 #[derive(Clone)]
 pub(crate) struct SpanJournal {
-    connection: Arc<Mutex<Option<Connection>>>,
+    connection: Arc<StorageMutex<Option<Connection>>>,
     changed: watch::Sender<u64>,
 }
 
@@ -68,10 +76,8 @@ impl StoredOp {
 impl SpanJournal {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let path = path.to_owned();
-        let connection = tokio::task::spawn_blocking(move || -> anyhow::Result<Connection> {
-            let parent = path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("SpanOp journal path has no parent"))?;
+        let connection = tokio::task::spawn_blocking(move || -> anyhow::Result<(Connection, u64)> {
+            let parent = path.parent().ok_or_else(|| anyhow::anyhow!("SpanOp journal path has no parent"))?;
             std::fs::create_dir_all(parent)?;
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -102,12 +108,14 @@ impl SpanJournal {
                 db.execute_batch("ALTER TABLE heads ADD COLUMN binding TEXT")?;
                 db.execute_batch("PRAGMA user_version=3; COMMIT")?;
             }
-            Ok(db)
+            let tail = db.query_row("SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1", [], |row| row.get(0))?;
+            Ok((db, tail))
         })
         .await??;
-        let (changed, _) = watch::channel(0);
+        let (connection, tail) = connection;
+        let (changed, _) = watch::channel(tail);
         Ok(Self {
-            connection: Arc::new(Mutex::new(Some(connection))),
+            connection: Arc::new(StorageMutex::new(Some(connection))),
             changed,
         })
     }
@@ -239,8 +247,7 @@ impl SpanJournal {
                 Ok(tail)
             })
             .await?;
-        self.changed
-            .send_modify(|version| *version = version.wrapping_add(1));
+        self.changed.send_replace(tail);
         Ok(tail)
     }
 
@@ -273,12 +280,20 @@ impl SpanJournal {
                 Ok(position)
             })
             .await?;
+        let (progress, _) = watch::channel(position);
         Ok(Cursor {
             journal: self.clone(),
             route,
             read: position,
             completed: position,
             changes: self.changed.subscribe(),
+            progress,
+            abandoned: Arc::new(AtomicBool::new(false)),
+            settings: None,
+            version: String::new(),
+            restored: false,
+            error: Arc::new(Mutex::new(None)),
+            recovery: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -426,9 +441,83 @@ pub(crate) struct Cursor {
     read: u64,
     completed: u64,
     changes: watch::Receiver<u64>,
+    progress: watch::Sender<u64>,
+    abandoned: Arc<AtomicBool>,
+    settings: Option<watch::Receiver<SessionConfig>>,
+    version: String,
+    restored: bool,
+    error: Arc<Mutex<Option<String>>>,
+    recovery: Arc<Mutex<Option<RecoveryInfo>>>,
+}
+
+/// The composition layer keeps this status handle; downstream stages only get
+/// the InputPort and managed deliveries.
+#[derive(Clone)]
+pub(crate) struct Progress {
+    completed: watch::Receiver<u64>,
+    published: watch::Receiver<u64>,
+}
+#[cfg(test)]
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            completed: watch::channel(0).1,
+            published: watch::channel(0).1,
+        }
+    }
+}
+impl Progress {
+    pub fn completed(&self) -> u64 {
+        *self.completed.borrow()
+    }
+    pub fn pending(&self) -> u64 {
+        self.published.borrow().saturating_sub(self.completed())
+    }
+
+    pub async fn through(&self, target: u64, error: &Mutex<Option<String>>) -> Result<(), String> {
+        let mut completed = self.completed.clone();
+        loop {
+            if *completed.borrow_and_update() >= target {
+                return Ok(());
+            }
+            if let Some(error) = error.lock().clone() {
+                return Err(error);
+            }
+            tokio::select! {
+                changed = completed.changed() => changed.map_err(|_| "journal input is gone".to_owned())?,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
+            }
+        }
+    }
+}
+
+pub(crate) struct Subscription {
+    pub input: Box<dyn InputPort<Item = Vec<SpanOp>>>,
+    pub progress: Progress,
 }
 
 impl Cursor {
+    pub fn into_input(
+        mut self,
+        settings: watch::Receiver<SessionConfig>,
+        version: String,
+        error: Arc<Mutex<Option<String>>>,
+        recovery: Arc<Mutex<Option<RecoveryInfo>>>,
+    ) -> Subscription {
+        let progress = Progress {
+            completed: self.progress.subscribe(),
+            published: self.changes.clone(),
+        };
+        self.settings = Some(settings);
+        self.version = version;
+        self.error = error;
+        self.recovery = recovery;
+        Subscription {
+            input: Box::new(self),
+            progress,
+        }
+    }
+
     pub async fn next_batch(
         &mut self,
         limit: usize,
@@ -463,27 +552,18 @@ impl Cursor {
                 route: self.route.clone(),
                 expected: after,
                 through,
+                progress: self.progress.clone(),
+                abandoned: self.abandoned.clone(),
+                acknowledged: false,
+                error: self.error.clone(),
+                recovery: self.recovery.clone(),
             },
         )))
     }
 
-    pub fn position(&self) -> u64 {
-        self.read
-    }
+    #[cfg(test)]
     pub fn completed_position(&self) -> u64 {
         self.completed
-    }
-    /// Terminal handling can aggregate its fully handled contiguous read prefix.
-    pub fn pending_prefix(&self) -> Delivery<()> {
-        Delivery::new(
-            (),
-            HeadCompletion {
-                journal: self.journal.clone(),
-                route: self.route.clone(),
-                expected: self.completed,
-                through: self.read,
-            },
-        )
     }
 
     pub async fn rewind(&mut self) -> anyhow::Result<()> {
@@ -499,23 +579,115 @@ impl Cursor {
             })
             .await?;
         self.read = self.completed;
+        self.progress.send_replace(self.completed);
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn changed(&mut self) {
         let _ = self.changes.changed().await;
     }
 }
 
 #[async_trait::async_trait]
-impl super::delivery::InputPort for Cursor {
+impl InputPort for Cursor {
     type Item = Vec<SpanOp>;
     async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
-        loop {
-            if let Some(delivery) = self.next_batch(128).await? {
-                return Ok(Some(delivery));
+        let result = self.receive_managed().await;
+        match result {
+            Ok(delivery) => Ok(Some(delivery)),
+            Err(error) => {
+                let error = match error.downcast::<Failure>() {
+                    Ok(failure) => return Err(anyhow::Error::new(failure)),
+                    Err(error) => error,
+                };
+                let failure = Failure::storage(&error, &self.version, 0).at(self.completed + 1);
+                // An input failure has no delivery receipt to report through.
+                // Its source still owns persistence of the recovery evidence.
+                if let Err(error) = self
+                    .journal
+                    .set_failure(&self.route, Some(serde_json::to_string(&failure)?))
+                    .await
+                {
+                    tracing::warn!(%error, "input recovery evidence could not be persisted");
+                }
+                Err(anyhow::Error::new(failure))
             }
-            self.changed().await;
+        }
+    }
+}
+
+impl Cursor {
+    async fn receive_managed(&mut self) -> anyhow::Result<Delivery<Vec<SpanOp>>> {
+        let mut acknowledgements = self.progress.subscribe();
+        loop {
+            if self.abandoned.load(Ordering::Acquire) {
+                self.rewind().await?;
+                self.abandoned.store(false, Ordering::Release);
+            }
+            self.completed = *self.progress.borrow();
+            self.read = self.read.max(self.completed);
+            let config = self
+                .settings
+                .as_ref()
+                .map(|settings| settings.borrow().clone());
+            if !self.restored {
+                if let Some(raw) = self.journal.failure(&self.route).await? {
+                    let failure = match serde_json::from_str::<Failure>(&raw) {
+                        Ok(failure) => failure,
+                        Err(error) => match &config {
+                            Some(config) => Failure::legacy(raw, self.completed + 1, config),
+                            None => return Err(error.into()),
+                        },
+                    };
+                    if matches!(failure.boundary, Boundary::Completion)
+                        && self.completed >= failure.through.unwrap_or(failure.position)
+                    {
+                        self.journal.set_failure(&self.route, None).await?;
+                    } else {
+                        *self.error.lock() = Some(failure.message());
+                        *self.recovery.lock() = Some(failure.info(false));
+                        if matches!(
+                            (Recovery {
+                                config: config.as_ref(),
+                                version: &self.version
+                            })
+                            .process(&failure)
+                            .await,
+                            RecoveryOutcome::Waiting
+                        ) {
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
+                        *self.recovery.lock() = Some(failure.info(true));
+                    }
+                }
+            }
+            if let Some(config) = &config {
+                if let Err(error) = self.journal.bind(&self.route, config).await {
+                    if error.downcast_ref::<BindingChanged>().is_some() {
+                        let failure =
+                            Failure::legacy(error.to_string(), self.completed + 1, config);
+                        self.journal
+                            .set_failure(&self.route, Some(serde_json::to_string(&failure)?))
+                            .await?;
+                        return Err(anyhow::Error::new(failure));
+                    }
+                    return Err(error);
+                }
+            }
+            if let Some(delivery) = self.next_batch(128).await? {
+                if self.abandoned.load(Ordering::Acquire) {
+                    drop(delivery);
+                    continue;
+                }
+                self.restored = true;
+                return Ok(delivery);
+            }
+            tokio::select! {
+                _ = self.changes.changed() => {},
+                _ = acknowledgements.changed() => {},
+            }
         }
     }
 }
@@ -525,6 +697,19 @@ struct HeadCompletion {
     route: String,
     expected: u64,
     through: u64,
+    progress: watch::Sender<u64>,
+    abandoned: Arc<AtomicBool>,
+    acknowledged: bool,
+    error: Arc<Mutex<Option<String>>>,
+    recovery: Arc<Mutex<Option<RecoveryInfo>>>,
+}
+impl Drop for HeadCompletion {
+    fn drop(&mut self) {
+        if !self.acknowledged {
+            self.abandoned.store(true, Ordering::Release);
+            self.progress.send_modify(|_| {});
+        }
+    }
 }
 #[async_trait::async_trait]
 impl Completion for HeadCompletion {
@@ -538,7 +723,7 @@ impl Completion for HeadCompletion {
                         r.get(0)
                     })?;
                 if head >= through {
-                    return Ok(());
+                    return Ok(head);
                 }
                 anyhow::ensure!(head >= expected, "completion cannot skip unresolved input");
                 tx.execute(
@@ -546,8 +731,24 @@ impl Completion for HeadCompletion {
                     params![through, route],
                 )?;
                 tx.commit()?;
-                Ok(())
+                Ok(through)
             })
+            .await
+            .map(|head| {
+                self.acknowledged = true;
+                self.progress.send_replace(head);
+                *self.error.lock() = None;
+                *self.recovery.lock() = None;
+            })
+    }
+
+    async fn failed(&mut self, failure: &mut Failure) -> anyhow::Result<()> {
+        failure.position = self.expected + 1;
+        failure.through = Some(self.through);
+        *self.error.lock() = Some(failure.message());
+        *self.recovery.lock() = Some(failure.info(false));
+        self.journal
+            .set_failure(&self.route, Some(serde_json::to_string(failure)?))
             .await
     }
 }
@@ -577,6 +778,40 @@ mod tests {
             tags: vec![name.into()],
             ..SessionRoute::default()
         }
+    }
+
+    #[tokio::test]
+    async fn input_port_replays_abandoned_delivery_without_cursor_control() {
+        use crate::pipeline::delivery::InputPort;
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        journal.begin(1, true).await.unwrap();
+        journal.append(1, &[op("one")]).await.unwrap();
+        journal.commit(1).await.unwrap();
+        let mut input: Box<dyn InputPort<Item = Vec<SpanOp>>> =
+            Box::new(journal.subscribe(&route("a"), 0).await.unwrap());
+        let delivery = input.receive().await.unwrap().unwrap();
+        drop(delivery);
+        // Cancel a receive while its storage read is pending, as a concurrent
+        // configuration update does. The replay obligation must survive it.
+        let storage = journal.connection.lock();
+        let mut cancelled = Box::pin(input.receive());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(cancelled.as_mut(), &mut context).is_pending());
+        drop(cancelled);
+        drop(storage);
+        let replay = tokio::time::timeout(std::time::Duration::from_millis(250), input.receive())
+            .await
+            .expect("unacknowledged input must be replayed")
+            .unwrap()
+            .unwrap();
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &replay.value()[0];
+        assert_eq!(row.name, "one");
+        replay.into_completed().await.ok().unwrap();
+        assert!(journal.route_complete(&route("a"), 1).await.unwrap());
+        assert!(!journal.route_complete(&route("b"), 1).await.unwrap());
     }
 
     #[tokio::test]
