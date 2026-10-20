@@ -25,6 +25,8 @@ impl TranslatorFactory for crate::agents::Pi {
             external_parent: None,
             opened: false,
             legacy_root_adopted: false,
+            root_model: None,
+            root_cwd: None,
             turn: None,
             turn_output: None,
             last_turn_output: None,
@@ -329,6 +331,8 @@ struct PiTranslator {
     // are initialization input only. Later reopen/replay events must retain
     // the daemon's accumulated counters and deterministic turn sequence.
     legacy_root_adopted: bool,
+    root_model: Option<String>,
+    root_cwd: Option<String>,
     /// The open turn's span id and the skills its prompt explicitly requested.
     turn: Option<(String, Vec<String>)>,
     turn_output: Option<Value>,
@@ -351,6 +355,9 @@ impl AgentTranslator for PiTranslator {
         self.last_ts = self.last_ts.max(envelope.ts_ms);
         let event = envelope.payload.get("event").unwrap_or(&envelope.payload);
         let mut ops = self.ensure_root(envelope, ctx);
+        if let Some(cwd) = envelope.payload.get("cwd").and_then(Value::as_str) {
+            self.root_cwd = Some(cwd.to_string());
+        }
         match envelope.event.as_str() {
             "before_agent_start" => {
                 if let Some(event) = decode(event) {
@@ -359,7 +366,13 @@ impl AgentTranslator for PiTranslator {
             }
             "context" => {
                 if let Some(event) = decode(event) {
-                    let selected = envelope.payload.get("model").and_then(decode);
+                    let selected = envelope
+                        .payload
+                        .get("model")
+                        .and_then(decode::<SelectedModel>);
+                    if let Some(model) = &selected {
+                        self.root_model = Some(format!("{}/{}", model.provider, model.id));
+                    }
                     self.capture_context(event, selected, envelope.ts_ms);
                 }
             }
@@ -445,6 +458,9 @@ impl AgentTranslator for PiTranslator {
                 ops.push(self.close_root(envelope.ts_ms));
             }
             _ => {}
+        }
+        if let Some(update) = self.root_context_update() {
+            ops.push(update);
         }
         let cwd = envelope.payload.get("cwd").and_then(Value::as_str);
         self.git.enrich_rows(cwd, &mut ops);
@@ -543,6 +559,19 @@ impl PiTranslator {
         metadata.insert("source".into(), json!("pi"));
         metadata.insert("_bt_defer_root".into(), json!(true));
         metadata.insert("username".into(), json!(local_username()));
+        if let Some(cwd) = envelope.payload.get("cwd").and_then(Value::as_str) {
+            self.root_cwd = Some(cwd.to_string());
+            metadata.insert("cwd".into(), json!(cwd));
+        }
+        if let Some(model) = envelope
+            .payload
+            .get("model")
+            .and_then(decode::<SelectedModel>)
+        {
+            let model = format!("{}/{}", model.provider, model.id);
+            self.root_model = Some(model.clone());
+            metadata.insert("model".into(), json!(model));
+        }
         metadata.insert("pi_version".into(), json!(envelope.source_version));
         metadata.insert(
             "extension_version".into(),
@@ -579,6 +608,30 @@ impl PiTranslator {
             tags: None,
             ..Default::default()
         })]
+    }
+
+    fn root_context_update(&self) -> Option<SpanOp> {
+        if !self.opened
+            || self.legacy_root_adopted
+            || (self.root_model.is_none() && self.root_cwd.is_none())
+        {
+            return None;
+        }
+        let mut metadata = Map::new();
+        if let Some(model) = &self.root_model {
+            metadata.insert("model".into(), json!(model));
+        }
+        if let Some(cwd) = &self.root_cwd {
+            metadata.insert("cwd".into(), json!(cwd));
+        }
+        Some(SpanOp::Merge(SpanRow {
+            span_id: self.root_span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
+            parent_span_ids: self.external_parent.clone().into_iter().collect(),
+            input: Some(json!({"model": self.root_model, "cwd": self.root_cwd})),
+            metadata: Some(Value::Object(metadata)),
+            ..Default::default()
+        }))
     }
 
     fn start_turn(&mut self, event: BeforeAgentStart, ts: i64) -> Vec<SpanOp> {
