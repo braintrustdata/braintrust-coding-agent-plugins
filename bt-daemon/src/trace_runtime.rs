@@ -666,6 +666,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             run_serve(serve_args, serve_options(&host)).await
         }
         TraceCommand::Hook(hook_args) => {
+            crate::delegate_hook_executable()?;
             // Cursor permission hooks must emit a response on this production
             // entry point too. Keep it outside capture and route resolution so
             // tracing failures cannot leave Cursor waiting on an empty reply.

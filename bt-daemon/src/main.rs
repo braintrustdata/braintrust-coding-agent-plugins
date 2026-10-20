@@ -263,6 +263,10 @@ async fn main() {
             }
         }
         Command::Hook { args, route } => {
+            if let Err(error) = bt_daemon::delegate_hook_executable() {
+                eprintln!("bt-daemon hook: {error:#}");
+                std::process::exit(1);
+            }
             if let Err(e) = run_hook(args, route.into_route(), host_info()).await {
                 eprintln!("bt-daemon hook: {e}");
                 std::process::exit(1);
