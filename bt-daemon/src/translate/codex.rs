@@ -726,6 +726,7 @@ impl CodexTranslator {
                     "user_message" => self.set_turn_input(scope, payload, ops),
                     "token_count" => self.close_llm_with_tokens(scope, payload, ts, ops),
                     "task_complete" => self.close_turn(scope, payload, ts, ops),
+                    "turn_aborted" => self.abort_turn(scope, payload, ts, ops),
                     _ => {}
                 }
             }
@@ -1285,6 +1286,22 @@ impl CodexTranslator {
     }
 
     fn close_turn(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
+        self.finish_turn(scope, payload, ts, None, ops);
+    }
+
+    fn abort_turn(&mut self, scope: &mut Scope, payload: &Value, ts: i64, ops: &mut Vec<SpanOp>) {
+        let reason = str_field(payload, "reason").unwrap_or_else(|| "turn_aborted".into());
+        self.finish_turn(scope, payload, ts, Some(reason.as_str()), ops);
+    }
+
+    fn finish_turn(
+        &mut self,
+        scope: &mut Scope,
+        payload: &Value,
+        ts: i64,
+        interruption_reason: Option<&str>,
+        ops: &mut Vec<SpanOp>,
+    ) {
         let requested_turn_id = str_field(payload, "turn_id");
         let turn_index = requested_turn_id
             .as_deref()
@@ -1315,19 +1332,32 @@ impl CodexTranslator {
             } else {
                 Some(llm_output(&llm.output))
             };
+            let metadata = if let Some(reason) = interruption_reason {
+                json!({
+                    "usage_unavailable_reason": "codex_turn_aborted_before_token_count",
+                    "outcome": "interrupted",
+                    "termination_reason": reason,
+                })
+            } else {
+                json!({
+                    "usage_unavailable_reason": "codex_transcript_missing_token_count"
+                })
+            };
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: llm.span_id,
                 root_span_id: self.effective_root_span_id.clone(),
                 parent_span_ids: vec![turn_span_id],
-                end_ms: Some(llm.last_output_ms),
+                end_ms: Some(if interruption_reason.is_some() {
+                    ts.max(llm.start_ms)
+                } else {
+                    llm.last_output_ms
+                }),
                 output,
-                metadata: Some(json!({
-                    "usage_unavailable_reason": "codex_transcript_missing_token_count"
-                })),
+                metadata: Some(metadata),
                 ..Default::default()
             }));
         }
-        self.close_tools_for_turn(scope, &turn_id, Some(ts), ops);
+        self.close_tools_for_turn(scope, &turn_id, Some(ts), interruption_reason, ops);
         let turn = scope.open_turns.remove(turn_index);
         scope.last_turn_end_ms = Some(ts);
         let output = str_field(payload, "last_agent_message")
@@ -1336,12 +1366,15 @@ impl CodexTranslator {
         if let Some(output) = &output {
             scope.last_turn_output = Some(output.clone());
         }
+        let metadata = interruption_reason
+            .map(|reason| json!({ "outcome": "interrupted", "termination_reason": reason }));
         ops.push(SpanOp::Merge(SpanRow {
             span_id: turn.span_id,
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: vec![scope.turn_parent_span_id.clone()],
             end_ms: Some(ts),
             output,
+            metadata,
             ..Default::default()
         }));
     }
@@ -1351,6 +1384,7 @@ impl CodexTranslator {
         scope: &mut Scope,
         turn_id: &str,
         end_ms: Option<i64>,
+        interruption_reason: Option<&str>,
         ops: &mut Vec<SpanOp>,
     ) {
         let parent_span_ids = self.turn_parent_span_ids(turn_id);
@@ -1362,6 +1396,13 @@ impl CodexTranslator {
             .collect();
         for call_id in call_ids {
             if let Some((span_id, _, start_ms)) = scope.open_tools.remove(&call_id) {
+                let mut metadata = tool_approval_metadata(Some(ToolApproval::Approved));
+                if let Some(reason) = interruption_reason {
+                    if let Some(fields) = metadata.as_object_mut() {
+                        fields.insert("outcome".into(), json!("interrupted"));
+                        fields.insert("termination_reason".into(), json!(reason));
+                    }
+                }
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id,
                     root_span_id: self.effective_root_span_id.clone(),
@@ -1370,8 +1411,10 @@ impl CodexTranslator {
                         || start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS),
                         |end| end.min(start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS)),
                     )),
-                    metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
-                    error: Some(MISSING_TOOL_OUTPUT_ERROR.to_string()),
+                    metadata: Some(metadata),
+                    error: interruption_reason
+                        .is_none()
+                        .then(|| MISSING_TOOL_OUTPUT_ERROR.to_string()),
                     ..Default::default()
                 }));
             }

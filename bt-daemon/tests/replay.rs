@@ -477,9 +477,9 @@ async fn imports_native_codex_rollout_through_codex_translator() {
             json!({"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-test"}}),
             json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
             json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"list files"}}),
-            json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"command\":\"ls\"}"}}),
-            json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"README.md"}}),
-            json!({"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done"}}),
+            json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working"}]}}),
+            json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"command\":\"sleep 10\"}"}}),
+            json!({"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}}),
             json!({"timestamp":"2026-01-01T00:00:08Z","type":"turn_context","payload":{"model":"gpt-test"}}),
             json!({"timestamp":"2026-01-01T00:00:09Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}),
             json!({"timestamp":"2026-01-01T00:00:10Z","type":"event_msg","payload":{"type":"user_message","message":"show status"}}),
@@ -519,6 +519,44 @@ async fn imports_native_codex_rollout_through_codex_translator() {
         .collect::<Vec<_>>();
     assert!(turn_ids.contains(&"turn-1"));
     assert!(turn_ids.contains(&"turn-2"));
+    let interrupted_turn_id = rows
+        .iter()
+        .find(|row| row.pointer("/Insert/name").and_then(Value::as_str) == Some("turn: turn-1"))
+        .and_then(|row| row.pointer("/Insert/span_id"))
+        .and_then(Value::as_str)
+        .unwrap();
+    let interrupted_turn = rows
+        .iter()
+        .find(|row| {
+            row.pointer("/Merge/span_id").and_then(Value::as_str) == Some(interrupted_turn_id)
+                && row
+                    .pointer("/Merge/metadata/outcome")
+                    .and_then(Value::as_str)
+                    == Some("interrupted")
+        })
+        .unwrap();
+    assert_eq!(
+        interrupted_turn
+            .pointer("/Merge/metadata/outcome")
+            .and_then(Value::as_str),
+        Some("interrupted")
+    );
+    assert_eq!(
+        interrupted_turn
+            .pointer("/Merge/metadata/termination_reason")
+            .and_then(Value::as_str),
+        Some("interrupted")
+    );
+    assert!(
+        rows.iter().any(|row| {
+            row.pointer("/Merge/metadata/outcome")
+                .and_then(Value::as_str)
+                == Some("interrupted")
+                && row.pointer("/Merge/end_ms").and_then(Value::as_i64) == Some(1_767_225_607_000)
+                && row.pointer("/Merge/error").is_none()
+        }),
+        "open model/tool work should close at the native abort boundary without an error"
+    );
 }
 
 /// Two `bt trace import` invocations for the same session id, each headed to
