@@ -147,8 +147,13 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
                 if update.output.is_some() {
                     row.output = update.output;
                 }
-                if update.metadata.is_some() {
-                    row.metadata = update.metadata;
+                if let Some(update_metadata) = update.metadata {
+                    match (row.metadata.as_mut(), update_metadata) {
+                        (Some(Value::Object(existing)), Value::Object(update)) => {
+                            existing.extend(update);
+                        }
+                        (_, update) => row.metadata = Some(update),
+                    }
                 }
                 if update.error.is_some() {
                     row.error = update.error;
@@ -1115,7 +1120,7 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
         event(
             "StopFailure",
             40,
-            json!({"session_id":"lifecycle","message":"model process exited"}),
+            json!({"session_id":"lifecycle","message":"provider stream interrupted unexpectedly"}),
         ),
     ] {
         ops.extend(translator.handle(&envelope, &ctx).unwrap());
@@ -1133,7 +1138,81 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
         json!("explicit")
     );
     let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
-    assert_eq!(turn.error.as_deref(), Some("model process exited"));
+    assert_eq!(
+        turn.error.as_deref(),
+        Some("provider stream interrupted unexpectedly")
+    );
+    assert_eq!(turn.metadata.as_ref().unwrap()["outcome"], "errored");
+}
+
+#[test]
+fn claude_post_compact_starts_a_root_when_it_is_the_first_trace_event() {
+    let mut translator = Registry::default_agents().create("claude-code", "compact-only");
+    let ctx = SessionCtx {
+        session_id: "compact-only".into(),
+        config: None,
+    };
+    let ops = translator
+        .handle(
+            &claude_event(
+                "compact-only",
+                "PostCompact",
+                10,
+                json!({"cwd":"/workspace/demo"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let rows = reduce(ops);
+    let root = rows
+        .values()
+        .find(|row| row.name == "Claude Code: demo")
+        .expect("PostCompact creates the session root");
+    let compaction = rows
+        .values()
+        .find(|row| row.name == "Compaction")
+        .expect("PostCompact creates a compaction span");
+    assert_eq!(compaction.root_span_id, root.root_span_id);
+    assert_eq!(compaction.parent_span_ids.first(), Some(&root.span_id));
+}
+
+#[test]
+fn claude_user_cancellation_reason_is_not_recorded_as_an_error() {
+    let mut translator = Registry::default_agents().create("claude-code", "user-cancel");
+    let ctx = SessionCtx {
+        session_id: "user-cancel".into(),
+        config: None,
+    };
+    let mut ops = translator
+        .handle(
+            &claude_event(
+                "user-cancel",
+                "UserPromptSubmit",
+                10,
+                json!({"prompt":"go"}),
+            ),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(
+        translator
+            .handle(
+                &claude_event(
+                    "user-cancel",
+                    "StopFailure",
+                    20,
+                    json!({"message":"Request interrupted by user"}),
+                ),
+                &ctx,
+            )
+            .unwrap(),
+    );
+
+    let rows = reduce(ops);
+    let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    assert_eq!(turn.error, None);
+    assert_eq!(turn.metadata.as_ref().unwrap()["outcome"], "interrupted");
 }
 
 /// A PreToolUse hook may rewrite a call's arguments with `updatedInput`, and
@@ -2254,6 +2333,15 @@ fn claude_post_compact_replaces_old_prefix_and_preserves_recent_window() {
     }
 
     let rows = reduce(ops);
+    let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    let compaction = rows
+        .values()
+        .find(|row| row.name == "Compaction")
+        .expect("PostCompact emits a compaction span");
+    assert_eq!(
+        compaction.turn_span_id.as_deref(),
+        Some(turn.span_id.as_str())
+    );
     let llm = rows
         .values()
         .find(|row| {

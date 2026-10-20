@@ -293,6 +293,7 @@ struct ClaudeTranslator {
     current_cwd: Option<String>,
     last_turn_cwd: Option<String>,
     last_turn_output: Option<Value>,
+    session_status: Option<String>,
     last_ts_ms: i64,
 }
 
@@ -340,6 +341,7 @@ impl ClaudeTranslator {
             current_cwd: None,
             last_turn_cwd: None,
             last_turn_output: None,
+            session_status: None,
             last_ts_ms: 0,
         }
     }
@@ -444,12 +446,14 @@ impl ClaudeTranslator {
                 | "PostToolUse"
                 | "PostToolUseFailure"
                 | "PermissionDenied"
+                | "PostCompact"
                 | "SubagentStart"
                 | "SubagentStop"
         )
     }
 
     fn open_turn(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
+        self.session_status = Some("running".into());
         if let Some(old) = self.turn.take() {
             self.close_pending_tools(
                 &old.id,
@@ -501,6 +505,9 @@ impl ClaudeTranslator {
         self.pending_skills.clear();
         if let Some(permission_mode) = &self.permission_mode {
             metadata.insert("permission_mode".into(), json!(permission_mode));
+        }
+        if let Some(kind) = turn_input_kind(&event.payload) {
+            metadata.insert("input_kind".into(), json!(kind));
         }
         if let Some((trigger, task_id)) = continuation {
             metadata.insert("turn_trigger".into(), json!(trigger));
@@ -1149,6 +1156,16 @@ impl ClaudeTranslator {
         let Some(turn_id) = self.turn.as_ref().map(|turn| turn.id.clone()) else {
             return;
         };
+        let interrupted = error.as_deref().is_some_and(is_interrupt_reason);
+        let outcome = if interrupted {
+            "interrupted"
+        } else if error.is_some() {
+            "errored"
+        } else {
+            "completed"
+        };
+        self.session_status = Some(outcome.to_string());
+        let error = (!interrupted).then_some(error).flatten();
         self.emit_main(&turn_id, ops);
         self.close_pending_tools(
             &turn_id,
@@ -1174,6 +1191,7 @@ impl ClaudeTranslator {
             late_merge_key: Some(format!("execution:stop:{}", event.ts_ms)),
             output,
             error,
+            metadata: Some(json!({"outcome": outcome})),
             ..Default::default()
         }));
         self.last_turn_cwd = turn.cwd;
@@ -1226,12 +1244,21 @@ impl ClaudeTranslator {
             parent_span_ids: self.session_parent_span_ids.clone(),
             end_ms: Some(end_ms),
             output: self.last_turn_output.clone(),
+            metadata: self
+                .session_status
+                .as_ref()
+                .map(|status| json!({"session_status": status})),
             late_merge_key: Some(format!("session:stop:{end_ms}")),
             ..Default::default()
         }));
     }
 
     fn end_session(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
+        if self.turn.is_some() {
+            self.session_status = Some("interrupted".into());
+        } else if self.session_status.is_none() {
+            self.session_status = Some("completed".into());
+        }
         if let Some(turn_id) = self
             .turn
             .as_ref()
@@ -1254,6 +1281,7 @@ impl ClaudeTranslator {
                 parent_span_ids: vec![turn.parent_id],
                 end_ms: Some(end_ms),
                 late_merge_key: Some(format!("execution:stop:{}", event.ts_ms)),
+                metadata: Some(json!({"outcome":"interrupted"})),
                 ..Default::default()
             }));
             self.last_turn_id = Some(turn.id);
@@ -1334,17 +1362,32 @@ impl AgentTranslator for ClaudeTranslator {
             ),
             "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, None, &mut ops),
             "PostCompact" => {
-                if let Some(parent) = self
+                let turn_span_id = self
                     .turn
                     .as_ref()
                     .map(|turn| turn.id.clone())
-                    .or_else(|| self.last_turn_id.clone())
-                {
+                    .or_else(|| self.last_turn_id.clone());
+                if let Some(parent) = &turn_span_id {
                     // PostCompact is the durable point at which Claude's
                     // synthetic compact-summary transcript record becomes the
                     // first message in the active history window.
-                    self.emit_main(&parent, &mut ops);
+                    self.emit_main(parent, &mut ops);
                 }
+                ops.push(SpanOp::Insert(SpanRow {
+                    span_id: ids::span_id(&self.session_id, &format!("compaction:{}", event.ts_ms)),
+                    root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: vec![turn_span_id
+                        .clone()
+                        .unwrap_or_else(|| self.session_span_id.clone())],
+                    turn_span_id,
+                    name: "Compaction".into(),
+                    span_type: SpanType::Task,
+                    start_ms: Some(event.ts_ms),
+                    end_ms: Some(event.ts_ms),
+                    metadata: Some(json!({"event":"compaction"})),
+                    tags: Some(vec!["compaction".into()]),
+                    ..Default::default()
+                }));
             }
             "SubagentStart" => {
                 if let Some(hook) = decode::<SubagentHook>(&event.payload) {
@@ -1362,12 +1405,14 @@ impl AgentTranslator for ClaudeTranslator {
                 }
             }
             "Stop" => self.stop_turn(event, None, &mut ops),
-            "StopFailure" => self.stop_turn(
-                event,
-                tool_failure_text(&event.payload)
-                    .or_else(|| Some("Claude Code turn failed".into())),
-                &mut ops,
-            ),
+            "StopFailure" => {
+                self.stop_turn(
+                    event,
+                    tool_failure_text(&event.payload)
+                        .or_else(|| Some("Claude Code turn failed".into())),
+                    &mut ops,
+                );
+            }
             "SessionEnd" => self.end_session(event, &mut ops),
             _ => {}
         }
@@ -1387,6 +1432,9 @@ impl AgentTranslator for ClaudeTranslator {
 
     fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let end_ms = self.last_ts_ms;
+        if self.turn.is_some() && self.session_status.as_deref() == Some("running") {
+            self.session_status = Some("interrupted".into());
+        }
         let mut ops = Vec::new();
         if let Some(parent) = self
             .turn
@@ -1414,7 +1462,11 @@ impl AgentTranslator for ClaudeTranslator {
                 parent_span_ids: vec![turn.parent_id],
                 end_ms: Some(turn_end_ms),
                 late_merge_key: Some(format!("execution:stop:{end_ms}")),
-                error: Some("Session ended before turn completion".into()),
+                metadata: Some(json!({
+                    "incomplete": true,
+                    "outcome": "interrupted",
+                    "termination_reason": "session_finalized_before_turn_completion"
+                })),
                 ..Default::default()
             }));
         }
@@ -2490,6 +2542,50 @@ fn tool_failure_text(payload: &Value) -> Option<String> {
     .into_iter()
     .flatten()
     .find_map(nonempty_error_text)
+}
+
+fn is_interrupt_reason(reason: &str) -> bool {
+    let reason = reason
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase();
+    matches!(
+        reason.as_str(),
+        "request interrupted by user"
+            | "interrupted by user"
+            | "user interrupted"
+            | "request cancelled by user"
+            | "request canceled by user"
+            | "cancelled by user"
+            | "canceled by user"
+            | "user cancelled"
+            | "user canceled"
+            | "user aborted"
+            | "aborted by user"
+    )
+}
+
+fn turn_input_kind(payload: &Value) -> Option<&'static str> {
+    let source = payload
+        .get("prompt_source")
+        .or_else(|| payload.get("promptSource"))
+        .or_else(|| payload.get("input_kind"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    match source.as_deref() {
+        Some("human" | "typed" | "user") => Some("human"),
+        Some("quick_reply" | "quick-reply") => Some("quick_reply"),
+        Some("task_notification" | "task-notification") => Some("task_notification"),
+        Some("scheduled" | "scheduled_wake" | "scheduled-wake") => Some("scheduled_wake"),
+        _ if payload
+            .get("prompt")
+            .and_then(Value::as_str)
+            .is_some_and(|prompt| prompt.trim_start().starts_with("<task-notification")) =>
+        {
+            Some("task_notification")
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
