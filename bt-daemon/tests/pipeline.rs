@@ -3681,12 +3681,10 @@ async fn startup_restores_a_durable_head_absent_from_captured_routes() {
 }
 
 #[tokio::test]
-async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+async fn clean_shutdown_keeps_claude_roots_resumable_for_every_route() {
     struct Shared {
-        started: AtomicUsize,
-        release: tokio::sync::Semaphore,
-        delivered: Mutex<HashSet<String>>,
+        roots: Mutex<HashSet<String>>,
+        terminal_roots: Mutex<HashSet<String>>,
     }
     struct Factory(Arc<Shared>);
     struct RouteSink {
@@ -3708,14 +3706,17 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
         }
         async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
             if ops.iter().any(|op| match op {
+                SpanOp::Insert(row) | SpanOp::Merge(row) => row.parent_span_ids.is_empty(),
+            }) {
+                self.shared.roots.lock().unwrap().insert(self.tag.clone());
+            }
+            if ops.iter().any(|op| match op {
                 SpanOp::Insert(row) | SpanOp::Merge(row) => {
                     row.parent_span_ids.is_empty() && row.end_ms.is_some()
                 }
             }) {
-                self.shared.started.fetch_add(1, Ordering::SeqCst);
-                self.shared.release.acquire().await.unwrap().forget();
                 self.shared
-                    .delivered
+                    .terminal_roots
                     .lock()
                     .unwrap()
                     .insert(self.tag.clone());
@@ -3730,9 +3731,8 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
     let shared = Arc::new(Shared {
-        started: AtomicUsize::new(0),
-        release: tokio::sync::Semaphore::new(0),
-        delivered: Mutex::new(HashSet::new()),
+        roots: Mutex::new(HashSet::new()),
+        terminal_roots: Mutex::new(HashSet::new()),
     });
     let mut opts = debug_serve_options("test", &data_dir);
     opts.auth_provider = Some(Arc::new(TestAuthProvider {
@@ -3764,28 +3764,20 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
             .unwrap()
             .flushed
     );
-    let gate = shared.clone();
-    let release = tokio::spawn(async move {
-        let all_started = tokio::time::timeout(Duration::from_secs(1), async {
-            while gate.started.load(Ordering::SeqCst) < 2 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        gate.release.add_permits(2);
-        all_started.unwrap();
-    });
     shutdown(&socket).await;
     handle.await.unwrap();
-    release.await.unwrap();
     assert_eq!(
-        *shared.delivered.lock().unwrap(),
+        *shared.roots.lock().unwrap(),
         HashSet::from(["left".into(), "right".into()])
+    );
+    assert!(
+        shared.terminal_roots.lock().unwrap().is_empty(),
+        "daemon shutdown must not mark a still-open Claude session as ended"
     );
     let (head, tail) = head_and_tail(&data_dir);
     assert_eq!(
         head, tail,
-        "every route durably completed the retirement output"
+        "every route durably completed the retirement boundary"
     );
 }
 
