@@ -285,6 +285,95 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
 }
 
 #[test]
+fn codex_turn_aborted_closes_open_work_as_interrupted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let path = transcript.to_str().unwrap();
+    for record in [
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
+                "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+                "payload": { "type": "message", "role": "assistant",
+                             "content": [{ "type": "output_text", "text": "Working" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+                "payload": { "type": "function_call", "call_id": "c1", "name": "shell",
+                             "arguments": "{\"command\":\"sleep 10\"}",
+                             "metadata": { "turn_id": "t1" } } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+                "payload": { "type": "turn_aborted", "turn_id": "t1", "reason": "interrupted" } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t2" } }),
+        json!({ "timestamp": "2026-01-01T00:00:07Z", "type": "response_item",
+                "payload": { "type": "message", "role": "assistant",
+                             "content": [{ "type": "output_text", "text": "Still thinking" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:08Z", "type": "event_msg",
+                "payload": { "type": "turn_aborted", "turn_id": "t2", "reason": "interrupted" } }),
+    ] {
+        append(&transcript, record);
+    }
+
+    let mut translator = Registry::default_agents().create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let mut ops = translator
+        .handle(&envelope("s", "SessionStart", path, json!({})), &ctx)
+        .unwrap();
+    ops.extend(translator.flush(&ctx).unwrap());
+    assert_merges_preserve_insert_identity(&ops);
+    let rows = reduce(ops);
+    let turn = find(&rows, SpanType::Task, "turn: t1");
+    let abort_ms = 1_767_225_605_000;
+    assert_eq!(turn.end_ms, Some(abort_ms));
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["outcome"],
+        json!("interrupted")
+    );
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["termination_reason"],
+        json!("interrupted")
+    );
+    assert_eq!(turn.error, None, "intentional interruption is not an error");
+
+    let active_turn = find(&rows, SpanType::Task, "turn: t2");
+    let active_llm = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm && row.parent_span_ids.contains(&active_turn.span_id)
+        })
+        .unwrap();
+    assert_eq!(active_llm.end_ms, Some(abort_ms + 3_000));
+
+    let llm = rows
+        .values()
+        .find(|row| row.span_type == SpanType::Llm && row.parent_span_ids.contains(&turn.span_id))
+        .unwrap();
+    assert_eq!(
+        llm.end_ms,
+        Some(abort_ms - 1_000),
+        "the model span ends when it emits the tool call, not when the tool is aborted"
+    );
+    assert_eq!(
+        llm.metadata.as_ref().unwrap()["outcome"],
+        json!("interrupted")
+    );
+
+    let tool = find(&rows, SpanType::Tool, "shell");
+    assert_eq!(tool.end_ms, Some(abort_ms));
+    assert_eq!(
+        tool.metadata.as_ref().unwrap()["outcome"],
+        json!("interrupted")
+    );
+    assert_eq!(
+        tool.error, None,
+        "intentional interruption is not a tool failure"
+    );
+}
+
+#[test]
 fn codex_root_preserves_canonical_source_across_lifecycle_events() {
     let tmp = tempfile::tempdir().unwrap();
 
