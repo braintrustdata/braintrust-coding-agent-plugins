@@ -147,9 +147,9 @@ pub trait AgentTranslator: Send {
         Ok(Vec::new())
     }
 
-    /// Finish the logical agent session and defensively close work whose
-    /// terminal native event never arrived. Called only when the actor itself
-    /// is shutting down or being retired.
+    /// Finish a terminal agent invocation and defensively close work whose
+    /// terminal native event never arrived. Resource retirement uses
+    /// `checkpoint`, since inactivity alone does not end the native session.
     fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let _ = ctx;
         Ok(Vec::new())

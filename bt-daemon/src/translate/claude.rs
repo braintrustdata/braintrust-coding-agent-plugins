@@ -258,6 +258,7 @@ struct ClaudeTranslator {
     session_parent_span_ids: Vec<String>,
     root_open: bool,
     root_end_ms: Option<i64>,
+    root_generation: u32,
     turn: Option<Turn>,
     last_turn_id: Option<String>,
     turn_count: u32,
@@ -307,6 +308,7 @@ impl ClaudeTranslator {
             session_parent_span_ids: Vec::new(),
             root_open: false,
             root_end_ms: None,
+            root_generation: 0,
             turn: None,
             last_turn_id: None,
             turn_count: 0,
@@ -355,6 +357,14 @@ impl ClaudeTranslator {
     ) {
         if self.root_open {
             return;
+        }
+        if self.root_end_ms.is_some() {
+            self.root_generation = self.root_generation.saturating_add(1);
+            let root = ids::span_id(&self.session_id, &format!("root:{}", self.root_generation));
+            self.session_span_id = root.clone();
+            self.root_span_id = root;
+            self.root_end_ms = None;
+            self.claude_version_logged = false;
         }
         self.root_open = true;
         let cwd = hook.cwd.clone().unwrap_or_default();
@@ -887,7 +897,6 @@ impl ClaudeTranslator {
         {
             self.extend_user_turn(&owner, event.ts_ms, ops);
         }
-        self.end_root(event.ts_ms, ops);
     }
 
     fn emit_main(&mut self, parent: &str, ops: &mut Vec<SpanOp>) {
@@ -1198,7 +1207,6 @@ impl ClaudeTranslator {
         self.last_user_turn_id = turn.user_turn_id;
         self.last_turn_id = Some(turn_id);
         self.pending_skills.clear();
-        self.end_root(event.ts_ms, ops);
     }
 
     fn close_pending_tools(
@@ -1288,6 +1296,7 @@ impl ClaudeTranslator {
             self.last_user_turn_id = turn.user_turn_id;
         }
         self.end_root(event.ts_ms, ops);
+        self.root_open = false;
         if let Some(pending) = &mut self.pending_emission {
             pending.clear_after = true;
         } else {
@@ -1450,7 +1459,6 @@ impl AgentTranslator for ClaudeTranslator {
                 root_span_id: self.root_span_id.clone(),
                 parent_span_ids: vec![tool.parent_id],
                 end_ms: Some(end_ms),
-                error: Some("Session ended before tool completion".into()),
                 ..Default::default()
             }));
         }
@@ -1483,11 +1491,11 @@ impl AgentTranslator for ClaudeTranslator {
                 root_span_id: self.root_span_id.clone(),
                 parent_span_ids: vec![subagent.parent_span_id],
                 end_ms: Some(end_ms),
-                error: Some("Session ended before subagent completion".into()),
                 ..Default::default()
             }));
         }
         self.end_root(end_ms, &mut ops);
+        self.root_open = false;
         if let Some(pending) = &mut self.pending_emission {
             pending.clear_after = true;
         } else {

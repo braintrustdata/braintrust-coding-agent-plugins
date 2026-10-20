@@ -549,8 +549,9 @@ impl Producer {
                     )
                 }
                 JournalRecord::Control(control) => {
-                    // Retirement exports defensive terminal updates but does not
-                    // close native state when rebuilding for later captured work.
+                    // Retirement releases daemon resources; it does not prove
+                    // that the native agent session ended. Keep translator
+                    // state resumable and only finalize explicit terminal runs.
                     if input <= self.committed && matches!(control.kind, ControlKind::Retire) {
                         self.position = input;
                         continue;
@@ -560,10 +561,11 @@ impl Producer {
                         .translator
                         .as_mut()
                         .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
-                    let ops = if !matches!(control.kind, ControlKind::Checkpoint) {
-                        translator.finalize_at(&ctx, &control.bounds)?
-                    } else {
-                        translator.checkpoint_at(&ctx, &control.bounds)?
+                    let ops = match control.kind {
+                        ControlKind::Finalize => translator.finalize_at(&ctx, &control.bounds)?,
+                        ControlKind::Checkpoint | ControlKind::Retire => {
+                            translator.checkpoint_at(&ctx, &control.bounds)?
+                        }
                     };
                     (ops, self.capture.clone())
                 }
