@@ -533,21 +533,26 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
     second.flush(session).await;
     let rows = logs3_rows(&server).await;
     let late_rows = &rows[initial_rows.len()..];
-    for span in [&root, &old_turn] {
-        let updates: Vec<_> = late_rows
-            .iter()
-            .filter(|row| row["span_id"] == *span)
-            .collect();
-        assert!(!updates.is_empty(), "missing late legacy update for {span}");
-        assert!(updates.iter().any(|row| row["metrics"]["end"] == 2.0));
-        for row in updates {
-            assert_eq!(row["_is_merge"], true, "historical insert replayed: {row}");
-            assert!(
-                row["context"].get("span_origin").is_none(),
-                "legacy update must omit provenance entirely, not set null: {row}"
-            );
-        }
+    let turn_updates: Vec<_> = late_rows
+        .iter()
+        .filter(|row| row["span_id"] == old_turn)
+        .collect();
+    assert!(
+        !turn_updates.is_empty(),
+        "missing late legacy update for {old_turn}"
+    );
+    assert!(turn_updates.iter().any(|row| row["metrics"]["end"] == 2.0));
+    for row in turn_updates {
+        assert_eq!(row["_is_merge"], true, "historical insert replayed: {row}");
+        assert!(
+            row["context"].get("span_origin").is_none(),
+            "legacy update must omit provenance entirely, not set null: {row}"
+        );
     }
+    assert!(
+        !late_rows.iter().any(|row| row["span_id"] == root),
+        "a completed turn must leave the session root open for later turns"
+    );
     assert!(late_rows
         .iter()
         .any(|row| { row["span_id"] == old_turn && row["output"] == "late legacy answer" }));
