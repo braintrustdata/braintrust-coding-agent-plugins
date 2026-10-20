@@ -5,15 +5,18 @@
 //! same event names through this translator.
 
 use super::git::GitMetadataCache;
+use super::recent::{RecentMap, RecentSet};
+
+#[path = "muse_events.rs"]
+mod muse_events;
 use super::{
-    local_username, root_tags, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
-    TranslatorFactory,
+    local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
 use crate::wire::Envelope;
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 impl TranslatorFactory for crate::agents::Muse {
@@ -66,8 +69,14 @@ struct MuseTranslator {
     session_version: Option<String>,
     turns: HashMap<String, OpenOp>,
     llms: HashMap<String, OpenOp>,
-    closed_turns: HashSet<String>,
-    closed_llms: HashSet<String>,
+    closed_turns: RecentSet<String>,
+    closed_llms: RecentSet<String>,
+    root_created: bool,
+    events: muse_events::Events,
+    total_metrics: Map<String, Value>,
+    model_metrics: RecentMap<String, Value>,
+    turn_usage: RecentMap<String, Value>,
+    last_completed_turn: Option<String>,
     last_ts: i64,
     git: Arc<GitMetadataCache>,
 }
@@ -84,8 +93,14 @@ impl MuseTranslator {
             session_version: None,
             turns: HashMap::new(),
             llms: HashMap::new(),
-            closed_turns: HashSet::new(),
-            closed_llms: HashSet::new(),
+            closed_turns: RecentSet::default(),
+            closed_llms: RecentSet::default(),
+            root_created: false,
+            events: muse_events::Events::default(),
+            total_metrics: Map::new(),
+            model_metrics: RecentMap::default(),
+            turn_usage: RecentMap::default(),
+            last_completed_turn: None,
             last_ts: 0,
             git,
         }
@@ -97,6 +112,7 @@ impl MuseTranslator {
         for key in [
             "cwd",
             "model",
+            "provider",
             "permission_mode",
             "trajectory_id",
             "root_session_id",
@@ -108,7 +124,18 @@ impl MuseTranslator {
     }
 
     fn starts_trace(event: &str) -> bool {
-        matches!(event, "UserPromptSubmit" | "PreLLMCall")
+        matches!(
+            event,
+            "UserPromptSubmit"
+                | "PreLLMCall"
+                | "PreToolUse"
+                | "PermissionRequest"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "PostToolBatch"
+                | "SubagentStart"
+                | "PreCompact"
+        )
     }
 
     fn ensure_root(&mut self, e: &Envelope, ctx: &SessionCtx) -> Vec<SpanOp> {
@@ -145,6 +172,10 @@ impl MuseTranslator {
         for (key, value) in &self.session_metadata {
             metadata.insert(key.clone(), value.clone());
         }
+        if self.root_created {
+            return Vec::new();
+        }
+        self.root_created = true;
         vec![SpanOp::Insert(SpanRow {
             span_id: self.root_id.clone(),
             root_span_id: self.effective_root_id.clone(),
@@ -153,7 +184,6 @@ impl MuseTranslator {
             span_type: SpanType::Task,
             start_ms: Some(e.ts_ms),
             metadata: Some(Value::Object(metadata)),
-            tags: root_tags(ctx),
             ..Default::default()
         })]
     }
@@ -178,11 +208,12 @@ impl MuseTranslator {
             output,
             metrics,
             error,
+            late_merge_key: Some(format!("muse:complete:{key}:{ts}")),
             ..Default::default()
         })]
     }
     fn close_all(&mut self, ts: i64, error: Option<&str>) -> Vec<SpanOp> {
-        let mut out = Vec::new();
+        let mut out = self.close_events(ts, error);
         for (map, closed) in [
             (&mut self.llms, &mut self.closed_llms),
             (&mut self.turns, &mut self.closed_turns),
@@ -256,11 +287,13 @@ impl AgentTranslator for MuseTranslator {
             }
         };
         if (e.event == "UserPromptSubmit"
-            && ids.turn().is_some_and(|id| self.closed_turns.contains(id)))
+            && ids
+                .turn()
+                .is_some_and(|id| self.closed_turns.contains(&id.to_owned())))
             || (e.event == "PreLLMCall"
                 && ids
                     .request()
-                    .is_some_and(|id| self.closed_llms.contains(id)))
+                    .is_some_and(|id| self.closed_llms.contains(&id.to_owned())))
         {
             return Ok(Vec::new());
         }
@@ -306,6 +339,9 @@ impl AgentTranslator for MuseTranslator {
                         "attempt",
                         "message_count",
                         "tool_count",
+                        "options",
+                        "request_record_id",
+                        "input_summary",
                     ] {
                         if let Some(value) = p.get(key) {
                             metadata.insert(key.into(), value.clone());
@@ -341,15 +377,74 @@ impl AgentTranslator for MuseTranslator {
             "PostLLMCall" => {
                 if let Some(id) = ids.request() {
                     let error = event_error(p);
-                    let closed = Self::close(
+                    let metrics = p.get("usage").filter(|v| v.is_object()).map(|usage| {
+                        // Native hook usage is cumulative within a turn (verified
+                        // against per-model durable records in Muse 1.4.11).
+                        // Export envelopes explicitly carry per-model usage.
+                        let mut per_model = usage.clone();
+                        if p.get("usage_scope").and_then(Value::as_str) != Some("model")
+                            && self.llms.contains_key(id)
+                        {
+                            if let Some(turn) = ids.turn() {
+                                if let Some(previous) = self.turn_usage.get(turn) {
+                                    if let Some(fields) = per_model.as_object_mut() {
+                                        for (key, value) in fields {
+                                            if let (Some(current), Some(previous)) = (
+                                                value.as_u64(),
+                                                previous.get(key).and_then(Value::as_u64),
+                                            ) {
+                                                // A reset starts a new native counter window.
+                                                *value = json!(current
+                                                    .checked_sub(previous)
+                                                    .unwrap_or(current));
+                                            }
+                                        }
+                                    }
+                                }
+                                self.turn_usage.insert(turn.to_owned(), usage.clone());
+                            }
+                        }
+                        usage_metrics(&per_model)
+                    });
+                    if let Some(metrics) = &metrics {
+                        if self.llms.contains_key(id) && self.model_metrics.get(id).is_none() {
+                            for (key, value) in metrics.as_object().into_iter().flatten() {
+                                if let Some(value) = value.as_u64() {
+                                    let previous = self
+                                        .total_metrics
+                                        .get(key)
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0);
+                                    self.total_metrics
+                                        .insert(key.clone(), json!(previous.saturating_add(value)));
+                                }
+                            }
+                            self.model_metrics.insert(id.to_owned(), metrics.clone());
+                        }
+                    }
+                    let mut closed = Self::close(
                         &self.effective_root_id,
                         &mut self.llms,
                         id,
                         e.ts_ms,
                         p.get("output_text_preview").cloned(),
-                        p.get("usage").map(usage_metrics),
+                        metrics,
                         error,
                     );
+                    for op in &mut closed {
+                        let (SpanOp::Merge(row) | SpanOp::Insert(row)) = op;
+                        let metadata: Map<String, Value> = [
+                            "finish_reason",
+                            "response_id",
+                            "tool_call_count",
+                            "status",
+                            "options",
+                        ]
+                        .into_iter()
+                        .filter_map(|key| p.get(key).map(|v| (key.to_owned(), v.clone())))
+                        .collect();
+                        row.metadata = Some(Value::Object(metadata));
+                    }
                     if !closed.is_empty() {
                         self.closed_llms.insert(id.into());
                         out.extend(closed);
@@ -358,7 +453,7 @@ impl AgentTranslator for MuseTranslator {
                     out.push(self.unpaired(e, "Muse PostLLMCall has no request_id"));
                 }
             }
-            "Stop" => {
+            "Stop" | "StopFailure" => {
                 if let Some(id) = ids.turn() {
                     let closed = Self::close(
                         &self.effective_root_id,
@@ -371,7 +466,24 @@ impl AgentTranslator for MuseTranslator {
                     );
                     if !closed.is_empty() {
                         self.closed_turns.insert(id.into());
+                        self.last_completed_turn = Some(id.to_owned());
                         out.extend(closed);
+                        out.push(SpanOp::Merge(SpanRow {
+                            span_id: self.root_id.clone(),
+                            root_span_id: self.effective_root_id.clone(),
+                            output: p
+                                .get("last_assistant_message")
+                                .cloned()
+                                .filter(|v| !v.is_null()),
+                            metrics: Some(Value::Object(self.total_metrics.clone())),
+                            error: event_error(p),
+                            late_merge_key: Some(format!("muse:turn:{id}:{}", e.ts_ms)),
+                            late_merge_version: Some(super::LateMergeVersion {
+                                ts_ms: e.ts_ms,
+                                native_id: Some(id.to_owned()),
+                            }),
+                            ..Default::default()
+                        }));
                     }
                 } else if self.opened {
                     out.push(self.unpaired(e, "Muse Stop has no turn_id"));
@@ -386,12 +498,30 @@ impl AgentTranslator for MuseTranslator {
                         end_ms: Some(e.ts_ms),
                         metadata: p.get("reason").map(|reason| json!({"end_reason":reason})),
                         error: event_error(p),
+                        metrics: Some(Value::Object(self.total_metrics.clone())),
+                        late_merge_key: Some(format!("muse:session:end:{}", e.ts_ms)),
+                        late_merge_version: Some(super::LateMergeVersion {
+                            ts_ms: e.ts_ms,
+                            native_id: self.last_completed_turn.clone(),
+                        }),
                         ..Default::default()
                     }));
                     self.opened = false;
                 }
             }
-            _ => {}
+            _ => out.extend(self.handle_events(e, &ids)),
+        }
+        // A native export can enrich a previously delivered preview at the
+        // same timestamp. Deduplicate the material completion, not only time.
+        for op in &mut out {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            if let Some(key) = &row.late_merge_key {
+                let content = json!({"output":row.output,"metrics":row.metrics,"error":row.error,"metadata":row.metadata});
+                row.late_merge_key = Some(format!(
+                    "{key}:{}",
+                    ids::span_id(&self.session_id, &content.to_string())
+                ));
+            }
         }
         self.git
             .enrich_rows(p.get("cwd").and_then(Value::as_str), &mut out);
@@ -415,21 +545,39 @@ impl AgentTranslator for MuseTranslator {
 }
 
 fn event_error(payload: &Value) -> Option<String> {
-    payload
-        .get("error")
-        .and_then(|error| {
-            error
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| (!error.is_null()).then(|| error.to_string()))
-        })
-        .or_else(|| {
-            payload
-                .get("status")
-                .and_then(Value::as_str)
-                .filter(|status| !matches!(*status, "success" | "completed"))
-                .map(|status| format!("Muse operation {status}"))
-        })
+    let render = |value: &Value| match value {
+        Value::Null => None,
+        Value::String(text) => (!text.is_empty()).then(|| text.clone()),
+        value => Some(value.to_string()),
+    };
+    let error = payload.get("error").and_then(render).or_else(|| {
+        payload
+            .get("status")
+            .and_then(Value::as_str)
+            // Native model completions include successful statuses such as
+            // `tool_calls`. Unknown future statuses are not evidence of failure.
+            .filter(|status| {
+                matches!(
+                    *status,
+                    "failed"
+                        | "failure"
+                        | "error"
+                        | "cancelled"
+                        | "canceled"
+                        | "interrupted"
+                        | "timeout"
+                        | "timed_out"
+                        | "denied"
+                        | "rejected"
+                )
+            })
+            .map(|status| format!("Muse operation {status}"))
+    });
+    match (error, payload.get("error_details").and_then(render)) {
+        (Some(error), Some(details)) => Some(format!("{error}: {details}")),
+        (Some(error), None) => Some(error),
+        (None, details) => details,
+    }
 }
 
 fn usage_metrics(usage: &Value) -> Value {
@@ -437,7 +585,9 @@ fn usage_metrics(usage: &Value) -> Value {
     for (native, standard) in [
         ("input_tokens", "prompt_tokens"),
         ("output_tokens", "completion_tokens"),
+        ("cache_read_tokens", "prompt_cached_tokens"),
         ("cached_tokens", "prompt_cached_tokens"),
+        ("cache_write_tokens", "prompt_cache_creation_tokens"),
         ("reasoning_tokens", "completion_reasoning_tokens"),
     ] {
         if let Some(value) = usage.get(native).and_then(Value::as_u64) {
@@ -553,6 +703,126 @@ mod tests {
     }
 
     #[test]
+    fn resumed_session_keeps_one_root_and_publishes_latest_output_and_totals() {
+        let mut translator = MuseTranslator::new(
+            "muse-fixture-session",
+            Arc::new(GitMetadataCache::default()),
+        );
+        let ctx = context();
+        let mut rows = Vec::new();
+        for (turn, ts) in [("t1", 1), ("t2", 10)] {
+            for event in [
+                event(
+                    "UserPromptSubmit",
+                    json!({"turn_id":turn,"prompt":"hello"}),
+                    ts,
+                ),
+                event(
+                    "PreLLMCall",
+                    json!({"turn_id":turn,"request_id":format!("{turn}:0:1"),"options":{"temperature":0.2}}),
+                    ts + 1,
+                ),
+                event(
+                    "PostLLMCall",
+                    json!({"turn_id":turn,"request_id":format!("{turn}:0:1"),"finish_reason":"stop","response_id":"native-response","tool_call_count":0,"usage":{"input_tokens":3,"output_tokens":2}}),
+                    ts + 2,
+                ),
+                event(
+                    "Stop",
+                    json!({"turn_id":turn,"last_assistant_message":turn}),
+                    ts + 3,
+                ),
+                event("SessionEnd", json!({}), ts + 4),
+            ] {
+                rows.extend(translator.handle(&event, &ctx).unwrap());
+            }
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|op| matches!(op, SpanOp::Insert(row) if row.name == "Muse Code"))
+                .count(),
+            1
+        );
+        let root = ids::span_id("muse-fixture-session", "root");
+        assert!(rows.iter().any(|op| matches!(op, SpanOp::Merge(row) if row.span_id == root && row.output == Some(json!("t2")) && row.metrics.as_ref().unwrap()["tokens"] == 10 && row.late_merge_key.is_some())));
+        assert!(rows.iter().any(|op| matches!(op, SpanOp::Merge(row) if row.metadata.as_ref().is_some_and(|m| m["response_id"] == "native-response"))));
+    }
+
+    #[test]
+    fn stop_failure_details_reach_turn_and_root() {
+        let mut translator = MuseTranslator::new(
+            "muse-fixture-session",
+            Arc::new(GitMetadataCache::default()),
+        );
+        translator
+            .handle(
+                &event(
+                    "UserPromptSubmit",
+                    json!({"turn_id":"turn","prompt":"hello"}),
+                    1,
+                ),
+                &context(),
+            )
+            .unwrap();
+        let rows = translator.handle(&event("StopFailure", json!({"turn_id":"turn","error":"provider_error","error_details":"rate limited"}), 2), &context()).unwrap();
+        assert_eq!(rows.iter().filter(|op| matches!(op, SpanOp::Merge(row) if row.error.as_deref() == Some("provider_error: rate limited"))).count(), 2);
+    }
+
+    #[test]
+    fn native_cumulative_hook_usage_becomes_per_model_metrics_without_overcounting_root() {
+        // Muse 1.4.11 deterministic two-model native run: live PostLLMCall
+        // reports 10/5 then 20/10, while each durable model_completed is 10/5.
+        let mut translator = MuseTranslator::new(
+            "muse-fixture-session",
+            Arc::new(GitMetadataCache::default()),
+        );
+        let ctx = context();
+        translator
+            .handle(
+                &event(
+                    "UserPromptSubmit",
+                    json!({"turn_id":"turn","prompt":"hello"}),
+                    1,
+                ),
+                &ctx,
+            )
+            .unwrap();
+        for (step, input, output) in [(0, 10, 5), (1, 20, 10)] {
+            let request = format!("turn:{step}:1");
+            translator
+                .handle(
+                    &event(
+                        "PreLLMCall",
+                        json!({"turn_id":"turn","request_id":request}),
+                        step + 2,
+                    ),
+                    &ctx,
+                )
+                .unwrap();
+            let complete = event(
+                "PostLLMCall",
+                json!({"turn_id":"turn","request_id":request,"usage":{"input_tokens":input,"output_tokens":output}}),
+                step + 3,
+            );
+            let rows = translator.handle(&complete, &ctx).unwrap();
+            assert!(rows.iter().any(|op|matches!(op,SpanOp::Merge(row) if row.metrics.as_ref().is_some_and(|m|m["prompt_tokens"] == 10 && m["completion_tokens"] == 5))));
+            assert!(translator.handle(&complete, &ctx).unwrap().is_empty());
+        }
+        let rows = translator
+            .handle(
+                &event(
+                    "Stop",
+                    json!({"turn_id":"turn","last_assistant_message":"done"}),
+                    10,
+                ),
+                &ctx,
+            )
+            .unwrap();
+        let root = ids::span_id("muse-fixture-session", "root");
+        assert!(rows.iter().any(|op|matches!(op,SpanOp::Merge(row) if row.span_id == root && row.metrics.as_ref().is_some_and(|m|m["prompt_tokens"] == 20 && m["completion_tokens"] == 10 && m["tokens"] == 30))));
+    }
+
+    #[test]
     fn passive_and_unknown_hooks_do_not_create_a_trace() {
         let mut translator = MuseTranslator::new(
             "muse-fixture-session",
@@ -634,7 +904,7 @@ mod tests {
         let unsupported = translator
             .handle(
                 &event(
-                    "PermissionRequest",
+                    "UnrecognizedEvent",
                     json!({"turn_id":"t1","request_id":"p1"}),
                     1001,
                 ),

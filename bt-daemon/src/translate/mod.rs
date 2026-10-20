@@ -67,6 +67,14 @@ pub struct OriginSnapshot {
     pub source_version: Option<String>,
 }
 
+/// Causal watermark for an aggregate updated by independently replayed snapshots.
+/// The same native operation may enrich a live preview despite capture clock lag.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LateMergeVersion {
+    pub ts_ms: i64,
+    pub native_id: Option<String>,
+}
+
 /// A resolved span row, ready for a sink to insert or merge. Field set is the
 /// subset every current plugin uses; extend as translators need more.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -97,6 +105,9 @@ pub struct SpanRow {
     #[serde(skip)]
     #[doc(hidden)]
     pub late_merge_key: Option<String>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub late_merge_version: Option<LateMergeVersion>,
     /// Span id of the user turn that owns this row, recorded by the translator
     /// from its native turn tracking. [`turn_lineage`] publishes it as
     /// `metadata.turn_span_id`.

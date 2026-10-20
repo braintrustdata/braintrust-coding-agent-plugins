@@ -41,6 +41,15 @@ pub(crate) trait ManagedRun: Agent {
         managed_run_id: &str,
     ) -> anyhow::Result<Injection>;
 
+    /// Combine invocation options with user arguments in the agent's native order.
+    fn invocation_args(
+        &self,
+        injection_args: Vec<OsString>,
+        agent_args: Vec<OsString>,
+    ) -> Vec<OsString> {
+        injection_args.into_iter().chain(agent_args).collect()
+    }
+
     /// Agents that sanitize hook environments need an already-running daemon
     /// and a private context file instead of relying on inherited settings.
     fn needs_daemon_host(&self) -> bool {
@@ -181,8 +190,7 @@ async fn run_traced_inner(
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut command: tokio::process::Command = subprocess::interactive_command(&executable).into();
     command
-        .args(injection.args)
-        .args(args.agent_args)
+        .args(agent.invocation_args(injection.args, args.agent_args))
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);

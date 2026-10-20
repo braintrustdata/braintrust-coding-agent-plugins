@@ -199,6 +199,9 @@ async fn capture_hook(
             anyhow::bail!("Muse managed hook context is incomplete");
         }
         route = context.route.clone();
+        if args.source_version.is_none() {
+            args.source_version = context.source_version.clone();
+        }
         Some(context)
     } else {
         None
@@ -247,9 +250,32 @@ async fn capture_hook(
 }
 
 fn resolve_dynamic_hook_versions(args: &mut HookArgs, payload: &serde_json::Value) {
+    resolve_dynamic_hook_versions_with_muse_probe(args, payload, || {
+        crate::setup::muse::installed_muse_version()
+            .ok()
+            .map(|version| version.to_string())
+    });
+}
+
+fn resolve_dynamic_hook_versions_with_muse_probe(
+    args: &mut HookArgs,
+    payload: &serde_json::Value,
+    muse_probe: impl FnOnce() -> Option<String>,
+) {
     if args.source_version.is_none() {
         args.source_version = source_version_from_env(&args.source)
             .or_else(|| source_version_from_payload(&args.source, payload));
+        let event = args.event.as_deref().or_else(|| {
+            payload
+                .get(&args.event_field)
+                .and_then(serde_json::Value::as_str)
+        });
+        if args.source_version.is_none()
+            && crate::translate::canonical_source_name(&args.source) == "muse"
+            && matches!(event, Some("SessionStart" | "session_start"))
+        {
+            args.source_version = muse_probe();
+        }
     }
     if args.plugin_version.is_none() {
         args.plugin_version = plugin_version_from_plugin_root(&args.source);
@@ -620,6 +646,51 @@ mod tests {
         assert_eq!(initialize["client"]["daemon_version"], "1.0.13");
         assert_eq!(initialize["client"]["plugin_version"], "0.1.0");
         assert_ne!(initialize["client"]["plugin_version"], "1.0.13");
+    }
+
+    #[test]
+    fn muse_version_probe_is_session_start_only_and_fail_open() {
+        let mut args = HookCli::try_parse_from(["test", "--source", "muse"])
+            .unwrap()
+            .args;
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut args,
+            &json!({"hook_event_name":"UserPromptSubmit"}),
+            || panic!("must not spawn a version probe on each event"),
+        );
+        assert!(args.source_version.is_none());
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut args,
+            &json!({"hook_event_name":"SessionStart"}),
+            || None,
+        );
+        assert!(args.source_version.is_none());
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut args,
+            &json!({"hook_event_name":"SessionStart"}),
+            || Some("1.4.11".into()),
+        );
+        let envelope = build_hook_envelope(
+            &args,
+            SessionRoute::default(),
+            json!({}),
+            "session".into(),
+            "SessionStart".into(),
+        );
+        assert_eq!(envelope.source_version.as_deref(), Some("1.4.11"));
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut args,
+            &json!({"hook_event_name":"SessionStart"}),
+            || panic!("explicit context version must be preserved"),
+        );
+        let mut other = HookCli::try_parse_from(["test", "--source", "cursor"])
+            .unwrap()
+            .args;
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut other,
+            &json!({"hook_event_name":"SessionStart"}),
+            || panic!("Muse probe must not run for other agents"),
+        );
     }
 
     #[test]

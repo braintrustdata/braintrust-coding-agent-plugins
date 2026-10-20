@@ -1,0 +1,348 @@
+{
+  "export_schema_version": 1,
+  "exporter_version": {
+    "semver": "1.4.11"
+  },
+  "sessions": [
+    {
+      "session_id": "muse-failure-fixture",
+      "session_end": {
+        "exit_reason": "clean"
+      }
+    }
+  ],
+  "events": [
+    {
+      "recorded_at": 1000000,
+      "envelope": {
+        "payload": {
+          "kind": "metadata",
+          "record": {
+            "model_id": "mock-model",
+            "provider_id": "meta",
+            "workspace_root": "/workspace"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2104594,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "kind": "started",
+            "prompt": "Run a failing integration command."
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2214403,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "bounded": {
+              "request_message_count": 2
+            },
+            "kind": "model_input_trace_recorded",
+            "model_step": 0,
+            "provider_family": "meta",
+            "request_message_count": 2,
+            "request_prefix_message_count": 1,
+            "request_record_id": "failure-request",
+            "schema_version": 2,
+            "scope": "full_request"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2258957,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "kind": "model_response_created",
+            "response_id": "resp_call_muse_failure"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2281286,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "duration_ms": 22,
+            "estimated_prompt_tokens": 10,
+            "kind": "model_completed",
+            "model": "mock-model",
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "input_tokens": 10,
+              "output_tokens": 5,
+              "reasoning_tokens": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2312338,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "kind": "assistant_tool_calls_committed",
+            "message_id": "failure-batch",
+            "response_id": "resp_call_muse_failure",
+            "tool_calls": [
+              {
+                "args": "{\"command\":\"printf MUSE_TOOL_FAILURE; exit 7\"}",
+                "call_id": "call_muse_failure",
+                "id": "fc_call_muse_failure",
+                "name": "shell"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2373307,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "failure-turn",
+          "task_id": "failure-tool-task",
+          "event": {
+            "kind": "proposed",
+            "task_id": "failure-tool-task",
+            "task_kind": "tool.shell"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2415592,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "failure-turn",
+          "task_id": "failure-tool-task",
+          "event": {
+            "kind": "accepted",
+            "task_id": "failure-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2419422,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "failure-turn",
+          "task_id": "failure-tool-task",
+          "event": {
+            "idempotency_key": "tool:call_muse_failure",
+            "kind": "scheduled",
+            "task_id": "failure-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2423304,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "failure-turn",
+          "task_id": "failure-tool-task",
+          "event": {
+            "cancellation_handle": null,
+            "idempotency_key": "tool:call_muse_failure",
+            "kind": "side_effect_intent",
+            "operation": "tool:shell",
+            "parent_task_id": null,
+            "policy_decision": "allow:policy",
+            "task_id": "failure-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2431463,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "failure-turn",
+          "task_id": "failure-tool-task",
+          "event": {
+            "kind": "started",
+            "task_id": "failure-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2481320,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "failure-turn",
+          "task_id": "failure-tool-task",
+          "event": {
+            "chunk": "tool failed: exit status: 7\nstdout:\nMUSE_TOOL_FAILURE",
+            "final_result": true,
+            "kind": "output",
+            "task_id": "failure-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2489421,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "failure-turn",
+          "task_id": "failure-tool-task",
+          "event": {
+            "kind": "failed",
+            "reason": "exit status: 7\nstdout:\nMUSE_TOOL_FAILURE",
+            "task_id": "failure-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2542413,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "batch_id": "failure-batch",
+            "kind": "tool_result_batch_committed",
+            "results": [
+              {
+                "text": "tool failed: exit status: 7\nstdout:\nMUSE_TOOL_FAILURE",
+                "tool_call_id": "call_muse_failure",
+                "tool_call_index": 0
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2622460,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "bounded": {
+              "request_message_count": 4
+            },
+            "kind": "model_input_trace_recorded",
+            "model_step": 1,
+            "provider_family": "meta",
+            "request_message_count": 4,
+            "request_prefix_message_count": 1,
+            "request_record_id": "failure-request",
+            "schema_version": 2,
+            "scope": "full_request"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2665876,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "kind": "model_response_created",
+            "response_id": "resp_mock_6"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2672505,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "kind": "assistant_message_committed",
+            "message_id": "failure-batch",
+            "provider_item_id": "msg_mock_6",
+            "response_id": "resp_mock_6",
+            "text": "MUSE_FAILURE_HANDLED"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2696355,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "duration_ms": 31,
+            "estimated_prompt_tokens": 20,
+            "kind": "model_completed",
+            "model": "mock-model",
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "input_tokens": 10,
+              "output_tokens": 5,
+              "reasoning_tokens": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2791452,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "failure-turn",
+          "event": {
+            "kind": "terminal",
+            "reason": null,
+            "terminal": "completed",
+            "time_to_first_token_ms": 637,
+            "turn_duration_ms": 756
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 2864316,
+      "envelope": {
+        "payload": {
+          "kind": "session_end"
+        }
+      }
+    }
+  ]
+}

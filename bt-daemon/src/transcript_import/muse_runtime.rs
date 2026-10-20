@@ -409,7 +409,13 @@ pub(super) async fn attach_muse_export(
     tokio::pin!(shutdown);
     loop {
         if reexport {
-            export_muse_session(session_id, export).await?;
+            tokio::select! {
+                result = &mut shutdown => {
+                    result?;
+                    break;
+                }
+                result = export_muse_session(session_id, export) => result?,
+            }
         }
         let (count, ended) =
             process_muse_snapshot(&mut processor, export, session_id, true, emitted).await?;
@@ -428,13 +434,14 @@ pub(super) async fn attach_muse_export(
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
-    // Capture one final complete snapshot before interrupting any still-open
-    // spans, matching the finalization behavior of other attach sources.
-    if reexport {
-        export_muse_session(session_id, export).await?;
-    }
-    process_muse_snapshot(&mut processor, export, session_id, true, emitted).await?;
-    processor.finish().await
+    // Detaching stops observation, not the native session. Leave open spans
+    // unfinished so a later export can deliver their authoritative completion.
+    // Do not launch another potentially slow export after cancellation.
+    Ok(processor
+        .detach_session(session_id)
+        .await?
+        .into_iter()
+        .collect())
 }
 
 #[cfg(test)]
