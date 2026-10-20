@@ -716,13 +716,21 @@ impl ClaudeTranslator {
         // PreToolUse only proves that Claude proposed a call. Approval is
         // recorded once a terminal hook or transcript result proves whether
         // the call executed or was denied.
-        let metadata = tool_metadata(event, &tool_name, &call_id, None, &input);
+        let mut metadata = tool_metadata(event, &tool_name, &call_id, None, &input);
+        let span_type = if tool_name == "AskUserQuestion" {
+            if let Some(fields) = metadata.as_object_mut() {
+                fields.insert("wait_kind".into(), json!("user_question"));
+            }
+            SpanType::Wait
+        } else {
+            SpanType::Tool
+        };
         ops.push(SpanOp::Insert(SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: vec![parent_id.clone()],
             name: tool_span_name(&tool_name, &input),
-            span_type: SpanType::Tool,
+            span_type,
             start_ms: Some(event.ts_ms),
             input: Some(input.clone()),
             metadata: Some(metadata.clone()),
@@ -756,7 +764,7 @@ impl ClaudeTranslator {
         let error = (approval != ToolApproval::Denied)
             .then(|| forced_error.or_else(|| tool_error(&event.payload)))
             .flatten();
-        let metadata = tool_metadata(event, &tool_name, &call_id, Some(approval), &input);
+        let mut metadata = tool_metadata(event, &tool_name, &call_id, Some(approval), &input);
         if let Some(pending) = self.pending_tools.remove(&call_id) {
             // A PreToolUse hook may rewrite the call via `updatedInput`, so the
             // terminal hook's `tool_input` is what the call ran (or was denied)
@@ -782,6 +790,14 @@ impl ClaudeTranslator {
             let Some(parent_id) = self.parent_for(event, ops) else {
                 return;
             };
+            let span_type = if tool_name == "AskUserQuestion" {
+                if let Some(fields) = metadata.as_object_mut() {
+                    fields.insert("wait_kind".into(), json!("user_question"));
+                }
+                SpanType::Wait
+            } else {
+                SpanType::Tool
+            };
             let duration = event
                 .payload
                 .get("duration_ms")
@@ -793,7 +809,7 @@ impl ClaudeTranslator {
                 turn_span_id: self.owner_of(&parent_id),
                 parent_span_ids: vec![parent_id],
                 name: tool_span_name(&tool_name, &input),
-                span_type: SpanType::Tool,
+                span_type,
                 start_ms: Some(event.ts_ms.saturating_sub(duration)),
                 end_ms: Some(event.ts_ms),
                 input: Some(input),

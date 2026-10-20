@@ -48,6 +48,8 @@ pub enum SpanType {
     Task,
     Llm,
     Tool,
+    /// A human response or approval interval, separate from agent execution.
+    Wait,
 }
 
 /// Immutable versions captured when a coding-agent span is first created.
