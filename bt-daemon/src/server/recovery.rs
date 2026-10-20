@@ -408,4 +408,75 @@ mod tests {
         .unwrap();
         super::super::maintenance::drain_all(&daemon).await;
     }
+    #[tokio::test]
+    async fn established_linked_handoff_retains_its_route_while_recovering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = SessionRoute {
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: Some("original-project".into()),
+                project_name: None,
+            }),
+            ..Default::default()
+        };
+        let linked = SessionRoute {
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: Some("linked-project".into()),
+                project_name: None,
+            }),
+            ..Default::default()
+        };
+        let env: Envelope = serde_json::from_value(serde_json::json!({
+            "source":"debug", "session_id":"linked-retry", "event":"Stop", "ts_ms":1,
+            "payload":{}, "route":original
+        }))
+        .unwrap();
+        let raw = journal::source_journal_path(tmp.path(), "debug", &env.session_id);
+        let mut writer = JournalWriter::open_path(&raw).await.unwrap();
+        let through = writer.append(&env).await.unwrap();
+        drop(writer);
+        let mut options = debug_serve_options("test", tmp.path());
+        options.auth_provider = Some(Arc::new(TestAuth));
+        let daemon = Daemon::new(options, tmp.path().into());
+        let key = automatic_link_key(&env);
+        daemon
+            .automatic_links
+            .lock()
+            .insert(key.clone(), linked.clone());
+        let storage = tmp.path().join("pipeline");
+        std::fs::write(&storage, "blocked storage path").unwrap();
+        assert!(accept_event(
+            &daemon,
+            PendingEvent {
+                env,
+                replay_through: 0,
+                journal_through: through,
+                settings_through: None,
+            }
+        )
+        .await
+        .is_err());
+        let saved = read_correlation_state(tmp.path(), &key).await.unwrap();
+        assert!(saved.linked_route.as_ref().unwrap().same_route(&linked));
+        assert_eq!(saved.recovery.unwrap().info(false).stage, "journal");
+        assert_eq!(daemon.pending_sessions.lock()[&key].events.len(), 1);
+        std::fs::remove_file(storage).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let _ = retry_pending_sessions(&daemon).await;
+                if !daemon.pending_sessions.lock().contains_key(&key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        daemon.ingress_barrier().await;
+        let sessions = daemon.status(StatusParams::default()).sessions;
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].route.as_ref().unwrap().same_route(&linked));
+        assert!(sessions[0].recovery.is_none());
+        assert!(sessions[0].last_error.is_none());
+        super::super::maintenance::drain_all(&daemon).await;
+    }
 }

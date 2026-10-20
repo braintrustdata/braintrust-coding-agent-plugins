@@ -4090,3 +4090,128 @@ async fn changed_plugin_chain_resumes_the_original_held_route() {
     shutdown(&socket).await;
     handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn storage_failure_after_retirement_is_reported_and_recovers_without_native_input() {
+    let (data, socket, handle, _tmp) = start_daemon_with_session_ttl(1).await;
+    forward_envelope(
+        &envelope("retired-failure", "SessionStart", 1),
+        &socket,
+        &dummy_host(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        flush_session("retired-failure", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status.sessions.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Retirement removes the session from status before every storage handle
+    // closes. Windows may still deny renaming that directory briefly.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match std::fs::rename(data.join("pipeline"), data.join("saved-pipeline")) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("move retired storage: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(data.join("pipeline"), "blocked storage path").unwrap();
+    forward_envelope(
+        &envelope("retired-failure", "Stop", 2),
+        &socket,
+        &dummy_host(),
+        false,
+    )
+    .await
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status
+                .sessions
+                .iter()
+                .any(|session| session.recovery.is_some())
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let recovery = status
+        .sessions
+        .iter()
+        .find_map(|session| session.recovery.as_ref())
+        .expect("retired-session failure must remain visible to doctor");
+    assert_eq!(recovery.stage, "journal");
+    assert!(recovery.retry.contains("bounded retry"));
+    assert!(status
+        .sessions
+        .iter()
+        .any(|session| session.queued > 0 && session.last_error.is_some()));
+    std::fs::remove_file(data.join("pipeline")).unwrap();
+    std::fs::rename(data.join("saved-pipeline"), data.join("pipeline")).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(data.join("spans/retired-failure.ndjson"))
+                .is_ok_and(|rows| rows.contains("\"name\":\"Stop\""))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        flush_session("retired-failure", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status
+        .sessions
+        .iter()
+        .all(|session| session.recovery.is_none() && session.last_error.is_none()));
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}

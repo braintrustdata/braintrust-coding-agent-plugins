@@ -140,17 +140,29 @@ pub(super) async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> R
     let mut state = daemon.pending_sessions.lock().get(&key).cloned();
     if state.is_none() {
         if daemon.standalone_links.lock().contains(&key) {
-            return accept_resolved_event(daemon, event, 0)
-                .await
-                .map_err(|failure| failure.message());
+            return accept_established_event(
+                daemon,
+                &key,
+                event,
+                PendingSession {
+                    standalone: true,
+                    ..Default::default()
+                },
+            )
+            .await;
         }
         let route = daemon.automatic_links.lock().get(&key).cloned();
         if let Some(route) = route {
-            let mut event = event;
-            event.env.route = Some(route);
-            return accept_resolved_event(daemon, event, 0)
-                .await
-                .map_err(|failure| failure.message());
+            return accept_established_event(
+                daemon,
+                &key,
+                event,
+                PendingSession {
+                    linked_route: Some(route),
+                    ..Default::default()
+                },
+            )
+            .await;
         }
         state = read_correlation_state(&daemon.data_dir, &key).await;
     }
@@ -305,6 +317,32 @@ pub(super) fn automatic_parent_route(
     let mut route = child.clone();
     route.destination = parent.destination.clone();
     Some(route)
+}
+
+/// Keep the normal established-session handoff fast, but retain any failure
+/// in the same durable recovery queue used during initial route discovery.
+async fn accept_established_event(
+    daemon: &Arc<Daemon>,
+    key: &str,
+    event: PendingEvent,
+    mut state: PendingSession,
+) -> Result<(), String> {
+    let mut resolved = event.clone();
+    if let Some(route) = &state.linked_route {
+        resolved.env.route = Some(route.clone());
+    }
+    if let Err(failure) = accept_resolved_event(daemon, resolved, 0).await {
+        let message = failure.message();
+        state.recovery = Some(*failure);
+        state.events.push(event);
+        // store_correlation registers the pending state before attempting I/O,
+        // so failed evidence persistence cannot hide or abandon the handoff.
+        if let Err(error) = store_correlation(daemon, key, &state).await {
+            tracing::warn!(%error, "established-session recovery evidence could not be persisted");
+        }
+        return Err(message);
+    }
+    Ok(())
 }
 
 pub(super) async fn store_correlation(
