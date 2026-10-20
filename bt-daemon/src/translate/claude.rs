@@ -161,6 +161,7 @@ struct AgentOrigin {
 struct PendingTool {
     span_id: String,
     parent_id: String,
+    input: Value,
     metadata: Value,
 }
 
@@ -733,6 +734,7 @@ impl ClaudeTranslator {
             PendingTool {
                 span_id,
                 parent_id,
+                input,
                 metadata,
             },
         );
@@ -756,10 +758,20 @@ impl ClaudeTranslator {
             .flatten();
         let metadata = tool_metadata(event, &tool_name, &call_id, Some(approval), &input);
         if let Some(pending) = self.pending_tools.remove(&call_id) {
+            // A PreToolUse hook may rewrite the call via `updatedInput`, so the
+            // terminal hook's `tool_input` is what the call ran (or was denied)
+            // with. Resend it only when it differs from the proposed input.
+            let rewritten = raw_tool_input(&event.payload).is_some() && input != pending.input;
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: pending.span_id,
                 root_span_id: self.root_span_id.clone(),
                 parent_span_ids: vec![pending.parent_id],
+                name: if rewritten {
+                    tool_span_name(&tool_name, &input)
+                } else {
+                    String::new()
+                },
+                input: rewritten.then_some(input),
                 end_ms: Some(event.ts_ms),
                 output,
                 metadata: Some(metadata),
@@ -2291,10 +2303,12 @@ fn tool_metadata(
     Value::Object(metadata)
 }
 
+fn raw_tool_input(payload: &Value) -> Option<&Value> {
+    payload.get("tool_input").or_else(|| payload.get("input"))
+}
+
 fn tool_input(payload: &Value) -> Value {
-    payload
-        .get("tool_input")
-        .or_else(|| payload.get("input"))
+    raw_tool_input(payload)
         .cloned()
         .unwrap_or_else(|| json!({}))
 }
