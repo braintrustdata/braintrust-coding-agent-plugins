@@ -148,8 +148,8 @@ pub trait AgentTranslator: Send {
     }
 
     /// Finish a terminal agent invocation and defensively close work whose
-    /// terminal native event never arrived. Resource retirement uses
-    /// `checkpoint`, since inactivity alone does not end the native session.
+    /// terminal native event never arrived. Resource retirement may use this
+    /// for agents whose sessions do not resume after an idle period.
     fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let _ = ctx;
         Ok(Vec::new())

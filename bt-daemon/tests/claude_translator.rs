@@ -1872,7 +1872,7 @@ fn claude_background_child_completion_extends_the_originating_human_turn() {
 }
 
 #[test]
-fn claude_later_turns_extend_an_already_closed_session_root() {
+fn claude_activity_after_session_end_starts_a_new_root_generation() {
     let session = "resumed-root";
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", session);
@@ -1900,16 +1900,20 @@ fn claude_later_turns_extend_an_already_closed_session_root() {
         );
     }
     let rows = reduce(ops.clone());
-    let root = rows
+    let roots: Vec<_> = rows
         .values()
-        .find(|row| row.parent_span_ids.is_empty())
-        .unwrap();
-    assert_eq!(root.start_ms, Some(10));
-    assert_eq!(root.end_ms, Some(50));
-    assert!(rows
-        .values()
-        .filter(|row| row.name.starts_with("Turn "))
-        .all(|row| row.end_ms <= root.end_ms));
+        .filter(|row| row.parent_span_ids.is_empty())
+        .collect();
+    assert_eq!(roots.len(), 2);
+    let original_root = roots.iter().find(|row| row.start_ms == Some(10)).unwrap();
+    let resumed_root = roots.iter().find(|row| row.start_ms == Some(40)).unwrap();
+    assert_ne!(original_root.span_id, resumed_root.span_id);
+    assert_eq!(original_root.end_ms, Some(25));
+    assert_eq!(resumed_root.end_ms, None);
+    let first_turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    let second_turn = rows.values().find(|row| row.name == "Turn 2").unwrap();
+    assert_eq!(first_turn.root_span_id, original_root.span_id);
+    assert_eq!(second_turn.root_span_id, resumed_root.span_id);
     // A delayed terminal hook must not shrink the root behind completed work.
     ops.extend(
         translator
@@ -1919,7 +1923,7 @@ fn claude_later_turns_extend_an_already_closed_session_root() {
     let rows = reduce(ops);
     assert_eq!(
         rows.values()
-            .find(|row| row.parent_span_ids.is_empty())
+            .find(|row| row.span_id == resumed_root.span_id)
             .unwrap()
             .end_ms,
         Some(50)
