@@ -244,6 +244,12 @@ fn claude_real_fixture_matches_session_turn_tool_and_token_contract() {
     assert_eq!(tools.len(), 13);
     assert_eq!(llms.len(), 7, "one LLM span per unique requestId");
     assert!(turns.iter().all(|turn| turn.end_ms.is_some()));
+    assert!(
+        turns
+            .iter()
+            .all(|turn| turn.metadata.as_ref().unwrap()["effort"] == "xhigh"),
+        "effort reported after UserPromptSubmit still reaches its turn"
+    );
     assert!(tools.iter().all(|tool| {
         tool.metadata.as_ref().and_then(|m| m.get("tool_approval")) == Some(&json!("approved"))
     }));
@@ -336,18 +342,13 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
             }),
         ),
     };
-    let event = |name: &str, ts_ms: i64| Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "session".into(),
-        event: name.into(),
-        ts_ms,
-        managed_run_id: None,
-        payload: json!({"session_id":"session","cwd":"/workspace","prompt":"go"}),
-        route: None,
-        config: None,
-        capture: None,
+    let event = |name: &str, ts_ms: i64| {
+        claude_event(
+            "session",
+            name,
+            ts_ms,
+            json!({"session_id":"session","cwd":"/workspace","prompt":"go"}),
+        )
     };
     let mut ops = translator
         .handle(&event("UserPromptSubmit", 1), &ctx)
@@ -373,19 +374,8 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
         session_id: "idle-session".into(),
         config: None,
     };
-    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "idle-session".into(),
-        event: name.into(),
-        ts_ms,
-        managed_run_id: None,
-        payload,
-        route: None,
-        config: None,
-        capture: None,
-    };
+    let event =
+        |name: &str, ts_ms: i64, payload: Value| claude_event("idle-session", name, ts_ms, payload);
 
     let mut ops = Vec::new();
     for event in [
@@ -444,25 +434,15 @@ fn claude_passive_hooks_do_not_create_blank_session_traces() {
 }
 
 #[test]
-fn claude_turns_capture_the_effective_permission_mode() {
+fn claude_turns_capture_the_effective_permission_mode_and_effort() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", "permission-session");
     let ctx = SessionCtx {
         session_id: "permission-session".into(),
         config: None,
     };
-    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "permission-session".into(),
-        event: name.into(),
-        ts_ms,
-        managed_run_id: None,
-        payload,
-        route: None,
-        config: None,
-        capture: None,
+    let event = |name: &str, ts_ms: i64, payload: Value| {
+        claude_event("permission-session", name, ts_ms, payload)
     };
 
     let mut ops = Vec::new();
@@ -477,10 +457,11 @@ fn claude_turns_capture_the_effective_permission_mode() {
             2,
             json!({"cwd":"/workspace/demo", "prompt":"plan this", "permission_mode":"plan"}),
         ),
+        // Claude reports effort on hooks after the prompt, not on UserPromptSubmit.
         event(
             "Stop",
             3,
-            json!({"cwd":"/workspace/demo", "permission_mode":"plan"}),
+            json!({"cwd":"/workspace/demo", "permission_mode":"plan", "effort":{"level":"high"}}),
         ),
         event(
             "UserPromptSubmit",
@@ -488,88 +469,72 @@ fn claude_turns_capture_the_effective_permission_mode() {
             json!({"cwd":"/workspace/demo", "prompt":"implement it", "permission_mode":"acceptEdits"}),
         ),
         event(
-            "SessionEnd",
+            "PreToolUse",
             5,
+            json!({
+                "cwd":"/workspace/demo", "permission_mode":"acceptEdits", "effort":{"level":"max"},
+                "tool_name":"Read", "tool_use_id":"read-1", "tool_input":{"file_path":"x"}
+            }),
+        ),
+        event(
+            "SessionEnd",
+            6,
             json!({"cwd":"/workspace/demo", "permission_mode":"acceptEdits"}),
         ),
     ] {
         ops.extend(translator.handle(&event, &ctx).unwrap());
     }
     let rows = reduce(ops);
-    let turn_metadata = |name: &str| {
+    let turn_metadata = |name: &str, key: &str| {
         rows.values()
             .find(|row| row.name == name)
             .and_then(|row| row.metadata.as_ref())
-            .and_then(|metadata| metadata.get("permission_mode"))
+            .and_then(|metadata| metadata.get(key))
             .cloned()
     };
-    assert_eq!(turn_metadata("Turn 1"), Some(json!("plan")));
-    assert_eq!(turn_metadata("Turn 2"), Some(json!("acceptEdits")));
+    assert_eq!(
+        turn_metadata("Turn 1", "permission_mode"),
+        Some(json!("plan"))
+    );
+    assert_eq!(
+        turn_metadata("Turn 2", "permission_mode"),
+        Some(json!("acceptEdits"))
+    );
+    assert_eq!(turn_metadata("Turn 1", "effort"), Some(json!("high")));
+    assert_eq!(turn_metadata("Turn 2", "effort"), Some(json!("max")));
 }
 
 #[test]
-fn claude_subagent_routing_tolerates_malformed_optional_metadata() {
+fn claude_subagent_start_requires_only_a_nonempty_agent_id() {
     let registry = Registry::default_agents();
-    let mut translator = registry.create("claude-code", "subagent-session");
     let ctx = SessionCtx {
         session_id: "subagent-session".into(),
         config: None,
     };
-    let event = Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "subagent-session".into(),
-        event: "SubagentStart".into(),
-        ts_ms: 1,
-        managed_run_id: None,
-        payload: json!({
-            "cwd": "/workspace/demo",
-            "agent_id": "agent-1",
-            "agent_type": { "future": "object shape" },
-            "future_field": true,
-        }),
-        route: None,
-        config: None,
-        capture: None,
+    let start = |payload: Value| {
+        let mut translator = registry.create("claude-code", "subagent-session");
+        let event = claude_event("subagent-session", "SubagentStart", 1, payload);
+        reduce(translator.handle(&event, &ctx).unwrap())
     };
 
-    let rows = reduce(translator.handle(&event, &ctx).unwrap());
+    let rows = start(json!({
+        "cwd": "/workspace/demo",
+        "agent_id": "agent-1",
+        "agent_type": { "future": "object shape" },
+        "future_field": true,
+    }));
     assert!(rows.values().any(|row| row.name == "Claude Code: demo"));
     let subagent = rows
         .values()
         .find(|row| row.name == "subagent: agent")
         .expect("valid agent_id must create a subagent span");
     assert_eq!(subagent.metadata.as_ref().unwrap()["agent_id"], "agent-1");
-}
 
-#[test]
-fn claude_ignores_empty_subagent_identifier() {
-    let registry = Registry::default_agents();
-    let mut translator = registry.create("claude-code", "empty-subagent-session");
-    let ctx = SessionCtx {
-        session_id: "empty-subagent-session".into(),
-        config: None,
-    };
-    let event = Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "empty-subagent-session".into(),
-        event: "SubagentStart".into(),
-        ts_ms: 1,
-        managed_run_id: None,
-        payload: json!({
-            "cwd": "/workspace/demo",
-            "agent_id": "",
-            "agent_type": "reviewer",
-        }),
-        route: None,
-        config: None,
-        capture: None,
-    };
-
-    let rows = reduce(translator.handle(&event, &ctx).unwrap());
+    let rows = start(json!({
+        "cwd": "/workspace/demo",
+        "agent_id": "",
+        "agent_type": "reviewer",
+    }));
     assert!(rows.values().all(|row| !row.name.starts_with("subagent:")));
 }
 
@@ -799,7 +764,7 @@ fn claude_tool_hook_outcomes_distinguish_denials_failures_and_successes() {
         ),
         event(
             "PostToolUseFailure",
-            json!({"session_id":"s","tool_name":"Read","tool_use_id":"failed","tool_input":{"file_path":"x"},"error":"missing"}),
+            json!({"session_id":"s","tool_name":"Read","tool_use_id":"failed","tool_input":{"file_path":"x"},"error":"missing","is_interrupt":true,"duration_ms":42}),
         ),
         event(
             "PostToolUse",
@@ -833,6 +798,11 @@ fn claude_tool_hook_outcomes_distinguish_denials_failures_and_successes() {
     assert_eq!(denied["tool_approval"], json!("denied"));
     assert_eq!(denied["permission_id"], json!("p1"));
     assert_eq!(denied["permission_title"], json!("Run command"));
+    let failed = tool("failed");
+    let failed_metadata = failed.metadata.as_ref().unwrap();
+    assert_eq!(failed_metadata["is_interrupt"], json!(true));
+    assert_eq!(failed_metadata["native_duration_ms"], json!(42));
+    assert_eq!(failed.start_ms, Some(1 - 42));
     for (call_id, error) in [
         ("denied", None),
         ("failed", Some("missing")),
@@ -1371,19 +1341,8 @@ fn claude_groups_streamed_rows_and_reads_late_final_output_at_session_end() {
         session_id: "streamed".into(),
         config: None,
     };
-    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "streamed".into(),
-        event: name.into(),
-        ts_ms,
-        managed_run_id: None,
-        payload,
-        route: None,
-        config: None,
-        capture: None,
-    };
+    let event =
+        |name: &str, ts_ms: i64, payload: Value| claude_event("streamed", name, ts_ms, payload);
     let mut ops = translator
         .handle(
             &event(
@@ -2579,165 +2538,49 @@ fn claude_finalization_drains_observed_late_response() {
 }
 
 #[test]
-fn claude_root_records_last_turn_output_on_session_end() {
+fn claude_root_records_the_last_completed_turn_output() {
     let registry = Registry::default_agents();
-    let mut translator = registry.create("claude-code", "outcome-session");
     let ctx = SessionCtx {
         session_id: "outcome-session".into(),
         config: None,
     };
-    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "outcome-session".into(),
-        event: name.into(),
-        ts_ms,
-        managed_run_id: None,
-        payload,
-        route: None,
-        config: None,
-        capture: None,
+    let root_output = |closing: &[&str], finalize: bool| {
+        let mut translator = registry.create("claude-code", "outcome-session");
+        let mut ops = Vec::new();
+        let events = [
+            (
+                "SessionStart",
+                json!({"source":"startup", "model":"claude-test"}),
+            ),
+            ("UserPromptSubmit", json!({"prompt":"ship it"})),
+        ]
+        .into_iter()
+        .chain(closing.iter().map(|&name| match name {
+            "Stop" => (name, json!({"last_assistant_message":"Done. Shipped it."})),
+            _ => (name, json!({})),
+        }));
+        for (ts_ms, (name, mut payload)) in (1..).zip(events) {
+            payload["cwd"] = json!("/workspace/demo");
+            let event = claude_event("outcome-session", name, ts_ms, payload);
+            ops.extend(translator.handle(&event, &ctx).unwrap());
+        }
+        if finalize {
+            // No SessionEnd hook: the daemon finalizes the session after a teardown.
+            ops.extend(translator.finalize(&ctx).unwrap());
+        }
+        reduce(ops)
+            .into_values()
+            .find(|row| row.name == "Claude Code: demo")
+            .expect("root span")
+            .output
     };
 
-    let mut ops = Vec::new();
-    for event in [
-        event(
-            "SessionStart",
-            1,
-            json!({"cwd":"/workspace/demo", "source":"startup", "model":"claude-test"}),
-        ),
-        event(
-            "UserPromptSubmit",
-            2,
-            json!({"cwd":"/workspace/demo", "prompt":"ship it"}),
-        ),
-        event(
-            "Stop",
-            3,
-            json!({"cwd":"/workspace/demo", "last_assistant_message":"Done. Shipped it."}),
-        ),
-        event("SessionEnd", 4, json!({"cwd":"/workspace/demo"})),
-    ] {
-        ops.extend(translator.handle(&event, &ctx).unwrap());
-    }
-
-    let rows = reduce(ops);
-    let turn = rows
-        .values()
-        .find(|row| row.name == "Turn 1")
-        .expect("turn span");
-    assert_eq!(turn.output, Some(json!("Done. Shipped it.")));
-    let root = rows
-        .values()
-        .find(|row| row.name == "Claude Code: demo")
-        .expect("root span");
+    let shipped = Some(json!("Done. Shipped it."));
+    assert_eq!(root_output(&["Stop", "SessionEnd"], false), shipped);
+    assert_eq!(root_output(&["Stop"], true), shipped);
     assert_eq!(
-        root.output,
-        Some(json!("Done. Shipped it.")),
-        "the session outcome must land on the root span"
-    );
-}
-
-#[test]
-fn claude_root_records_last_turn_output_on_finalize() {
-    let registry = Registry::default_agents();
-    let mut translator = registry.create("claude-code", "finalize-session");
-    let ctx = SessionCtx {
-        session_id: "finalize-session".into(),
-        config: None,
-    };
-    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "finalize-session".into(),
-        event: name.into(),
-        ts_ms,
-        managed_run_id: None,
-        payload,
-        route: None,
-        config: None,
-        capture: None,
-    };
-
-    let mut ops = Vec::new();
-    for event in [
-        event(
-            "SessionStart",
-            1,
-            json!({"cwd":"/workspace/demo", "source":"startup", "model":"claude-test"}),
-        ),
-        event(
-            "UserPromptSubmit",
-            2,
-            json!({"cwd":"/workspace/demo", "prompt":"ship it"}),
-        ),
-        event(
-            "Stop",
-            3,
-            json!({"cwd":"/workspace/demo", "last_assistant_message":"Done. Shipped it."}),
-        ),
-    ] {
-        ops.extend(translator.handle(&event, &ctx).unwrap());
-    }
-    // No SessionEnd hook: the daemon finalizes the session after a teardown.
-    ops.extend(translator.finalize(&ctx).unwrap());
-
-    let rows = reduce(ops);
-    let root = rows
-        .values()
-        .find(|row| row.name == "Claude Code: demo")
-        .expect("root span");
-    assert_eq!(root.output, Some(json!("Done. Shipped it.")));
-}
-
-#[test]
-fn claude_root_output_stays_unset_without_a_completed_turn() {
-    let registry = Registry::default_agents();
-    let mut translator = registry.create("claude-code", "no-turn-session");
-    let ctx = SessionCtx {
-        session_id: "no-turn-session".into(),
-        config: None,
-    };
-    let event = |name: &str, ts_ms: i64, payload: Value| Envelope {
-        source: "claude-code".into(),
-        source_version: None,
-        plugin_version: None,
-        session_id: "no-turn-session".into(),
-        event: name.into(),
-        ts_ms,
-        managed_run_id: None,
-        payload,
-        route: None,
-        config: None,
-        capture: None,
-    };
-
-    let mut ops = Vec::new();
-    for event in [
-        event(
-            "SessionStart",
-            1,
-            json!({"cwd":"/workspace/demo", "source":"startup", "model":"claude-test"}),
-        ),
-        event(
-            "UserPromptSubmit",
-            2,
-            json!({"cwd":"/workspace/demo", "prompt":"interrupted"}),
-        ),
-        event("SessionEnd", 3, json!({"cwd":"/workspace/demo"})),
-    ] {
-        ops.extend(translator.handle(&event, &ctx).unwrap());
-    }
-
-    let rows = reduce(ops);
-    let root = rows
-        .values()
-        .find(|row| row.name == "Claude Code: demo")
-        .expect("root span");
-    assert_eq!(
-        root.output, None,
+        root_output(&["SessionEnd"], false),
+        None,
         "a session with no completed turn has no outcome to record"
     );
 }

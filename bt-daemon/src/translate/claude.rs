@@ -33,6 +33,8 @@ struct HookContext {
     model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     permission_mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_effort")]
+    effort: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     system_prompt: Option<String>,
 }
@@ -85,6 +87,17 @@ where
         .and_then(value_as_nonempty_string))
 }
 
+/// Claude hooks report effort as `{"level": "high"}`.
+fn deserialize_optional_effort<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(|effort| effort.get("level"))
+        .and_then(value_as_nonempty_string))
+}
+
 fn deserialize_nonempty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -133,6 +146,7 @@ struct Turn {
     cwd: Option<String>,
     parent_id: String,
     user_turn_id: Option<String>,
+    effort: Option<String>,
 }
 
 struct PendingPrompt {
@@ -289,6 +303,7 @@ struct ClaudeTranslator {
     session_source: Option<String>,
     session_model: Option<String>,
     permission_mode: Option<String>,
+    effort: Option<String>,
     system_prompt: Option<String>,
     git: Arc<GitMetadataCache>,
     current_cwd: Option<String>,
@@ -338,6 +353,7 @@ impl ClaudeTranslator {
             session_source: None,
             session_model: None,
             permission_mode: None,
+            effort: None,
             system_prompt: None,
             git,
             current_cwd: None,
@@ -440,6 +456,9 @@ impl ClaudeTranslator {
         if let Some(permission_mode) = &hook.permission_mode {
             self.permission_mode = Some(permission_mode.clone());
         }
+        if let Some(effort) = &hook.effort {
+            self.effort = Some(effort.clone());
+        }
         if let Some(system_prompt) = &hook.system_prompt {
             self.system_prompt = Some(system_prompt.clone());
         }
@@ -516,6 +535,9 @@ impl ClaudeTranslator {
         if let Some(permission_mode) = &self.permission_mode {
             metadata.insert("permission_mode".into(), json!(permission_mode));
         }
+        if let Some(effort) = &self.effort {
+            metadata.insert("effort".into(), json!(effort));
+        }
         if let Some(kind) = turn_input_kind(&event.payload) {
             metadata.insert("input_kind".into(), json!(kind));
         }
@@ -558,7 +580,27 @@ impl ClaudeTranslator {
             cwd: self.current_cwd.clone(),
             parent_id,
             user_turn_id,
+            effort: self.effort.clone(),
         });
+    }
+
+    /// Claude reports effort on later hooks, not reliably on UserPromptSubmit.
+    /// Merge a newly observed level into the active turn.
+    fn record_turn_effort(&mut self, ops: &mut Vec<SpanOp>) {
+        let Some(turn) = self.turn.as_mut() else {
+            return;
+        };
+        if self.effort.is_none() || turn.effort == self.effort {
+            return;
+        }
+        turn.effort = self.effort.clone();
+        ops.push(SpanOp::Merge(SpanRow {
+            span_id: turn.id.clone(),
+            root_span_id: self.root_span_id.clone(),
+            parent_span_ids: vec![turn.parent_id.clone()],
+            metadata: Some(json!({ "effort": turn.effort })),
+            ..Default::default()
+        }));
     }
 
     // A stopped foreground response can still own background work. Retain its
@@ -782,6 +824,13 @@ impl ClaudeTranslator {
             .then(|| forced_error.or_else(|| tool_error(&event.payload)))
             .flatten();
         let mut metadata = tool_metadata(event, &tool_name, &call_id, Some(approval), &input);
+        let duration = event.payload.get("duration_ms").and_then(Value::as_i64);
+        if let Some(duration) = duration {
+            metadata["native_duration_ms"] = json!(duration);
+        }
+        if let Some(interrupted) = event.payload.get("is_interrupt").and_then(Value::as_bool) {
+            metadata["is_interrupt"] = json!(interrupted);
+        }
         if let Some(pending) = self.pending_tools.remove(&call_id) {
             // A PreToolUse hook may rewrite the call via `updatedInput`, so the
             // terminal hook's `tool_input` is what the call ran (or was denied)
@@ -815,11 +864,6 @@ impl ClaudeTranslator {
             } else {
                 SpanType::Tool
             };
-            let duration = event
-                .payload
-                .get("duration_ms")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
             ops.push(SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.session_id, &format!("tool:{call_id}")),
                 root_span_id: self.root_span_id.clone(),
@@ -827,7 +871,7 @@ impl ClaudeTranslator {
                 parent_span_ids: vec![parent_id],
                 name: tool_span_name(&tool_name, &input),
                 span_type,
-                start_ms: Some(event.ts_ms.saturating_sub(duration)),
+                start_ms: Some(event.ts_ms.saturating_sub(duration.unwrap_or(0))),
                 end_ms: Some(event.ts_ms),
                 input: Some(input),
                 output,
@@ -999,8 +1043,9 @@ impl ClaudeTranslator {
         self.main_record_turn = None;
     }
 
-    // Native hooks omit prompt_id. Match their prompts in submission order,
-    // then retain transcript identities so repeats cannot consume another turn.
+    // Hooks carry prompt_id only after the first user input, and older Claude
+    // versions omit it. Without it, match prompts in submission order, then
+    // retain transcript identities so repeats cannot consume another turn.
     fn user_record_turn(&mut self, record: &Value) -> Option<Arc<String>> {
         let prompt_id = record.get("promptId").and_then(Value::as_str);
         let mut owner = prompt_id
@@ -1348,6 +1393,7 @@ impl AgentTranslator for ClaudeTranslator {
                 }));
             }
         }
+        self.record_turn_effort(&mut ops);
         // Root creation moved below the passive-hook gate. Enrich it before
         // handling the event so a later prompt can retain the prior turn's
         // cwd while flushing its deferred transcript rows.
