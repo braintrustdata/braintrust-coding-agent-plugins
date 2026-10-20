@@ -446,6 +446,7 @@ impl ClaudeTranslator {
                 | "PostToolUse"
                 | "PostToolUseFailure"
                 | "PermissionDenied"
+                | "PostCompact"
                 | "SubagentStart"
                 | "SubagentStop"
         )
@@ -1345,12 +1346,12 @@ impl AgentTranslator for ClaudeTranslator {
             ),
             "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, None, &mut ops),
             "PostCompact" => {
-                let parent = self
+                let turn_span_id = self
                     .turn
                     .as_ref()
                     .map(|turn| turn.id.clone())
                     .or_else(|| self.last_turn_id.clone());
-                if let Some(parent) = &parent {
+                if let Some(parent) = &turn_span_id {
                     // PostCompact is the durable point at which Claude's
                     // synthetic compact-summary transcript record becomes the
                     // first message in the active history window.
@@ -1359,7 +1360,10 @@ impl AgentTranslator for ClaudeTranslator {
                 ops.push(SpanOp::Insert(SpanRow {
                     span_id: ids::span_id(&self.session_id, &format!("compaction:{}", event.ts_ms)),
                     root_span_id: self.root_span_id.clone(),
-                    parent_span_ids: vec![parent.unwrap_or_else(|| self.session_span_id.clone())],
+                    parent_span_ids: vec![turn_span_id
+                        .clone()
+                        .unwrap_or_else(|| self.session_span_id.clone())],
+                    turn_span_id,
                     name: "Compaction".into(),
                     span_type: SpanType::Task,
                     start_ms: Some(event.ts_ms),
@@ -2525,8 +2529,24 @@ fn tool_failure_text(payload: &Value) -> Option<String> {
 }
 
 fn is_interrupt_reason(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    reason.contains("interrupt") || reason.contains("cancelled") || reason.contains("canceled")
+    let reason = reason
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase();
+    matches!(
+        reason.as_str(),
+        "request interrupted by user"
+            | "interrupted by user"
+            | "user interrupted"
+            | "request cancelled by user"
+            | "request canceled by user"
+            | "cancelled by user"
+            | "canceled by user"
+            | "user cancelled"
+            | "user canceled"
+            | "user aborted"
+            | "aborted by user"
+    )
 }
 
 fn turn_input_kind(payload: &Value) -> Option<&'static str> {
