@@ -1318,6 +1318,10 @@ impl CodexTranslator {
         };
         let turn_id = scope.open_turns[turn_index].turn_id.clone();
         let turn_span_id = scope.open_turns[turn_index].span_id.clone();
+        let has_open_tool = scope
+            .open_tools
+            .values()
+            .any(|(_, owner, _)| owner == &turn_id);
 
         if scope
             .open_llm
@@ -1347,10 +1351,10 @@ impl CodexTranslator {
                 span_id: llm.span_id,
                 root_span_id: self.effective_root_span_id.clone(),
                 parent_span_ids: vec![turn_span_id],
-                end_ms: Some(if interruption_reason.is_some() {
+                end_ms: Some(if interruption_reason.is_some() && !has_open_tool {
                     ts.max(llm.start_ms)
                 } else {
-                    llm.last_output_ms
+                    llm.last_output_ms.max(llm.start_ms)
                 }),
                 output,
                 metadata: Some(metadata),

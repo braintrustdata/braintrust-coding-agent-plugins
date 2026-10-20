@@ -303,6 +303,13 @@ fn codex_turn_aborted_closes_open_work_as_interrupted() {
                              "metadata": { "turn_id": "t1" } } }),
         json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
                 "payload": { "type": "turn_aborted", "turn_id": "t1", "reason": "interrupted" } }),
+        json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t2" } }),
+        json!({ "timestamp": "2026-01-01T00:00:07Z", "type": "response_item",
+                "payload": { "type": "message", "role": "assistant",
+                             "content": [{ "type": "output_text", "text": "Still thinking" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:08Z", "type": "event_msg",
+                "payload": { "type": "turn_aborted", "turn_id": "t2", "reason": "interrupted" } }),
     ] {
         append(&transcript, record);
     }
@@ -331,11 +338,24 @@ fn codex_turn_aborted_closes_open_work_as_interrupted() {
     );
     assert_eq!(turn.error, None, "intentional interruption is not an error");
 
+    let active_turn = find(&rows, SpanType::Task, "turn: t2");
+    let active_llm = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Llm && row.parent_span_ids.contains(&active_turn.span_id)
+        })
+        .unwrap();
+    assert_eq!(active_llm.end_ms, Some(abort_ms + 3_000));
+
     let llm = rows
         .values()
-        .find(|row| row.span_type == SpanType::Llm)
+        .find(|row| row.span_type == SpanType::Llm && row.parent_span_ids.contains(&turn.span_id))
         .unwrap();
-    assert_eq!(llm.end_ms, Some(abort_ms));
+    assert_eq!(
+        llm.end_ms,
+        Some(abort_ms - 1_000),
+        "the model span ends when it emits the tool call, not when the tool is aborted"
+    );
     assert_eq!(
         llm.metadata.as_ref().unwrap()["outcome"],
         json!("interrupted")
