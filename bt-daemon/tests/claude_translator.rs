@@ -666,6 +666,180 @@ fn claude_subagent_stops_preserve_lifecycle_and_missing_start_recovery() {
 }
 
 #[test]
+fn claude_subagent_handback_report_is_the_span_output() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "subagent-handback");
+    let ctx = SessionCtx {
+        session_id: "subagent-handback".into(),
+        config: None,
+    };
+    let event = |name, ts_ms, payload| claude_event(&ctx.session_id, name, ts_ms, payload);
+    let report = "The implementation is complete; these are the findings.";
+    let mut ops = Vec::new();
+    for envelope in [
+        event("UserPromptSubmit", 10, json!({"prompt": "delegate"})),
+        event(
+            "SubagentStart",
+            20,
+            json!({"agent_id": "worker", "agent_type": "reviewer"}),
+        ),
+        event(
+            "PreToolUse",
+            30,
+            json!({
+                "agent_id": "worker", "tool_name": "SubagentHandback",
+                "tool_use_id": "handback-1", "tool_input": {"message": report}
+            }),
+        ),
+        event(
+            "PostToolUse",
+            40,
+            json!({
+                "agent_id": "worker", "tool_name": "SubagentHandback",
+                "tool_use_id": "handback-1", "tool_input": {"message": report},
+                "tool_response": {"message": "Report delivered"}
+            }),
+        ),
+        event(
+            "SubagentStop",
+            50,
+            json!({
+                "agent_id": "worker", "agent_type": "reviewer",
+                "last_assistant_message": "Handback complete."
+            }),
+        ),
+        event(
+            "SubagentStart",
+            60,
+            json!({"agent_id": "ordinary", "agent_type": "worker"}),
+        ),
+        event(
+            "SubagentStop",
+            70,
+            json!({
+                "agent_id": "ordinary", "agent_type": "worker",
+                "last_assistant_message": "Ordinary subagent result."
+            }),
+        ),
+    ] {
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let handback_agent = rows
+        .values()
+        .find(|row| {
+            row.name == "subagent: reviewer"
+                && row
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("agent_id"))
+                    == Some(&json!("worker"))
+        })
+        .unwrap();
+    assert_eq!(handback_agent.output, Some(json!(report)));
+    let handback_tool = rows
+        .values()
+        .find(|row| {
+            row.span_type == SpanType::Tool
+                && row
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("tool_call_id"))
+                    == Some(&json!("handback-1"))
+        })
+        .unwrap();
+    assert_eq!(
+        handback_tool.parent_span_ids,
+        vec![handback_agent.span_id.clone()]
+    );
+    assert_eq!(
+        handback_tool.output.as_ref().unwrap()["message"],
+        json!("Report delivered")
+    );
+
+    let ordinary_agent = rows
+        .values()
+        .find(|row| {
+            row.name == "subagent: worker"
+                && row
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("agent_id"))
+                    == Some(&json!("ordinary"))
+        })
+        .unwrap();
+    assert_eq!(
+        ordinary_agent.output,
+        Some(json!("Ordinary subagent result."))
+    );
+}
+
+#[test]
+fn claude_subagent_stop_recovers_handback_from_transcript_without_post_tool_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("agent-worker.jsonl");
+    let report = "Recovered report delivered to the caller.";
+    let records = [
+        json!({"type":"assistant","timestamp":"1970-01-01T00:00:03Z","message":{"id":"handback","content":[{"type":"tool_use","id":"handback-1","name":"SubagentHandback","input":{"message":report}}]}}),
+        json!({"type":"user","timestamp":"1970-01-01T00:00:04Z","message":{"content":[{"type":"tool_result","tool_use_id":"handback-1","content":"Delivered"}]}}),
+        json!({"type":"assistant","timestamp":"1970-01-01T00:00:04.500Z","message":{"id":"closing","content":[{"type":"text","text":"Handback complete."}]}}),
+    ];
+    std::fs::write(
+        &transcript,
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "subagent-transcript-recovery");
+    let ctx = SessionCtx {
+        session_id: "subagent-transcript-recovery".into(),
+        config: None,
+    };
+    let path = transcript.to_str().unwrap();
+    let events = [
+        claude_event(
+            &ctx.session_id,
+            "UserPromptSubmit",
+            1_000,
+            json!({"prompt":"delegate"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStart",
+            2_000,
+            json!({"agent_id":"worker","agent_type":"reviewer","agent_transcript_path":path}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStop",
+            5_000,
+            json!({"agent_id":"worker","agent_type":"reviewer","agent_transcript_path":path,"last_assistant_message":"Handback complete."}),
+        ),
+    ];
+    let ops = events
+        .iter()
+        .flat_map(|event| translator.handle(event, &ctx).unwrap())
+        .collect();
+    let rows = reduce(ops);
+    let agent = rows
+        .values()
+        .find(|row| row.name == "subagent: reviewer")
+        .unwrap();
+    assert_eq!(agent.output, Some(json!(report)));
+    assert!(rows.values().any(|row| {
+        row.span_type == SpanType::Tool
+            && row.name == "SubagentHandback"
+            && row.parent_span_ids.contains(&agent.span_id)
+    }));
+}
+
+#[test]
 fn claude_subagent_fixture_builds_nested_subagent_llms() {
     let rows = reduce(replay("subagent-compact"));
     let subagents: Vec<_> = rows

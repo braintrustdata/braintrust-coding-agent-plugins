@@ -296,6 +296,7 @@ struct ClaudeTranslator {
     emitted_tools: RecentSet<String>,
     pending_tools: HashMap<String, PendingTool>,
     subagents: HashMap<String, Subagent>,
+    subagent_handbacks: HashMap<String, Value>,
     pending_skills: Vec<String>,
     pending_emission: Option<PendingEmission>,
     claude_version: Option<String>,
@@ -346,6 +347,7 @@ impl ClaudeTranslator {
             emitted_tools: RecentSet::default(),
             pending_tools: HashMap::new(),
             subagents: HashMap::new(),
+            subagent_handbacks: HashMap::new(),
             pending_skills: Vec::new(),
             pending_emission: None,
             claude_version: None,
@@ -823,6 +825,15 @@ impl ClaudeTranslator {
         let error = (approval != ToolApproval::Denied)
             .then(|| forced_error.or_else(|| tool_error(&event.payload)))
             .flatten();
+        if approval == ToolApproval::Approved && error.is_none() && tool_name == "SubagentHandback"
+        {
+            if let (Some(agent_id), Some(message)) = (
+                string_field(&event.payload, "agent_id"),
+                raw_tool_input(&event.payload).and_then(|input| input.get("message")),
+            ) {
+                self.subagent_handbacks.insert(agent_id, message.clone());
+            }
+        }
         let mut metadata = tool_metadata(event, &tool_name, &call_id, Some(approval), &input);
         let duration = event.payload.get("duration_ms").and_then(Value::as_i64);
         if let Some(duration) = duration {
@@ -903,12 +914,14 @@ impl ClaudeTranslator {
         if let Some(agent) = self.subagents.get_mut(&agent_id) {
             agent.transcript_path = path.clone();
         }
+        let mut transcript_handback = None;
         if let Some(path) = path {
             let cursor = self.transcripts.entry(path.clone()).or_default();
             cursor
                 .buffered
                 .extend(read_event_records(event, &path, &mut cursor.offset));
             let records = std::mem::take(&mut cursor.buffered);
+            transcript_handback = successful_subagent_handback_message(&records);
             self.queue_transcript(
                 records,
                 PendingHistory::Owned(MessageHistory::default()),
@@ -925,12 +938,17 @@ impl ClaudeTranslator {
             "Subagent ended before tool completion",
             ops,
         );
+        let output = self
+            .subagent_handbacks
+            .remove(&agent_id)
+            .or(transcript_handback)
+            .or_else(|| event.payload.get("last_assistant_message").cloned());
         ops.push(SpanOp::Merge(SpanRow {
             span_id: parent.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids,
             end_ms: Some(event.ts_ms),
-            output: event.payload.get("last_assistant_message").cloned(),
+            output,
             ..Default::default()
         }));
         self.subagents.remove(&agent_id);
@@ -1776,6 +1794,22 @@ fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTra
             .collect(),
         history,
     }
+}
+
+/// Returns the most recent SubagentHandback report whose matching transcript
+/// result proves that the tool completed successfully.
+pub(crate) fn successful_subagent_handback_message(records: &[Value]) -> Option<Value> {
+    parse_transcript(records, MessageHistory::default())
+        .tools
+        .into_iter()
+        .rev()
+        .find(|tool| {
+            tool.tool_name == "SubagentHandback"
+                && tool.approval == Some(ToolApproval::Approved)
+                && tool.error.is_none()
+                && !tool.cancelled
+        })
+        .and_then(|tool| tool.input.get("message").cloned())
 }
 
 fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
@@ -2646,7 +2680,7 @@ fn turn_input_kind(payload: &Value) -> Option<&'static str> {
 mod tests {
     use super::{
         decode, parse_rfc3339_timestamp, parse_timestamp_ms, read_snapshot_bounded,
-        TranscriptEnvelope,
+        successful_subagent_handback_message, TranscriptEnvelope,
     };
 
     #[test]
@@ -2711,5 +2745,44 @@ mod tests {
             "a row split across captures must not be permanently skipped"
         );
         assert!(read_snapshot_bounded(&contents, &mut offset, None, None).is_empty());
+    }
+
+    #[test]
+    fn handback_requires_a_successful_matching_tool_result() {
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "message": {"id": "request", "content": [{
+                "type": "tool_use", "id": "handback", "name": "SubagentHandback",
+                "input": {"message": "report"}
+            }]}
+        });
+        let successful = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "handback", "content": "Delivered"
+            }]}
+        });
+        let failed = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "handback", "content": "Failed",
+                "is_error": true
+            }]}
+        });
+
+        assert_eq!(
+            successful_subagent_handback_message(&[assistant.clone(), successful]),
+            Some(serde_json::json!("report"))
+        );
+        assert_eq!(
+            successful_subagent_handback_message(&[assistant.clone(), failed]),
+            None,
+            "a failed handback proposal is not output delivered to the caller"
+        );
+        assert_eq!(
+            successful_subagent_handback_message(&[assistant]),
+            None,
+            "an incomplete handback proposal is not output delivered to the caller"
+        );
     }
 }
