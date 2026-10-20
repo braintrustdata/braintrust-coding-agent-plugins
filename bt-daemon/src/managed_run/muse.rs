@@ -3,7 +3,6 @@ use super::{Injection, ManagedRun, Terminal};
 use crate::agents::Muse;
 use crate::args::RunHookCommand;
 use crate::wire::SessionRoute;
-use anyhow::Context;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +11,8 @@ pub(crate) struct MuseManagedContext {
     pub route: SessionRoute,
     pub managed_run_id: String,
     pub socket: PathBuf,
+    #[serde(default)]
+    pub source_version: Option<String>,
 }
 
 impl ManagedRun for Muse {
@@ -32,17 +33,34 @@ impl ManagedRun for Muse {
                 crate::setup::muse::check_muse_project_hooks(&workspace)?;
             }
         }
-        let executable = crate::env::var_os("MUSE_BIN").unwrap_or_else(|| "muse".into());
-        let output = crate::subprocess::background_command(executable)
-            .arg("--version")
-            .output()
-            .context("check Muse Code version for managed hooks")?;
-        if !output.status.success()
-            || crate::setup::muse::muse_version(&output.stdout)? != semver::Version::new(1, 1, 1)
-        {
-            anyhow::bail!("Muse managed runs require the verified Muse Code 1.1.1 hook override");
+        if crate::setup::muse::installed_muse_version()? < semver::Version::new(1, 3, 0) {
+            anyhow::bail!(
+                "Muse Code 1.3.0 or newer is required for invocation-local hook overrides"
+            );
         }
         Ok(())
+    }
+
+    fn invocation_args(
+        &self,
+        injection_args: Vec<OsString>,
+        mut agent_args: Vec<OsString>,
+    ) -> Vec<OsString> {
+        // Muse dispatches subcommands before parsing options. Placing --config
+        // before `exec` accidentally launches its interactive parser instead.
+        if agent_args
+            .first()
+            .and_then(|arg| arg.to_str())
+            .is_some_and(|arg| matches!(arg, "exec" | "resume"))
+        {
+            let subcommand = agent_args.remove(0);
+            std::iter::once(subcommand)
+                .chain(injection_args)
+                .chain(agent_args)
+                .collect()
+        } else {
+            injection_args.into_iter().chain(agent_args).collect()
+        }
     }
 
     fn needs_daemon_host(&self) -> bool {
@@ -69,6 +87,7 @@ impl ManagedRun for Muse {
             route: route.clone(),
             managed_run_id: id.into(),
             socket: socket.into(),
+            source_version: Some(crate::setup::muse::installed_muse_version()?.to_string()),
         };
         std::fs::write(&context_path, serde_json::to_vec(&context)?)?;
         crate::paths::restrict_file_to_owner(&context_path)?;
@@ -83,15 +102,82 @@ impl ManagedRun for Muse {
             &crate::paths::muse_config_dir(),
             &command,
         )?;
-        let hooks_path = directory.path().join("hooks.json");
-        std::fs::write(&hooks_path, serde_json::to_vec(&hooks)?)?;
+        let mut args = vec![
+            OsString::from("--config"),
+            OsString::from(format!("hooks={}", serde_json::to_string(&hooks)?)),
+        ];
+        // Old persistent installs used a dedicated managed file. Its handlers
+        // must be suppressed alongside the replaced user hooks for this run.
+        if crate::setup::muse::muse_has_owned_managed_hooks(&crate::paths::muse_config_dir())? {
+            args.extend([
+                OsString::from("--config"),
+                OsString::from("managed_hooks_path=\"\""),
+            ]);
+        }
         Ok(Injection {
-            env: vec![(
-                "TBH_MANAGED_HOOKS_PATH",
-                hooks_path.to_string_lossy().into_owned(),
-            )],
+            args,
             guards: vec![Box::new(directory)],
             ..Injection::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_context_carries_runtime_version_and_reads_old_contexts() {
+        let context = MuseManagedContext {
+            route: SessionRoute::default(),
+            managed_run_id: "run".into(),
+            socket: PathBuf::from("daemon.sock"),
+            source_version: Some("1.4.11".into()),
+        };
+        let mut value = serde_json::to_value(&context).unwrap();
+        assert_eq!(
+            serde_json::from_value::<MuseManagedContext>(value.clone())
+                .unwrap()
+                .source_version
+                .as_deref(),
+            Some("1.4.11")
+        );
+        value.as_object_mut().unwrap().remove("source_version");
+        assert!(serde_json::from_value::<MuseManagedContext>(value)
+            .unwrap()
+            .source_version
+            .is_none());
+    }
+
+    #[test]
+    fn invocation_options_follow_native_subcommands() {
+        for subcommand in ["exec", "resume"] {
+            let args = Muse.invocation_args(
+                vec!["--config".into(), "hooks={}".into()],
+                vec![
+                    subcommand.into(),
+                    "--workspace".into(),
+                    "path with spaces".into(),
+                    "prompt".into(),
+                ],
+            );
+            assert_eq!(
+                args,
+                [
+                    subcommand,
+                    "--config",
+                    "hooks={}",
+                    "--workspace",
+                    "path with spaces",
+                    "prompt"
+                ]
+                .map(OsString::from)
+            );
+        }
+        let args = Muse.invocation_args(
+            vec!["--config".into(), "hooks={}".into()],
+            vec!["prompt".into()],
+        );
+        assert_eq!(args, ["--config", "hooks={}", "prompt"].map(OsString::from));
     }
 }

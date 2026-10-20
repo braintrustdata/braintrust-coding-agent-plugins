@@ -44,6 +44,8 @@ struct StoredOp {
     version: u32,
     op: SpanOp,
     late_merge_key: Option<String>,
+    #[serde(default)]
+    late_merge_version: Option<crate::translate::LateMergeVersion>,
     turn_span_id: Option<String>,
     is_turn: bool,
 }
@@ -55,6 +57,7 @@ impl StoredOp {
             version: 1,
             op: op.clone(),
             late_merge_key: row.late_merge_key.clone(),
+            late_merge_version: row.late_merge_version.clone(),
             turn_span_id: row.turn_span_id.clone(),
             is_turn: row.is_turn,
         })?)
@@ -68,6 +71,7 @@ impl StoredOp {
         );
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut stored.op;
         row.late_merge_key = stored.late_merge_key;
+        row.late_merge_version = stored.late_merge_version;
         row.turn_span_id = stored.turn_span_id;
         row.is_turn = stored.is_turn;
         Ok(stored.op)
@@ -923,6 +927,29 @@ mod tests {
             ..SpanRow::default()
         })
     }
+    #[test]
+    fn codec_preserves_aggregate_watermarks_and_reads_older_records() {
+        let mut op = op("root");
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut op;
+        let version = crate::translate::LateMergeVersion {
+            ts_ms: 123,
+            native_id: Some("turn".into()),
+        };
+        row.late_merge_version = Some(version.clone());
+        let encoded = StoredOp::encode(&op).unwrap();
+        let decoded = StoredOp::decode(&encoded).unwrap();
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = decoded;
+        assert_eq!(row.late_merge_version, Some(version));
+        let mut legacy: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        legacy.as_object_mut().unwrap().remove("late_merge_version");
+        let decoded = StoredOp::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = decoded;
+        assert!(row.late_merge_version.is_none());
+        assert!(serde_json::to_value(&op).unwrap()["Insert"]
+            .get("late_merge_version")
+            .is_none());
+    }
+
     fn route(name: &str) -> SessionRoute {
         SessionRoute {
             tags: vec![name.into()],

@@ -652,7 +652,8 @@ mod tests {
                     .filter(|row| row
                         .pointer("/Merge/span_id")
                         .and_then(|value| value.as_str())
-                        == Some(id.as_str()))
+                        == Some(id.as_str())
+                        && row.pointer("/Merge/end_ms").is_some())
                     .count(),
                 1,
                 "missing or duplicate completion for {identity}"
@@ -766,7 +767,8 @@ mod tests {
                 .filter(|row| row
                     .pointer("/Merge/span_id")
                     .and_then(|value| value.as_str())
-                    == Some(root_id.as_str()))
+                    == Some(root_id.as_str())
+                    && row.pointer("/Merge/end_ms").is_some())
                 .count(),
             1
         );
@@ -774,6 +776,226 @@ mod tests {
         let completed = rows.clone();
         import().await.unwrap();
         assert_eq!(std::fs::read_to_string(&rows_path).unwrap(), completed);
+    }
+
+    #[tokio::test]
+    async fn muse_live_capture_then_export_reuses_model_and_late_updates_resumed_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let export = temp.path().join("export.json");
+        let make_processor = || {
+            ImportProcessor::new(
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                Some(ledger.clone()),
+            )
+            .unwrap()
+        };
+        let mut live = make_processor();
+        for (name, payload, ts) in [
+            (
+                "UserPromptSubmit",
+                json!({"turn_id":"run-1","prompt":"first"}),
+                1000,
+            ),
+            (
+                "PreLLMCall",
+                json!({"turn_id":"run-1","request_id":"run-1:0:1"}),
+                1001,
+            ),
+            (
+                "PostLLMCall",
+                json!({"turn_id":"run-1","request_id":"run-1:0:1","output_text_preview":"preview"}),
+                1003,
+            ),
+            (
+                "Stop",
+                json!({"turn_id":"run-1","last_assistant_message":"first answer"}),
+                1003,
+            ),
+            ("SessionEnd", json!({}), 1004),
+            (
+                "UserPromptSubmit",
+                json!({"turn_id":"run-2","prompt":"second"}),
+                2400,
+            ),
+            (
+                "Stop",
+                json!({"turn_id":"run-2","last_assistant_message":"latest preview"}),
+                2500,
+            ),
+            ("SessionEnd", json!({}), 2501),
+        ] {
+            live.process(vec![transcript_import::envelope(
+                "muse",
+                None,
+                "cross-ingress",
+                name,
+                ts,
+                payload,
+            )])
+            .await
+            .unwrap();
+        }
+        live.finish().await.unwrap();
+        std::fs::write(&export, serde_json::to_vec(&json!({
+            "export_schema_version":1,"sessions":[{"session_id":"cross-ingress"}],
+            "events":[
+                {"recorded_at":1000000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"first"}}}},
+                {"recorded_at":1001000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_input_trace_recorded","request_record_id":"uuid-1","model_step":0}}}},
+                {"recorded_at":1002000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"assistant_message_committed","text":"full exported answer"}}}},
+                {"recorded_at":1003000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}},
+                {"recorded_at":1004000,"envelope":{"payload":{"kind":"session_end"}}},
+                {"recorded_at":2000000,"envelope":{"payload":{"kind":"run","run_id":"run-2","event":{"kind":"started","prompt":"second"}}}},
+                {"recorded_at":2001000,"envelope":{"payload":{"kind":"run","run_id":"run-2","event":{"kind":"assistant_message_committed","text":"latest answer"}}}},
+                {"recorded_at":2002000,"envelope":{"payload":{"kind":"run","run_id":"run-2","event":{"kind":"terminal","terminal":"completed"}}}},
+                {"recorded_at":2003000,"envelope":{"payload":{"kind":"session_end"}}}
+            ]
+        })).unwrap()).unwrap();
+        let mut imported = make_processor();
+        assert!(process_muse_export(&mut imported, &export, "cross-ingress")
+            .await
+            .unwrap());
+        imported.finish().await.unwrap();
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(output.join("spans/cross-ingress.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let namespace = ids::session_namespace("muse", "cross-ingress");
+        let model = ids::span_id(&namespace, "llm:run-1:0:1");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row
+                    .pointer("/Insert/span_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(model.as_str()))
+                .count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .filter_map(|row| row.get("Merge"))
+            .any(|row| row["span_id"] == model && row["output"] == "full exported answer"));
+        let root = ids::span_id(&namespace, "root");
+        let root_updates: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.get("Merge"))
+            .filter(|row| row["span_id"] == root)
+            .collect();
+        assert!(root_updates
+            .iter()
+            .any(|row| row["output"] == "latest answer"));
+        assert_eq!(root_updates.last().unwrap()["end_ms"], 2003);
+        assert_eq!(
+            root_updates
+                .iter()
+                .rev()
+                .find(|row| row.get("output").is_some())
+                .unwrap()["output"],
+            "latest answer"
+        );
+        // An older complete export must not roll the root back to run-1.
+        let rows_path = output.join("spans/cross-ingress.ndjson");
+        let before_stale = std::fs::read_to_string(&rows_path).unwrap();
+        let mut stale: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&export).unwrap()).unwrap();
+        stale["events"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|event| event["recorded_at"].as_i64().unwrap() < 2_000_000);
+        std::fs::write(&export, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let mut old = make_processor();
+        process_muse_export(&mut old, &export, "cross-ingress")
+            .await
+            .unwrap();
+        old.finish().await.unwrap();
+        assert_eq!(std::fs::read_to_string(rows_path).unwrap(), before_stale);
+    }
+
+    #[tokio::test]
+    async fn muse_native_tool_export_reuses_delivered_live_tool_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let make_processor = || {
+            ImportProcessor::new(
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                Some(ledger.clone()),
+            )
+            .unwrap()
+        };
+        let mut live = make_processor();
+        for (name, payload, ts) in [
+            (
+                "UserPromptSubmit",
+                json!({"turn_id":"fixture-turn","prompt":"Print an integration marker."}),
+                1,
+            ),
+            (
+                "PreToolUse",
+                json!({"turn_id":"fixture-turn","tool_use_id":"call_muse_1","tool_name":"shell","tool_input":{"command":"printf MUSE_TOOL_OK"}}),
+                2,
+            ),
+            (
+                "PostToolUse",
+                json!({"turn_id":"fixture-turn","tool_use_id":"call_muse_1","tool_name":"shell","tool_response":"MUSE_TOOL_OK"}),
+                3,
+            ),
+            (
+                "Stop",
+                json!({"turn_id":"fixture-turn","last_assistant_message":"MUSE_TOOL_OK"}),
+                4,
+            ),
+            ("SessionEnd", json!({}), 5),
+        ] {
+            live.process(vec![transcript_import::envelope(
+                "muse",
+                Some("1.4.11".into()),
+                "muse-export-fixture",
+                name,
+                ts,
+                payload,
+            )])
+            .await
+            .unwrap();
+        }
+        live.finish().await.unwrap();
+        let export = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/muse-export-1.4.11.json");
+        let mut imported = make_processor();
+        assert!(
+            process_muse_export(&mut imported, &export, "muse-export-fixture")
+                .await
+                .unwrap()
+        );
+        imported.finish().await.unwrap();
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(output.join("spans/muse-export-fixture.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let tool = ids::span_id(
+            &ids::session_namespace("muse", "muse-export-fixture"),
+            "tool:call_muse_1",
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row
+                    .pointer("/Insert/span_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tool.as_str()))
+                .count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .filter_map(|row| row.get("Merge"))
+            .any(|row| row["span_id"] == tool && row["output"] == "MUSE_TOOL_OK"));
     }
 
     #[derive(Debug, Parser)]

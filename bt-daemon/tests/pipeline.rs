@@ -2817,15 +2817,22 @@ esac
 
 #[cfg(all(feature = "cli", unix))]
 #[tokio::test]
-#[ignore = "requires a local Muse Code 1.1.1 installation"]
+#[ignore = "requires a local Muse Code 1.3+ installation"]
 async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
-    let output = match std::process::Command::new("muse").arg("--version").output() {
-        Ok(output) if output.status.success() => output,
-        _ => return,
-    };
-    if !String::from_utf8_lossy(&output.stdout).contains("1.1.1") {
-        return;
-    }
+    let _credential_backend = EnvVarGuard::set("TBH_CREDENTIAL_BACKEND", "file");
+    let _telemetry = EnvVarGuard::set("TBH_DISABLE_TELEMETRY", "1");
+    let muse_executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| "muse".into());
+    let output = std::process::Command::new(&muse_executable)
+        .arg("--version")
+        .output()
+        .expect("install Muse Code before explicitly running this ignored test");
+    assert!(output.status.success(), "Muse version check failed");
+    let native_version = String::from_utf8(output.stdout)
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_owned();
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("muse");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -2833,12 +2840,16 @@ async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
     let foreign_command = format!("printf foreign >> '{}'", marker.display());
     let managed = serde_json::json!({
         "schema_version": 1,
-        "hooks": {"SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": foreign_command}]}]}
+        "hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "enterprise-audit", "timeout_ms": 1000, "command": foreign_command}]}]}
     });
     std::fs::write(config_dir.join("global.json"), managed.to_string()).unwrap();
-    let settings = r#"{"schema_version":1,"managed_hooks_path":"global.json"}"#;
-    std::fs::write(config_dir.join("settings.json"), settings).unwrap();
+    let user_marker = tmp.path().join("user-hook.txt");
+    let settings = serde_json::json!({"schema_version":1,"managed_hooks_path":"global.json","hooks":{"Stop":[{"hooks":[{"type":"command","command":format!("printf user >> '{}'", user_marker.display())}]}]}});
+    std::fs::write(config_dir.join("settings.json"), settings.to_string()).unwrap();
     let _config = EnvVarGuard::set("XDG_CONFIG_HOME", tmp.path());
+    let _data = EnvVarGuard::set("XDG_DATA_HOME", tmp.path().join("data"));
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
     let (socket, daemon, flushes, daemon_dir) =
         start_tracking_daemon(env!("CARGO_PKG_VERSION")).await;
     let _socket = EnvVarGuard::set("BT_DAEMON_SOCKET", &socket);
@@ -2866,6 +2877,8 @@ async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
                 "--provider".into(),
                 "echo".into(),
                 "--no-foreign-personal-context".into(),
+                "--workspace".into(),
+                workspace.clone().into_os_string(),
                 "hello".into(),
             ],
         },
@@ -2883,9 +2896,10 @@ async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
     .unwrap();
     assert!(status.success());
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "foreign");
+    assert_eq!(std::fs::read_to_string(&user_marker).unwrap(), "user");
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(config_dir.join("settings.json")).unwrap()).unwrap();
-    assert_eq!(saved["managed_hooks_path"], "global.json");
+    assert_eq!(saved, settings);
     assert_eq!(
         std::fs::read_to_string(config_dir.join("global.json")).unwrap(),
         managed.to_string()
@@ -2905,14 +2919,17 @@ async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
                 "muse-managed-test"
             );
             assert!(row["managed_run_id"].as_str().is_some());
+            assert_eq!(row["source_version"], native_version);
             main_session |= row["event"] == "SessionStart";
         }
     }
     assert!(main_session);
     assert!(flushed.values().copied().sum::<usize>() >= 1);
-    let ordinary = std::process::Command::new("muse")
+    let ordinary = std::process::Command::new(&muse_executable)
+        .arg("exec")
+        .arg("--workspace")
+        .arg(&workspace)
         .args([
-            "exec",
             "--provider",
             "echo",
             "--no-foreign-personal-context",
@@ -2922,23 +2939,28 @@ async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
         .unwrap();
     assert!(ordinary.status.success());
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "foreignforeign");
+    assert_eq!(std::fs::read_to_string(&user_marker).unwrap(), "useruser");
     shutdown(&socket).await;
     daemon.await.unwrap();
 }
 
 #[cfg(all(feature = "cli", unix))]
 #[tokio::test]
-#[ignore = "requires a local Muse Code 1.1.1 installation"]
+#[ignore = "requires a local Muse Code 1.3+ installation"]
 async fn muse_managed_run_starts_its_isolated_daemon_before_sanitized_hooks() {
-    let output = match std::process::Command::new("muse").arg("--version").output() {
-        Ok(output) if output.status.success() => output,
-        _ => return,
-    };
-    if !String::from_utf8_lossy(&output.stdout).contains("1.1.1") {
-        return;
-    }
+    let _credential_backend = EnvVarGuard::set("TBH_CREDENTIAL_BACKEND", "file");
+    let _telemetry = EnvVarGuard::set("TBH_DISABLE_TELEMETRY", "1");
+    let muse_executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| "muse".into());
+    let output = std::process::Command::new(&muse_executable)
+        .arg("--version")
+        .output()
+        .expect("install Muse Code before explicitly running this ignored test");
+    assert!(output.status.success(), "Muse version check failed");
     let tmp = tempfile::tempdir().unwrap();
     let _config = EnvVarGuard::set("XDG_CONFIG_HOME", tmp.path());
+    let _data = EnvVarGuard::set("XDG_DATA_HOME", tmp.path().join("data"));
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
     let _socket = EnvVarGuard::unset("BT_DAEMON_SOCKET");
     let binary = env!("CARGO_BIN_EXE_bt-daemon");
     let status = run_traced(
@@ -2952,6 +2974,8 @@ async fn muse_managed_run_starts_its_isolated_daemon_before_sanitized_hooks() {
                 "--provider".into(),
                 "echo".into(),
                 "--no-foreign-personal-context".into(),
+                "--workspace".into(),
+                workspace.clone().into_os_string(),
                 "hello".into(),
             ],
         },

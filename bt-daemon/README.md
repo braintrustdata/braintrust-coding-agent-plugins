@@ -285,32 +285,49 @@ Muse imports invoke its documented local `muse export --session` interface and
 read export schema version 1. `import muse --all` enumerates durable session
 IDs through Muse's read-only MSP `session/list` interface, then exports each
 completed session. Exports are parsed incrementally, one session at a time.
-Muse Code 1.1.1 setup captures the six verified lifecycle and model hooks:
-`SessionStart`, `UserPromptSubmit`, `PreLLMCall`, `PostLLMCall`, `Stop`, and
-`SessionEnd`. Tool, permission, subagent, and compaction details are not
-available from those hooks and are not inferred by the live translator.
+Muse Code 1.3+ setup captures lifecycle, model, tool success/failure, permission
+requests, subagent lifecycle, compaction, batch completion, and notifications.
+Installation adds owned user hooks while preserving unrelated user hooks and
+enterprise managed-hook policy. Disablement removes only Braintrust's hooks.
+
 `import muse <session-id> --attach` follows an active session by polling full
-exports. Each snapshot is parsed with the same reader and translator as
-historical import; only new envelopes are delivered, and an active snapshot
-does not invent `Stop` or `SessionEnd` events. The attach exits after a native
-session end, or finalizes open spans on interruption. This reads the full
-export each poll, so polling cost grows with long sessions. MSP offers
-cursor-paged `view/page`, but its view events omit the model request/response
-records needed by this translator; `view/subscribe` also requires a session
-loaded on the same host.
-One-shot imports of active Muse sessions also leave spans open, allowing a
-later import to add the native completion to the same deterministic trace.
-`run muse` uses a process-local managed-hook override in the verified Muse Code
-1.1.1 release. It retains compatible unrelated managed hooks, replaces Braintrust's saved
-managed hooks only for that invocation, and leaves ordinary Muse sessions and
-settings unchanged. The injected hook reads a private invocation context file
-because Muse clears its hook environment. A dedicated daemon is started before
-Muse so environment-based Braintrust authentication never depends on that
-cleared environment. Known duplicate Braintrust user or project hooks stop the
-managed run with a diagnostic. A foreign managed file using Muse's strict
-handler schema is also rejected rather than silently losing hooks. Muse plugins that independently trace the same
-session should be disabled before using `run muse`; new Muse versions must be
-verified before the undocumented hook-path override is enabled for them.
+exports with the same parser and translator used for historical import. Only
+new envelopes are delivered. Active snapshots leave spans open; Ctrl-C detaches
+without fabricating a terminal result or launching a final export. A later attach
+or import applies authoritative completion to the same span IDs. Polling cost
+grows with session length; MSP view events omit the model request/response records
+needed by the translator.
+
+Live model hooks and schema-v1 exports use the native turn, model step, and retry
+attempt for shared span identity; the export's record UUID is retained as metadata.
+Legacy exports without a model step retain their record UUID, so cross-ingress
+model deduplication cannot be guaranteed for those records. Native response
+previews remain previews: tracing cannot recover content Muse does not export.
+Permission hooks report requests, not approval decisions; compaction hooks lack
+native operation IDs. Captured built-in child hooks identify their child session
+but omit the parent session, so their work remains in a separate trace rather
+than guessing ancestry across concurrent sessions. Missing native facts are not invented.
+
+`run muse` uses invocation-local `-c hooks=…` configuration and a private context
+file because Muse sanitizes the hook environment. It replaces owned user hooks
+for that invocation, preserves foreign user hooks and enterprise managed hooks,
+and leaves saved settings unchanged. An isolated daemon starts before Muse so
+authentication does not depend on the sanitized hook environment. Duplicate
+Braintrust project hooks produce a diagnostic. Disable independently tracing
+Muse plugins before running a managed session.
+
+Muse native verification runs on Linux in CI and locally on macOS. The official
+installer does not provide a Windows binary; Rust fixture tests still run on
+Windows. Native tests use Muse's file credential backend
+(`TBH_CREDENTIAL_BACKEND=file`) and disable telemetry so temporary profiles do
+not trigger macOS Keychain creation dialogs. Muse hooks ship through the embedding `bt` binary; no separate marketplace
+package is needed. After this PR merges, dispatch the consumer's existing
+`Update bt-daemon dependency` workflow (`update-bt-daemon.yml` in
+`braintrustdata/bt`) to prepare its Git pin and lockfile PR. Merge that consumer
+update and build/install `bt`, then verify `bt trace setup
+muse`, `bt trace run muse exec …`, `bt trace import muse <session-id>`, status,
+and disablement against an isolated Muse profile. Release publishing remains
+owned by the consumer repository.
 
 Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
 Ctrl-C. `run <codex|muse|claude|opencode|pi> [ARGS...]` launches the selected agent with

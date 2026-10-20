@@ -67,6 +67,7 @@ struct NativePayload {
     kind: Option<String>,
     run_id: Option<String>,
     event: Option<Value>,
+    record: Option<Value>,
 }
 
 #[derive(Default)]
@@ -74,12 +75,15 @@ struct RunState {
     active_model: Option<ModelState>,
     last_assistant: Option<Value>,
     model_ordinal: u64,
+    step_attempts: HashMap<u64, u64>,
 }
 
 struct ModelState {
     request_id: String,
     usage: Option<Value>,
     text: Option<Value>,
+    response_id: Option<Value>,
+    completed_at: Option<i64>,
 }
 
 struct Reader<'a, F> {
@@ -94,6 +98,11 @@ struct Reader<'a, F> {
     last_ts: Option<i64>,
     current_session_ended: bool,
     activity_count: usize,
+    metadata: Value,
+    tools: HashMap<String, Value>,
+    tool_errors: HashMap<String, String>,
+    tool_tasks: HashMap<String, String>,
+    run_metadata: HashMap<String, Value>,
 }
 
 impl<F> Reader<'_, F>
@@ -122,6 +131,9 @@ where
                     "hook_event_name": "SessionStart",
                     "source": "muse_export_v1",
                     "trajectory_id": self.session.trajectory_id,
+                    "model": self.metadata.get("model_id"),
+                    "provider": self.metadata.get("provider_id"),
+                    "cwd": self.metadata.get("workspace_root"),
                     "root_session_id": self.session.root_session_id,
                     "transcript_path": self.path.to_string_lossy(),
                 }),
@@ -136,16 +148,30 @@ where
         run_id: &str,
         ts: i64,
         request_id: Option<&str>,
-        messages: Value,
+        input: Value,
+        model_step: Option<u64>,
     ) -> Result<()> {
+        let model_metadata = self
+            .run_metadata
+            .get(run_id)
+            .unwrap_or(&self.metadata)
+            .clone();
         let run = self.runs.entry(run_id.to_owned()).or_default();
         if run.active_model.is_some() {
             bail!("Muse run {run_id} starts another model request before the previous response")
         }
-        let request_id = match request_id {
-            Some(id) if !id.is_empty() => id.to_owned(),
-            Some(_) => bail!("Muse model_input_trace_recorded has an empty request_record_id"),
-            None => {
+        let native_request_id = request_id.map(str::to_owned);
+        let request_id = match (model_step, request_id) {
+            (Some(step), _) => {
+                let attempt = run.step_attempts.entry(step).or_default();
+                *attempt += 1;
+                format!("{run_id}:{step}:{attempt}")
+            }
+            (None, Some(id)) if !id.is_empty() => id.to_owned(),
+            (None, Some(_)) => {
+                bail!("Muse model_input_trace_recorded has an empty request_record_id")
+            }
+            (None, None) => {
                 run.model_ordinal += 1;
                 format!("{run_id}:model:{}", run.model_ordinal)
             }
@@ -154,6 +180,8 @@ where
             request_id: request_id.clone(),
             usage: None,
             text: None,
+            response_id: None,
+            completed_at: None,
         });
         self.emit(
             "PreLLMCall",
@@ -163,7 +191,15 @@ where
                 "hook_event_name": "PreLLMCall",
                 "turn_id": run_id,
                 "request_id": request_id,
-                "messages": messages,
+                "request_record_id": native_request_id,
+                "step": model_step,
+                "model": model_metadata.get("model_id"),
+                "provider": model_metadata.get("provider_id"),
+                "cwd": self.metadata.get("workspace_root"),
+                "messages": input.get("messages"),
+                "tools": input.get("tools"),
+                "options": input.get("options"),
+                "input_summary": input.get("bounded"),
                 "source": "muse_export_v1",
             }),
         )
@@ -197,15 +233,17 @@ where
         };
         self.emit(
             "PostLLMCall",
-            ts,
+            model.completed_at.unwrap_or(ts),
             json!({
                 "session_id": self.session_id,
                 "hook_event_name": "PostLLMCall",
                 "turn_id": run_id,
                 "request_id": model.request_id,
                 "usage": model.usage,
+                "usage_scope": "model",
                 "output_text_preview": model.text,
-                "error": error,
+                "response_id": model.response_id,
+                "error": if model.completed_at.is_some() { None } else { error },
                 "source": "muse_export_v1",
             }),
         )
@@ -218,6 +256,74 @@ where
         let Some(payload) = native_envelope.payload else {
             return Ok(());
         };
+        if payload.kind.as_deref() == Some("run_model") {
+            if let Some(record) = payload.record {
+                if let Some(run) = record.pointer("/run_stream/id").and_then(Value::as_str) {
+                    self.run_metadata.insert(run.to_owned(), record);
+                }
+            }
+            return Ok(());
+        }
+        if payload.kind.as_deref() == Some("task") {
+            if let Some(event) = &payload.event {
+                let kind = event.get("kind").and_then(Value::as_str);
+                let task = event.get("task_id").and_then(Value::as_str);
+                if let (Some(task), Some(call)) = (
+                    task,
+                    event
+                        .get("idempotency_key")
+                        .and_then(Value::as_str)
+                        .and_then(|key| key.strip_prefix("tool:")),
+                ) {
+                    self.tool_tasks.insert(task.to_owned(), call.to_owned());
+                }
+                if kind == Some("rejected") {
+                    if let (Some(id), Some(reason)) = (
+                        event
+                            .pointer("/origin/tool_call_id")
+                            .and_then(Value::as_str),
+                        event.get("reason").and_then(Value::as_str),
+                    ) {
+                        self.tool_errors.insert(id.to_owned(), reason.to_owned());
+                    }
+                }
+                if let Some(call) = task.and_then(|task| self.tool_tasks.get(task)).cloned() {
+                    if kind == Some("started") {
+                        if let Some(tool) = self.tools.get(&call).cloned() {
+                            let ts = item
+                                .recorded_at
+                                .or(native_envelope.recorded_at)
+                                .context("Muse tool task has no recorded_at")?
+                                / 1000;
+                            self.emit("PreToolUse", ts, tool)?;
+                        }
+                    } else if matches!(kind, Some("failed" | "cancelled" | "canceled")) {
+                        let reason = event
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Muse tool task failed");
+                        self.tool_errors.insert(call, reason.to_owned());
+                        if let Some(task) = task {
+                            self.tool_tasks.remove(task);
+                        }
+                    } else if kind == Some("completed") {
+                        if let Some(tool) = self.tools.get_mut(&call) {
+                            tool["status"] = json!("completed");
+                        }
+                        if let Some(task) = task {
+                            self.tool_tasks.remove(task);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if payload.kind.as_deref() == Some("metadata") {
+            if let Some(record) = payload.record {
+                self.metadata = record;
+            }
+            return Ok(());
+        }
         let kind = payload
             .event
             .as_ref()
@@ -234,6 +340,10 @@ where
                         "started"
                             | "model_input_trace_recorded"
                             | "model_completed"
+                            | "model_response_created"
+                            | "assistant_tool_calls_committed"
+                            | "tool_result_batch_committed"
+                            | "model_failure_terminal_intent"
                             | "resource_usage_sampled"
                             | "assistant_message_committed"
                             | "terminal"
@@ -305,8 +415,87 @@ where
                     &run_id,
                     ts,
                     Some(request_id),
-                    event.get("bounded").cloned().unwrap_or(Value::Null),
+                    json!({"bounded":event.get("bounded")}),
+                    event.get("model_step").and_then(Value::as_u64),
                 )?;
+            }
+            "assistant_tool_calls_committed" => {
+                let calls = event
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .context("Muse assistant_tool_calls_committed has no tool_calls array")?;
+                let mut output_calls = Vec::new();
+                for call in calls {
+                    let id = call
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .context("Muse committed tool call has no call_id")?;
+                    let name = call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .context("Muse committed tool call has no name")?;
+                    let args = call.get("args").cloned().unwrap_or(Value::Null);
+                    let input = if let Some(args) = args.as_str() {
+                        serde_json::from_str(args).unwrap_or_else(|_| args.into())
+                    } else {
+                        args.clone()
+                    };
+                    let payload = json!({"turn_id":run_id,"tool_use_id":id,"tool_name":name,"tool_input":input,"source":"muse_export_v1"});
+                    self.tools.insert(id.to_owned(), payload.clone());
+
+                    output_calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":args}}));
+                }
+                if let Some(model) = self
+                    .runs
+                    .get_mut(&run_id)
+                    .and_then(|run| run.active_model.as_mut())
+                {
+                    model.text = Some(json!([{"role":"assistant","tool_calls":output_calls}]));
+                    model.response_id = event.get("response_id").cloned();
+                }
+            }
+            "tool_result_batch_committed" => {
+                let results = event
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .context("Muse tool_result_batch_committed has no results array")?;
+                for result in results {
+                    let id = result
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .context("Muse tool result has no tool_call_id")?;
+                    let mut payload = self.tools.remove(id).unwrap_or_else(
+                        || json!({"turn_id":run_id,"tool_use_id":id,"source":"muse_export_v1"}),
+                    );
+                    payload["tool_response"] = result.get("text").cloned().unwrap_or(Value::Null);
+                    let error = self.tool_errors.remove(id);
+                    payload["error"] = json!(error);
+                    if error.is_some() {
+                        self.emit("PostToolUseFailure", ts, payload)?;
+                    } else if payload.get("status").and_then(Value::as_str) == Some("completed") {
+                        self.emit("PostToolUse", ts, payload)?;
+                    } else {
+                        self.emit("PostToolBatch", ts, json!({"turn_id":run_id,"tool_calls":[payload],"source":"muse_export_v1"}))?;
+                    }
+                }
+            }
+            "model_failure_terminal_intent" => {
+                let reason = event
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Muse model failed");
+                self.finish_model(&run_id, ts, Some(reason))?;
+            }
+            "model_response_created" => {
+                if let Some(model) = self
+                    .runs
+                    .get_mut(&run_id)
+                    .and_then(|run| run.active_model.as_mut())
+                {
+                    model.response_id = event.get("response_id").cloned();
+                }
             }
             "model_completed" => {
                 if self
@@ -315,7 +504,7 @@ where
                     .and_then(|run| run.active_model.as_ref())
                     .is_none()
                 {
-                    self.start_model(&run_id, ts, None, Value::Null)?;
+                    self.start_model(&run_id, ts, None, Value::Null, None)?;
                 }
                 if let Some(model) = self
                     .runs
@@ -323,6 +512,7 @@ where
                     .and_then(|run| run.active_model.as_mut())
                 {
                     model.usage = event.get("usage").cloned();
+                    model.completed_at = Some(ts);
                 }
             }
             "resource_usage_sampled" => {
@@ -347,7 +537,7 @@ where
                     .and_then(|run| run.active_model.as_ref())
                     .is_none()
                 {
-                    self.start_model(&run_id, ts, None, Value::Null)?;
+                    self.start_model(&run_id, ts, None, Value::Null, None)?;
                 }
                 let run = self
                     .runs
@@ -358,6 +548,9 @@ where
                     .as_mut()
                     .context("Muse run has no active model")?
                     .text = Some(text);
+                if let Some(model) = run.active_model.as_mut() {
+                    model.response_id = event.get("response_id").cloned();
+                }
             }
             "terminal" => {
                 let terminal = event
@@ -378,6 +571,7 @@ where
                 });
                 self.finish_model(&run_id, ts, error.as_deref())?;
                 let run = self.runs.remove(&run_id);
+                self.run_metadata.remove(&run_id);
                 self.emit(
                     "Stop",
                     ts,
@@ -524,6 +718,11 @@ where
         last_ts: None,
         current_session_ended: false,
         activity_count: 0,
+        metadata: json!({}),
+        tools: HashMap::new(),
+        tool_errors: HashMap::new(),
+        tool_tasks: HashMap::new(),
+        run_metadata: HashMap::new(),
     };
     let mut de = serde_json::Deserializer::from_reader(BufReader::new(
         File::open(path).with_context(|| format!("read Muse export {}", path.display()))?,
@@ -691,9 +890,123 @@ mod tests {
                 "SessionEnd"
             ]
         );
+        assert_eq!(events[3].ts_ms, 1002);
         assert_eq!(events[3].payload["usage"]["input_tokens"], 1);
         assert_eq!(events[3].payload["output_text_preview"], "world");
         assert_eq!(events[5].ts_ms, 1009);
+    }
+
+    #[test]
+    fn native_model_steps_match_live_hook_identity_and_distinguish_retries() {
+        let (_temp, path) = write_export(json!({
+            "export_schema_version":1,
+            "sessions":[{"session_id":"session-1"}],
+            "events":[
+                {"recorded_at":999000,"envelope":{"payload":{"kind":"metadata","record":{"model_id":"native-model","provider_id":"native-provider","workspace_root":"/workspace"}}}},
+                {"recorded_at":1000000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}},
+                {"recorded_at":1001000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_input_trace_recorded","model_step":0,"request_record_id":"uuid-a","bounded":{"request_message_count":2}}}}},
+                {"recorded_at":1002000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_input_trace_recorded","model_step":0,"request_record_id":"uuid-b"}}}},
+                {"recorded_at":1003000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"assistant_message_committed","text":"hello","response_id":"provider-response"}}}},
+                {"recorded_at":1004000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}}
+            ]
+        }));
+        let events = envelopes(&path).unwrap();
+        let starts: Vec<_> = events.iter().filter(|e| e.event == "PreLLMCall").collect();
+        assert_eq!(starts[0].payload["model"], "native-model");
+        assert_eq!(starts[0].payload["provider"], "native-provider");
+        assert_eq!(events[0].payload["cwd"], "/workspace");
+        assert_eq!(starts[0].payload["request_id"], "run-1:0:1");
+        assert_eq!(starts[1].payload["request_id"], "run-1:0:2");
+        assert_eq!(starts[0].payload["request_record_id"], "uuid-a");
+        assert!(starts[0].payload["messages"].is_null());
+        assert_eq!(
+            starts[0].payload["input_summary"]["request_message_count"],
+            2
+        );
+        let post = events.iter().rfind(|e| e.event == "PostLLMCall").unwrap();
+        assert_eq!(post.payload["response_id"], "provider-response");
+    }
+
+    #[test]
+    fn captured_modern_export_imports_native_tools_models_and_usage() {
+        // Reduced native 1.4.11 export captured against a deterministic Responses
+        // endpoint. Session/turn/task ids, paths and timestamps are sanitized.
+        let (_temp, path) = write_export(
+            serde_json::from_str(include_str!("../../tests/fixtures/muse-export-1.4.11.json"))
+                .unwrap(),
+        );
+        let events = envelopes(&path).unwrap();
+        let pre = events.iter().find(|e| e.event == "PreToolUse").unwrap();
+        let post = events.iter().find(|e| e.event == "PostToolUse").unwrap();
+        assert_eq!(pre.payload["tool_use_id"], "call_muse_1");
+        assert_eq!(pre.payload["tool_input"]["command"], "printf MUSE_TOOL_OK");
+        assert_eq!(post.payload["tool_response"], "MUSE_TOOL_OK");
+        assert!(pre.ts_ms < post.ts_ms);
+        let registry = crate::translate::Registry::default_agents();
+        let mut translator = registry.create("muse", "muse-export-fixture");
+        let ctx = crate::translate::SessionCtx {
+            session_id: "muse-export-fixture".into(),
+            config: None,
+        };
+        let mut rows = Vec::new();
+        for event in &events {
+            rows.extend(translator.handle(event, &ctx).unwrap());
+        }
+        assert_eq!(rows.iter().filter(|op|matches!(op,crate::translate::SpanOp::Insert(row) if row.span_type == crate::translate::SpanType::Tool)).count(),1);
+        assert_eq!(rows.iter().filter(|op|matches!(op,crate::translate::SpanOp::Insert(row) if row.span_type == crate::translate::SpanType::Llm)).count(),2);
+        let root = crate::ids::span_id(
+            &crate::ids::session_namespace("muse", "muse-export-fixture"),
+            "root",
+        );
+        assert!(rows.iter().any(|op|matches!(op,crate::translate::SpanOp::Merge(row) if row.span_id == root && row.metrics.as_ref().is_some_and(|m|m["prompt_tokens"] == 20 && m["completion_tokens"] == 10 && m["tokens"] == 30))));
+        assert!(rows.iter().any(|op|matches!(op,crate::translate::SpanOp::Merge(row) if row.output == Some(json!("MUSE_TOOL_OK")) && row.metadata.as_ref().is_some_and(|m|m["tool_outcome"] == "success"))));
+    }
+
+    #[test]
+    fn captured_failed_tool_task_preserves_reason_and_output() {
+        let (_temp, path) = write_export(
+            serde_json::from_str(include_str!(
+                "../../tests/fixtures/muse-export-tool-failure-1.4.11.json"
+            ))
+            .unwrap(),
+        );
+        let events = envelopes(&path).unwrap();
+        let failed = events
+            .iter()
+            .find(|e| e.event == "PostToolUseFailure")
+            .expect("native failed task has a failure envelope");
+        assert_eq!(failed.payload["tool_use_id"], "call_muse_failure");
+        assert_eq!(
+            failed.payload["error"],
+            "exit status: 7\nstdout:\nMUSE_TOOL_FAILURE"
+        );
+        assert_eq!(
+            failed.payload["tool_response"],
+            "tool failed: exit status: 7\nstdout:\nMUSE_TOOL_FAILURE"
+        );
+    }
+
+    #[test]
+    fn rejected_tool_and_model_failures_keep_explicit_native_reasons() {
+        let (_temp, path) = write_export(
+            json!({"export_schema_version":1,"sessions":[{"session_id":"failure-fixture"}],"events":[
+                {"recorded_at":1000000,"envelope":{"payload":{"kind":"run","run_id":"turn","event":{"kind":"started","prompt":"hello"}}}},
+                {"recorded_at":1001000,"envelope":{"payload":{"kind":"run","run_id":"turn","event":{"kind":"model_input_trace_recorded","model_step":0,"request_record_id":"uuid"}}}},
+                {"recorded_at":1002000,"envelope":{"payload":{"kind":"run","run_id":"turn","event":{"kind":"model_failure_terminal_intent","reason":"provider connection failed"}}}},
+                {"recorded_at":1003000,"envelope":{"payload":{"kind":"run","run_id":"turn","event":{"kind":"assistant_tool_calls_committed","tool_calls":[{"call_id":"call","name":"unknown","args":"{}"}]}}}},
+                {"recorded_at":1004000,"envelope":{"payload":{"kind":"task","run_id":"turn","event":{"kind":"rejected","origin":{"tool_call_id":"call"},"reason":"unknown tool `unknown`"}}}},
+                {"recorded_at":1005000,"envelope":{"payload":{"kind":"run","run_id":"turn","event":{"kind":"tool_result_batch_committed","results":[{"tool_call_id":"call","text":"unavailable"}]}}}},
+                {"recorded_at":1006000,"envelope":{"payload":{"kind":"run","run_id":"turn","event":{"kind":"terminal","terminal":"failed","reason":"provider connection failed"}}}}
+            ]}),
+        );
+        let events = envelopes(&path).unwrap();
+        assert!(events.iter().any(
+            |e| e.event == "PostLLMCall" && e.payload["error"] == "provider connection failed"
+        ));
+        assert!(events
+            .iter()
+            .any(|e| e.event == "PostToolUseFailure"
+                && e.payload["error"] == "unknown tool `unknown`"));
     }
 
     #[test]

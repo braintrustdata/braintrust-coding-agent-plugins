@@ -1,0 +1,347 @@
+{
+  "export_schema_version": 1,
+  "exporter_version": {
+    "semver": "1.4.11"
+  },
+  "sessions": [
+    {
+      "session_id": "muse-export-fixture",
+      "session_end": {
+        "exit_reason": "clean"
+      }
+    }
+  ],
+  "events": [
+    {
+      "recorded_at": -685756,
+      "envelope": {
+        "payload": {
+          "kind": "metadata",
+          "record": {
+            "model_id": "mock-model",
+            "provider_id": "meta",
+            "workspace_root": "/workspace"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 438662,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "kind": "started",
+            "prompt": "Print an integration marker."
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 544695,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "bounded": {
+              "request_message_count": 2
+            },
+            "kind": "model_input_trace_recorded",
+            "model_step": 0,
+            "provider_family": "meta",
+            "request_message_count": 2,
+            "request_prefix_message_count": 1,
+            "request_record_id": "fixture-request",
+            "schema_version": 2,
+            "scope": "full_request"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 586838,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "kind": "model_response_created",
+            "response_id": "resp_muse_tool"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 604709,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "duration_ms": 24,
+            "estimated_prompt_tokens": 10,
+            "kind": "model_completed",
+            "model": "mock-model",
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "input_tokens": 10,
+              "output_tokens": 5,
+              "reasoning_tokens": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 633823,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "kind": "assistant_tool_calls_committed",
+            "message_id": "fixture-batch",
+            "response_id": "resp_muse_tool",
+            "tool_calls": [
+              {
+                "args": "{\"command\":\"printf MUSE_TOOL_OK\"}",
+                "call_id": "call_muse_1",
+                "id": "fc_muse_1",
+                "name": "shell"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 697679,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "fixture-turn",
+          "task_id": "fixture-tool-task",
+          "event": {
+            "kind": "proposed",
+            "task_id": "fixture-tool-task",
+            "task_kind": "tool.shell"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 743742,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "fixture-turn",
+          "task_id": "fixture-tool-task",
+          "event": {
+            "kind": "accepted",
+            "task_id": "fixture-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 747823,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "fixture-turn",
+          "task_id": "fixture-tool-task",
+          "event": {
+            "idempotency_key": "tool:call_muse_1",
+            "kind": "scheduled",
+            "task_id": "fixture-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 751752,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "fixture-turn",
+          "task_id": "fixture-tool-task",
+          "event": {
+            "cancellation_handle": null,
+            "idempotency_key": "tool:call_muse_1",
+            "kind": "side_effect_intent",
+            "operation": "tool:shell",
+            "parent_task_id": null,
+            "policy_decision": "allow:policy",
+            "task_id": "fixture-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 758731,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "fixture-turn",
+          "task_id": "fixture-tool-task",
+          "event": {
+            "kind": "started",
+            "task_id": "fixture-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 809169,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "fixture-turn",
+          "task_id": "fixture-tool-task",
+          "event": {
+            "chunk": "MUSE_TOOL_OK",
+            "final_result": true,
+            "kind": "output",
+            "task_id": "fixture-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 814762,
+      "envelope": {
+        "payload": {
+          "kind": "task",
+          "run_id": "fixture-turn",
+          "task_id": "fixture-tool-task",
+          "event": {
+            "kind": "completed",
+            "task_id": "fixture-tool-task"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 858622,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "batch_id": "fixture-batch",
+            "kind": "tool_result_batch_committed",
+            "results": [
+              {
+                "text": "MUSE_TOOL_OK",
+                "tool_call_id": "call_muse_1",
+                "tool_call_index": 0
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 934575,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "bounded": {
+              "request_message_count": 4
+            },
+            "kind": "model_input_trace_recorded",
+            "model_step": 1,
+            "provider_family": "meta",
+            "request_message_count": 4,
+            "request_prefix_message_count": 1,
+            "request_record_id": "fixture-request",
+            "schema_version": 2,
+            "scope": "full_request"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 974464,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "kind": "model_response_created",
+            "response_id": "resp_mock_1"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 979674,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "kind": "assistant_message_committed",
+            "message_id": "f546e181-b8ed-45f2-af8b-fdb587d2a628",
+            "provider_item_id": "msg_mock_1",
+            "response_id": "resp_mock_1",
+            "text": "MUSE_MOCK_OK"
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 996545,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "duration_ms": 26,
+            "estimated_prompt_tokens": 18,
+            "kind": "model_completed",
+            "model": "mock-model",
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "input_tokens": 10,
+              "output_tokens": 5,
+              "reasoning_tokens": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 1096656,
+      "envelope": {
+        "payload": {
+          "kind": "run",
+          "run_id": "fixture-turn",
+          "event": {
+            "kind": "terminal",
+            "reason": null,
+            "terminal": "completed",
+            "time_to_first_token_ms": 603,
+            "turn_duration_ms": 720
+          }
+        }
+      }
+    },
+    {
+      "recorded_at": 1170037,
+      "envelope": {
+        "payload": {
+          "kind": "session_end"
+        }
+      }
+    }
+  ]
+}

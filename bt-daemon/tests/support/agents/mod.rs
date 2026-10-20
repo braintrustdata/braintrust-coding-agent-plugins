@@ -1,5 +1,6 @@
 mod claude;
 mod codex;
+mod muse;
 mod opencode;
 mod pi;
 mod test_plugin;
@@ -8,6 +9,8 @@ mod test_plugin;
 pub use claude::{ClaudeAgent, ClaudeRun};
 #[allow(unused_imports)]
 pub use codex::{CodexAgent, CodexRun};
+#[allow(unused_imports)]
+pub use muse::MuseAgent;
 #[allow(unused_imports)]
 pub use opencode::{OpenCodeAgent, OpenCodeRun};
 #[allow(unused_imports)]
