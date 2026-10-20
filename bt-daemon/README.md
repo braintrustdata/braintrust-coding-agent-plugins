@@ -304,6 +304,11 @@ or intentional filtering. Plugin, authentication, and delivery recovery resumes
 from unresolved SpanOps without replaying translation. Retries use deterministic
 span IDs, so repeated delivery updates the same spans.
 
+Provisional session roots stay hidden until their first child arrives. Root
+candidates are saved with translation's input checkpoint, independently of route
+delivery, so an unused root does not hold completed turn batches open. When work
+arrives, the root's saved operations are published before its child.
+
 Failures retain their reason and retry condition, including across restarts.
 The daemon waits for the relevant plugin/configuration change, fresh credentials,
 or retry delay before trying again. `bt trace doctor` reports the affected stage,
