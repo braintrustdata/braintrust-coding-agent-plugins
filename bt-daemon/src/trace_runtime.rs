@@ -495,14 +495,28 @@ fn daemon_warnings(
 
 async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorCommandOutput {
     let source = args.agent.identity().id;
-    doctor_output_at(
-        host,
-        args,
-        &paths::socket_path(None),
-        paths::agent_settings_path(source, None),
-        crate::settings::AgentSettings::load(source),
-    )
-    .await
+    let settings = crate::settings::AgentSettings::load(source);
+    let socket = paths::socket_path(None);
+    let inspect_hooks = matches!(args.agent, DoctorAgent::Codex) && settings.tracing_enabled();
+    let hooks = async {
+        if inspect_hooks {
+            Some(crate::codex_hooks::probe().await)
+        } else {
+            None
+        }
+    };
+    let (mut output, hooks) = tokio::join!(
+        doctor_output_at(
+            host,
+            args,
+            &socket,
+            paths::agent_settings_path(source, None),
+            settings,
+        ),
+        hooks
+    );
+    output.codex_hooks = hooks;
+    output
 }
 
 async fn doctor_output_at(
@@ -632,6 +646,7 @@ async fn doctor_output_at(
         daemon,
         warnings,
         plugin_diagnostics,
+        codex_hooks: None,
     }
 }
 

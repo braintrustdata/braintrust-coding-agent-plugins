@@ -59,6 +59,8 @@ pub struct SetupCommandOutput {
     pub display_name: String,
     pub settings_path: PathBuf,
     pub restart_required: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +68,8 @@ pub struct UpdateCommandOutput {
     pub source: String,
     pub display_name: String,
     pub restart_required: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,6 +162,8 @@ pub struct DoctorCommandOutput {
     pub daemon: DaemonDiagnostic,
     pub warnings: Vec<String>,
     pub plugin_diagnostics: Vec<crate::PluginDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_hooks: Option<crate::CodexHookReadiness>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,8 +192,10 @@ impl TraceCommandOutput {
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
+        let source = source.into();
         Self::Enable(SetupCommandOutput {
-            source: source.into(),
+            next_steps: activation_steps(&source),
+            source,
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
@@ -208,6 +216,7 @@ impl TraceCommandOutput {
         settings_path: impl Into<PathBuf>,
     ) -> Self {
         Self::Disable(SetupCommandOutput {
+            next_steps: Vec::new(),
             source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
@@ -216,8 +225,10 @@ impl TraceCommandOutput {
     }
 
     pub fn update(source: impl Into<String>, display_name: impl Into<String>) -> Self {
+        let source = source.into();
         Self::Update(UpdateCommandOutput {
-            source: source.into(),
+            next_steps: activation_steps(&source),
+            source,
             display_name: display_name.into(),
             restart_required: true,
         })
@@ -274,6 +285,14 @@ impl TraceCommandOutput {
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
                 }
+                if let Some(hooks) = &doctor.codex_hooks {
+                    rendered.push_str(&format!("\nCodex hook trust: {}\n{}\nHooks: {} loaded, {} trusted, {} require review, {} disabled",
+                        hooks.state, hooks.detail, hooks.hook_count, hooks.trusted_count,
+                        hooks.review_required_count, hooks.disabled_count));
+                    if !hooks.missing_events.is_empty() {
+                        rendered.push_str(&format!("\nMissing hook events: {}", hooks.missing_events.join(", ")));
+                    }
+                }
                 for diagnostic in &doctor.plugin_diagnostics {
                     rendered.push_str(&format!(
                         "\nPlugin error: {} ({} occurrence{})\nFirst seen: {}\nLast seen: {}\n{}",
@@ -288,9 +307,9 @@ impl TraceCommandOutput {
                 Ok(rendered)
             }
             Self::Enable(setup) => Ok(format!(
-                "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.",
+                "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.{}",
                 setup.display_name,
-                setup.settings_path.display()
+                setup.settings_path.display(), render_next_steps(&setup.next_steps)
             )),
             Self::Disable(disable) => Ok(format!(
                 "The Braintrust tracing plugin and configuration were removed for {} from {}.\nRestart the coding agent to apply the change.",
@@ -298,8 +317,8 @@ impl TraceCommandOutput {
                 disable.settings_path.display()
             )),
             Self::Update(update) => Ok(format!(
-                "The Braintrust tracing plugin was updated for {}.\nRestart the coding agent to load the update.",
-                update.display_name,
+                "The Braintrust tracing plugin was updated for {}.\nRestart the coding agent to load the update.{}",
+                update.display_name, render_next_steps(&update.next_steps),
             )),
             Self::Stop(stop) if stop.stopped => Ok("Tracing daemon stopped.".into()),
             Self::Stop(_) => Ok("No tracing daemon is running.".into()),
@@ -351,6 +370,18 @@ fn push_auth_lines(rendered: &mut String, prefix: &str, auth: &AuthDiagnostic) {
             rendered.push_str(&format!("\n{}: {value}", label(name)));
         }
     }
+}
+
+fn activation_steps(source: &str) -> Vec<String> {
+    if source == "codex" {
+        vec!["Codex separately requires trust for plugin hooks. Open /hooks in Codex and review the Braintrust definitions, then run bt trace doctor codex. Installation alone does not confirm capture or delivery.".into()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn render_next_steps(steps: &[String]) -> String {
+    steps.iter().map(|step| format!("\n{step}")).collect()
 }
 
 fn render_timestamp(timestamp_ms: i64) -> String {
@@ -425,6 +456,27 @@ mod tests {
             .render(OutputFormat::Human)
             .unwrap()
             .contains("removed for Google Antigravity"));
+    }
+
+    #[test]
+    fn codex_setup_and_updates_explain_the_separate_hook_review_step() {
+        for output in [
+            TraceCommandOutput::setup("codex", "Codex", PathBuf::from("braintrust.json")),
+            TraceCommandOutput::update("codex", "Codex"),
+        ] {
+            let human = output.render(OutputFormat::Human).unwrap();
+            assert!(human.contains("Open /hooks"));
+            assert!(human.contains("Installation alone does not confirm capture or delivery"));
+            let json: serde_json::Value =
+                serde_json::from_str(&output.render(OutputFormat::Json).unwrap()).unwrap();
+            assert_eq!(json["next_steps"].as_array().unwrap().len(), 1);
+        }
+        let disabled =
+            TraceCommandOutput::disable("codex", "Codex", PathBuf::from("braintrust.json"));
+        assert!(!disabled
+            .render(OutputFormat::Human)
+            .unwrap()
+            .contains("Open /hooks"));
     }
 
     #[test]
@@ -535,6 +587,15 @@ mod tests {
                 error: None,
             },
             warnings: Vec::new(),
+            codex_hooks: Some(crate::CodexHookReadiness {
+                state: crate::CodexHookState::ReviewRequired,
+                hook_count: 10,
+                trusted_count: 0,
+                disabled_count: 0,
+                review_required_count: 10,
+                missing_events: Vec::new(),
+                detail: "Open /hooks to review Braintrust definitions".into(),
+            }),
             plugin_diagnostics: vec![crate::PluginDiagnostic {
                 source: "codex".into(),
                 plugin_path: PathBuf::from("/tmp/redact.mjs"),
@@ -551,6 +612,11 @@ mod tests {
         assert_eq!(value["auth"]["source"], "saved_profile");
         assert_eq!(value["daemon"]["status"], "running");
         assert_eq!(value["daemon"]["auth"]["status"], "error");
+        assert_eq!(value["codex_hooks"]["state"], "review_required");
+        assert!(output
+            .render(OutputFormat::Human)
+            .unwrap()
+            .contains("10 require review"));
         assert_eq!(
             value["daemon"]["session_errors"][0],
             "could not resolve Braintrust auth for codex"
