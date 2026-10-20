@@ -3788,3 +3788,305 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
         "every route durably completed the retirement output"
     );
 }
+
+#[tokio::test]
+async fn initial_span_storage_failure_reports_journal_and_recovers_without_native_input() {
+    let (data, socket, handle, _tmp) = start_daemon().await;
+    let storage = data.join("pipeline");
+    std::fs::write(&storage, "blocked storage path").unwrap();
+    forward_envelope(
+        &envelope("storage-open", "SessionStart", 1),
+        &socket,
+        &dummy_host(),
+        false,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: Some("storage-open".into()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if let Some(recovery) = status.sessions.iter().find_map(|s| s.recovery.as_ref()) {
+                assert_eq!(recovery.stage, "journal");
+                assert!(recovery.retry.contains("bounded retry"));
+                assert!(!recovery.reason.contains("credential"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::remove_file(&storage).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(data.join("spans/storage-open.ndjson"))
+                .is_ok_and(|rows| rows.lines().count() >= 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        flush_session("storage-open", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status
+        .sessions
+        .iter()
+        .all(|s| s.recovery.is_none() && s.last_error.is_none()));
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn changed_settings_resume_the_original_rejected_route_through_ingress() {
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+    struct MockAuth(String);
+    #[async_trait]
+    impl AuthProvider for MockAuth {
+        async fn resolve(
+            &self,
+            selection: &AuthSelection,
+            _: AuthResolveReason,
+        ) -> anyhow::Result<AuthLease> {
+            Ok(AuthLease {
+                selection: selection.clone(),
+                auth: BackendAuth {
+                    token: "test-token".into(),
+                    api_url: Some(self.0.clone()),
+                    app_url: Some(self.0.clone()),
+                    org_id: Some("test-org".into()),
+                    org_name: None,
+                },
+                expires_at_ms: None,
+            })
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    let rejection = Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid row"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let start = || {
+        let opts = ServeOptions {
+            version: "test".into(),
+            translators: Arc::new(Registry::default_agents()),
+            sink_factory: Arc::new(bt_daemon::BraintrustSinkFactory::new(
+                bt_daemon::BraintrustSinkConfig::default(),
+            )),
+            auth_provider: Some(Arc::new(MockAuth(server.uri()))),
+        };
+        let args = ServeArgs {
+            socket: Some(socket.clone()),
+            data_dir: Some(data.clone()),
+            idle_timeout_secs: 0,
+            session_idle_timeout_secs: 0,
+        };
+        tokio::spawn(async move { run_serve(args, opts).await.unwrap() })
+    };
+    let handle = start();
+    wait_for(&socket).await;
+    let mut event = envelope("rejected-settings", "SessionStart", 1);
+    event.route.as_mut().unwrap().destination =
+        Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+            project_id: Some("test-project".into()),
+            project_name: None,
+        });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        forward_envelope(&event, &socket, &dummy_host(), false)
+            .await
+            .unwrap();
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status
+                .sessions
+                .iter()
+                .any(|s| s.recovery.as_ref().is_some_and(|r| r.stage == "sink"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(rejection);
+    Mock::given(method("POST"))
+        .and(path("/logs3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    event.event = "Stop".into();
+    event.ts_ms = 2;
+    event.route.as_mut().unwrap().tags.push("corrected".into());
+    forward_envelope(&event, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status.sessions.len() == 2
+                && status
+                    .sessions
+                    .iter()
+                    .all(|s| s.recovery.is_none() && s.last_error.is_none() && s.queued == 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let db = pipeline_database(&data);
+    let held: u64 = db.query_row("SELECT count(*) FROM heads WHERE failure IS NOT NULL OR position<(SELECT max(position) FROM ops JOIN batches USING(input) WHERE committed=1)", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        held, 0,
+        "both original and corrected subscriptions must complete"
+    );
+    let settings: String = db
+        .query_row(
+            "SELECT settings FROM heads WHERE settings IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(settings.contains("corrected"));
+    drop(db);
+    shutdown(&socket).await;
+    handle.await.unwrap();
+    let restarted = start();
+    wait_for(&socket).await;
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status
+        .sessions
+        .iter()
+        .all(|s| s.recovery.is_none() && s.last_error.is_none()));
+    shutdown(&socket).await;
+    restarted.await.unwrap();
+}
+
+#[tokio::test]
+async fn changed_plugin_chain_resumes_the_original_held_route() {
+    let (data, socket, handle, tmp) = start_daemon().await;
+    let plugin = tmp.path().join("broken.mjs");
+    std::fs::write(
+        &plugin,
+        "export default () => { throw new Error('broken plugin') }",
+    )
+    .unwrap();
+    let mut event = envelope("changed-chain", "SessionStart", 1);
+    event.route.as_mut().unwrap().span_plugins.push(plugin);
+    forward_envelope(&event, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status
+                .sessions
+                .iter()
+                .any(|s| s.recovery.as_ref().is_some_and(|r| r.stage == "plugin"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    event.event = "Stop".into();
+    event.ts_ms = 2;
+    event.route.as_mut().unwrap().span_plugins.clear();
+    forward_envelope(&event, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status.sessions.len() == 2
+                && status
+                    .sessions
+                    .iter()
+                    .all(|s| s.recovery.is_none() && s.last_error.is_none() && s.queued == 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let db = pipeline_database(&data);
+    let held: u64 = db
+        .query_row(
+            "SELECT count(*) FROM heads WHERE failure IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(held, 0);
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}

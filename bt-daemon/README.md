@@ -314,6 +314,12 @@ The daemon waits for the relevant plugin/configuration change, fresh credentials
 or retry delay before trying again. `bt trace doctor` reports the affected stage,
 pending position, reason, and retry eligibility.
 
+A later event with corrected delivery settings also resumes configuration-held
+subscriptions for the same source session, authentication selection, and
+destination. Each subscription keeps its original durable head and pinned backend;
+the correction is saved for restart recovery. Healthy routes and other destinations
+retain their own settings.
+
 Claude, Codex, and Cursor events reference daemon-owned transcript mirrors. Cursor
 preserves separate immutable generations when its native transcript is rewritten.
 Grok uses

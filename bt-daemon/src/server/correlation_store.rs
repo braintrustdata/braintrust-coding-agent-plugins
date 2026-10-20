@@ -132,13 +132,17 @@ pub(super) async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> R
     let mut state = daemon.pending_sessions.lock().get(&key).cloned();
     if state.is_none() {
         if daemon.standalone_links.lock().contains(&key) {
-            return accept_resolved_event(daemon, event).await;
+            return accept_resolved_event(daemon, event, 0)
+                .await
+                .map_err(|failure| failure.message());
         }
         let route = daemon.automatic_links.lock().get(&key).cloned();
         if let Some(route) = route {
             let mut event = event;
             event.env.route = Some(route);
-            return accept_resolved_event(daemon, event).await;
+            return accept_resolved_event(daemon, event, 0)
+                .await
+                .map_err(|failure| failure.message());
         }
         state = read_correlation_state(&daemon.data_dir, &key).await;
     }
@@ -333,18 +337,29 @@ pub(super) async fn finish_correlation(
         .recovery
         .take()
         .map_or(0, |failure| failure.attempt.saturating_add(1));
-    let result: Result<(), String> = async {
+    let storage_failure = |error: String| {
+        crate::pipeline::recovery::Failure::storage(
+            &anyhow::anyhow!(error),
+            &daemon.version,
+            attempt,
+        )
+    };
+    let result: Result<(), crate::pipeline::recovery::Failure> = async {
         // Persist the final route before delivering any events. A crash may
         // replay deterministic rows, but must never select a different parent.
-        store_correlation(daemon, key, &state).await?;
+        store_correlation(daemon, key, &state)
+            .await
+            .map_err(&storage_failure)?;
         while let Some(event) = state.events.first() {
             let mut event = event.clone();
             if let Some(route) = &state.linked_route {
                 event.env.route = Some(route.clone());
             }
-            accept_resolved_event(daemon, event).await?;
+            accept_resolved_event(daemon, event, attempt).await?;
             state.events.remove(0);
-            store_correlation(daemon, key, &state).await?;
+            store_correlation(daemon, key, &state)
+                .await
+                .map_err(&storage_failure)?;
         }
         Ok(())
     }
@@ -354,9 +369,7 @@ pub(super) async fn finish_correlation(
             .events
             .first()
             .map_or(0, |event| event.journal_through);
-        state.recovery = Some(
-            crate::pipeline::recovery::Failure::credentials(error.clone(), attempt).at(position),
-        );
+        state.recovery = Some(error.clone().at(position));
         if let Err(error) = store_correlation(daemon, key, &state).await {
             tracing::warn!(%error,"pending recovery evidence could not be persisted");
         }
@@ -365,7 +378,7 @@ pub(super) async fn finish_correlation(
             .lock()
             .insert(key.to_string(), state);
     }
-    result
+    result.map_err(|failure| failure.message())
 }
 
 pub(super) async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
