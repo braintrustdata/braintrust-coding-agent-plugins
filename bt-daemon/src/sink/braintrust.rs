@@ -601,6 +601,9 @@ fn destination_components(destination: &TraceDestination, project: &str) -> Dest
 fn map_span_type(t: SpanType) -> SdkSpanType {
     match t {
         SpanType::Task => SdkSpanType::Task,
+        // Braintrust's span type enum has no dedicated wait value. Keep waits
+        // as task spans so their elapsed time cannot be mistaken for tool time.
+        SpanType::Wait => SdkSpanType::Task,
         SpanType::Llm => SdkSpanType::Llm,
         SpanType::Tool => SdkSpanType::Tool,
     }

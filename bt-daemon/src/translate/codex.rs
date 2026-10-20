@@ -37,6 +37,7 @@ use std::sync::{Arc, OnceLock};
 
 const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 const MISSING_TOOL_OUTPUT_ERROR: &str = "Tool output missing before turn ended";
+const MAX_OPEN_TOOL_SPAN_MS: i64 = 24 * 60 * 60 * 1000;
 /// A hook can arrive after a daemon restart or against an existing rollout.
 /// Keep a single translator batch small even when the unread suffix is large.
 const CATCH_UP_BYTE_BUDGET: usize = 64 * 1024;
@@ -117,6 +118,8 @@ impl TranslatorFactory for crate::agents::Codex {
             effective_root_span_id: root_span_id,
             external_parent_span_id: None,
             root_opened: false,
+            main_root_start_ms: None,
+            first_observed_ms: None,
             session_source: None,
             permission_mode: None,
             root_cwd: None,
@@ -179,7 +182,7 @@ struct Scope {
     open_turns: Vec<OpenTurn>,
     message_history: Vec<Value>,
     open_llm: Option<OpenLlm>,
-    open_tools: HashMap<String, (String, String)>, // call_id -> (tool span_id, turn_id)
+    open_tools: HashMap<String, (String, String, i64)>, // call_id -> (tool span_id, turn_id, start_ms)
     last_turn_end_ms: Option<i64>,
     last_turn_output: Option<Value>,
     turn_seq: u32,
@@ -242,6 +245,8 @@ struct CodexTranslator {
     effective_root_span_id: String,
     external_parent_span_id: Option<String>,
     root_opened: bool,
+    main_root_start_ms: Option<i64>,
+    first_observed_ms: Option<i64>,
     session_source: Option<String>,
     permission_mode: Option<String>,
     root_cwd: Option<String>,
@@ -262,6 +267,7 @@ impl AgentTranslator for CodexTranslator {
             self.pending.is_none(),
             "Codex translator has pending catch-up work; drain it before handling another event"
         );
+        self.first_observed_ms.get_or_insert(event.ts_ms);
         let payload = &event.payload;
         let mut ops = Vec::new();
 
@@ -759,6 +765,10 @@ impl CodexTranslator {
                 };
                 let cwd = str_field(payload, "cwd");
                 self.root_cwd = cwd.clone();
+                let root_start_ms = self
+                    .first_observed_ms
+                    .map_or(ts, |first_observed| ts.max(first_observed));
+                self.main_root_start_ms = Some(root_start_ms);
                 let mut md = Map::new();
                 for k in ["id", "cwd", "cli_version"] {
                     if let Some(v) = str_field(payload, k) {
@@ -797,7 +807,7 @@ impl CodexTranslator {
                     parent_span_ids: self.scope_root_parent_span_ids(scope),
                     name,
                     span_type: SpanType::Task,
-                    start_ms: Some(ts),
+                    start_ms: Some(root_start_ms),
                     input: Some(json!({
                         "model": scope.model,
                         "cwd": cwd,
@@ -1180,7 +1190,7 @@ impl CodexTranslator {
             tags: if tags.is_empty() { None } else { Some(tags) },
             ..Default::default()
         }));
-        scope.open_tools.insert(call_id, (span_id, turn_id));
+        scope.open_tools.insert(call_id, (span_id, turn_id, ts));
     }
 
     fn on_tool_output(
@@ -1195,7 +1205,7 @@ impl CodexTranslator {
             return;
         };
         push_tool_result(scope, Some(&call_id), payload);
-        let Some((span_id, turn_id)) = scope.open_tools.remove(&call_id) else {
+        let Some((span_id, turn_id, _start_ms)) = scope.open_tools.remove(&call_id) else {
             return;
         };
         if let Some(turn) = scope
@@ -1347,16 +1357,19 @@ impl CodexTranslator {
         let call_ids: Vec<String> = scope
             .open_tools
             .iter()
-            .filter(|(_, (_, owner))| owner == turn_id)
+            .filter(|(_, (_, owner, _))| owner == turn_id)
             .map(|(call_id, _)| call_id.clone())
             .collect();
         for call_id in call_ids {
-            if let Some((span_id, _)) = scope.open_tools.remove(&call_id) {
+            if let Some((span_id, _, start_ms)) = scope.open_tools.remove(&call_id) {
                 ops.push(SpanOp::Merge(SpanRow {
                     span_id,
                     root_span_id: self.effective_root_span_id.clone(),
                     parent_span_ids: parent_span_ids.clone(),
-                    end_ms,
+                    end_ms: Some(end_ms.map_or_else(
+                        || start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS),
+                        |end| end.min(start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS)),
+                    )),
                     metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
                     error: Some(MISSING_TOOL_OUTPUT_ERROR.to_string()),
                     ..Default::default()
@@ -1455,9 +1468,10 @@ impl CodexTranslator {
             .main_path
             .as_ref()
             .and_then(|path| self.scopes.get(path));
-        let end_ms = main_scope
+        let observed_end_ms = main_scope
             .and_then(|scope| scope.last_turn_end_ms)
             .unwrap_or(fallback_ts);
+        let end_ms = observed_end_ms.max(self.main_root_start_ms.unwrap_or(observed_end_ms));
         let output = main_scope.and_then(|scope| scope.last_turn_output.clone());
         ops.push(SpanOp::Merge(SpanRow {
             span_id: self.root_span_id.clone(),
@@ -1525,19 +1539,27 @@ impl CodexTranslator {
                 ..Default::default()
             }));
         }
-        let tools: Vec<(String, String, String)> = scope
+        let tools: Vec<(String, String, i64, String)> = scope
             .open_tools
             .drain()
-            .map(|(_, (span_id, turn_id))| {
-                (span_id, turn_id, MISSING_TOOL_OUTPUT_ERROR.to_string())
+            .map(|(_, (span_id, turn_id, start_ms))| {
+                (
+                    span_id,
+                    turn_id,
+                    start_ms,
+                    MISSING_TOOL_OUTPUT_ERROR.to_string(),
+                )
             })
             .collect();
-        for (sid, turn_id, error) in tools {
+        for (sid, turn_id, start_ms, error) in tools {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: sid,
                 root_span_id: self.effective_root_span_id.clone(),
                 parent_span_ids: self.turn_parent_span_ids(&turn_id),
-                end_ms,
+                end_ms: Some(end_ms.map_or_else(
+                    || start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS),
+                    |end| end.min(start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS)),
+                )),
                 metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
                 error: Some(error),
                 ..Default::default()
