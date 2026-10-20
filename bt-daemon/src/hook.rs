@@ -185,7 +185,7 @@ async fn capture_hook(
     mut route: SessionRoute,
     host: HostInfo,
 ) -> anyhow::Result<()> {
-    let mut payload = read_stdin_json()?;
+    let mut payload = read_stdin_json(args.transcript_path_field.as_deref())?;
 
     resolve_dynamic_hook_versions(&mut args, &payload);
 
@@ -291,14 +291,93 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn read_stdin_json() -> anyhow::Result<serde_json::Value> {
+fn read_stdin_json(path_field: Option<&str>) -> anyhow::Result<serde_json::Value> {
     use std::io::Read;
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     if buf.trim().is_empty() {
         anyhow::bail!("empty stdin (expected a JSON hook payload)");
     }
-    Ok(serde_json::from_str(&buf)?)
+    parse_hook_payload(&buf, path_field)
+}
+
+/// Parse a hook payload, tolerating raw Windows paths.
+///
+/// Works around a Cursor bug: on Windows, Cursor writes `transcript_path` as
+/// `c:\Users\...` without escaping backslashes, which is invalid JSON, so
+/// every Cursor hook failed to parse (and the installed hook swallows errors,
+/// so nothing was traced). See
+/// https://github.com/braintrustdata/braintrust-coding-agent-plugins/issues/197.
+///
+/// Valid JSON always takes the strict path, so Cursor stops reaching this
+/// fallback once it escapes the field. When strict parsing fails, invalid escapes
+/// are reinterpreted as literal backslashes and the path field's accidental
+/// valid escapes (`\b`, `\f`, `\n`, `\r`, `\t`) are restored.
+fn parse_hook_payload(raw: &str, path_field: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let error = match serde_json::from_str(raw) {
+        Ok(payload) => return Ok(payload),
+        Err(error) => error,
+    };
+    let mut payload: serde_json::Value = escape_invalid_json_backslashes(raw)
+        .and_then(|repaired| serde_json::from_str(&repaired).ok())
+        .ok_or(error)?;
+    if let Some(serde_json::Value::String(path)) =
+        path_field.and_then(|field| payload.get_mut(field))
+    {
+        *path = restore_raw_path_escapes(path);
+    }
+    Ok(payload)
+}
+
+/// Double every backslash inside a JSON string that does not begin a valid
+/// escape. Returns `None` when no repair was needed.
+fn escape_invalid_json_backslashes(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut in_string = false;
+    let mut repaired = false;
+    while let Some(c) = chars.next() {
+        out.push(c);
+        match c {
+            '"' => in_string = !in_string,
+            '\\' if in_string => {
+                let valid = match chars.peek() {
+                    Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => true,
+                    Some('u') => {
+                        let mut lookahead = chars.clone();
+                        lookahead.next();
+                        (0..4).all(|_| lookahead.next().is_some_and(|h| h.is_ascii_hexdigit()))
+                    }
+                    _ => false,
+                };
+                if valid {
+                    out.extend(chars.next());
+                } else {
+                    out.push('\\');
+                    repaired = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    repaired.then_some(out)
+}
+
+/// Undo control characters that a raw Windows path picked up from
+/// coincidentally valid escapes, such as the `\b` in `...\b91a...`.
+fn restore_raw_path_escapes(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Read a string-ish field (`session_id` / event name) from the payload,
@@ -615,6 +694,46 @@ mod tests {
         assert_eq!(json_str_field(&payload, "boolean"), None);
         assert_eq!(json_str_field(&payload, "null"), None);
         assert_eq!(json_str_field(&payload, "missing"), None);
+    }
+
+    #[test]
+    fn hook_payload_tolerates_unescaped_windows_transcript_paths() {
+        // Payload shape Cursor 3.7 sends on Windows: `transcript_path` has raw,
+        // unescaped backslashes. The path also includes segments (`\b91a`,
+        // `\f00d`, `\new`, `\tmp`) that look like valid escapes and must still be
+        // restored. See
+        // https://github.com/braintrustdata/braintrust-coding-agent-plugins/issues/197.
+        let raw = r#"{
+  "conversation_id": "791a1997",
+  "hook_event_name": "afterAgentResponse",
+  "text": "line one\nline \"two\"\u00e9",
+  "transcript_path": "c:\Users\me\.cursor\projects\ws\agent-transcripts\b91a\f00d\new\tmp\raw.jsonl"
+}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(raw).is_err());
+
+        let payload = parse_hook_payload(raw, Some("transcript_path")).unwrap();
+
+        assert_eq!(
+            payload["transcript_path"],
+            r"c:\Users\me\.cursor\projects\ws\agent-transcripts\b91a\f00d\new\tmp\raw.jsonl"
+        );
+        assert_eq!(payload["text"], "line one\nline \"two\"\u{e9}");
+        assert_eq!(payload["conversation_id"], "791a1997");
+    }
+
+    #[test]
+    fn hook_payload_leaves_valid_json_and_reports_unrepairable_errors() {
+        // Once Cursor properly escapes paths (issue #197), payloads must take
+        // the strict path unchanged.
+        let valid = r#"{"transcript_path":"c:\\Users\\me\\new.jsonl","text":"a\tb"}"#;
+        let payload = parse_hook_payload(valid, Some("transcript_path")).unwrap();
+        assert_eq!(payload["transcript_path"], r"c:\Users\me\new.jsonl");
+        assert_eq!(payload["text"], "a\tb");
+
+        let error = parse_hook_payload(r#"{"a": 1,"#, None).unwrap_err();
+        assert!(error.to_string().contains("EOF"), "{error}");
+        let error = parse_hook_payload(r#"{"a": "c:\Users", }"#, None).unwrap_err();
+        assert!(error.to_string().contains("invalid escape"), "{error}");
     }
 
     #[test]
