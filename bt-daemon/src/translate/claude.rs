@@ -282,6 +282,7 @@ struct ClaudeTranslator {
     emitted_tools: RecentSet<String>,
     pending_tools: HashMap<String, PendingTool>,
     subagents: HashMap<String, Subagent>,
+    subagent_handbacks: HashMap<String, Value>,
     pending_skills: Vec<String>,
     pending_emission: Option<PendingEmission>,
     claude_version: Option<String>,
@@ -331,6 +332,7 @@ impl ClaudeTranslator {
             emitted_tools: RecentSet::default(),
             pending_tools: HashMap::new(),
             subagents: HashMap::new(),
+            subagent_handbacks: HashMap::new(),
             pending_skills: Vec::new(),
             pending_emission: None,
             claude_version: None,
@@ -781,6 +783,15 @@ impl ClaudeTranslator {
         let error = (approval != ToolApproval::Denied)
             .then(|| forced_error.or_else(|| tool_error(&event.payload)))
             .flatten();
+        if approval == ToolApproval::Approved && error.is_none() && tool_name == "SubagentHandback"
+        {
+            if let (Some(agent_id), Some(message)) = (
+                string_field(&event.payload, "agent_id"),
+                raw_tool_input(&event.payload).and_then(|input| input.get("message")),
+            ) {
+                self.subagent_handbacks.insert(agent_id, message.clone());
+            }
+        }
         let mut metadata = tool_metadata(event, &tool_name, &call_id, Some(approval), &input);
         if let Some(pending) = self.pending_tools.remove(&call_id) {
             // A PreToolUse hook may rewrite the call via `updatedInput`, so the
@@ -881,12 +892,16 @@ impl ClaudeTranslator {
             "Subagent ended before tool completion",
             ops,
         );
+        let output = self
+            .subagent_handbacks
+            .remove(&agent_id)
+            .or_else(|| event.payload.get("last_assistant_message").cloned());
         ops.push(SpanOp::Merge(SpanRow {
             span_id: parent.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids,
             end_ms: Some(event.ts_ms),
-            output: event.payload.get("last_assistant_message").cloned(),
+            output,
             ..Default::default()
         }));
         self.subagents.remove(&agent_id);

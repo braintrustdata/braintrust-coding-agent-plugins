@@ -360,7 +360,9 @@ async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace()
     write_jsonl(
         &subagent,
         &[
-            json!({"type":"assistant","timestamp":"2026-01-01T00:00:04Z","sessionId":"claude-parent","message":{"id":"child-message","model":"claude-test","content":[{"type":"text","text":"reviewed"}],"usage":{"input_tokens":2,"output_tokens":1}}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:03Z","sessionId":"claude-parent","message":{"id":"child-handback","model":"claude-test","content":[{"type":"tool_use","id":"handback-call","name":"SubagentHandback","input":{"message":"The review report delivered to the caller."}}],"usage":{"input_tokens":2,"output_tokens":1}}}),
+            json!({"type":"user","timestamp":"2026-01-01T00:00:04Z","sessionId":"claude-parent","message":{"content":[{"type":"tool_result","tool_use_id":"handback-call","content":"Report delivered"}]}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:04.500Z","sessionId":"claude-parent","message":{"id":"child-message","model":"claude-test","content":[{"type":"text","text":"Handback complete."}],"usage":{"input_tokens":2,"output_tokens":1}}}),
         ],
     );
 
@@ -378,6 +380,11 @@ async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace()
     let rows = rows(&output.join("claude-parent.ndjson"));
     assert_eq!(inserted(&rows, "task"), 3, "session, turn, and subagent");
     assert_eq!(inserted(&rows, "llm"), 3, "parent and child model calls");
+    assert_eq!(
+        inserted(&rows, "tool"),
+        2,
+        "agent and handback remain tool spans"
+    );
     let inserts = rows
         .iter()
         .filter_map(|op| op.get("Insert"))
@@ -399,6 +406,21 @@ async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace()
         .unwrap();
     assert_eq!(child["root_span_id"], root["span_id"]);
     assert_eq!(child["parent_span_ids"][0], turn["span_id"]);
+    let child_merge = rows
+        .iter()
+        .find(|op| {
+            op.pointer("/Merge/span_id").and_then(Value::as_str) == child["span_id"].as_str()
+        })
+        .unwrap();
+    assert_eq!(
+        child_merge.pointer("/Merge/output").and_then(Value::as_str),
+        Some("The review report delivered to the caller.")
+    );
+    let handback_tool = inserts
+        .iter()
+        .find(|row| row.get("name").and_then(Value::as_str) == Some("SubagentHandback"))
+        .unwrap();
+    assert_eq!(handback_tool["parent_span_ids"][0], child["span_id"]);
 }
 
 #[tokio::test]

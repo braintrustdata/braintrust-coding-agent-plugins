@@ -256,7 +256,10 @@ pub(super) fn envelopes(
                 "agent_transcript_path": subagent.path
             });
             if !is_start {
-                payload["last_assistant_message"] = json!(subagent.last_assistant_message);
+                payload["last_assistant_message"] = json!(subagent
+                    .handback_message
+                    .clone()
+                    .or_else(|| subagent.last_assistant_message.clone()));
             }
             events.push(import_envelope(
                 source_version.clone(),
@@ -315,6 +318,27 @@ struct Subagent {
     start_ms: i64,
     end_ms: i64,
     last_assistant_message: Option<Value>,
+    handback_message: Option<Value>,
+}
+
+fn last_handback_message(records: &[Value]) -> Option<Value> {
+    records.iter().rev().find_map(|record| {
+        if record.get("type").and_then(Value::as_str) != Some("assistant") {
+            return None;
+        }
+        record
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .rev()
+            .find(|block| {
+                block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && block.get("name").and_then(Value::as_str) == Some("SubagentHandback")
+            })
+            .and_then(|block| block.pointer("/input/message"))
+            .cloned()
+    })
 }
 
 fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
@@ -461,6 +485,7 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 start_ms,
                 end_ms,
                 last_assistant_message: last_assistant_text(&subagent_records),
+                handback_message: last_handback_message(&subagent_records),
             })
         })
         .collect::<Vec<_>>();
