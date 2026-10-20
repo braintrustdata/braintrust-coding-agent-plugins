@@ -83,7 +83,7 @@ impl SpanJournal {
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            anyhow::ensure!(version <= 4, "unsupported SpanOp journal schema {version}");
+            anyhow::ensure!(version <= 5, "unsupported SpanOp journal schema {version}");
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
             if version < 3 {
                 db.execute_batch(
@@ -111,6 +111,9 @@ impl SpanJournal {
             }
             if version < 4 {
                 db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE root_candidates (span_id TEXT PRIMARY KEY, value BLOB NOT NULL); PRAGMA user_version=4; COMMIT")?;
+            }
+            if version < 5 {
+                db.execute_batch("BEGIN IMMEDIATE; ALTER TABLE heads ADD COLUMN settings TEXT; ALTER TABLE heads ADD COLUMN settings_through INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=5; COMMIT")?;
             }
             let tail = db.query_row("SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1", [], |row| row.get(0))?;
             Ok((db, tail))
@@ -424,6 +427,90 @@ impl SpanJournal {
         })
         .await
     }
+    /// Keep the original subscription and backend binding while correcting settings
+    /// that can unblock an explicitly configuration-held delivery.
+    pub async fn reconfigure_held(
+        &self,
+        route: &SessionRoute,
+        through: u64,
+    ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
+        let route = route.clone();
+        self.with_db(move |db| {
+            let tx = db.transaction()?;
+            let updates = {
+                let mut query = tx.prepare(
+                    "SELECT route,failure,settings FROM heads WHERE failure IS NOT NULL AND settings_through<?",
+                )?;
+                let rows = query.query_map([through], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?;
+                let mut updates = Vec::new();
+                for row in rows {
+                    let (key, raw, settings) = row?;
+                    let stored: SessionRoute = serde_json::from_str(&key)?;
+                    let Ok(failure) = serde_json::from_str::<Failure>(&raw) else {
+                        continue;
+                    };
+                    if !matches!(
+                        failure.condition,
+                        super::recovery::Condition::Configuration { .. } | super::recovery::Condition::Plugin { .. }
+                    ) || !stored.same_destination(&route)
+                    {
+                        continue;
+                    }
+                    let previous: SessionRoute = settings
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()?
+                        .unwrap_or_else(|| stored.clone());
+                    if previous.same_route(&route) {
+                        continue;
+                    }
+                    let mut corrected = route.clone();
+                    // Preserve the subscription's pinned credential selection.
+                    corrected.auth = stored.auth.clone();
+                    updates.push((key, stored, corrected));
+                }
+                updates
+            };
+            for (key, _, corrected) in &updates {
+                tx.execute(
+                    "UPDATE heads SET settings=?, settings_through=? WHERE route=?",
+                    params![serde_json::to_string(corrected)?, through, key],
+                )?;
+            }
+            tx.commit()?;
+            Ok(updates
+                .into_iter()
+                .map(|(_, stored, corrected)| (stored, corrected))
+                .collect())
+        })
+        .await
+    }
+
+    pub async fn route_settings(&self, route: &SessionRoute) -> anyhow::Result<SessionRoute> {
+        let fallback = route.clone();
+        let key = serde_json::to_string(route)?;
+        self.with_db(move |db| {
+            let settings: Option<String> = db
+                .query_row("SELECT settings FROM heads WHERE route=?", [key], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten();
+            Ok(settings
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or(fallback))
+        })
+        .await
+    }
+
     pub async fn routes(&self) -> anyhow::Result<Vec<SessionRoute>> {
         self.with_db(|db| {
             let mut query = db.prepare("SELECT route FROM heads ORDER BY route")?;
@@ -1142,6 +1229,96 @@ mod tests {
             .await
             .unwrap();
     }
+    #[tokio::test]
+    async fn corrected_settings_survive_restart_without_advancing_or_retargeting_heads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spans.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let original = SessionRoute {
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: Some("test-project".into()),
+                project_name: None,
+            }),
+            ..route("a")
+        };
+        let cursor = journal.subscribe(&original, 0).await.unwrap();
+        let failure = Failure {
+            boundary: Boundary::Sink,
+            position: 1,
+            through: None,
+            reason: "rejected row".into(),
+            attempt: 0,
+            condition: super::super::recovery::Condition::Configuration {
+                signature: "original".into(),
+                recheck_ms: None,
+            },
+        };
+        let raw = serde_json::to_string(&failure).unwrap();
+        journal
+            .set_failure(&cursor.route, Some(raw.clone()))
+            .await
+            .unwrap();
+        let mut corrected = original.clone();
+        corrected.tags.push("corrected".into());
+        for unrelated in [
+            SessionRoute {
+                destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                    project_id: Some("other-project".into()),
+                    project_name: None,
+                }),
+                ..corrected.clone()
+            },
+            SessionRoute {
+                auth: crate::wire::AuthSelection {
+                    org_name: Some("other-org".into()),
+                    ..Default::default()
+                },
+                ..corrected.clone()
+            },
+        ] {
+            assert!(journal
+                .reconfigure_held(&unrelated, 20)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(
+            journal
+                .reconfigure_held(&corrected, 20)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(cursor.completed, 0);
+        assert_eq!(journal.failure(&cursor.route).await.unwrap(), Some(raw));
+        // A captured prefix must not revert a newer correction during startup replay.
+        assert!(journal
+            .reconfigure_held(&original, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        journal.close().await.unwrap();
+        let restored = SpanJournal::open(&path).await.unwrap();
+        assert_eq!(
+            restored.route_settings(&original).await.unwrap().tags,
+            corrected.tags
+        );
+        assert_eq!(restored.routes().await.unwrap().len(), 1);
+        assert_eq!(restored.subscribe(&original, 0).await.unwrap().completed, 0);
+        restored.set_failure(&cursor.route, None).await.unwrap();
+        let mut newer = corrected.clone();
+        newer.tags.push("independent".into());
+        assert!(
+            restored
+                .reconfigure_held(&newer, 30)
+                .await
+                .unwrap()
+                .is_empty(),
+            "healthy independent subscriptions retain their settings"
+        );
+    }
+
     #[tokio::test]
     async fn close_releases_storage_even_when_a_blocking_read_was_cancelled() {
         let tmp = tempfile::tempdir().unwrap();

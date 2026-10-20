@@ -172,6 +172,18 @@ impl Translation {
             .map_err(|_| "translation control lost".to_owned())?
     }
 
+    pub async fn reconfigure_held(
+        &self,
+        route: &SessionRoute,
+        through: u64,
+    ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
+        self.journal.reconfigure_held(route, through).await
+    }
+
+    pub async fn route_settings(&self, route: &SessionRoute) -> anyhow::Result<SessionRoute> {
+        self.journal.route_settings(route).await
+    }
+
     /// Connect a route to the committed SpanOp stream without exposing its
     /// storage adapter to the route actor.
     pub async fn subscribe(

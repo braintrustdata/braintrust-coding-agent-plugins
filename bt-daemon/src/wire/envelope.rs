@@ -194,6 +194,16 @@ impl SessionRoute {
         serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
     }
 
+    /// Delivery settings may change without moving held work to another destination.
+    pub(crate) fn same_destination(&self, other: &Self) -> bool {
+        let identity = |route: &Self| Self {
+            auth: route.auth.clone(),
+            destination: route.destination.clone(),
+            ..Self::default()
+        };
+        identity(self).same_route(&identity(other))
+    }
+
     /// Raw journal entries can be replayed through a newer plugin chain as
     /// long as their Braintrust delivery route is otherwise unchanged.
     pub fn same_replay_route(&self, other: &Self) -> bool {

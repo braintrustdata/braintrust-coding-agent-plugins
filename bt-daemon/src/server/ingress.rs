@@ -171,6 +171,7 @@ pub(super) async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
                         env,
                         replay_through: before,
                         journal_through: through,
+                        settings_through: None,
                     },
                 )
                 .await;
@@ -204,11 +205,14 @@ pub(super) fn spawn_pending_reconciler(daemon: Arc<Daemon>) {
 pub(super) async fn accept_resolved_event(
     daemon: &Arc<Daemon>,
     event: PendingEvent,
-) -> Result<(), String> {
+    attempt: u32,
+) -> Result<(), Box<crate::pipeline::recovery::Failure>> {
+    use crate::pipeline::recovery::Failure;
     let PendingEvent {
         mut env,
         replay_through,
         journal_through,
+        settings_through,
     } = event;
     // Every fresh Claude capture carries a bounded observation marker. Older
     // persisted ingress must never consume live bytes while rebuilding state.
@@ -235,7 +239,8 @@ pub(super) async fn accept_resolved_event(
         let delivery_key = daemon
             .configure_event(&mut env)
             .await
-            .map_err(|error| format!("session auth failed: {error}"))?;
+            .map_err(|error| Failure::credentials(format!("session auth failed: {error}"), attempt).at(journal_through))?;
+        daemon.reconfigure_held_routes(&env, settings_through.unwrap_or(journal_through)).await.map_err(|error| Failure::storage(&error, &daemon.version, attempt).at(journal_through))?;
         if crate::dispatch::is_tool_lifecycle_event(&env.event) {
             if let Err(error) = mark_active_parent_snapshot_dirty(
                 &daemon.data_dir,
@@ -248,9 +253,9 @@ pub(super) async fn accept_resolved_event(
             }
         }
         let session = daemon
-            .session_for(&env, &delivery_key, replay_through)
+            .session_for(&mut env, &delivery_key, replay_through)
             .await
-            .map_err(|error| format!("session init failed: {error}"))?;
+            .map_err(|error| Failure::storage(&error, &daemon.version, attempt).at(journal_through))?;
         daemon
             .correlation
             .observe_session(&delivery_key.correlation_key(), &env.source, env.capture.as_ref(),
@@ -258,7 +263,7 @@ pub(super) async fn accept_resolved_event(
         session
             .enqueue(env, journal_through)
             .await
-            .map_err(|error| format!("enqueue failed: {error}"))?;
+            .map_err(|error| Failure::delay(crate::pipeline::recovery::Boundary::Translation, journal_through, format!("enqueue failed: {error}"), attempt))?;
         Ok(delivery_key)
     }
     .await;
@@ -272,7 +277,7 @@ pub(super) async fn accept_resolved_event(
             }
             tracing::info!(source, event, session_id, "event accepted")
         }
-        Err(error) => tracing::warn!(source, event, session_id, error, "event rejected"),
+        Err(error) => tracing::warn!(source, event, session_id, %error, "event rejected"),
     }
     if result.is_ok() && schedule_flush {
         // Deferred terminal events need the same flush as immediate events;
@@ -281,7 +286,7 @@ pub(super) async fn accept_resolved_event(
             .enqueue_source_session_flush(&source, &session_id, Duration::from_secs(10))
             .await;
     }
-    result.map(|_| ())
+    result.map(|_| ()).map_err(Box::new)
 }
 
 pub(super) fn is_session_start(source: &str, event: &str) -> bool {
@@ -325,6 +330,7 @@ impl Daemon {
                 env,
                 replay_through,
                 journal_through,
+                settings_through: None,
             }))) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {

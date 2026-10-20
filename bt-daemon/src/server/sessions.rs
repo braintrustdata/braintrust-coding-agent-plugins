@@ -80,7 +80,7 @@ impl Daemon {
 
     pub(super) async fn session_for(
         &self,
-        env: &Envelope,
+        env: &mut Envelope,
         key: &DeliveryKey,
         replay_through: u64,
     ) -> anyhow::Result<Arc<Session>> {
@@ -92,7 +92,7 @@ impl Daemon {
         }
         let route = env
             .route
-            .as_ref()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("event is missing its session route"))?;
         let config = env.config.clone().ok_or_else(|| {
             anyhow::anyhow!("resolved route is missing its session configuration")
@@ -106,9 +106,15 @@ impl Daemon {
         let journal_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
         let legacy_through =
-            journal::JournalReader::acknowledged_through(&journal_path, replay_through, route)
+            journal::JournalReader::acknowledged_through(&journal_path, replay_through, &route)
                 .await;
         let translation = self.translation_for(env).await?;
+        let settings = translation.route_settings(&route).await?;
+        let config = settings.with_auth(config.auth);
+        env.config = Some(config.clone());
+        if let Some(state) = self.session_auth.lock().await.get_mut(key) {
+            state.route = settings;
+        }
         translation
             .observe(crate::pipeline::translation::Observation {
                 key: key.correlation_key(),
@@ -119,7 +125,7 @@ impl Daemon {
         // Materialize historical output before seeding a released completion boundary.
         translation.advance(replay_through).await?;
         let _ = translation.barrier().await;
-        let input = translation.subscribe(route, legacy_through).await?;
+        let input = translation.subscribe(&route, legacy_through).await?;
         let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
@@ -141,6 +147,34 @@ impl Daemon {
         );
         map.insert(key.clone(), session.clone());
         Ok(session)
+    }
+
+    /// New settings can repair older subscriptions held on configuration, without
+    /// merging independent routes or acknowledging any unresolved work.
+    pub(super) async fn reconfigure_held_routes(
+        &self,
+        env: &Envelope,
+        through: u64,
+    ) -> anyhow::Result<()> {
+        let Some(route) = &env.route else {
+            return Ok(());
+        };
+        let translation = self.translation_for(env).await?;
+        for (stored, settings) in translation.reconfigure_held(route, through).await? {
+            let key = DeliveryKey::new(&env.source, &env.session_id, &stored)?;
+            let config = {
+                let mut states = self.session_auth.lock().await;
+                states.get_mut(&key).map(|state| {
+                    state.route = settings;
+                    state.route.with_auth(state.lease.auth.clone())
+                })
+            };
+            let session = self.sessions.lock().get(&key).cloned();
+            if let (Some(session), Some(config)) = (session, config) {
+                session.configure(config).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Drop every trace of one delivery pipeline. A session that goes quiet

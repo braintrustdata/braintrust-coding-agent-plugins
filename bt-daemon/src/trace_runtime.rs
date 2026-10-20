@@ -1398,6 +1398,59 @@ mod tests {
         daemon.stop().await;
     }
 
+    #[tokio::test]
+    async fn doctor_reports_storage_open_failures_with_storage_retry_conditions() {
+        for corrupt in [false, true] {
+            let daemon = TestDaemon::start(Arc::new(OtherProfileDaemonAuth)).await;
+            let data = daemon._dir.path().join("data");
+            let storage = data.join("pipeline");
+            if corrupt {
+                std::fs::create_dir_all(&storage).unwrap();
+                std::fs::write(
+                    storage.join(format!(
+                        "{}.sqlite",
+                        crate::ids::session_storage_id("codex", "storage-failure")
+                    )),
+                    "not a database",
+                )
+                .unwrap();
+            } else {
+                std::fs::write(&storage, "blocked storage directory").unwrap();
+            }
+            daemon
+                .forward_event("codex", "storage-failure", SessionRoute::default())
+                .await;
+            let output = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let output = daemon.doctor(DoctorAgent::Codex).await;
+                    if !output.daemon.session_errors.is_empty() {
+                        break output;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let error = &output.daemon.session_errors[0];
+            assert!(error.contains("recovering journal at"), "{error}");
+            assert!(!error.contains("fresh credential resolution"), "{error}");
+            assert!(
+                error.contains(if corrupt {
+                    "processor revision changes"
+                } else {
+                    "bounded retry"
+                }),
+                "{error}"
+            );
+            let rendered = TraceCommandOutput::doctor(output)
+                .render(OutputFormat::Human)
+                .unwrap();
+            assert!(rendered.contains("recovering journal at"));
+            assert!(rendered.contains("retry eligible: false"));
+            daemon.stop().await;
+        }
+    }
+
     /// Resolves a working credential, but for another profile and org than
     /// the shell's.
     struct OtherProfileDaemonAuth;

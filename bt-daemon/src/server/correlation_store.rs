@@ -89,6 +89,9 @@ pub(super) struct PendingEvent {
     pub(super) env: Envelope,
     pub(super) replay_through: u64,
     pub(super) journal_through: u64,
+    /// Original capture position when startup extends the replay boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) settings_through: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for PendingEvent {
@@ -103,6 +106,8 @@ impl<'de> Deserialize<'de> for PendingEvent {
                 env: Envelope,
                 replay_through: u64,
                 journal_through: u64,
+                #[serde(default)]
+                settings_through: Option<u64>,
             },
             Legacy(Envelope),
         }
@@ -111,15 +116,18 @@ impl<'de> Deserialize<'de> for PendingEvent {
                 env,
                 replay_through,
                 journal_through,
+                settings_through,
             } => Self {
                 env,
                 replay_through,
                 journal_through,
+                settings_through,
             },
             StoredPendingEvent::Legacy(env) => Self {
                 env,
                 replay_through: 0,
                 journal_through: 0,
+                settings_through: None,
             },
         })
     }
@@ -132,13 +140,29 @@ pub(super) async fn accept_event(daemon: &Arc<Daemon>, event: PendingEvent) -> R
     let mut state = daemon.pending_sessions.lock().get(&key).cloned();
     if state.is_none() {
         if daemon.standalone_links.lock().contains(&key) {
-            return accept_resolved_event(daemon, event).await;
+            return accept_established_event(
+                daemon,
+                &key,
+                event,
+                PendingSession {
+                    standalone: true,
+                    ..Default::default()
+                },
+            )
+            .await;
         }
         let route = daemon.automatic_links.lock().get(&key).cloned();
         if let Some(route) = route {
-            let mut event = event;
-            event.env.route = Some(route);
-            return accept_resolved_event(daemon, event).await;
+            return accept_established_event(
+                daemon,
+                &key,
+                event,
+                PendingSession {
+                    linked_route: Some(route),
+                    ..Default::default()
+                },
+            )
+            .await;
         }
         state = read_correlation_state(&daemon.data_dir, &key).await;
     }
@@ -295,6 +319,32 @@ pub(super) fn automatic_parent_route(
     Some(route)
 }
 
+/// Keep the normal established-session handoff fast, but retain any failure
+/// in the same durable recovery queue used during initial route discovery.
+async fn accept_established_event(
+    daemon: &Arc<Daemon>,
+    key: &str,
+    event: PendingEvent,
+    mut state: PendingSession,
+) -> Result<(), String> {
+    let mut resolved = event.clone();
+    if let Some(route) = &state.linked_route {
+        resolved.env.route = Some(route.clone());
+    }
+    if let Err(failure) = accept_resolved_event(daemon, resolved, 0).await {
+        let message = failure.message();
+        state.recovery = Some(*failure);
+        state.events.push(event);
+        // store_correlation registers the pending state before attempting I/O,
+        // so failed evidence persistence cannot hide or abandon the handoff.
+        if let Err(error) = store_correlation(daemon, key, &state).await {
+            tracing::warn!(%error, "established-session recovery evidence could not be persisted");
+        }
+        return Err(message);
+    }
+    Ok(())
+}
+
 pub(super) async fn store_correlation(
     daemon: &Daemon,
     key: &str,
@@ -333,18 +383,29 @@ pub(super) async fn finish_correlation(
         .recovery
         .take()
         .map_or(0, |failure| failure.attempt.saturating_add(1));
-    let result: Result<(), String> = async {
+    let storage_failure = |error: String| {
+        Box::new(crate::pipeline::recovery::Failure::storage(
+            &anyhow::anyhow!(error),
+            &daemon.version,
+            attempt,
+        ))
+    };
+    let result: Result<(), Box<crate::pipeline::recovery::Failure>> = async {
         // Persist the final route before delivering any events. A crash may
         // replay deterministic rows, but must never select a different parent.
-        store_correlation(daemon, key, &state).await?;
+        store_correlation(daemon, key, &state)
+            .await
+            .map_err(storage_failure)?;
         while let Some(event) = state.events.first() {
             let mut event = event.clone();
             if let Some(route) = &state.linked_route {
                 event.env.route = Some(route.clone());
             }
-            accept_resolved_event(daemon, event).await?;
+            accept_resolved_event(daemon, event, attempt).await?;
             state.events.remove(0);
-            store_correlation(daemon, key, &state).await?;
+            store_correlation(daemon, key, &state)
+                .await
+                .map_err(storage_failure)?;
         }
         Ok(())
     }
@@ -354,9 +415,7 @@ pub(super) async fn finish_correlation(
             .events
             .first()
             .map_or(0, |event| event.journal_through);
-        state.recovery = Some(
-            crate::pipeline::recovery::Failure::credentials(error.clone(), attempt).at(position),
-        );
+        state.recovery = Some((**error).clone().at(position));
         if let Err(error) = store_correlation(daemon, key, &state).await {
             tracing::warn!(%error,"pending recovery evidence could not be persisted");
         }
@@ -365,7 +424,7 @@ pub(super) async fn finish_correlation(
             .lock()
             .insert(key.to_string(), state);
     }
-    result
+    result.map_err(|failure| failure.message())
 }
 
 pub(super) async fn retry_pending_sessions(daemon: &Arc<Daemon>) -> Result<(), String> {
