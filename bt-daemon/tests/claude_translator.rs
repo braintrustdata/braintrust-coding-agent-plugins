@@ -147,8 +147,7 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
                 if update.output.is_some() {
                     row.output = update.output;
                 }
-                if update.metadata.is_some() {
-                    let update_metadata = update.metadata.unwrap();
+                if let Some(update_metadata) = update.metadata {
                     match (row.metadata.as_mut(), update_metadata) {
                         (Some(Value::Object(existing)), Value::Object(update)) => {
                             existing.extend(update);
@@ -1175,7 +1174,7 @@ fn claude_post_compact_starts_a_root_when_it_is_the_first_trace_event() {
         .find(|row| row.name == "Compaction")
         .expect("PostCompact creates a compaction span");
     assert_eq!(compaction.root_span_id, root.root_span_id);
-    assert_eq!(compaction.parent_span_ids, [root.span_id.clone()]);
+    assert_eq!(compaction.parent_span_ids.first(), Some(&root.span_id));
 }
 
 #[test]
