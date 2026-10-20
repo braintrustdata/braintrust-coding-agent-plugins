@@ -46,6 +46,15 @@ impl Plugins {
     }
 
     pub fn configure(&mut self, paths: &[PathBuf]) {
+        // One timeout attempt per submission; the durable consumer owns retry
+        // timing and attempt limits. Do not latch a transient deadline forever.
+        if self
+            .blocked
+            .as_ref()
+            .is_some_and(|(_, failure)| failure.failure.timed_out)
+        {
+            self.blocked = None;
+        }
         self.paths.clear();
         self.paths.extend_from_slice(paths);
     }

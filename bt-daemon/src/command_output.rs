@@ -123,6 +123,9 @@ pub struct DaemonDiagnostic {
     /// Distinct latest errors the daemon recorded for this agent's sessions.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub session_errors: Vec<String>,
+    /// Current holds, separate from persisted historical plugin errors.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recovering_sessions: Vec<crate::wire::SessionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -271,12 +274,21 @@ impl TraceCommandOutput {
                 for error in &daemon.session_errors {
                     rendered.push_str(&format!("\nDaemon session error: {error}"));
                 }
+                for session in &daemon.recovering_sessions {
+                    if let Some(recovery) = &session.recovery {
+                        rendered.push_str(&format!(
+                            "\nActive delivery hold: {} / {}\nStage: {}\nQueued span operations: {}\nRetry attempts: {}\nWaiting for: {}",
+                            session.source, session.session_id, recovery.stage,
+                            session.queued_span_ops.map_or_else(|| "unknown".into(), |count| count.to_string()), recovery.attempt, recovery.retry
+                        ));
+                    }
+                }
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
                 }
                 for diagnostic in &doctor.plugin_diagnostics {
                     rendered.push_str(&format!(
-                        "\nPlugin error: {} ({} occurrence{})\nFirst seen: {}\nLast seen: {}\n{}",
+                        "\nHistorical plugin error: {} ({} recorded occurrence{}; not an affected-span count)\nFirst seen: {}\nLast seen: {}\n{}",
                         diagnostic.plugin_path.display(),
                         diagnostic.occurrences,
                         if diagnostic.occurrences == 1 { "" } else { "s" },
@@ -532,6 +544,24 @@ mod tests {
                     error: Some("saved profile ID 'p' no longer exists".into()),
                 }),
                 session_errors: vec!["could not resolve Braintrust auth for codex".into()],
+                recovering_sessions: vec![crate::wire::SessionStatus {
+                    session_id: "held-session".into(),
+                    source: "codex".into(),
+                    route: None,
+                    recovery: Some(crate::wire::RecoveryInfo {
+                        stage: "plugin".into(),
+                        position: 1,
+                        reason: "deadline".into(),
+                        retry: "bounded retry".into(),
+                        eligible: false,
+                        attempt: 1,
+                    }),
+                    queued: 8,
+                    queued_span_ops: Some(7),
+                    spans_emitted: 0,
+                    permalink: None,
+                    last_error: None,
+                }],
                 error: None,
             },
             warnings: Vec::new(),
@@ -555,6 +585,19 @@ mod tests {
             value["daemon"]["session_errors"][0],
             "could not resolve Braintrust auth for codex"
         );
+        assert_eq!(
+            value["daemon"]["recovering_sessions"][0]["queued_span_ops"],
+            7
+        );
+        assert_eq!(
+            value["daemon"]["recovering_sessions"][0]["recovery"]["attempt"],
+            1
+        );
+        let human = output.render(OutputFormat::Human).unwrap();
+        assert!(human.contains("Active delivery hold: codex / held-session"));
+        assert!(human.contains("Queued span operations: 7"));
+        assert!(human.contains("Historical plugin error:"));
+        assert!(human.contains("not an affected-span count"));
         assert!(!rendered.contains("token"));
         assert!(!rendered.contains("api_key"));
         assert_eq!(

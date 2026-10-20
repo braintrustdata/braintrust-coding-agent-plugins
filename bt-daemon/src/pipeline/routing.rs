@@ -80,6 +80,7 @@ impl RoutingSink {
                                     failure = Some((
                                         anyhow::Error::new(error.clone()),
                                         RetryCondition::Plugin {
+                                            timed_out: error.failure.timed_out,
                                             path: error.failure.path.clone(),
                                             digest: error.digest,
                                             processors: error.processors.clone(),

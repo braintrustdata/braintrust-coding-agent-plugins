@@ -208,6 +208,10 @@ impl Session {
             .saturating_add(self.source_progress.pending())
     }
 
+    pub(crate) fn pending_span_ops(&self) -> u64 {
+        self.route_progress.pending()
+    }
+
     /// Queue a journaled event without waiting for translation or delivery.
     pub async fn enqueue(&self, env: Envelope, journal_through: u64) -> anyhow::Result<()> {
         self.touch();

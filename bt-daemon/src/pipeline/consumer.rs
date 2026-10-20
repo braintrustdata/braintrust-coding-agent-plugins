@@ -131,7 +131,10 @@ impl ConsumerOptions {
                 tracing::warn!(session_id=%self.session_id, %error, "route processing failed");
             }
         }
-        Box::new((Failure::routing(error, config, attempt), Work::Resubmit))
+        Box::new((
+            Failure::routing(error, config, attempt, &self.version),
+            Work::Resubmit,
+        ))
     }
 
     // Keep the original acknowledgement obligations until checked delivery has
@@ -543,6 +546,40 @@ mod tests {
         consumer.shutdown().await;
         forward.abort();
         let _ = forward.await;
+        journal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_plugin_timeout_replays_the_held_operation_without_an_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("redact.mjs");
+        std::fs::write(&plugin, "let calls=0; export default span => {if(calls++===0) {while(true){}} return {...span,name:'redacted'};}").unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        stored(&journal).await;
+        let route = SessionRoute {
+            span_plugins: vec![plugin],
+            ..Default::default()
+        };
+        let record = Arc::new(Recording::default());
+        let opts = options(tmp.path(), &route, record.clone());
+        let recovery = opts.recovery.clone();
+        let (consumer, progress, error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        wait_for(|| recovery.lock().is_some()).await;
+        assert_eq!(progress.completed(), 0);
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(recovery.lock().as_ref().unwrap().stage, "plugin");
+        wait_for(|| progress.completed() == 1).await;
+        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
+        assert!(error.lock().is_none());
+        assert!(recovery.lock().is_none());
+        assert!(journal
+            .failure(&serde_json::to_string(&route).unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        consumer.shutdown().await;
         journal.close().await.unwrap();
     }
     struct Acknowledged(Arc<AtomicU64>);
