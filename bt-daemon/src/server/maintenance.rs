@@ -548,6 +548,7 @@ mod tests {
                     env,
                     replay_through: 0,
                     journal_through: 1,
+                    settings_through: None,
                 }],
                 ..Default::default()
             };

@@ -52,6 +52,7 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                                 env,
                                 replay_through: before,
                                 journal_through: through,
+                                settings_through: Some(through),
                             },
                         );
                     }
@@ -108,7 +109,12 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
                     .map(|(key, _)| key.clone());
                 let mut event = matching
                     .and_then(|key| latest_by_route.remove(&key))
-                    .unwrap_or_else(|| template.clone());
+                    .unwrap_or_else(|| {
+                        let mut event = template.clone();
+                        // A dormant head has no captured settings correction.
+                        event.settings_through = Some(0);
+                        event
+                    });
                 event.env.route = Some(route.clone());
                 latest_by_route.insert(route_key, event);
             }
@@ -289,6 +295,7 @@ mod tests {
                     env,
                     replay_through: 0,
                     journal_through: through,
+                    settings_through: None,
                 }],
                 ..Default::default()
             },
@@ -308,6 +315,97 @@ mod tests {
             .sessions
             .lock()
             .contains_key(&DeliveryKey::new("debug", "test", &dormant).unwrap()));
+        super::super::maintenance::drain_all(&daemon).await;
+    }
+    #[tokio::test]
+    async fn startup_preserves_corrected_settings_before_a_held_head_completes() {
+        use crate::pipeline::{journal::SpanJournal, recovery::Failure};
+        let tmp = tempfile::tempdir().unwrap();
+        let original = SessionRoute {
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: Some("test-project".into()),
+                project_name: None,
+            }),
+            ..Default::default()
+        };
+        let mut corrected = original.clone();
+        corrected.tags.push("corrected".into());
+        let mut env: Envelope = serde_json::from_value(serde_json::json!({
+            "source":"debug", "session_id":"restart-correction", "event":"SessionStart", "ts_ms":1,
+            "payload":{}, "route":original
+        }))
+        .unwrap();
+        let raw = journal::source_journal_path(tmp.path(), "debug", &env.session_id);
+        let mut writer = JournalWriter::open_path(&raw).await.unwrap();
+        let first = writer.append(&env).await.unwrap();
+        env.route = Some(corrected.clone());
+        env.event = "Stop".into();
+        env.ts_ms = 2;
+        let settings_through = writer.append(&env).await.unwrap();
+        let tail = writer
+            .append_control(&journal::PipelineControl {
+                kind: journal::ControlKind::Checkpoint,
+                bounds: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        drop(writer);
+        let path = tmp.path().join("pipeline").join(format!(
+            "{}.sqlite",
+            crate::ids::session_storage_id("debug", &env.session_id)
+        ));
+        let spans = SpanJournal::open(&path).await.unwrap();
+        spans.begin(first, true).await.unwrap();
+        spans
+            .append(
+                first,
+                &[SpanOp::Insert(SpanRow {
+                    span_id: "stored".into(),
+                    name: "stored".into(),
+                    root_span_id: "stored".into(),
+                    end_ms: Some(1),
+                    ..Default::default()
+                })],
+            )
+            .await
+            .unwrap();
+        spans.commit(first).await.unwrap();
+        spans.subscribe(&original, 0).await.unwrap();
+        let lease = TestAuth
+            .resolve(&original.auth, AuthResolveReason::Initial)
+            .await
+            .unwrap();
+        let failure = Failure::legacy("rejected row".into(), 1, &original.with_auth(lease.auth));
+        spans
+            .set_failure(
+                &serde_json::to_string(&original).unwrap(),
+                Some(serde_json::to_string(&failure).unwrap()),
+            )
+            .await
+            .unwrap();
+        spans
+            .reconfigure_held(&corrected, settings_through)
+            .await
+            .unwrap();
+        // Crash window: the correction is durable, but no consumer has retried it.
+        spans.close().await.unwrap();
+        let mut options = debug_serve_options("test", tmp.path());
+        options.auth_provider = Some(Arc::new(TestAuth));
+        let daemon = Daemon::new(options, tmp.path().into());
+        recover_unprocessed_journals(&daemon).await;
+        daemon.ingress_barrier().await;
+        let restored = SpanJournal::open(&path).await.unwrap();
+        assert_eq!(
+            restored.route_settings(&original).await.unwrap().tags,
+            corrected.tags
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !restored.route_complete(&original, tail).await.unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         super::super::maintenance::drain_all(&daemon).await;
     }
 }

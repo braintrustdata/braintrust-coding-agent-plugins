@@ -89,6 +89,9 @@ pub(super) struct PendingEvent {
     pub(super) env: Envelope,
     pub(super) replay_through: u64,
     pub(super) journal_through: u64,
+    /// Original capture position when startup extends the replay boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) settings_through: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for PendingEvent {
@@ -103,6 +106,8 @@ impl<'de> Deserialize<'de> for PendingEvent {
                 env: Envelope,
                 replay_through: u64,
                 journal_through: u64,
+                #[serde(default)]
+                settings_through: Option<u64>,
             },
             Legacy(Envelope),
         }
@@ -111,15 +116,18 @@ impl<'de> Deserialize<'de> for PendingEvent {
                 env,
                 replay_through,
                 journal_through,
+                settings_through,
             } => Self {
                 env,
                 replay_through,
                 journal_through,
+                settings_through,
             },
             StoredPendingEvent::Legacy(env) => Self {
                 env,
                 replay_through: 0,
                 journal_through: 0,
+                settings_through: None,
             },
         })
     }
@@ -338,18 +346,18 @@ pub(super) async fn finish_correlation(
         .take()
         .map_or(0, |failure| failure.attempt.saturating_add(1));
     let storage_failure = |error: String| {
-        crate::pipeline::recovery::Failure::storage(
+        Box::new(crate::pipeline::recovery::Failure::storage(
             &anyhow::anyhow!(error),
             &daemon.version,
             attempt,
-        )
+        ))
     };
-    let result: Result<(), crate::pipeline::recovery::Failure> = async {
+    let result: Result<(), Box<crate::pipeline::recovery::Failure>> = async {
         // Persist the final route before delivering any events. A crash may
         // replay deterministic rows, but must never select a different parent.
         store_correlation(daemon, key, &state)
             .await
-            .map_err(&storage_failure)?;
+            .map_err(storage_failure)?;
         while let Some(event) = state.events.first() {
             let mut event = event.clone();
             if let Some(route) = &state.linked_route {
@@ -359,7 +367,7 @@ pub(super) async fn finish_correlation(
             state.events.remove(0);
             store_correlation(daemon, key, &state)
                 .await
-                .map_err(&storage_failure)?;
+                .map_err(storage_failure)?;
         }
         Ok(())
     }
@@ -369,7 +377,7 @@ pub(super) async fn finish_correlation(
             .events
             .first()
             .map_or(0, |event| event.journal_through);
-        state.recovery = Some(error.clone().at(position));
+        state.recovery = Some((**error).clone().at(position));
         if let Err(error) = store_correlation(daemon, key, &state).await {
             tracing::warn!(%error,"pending recovery evidence could not be persisted");
         }
