@@ -321,26 +321,6 @@ struct Subagent {
     handback_message: Option<Value>,
 }
 
-fn last_handback_message(records: &[Value]) -> Option<Value> {
-    records.iter().rev().find_map(|record| {
-        if record.get("type").and_then(Value::as_str) != Some("assistant") {
-            return None;
-        }
-        record
-            .pointer("/message/content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .rev()
-            .find(|block| {
-                block.get("type").and_then(Value::as_str) == Some("tool_use")
-                    && block.get("name").and_then(Value::as_str) == Some("SubagentHandback")
-            })
-            .and_then(|block| block.pointer("/input/message"))
-            .cloned()
-    })
-}
-
 fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
     let Some(stem) = path.file_stem() else {
         return Ok(Vec::new());
@@ -485,7 +465,9 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 start_ms,
                 end_ms,
                 last_assistant_message: last_assistant_text(&subagent_records),
-                handback_message: last_handback_message(&subagent_records),
+                handback_message: crate::translate::successful_subagent_handback_message(
+                    &subagent_records,
+                ),
             })
         })
         .collect::<Vec<_>>();
