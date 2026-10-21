@@ -31,6 +31,7 @@ check_json "$MARKETPLACE"
 # Required files for each shipped plugin.
 required=(
   "plugins/trace-claude-code/.claude-plugin/plugin.json"
+  "plugins/trace-claude-code/.cursor-plugin/plugin.json"
   "plugins/trace-claude-code/hooks/hooks.json"
 )
 for rel in "${required[@]}"; do
@@ -64,6 +65,14 @@ import sys
 
 with open(sys.argv[1]) as f:
     hooks = json.load(f)["hooks"]
+
+# Cursor prefers its own manifest when importing an installed Claude plugin.
+# An explicit empty hook config prevents fallback to the Claude hook file.
+from pathlib import Path
+plugin = Path(sys.argv[1]).parent.parent
+cursor = json.loads((plugin / '.cursor-plugin/plugin.json').read_text())
+assert cursor['name'] == 'trace-claude-code'
+assert cursor['hooks'] == {'version': 1, 'hooks': {}}
 
 expected_events = {
     "PermissionDenied", "PostCompact", "PostToolUse", "PostToolUseFailure",
