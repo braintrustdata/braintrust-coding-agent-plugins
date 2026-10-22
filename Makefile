@@ -6,6 +6,7 @@
 #   publish.sh              deploy it (push to dist repo, npm/vsce publish, ...)
 #
 # Targets fan out over every plugin dir:
+#   make install-deps     install JavaScript dependencies for local development
 #   make build            build all plugins into dist/<agent>
 #   make build-codex      build just one
 #   make test             build then validate all
@@ -24,7 +25,12 @@ BUILD_RULES := $(addprefix build-,$(PLUGINS))
 PUBLISH_RULES := $(addprefix publish-,$(PLUGINS))
 VALIDATE_RULES := $(addprefix validate-,$(PLUGINS))
 
-.PHONY: build test publish clean $(BUILD_RULES) $(VALIDATE_RULES) $(PUBLISH_RULES)
+.PHONY: install-deps build test publish clean $(BUILD_RULES) $(VALIDATE_RULES) $(PUBLISH_RULES)
+
+install-deps:
+	mise exec -- pnpm --dir src/plugins/opencode/content install --frozen-lockfile
+	mise exec -- pnpm --dir src/plugins/pi/content install --frozen-lockfile
+	mise exec -- npm --prefix src/plugins/cursor/content ci --no-audit --no-fund
 
 build: $(BUILD_RULES)
 

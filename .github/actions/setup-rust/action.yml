@@ -1,0 +1,26 @@
+name: Set up Rust
+description: Install the Rust toolchain pinned in the root .tool-versions and make it the default.
+inputs:
+  components:
+    description: Space-separated rustup components to add, such as "clippy rustfmt".
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        rust_version="$(awk '$1 == "rust" { print $2 }' "$GITHUB_WORKSPACE/.tool-versions")"
+        if [ -z "$rust_version" ]; then
+          echo "::error file=.tool-versions::missing rust entry"
+          exit 1
+        fi
+        rustup toolchain install "$rust_version" --profile minimal
+        rustup default "$rust_version"
+        if [ -n "$COMPONENTS" ]; then
+          # shellcheck disable=SC2086 # split the component list into arguments
+          rustup component add $COMPONENTS
+        fi
