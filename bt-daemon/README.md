@@ -290,56 +290,14 @@ that transcript, and sends them through the normal translator and sink to
 create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
 
-Muse imports invoke its documented local `muse export --session` interface and
-read export schema version 1. `import muse --all` enumerates durable session
-IDs through Muse's read-only MSP `session/list` interface, then exports each
-completed session. Exports are parsed incrementally, one session at a time.
-Muse Code 1.3+ setup captures lifecycle, model, tool success/failure, permission
-requests, subagent lifecycle, compaction, batch completion, and notifications.
-Installation adds owned user hooks while preserving unrelated user hooks and
-enterprise managed-hook policy. Disablement removes only Braintrust's hooks.
+Muse Code 1.3+ supports live tracing, managed runs, session import, and attach
+on macOS and Linux. Use `import muse --all` to import completed sessions.
 
-`import muse <session-id> --attach` follows an active session by polling full
-exports with the same parser and translator used for historical import. Only
-new envelopes are delivered. Active snapshots leave spans open; Ctrl-C detaches
-without fabricating a terminal result or launching a final export. A later attach
-or import applies authoritative completion to the same span IDs. Polling cost
-grows with session length; MSP view events omit the model request/response records
-needed by the translator.
+Add `--attach` to keep following an active Codex, Claude, Antigravity, or Muse
+session until Ctrl-C. Detaching from Muse leaves the session running; attach
+again or import it later to collect its completion.
 
-Live model hooks and schema-v1 exports use the native turn, model step, and retry
-attempt for shared span identity; the export's record UUID is retained as metadata.
-Legacy exports without a model step retain their record UUID, so cross-ingress
-model deduplication cannot be guaranteed for those records. Native response
-previews remain previews: tracing cannot recover content Muse does not export.
-Permission hooks report requests, not approval decisions; compaction hooks lack
-native operation IDs. Captured built-in child hooks identify their child session
-but omit the parent session, so their work remains in a separate trace rather
-than guessing ancestry across concurrent sessions. Missing native facts are not invented.
-
-`run muse` uses invocation-local `-c hooks=…` configuration and a private context
-file because Muse sanitizes the hook environment. It replaces owned user hooks
-for that invocation, preserves foreign user hooks and enterprise managed hooks,
-and leaves saved settings unchanged. An isolated daemon starts before Muse so
-authentication does not depend on the sanitized hook environment. Duplicate
-Braintrust project hooks produce a diagnostic. Disable independently tracing
-Muse plugins before running a managed session.
-
-Muse native verification runs on Linux in CI and locally on macOS. The official
-installer does not provide a Windows binary; Rust fixture tests still run on
-Windows. Native tests use Muse's file credential backend
-(`TBH_CREDENTIAL_BACKEND=file`) and disable telemetry so temporary profiles do
-not trigger macOS Keychain creation dialogs. Muse hooks ship through the embedding `bt` binary; no separate marketplace
-package is needed. After this PR merges, dispatch the consumer's existing
-`Update bt-daemon dependency` workflow (`update-bt-daemon.yml` in
-`braintrustdata/bt`) to prepare its Git pin and lockfile PR. Merge that consumer
-update and build/install `bt`, then verify `bt trace setup
-muse`, `bt trace run muse exec …`, `bt trace import muse <session-id>`, status,
-and disablement against an isolated Muse profile. Release publishing remains
-owned by the consumer repository.
-
-Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
-Ctrl-C. `run <codex|muse|claude|opencode|pi> [ARGS...]` launches the selected agent with
+`run <codex|muse|claude|opencode|pi> [ARGS...]` launches the selected agent with
 inherited stdio and injects Braintrust hooks or an adapter for that invocation, so it
 does not depend on the tracing plugin being installed or enabled. Managed runs
 suppress inherited Braintrust plugin hooks to avoid logging the same session
