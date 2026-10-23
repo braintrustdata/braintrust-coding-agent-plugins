@@ -1,86 +1,56 @@
-//! Muse Code hook translator.
-//!
-//! Muse hooks remain a thin transport. The session, turn and model payloads
-//! used here were captured from Muse Code 1.1.1-R2514.1. Import feeds the
-//! same event names through this translator.
-
+//! Muse hook reducer. Native hook decoding and export DTOs live in crate::muse;
+//! this module owns span correlation, ordering, and replay policy.
 use super::git::GitMetadataCache;
-use super::recent::{RecentMap, RecentSet};
-
+use super::recent::RecentSet;
 #[path = "muse_events.rs"]
 mod muse_events;
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
+use crate::muse::hooks::*;
+use crate::muse::metadata::*;
+#[path = "muse_usage.rs"]
+mod muse_usage;
 use crate::wire::Envelope;
-use serde::{Deserialize, Deserializer};
-use serde_json::{json, Map, Value};
+use muse_usage::UsageTracker;
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+type Result<T> = anyhow::Result<T>;
 impl TranslatorFactory for crate::agents::Muse {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
         Box::new(MuseTranslator::new(session_id, GitMetadataCache::shared()))
     }
 }
-
 #[derive(Clone)]
 struct OpenOp {
     id: String,
     parents: Vec<String>,
     turn_span_id: Option<String>,
 }
-
-#[derive(Default, Deserialize)]
-struct HookIds {
-    #[serde(default, deserialize_with = "string_or_none")]
-    turn_id: Option<String>,
-    #[serde(default, deserialize_with = "string_or_none")]
-    request_id: Option<String>,
-}
-
-fn string_or_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Ok(Value::deserialize(deserializer)?
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned))
-}
-
-impl HookIds {
-    fn turn(&self) -> Option<&str> {
-        self.turn_id.as_deref().filter(|id| !id.is_empty())
-    }
-    fn request(&self) -> Option<&str> {
-        self.request_id.as_deref().filter(|id| !id.is_empty())
-    }
-}
-
 struct MuseTranslator {
     session_id: String,
     root_id: String,
     effective_root_id: String,
     external_parent: Option<String>,
     opened: bool,
-    session_metadata: Map<String, Value>,
+    root_created: bool,
+    session_metadata: SessionMetadata,
     session_version: Option<String>,
     turns: HashMap<String, OpenOp>,
     llms: HashMap<String, OpenOp>,
     closed_turns: RecentSet<String>,
     closed_llms: RecentSet<String>,
-    root_created: bool,
     events: muse_events::Events,
-    total_metrics: Map<String, Value>,
-    model_metrics: RecentMap<String, Value>,
-    turn_usage: RecentMap<String, Value>,
+    usage: UsageTracker,
     last_completed_turn: Option<String>,
     last_ts: i64,
     git: Arc<GitMetadataCache>,
 }
-
 impl MuseTranslator {
     fn new(session_id: &str, git: Arc<GitMetadataCache>) -> Self {
         Self {
@@ -89,7 +59,7 @@ impl MuseTranslator {
             effective_root_id: String::new(),
             external_parent: None,
             opened: false,
-            session_metadata: Map::new(),
+            session_metadata: SessionMetadata::default(),
             session_version: None,
             turns: HashMap::new(),
             llms: HashMap::new(),
@@ -97,50 +67,15 @@ impl MuseTranslator {
             closed_llms: RecentSet::default(),
             root_created: false,
             events: muse_events::Events::default(),
-            total_metrics: Map::new(),
-            model_metrics: RecentMap::default(),
-            turn_usage: RecentMap::default(),
+            usage: UsageTracker::default(),
             last_completed_turn: None,
             last_ts: 0,
             git,
         }
     }
-    fn remember_session(&mut self, e: &Envelope) {
-        if let Some(version) = &e.source_version {
-            self.session_version = Some(version.clone());
-        }
-        for key in [
-            "cwd",
-            "model",
-            "provider",
-            "permission_mode",
-            "trajectory_id",
-            "root_session_id",
-        ] {
-            if let Some(value) = e.payload.get(key) {
-                self.session_metadata.insert(key.into(), value.clone());
-            }
-        }
-    }
-
-    fn starts_trace(event: &str) -> bool {
-        matches!(
-            event,
-            "UserPromptSubmit"
-                | "PreLLMCall"
-                | "PreToolUse"
-                | "PermissionRequest"
-                | "PostToolUse"
-                | "PostToolUseFailure"
-                | "PostToolBatch"
-                | "SubagentStart"
-                | "PreCompact"
-        )
-    }
-
-    fn ensure_root(&mut self, e: &Envelope, ctx: &SessionCtx) -> Vec<SpanOp> {
+    fn ensure_root(&mut self, e: &Envelope, ctx: &SessionCtx) -> Result<Vec<SpanOp>> {
         if self.opened {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.opened = true;
         let attached = ctx
@@ -153,6 +88,18 @@ impl MuseTranslator {
             .1
             .or_else(|| self.external_parent.clone())
             .unwrap_or_else(|| self.root_id.clone());
+        if self.root_created {
+            return Ok(Vec::new());
+        }
+        let authored = serde_json::to_value(RootMetadata {
+            source: "muse",
+            session_id: &ctx.session_id,
+            username: local_username(),
+            muse_version: self.session_version.as_deref(),
+            adapter_version: e.plugin_version.as_deref(),
+            session: &self.session_metadata,
+        })?;
+        // Arbitrary user metadata is an intentional JSON merge boundary.
         let mut metadata = ctx
             .config
             .as_ref()
@@ -160,23 +107,11 @@ impl MuseTranslator {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        metadata.insert("source".into(), json!("muse"));
-        metadata.insert("session_id".into(), json!(ctx.session_id));
-        metadata.insert("username".into(), json!(local_username()));
-        if let Some(version) = &self.session_version {
-            metadata.insert("muse_version".into(), json!(version));
-        }
-        if let Some(version) = &e.plugin_version {
-            metadata.insert("adapter_version".into(), json!(version));
-        }
-        for (key, value) in &self.session_metadata {
-            metadata.insert(key.clone(), value.clone());
-        }
-        if self.root_created {
-            return Vec::new();
+        if let Value::Object(authored) = authored {
+            metadata.extend(authored);
         }
         self.root_created = true;
-        vec![SpanOp::Insert(SpanRow {
+        Ok(vec![SpanOp::Insert(SpanRow {
             span_id: self.root_id.clone(),
             root_span_id: self.effective_root_id.clone(),
             parent_span_ids: self.external_parent.clone().into_iter().collect(),
@@ -185,10 +120,11 @@ impl MuseTranslator {
             start_ms: Some(e.ts_ms),
             metadata: Some(Value::Object(metadata)),
             ..Default::default()
-        })]
+        })])
     }
+    // Values here are already serialized SpanRow fields, never native payloads.
     fn close(
-        root_span_id: &str,
+        root: &str,
         map: &mut HashMap<String, OpenOp>,
         key: &str,
         ts: i64,
@@ -201,7 +137,7 @@ impl MuseTranslator {
         };
         vec![SpanOp::Merge(SpanRow {
             span_id: open.id,
-            root_span_id: root_span_id.into(),
+            root_span_id: root.into(),
             parent_span_ids: open.parents,
             turn_span_id: open.turn_span_id,
             end_ms: Some(ts),
@@ -233,14 +169,12 @@ impl MuseTranslator {
         }
         out
     }
-
-    fn parent(&self, ids: &HookIds) -> String {
+    fn parent(&self, ids: &HookContext) -> String {
         ids.turn()
             .and_then(|id| self.turns.get(id))
             .map(|op| op.id.clone())
             .unwrap_or_else(|| self.root_id.clone())
     }
-
     fn insert_open(map: &mut HashMap<String, OpenOp>, key: &str, row: SpanRow) -> Vec<SpanOp> {
         if map.contains_key(key) {
             return Vec::new();
@@ -255,11 +189,10 @@ impl MuseTranslator {
         );
         vec![SpanOp::Insert(row)]
     }
-
-    fn unpaired(&self, e: &Envelope, reason: &str) -> SpanOp {
-        // A malformed event must not share an `unknown` ID with another event.
+    fn unpaired(&self, e: &Envelope, reason: &str) -> Result<SpanOp> {
+        // Raw payload is used only as an identity fingerprint, not inspected.
         let identity = format!("unpaired:{}:{}:{}", e.event, e.ts_ms, e.payload);
-        SpanOp::Insert(SpanRow {
+        Ok(SpanOp::Insert(SpanRow {
             span_id: ids::span_id(&self.session_id, &identity),
             root_span_id: self.effective_root_id.clone(),
             parent_span_ids: vec![self.root_id.clone()],
@@ -267,238 +200,224 @@ impl MuseTranslator {
             span_type: SpanType::Task,
             start_ms: Some(e.ts_ms),
             end_ms: Some(e.ts_ms),
-            metadata: Some(json!({"unpaired": true})),
+            metadata: Some(serde_json::to_value(UnpairedMetadata { unpaired: true })?),
             error: Some(reason.into()),
             ..Default::default()
-        })
+        }))
+    }
+    fn start_model(&mut self, e: &Envelope, hook: Hook<ModelStarted>) -> Result<Vec<SpanOp>> {
+        let Some(id) = hook.context.request() else {
+            return Ok(vec![self.unpaired(e, "Muse PreLLMCall has no request_id")?]);
+        };
+        let parent = self.parent(&hook.context);
+        let model = hook.context.session.model.as_deref();
+        Ok(Self::insert_open(
+            &mut self.llms,
+            id,
+            SpanRow {
+                span_id: ids::span_id(&self.session_id, &format!("llm:{id}")),
+                root_span_id: self.effective_root_id.clone(),
+                parent_span_ids: vec![parent.clone()],
+                turn_span_id: (parent != self.root_id).then_some(parent),
+                name: model
+                    .filter(|s| !s.is_empty() && *s != "unknown")
+                    .unwrap_or("llm")
+                    .into(),
+                span_type: SpanType::Llm,
+                start_ms: Some(e.ts_ms),
+                input: Some(serde_json::to_value(ModelInput {
+                    messages: &hook.body.messages,
+                    tools: &hook.body.tools,
+                })?),
+                metadata: Some(serde_json::to_value(ModelStartMetadata {
+                    model: &hook.context.session.model,
+                    provider: &hook.context.session.provider,
+                    details: &hook.body.details,
+                    request_record_id: &hook.body.request_record_id,
+                    input_summary: &hook.body.input_summary,
+                })?),
+                ..Default::default()
+            },
+        ))
+    }
+    fn finish_model(&mut self, e: &Envelope, hook: Hook<ModelFinished>) -> Result<Vec<SpanOp>> {
+        let Some(id) = hook.context.request() else {
+            return if self.opened {
+                Ok(vec![self.unpaired(e, "Muse PostLLMCall has no request_id")?])
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        let metrics = hook.body.usage.as_ref().map(|usage| {
+            self.usage.record(
+                hook.context.turn(),
+                id,
+                usage,
+                hook.body.usage_scope,
+                self.llms.contains_key(id),
+            )
+        });
+        let mut closed = Self::close(
+            &self.effective_root_id,
+            &mut self.llms,
+            id,
+            e.ts_ms,
+            hook.body
+                .output_text_preview
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+            metrics.map(serde_json::to_value).transpose()?,
+            hook.body.outcome.error_message(),
+        );
+        for op in &mut closed {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            row.metadata = Some(serde_json::to_value(ModelEndMetadata {
+                finish_reason: &hook.body.finish_reason,
+                response_id: &hook.body.response_id,
+                tool_call_count: &hook.body.tool_call_count,
+                status: &hook.body.outcome.status,
+                options: &hook.body.options,
+            })?);
+        }
+        if !closed.is_empty() {
+            self.closed_llms.insert(id.into());
+        }
+        Ok(closed)
+    }
+    fn finish_turn(&mut self, e: &Envelope, hook: Hook<TurnFinished>) -> Result<Vec<SpanOp>> {
+        let Some(id) = hook.context.turn() else {
+            return if self.opened {
+                Ok(vec![self.unpaired(e, "Muse Stop has no turn_id")?])
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        let output = hook
+            .body
+            .last_assistant_message
+            .map(serde_json::to_value)
+            .transpose()?;
+        let error = hook.body.outcome.error_message();
+        let mut out = Self::close(
+            &self.effective_root_id,
+            &mut self.turns,
+            id,
+            e.ts_ms,
+            output.clone(),
+            None,
+            error.clone(),
+        );
+        if !out.is_empty() {
+            self.closed_turns.insert(id.into());
+            self.last_completed_turn = Some(id.into());
+            out.push(SpanOp::Merge(SpanRow {
+                span_id: self.root_id.clone(),
+                root_span_id: self.effective_root_id.clone(),
+                output,
+                metrics: Some(serde_json::to_value(&self.usage.totals)?),
+                error,
+                late_merge_key: Some(format!("muse:turn:{id}:{}", e.ts_ms)),
+                late_merge_version: Some(super::LateMergeVersion {
+                    ts_ms: e.ts_ms,
+                    native_id: Some(id.into()),
+                }),
+                ..Default::default()
+            }));
+        }
+        Ok(out)
     }
 }
-
 impl AgentTranslator for MuseTranslator {
-    fn handle(&mut self, e: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn handle(&mut self, e: &Envelope, ctx: &SessionCtx) -> Result<Vec<SpanOp>> {
         self.last_ts = self.last_ts.max(e.ts_ms);
-        self.remember_session(e);
-        let ids = match serde_json::from_value::<HookIds>(e.payload.clone()) {
-            Ok(ids) => ids,
+        let event = match MuseEvent::decode(e) {
+            Ok(Some(event)) => event,
+            Ok(None) => return Ok(Vec::new()),
             Err(error) => {
-                // Unknown or malformed optional fields must not terminate a session.
-                tracing::warn!(source = "muse", event = %e.event, %error, "invalid Muse hook identifiers");
-                HookIds::default()
+                tracing::warn!(source = "muse", event = %e.event, %error, "invalid Muse hook payload");
+                return Ok(Vec::new());
             }
         };
-        if (e.event == "UserPromptSubmit"
+        if let Some(version) = &e.source_version {
+            self.session_version = Some(version.clone());
+        }
+        self.session_metadata.update(&event.context().session);
+        let kind = event.name();
+        let ids = event.context();
+        if (kind == HookName::UserPromptSubmit
             && ids
                 .turn()
                 .is_some_and(|id| self.closed_turns.contains(&id.to_owned())))
-            || (e.event == "PreLLMCall"
+            || (kind == HookName::PreLLMCall
                 && ids
                     .request()
                     .is_some_and(|id| self.closed_llms.contains(&id.to_owned())))
         {
             return Ok(Vec::new());
         }
-        let mut out = if Self::starts_trace(&e.event) {
-            self.ensure_root(e, ctx)
+        let mut out = if matches!(
+            kind,
+            HookName::UserPromptSubmit
+                | HookName::PreLLMCall
+                | HookName::PreToolUse
+                | HookName::PermissionRequest
+                | HookName::PostToolUse
+                | HookName::PostToolUseFailure
+                | HookName::PostToolBatch
+                | HookName::SubagentStart
+                | HookName::PreCompact
+        ) {
+            self.ensure_root(e, ctx)?
         } else {
             Vec::new()
         };
-        let p = &e.payload;
-        match e.event.as_str() {
-            "UserPromptSubmit" => {
-                if let Some(id) = ids.turn() {
+        let cwd = event.context().session.cwd.clone();
+        match event {
+            MuseEvent::UserPromptSubmit(hook) => {
+                if let Some(id) = hook.context.turn() {
+                    let turn_span_id = ids::span_id(&self.session_id, &format!("turn:{id}"));
                     out.extend(Self::insert_open(
                         &mut self.turns,
                         id,
                         SpanRow {
-                            span_id: ids::span_id(&self.session_id, &format!("turn:{id}")),
+                            span_id: turn_span_id.clone(),
                             root_span_id: self.effective_root_id.clone(),
                             parent_span_ids: vec![self.root_id.clone()],
                             name: "Turn".into(),
                             span_type: SpanType::Task,
                             start_ms: Some(e.ts_ms),
-                            input: p.get("prompt").cloned(),
+                            input: hook.body.prompt.map(serde_json::to_value).transpose()?,
                             is_turn: true,
-                            turn_span_id: Some(ids::span_id(
-                                &self.session_id,
-                                &format!("turn:{id}"),
-                            )),
+                            turn_span_id: Some(turn_span_id),
                             ..Default::default()
                         },
                     ));
                 } else {
-                    out.push(self.unpaired(e, "Muse UserPromptSubmit has no turn_id"));
+                    out.push(self.unpaired(e, "Muse UserPromptSubmit has no turn_id")?);
                 }
             }
-            "PreLLMCall" => {
-                if let Some(id) = ids.request() {
-                    let mut metadata = Map::new();
-                    for key in [
-                        "model",
-                        "provider",
-                        "step",
-                        "attempt",
-                        "message_count",
-                        "tool_count",
-                        "options",
-                        "request_record_id",
-                        "input_summary",
-                    ] {
-                        if let Some(value) = p.get(key) {
-                            metadata.insert(key.into(), value.clone());
-                        }
-                    }
-                    let input = json!({"messages": p.get("messages"), "tools": p.get("tools")});
-                    let parent = self.parent(&ids);
-                    out.extend(Self::insert_open(
-                        &mut self.llms,
-                        id,
-                        SpanRow {
-                            span_id: ids::span_id(&self.session_id, &format!("llm:{id}")),
-                            root_span_id: self.effective_root_id.clone(),
-                            parent_span_ids: vec![parent.clone()],
-                            turn_span_id: (parent != self.root_id).then_some(parent),
-                            name: p
-                                .get("model")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty() && *s != "unknown")
-                                .unwrap_or("llm")
-                                .into(),
-                            span_type: SpanType::Llm,
-                            start_ms: Some(e.ts_ms),
-                            input: Some(input),
-                            metadata: Some(Value::Object(metadata)),
-                            ..Default::default()
-                        },
-                    ));
-                } else {
-                    out.push(self.unpaired(e, "Muse PreLLMCall has no request_id"));
-                }
+            MuseEvent::PreLLMCall(hook) => out.extend(self.start_model(e, hook)?),
+            MuseEvent::PostLLMCall(hook) => out.extend(self.finish_model(e, hook)?),
+            MuseEvent::Stop(hook) | MuseEvent::StopFailure(hook) => {
+                out.extend(self.finish_turn(e, hook)?)
             }
-            "PostLLMCall" => {
-                if let Some(id) = ids.request() {
-                    let error = event_error(p);
-                    let metrics = p.get("usage").filter(|v| v.is_object()).map(|usage| {
-                        // Native hook usage is cumulative within a turn (verified
-                        // against per-model durable records in Muse 1.4.11).
-                        // Export envelopes explicitly carry per-model usage.
-                        let mut per_model = usage.clone();
-                        if p.get("usage_scope").and_then(Value::as_str) != Some("model")
-                            && self.llms.contains_key(id)
-                        {
-                            if let Some(turn) = ids.turn() {
-                                if let Some(previous) = self.turn_usage.get(turn) {
-                                    if let Some(fields) = per_model.as_object_mut() {
-                                        for (key, value) in fields {
-                                            if let (Some(current), Some(previous)) = (
-                                                value.as_u64(),
-                                                previous.get(key).and_then(Value::as_u64),
-                                            ) {
-                                                // A reset starts a new native counter window.
-                                                *value = json!(current
-                                                    .checked_sub(previous)
-                                                    .unwrap_or(current));
-                                            }
-                                        }
-                                    }
-                                }
-                                self.turn_usage.insert(turn.to_owned(), usage.clone());
-                            }
-                        }
-                        usage_metrics(&per_model)
-                    });
-                    if let Some(metrics) = &metrics {
-                        if self.llms.contains_key(id) && self.model_metrics.get(id).is_none() {
-                            for (key, value) in metrics.as_object().into_iter().flatten() {
-                                if let Some(value) = value.as_u64() {
-                                    let previous = self
-                                        .total_metrics
-                                        .get(key)
-                                        .and_then(Value::as_u64)
-                                        .unwrap_or(0);
-                                    self.total_metrics
-                                        .insert(key.clone(), json!(previous.saturating_add(value)));
-                                }
-                            }
-                            self.model_metrics.insert(id.to_owned(), metrics.clone());
-                        }
-                    }
-                    let mut closed = Self::close(
-                        &self.effective_root_id,
-                        &mut self.llms,
-                        id,
-                        e.ts_ms,
-                        p.get("output_text_preview").cloned(),
-                        metrics,
-                        error,
-                    );
-                    for op in &mut closed {
-                        let (SpanOp::Merge(row) | SpanOp::Insert(row)) = op;
-                        let metadata: Map<String, Value> = [
-                            "finish_reason",
-                            "response_id",
-                            "tool_call_count",
-                            "status",
-                            "options",
-                        ]
-                        .into_iter()
-                        .filter_map(|key| p.get(key).map(|v| (key.to_owned(), v.clone())))
-                        .collect();
-                        row.metadata = Some(Value::Object(metadata));
-                    }
-                    if !closed.is_empty() {
-                        self.closed_llms.insert(id.into());
-                        out.extend(closed);
-                    }
-                } else if self.opened {
-                    out.push(self.unpaired(e, "Muse PostLLMCall has no request_id"));
-                }
-            }
-            "Stop" | "StopFailure" => {
-                if let Some(id) = ids.turn() {
-                    let closed = Self::close(
-                        &self.effective_root_id,
-                        &mut self.turns,
-                        id,
-                        e.ts_ms,
-                        p.get("last_assistant_message").cloned(),
-                        None,
-                        event_error(p),
-                    );
-                    if !closed.is_empty() {
-                        self.closed_turns.insert(id.into());
-                        self.last_completed_turn = Some(id.to_owned());
-                        out.extend(closed);
-                        out.push(SpanOp::Merge(SpanRow {
-                            span_id: self.root_id.clone(),
-                            root_span_id: self.effective_root_id.clone(),
-                            output: p
-                                .get("last_assistant_message")
-                                .cloned()
-                                .filter(|v| !v.is_null()),
-                            metrics: Some(Value::Object(self.total_metrics.clone())),
-                            error: event_error(p),
-                            late_merge_key: Some(format!("muse:turn:{id}:{}", e.ts_ms)),
-                            late_merge_version: Some(super::LateMergeVersion {
-                                ts_ms: e.ts_ms,
-                                native_id: Some(id.to_owned()),
-                            }),
-                            ..Default::default()
-                        }));
-                    }
-                } else if self.opened {
-                    out.push(self.unpaired(e, "Muse Stop has no turn_id"));
-                }
-            }
-            "SessionEnd" => {
+            MuseEvent::SessionEnd(hook) => {
                 out.extend(self.close_all(e.ts_ms, Some("Interrupted before completion")));
                 if self.opened {
                     out.push(SpanOp::Merge(SpanRow {
                         span_id: self.root_id.clone(),
                         root_span_id: self.effective_root_id.clone(),
                         end_ms: Some(e.ts_ms),
-                        metadata: p.get("reason").map(|reason| json!({"end_reason":reason})),
-                        error: event_error(p),
-                        metrics: Some(Value::Object(self.total_metrics.clone())),
+                        metadata: if hook.body.reason.is_missing() {
+                            None
+                        } else {
+                            Some(serde_json::to_value(SessionEndMetadata {
+                                end_reason: &hook.body.reason,
+                            })?)
+                        },
+                        error: hook.body.outcome.error_message(),
+                        metrics: Some(serde_json::to_value(&self.usage.totals)?),
                         late_merge_key: Some(format!("muse:session:end:{}", e.ts_ms)),
                         late_merge_version: Some(super::LateMergeVersion {
                             ts_ms: e.ts_ms,
@@ -509,26 +428,27 @@ impl AgentTranslator for MuseTranslator {
                     self.opened = false;
                 }
             }
-            _ => out.extend(self.handle_events(e, &ids)),
+            event => out.extend(self.handle_events(e, event)?),
         }
-        // A native export can enrich a previously delivered preview at the
-        // same timestamp. Deduplicate the material completion, not only time.
         for op in &mut out {
             let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
             if let Some(key) = &row.late_merge_key {
-                let content = json!({"output":row.output,"metrics":row.metrics,"error":row.error,"metadata":row.metadata});
+                let content = serde_json::to_value(CompletionFingerprint {
+                    output: &row.output,
+                    metrics: &row.metrics,
+                    error: &row.error,
+                    metadata: &row.metadata,
+                })?;
                 row.late_merge_key = Some(format!(
                     "{key}:{}",
                     ids::span_id(&self.session_id, &content.to_string())
                 ));
             }
         }
-        self.git
-            .enrich_rows(p.get("cwd").and_then(Value::as_str), &mut out);
+        self.git.enrich_rows(cwd.as_deref(), &mut out);
         Ok(out)
     }
-
-    fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+    fn finalize(&mut self, _ctx: &SessionCtx) -> Result<Vec<SpanOp>> {
         let mut out = self.close_all(self.last_ts, Some("Interrupted before completion"));
         if self.opened {
             out.push(SpanOp::Merge(SpanRow {
@@ -543,66 +463,12 @@ impl AgentTranslator for MuseTranslator {
         Ok(out)
     }
 }
-
+#[cfg(test)]
 fn event_error(payload: &Value) -> Option<String> {
-    let render = |value: &Value| match value {
-        Value::Null => None,
-        Value::String(text) => (!text.is_empty()).then(|| text.clone()),
-        value => Some(value.to_string()),
-    };
-    let error = payload.get("error").and_then(render).or_else(|| {
-        payload
-            .get("status")
-            .and_then(Value::as_str)
-            // Native model completions include successful statuses such as
-            // `tool_calls`. Unknown future statuses are not evidence of failure.
-            .filter(|status| {
-                matches!(
-                    *status,
-                    "failed"
-                        | "failure"
-                        | "error"
-                        | "cancelled"
-                        | "canceled"
-                        | "interrupted"
-                        | "timeout"
-                        | "timed_out"
-                        | "denied"
-                        | "rejected"
-                )
-            })
-            .map(|status| format!("Muse operation {status}"))
-    });
-    match (error, payload.get("error_details").and_then(render)) {
-        (Some(error), Some(details)) => Some(format!("{error}: {details}")),
-        (Some(error), None) => Some(error),
-        (None, details) => details,
-    }
+    serde_json::from_value::<NativeOutcome>(payload.clone())
+        .unwrap()
+        .error_message()
 }
-
-fn usage_metrics(usage: &Value) -> Value {
-    let mut metrics = Map::new();
-    for (native, standard) in [
-        ("input_tokens", "prompt_tokens"),
-        ("output_tokens", "completion_tokens"),
-        ("cache_read_tokens", "prompt_cached_tokens"),
-        ("cached_tokens", "prompt_cached_tokens"),
-        ("cache_write_tokens", "prompt_cache_creation_tokens"),
-        ("reasoning_tokens", "completion_reasoning_tokens"),
-    ] {
-        if let Some(value) = usage.get(native).and_then(Value::as_u64) {
-            metrics.insert(standard.into(), json!(value));
-        }
-    }
-    if let (Some(input), Some(output)) = (
-        usage.get("input_tokens").and_then(Value::as_u64),
-        usage.get("output_tokens").and_then(Value::as_u64),
-    ) {
-        metrics.insert("tokens".into(), json!(input.saturating_add(output)));
-    }
-    Value::Object(metrics)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,6 +689,87 @@ mod tests {
     }
 
     #[test]
+    fn completion_metadata_preserves_absent_null_and_native_status_aliases() {
+        let mut translator = MuseTranslator::new(
+            "muse-fixture-session",
+            Arc::new(GitMetadataCache::default()),
+        );
+        translator
+            .handle(
+                &event("PreLLMCall", json!({"request_id":"r"}), 1),
+                &context(),
+            )
+            .unwrap();
+        let completed = translator
+            .handle(
+                &event(
+                    "PostLLMCall",
+                    json!({
+                        "request_id":"r", "status":"error", "response_id":null,
+                        "finish_reason":null, "options":null,
+                    }),
+                    2,
+                ),
+                &context(),
+            )
+            .unwrap();
+        let row = completed
+            .iter()
+            .find_map(|op| match op {
+                SpanOp::Merge(row) => Some(row),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            row.metadata,
+            Some(json!({"status":"error","response_id":null,"finish_reason":null,"options":null}))
+        );
+        assert_eq!(row.error.as_deref(), Some("Muse operation error"));
+        let ended = translator
+            .handle(&event("SessionEnd", json!({"reason":null}), 3), &context())
+            .unwrap();
+        assert!(ended.iter().any(|op| matches!(op, SpanOp::Merge(row) if row.metadata == Some(json!({"end_reason":null})))));
+    }
+
+    #[test]
+    fn malformed_known_hook_is_a_noop_and_does_not_lose_open_state() {
+        let mut translator = MuseTranslator::new(
+            "muse-fixture-session",
+            Arc::new(GitMetadataCache::default()),
+        );
+        translator
+            .handle(
+                &event("PreLLMCall", json!({"request_id":"r"}), 1),
+                &context(),
+            )
+            .unwrap();
+        assert!(translator
+            .handle(
+                &event(
+                    "PostLLMCall",
+                    json!({"request_id":"r","usage":{"input_tokens":"wrong"}}),
+                    2
+                ),
+                &context()
+            )
+            .unwrap()
+            .is_empty());
+        assert!(translator.llms.contains_key("r"));
+        assert!(translator
+            .handle(
+                &event(
+                    "PostLLMCall",
+                    json!({"request_id":"r","usage":{"input_tokens":1}}),
+                    3
+                ),
+                &context()
+            )
+            .unwrap()
+            .iter()
+            .any(|op| matches!(op, SpanOp::Merge(_))));
+    }
+
+    #[test]
     fn passive_and_unknown_hooks_do_not_create_a_trace() {
         let mut translator = MuseTranslator::new(
             "muse-fixture-session",
@@ -848,14 +795,21 @@ mod tests {
             .handle(
                 &event(
                     "PreLLMCall",
-                    json!({"messages":["a"],"request_id":42}),
+                    json!({"messages":[{"role":"user","content":"a"}],"request_id":42}),
                     1000,
                 ),
                 &ctx,
             )
             .unwrap();
         let second = translator
-            .handle(&event("PreLLMCall", json!({"messages":["b"]}), 1001), &ctx)
+            .handle(
+                &event(
+                    "PreLLMCall",
+                    json!({"messages":[{"role":"user","content":"b"}]}),
+                    1001,
+                ),
+                &ctx,
+            )
             .unwrap();
         let first_id = first
             .iter()

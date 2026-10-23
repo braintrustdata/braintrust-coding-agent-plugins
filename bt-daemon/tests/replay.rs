@@ -142,7 +142,7 @@ async fn importing_sparse_failed_muse_export_preserves_model_and_error() {
         "sessions": [{"session_id":"muse-sparse", "session_end":{"exit_reason":"error"}}],
         "events": [
             {"recorded_at": 1_000_000, "envelope":{"payload":{"kind":"run", "run_id":"run-1", "event":{"kind":"assistant_message_committed", "text":"partial"}}}},
-            {"recorded_at": 1_001_000, "envelope":{"payload":{"kind":"run", "run_id":"run-1", "event":{"kind":"resource_usage_sampled", "usage":{"input_tokens":3, "output_tokens":2}}}}},
+            {"recorded_at": 1_001_000, "envelope":{"payload":{"kind":"run", "run_id":"run-1", "event":{"kind":"resource_usage_sampled", "usage":{"cpu_time_ms":3, "peak_rss_bytes":4096}}}}},
             {"recorded_at": 1_002_000, "envelope":{"payload":{"kind":"run", "run_id":"run-1", "event":{"kind":"terminal", "terminal":"failed", "reason":"provider failed"}}}},
             {"recorded_at": 1_009_000, "envelope":{"payload":{"kind":"session_end"}}}
         ]
@@ -154,9 +154,7 @@ async fn importing_sparse_failed_muse_export_preserves_model_and_error() {
     let output_rows = rows(&output.join("muse-sparse.ndjson"));
     assert_eq!(inserted(&output_rows, "llm"), 1);
     assert!(output_rows.iter().any(|row| {
-        row.pointer("/Merge/metrics/prompt_tokens")
-            .and_then(Value::as_u64)
-            == Some(3)
+        row.pointer("/Merge/metrics/prompt_tokens").is_none()
             && row.pointer("/Merge/error").and_then(Value::as_str) == Some("provider failed")
     }));
     assert!(output_rows

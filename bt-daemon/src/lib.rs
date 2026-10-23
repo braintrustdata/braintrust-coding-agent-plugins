@@ -24,6 +24,7 @@ mod hook;
 mod ids;
 mod journal;
 mod managed_run;
+mod muse;
 mod pipeline;
 mod plugin_diagnostics;
 pub(crate) mod process;

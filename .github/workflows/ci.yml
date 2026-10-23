@@ -120,7 +120,7 @@ jobs:
         run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
       - name: Install Rust for native Windows console probes
         if: runner.os == 'Windows'
-        run: rustup default stable
+        run: rustup default 1.97.1
       - name: Verify JavaScript background launches have no Windows console
         if: runner.os == 'Windows'
         run: node scripts/tests/windows-background-process.mjs
@@ -219,8 +219,8 @@ jobs:
           "$RUNNER_TEMP/pi-install-test/node_modules/.bin/pi" --version
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
       # One cache for every Pi target; pushes to main refresh it from the
       # latest target and PRs restore it.
       - name: Cache Rust build
@@ -292,8 +292,8 @@ jobs:
         run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
           rustup component add clippy rustfmt
       # PRs restore main's cache; pushes to main and manual runs refresh it.
       - name: Cache Rust build
@@ -425,8 +425,8 @@ jobs:
           echo "MUSE_BIN=$MUSE_INSTALL_DIR/muse" >> "$GITHUB_ENV"
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

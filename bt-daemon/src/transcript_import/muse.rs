@@ -1,91 +1,39 @@
-//! Versioned Muse Code export-v1 reader. Retained frames can contain large
-//! serialized payloads, so export events are decoded one record at a time.
-
+//! Streaming Muse export reader and correlation policy. Wire DTOs live in
+//! muse::export_v1; synthesized hooks use the same typed events as live capture.
 use super::{envelope, validate_session_id};
+use crate::muse::export_v1::*;
+use crate::muse::hooks::*;
+use crate::muse::usage::{TokenUsage, UsageScope};
 use crate::wire::Envelope;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::Deserialize;
+#[cfg(test)]
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-#[derive(Deserialize)]
-struct Header {
-    export_schema_version: u64,
-    exporter_version: Option<Version>,
-    sessions: Vec<Session>,
-    #[serde(default)]
-    session_terminated_abnormally: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Version {
-    String(String),
-    Object { semver: String },
-}
-
-impl Version {
-    fn into_string(self) -> String {
-        match self {
-            Self::String(value) | Self::Object { semver: value } => value,
-        }
-    }
-}
-
-#[derive(Clone, Deserialize)]
-struct Session {
-    session_id: String,
-    trajectory_id: Option<String>,
-    root_session_id: Option<String>,
-    session_end: Option<SessionEnd>,
-}
-
-#[derive(Clone, Deserialize)]
-struct SessionEnd {
-    exit_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ExportRecord {
-    recorded_at: Option<i64>,
-    envelope: Option<NativeEnvelope>,
-}
-
-#[derive(Deserialize)]
-struct NativeEnvelope {
-    recorded_at: Option<i64>,
-    payload: Option<NativePayload>,
-}
-
-#[derive(Deserialize)]
-struct NativePayload {
-    kind: Option<String>,
-    run_id: Option<String>,
-    event: Option<Value>,
-    record: Option<Value>,
-}
-
 #[derive(Default)]
 struct RunState {
     active_model: Option<ModelState>,
-    last_assistant: Option<Value>,
+    last_assistant: Option<String>,
     model_ordinal: u64,
     step_attempts: HashMap<u64, u64>,
 }
-
 struct ModelState {
     request_id: String,
-    usage: Option<Value>,
-    text: Option<Value>,
-    response_id: Option<Value>,
+    usage: Option<TokenUsage>,
+    output: Option<ModelOutput>,
+    response_id: Option<String>,
     completed_at: Option<i64>,
 }
-
+struct PendingTool {
+    turn_id: String,
+    tool: ToolStarted,
+    completed: bool,
+}
 struct Reader<'a, F> {
     path: &'a Path,
     session: Session,
@@ -98,60 +46,65 @@ struct Reader<'a, F> {
     last_ts: Option<i64>,
     current_session_ended: bool,
     activity_count: usize,
-    metadata: Value,
-    tools: HashMap<String, Value>,
+    metadata: ExportMetadata,
+    tools: HashMap<String, PendingTool>,
     tool_errors: HashMap<String, String>,
     tool_tasks: HashMap<String, String>,
-    run_metadata: HashMap<String, Value>,
+    run_metadata: HashMap<String, ExportMetadata>,
 }
-
-impl<F> Reader<'_, F>
-where
-    F: FnMut(Envelope) -> Result<()>,
-{
-    fn emit(&mut self, name: &str, ts: i64, payload: Value) -> Result<()> {
+impl<F: FnMut(Envelope) -> Result<()>> Reader<'_, F> {
+    fn context(&self, turn: Option<&str>, request: Option<&str>) -> HookContext {
+        HookContext {
+            session_id: Some(self.session_id.clone()),
+            turn_id: turn.map(Into::into),
+            request_id: request.map(Into::into),
+            source: Some("muse_export_v1".into()),
+            ..Default::default()
+        }
+    }
+    fn emit(&mut self, ts: i64, event: MuseEvent) -> Result<()> {
         (self.emit)(envelope(
             "muse",
             self.version.clone(),
             &self.session_id,
-            name,
+            event.name().as_str(),
             ts,
-            payload,
+            event.payload()?,
         ))
     }
-
     fn ensure_start(&mut self, ts: i64) -> Result<()> {
         if self.first_ts.is_none() {
             self.first_ts = Some(ts);
+            let mut context = self.context(None, None);
+            context.transcript_path = Some(self.path.to_string_lossy().into_owned());
+            context.session = SessionMetadata {
+                trajectory_id: self.session.trajectory_id.clone().into(),
+                root_session_id: self.session.root_session_id.clone().into(),
+                model: self.metadata.model_id.clone().into(),
+                provider: self.metadata.provider_id.clone().into(),
+                cwd: self.metadata.workspace_root.clone().into(),
+                ..Default::default()
+            };
             self.emit(
-                "SessionStart",
                 ts,
-                json!({
-                    "session_id": self.session_id,
-                    "hook_event_name": "SessionStart",
-                    "source": "muse_export_v1",
-                    "trajectory_id": self.session.trajectory_id,
-                    "model": self.metadata.get("model_id"),
-                    "provider": self.metadata.get("provider_id"),
-                    "cwd": self.metadata.get("workspace_root"),
-                    "root_session_id": self.session.root_session_id,
-                    "transcript_path": self.path.to_string_lossy(),
+                MuseEvent::SessionStart(Hook {
+                    context,
+                    body: Empty {},
                 }),
             )?;
         }
         self.last_ts = Some(self.last_ts.unwrap_or(ts).max(ts));
         Ok(())
     }
-
     fn start_model(
         &mut self,
         run_id: &str,
         ts: i64,
         request_id: Option<&str>,
-        input: Value,
+        bounded: Option<InputSummary>,
         model_step: Option<u64>,
     ) -> Result<()> {
-        let model_metadata = self
+        let metadata = self
             .run_metadata
             .get(run_id)
             .unwrap_or(&self.metadata)
@@ -179,418 +132,392 @@ where
         run.active_model = Some(ModelState {
             request_id: request_id.clone(),
             usage: None,
-            text: None,
+            output: None,
             response_id: None,
             completed_at: None,
         });
+        let mut context = self.context(Some(run_id), Some(&request_id));
+        context.session.model = metadata.model_id.into();
+        context.session.provider = metadata.provider_id.into();
+        context.session.cwd = self.metadata.workspace_root.clone().into();
         self.emit(
-            "PreLLMCall",
             ts,
-            json!({
-                "session_id": self.session_id,
-                "hook_event_name": "PreLLMCall",
-                "turn_id": run_id,
-                "request_id": request_id,
-                "request_record_id": native_request_id,
-                "step": model_step,
-                "model": model_metadata.get("model_id"),
-                "provider": model_metadata.get("provider_id"),
-                "cwd": self.metadata.get("workspace_root"),
-                "messages": input.get("messages"),
-                "tools": input.get("tools"),
-                "options": input.get("options"),
-                "input_summary": input.get("bounded"),
-                "source": "muse_export_v1",
+            MuseEvent::PreLLMCall(Hook {
+                context,
+                body: ModelStarted {
+                    request_record_id: native_request_id.into(),
+                    details: ModelDetails {
+                        step: model_step.into(),
+                        ..Default::default()
+                    },
+                    input_summary: bounded.into(),
+                    ..Default::default()
+                },
             }),
         )
     }
-
     fn ensure_run(&mut self, run_id: &str, ts: i64) -> Result<()> {
         if self.runs.contains_key(run_id) {
             return Ok(());
         }
         self.runs.insert(run_id.to_owned(), RunState::default());
         self.emit(
-            "UserPromptSubmit",
             ts,
-            json!({
-                "session_id": self.session_id,
-                "hook_event_name": "UserPromptSubmit",
-                "turn_id": run_id,
-                "prompt": Value::Null,
-                "source": "muse_export_v1",
+            MuseEvent::UserPromptSubmit(Hook {
+                context: self.context(Some(run_id), None),
+                body: PromptSubmitted { prompt: None },
             }),
         )
     }
-
     fn finish_model(&mut self, run_id: &str, ts: i64, error: Option<&str>) -> Result<()> {
         let Some(model) = self
             .runs
             .get_mut(run_id)
-            .and_then(|run| run.active_model.take())
+            .and_then(|r| r.active_model.take())
         else {
             return Ok(());
         };
         self.emit(
-            "PostLLMCall",
             model.completed_at.unwrap_or(ts),
-            json!({
-                "session_id": self.session_id,
-                "hook_event_name": "PostLLMCall",
-                "turn_id": run_id,
-                "request_id": model.request_id,
-                "usage": model.usage,
-                "usage_scope": "model",
-                "output_text_preview": model.text,
-                "response_id": model.response_id,
-                "error": if model.completed_at.is_some() { None } else { error },
-                "source": "muse_export_v1",
+            MuseEvent::PostLLMCall(Hook {
+                context: self.context(Some(run_id), Some(&model.request_id)),
+                body: ModelFinished {
+                    usage: model.usage,
+                    usage_scope: UsageScope::Model,
+                    output_text_preview: model.output,
+                    response_id: model.response_id.into(),
+                    outcome: NativeOutcome {
+                        error: if model.completed_at.is_some() {
+                            None
+                        } else {
+                            error.map(|e| ErrorDetail::Text(e.into()))
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             }),
         )
     }
-
+    fn process_task(&mut self, task: TaskEvent, at: Option<UnixMicros>) -> Result<()> {
+        if let (Some(id), Some(call)) = (
+            task.task_id.as_ref(),
+            task.idempotency_key
+                .as_deref()
+                .and_then(|s| s.strip_prefix("tool:")),
+        ) {
+            self.tool_tasks.insert(id.clone(), call.into());
+        }
+        if matches!(task.kind, TaskEventKind::Rejected) {
+            if let (Some(id), Some(reason)) = (
+                task.origin.and_then(|o| o.tool_call_id),
+                task.reason.as_ref(),
+            ) {
+                self.tool_errors.insert(id, reason.clone());
+            }
+        }
+        if let Some(call) = task
+            .task_id
+            .as_ref()
+            .and_then(|id| self.tool_tasks.get(id))
+            .cloned()
+        {
+            match task.kind {
+                TaskEventKind::Started => {
+                    if let Some(tool) = self.tools.get(&call) {
+                        let event = MuseEvent::PreToolUse(Hook {
+                            context: self.context(Some(&tool.turn_id), None),
+                            body: tool.tool.clone(),
+                        });
+                        self.emit(
+                            at.context("Muse tool task has no recorded_at")?.millis(),
+                            event,
+                        )?;
+                    }
+                }
+                TaskEventKind::Failed | TaskEventKind::Cancelled => {
+                    self.tool_errors.insert(
+                        call,
+                        task.reason
+                            .unwrap_or_else(|| "Muse tool task failed".into()),
+                    );
+                    if let Some(id) = task.task_id {
+                        self.tool_tasks.remove(&id);
+                    }
+                }
+                TaskEventKind::Completed => {
+                    if let Some(tool) = self.tools.get_mut(&call) {
+                        tool.completed = true;
+                    }
+                    if let Some(id) = task.task_id {
+                        self.tool_tasks.remove(&id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
     fn process(&mut self, item: ExportRecord) -> Result<()> {
-        let Some(native_envelope) = item.envelope else {
+        let Some(native) = item.envelope else {
             return Ok(());
         };
-        let Some(payload) = native_envelope.payload else {
+        let at = item.recorded_at.or(native.recorded_at);
+        let Some(payload) = native.payload else {
             return Ok(());
         };
-        if payload.kind.as_deref() == Some("run_model") {
-            if let Some(record) = payload.record {
-                if let Some(run) = record.pointer("/run_stream/id").and_then(Value::as_str) {
-                    self.run_metadata.insert(run.to_owned(), record);
+        let (run_id, event) = match payload {
+            NativePayload::RunModel { record } => {
+                if let Some(record) = record {
+                    self.run_metadata
+                        .insert(record.run_stream.id, record.metadata);
                 }
+                return Ok(());
             }
-            return Ok(());
-        }
-        if payload.kind.as_deref() == Some("task") {
-            if let Some(event) = &payload.event {
-                let kind = event.get("kind").and_then(Value::as_str);
-                let task = event.get("task_id").and_then(Value::as_str);
-                if let (Some(task), Some(call)) = (
-                    task,
-                    event
-                        .get("idempotency_key")
-                        .and_then(Value::as_str)
-                        .and_then(|key| key.strip_prefix("tool:")),
-                ) {
-                    self.tool_tasks.insert(task.to_owned(), call.to_owned());
+            NativePayload::Metadata { record } => {
+                if let Some(record) = record {
+                    self.metadata = record;
                 }
-                if kind == Some("rejected") {
-                    if let (Some(id), Some(reason)) = (
-                        event
-                            .pointer("/origin/tool_call_id")
-                            .and_then(Value::as_str),
-                        event.get("reason").and_then(Value::as_str),
-                    ) {
-                        self.tool_errors.insert(id.to_owned(), reason.to_owned());
-                    }
-                }
-                if let Some(call) = task.and_then(|task| self.tool_tasks.get(task)).cloned() {
-                    if kind == Some("started") {
-                        if let Some(tool) = self.tools.get(&call).cloned() {
-                            let ts = item
-                                .recorded_at
-                                .or(native_envelope.recorded_at)
-                                .context("Muse tool task has no recorded_at")?
-                                / 1000;
-                            self.emit("PreToolUse", ts, tool)?;
-                        }
-                    } else if matches!(kind, Some("failed" | "cancelled" | "canceled")) {
-                        let reason = event
-                            .get("reason")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Muse tool task failed");
-                        self.tool_errors.insert(call, reason.to_owned());
-                        if let Some(task) = task {
-                            self.tool_tasks.remove(task);
-                        }
-                    } else if kind == Some("completed") {
-                        if let Some(tool) = self.tools.get_mut(&call) {
-                            tool["status"] = json!("completed");
-                        }
-                        if let Some(task) = task {
-                            self.tool_tasks.remove(task);
-                        }
-                    }
-                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        if payload.kind.as_deref() == Some("metadata") {
-            if let Some(record) = payload.record {
-                self.metadata = record;
+            NativePayload::Task { event } => {
+                if let Some(event) = event {
+                    self.process_task(event, at)?;
+                }
+                return Ok(());
             }
-            return Ok(());
+            NativePayload::SessionEnd => {
+                let ts = at
+                    .context("Muse session_end record has no recorded_at timestamp")?
+                    .millis();
+                self.ensure_start(ts)?;
+                self.current_session_ended = true;
+                return Ok(());
+            }
+            NativePayload::Run {
+                event: RunEvent::Ignored,
+                ..
+            }
+            | NativePayload::Ignored => return Ok(()),
+            NativePayload::Run { run_id, event } => (run_id, event),
+        };
+        if run_id.is_empty() {
+            bail!("Muse run record has no run_id")
         }
-        let kind = payload
-            .event
-            .as_ref()
-            .and_then(|event| event.get("kind"))
-            .and_then(Value::as_str);
-        if payload.kind.as_deref() == Some("run") && payload.event.is_some() && kind.is_none() {
-            bail!("Muse run event has no kind");
-        }
-        let recognized = payload.kind.as_deref() == Some("session_end")
-            || (payload.kind.as_deref() == Some("run")
-                && matches!(
-                    kind,
-                    Some(
-                        "started"
-                            | "model_input_trace_recorded"
-                            | "model_completed"
-                            | "model_response_created"
-                            | "assistant_tool_calls_committed"
-                            | "tool_result_batch_committed"
-                            | "model_failure_terminal_intent"
-                            | "resource_usage_sampled"
-                            | "assistant_message_committed"
-                            | "terminal"
-                    )
-                ));
-        if !recognized {
-            return Ok(());
-        }
-        let micros = item
-            .recorded_at
-            .or(native_envelope.recorded_at)
-            .ok_or_else(|| anyhow!("Muse {kind:?} record has no recorded_at timestamp"))?;
-        let ts = micros / 1_000;
+        let ts = at
+            .context("Muse run record has no recorded_at timestamp")?
+            .millis();
         self.ensure_start(ts)?;
-        if payload.kind.as_deref() == Some("session_end") {
-            self.current_session_ended = true;
-            return Ok(());
-        }
         self.current_session_ended = false;
-        let event = payload
-            .event
-            .as_ref()
-            .ok_or_else(|| anyhow!("Muse run record has no event"))?;
-        let kind = kind.context("recognized Muse run event has no kind")?;
-        let run_id = payload
-            .run_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow!("Muse {kind} record has no run_id"))?
-            .to_owned();
         self.activity_count += 1;
-        if kind != "started" {
+        if !matches!(event, RunEvent::Started { .. }) {
             self.ensure_run(&run_id, ts)?;
         }
-        match kind {
-            "started" => {
+        match event {
+            RunEvent::Started { prompt } => {
                 if self.runs.contains_key(&run_id) {
                     bail!("Muse run {run_id} has duplicate started event")
                 }
                 self.runs.insert(run_id.clone(), RunState::default());
                 self.emit(
-                    "UserPromptSubmit",
                     ts,
-                    json!({
-                        "session_id": self.session_id,
-                        "hook_event_name": "UserPromptSubmit",
-                        "turn_id": run_id,
-                        "prompt": event.get("prompt"),
-                        "source": "muse_export_v1",
+                    MuseEvent::UserPromptSubmit(Hook {
+                        context: self.context(Some(&run_id), None),
+                        body: PromptSubmitted { prompt },
                     }),
                 )?;
             }
-            "model_input_trace_recorded" => {
-                let request_id = event
-                    .get("request_record_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        anyhow!("Muse model_input_trace_recorded has no request_record_id")
-                    })?;
+            RunEvent::ModelInputTraceRecorded {
+                request_record_id,
+                model_step,
+                bounded,
+            } => {
                 if self
                     .runs
                     .get(&run_id)
-                    .and_then(|run| run.active_model.as_ref())
+                    .and_then(|r| r.active_model.as_ref())
                     .is_some()
                 {
                     self.finish_model(&run_id, ts, None)?;
                 }
-                self.start_model(
-                    &run_id,
-                    ts,
-                    Some(request_id),
-                    json!({"bounded":event.get("bounded")}),
-                    event.get("model_step").and_then(Value::as_u64),
-                )?;
+                self.start_model(&run_id, ts, Some(&request_record_id), bounded, model_step)?;
             }
-            "assistant_tool_calls_committed" => {
-                let calls = event
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .context("Muse assistant_tool_calls_committed has no tool_calls array")?;
+            RunEvent::AssistantToolCallsCommitted {
+                tool_calls,
+                response_id,
+            } => {
                 let mut output_calls = Vec::new();
-                for call in calls {
-                    let id = call
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .context("Muse committed tool call has no call_id")?;
-                    let name = call
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .context("Muse committed tool call has no name")?;
-                    let args = call.get("args").cloned().unwrap_or(Value::Null);
-                    let input = if let Some(args) = args.as_str() {
-                        serde_json::from_str(args).unwrap_or_else(|_| args.into())
-                    } else {
-                        args.clone()
-                    };
-                    let payload = json!({"turn_id":run_id,"tool_use_id":id,"tool_name":name,"tool_input":input,"source":"muse_export_v1"});
-                    self.tools.insert(id.to_owned(), payload.clone());
-
-                    output_calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":args}}));
-                }
-                if let Some(model) = self
-                    .runs
-                    .get_mut(&run_id)
-                    .and_then(|run| run.active_model.as_mut())
-                {
-                    model.text = Some(json!([{"role":"assistant","tool_calls":output_calls}]));
-                    model.response_id = event.get("response_id").cloned();
-                }
-            }
-            "tool_result_batch_committed" => {
-                let results = event
-                    .get("results")
-                    .and_then(Value::as_array)
-                    .context("Muse tool_result_batch_committed has no results array")?;
-                for result in results {
-                    let id = result
-                        .get("tool_call_id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .context("Muse tool result has no tool_call_id")?;
-                    let mut payload = self.tools.remove(id).unwrap_or_else(
-                        || json!({"turn_id":run_id,"tool_use_id":id,"source":"muse_export_v1"}),
-                    );
-                    payload["tool_response"] = result.get("text").cloned().unwrap_or(Value::Null);
-                    let error = self.tool_errors.remove(id);
-                    payload["error"] = json!(error);
-                    if error.is_some() {
-                        self.emit("PostToolUseFailure", ts, payload)?;
-                    } else if payload.get("status").and_then(Value::as_str) == Some("completed") {
-                        self.emit("PostToolUse", ts, payload)?;
-                    } else {
-                        self.emit("PostToolBatch", ts, json!({"turn_id":run_id,"tool_calls":[payload],"source":"muse_export_v1"}))?;
+                for call in tool_calls {
+                    if call.call_id.is_empty() {
+                        bail!("Muse committed tool call has no call_id")
                     }
+                    let args = call
+                        .args
+                        .unwrap_or(ToolArguments::Json(serde_json::Value::Null));
+                    self.tools.insert(
+                        call.call_id.clone(),
+                        PendingTool {
+                            turn_id: run_id.clone(),
+                            tool: ToolStarted {
+                                tool_use_id: Some(call.call_id.clone().into()),
+                                tool_name: Some(call.name.clone()),
+                                tool_input: Some(args.input()),
+                            },
+                            completed: false,
+                        },
+                    );
+                    output_calls.push(AssistantToolCall {
+                        id: call.call_id,
+                        call_type: FunctionCallType::Function,
+                        function: FunctionCall {
+                            name: call.name,
+                            arguments: args,
+                        },
+                    });
                 }
-            }
-            "model_failure_terminal_intent" => {
-                let reason = event
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Muse model failed");
-                self.finish_model(&run_id, ts, Some(reason))?;
-            }
-            "model_response_created" => {
                 if let Some(model) = self
                     .runs
                     .get_mut(&run_id)
-                    .and_then(|run| run.active_model.as_mut())
+                    .and_then(|r| r.active_model.as_mut())
                 {
-                    model.response_id = event.get("response_id").cloned();
+                    model.output = Some(ModelOutput::Messages(vec![NativeMessage {
+                        role: MessageRole::Assistant,
+                        content: None,
+                        tool_calls: Some(output_calls),
+                        tool_call_id: None,
+                        name: None,
+                        extensions: BTreeMap::new(),
+                    }]));
+                    model.response_id = response_id;
                 }
             }
-            "model_completed" => {
+            RunEvent::ToolResultBatchCommitted { results } => {
+                for result in results {
+                    if result.tool_call_id.is_empty() {
+                        bail!("Muse tool result has no tool_call_id")
+                    }
+                    let tool = self
+                        .tools
+                        .remove(&result.tool_call_id)
+                        .unwrap_or(PendingTool {
+                            turn_id: run_id.clone(),
+                            tool: ToolStarted {
+                                tool_use_id: Some(result.tool_call_id.clone().into()),
+                                ..Default::default()
+                            },
+                            completed: false,
+                        });
+                    let error = self.tool_errors.remove(&result.tool_call_id);
+                    let context = self.context(Some(&tool.turn_id), None);
+                    let body = ToolFinished {
+                        tool: tool.tool,
+                        tool_response: result.text,
+                        outcome: NativeOutcome {
+                            error: error.clone().map(ErrorDetail::Text),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let event = if error.is_some() {
+                        MuseEvent::PostToolUseFailure(Hook { context, body })
+                    } else if tool.completed {
+                        MuseEvent::PostToolUse(Hook { context, body })
+                    } else {
+                        MuseEvent::PostToolBatch(Hook {
+                            context,
+                            body: ToolBatchFinished {
+                                tool_calls: vec![body],
+                            },
+                        })
+                    };
+                    self.emit(ts, event)?;
+                }
+            }
+            RunEvent::ModelFailureTerminalIntent { reason } => self.finish_model(
+                &run_id,
+                ts,
+                Some(reason.as_deref().unwrap_or("Muse model failed")),
+            )?,
+            RunEvent::ModelResponseCreated { response_id } => {
+                if let Some(model) = self
+                    .runs
+                    .get_mut(&run_id)
+                    .and_then(|r| r.active_model.as_mut())
+                {
+                    model.response_id = response_id;
+                }
+            }
+            RunEvent::ModelCompleted { usage } => {
                 if self
                     .runs
                     .get(&run_id)
-                    .and_then(|run| run.active_model.as_ref())
+                    .and_then(|r| r.active_model.as_ref())
                     .is_none()
                 {
-                    self.start_model(&run_id, ts, None, Value::Null, None)?;
+                    self.start_model(&run_id, ts, None, None, None)?;
                 }
                 if let Some(model) = self
                     .runs
                     .get_mut(&run_id)
-                    .and_then(|run| run.active_model.as_mut())
+                    .and_then(|r| r.active_model.as_mut())
                 {
-                    model.usage = event.get("usage").cloned();
+                    model.usage = usage;
                     model.completed_at = Some(ts);
                 }
             }
-            "resource_usage_sampled" => {
-                if let Some(model) = self
-                    .runs
-                    .get_mut(&run_id)
-                    .and_then(|run| run.active_model.as_mut())
-                {
-                    if model.usage.is_none() {
-                        model.usage = event.get("usage").cloned();
-                    }
-                }
-            }
-            "assistant_message_committed" => {
-                let text = event
-                    .get("text")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("Muse assistant_message_committed has no text"))?;
+            RunEvent::ResourceUsageSampled => {}
+            RunEvent::AssistantMessageCommitted { text, response_id } => {
                 if self
                     .runs
                     .get(&run_id)
-                    .and_then(|run| run.active_model.as_ref())
+                    .and_then(|r| r.active_model.as_ref())
                     .is_none()
                 {
-                    self.start_model(&run_id, ts, None, Value::Null, None)?;
+                    self.start_model(&run_id, ts, None, None, None)?;
                 }
                 let run = self
                     .runs
                     .get_mut(&run_id)
                     .context("Muse model start did not create a run")?;
                 run.last_assistant = Some(text.clone());
-                run.active_model
+                let model = run
+                    .active_model
                     .as_mut()
-                    .context("Muse run has no active model")?
-                    .text = Some(text);
-                if let Some(model) = run.active_model.as_mut() {
-                    model.response_id = event.get("response_id").cloned();
-                }
+                    .context("Muse run has no active model")?;
+                model.output = Some(ModelOutput::Text(text));
+                model.response_id = response_id;
             }
-            "terminal" => {
-                let terminal = event
-                    .get("terminal")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("Muse terminal record has no terminal status"))?;
+            RunEvent::Terminal { terminal, reason } => {
                 let error = (terminal != "completed").then(|| {
-                    event
-                        .get("reason")
-                        .filter(|reason| !reason.is_null())
-                        .map(|reason| {
-                            reason
-                                .as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| reason.to_string())
-                        })
-                        .unwrap_or_else(|| terminal.to_owned())
+                    reason
+                        .as_ref()
+                        .and_then(ErrorDetail::render)
+                        .unwrap_or_else(|| terminal.clone())
                 });
                 self.finish_model(&run_id, ts, error.as_deref())?;
                 let run = self.runs.remove(&run_id);
                 self.run_metadata.remove(&run_id);
                 self.emit(
-                    "Stop",
                     ts,
-                    json!({
-                        "session_id": self.session_id,
-                        "hook_event_name": "Stop",
-                        "turn_id": run_id,
-                        "last_assistant_message": run.and_then(|run| run.last_assistant),
-                        "terminal": terminal,
-                        "error": error,
-                        "source": "muse_export_v1",
+                    MuseEvent::Stop(Hook {
+                        context: self.context(Some(&run_id), None),
+                        body: TurnFinished {
+                            last_assistant_message: run
+                                .and_then(|r| r.last_assistant)
+                                .map(ModelOutput::Text),
+                            terminal: Some(terminal),
+                            outcome: NativeOutcome {
+                                error: error.map(ErrorDetail::Text),
+                                ..Default::default()
+                            },
+                        },
                     }),
                 )?;
             }
-            _ => unreachable!(),
+            RunEvent::Ignored => {}
         }
         Ok(())
     }
-
     fn finish(mut self, attach_snapshot: bool) -> Result<bool> {
         if self.activity_count == 0 {
             if attach_snapshot {
@@ -604,8 +531,8 @@ where
         let end_ts = self
             .last_ts
             .ok_or_else(|| anyhow!("Muse export {} has no timestamps", self.path.display()))?;
-        let current_session_ended = self.current_session_ended;
-        if attach_snapshot && !current_session_ended {
+        let ended = self.current_session_ended;
+        if attach_snapshot && !ended {
             return Ok(false);
         }
         for run_id in self.runs.keys().cloned().collect::<Vec<_>>() {
@@ -615,32 +542,52 @@ where
                 .remove(&run_id)
                 .context("Muse run disappeared while finalizing")?;
             self.emit(
-                "Stop",
                 end_ts,
-                json!({
-                    "session_id": self.session_id,
-                    "hook_event_name": "Stop",
-                    "turn_id": run_id,
-                    "last_assistant_message": run.last_assistant,
-                    "error": "Run ended without a terminal event",
-                    "source": "muse_export_v1",
+                MuseEvent::Stop(Hook {
+                    context: self.context(Some(&run_id), None),
+                    body: TurnFinished {
+                        last_assistant_message: run.last_assistant.map(ModelOutput::Text),
+                        outcome: NativeOutcome {
+                            error: Some(ErrorDetail::Text(
+                                "Run ended without a terminal event".into(),
+                            )),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
                 }),
             )?;
         }
-        self.emit("SessionEnd", end_ts, json!({
-            "session_id": self.session_id,
-            "hook_event_name": "SessionEnd",
-            "reason": current_session_ended.then(|| self.session.session_end.as_ref().and_then(|end| end.exit_reason.as_deref())).flatten(),
-            "error": if !current_session_ended {
-                Some("Session has no terminal end after its latest activity")
-            } else if self.terminated_abnormally {
-                Some("Session terminated abnormally")
-            } else {
-                None
-            },
-            "source": "muse_export_v1",
-        }))?;
-        Ok(current_session_ended)
+        let error = if !ended {
+            Some("Session has no terminal end after its latest activity")
+        } else if self.terminated_abnormally {
+            Some("Session terminated abnormally")
+        } else {
+            None
+        };
+        self.emit(
+            end_ts,
+            MuseEvent::SessionEnd(Hook {
+                context: self.context(None, None),
+                body: SessionFinished {
+                    reason: (if ended {
+                        self.session
+                            .session_end
+                            .as_ref()
+                            .and_then(|e| e.exit_reason.clone())
+                            .map(ErrorDetail::Text)
+                    } else {
+                        None
+                    })
+                    .into(),
+                    outcome: NativeOutcome {
+                        error: error.map(|e| ErrorDetail::Text(e.into())),
+                        ..Default::default()
+                    },
+                },
+            }),
+        )?;
+        Ok(ended)
     }
 }
 
@@ -718,7 +665,7 @@ where
         last_ts: None,
         current_session_ended: false,
         activity_count: 0,
-        metadata: json!({}),
+        metadata: ExportMetadata::default(),
         tools: HashMap::new(),
         tool_errors: HashMap::new(),
         tool_tasks: HashMap::new(),
@@ -729,9 +676,9 @@ where
     ));
     EventsSeed(&mut reader)
         .deserialize(&mut de)
-        .with_context(|| format!("parse Muse export {}", path.display()))?;
+        .map_err(|error| anyhow!("parse Muse export {}: {error}", path.display()))?;
     de.end()
-        .with_context(|| format!("parse Muse export {}", path.display()))?;
+        .map_err(|error| anyhow!("parse Muse export {}: {error}", path.display()))?;
     reader.finish(attach_snapshot)
 }
 
@@ -839,7 +786,11 @@ where
         S: SeqAccess<'de>,
     {
         let mut index = 0;
-        while let Some(item) = seq.next_element::<ExportRecord>()? {
+        loop {
+            let item = seq.next_element::<ExportRecord>().map_err(|error| {
+                serde::de::Error::custom(format!("event {}: {error}", index + 1))
+            })?;
+            let Some(item) = item else { break };
             self.0.process(item).map_err(|error| {
                 serde::de::Error::custom(format!("event {}: {error:#}", index + 1))
             })?;
@@ -1016,13 +967,13 @@ mod tests {
             "sessions": [{"session_id":"session-1"}],
             "events": [
                 {"recorded_at": 1_001_000, "envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"assistant_message_committed","text":"partial"}}}},
-                {"recorded_at": 1_002_000, "envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"resource_usage_sampled","usage":{"output_tokens":2}}}}},
+                {"recorded_at": 1_002_000, "envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"resource_usage_sampled","usage":{"cpu_time_ms":2,"peak_rss_bytes":4096}}}}},
                 {"recorded_at": 1_003_000, "envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"failed","reason":"provider failed"}}}}
             ]
         }));
         let events = envelopes(&path).unwrap();
         assert_eq!(events[2].payload["request_id"], "run-1:model:1");
-        assert_eq!(events[3].payload["usage"]["output_tokens"], 2);
+        assert!(events[3].payload["usage"].is_null());
         assert_eq!(events[3].payload["error"], "provider failed");
         assert_eq!(events[4].payload["error"], "provider failed");
     }
@@ -1039,7 +990,7 @@ mod tests {
             .to_string()
             .contains("expected session-2"));
         let error = envelopes(&path).unwrap_err();
-        assert!(format!("{error:#}").contains("event 1: Muse started record has no run_id"));
+        assert!(format!("{error:#}").contains("event 1: missing field `run_id`"));
     }
 
     #[test]
