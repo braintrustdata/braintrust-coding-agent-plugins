@@ -1,7 +1,7 @@
 //! Optional wire fields whose explicit null differs from absence in authored
 //! metadata and replay fingerprints. Ordinary optional data uses Option instead.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Field<T> {
     #[default]
     Missing,
