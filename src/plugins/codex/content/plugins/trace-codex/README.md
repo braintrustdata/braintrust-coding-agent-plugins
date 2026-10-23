@@ -35,9 +35,6 @@ older Codex versions can use manual approval through `/hooks`.
 `bt trace doctor codex` reports route, authentication, daemon, and plugin
 diagnostics; setup owns plugin installation and hook trust.
 
-For enterprise policy deployment, see the
-[administrator-managed hook recipe](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/docs/codex-managed-tracing.md).
-
 To inspect tracing configuration and daemon status:
 
 ```bash
