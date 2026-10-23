@@ -27,12 +27,13 @@ event definitions are used by `bt trace run codex`; run trust is scoped to that
 Codex invocation. Restart Codex after setup so it loads the plugin and trust
 settings. `bt trace update codex` refreshes
 the plugin and trusts its current definitions, preserving unrelated hooks and
-explicitly disabled hook settings.
+unrelated trust settings. Setup reports an error if Codex hooks or a Braintrust
+hook definition are disabled.
 
 If activation fails, setup reports the cause. Update Codex and `bt`, then retry;
 older Codex versions can use manual approval through `/hooks`.
-`bt trace doctor codex` provides a read-only view of hook readiness separately
-from daemon authentication and delivery.
+`bt trace doctor codex` reports route, authentication, daemon, and plugin
+diagnostics; setup owns plugin installation and hook trust.
 
 For enterprise policy deployment, see the
 [administrator-managed hook recipe](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/docs/codex-managed-tracing.md).
