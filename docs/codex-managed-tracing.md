@@ -1,25 +1,38 @@
 # Codex hook activation and enterprise deployment
 
-Installing `trace-codex` does not approve its hooks. Codex skips untrusted or
-modified plugin hooks before Braintrust receives their events. Restart Codex,
-open `/hooks`, review the Braintrust definitions, and run `bt trace doctor codex`.
-The doctor probes the installed Codex app server for the current working directory.
-It distinguishes trusted, review-required, disabled, missing, erroneous, and
-unknown configurations. Trust readiness does not prove capture or delivery.
+`bt trace enable codex` and `bt trace update codex` install the plugin and trust
+its current Braintrust hook definitions automatically. Restart Codex after setup
+so existing sessions load the plugin and trust settings.
 
-## Supported approval mechanisms
+## Scoped approval through Codex
 
-[Official OpenAI hook documentation](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks)
-describes user review through `/hooks` and administrator-managed hooks trusted by
-policy. Codex CLI 0.163.0 exposes `hooks/list` with each definition's enabled and
-trust state, but its generated app-server protocol has no hook approval method.
-Braintrust therefore does not modify Codex's private trust files or approve
-unrelated hooks. A release that changes hook definitions can require review again;
-route changes and `bt` updates do not change the marketplace definitions.
+Codex CLI 0.163.0 exposes the same configuration API used by its `/hooks` UI:
+`hooks/list` supplies each definition's key and current hash, and
+`config/batchWrite` upserts `hooks.state` entries containing `trusted_hash`.
+Braintrust uses that API, reloads configuration, and checks that the hooks are
+trusted. It does not calculate Codex hashes or write private trust files.
 
-The invocation-wide `--dangerously-bypass-hook-trust` flag is not scoped to
-Braintrust. `bt trace run codex` continues to reject it. For unattended enterprise
-activation, use Codex's supported managed policy rather than that flag.
+Only hooks belonging to `trace-codex@braintrust-codex-plugins` are eligible. Before
+writing trust, Braintrust verifies the complete installed hook file against the
+definitions bundled with this version of `bt`, including Windows commands, and
+checks that Codex reports the expected commands and lifecycle events. Unexpected
+definitions fail activation; update `bt` and retry. Unrelated hook trust and
+existing configuration are preserved. Already trusted definitions need no write.
+Update preserves disabled hooks rather than enabling them.
+
+An unsupported API, failed write, missing definition, or configuration error makes
+setup report an activation failure instead of claiming success. Older Codex
+versions can still use manual approval through `/hooks`. After a marketplace
+update changes definitions, run `bt trace update codex` to trust the current
+Braintrust definitions. The invocation-wide `--dangerously-bypass-hook-trust`
+flag is not used; `bt trace run codex` continues to reject it.
+
+`bt trace doctor codex` remains read-only. It probes the installed Codex app
+server for the current directory and distinguishes trusted, review-required,
+disabled, missing, erroneous, and unknown configurations. Trust readiness does
+not prove capture or delivery. See the
+[official OpenAI hook documentation](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks)
+for Codex's trust model.
 
 ## Administrator-managed local Codex hooks
 
@@ -140,7 +153,8 @@ directory, then run a short session and verify its matching trace in Braintrust.
 A running daemon, trusted definitions, or historical traces alone do not confirm
 that the newly deployed path delivered the session.
 
-For ordinary plugin installs, hooks still need review after definition changes.
+For plugin installs performed outside `bt`, approve hooks through `/hooks` or
+run `bt trace update codex` after definition changes.
 Events skipped before approval are not in the daemon's journal; replay cannot
 recover those events. Historical transcript import may recover supported data,
 with the limitations documented for that import path.

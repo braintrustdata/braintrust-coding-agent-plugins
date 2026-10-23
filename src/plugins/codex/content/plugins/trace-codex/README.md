@@ -21,22 +21,19 @@ Install and configure the published plugin with the Braintrust CLI:
 bt trace enable codex --project my-coding-agent
 ```
 
-Use `--profile` or `--org` when needed. Restart Codex after setup so it loads
-the plugin. Codex will apply its normal hook-review flow; approve the stable
-Braintrust hook definition through `/hooks` when prompted. Installing the plugin
-alone does not approve hooks: untrusted or modified definitions are skipped
-before Braintrust can capture events.
+Use `--profile` or `--org` when needed. Setup automatically trusts the installed
+Braintrust hook definitions through Codex's configuration API. Restart Codex after
+setup so it loads the plugin and trust settings. `bt trace update codex` refreshes
+the plugin and trusts its current definitions, preserving unrelated hooks and
+explicitly disabled hook settings.
 
-`bt trace doctor codex` inspects hook trust through the installed Codex app server
-for the current directory. It reports missing or disabled hooks, pending review,
-and trusted definitions separately from daemon authentication and delivery.
-Older Codex versions without this inspection API report an unknown state and
-still require inspection through `/hooks`.
+If activation fails, setup reports the cause. Update Codex and `bt`, then retry;
+older Codex versions can use manual approval through `/hooks`.
+`bt trace doctor codex` provides a read-only view of hook readiness separately
+from daemon authentication and delivery.
 
-For unattended enterprise deployment, see the
+For enterprise policy deployment, see the
 [administrator-managed hook recipe](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/docs/codex-managed-tracing.md).
-Managed hooks use Codex policy-based trust. Braintrust does not edit Codex's
-private trust store or bypass review for other hooks.
 
 To inspect tracing configuration and daemon status:
 

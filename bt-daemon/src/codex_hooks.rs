@@ -1,5 +1,5 @@
-//! Read-only hook readiness through Codex's app-server protocol. Trust remains
-//! owned by Codex; this module never writes its private trust store.
+//! Inspect and activate Braintrust hooks through Codex's app-server protocol.
+//! Trust writes use the same exact-definition config API as Codex's /hooks UI.
 
 use anyhow::{anyhow, Context};
 use serde::Serialize;
@@ -12,6 +12,10 @@ use tokio::io::{
 };
 
 const PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
+const PACKAGED_HOOKS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../src/plugins/codex/content/plugins/trace-codex/hooks/hooks.json"
+));
 const TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_EVENTS: &[&str] = &[
     "sessionStart",
@@ -85,7 +89,28 @@ pub(crate) async fn probe() -> CodexHookReadiness {
     probe_at("codex", &cwd, None).await
 }
 
+pub(crate) async fn activate(allow_disabled: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let readiness = inspect_at("codex", &cwd, None, true).await;
+    anyhow::ensure!(
+        readiness.state == CodexHookState::Trusted
+            || (allow_disabled && readiness.state == CodexHookState::Disabled),
+        "Codex plugin installed, but hook activation failed: {}",
+        readiness.detail
+    );
+    Ok(())
+}
+
 async fn probe_at(program: &str, cwd: &Path, home: Option<&Path>) -> CodexHookReadiness {
+    inspect_at(program, cwd, home, false).await
+}
+
+async fn inspect_at(
+    program: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+    approve: bool,
+) -> CodexHookReadiness {
     let mut command: tokio::process::Command =
         crate::subprocess::background_command(program).into();
     command
@@ -102,46 +127,81 @@ async fn probe_at(program: &str, cwd: &Path, home: Option<&Path>) -> CodexHookRe
         Ok(child) => child,
         Err(error) => return CodexHookReadiness::unknown(error),
     };
-    let result =
-        tokio::time::timeout(TIMEOUT, async {
-            let mut stdin = child.stdin.take().context("Codex stdin unavailable")?;
-            let stdout = child.stdout.take().context("Codex stdout unavailable")?;
-            // Bound both total response bytes and wall time, including notifications.
-            let mut stdout = BufReader::new(stdout.take(8 * 1024 * 1024));
-            request(&mut stdin, &mut stdout, 1, "initialize", json!({
-            "clientInfo":{"name":"braintrust_trace_doctor","version":env!("CARGO_PKG_VERSION")},
-            "capabilities":{"experimentalApi":true}
-        })).await?;
-            stdin.write_all(b"{\"method\":\"initialized\"}\n").await?;
-            let config = request(
-                &mut stdin,
-                &mut stdout,
-                2,
-                "config/read",
-                json!({"includeLayers":false}),
-            )
-            .await?;
-            let hooks = request(
-                &mut stdin,
-                &mut stdout,
-                3,
-                "hooks/list",
-                json!({"cwds":[cwd]}),
-            )
-            .await?;
-            let plugins = request(
-                &mut stdin,
-                &mut stdout,
-                4,
-                "plugin/list",
-                json!({
-                    "cwds":[cwd], "forceRefetch":false, "marketplaceKinds":["local"]
-                }),
-            )
-            .await?;
-            classify(&hooks, &config, &plugins)
-        })
-        .await;
+    let result = tokio::time::timeout(TIMEOUT, async {
+        let mut stdin = child.stdin.take().context("Codex stdin unavailable")?;
+        let stdout = child.stdout.take().context("Codex stdout unavailable")?;
+        // Bound both total response bytes and wall time, including notifications.
+        let mut stdout = BufReader::new(stdout.take(8 * 1024 * 1024));
+        request(
+            &mut stdin,
+            &mut stdout,
+            1,
+            "initialize",
+            json!({
+                "clientInfo":{"name":"braintrust_trace","version":env!("CARGO_PKG_VERSION")},
+                "capabilities":{"experimentalApi":true}
+            }),
+        )
+        .await?;
+        stdin.write_all(b"{\"method\":\"initialized\"}\n").await?;
+        let config = request(
+            &mut stdin,
+            &mut stdout,
+            2,
+            "config/read",
+            json!({"includeLayers":false}),
+        )
+        .await?;
+        let hooks = request(
+            &mut stdin,
+            &mut stdout,
+            3,
+            "hooks/list",
+            json!({"cwds":[cwd]}),
+        )
+        .await?;
+        let plugins = request(
+            &mut stdin,
+            &mut stdout,
+            4,
+            "plugin/list",
+            json!({
+                "cwds":[cwd], "forceRefetch":false, "marketplaceKinds":["local"]
+            }),
+        )
+        .await?;
+        let readiness = classify(&hooks, &config, &plugins)?;
+        if !approve || readiness.state != CodexHookState::ReviewRequired {
+            return Ok(readiness);
+        }
+        anyhow::ensure!(
+            readiness.missing_events.is_empty(),
+            "Braintrust lifecycle hooks are missing"
+        );
+        let edits = trust_edits(&hooks)?;
+        anyhow::ensure!(!edits.is_empty(), "No Braintrust hooks available to trust");
+        request(
+            &mut stdin,
+            &mut stdout,
+            5,
+            "config/batchWrite",
+            json!({
+                "edits":[{"keyPath":"hooks.state", "value":edits,"mergeStrategy":"upsert"}],
+                "reloadUserConfig":true
+            }),
+        )
+        .await?;
+        let hooks = request(
+            &mut stdin,
+            &mut stdout,
+            6,
+            "hooks/list",
+            json!({"cwds":[cwd]}),
+        )
+        .await?;
+        classify(&hooks, &config, &plugins)
+    })
+    .await;
     // Always reap the probe, even when the protocol is unsupported or stalls.
     let _ = child.kill().await;
     match result {
@@ -149,6 +209,77 @@ async fn probe_at(program: &str, cwd: &Path, home: Option<&Path>) -> CodexHookRe
         Ok(Err(error)) => CodexHookReadiness::unknown(error),
         Err(_) => CodexHookReadiness::unknown("probe timed out after 5 seconds"),
     }
+}
+
+/// Validate the complete installed file, including the other platform's command,
+/// before approving exact hashes returned by Codex. Never infer hashes or keys.
+fn trust_edits(hooks: &Value) -> anyhow::Result<serde_json::Map<String, Value>> {
+    let expected: Value = serde_json::from_str(PACKAGED_HOOKS)?;
+    let mut checked_paths = std::collections::HashSet::new();
+    let mut events = std::collections::HashSet::new();
+    let mut edits = serde_json::Map::new();
+    for entry in hooks["data"]
+        .as_array()
+        .context("hooks/list has no data array")?
+    {
+        for hook in entry["hooks"]
+            .as_array()
+            .context("hooks/list entry has no hooks array")?
+        {
+            if hook["pluginId"].as_str() != Some(PLUGIN) {
+                continue;
+            }
+            let event = hook["eventName"].as_str().context("hook event missing")?;
+            anyhow::ensure!(
+                PLUGIN_EVENTS.contains(&event)
+                    && events.insert(event)
+                    && hook["handlerType"] == "command"
+                    && hook["command"] == "bt trace hook --source codex"
+                    && hook["enabled"] == true
+                    && hook["isManaged"] == false
+                    && hook["source"] == "plugin",
+                "Unexpected or disabled Braintrust hook definition; inspect /hooks"
+            );
+            let path = hook["sourcePath"]
+                .as_str()
+                .context("hook source path missing")?;
+            anyhow::ensure!(
+                Path::new(path).is_absolute(),
+                "hook source path is not absolute"
+            );
+            if checked_paths.insert(path) {
+                let installed: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+                anyhow::ensure!(installed == expected,
+                    "Installed Braintrust hooks differ from this bt version; update bt and retry setup");
+            }
+            if hook["trustStatus"] == "trusted" {
+                continue;
+            }
+            anyhow::ensure!(
+                hook["trustStatus"] == "untrusted" || hook["trustStatus"] == "modified",
+                "Unknown Braintrust hook trust state"
+            );
+            let key = hook["key"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .context("hook key missing")?;
+            let hash = hook["currentHash"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .context("hook hash missing")?;
+            anyhow::ensure!(
+                edits
+                    .insert(key.to_owned(), json!({"trusted_hash":hash}))
+                    .is_none(),
+                "Duplicate Braintrust hook key"
+            );
+        }
+    }
+    anyhow::ensure!(
+        events.len() == PLUGIN_EVENTS.len(),
+        "Braintrust lifecycle hooks are missing"
+    );
+    Ok(edits)
 }
 
 async fn request(
@@ -307,12 +438,15 @@ fn classify(hooks: &Value, config: &Value, plugins: &Value) -> anyhow::Result<Co
     } else if has_errors {
         (CodexHookState::ConfigurationError, "Codex reported hook configuration errors. Inspect /hooks and Codex startup diagnostics.")
     } else if readiness.review_required_count > 0 {
-        (CodexHookState::ReviewRequired, "Open /hooks in Codex and review the current Braintrust hook definitions. Untrusted or modified hooks are skipped before capture.")
+        (CodexHookState::ReviewRequired, "Run bt trace update codex to activate the current Braintrust hook definitions. Untrusted or modified hooks are skipped before capture.")
     } else if selected.is_empty()
         && plugin
             .is_none_or(|plugin| plugin.get("installed").and_then(Value::as_bool) != Some(true))
     {
-        (CodexHookState::PluginMissing, "Braintrust Codex hooks are not installed. Run bt trace enable codex, then review /hooks in Codex.")
+        (
+            CodexHookState::PluginMissing,
+            "Braintrust Codex hooks are not installed. Run bt trace enable codex.",
+        )
     } else if !readiness.missing_events.is_empty() {
         (CodexHookState::MissingHooks, "Some Braintrust lifecycle hooks are missing. Update the plugin or complete the managed hook policy, then inspect /hooks.")
     } else if readiness.trusted_count == readiness.hook_count {
