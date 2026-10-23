@@ -11,13 +11,25 @@ use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const STACK_LIMIT_BYTES: usize = 512 * 1024;
-const CALL_TIMEOUT: Duration = Duration::from_millis(50);
+const CALL_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, thiserror::Error)]
+#[error("span plugin exceeded its {budget_ms} ms budget during {phase} (total {elapsed_ms} ms; input conversion {input_ms} ms, execution {execution_ms} ms, output conversion {output_ms} ms): {exception}")]
+struct PluginTimeout {
+    budget_ms: u128,
+    phase: &'static str,
+    elapsed_ms: u128,
+    input_ms: u128,
+    execution_ms: u128,
+    output_ms: u128,
+    exception: String,
+}
 
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
@@ -46,6 +58,7 @@ struct Engine {
     context: Context,
     started: Instant,
     deadline_ms: Arc<AtomicU64>,
+    interrupted: Arc<AtomicBool>,
     // Must drop after every Context and persistent JavaScript value.
     _runtime: Runtime,
 }
@@ -59,6 +72,7 @@ struct CachedModule {
 struct FailedPlugin {
     fingerprint: Option<PluginFingerprint>,
     message: String,
+    timed_out: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,9 +89,16 @@ impl Engine {
         let deadline_ms = Arc::new(AtomicU64::new(0));
         let interrupt_deadline = deadline_ms.clone();
         let interrupt_started = started;
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let interrupt_fired = interrupted.clone();
         runtime.set_interrupt_handler(Some(Box::new(move || {
             let deadline = interrupt_deadline.load(Ordering::Relaxed);
-            deadline != 0 && interrupt_started.elapsed().as_millis() as u64 >= deadline
+            let expired =
+                deadline != 0 && interrupt_started.elapsed().as_millis() as u64 >= deadline;
+            if expired {
+                interrupt_fired.store(true, Ordering::Relaxed);
+            }
+            expired
         })));
         let context = Context::full(&runtime)?;
         Ok(Self {
@@ -88,6 +109,7 @@ impl Engine {
             context,
             started,
             deadline_ms,
+            interrupted,
             _runtime: runtime,
         })
     }
@@ -107,7 +129,8 @@ impl Engine {
         }
         let digest = Sha256::digest(&source);
         let name = format!("bt-span-plugin:{digest:x}");
-        self.arm_deadline();
+        self.arm_deadline(CALL_TIMEOUT);
+        let started = Instant::now();
         let function = self.context.with(|ctx| -> anyhow::Result<_> {
             let (module, promise) = Module::declare(ctx.clone(), name, source)
                 .catch(&ctx)
@@ -126,6 +149,21 @@ impl Engine {
             Ok(Persistent::save(&ctx, function))
         });
         self.deadline_ms.store(0, Ordering::Relaxed);
+        if self.interrupted.load(Ordering::Relaxed) || started.elapsed() >= CALL_TIMEOUT {
+            return Err(PluginTimeout {
+                budget_ms: CALL_TIMEOUT.as_millis(),
+                phase: "module loading",
+                elapsed_ms: started.elapsed().as_millis(),
+                input_ms: 0,
+                execution_ms: 0,
+                output_ms: 0,
+                exception: function
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default(),
+            }
+            .into());
+        }
         let function = function?;
         self.modules.insert(
             path.to_path_buf(),
@@ -145,6 +183,18 @@ impl Engine {
         source: &str,
         session_id: &str,
     ) -> anyhow::Result<SpanRow> {
+        self.call_with_budget(path, row, operation, source, session_id, CALL_TIMEOUT)
+    }
+
+    fn call_with_budget(
+        &mut self,
+        path: &Path,
+        row: &SpanRow,
+        operation: Operation,
+        source: &str,
+        session_id: &str,
+        budget: Duration,
+    ) -> anyhow::Result<SpanRow> {
         let function = self.load(path)?;
         let context = PluginContext {
             operation,
@@ -152,30 +202,63 @@ impl Engine {
             session_id,
             env: &self.env,
         };
-        self.arm_deadline();
+        self.arm_deadline(budget);
+        let started = Instant::now();
+        let mut phase = "input conversion";
+        let mut input_ms = 0;
+        let mut execution_ms = 0;
+        let mut output_ms = 0;
         let result = self.context.with(|ctx| -> anyhow::Result<SpanRow> {
             let function = function.restore(&ctx)?;
             let row = rquickjs_serde::to_value(ctx.clone(), row)?;
             let context = rquickjs_serde::to_value(ctx.clone(), &context)?;
+            input_ms = started.elapsed().as_millis();
+            anyhow::ensure!(
+                started.elapsed() < budget,
+                "deadline expired before plugin execution"
+            );
+            phase = "plugin execution";
+            let executing = Instant::now();
             let result = function
                 .call::<_, rquickjs::Value<'_>>((row, context))
                 .catch(&ctx)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                .map_err(|error| anyhow::anyhow!(error.to_string()));
+            execution_ms = executing.elapsed().as_millis();
+            let result = result?;
             if result.as_promise().is_some() {
                 anyhow::bail!("plugin returned a Promise; span plugins must be synchronous");
             }
-            Ok(rquickjs_serde::from_value_strict(result)?)
+            phase = "output conversion";
+            let converting = Instant::now();
+            let result = rquickjs_serde::from_value_strict(result);
+            output_ms = converting.elapsed().as_millis();
+            Ok(result?)
         });
         self.deadline_ms.store(0, Ordering::Relaxed);
+        if self.interrupted.load(Ordering::Relaxed) || started.elapsed() >= budget {
+            if phase == "input conversion" {
+                input_ms = started.elapsed().as_millis();
+            }
+            return Err(PluginTimeout {
+                budget_ms: budget.as_millis(),
+                phase,
+                elapsed_ms: started.elapsed().as_millis(),
+                input_ms,
+                execution_ms,
+                output_ms,
+                exception: result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default(),
+            }
+            .into());
+        }
         result
     }
 
-    fn arm_deadline(&self) {
-        let deadline = self
-            .started
-            .elapsed()
-            .saturating_add(CALL_TIMEOUT)
-            .as_millis() as u64;
+    fn arm_deadline(&self, budget: Duration) {
+        self.interrupted.store(false, Ordering::Relaxed);
+        let deadline = self.started.elapsed().saturating_add(budget).as_millis() as u64;
         self.deadline_ms.store(deadline.max(1), Ordering::Relaxed);
     }
 }
@@ -184,6 +267,7 @@ impl Engine {
 pub struct PluginFailure {
     pub path: PathBuf,
     pub message: String,
+    pub timed_out: bool,
     /// Only the first failure on this worker needs to be logged and persisted.
     pub newly_seen: bool,
 }
@@ -252,12 +336,13 @@ fn process_inner(
                 .failed_plugins
                 .get(plugin)
                 .cloned()
-                .filter(|_| use_failed_cache)
+                .filter(|failed| use_failed_cache && !failed.timed_out)
             {
                 if failed.fingerprint == plugin_fingerprint(plugin) {
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
                         message: failed.message,
+                        timed_out: failed.timed_out,
                         newly_seen: false,
                     });
                     break;
@@ -283,24 +368,27 @@ fn process_inner(
                     let message = "changed immutable span identity fields".to_owned();
                     engine.failed_plugins.insert(
                         plugin.clone(),
-                        failed_plugin(engine.last_fingerprint, &message),
+                        failed_plugin(engine.last_fingerprint, &message, false),
                     );
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
                         message,
+                        timed_out: false,
                         newly_seen: true,
                     });
                     break;
                 }
                 Err(error) => {
+                    let timed_out = error.downcast_ref::<PluginTimeout>().is_some();
                     let message = error.to_string();
                     engine.failed_plugins.insert(
                         plugin.clone(),
-                        failed_plugin(engine.last_fingerprint, &message),
+                        failed_plugin(engine.last_fingerprint, &message, timed_out),
                     );
                     failure = Some(PluginFailure {
                         path: plugin.clone(),
                         message,
+                        timed_out,
                         newly_seen: true,
                     });
                     break;
@@ -324,10 +412,15 @@ fn process_inner(
     })
 }
 
-fn failed_plugin(fingerprint: Option<PluginFingerprint>, message: &str) -> FailedPlugin {
+fn failed_plugin(
+    fingerprint: Option<PluginFingerprint>,
+    message: &str,
+    timed_out: bool,
+) -> FailedPlugin {
     FailedPlugin {
         fingerprint,
         message: message.to_owned(),
+        timed_out,
     }
 }
 
@@ -453,6 +546,66 @@ mod tests {
     }
 
     #[test]
+    fn conversion_deadline_is_reported_before_the_filter_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("guard.mjs");
+        std::fs::write(
+            &plugin,
+            "export default () => { throw new Error('filter ran'); }",
+        )
+        .unwrap();
+        let error = Engine::new()
+            .unwrap()
+            .call_with_budget(
+                &plugin,
+                &row(),
+                Operation::Insert,
+                "pi",
+                "session",
+                Duration::ZERO,
+            )
+            .unwrap_err();
+        let timeout = error.downcast_ref::<PluginTimeout>().unwrap();
+        assert_eq!(timeout.phase, "input conversion");
+        assert_eq!(timeout.execution_ms, 0);
+        assert!(!timeout.exception.contains("filter ran"));
+    }
+
+    #[test]
+    fn redacts_large_input_and_preserves_property_error_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("redact.mjs");
+        std::fs::write(
+            &plugin,
+            "export default span => {delete span.metadata.username; return span}",
+        )
+        .unwrap();
+        let mut span = row();
+        span.input = Some(serde_json::json!((0..10_000)
+            .map(|_| "x".repeat(100))
+            .collect::<Vec<_>>()));
+        span.metadata = Some(serde_json::json!({"username":"private","source":"pi"}));
+        let processed = Engine::new()
+            .unwrap()
+            .call(&plugin, &span, Operation::Insert, "pi", "session")
+            .unwrap();
+        assert_eq!(processed.input, span.input);
+        assert_eq!(processed.metadata, Some(serde_json::json!({"source":"pi"})));
+        assert_eq!(span.metadata.unwrap()["username"], "private");
+
+        std::fs::write(
+            &plugin,
+            "export default span => {span.missing.workspace; return span}",
+        )
+        .unwrap();
+        let result = process(&[plugin], &SpanOp::Insert(row()), "pi", "session").unwrap();
+        let failure = result.failure.unwrap();
+        assert!(!failure.timed_out);
+        assert!(failure.message.contains("workspace"));
+        assert!(result.op.is_none());
+    }
+
+    #[test]
     fn rejects_identity_changes_and_drops_the_operation() {
         let dir = tempfile::tempdir().unwrap();
         let plugin = dir.path().join("identity.mjs");
@@ -478,7 +631,9 @@ mod tests {
         std::fs::write(&runaway, "export default span => { while (true) {} }").unwrap();
         let started = Instant::now();
         let result = process(&[runaway], &SpanOp::Insert(row()), "codex", "session").unwrap();
-        assert!(result.failure.is_some());
+        let failure = result.failure.as_ref().unwrap();
+        assert!(failure.timed_out);
+        assert!(failure.message.contains("plugin execution"));
         assert!(result.op.is_none());
         assert!(started.elapsed() < Duration::from_secs(2));
 

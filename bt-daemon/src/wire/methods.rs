@@ -93,6 +93,9 @@ pub struct StatusResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryInfo {
+    /// Retry attempts already made for this held delivery.
+    #[serde(default)]
+    pub attempt: u32,
     pub stage: String,
     pub position: u64,
     pub reason: String,
@@ -109,6 +112,10 @@ pub struct SessionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryInfo>,
     pub queued: u64,
+    /// Canonical span operations not yet acknowledged for this route. Distinct
+    /// from native events still awaiting translation and from unique spans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_span_ops: Option<u64>,
     pub spans_emitted: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permalink: Option<String>,

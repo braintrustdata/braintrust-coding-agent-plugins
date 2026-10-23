@@ -335,6 +335,7 @@ impl Daemon {
                 source: s.source.clone(),
                 route: serde_json::from_str(&key.route).ok(),
                 queued: s.pending(),
+                queued_span_ops: Some(s.pending_span_ops()),
                 recovery: s
                     .recovery
                     .lock()
@@ -364,6 +365,7 @@ impl Daemon {
                 source: source.clone(),
                 route: serde_json::from_str(&key.route).ok(),
                 queued: 0,
+                queued_span_ops: None,
                 recovery: None,
                 spans_emitted: 0,
                 permalink: None,
@@ -414,6 +416,7 @@ impl Daemon {
                     source: first.env.source.clone(),
                     route: route.cloned(),
                     queued: state.events.len() as u64,
+                    queued_span_ops: None,
                     recovery: state.recovery.as_ref().map(|failure| failure.info(false)),
                     spans_emitted: 0,
                     permalink: None,

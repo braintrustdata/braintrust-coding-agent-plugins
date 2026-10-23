@@ -352,6 +352,14 @@ async fn diagnose_daemon(
         Ok(Err(error)) => return unreachable(error.to_string()),
         Ok(Ok(status)) => {
             let mut session_errors = Vec::new();
+            let recovering_sessions = status
+                .sessions
+                .iter()
+                .filter(|session| {
+                    is_same_agent(source, &session.source) && session.recovery.is_some()
+                })
+                .cloned()
+                .collect();
             let errors = status
                 .sessions
                 .into_iter()
@@ -370,6 +378,7 @@ async fn diagnose_daemon(
             DaemonDiagnostic {
                 version: Some(status.daemon_version),
                 session_errors,
+                recovering_sessions,
                 ..DaemonDiagnostic::default()
             }
         }
@@ -1645,6 +1654,7 @@ mod tests {
             version: Some(version.into()),
             auth: Some(auth),
             session_errors: vec![session_error.into()],
+            recovering_sessions: Vec::new(),
             error: None,
         };
         let shell = diagnostic("ready", None);

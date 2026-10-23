@@ -39,6 +39,8 @@ pub(crate) enum Condition {
         chain: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         processors: Option<Vec<Option<[u8; 32]>>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<Box<TimeoutRetry>>,
     },
     Configuration {
         signature: String,
@@ -55,11 +57,18 @@ pub(crate) enum Condition {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TimeoutRetry {
+    recheck_ms: Option<i64>,
+    version: String,
+}
+
 /// Stage adapters classify failures before handing them to the shared recovery
 /// state. The retry runner consumes this value without knowing SDK/plugin types.
 #[derive(Debug, Clone)]
 pub(crate) enum RetryCondition {
     Plugin {
+        timed_out: bool,
         path: PathBuf,
         digest: Option<[u8; 32]>,
         processors: Vec<Option<[u8; 32]>>,
@@ -173,12 +182,18 @@ impl Failure {
             },
         }
     }
-    pub fn routing(error: &anyhow::Error, config: &SessionConfig, attempt: u32) -> Self {
+    pub fn routing(
+        error: &anyhow::Error,
+        config: &SessionConfig,
+        attempt: u32,
+        version: &str,
+    ) -> Self {
         let classified = error.downcast_ref::<RouteFailure>();
         let cause = classified.map_or(error, |failure| &failure.cause);
         let mut failure = Self::delay(Boundary::Sink, 0, format!("{cause:#}"), attempt);
         match classified.map(|failure| &failure.retry) {
             Some(RetryCondition::Plugin {
+                timed_out,
                 path,
                 digest,
                 processors,
@@ -189,6 +204,13 @@ impl Failure {
                     digest: *digest,
                     chain: chain(config),
                     processors: Some(processors.clone()),
+                    timeout: timed_out.then(|| {
+                        Box::new(TimeoutRetry {
+                            recheck_ms: (attempt < 2)
+                                .then(|| now_ms().saturating_add(500 * (1i64 << attempt.min(8)))),
+                            version: version.to_owned(),
+                        })
+                    }),
                 };
             }
             Some(RetryCondition::Credentials) => {
@@ -239,10 +261,22 @@ impl Failure {
     }
     pub fn info(&self, eligible: bool) -> RecoveryInfo {
         let retry = match &self.condition {
-            Condition::Plugin { path, .. } => format!(
-                "bytes/existence of {} or configured plugin chain changes",
-                path.display()
-            ),
+            Condition::Plugin { path, timeout, .. } => {
+                let mut retry = format!(
+                    "bytes/existence of {} or configured plugin chain changes",
+                    path.display()
+                );
+                if let Some(timeout) = timeout {
+                    if let Some(when) = timeout.recheck_ms {
+                        retry.push_str(&format!(" or timeout retry at {when}"));
+                    }
+                    retry.push_str(&format!(
+                        " or runtime revision changes from {}",
+                        timeout.version
+                    ));
+                }
+                retry
+            }
             Condition::Configuration { recheck_ms, .. } => match recheck_ms {
                 Some(when) => format!("relevant settings/processors change or recheck at {when}"),
                 None => "relevant settings or processors change".into(),
@@ -259,6 +293,7 @@ impl Failure {
             reason: self.reason.clone(),
             retry,
             eligible,
+            attempt: self.attempt,
         }
     }
     pub fn message(&self) -> String {
@@ -296,8 +331,12 @@ impl Stage for Recovery<'_> {
                 digest,
                 chain: previous,
                 processors,
+                timeout,
             } => {
-                self.config.is_some_and(|config| chain(config) != *previous)
+                timeout.as_ref().is_some_and(|timeout| {
+                    timeout.recheck_ms.is_some_and(|when| now_ms() >= when)
+                        || timeout.version != self.version
+                }) || self.config.is_some_and(|config| chain(config) != *previous)
                     || crate::span_processor::file_digest(path) != *digest
                     || processors.as_ref().is_some_and(|previous| {
                         self.config.is_some_and(|config| {
@@ -327,6 +366,71 @@ impl Stage for Recovery<'_> {
             RecoveryOutcome::Retry
         } else {
             RecoveryOutcome::Waiting
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timeout_retries_are_bounded_and_runtime_upgrades_unblock_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("plugin.mjs");
+        std::fs::write(&path, "export default span => span").unwrap();
+        let digest = crate::span_processor::file_digest(&path);
+        let config = crate::wire::SessionRoute {
+            span_plugins: vec![path.clone()],
+            ..Default::default()
+        }
+        .with_auth(crate::wire::BackendAuth {
+            token: String::new(),
+            api_url: None,
+            app_url: None,
+            org_id: None,
+            org_name: None,
+        });
+        let error = anyhow::Error::new(RouteFailure {
+            cause: anyhow::anyhow!("deadline"),
+            retry: RetryCondition::Plugin {
+                path,
+                digest,
+                processors: vec![digest],
+                timed_out: true,
+            },
+            emitted: 0,
+            report: true,
+        });
+        for attempt in 0..=2 {
+            let mut failure = Failure::routing(&error, &config, attempt, "old");
+            let Condition::Plugin { timeout, .. } = &mut failure.condition else {
+                panic!("plugin condition")
+            };
+            let timeout = timeout.as_mut().unwrap();
+            assert_eq!(timeout.recheck_ms.is_some(), attempt < 2);
+            if timeout.recheck_ms.is_some() {
+                timeout.recheck_ms = Some(0);
+            }
+            let json = serde_json::to_string(&failure).unwrap();
+            let failure: Failure = serde_json::from_str(&json).unwrap();
+            assert_eq!(failure.info(false).attempt, attempt);
+            let result = (Recovery {
+                config: Some(&config),
+                version: "old",
+            })
+            .process(&failure)
+            .await;
+            assert_eq!(matches!(result, RecoveryOutcome::Retry), attempt < 2);
+            assert!(matches!(
+                (Recovery {
+                    config: Some(&config),
+                    version: "new"
+                })
+                .process(&failure)
+                .await,
+                RecoveryOutcome::Retry
+            ));
         }
     }
 }

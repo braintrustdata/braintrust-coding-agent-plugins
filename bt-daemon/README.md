@@ -175,7 +175,13 @@ QuickJS runtimes with no filesystem or network host APIs. Modules must be
 self-contained and transforms must be stateless: module globals belong to a
 worker thread, not a session. Every configured plugin is mandatory. A plugin
 failure holds the affected route at its earliest unresolved SpanOp; other routes
-continue independently. The daemon persists the failure and waits for the failed
+continue independently. Calls have a one-second total budget, including input
+conversion, synchronous execution, and output conversion. Timeout diagnostics
+identify the phase and include timings alongside the original exception.
+Timeouts receive at most two automatic retries with backoff from the same
+durable SpanOp position; unredacted operations are never delivered. Exhausted
+timeouts can recover after a runtime upgrade or a relevant plugin change.
+For other plugin errors, the daemon persists the failure and waits for the failed
 file or another plugin in its configured chain to change, or for the chain itself
 to change. It then retries from the SpanOp journal without requiring a restart or
 another agent event. Restarting alone does not retry an unchanged failing chain.
@@ -187,8 +193,11 @@ the raw QuickJS exception and stack. Inspect them with:
 bt trace doctor codex
 ```
 
-The doctor output reports the plugin path, exception, occurrence count, and
-timestamps. Managed-run diagnostics are copied out of their temporary daemon
+The doctor output separates historical plugin errors (path, exception, recorded
+occurrence count, and timestamps) from active delivery holds (session, stage,
+queued span operations, retry attempts, and recovery condition). Recorded
+occurrences do not count affected spans; queued span operations can include
+multiple updates to the same span. Managed-run diagnostics are copied out of their temporary daemon
 directory before it is removed.
 Plugins are trusted local code: although they have no host APIs, they can copy
 environment values into spans that are delivered to Braintrust. Read only the
