@@ -296,6 +296,15 @@ pub(super) fn write_object_atomic_unlocked(
     object: Map<String, Value>,
     access: FileAccess,
 ) -> anyhow::Result<()> {
+    write_json_atomic_unlocked(path, &object, access)
+}
+
+/// Serialize a concrete configuration under a caller-held native settings lock.
+pub(super) fn write_json_atomic_unlocked<T: serde::Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+    access: FileAccess,
+) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("configuration path has no parent: {}", path.display()))?;
@@ -305,7 +314,7 @@ pub(super) fn write_object_atomic_unlocked(
             parent.display()
         )
     })?;
-    let mut encoded = serde_json::to_string_pretty(&Value::Object(object))?;
+    let mut encoded = serde_json::to_string_pretty(value)?;
     encoded.push('\n');
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;

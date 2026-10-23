@@ -1,127 +1,73 @@
-//! Muse Code managed command hooks.
-use super::common::{load_object, write_object_atomic_unlocked, CommandRunner, FileAccess};
+//! Muse Code setup orchestration. Native settings and hook schemas live in
+//! crate::muse::config; this module owns locks, migration, and installation.
+use super::common::{write_json_atomic_unlocked, CommandRunner, FileAccess};
 use super::Setup;
 use crate::agents::Muse;
 use crate::muse::config::{
-    contains_braintrust_hook as muse_contains_braintrust_hook, HookOverlay, OwnedHookFile,
+    inspect_hook_file, HookFileInspection, HookOverlay, MuseSettings,
     HOOK_COMMAND as MUSE_HOOK_COMMAND,
 };
-use crate::muse::hooks::HookName;
+use crate::muse::field::Field;
 use crate::paths;
 use anyhow::{bail, Context};
 use fs2::FileExt;
-use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
-
-const PREVIOUS_MUSE_HOOK_EVENTS: &[HookName] = &[
-    HookName::SessionStart,
-    HookName::UserPromptSubmit,
-    HookName::PreLLMCall,
-    HookName::PostLLMCall,
-    HookName::Stop,
-    HookName::SessionEnd,
-];
-const LEGACY_MUSE_HOOK_EVENTS: &[HookName] = &[
-    HookName::SessionStart,
-    HookName::UserPromptSubmit,
-    HookName::PreToolUse,
-    HookName::PermissionRequest,
-    HookName::PostToolUse,
-    HookName::PreLLMCall,
-    HookName::PostLLMCall,
-    HookName::PreCompact,
-    HookName::PostCompact,
-    HookName::SubagentStart,
-    HookName::SubagentStop,
-    HookName::Stop,
-    HookName::SessionEnd,
-];
 
 fn muse_hook_path(config_dir: &Path) -> PathBuf {
     config_dir.join("braintrust-hooks.json")
 }
 
-#[cfg(test)]
-fn muse_hook_config_for(events: &[HookName], command: &str) -> anyhow::Result<Map<String, Value>> {
-    Ok(serde_json::from_value(serde_json::to_value(
-        OwnedHookFile::for_events(events.iter().copied(), command),
-    )?)?)
-}
-
-/// Build a per-run user hook overlay. Keeping the managed source separate preserves
-/// enterprise handlers, including its stricter file-wide validation schema.
 pub(crate) fn muse_managed_hook_config(
     config_dir: &Path,
     command: &str,
 ) -> anyhow::Result<HookOverlay> {
-    let settings = load_object(&config_dir.join("settings.json"))?;
+    let settings = MuseSettings::load(&config_dir.join("settings.json"))?;
     check_foreign_managed_hooks(config_dir, &settings)?;
-    let mut hooks = HookOverlay::from_value(
-        settings
-            .get("hooks")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new())),
-    )?;
-    hooks.remove_owned()?;
+    let mut hooks = settings.hook_overlay()?;
+    hooks.remove_owned();
     if hooks.contains_braintrust_hook() {
         bail!("Muse user hooks already include an unrecognized Braintrust forwarder; cannot safely replace it");
     }
-    hooks.append_owned(command)?;
+    hooks.append_owned(command);
     Ok(hooks)
 }
 
-fn managed_hook_path(config_dir: &Path, settings: &Map<String, Value>) -> Option<PathBuf> {
-    settings
-        .get("managed_hooks_path")
-        .and_then(Value::as_str)
-        .map(|path| {
-            let path = Path::new(path);
-            if path.is_absolute() {
-                path.to_owned()
-            } else {
-                config_dir.join(path)
-            }
-        })
-}
-
 pub(crate) fn muse_has_owned_managed_hooks(config_dir: &Path) -> anyhow::Result<bool> {
-    let settings = load_object(&config_dir.join("settings.json"))?;
-    managed_hook_path(config_dir, &settings)
-        .map(|path| {
-            if path == muse_hook_path(config_dir) {
-                muse_hook_is_owned(&path)
-            } else {
-                Ok(false)
-            }
-        })
-        .transpose()
-        .map(|owned| owned.unwrap_or(false))
+    let settings = MuseSettings::load(&config_dir.join("settings.json"))?;
+    Ok(owned_managed_path(config_dir, &settings)?.is_some())
 }
-
-fn check_foreign_managed_hooks(
+fn owned_managed_path(
     config_dir: &Path,
-    settings: &Map<String, Value>,
-) -> anyhow::Result<()> {
-    if let Some(path) = managed_hook_path(config_dir, settings) {
-        if path.exists() && (path != muse_hook_path(config_dir) || !muse_hook_is_owned(&path)?) {
-            let hooks: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-            if muse_contains_braintrust_hook(&hooks) {
-                bail!("Muse managed hooks already include an unrecognized Braintrust forwarder; cannot safely replace it");
-            }
+    settings: &MuseSettings,
+) -> anyhow::Result<Option<PathBuf>> {
+    match settings.managed_path(config_dir) {
+        Some(path)
+            if path == muse_hook_path(config_dir) && inspect_hook_file(&path)?.is_owned() =>
+        {
+            Ok(Some(path))
+        }
+        _ => Ok(None),
+    }
+}
+fn check_foreign_managed_hooks(config_dir: &Path, settings: &MuseSettings) -> anyhow::Result<()> {
+    if let Some(path) = settings.managed_path(config_dir) {
+        let inspection = inspect_hook_file(&path)?;
+        if inspection.contains_braintrust()
+            && !(path == muse_hook_path(config_dir) && inspection.is_owned())
+        {
+            bail!("Muse managed hooks already include an unrecognized Braintrust forwarder; cannot safely replace it");
         }
     }
     Ok(())
 }
-
 pub(crate) fn check_muse_project_hooks(start: &Path) -> anyhow::Result<()> {
     for dir in start.ancestors() {
-        let path = dir.join(".muse").join("hooks.json");
-        if !path.exists() {
+        let path = dir.join(".muse/hooks.json");
+        let inspection = inspect_hook_file(&path)?;
+        if inspection == HookFileInspection::Missing {
             continue;
         }
-        let hooks: Value = serde_json::from_slice(&std::fs::read(&path)?)
-            .with_context(|| format!("read Muse project hooks {}", path.display()))?;
-        if muse_contains_braintrust_hook(&hooks) {
+        if inspection.contains_braintrust() {
             bail!("Muse project hooks {} already include Braintrust tracing; cannot safely run a managed trace", path.display());
         }
         break;
@@ -179,119 +125,62 @@ fn with_muse_settings_lock<T>(
     result
 }
 
-fn muse_hook_is_owned(path: &Path) -> anyhow::Result<bool> {
-    match std::fs::read(path) {
-        Ok(raw) => {
-            let value: Value = serde_json::from_slice(&raw)
-                .with_context(|| format!("invalid Muse hook configuration: {}", path.display()))?;
-            let mut previous = OwnedHookFile::for_events(
-                PREVIOUS_MUSE_HOOK_EVENTS.iter().copied(),
-                MUSE_HOOK_COMMAND,
-            );
-            let mut legacy = OwnedHookFile::for_events(
-                LEGACY_MUSE_HOOK_EVENTS.iter().copied(),
-                "bt trace hook --source muse --flush-on-turn-end || true",
-            );
-            for config in [&mut previous, &mut legacy] {
-                for groups in config.hooks.values_mut() {
-                    for group in groups {
-                        group.matcher = Some("*");
-                    }
-                }
-            }
-            Ok(
-                value == serde_json::to_value(OwnedHookFile::current(MUSE_HOOK_COMMAND))?
-                    || value == serde_json::to_value(previous)?
-                    || value == serde_json::to_value(legacy)?
-                    || value
-                        == serde_json::to_value(OwnedHookFile::for_events(
-                            LEGACY_MUSE_HOOK_EVENTS.iter().copied(),
-                            "bt trace hook --source muse --flush-on-turn-end || true",
-                        ))?,
-            )
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => {
-            Err(error).with_context(|| format!("read Muse hook configuration: {}", path.display()))
-        }
-    }
-}
-
 fn setup_muse_at(config_dir: &Path) -> anyhow::Result<()> {
     with_muse_settings_lock(config_dir, || {
         let settings_path = config_dir.join("settings.json");
-        let mut settings = load_object(&settings_path)?;
+        let mut settings = MuseSettings::load(&settings_path)?;
         check_foreign_managed_hooks(config_dir, &settings)?;
-        let mut hooks = HookOverlay::from_value(
-            settings
-                .remove("hooks")
-                .unwrap_or_else(|| Value::Object(Map::new())),
-        )?;
-        hooks.remove_owned()?;
+        let mut hooks = settings.hook_overlay()?;
+        hooks.remove_owned();
         if hooks.contains_braintrust_hook() {
             bail!("Muse user hooks include an unrecognized Braintrust forwarder; refusing to duplicate it");
         }
-        hooks.append_owned(MUSE_HOOK_COMMAND)?;
-        settings.insert("hooks".into(), hooks.into_value());
-        settings.entry("schema_version").or_insert(Value::from(1));
-        // Migrate our old dedicated managed file; never edit an enterprise file.
-        let old_path = managed_hook_path(config_dir, &settings)
-            .filter(|path| path == &muse_hook_path(config_dir));
-        let migrate = old_path
-            .as_ref()
-            .map(|path| muse_hook_is_owned(path))
-            .transpose()?
-            .unwrap_or(false);
-        if migrate {
-            settings.remove("managed_hooks_path");
+        hooks.append_owned(MUSE_HOOK_COMMAND);
+        settings.hooks = Field::Value(hooks);
+        settings.ensure_schema_version();
+        let old_path = owned_managed_path(config_dir, &settings)?;
+        if old_path.is_some() {
+            settings.managed_hooks_path = Field::Missing;
         }
-        write_muse_object(&settings_path, settings)?;
-        if migrate {
-            std::fs::remove_file(old_path.context("owned Muse hook path")?)?;
+        write_muse_settings(&settings_path, &settings)?;
+        if let Some(path) = old_path {
+            std::fs::remove_file(path)?;
         }
         Ok(())
     })
 }
-
 fn disable_muse_at(config_dir: &Path) -> anyhow::Result<()> {
     with_muse_settings_lock(config_dir, || {
         let settings_path = config_dir.join("settings.json");
         if !settings_path.exists() {
             return Ok(());
         }
-        let mut settings = load_object(&settings_path)?;
-        if let Some(hooks) = settings.remove("hooks") {
-            let mut hooks = HookOverlay::from_value(hooks)?;
-            hooks.remove_owned()?;
-            if !hooks.is_empty() {
-                settings.insert("hooks".into(), hooks.into_value());
-            }
+        let mut settings = MuseSettings::load(&settings_path)?;
+        if !settings.hooks.is_missing() {
+            let mut hooks = settings.hook_overlay()?;
+            hooks.remove_owned();
+            settings.hooks = if hooks.is_empty() {
+                Field::Missing
+            } else {
+                Field::Value(hooks)
+            };
         }
-        let old_path = managed_hook_path(config_dir, &settings)
-            .filter(|path| path == &muse_hook_path(config_dir));
-        let remove_old = old_path
-            .as_ref()
-            .map(|path| muse_hook_is_owned(path))
-            .transpose()?
-            .unwrap_or(false);
-        if remove_old {
-            settings.remove("managed_hooks_path");
+        let old_path = owned_managed_path(config_dir, &settings)?;
+        if old_path.is_some() {
+            settings.managed_hooks_path = Field::Missing;
         }
-        write_muse_object(&settings_path, settings)?;
-        if remove_old {
-            std::fs::remove_file(old_path.context("owned Muse hook path")?)?;
+        write_muse_settings(&settings_path, &settings)?;
+        if let Some(path) = old_path {
+            std::fs::remove_file(path)?;
         }
         Ok(())
     })
 }
-
 fn update_muse_at(config_dir: &Path) -> anyhow::Result<()> {
-    let settings = load_object(&config_dir.join("settings.json"))?;
-    let installed = settings
-        .get("hooks")
-        .is_some_and(muse_contains_braintrust_hook)
-        || muse_has_owned_managed_hooks(config_dir)?;
-    if !installed {
+    let settings = MuseSettings::load(&config_dir.join("settings.json"))?;
+    if !settings.hook_overlay()?.contains_braintrust_hook()
+        && owned_managed_path(config_dir, &settings)?.is_none()
+    {
         bail!("Muse tracing hooks are not installed; run `bt trace enable muse`");
     }
     setup_muse_at(config_dir)
@@ -322,7 +211,7 @@ pub(crate) fn muse_doctor_warnings(config_dir: &Path) -> Vec<String> {
             "Braintrust `bt` executable is unavailable on PATH; Muse command hooks cannot forward events".into(),
         );
     }
-    let settings = match load_object(&config_dir.join("settings.json")) {
+    let settings = match MuseSettings::load(&config_dir.join("settings.json")) {
         Ok(settings) => settings,
         Err(error) => {
             warnings.push(format!("Muse settings could not be read: {error}"));
@@ -332,18 +221,13 @@ pub(crate) fn muse_doctor_warnings(config_dir: &Path) -> Vec<String> {
     if let Err(error) = check_foreign_managed_hooks(config_dir, &settings) {
         warnings.push(error.to_string());
     }
-    match HookOverlay::from_value(
-        settings
-            .get("hooks")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new())),
-    ) {
+    match settings.hook_overlay() {
         Err(_) => warnings.push("Muse user hooks are malformed".into()),
         Ok(current) => {
             let mut upgraded = current.clone();
-            if upgraded.remove_owned().is_err() {
-                warnings.push("Muse user hooks are malformed".into());
-            } else if upgraded.append_owned(MUSE_HOOK_COMMAND).is_err() || current != upgraded {
+            upgraded.remove_owned();
+            upgraded.append_owned(MUSE_HOOK_COMMAND);
+            if current != upgraded {
                 warnings.push("Muse Braintrust hooks are missing or outdated; run `bt trace update muse` or `bt trace enable muse`".into());
             }
         }
@@ -367,8 +251,8 @@ fn update_muse() -> anyhow::Result<()> {
     update_muse_at(&paths::muse_config_dir())
 }
 
-fn write_muse_object(path: &Path, object: Map<String, Value>) -> anyhow::Result<()> {
-    write_object_atomic_unlocked(path, object, FileAccess::Inherited)
+fn write_muse_settings(path: &Path, settings: &MuseSettings) -> anyhow::Result<()> {
+    write_json_atomic_unlocked(path, settings, FileAccess::Inherited)
 }
 
 impl Setup for Muse {
@@ -385,6 +269,9 @@ impl Setup for Muse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::muse::config::OwnedHookFile;
+    use crate::setup::common::load_object;
+    use serde_json::Value;
 
     #[test]
     fn setup_update_and_disable_preserve_enterprise_and_user_hooks() {
@@ -421,17 +308,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path();
         let hook_path = muse_hook_path(config);
-        let mut old = muse_hook_config_for(PREVIOUS_MUSE_HOOK_EVENTS, MUSE_HOOK_COMMAND).unwrap();
-        for groups in old["hooks"].as_object_mut().unwrap().values_mut() {
-            groups[0]["matcher"] = Value::from("*");
-        }
-        write_muse_object(&hook_path, old).unwrap();
-        write_muse_object(
-            &config.join("settings.json"),
-            serde_json::json!({"managed_hooks_path":hook_path})
-                .as_object()
-                .unwrap()
-                .clone(),
+        std::fs::write(
+            &hook_path,
+            serde_json::to_vec(&OwnedHookFile::previous()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({"managed_hooks_path":hook_path})).unwrap(),
         )
         .unwrap();
         assert!(muse_has_owned_managed_hooks(config).unwrap());
@@ -457,9 +341,8 @@ mod tests {
         std::fs::write(config.join("settings.json"), r#"{"managed_hooks_path":"enterprise.json","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo unrelated"}]}]}}"#).unwrap();
         setup_muse_at(config).unwrap();
         let saved = std::fs::read(config.join("settings.json")).unwrap();
-        let overlay = muse_managed_hook_config(config, "run-forwarder")
-            .unwrap()
-            .into_value();
+        let overlay = muse_managed_hook_config(config, "run-forwarder").unwrap();
+        let overlay = serde_json::to_value(overlay).unwrap();
         assert_eq!(overlay["Stop"].as_array().unwrap().len(), 2);
         assert_eq!(overlay["Stop"][0]["hooks"][0]["command"], "echo unrelated");
         assert_eq!(overlay["Stop"][1]["hooks"][0]["command"], "run-forwarder");
@@ -487,6 +370,25 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         disable_muse_at(temp.path()).unwrap();
         assert!(!temp.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn malformed_known_fields_do_not_replace_saved_settings() {
+        for invalid in [
+            serde_json::json!({"schema_version":"wrong"}),
+            serde_json::json!({"managed_hooks_path":42}),
+            serde_json::json!({"hooks":null}),
+            serde_json::json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":null}]}]}}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.json");
+            let saved = serde_json::to_vec(&invalid).unwrap();
+            std::fs::write(&path, &saved).unwrap();
+            assert!(setup_muse_at(temp.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert!(disable_muse_at(temp.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        }
     }
 
     #[test]
