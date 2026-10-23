@@ -203,7 +203,14 @@ async fn native_active_session_detach_reattach_preserves_authoritative_completio
                 break;
             }
             if let Some(status) = first.try_wait().unwrap() {
-                panic!("observer exited before active rows: {status}");
+                let mut stderr = String::new();
+                tokio::io::AsyncReadExt::read_to_string(
+                    &mut first.stderr.take().unwrap(),
+                    &mut stderr,
+                )
+                .await
+                .unwrap();
+                panic!("observer exited before active rows: {status}: {stderr}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -297,5 +304,19 @@ async fn native_active_session_detach_reattach_preserves_authoritative_completio
         identities(&completed),
         "reattach changed the open span identities"
     );
+    // Exercise the SDK handshake and full SessionListResult against the native
+    // durable index, then reimport through the same production reader.
+    let all = native
+        .command(env!("CARGO_BIN_EXE_bt-daemon"))
+        .args(["--json", "import", "muse", "--all"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        all.status.success(),
+        "MSP import all: {}",
+        String::from_utf8_lossy(&all.stderr)
+    );
+    assert!(String::from_utf8_lossy(&all.stdout).contains(&session));
     assert_eq!(inference.requests().len(), 1);
 }

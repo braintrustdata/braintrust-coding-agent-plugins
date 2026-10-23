@@ -392,8 +392,8 @@ jobs:
           echo "MUSE_BIN=$MUSE_INSTALL_DIR/muse" >> "$GITHUB_ENV"
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

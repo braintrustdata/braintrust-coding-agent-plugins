@@ -1,117 +1,194 @@
-//! Additional native Muse lifecycle events. Keep hook forwarding free of trace policy.
+//! Typed tool, observation, subagent, and compaction reducers.
 use super::*;
-
 #[derive(Default)]
 pub(super) struct Events {
     open: HashMap<String, OpenOp>,
     closed: RecentSet<String>,
 }
-
 impl MuseTranslator {
-    pub(super) fn handle_events(&mut self, e: &Envelope, hook_ids: &HookIds) -> Vec<SpanOp> {
+    pub(super) fn handle_events(&mut self, e: &Envelope, event: MuseEvent) -> Result<Vec<SpanOp>> {
         if !self.opened {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let p = &e.payload;
-        match e.event.as_str() {
-            "PreToolUse" | "ToolUseStart" => self.start_tool(e, hook_ids, p),
-            "PostToolUse" | "PostToolUseFailure" => self.finish_tool(e, hook_ids, p),
-            "PostToolBatch" => p
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .flat_map(|call| self.finish_tool(e, hook_ids, call))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            "PermissionRequest" | "Notification" => {
-                // Muse provides no permission operation id or decision event. Record the
-                // observation without claiming to know its duration or approval result.
-                let identity = format!("observation:{}:{}:{}", e.event, e.ts_ms, p);
-                let key = ids::span_id(&self.session_id, &identity);
-                if !self.events.closed.insert(key.clone()) {
-                    return Vec::new();
-                }
-                let mut row = self.event_row(e, hook_ids, &key);
-                row.name = e.event.clone();
-                row.end_ms = Some(e.ts_ms);
-                row.input = p.get("tool_input").cloned();
-                row.metadata = Some(selected(
-                    p,
-                    &["tool_name", "notification_type", "title", "message"],
-                ));
-                row.tags = Some(vec![if e.event == "Notification" {
-                    "notification".into()
-                } else {
-                    "permission-request".into()
-                }]);
-                vec![SpanOp::Insert(row)]
+        match event {
+            MuseEvent::PreToolUse(hook) => self.start_tool(e, &hook.context, &hook.body, false),
+            MuseEvent::PostToolUse(hook) => {
+                let outcome = hook
+                    .body
+                    .outcome
+                    .error_message()
+                    .map(ToolOutcome::Failure)
+                    .unwrap_or(ToolOutcome::Success);
+                self.finish_tool(e, &hook.context, hook.body, outcome)
             }
-            "SubagentStart" | "SubagentStop" => {
-                // subagent_id is an agent name (e.g. "skill-reminder"), so
-                // reusing it must not conflate multiple child sessions.
-                let Some(child) = string(p, "child_session_id") else {
-                    return vec![self.unpaired(e, "Muse subagent event has no child identity")];
+            MuseEvent::PostToolUseFailure(hook) => {
+                let outcome = ToolOutcome::Failure(
+                    hook.body
+                        .outcome
+                        .error_message()
+                        .unwrap_or_else(|| "Muse tool failed".into()),
+                );
+                self.finish_tool(e, &hook.context, hook.body, outcome)
+            }
+            MuseEvent::PostToolBatch(hook) => {
+                let mut out = Vec::new();
+                for call in hook.body.tool_calls {
+                    let outcome = call
+                        .outcome
+                        .error_message()
+                        .map(ToolOutcome::Failure)
+                        .unwrap_or(ToolOutcome::Unknown);
+                    out.extend(self.finish_tool(e, &hook.context, call, outcome)?);
+                }
+                Ok(out)
+            }
+            MuseEvent::PermissionRequest(hook) => {
+                let metadata = serde_json::to_value(PermissionMetadata {
+                    tool_name: &hook.body.tool_name,
+                })?;
+                self.observe(
+                    e,
+                    &hook.context,
+                    hook.body.tool_input.map(|v| v.0),
+                    metadata,
+                    "permission-request",
+                )
+            }
+            MuseEvent::Notification(hook) => {
+                let metadata = serde_json::to_value(NotificationMetadata {
+                    tool_name: &hook.body.tool.tool_name,
+                    notification_type: &hook.body.notification_type,
+                    title: &hook.body.title,
+                    message: &hook.body.message,
+                })?;
+                self.observe(
+                    e,
+                    &hook.context,
+                    hook.body.tool.tool_input.map(|v| v.0),
+                    metadata,
+                    "notification",
+                )
+            }
+            MuseEvent::SubagentStart(hook) => {
+                let Some(child) = hook
+                    .body
+                    .child_session_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                else {
+                    return Ok(vec![
+                        self.unpaired(e, "Muse subagent event has no child identity")?
+                    ]);
                 };
+                // subagent_id names an agent; only child_session_id identifies an invocation.
                 let key = format!("subagent:{child}");
-                if e.event == "SubagentStart" {
-                    let mut row = self.event_row(e, hook_ids, &key);
-                    row.name = string(p, "subagent_id").unwrap_or("Subagent").into();
-                    row.metadata = Some(selected(p, &["subagent_id", "child_session_id"]));
-                    self.open_event(&key, row)
-                } else {
+                let mut row = self.event_row(e, &hook.context, &key);
+                row.name = hook
+                    .body
+                    .subagent_id
+                    .as_deref()
+                    .unwrap_or("Subagent")
+                    .into();
+                row.metadata = Some(serde_json::to_value(SubagentMetadata {
+                    subagent_id: &hook.body.subagent_id,
+                    child_session_id: &hook.body.child_session_id,
+                })?);
+                Ok(self.open_event(&key, row))
+            }
+            MuseEvent::SubagentStop(hook) => {
+                let Some(child) = hook
+                    .body
+                    .child
+                    .child_session_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                else {
+                    return Ok(vec![
+                        self.unpaired(e, "Muse subagent event has no child identity")?
+                    ]);
+                };
+                Ok(self.finish_event(
+                    &format!("subagent:{child}"),
+                    e.ts_ms,
+                    hook.body
+                        .last_assistant_message
+                        .map(serde_json::to_value)
+                        .transpose()?,
+                    hook.body.outcome.error_message(),
+                    None,
+                ))
+            }
+            MuseEvent::PreCompact(hook) => {
+                let key = format!(
+                    "compact:{}:{}:{}",
+                    hook.context.turn().unwrap_or("session"),
+                    hook.body.trigger.as_deref().unwrap_or("unknown"),
+                    e.ts_ms
+                );
+                let mut row = self.event_row(e, &hook.context, &key);
+                row.name = "Context compaction".into();
+                row.tags = Some(vec!["compaction".into()]);
+                row.metadata = Some(serde_json::to_value(CompactMetadata {
+                    trigger: &hook.body.trigger,
+                    native_operation_id_available: false,
+                })?);
+                Ok(self.open_event(&key, row))
+            }
+            MuseEvent::PostCompact(hook) => {
+                let prefix = format!(
+                    "compact:{}:{}:",
+                    hook.context.turn().unwrap_or("session"),
+                    hook.body.trigger.as_deref().unwrap_or("unknown")
+                );
+                // There is no native operation id. Pair only a uniquely matching start.
+                let matches: Vec<_> = self
+                    .events
+                    .open
+                    .keys()
+                    .filter(|key| key.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                Ok(if matches.len() == 1 {
                     self.finish_event(
-                        &key,
+                        &matches[0],
                         e.ts_ms,
-                        p.get("last_assistant_message").cloned(),
-                        event_error(p),
+                        None,
+                        hook.body.outcome.error_message(),
                         None,
                     )
-                }
-            }
-            "PreCompact" | "PostCompact" => {
-                // Compaction is serialized within a turn but has no native operation id.
-                // Pair by turn and trigger and retain that limitation on the span.
-                let key = format!(
-                    "compact:{}:{}",
-                    hook_ids.turn().unwrap_or("session"),
-                    string(p, "trigger").unwrap_or("unknown")
-                );
-                if e.event == "PreCompact" {
-                    // A later compaction in the same turn is a distinct operation.
-                    let key = format!("{key}:{}", e.ts_ms);
-                    let mut row = self.event_row(e, hook_ids, &key);
-                    row.name = "Context compaction".into();
-                    row.tags = Some(vec!["compaction".into()]);
-                    row.metadata = Some(
-                        json!({"trigger":p.get("trigger"), "native_operation_id_available":false}),
-                    );
-                    self.open_event(&key, row)
                 } else {
-                    // Choose only a uniquely matching open start; never guess across
-                    // concurrent/malformed starts.
-                    let matches: Vec<_> = self
-                        .events
-                        .open
-                        .keys()
-                        .filter(|candidate| candidate.starts_with(&format!("{key}:")))
-                        .cloned()
-                        .collect();
-                    if matches.len() == 1 {
-                        self.finish_event(&matches[0], e.ts_ms, None, event_error(p), None)
-                    } else {
-                        Vec::new()
-                    }
-                }
+                    Vec::new()
+                })
             }
-            _ => Vec::new(),
+            _ => Ok(Vec::new()),
         }
     }
-
-    fn event_row(&self, e: &Envelope, hook_ids: &HookIds, key: &str) -> SpanRow {
-        let parent = self.parent(hook_ids);
+    fn observe(
+        &mut self,
+        e: &Envelope,
+        context: &HookContext,
+        input: Option<Value>,
+        metadata: Value,
+        tag: &str,
+    ) -> Result<Vec<SpanOp>> {
+        // Native observation has neither a decision nor an operation duration.
+        let key = ids::span_id(
+            &self.session_id,
+            &format!("observation:{}:{}:{}", e.event, e.ts_ms, e.payload),
+        );
+        if !self.events.closed.insert(key.clone()) {
+            return Ok(Vec::new());
+        }
+        let mut row = self.event_row(e, context, &key);
+        row.name = e.event.clone();
+        row.end_ms = Some(e.ts_ms);
+        row.input = input;
+        row.metadata = Some(metadata);
+        row.tags = Some(vec![tag.into()]);
+        Ok(vec![SpanOp::Insert(row)])
+    }
+    fn event_row(&self, e: &Envelope, context: &HookContext, key: &str) -> SpanRow {
+        let parent = self.parent(context);
         SpanRow {
             span_id: ids::span_id(&self.session_id, key),
             root_span_id: self.effective_root_id.clone(),
@@ -121,14 +198,12 @@ impl MuseTranslator {
             ..Default::default()
         }
     }
-
     fn open_event(&mut self, key: &str, row: SpanRow) -> Vec<SpanOp> {
         if self.events.closed.contains(&key.to_owned()) {
             return Vec::new();
         }
         Self::insert_open(&mut self.events.open, key, row)
     }
-
     fn finish_event(
         &mut self,
         key: &str,
@@ -155,62 +230,77 @@ impl MuseTranslator {
         }
         out
     }
-
-    fn start_tool(&mut self, e: &Envelope, hook_ids: &HookIds, p: &Value) -> Vec<SpanOp> {
-        let Some(id) = string(p, "tool_use_id") else {
-            return vec![self.unpaired(e, "Muse tool event has no tool_use_id")];
+    fn start_tool(
+        &mut self,
+        e: &Envelope,
+        context: &HookContext,
+        tool: &ToolStarted,
+        missing_start: bool,
+    ) -> Result<Vec<SpanOp>> {
+        let Some(id) = tool.tool_use_id.as_deref().filter(|s| !s.is_empty()) else {
+            return Ok(vec![self.unpaired(e, "Muse tool event has no tool_use_id")?]);
         };
         let key = format!("tool:{id}");
-        let mut row = self.event_row(e, hook_ids, &key);
-        row.name = string(p, "tool_name").unwrap_or("tool").into();
+        let mut row = self.event_row(e, context, &key);
+        row.name = tool
+            .tool_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("tool")
+            .into();
         row.span_type = SpanType::Tool;
-        row.input = p.get("tool_input").cloned();
-        row.metadata = Some(json!({"tool_name":row.name}));
-        self.open_event(&key, row)
+        row.input = tool.tool_input.as_ref().map(|v| v.0.clone());
+        row.metadata = Some(serde_json::to_value(ToolStartMetadata {
+            tool_name: &row.name,
+            native_start_missing: missing_start,
+        })?);
+        Ok(self.open_event(&key, row))
     }
-
-    fn finish_tool(&mut self, e: &Envelope, hook_ids: &HookIds, p: &Value) -> Vec<SpanOp> {
-        let Some(id) = string(p, "tool_use_id") else {
-            return vec![self.unpaired(e, "Muse tool result has no tool_use_id")];
+    fn finish_tool(
+        &mut self,
+        e: &Envelope,
+        context: &HookContext,
+        tool: ToolFinished,
+        outcome: ToolOutcome,
+    ) -> Result<Vec<SpanOp>> {
+        let Some(id) = tool.tool.tool_use_id.as_deref().filter(|s| !s.is_empty()) else {
+            return Ok(vec![
+                self.unpaired(e, "Muse tool result has no tool_use_id")?
+            ]);
         };
         let key = format!("tool:{id}");
         if self.events.closed.contains(&key) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let failed = e.event == "PostToolUseFailure";
-        let error = event_error(p).or_else(|| failed.then(|| "Muse tool failed".into()));
-        let outcome = if error.is_some() {
-            Some("error")
-        } else if e.event == "PostToolUse" {
-            Some("success")
-        } else {
-            // Batch results may contain unavailable/denied tools without a
-            // machine-readable failure field. Their prose is not an outcome API.
-            None
-        };
         let mut out = Vec::new();
         if !self.events.open.contains_key(&key) {
-            out.extend(self.start_tool(e, hook_ids, p));
+            out.extend(self.start_tool(e, context, &tool.tool, true)?);
             if let Some(SpanOp::Insert(row)) = out.first_mut() {
-                row.start_ms = p
-                    .get("duration_ms")
-                    .and_then(Value::as_i64)
-                    .filter(|duration| *duration >= 0)
-                    .map(|duration| e.ts_ms.saturating_sub(duration))
-                    .or(Some(e.ts_ms));
-                row.metadata = Some(json!({"tool_name":row.name, "native_start_missing":true}));
+                row.start_ms = Some(
+                    tool.duration_ms
+                        .map(|d| e.ts_ms.saturating_sub(i64::try_from(d).unwrap_or(i64::MAX)))
+                        .unwrap_or(e.ts_ms),
+                );
             }
         }
-        out.extend(self.finish_event(
-            &key,
-            e.ts_ms,
-            p.get("tool_response").cloned(),
-            error,
-            outcome.map(|outcome| json!({"tool_outcome":outcome})),
-        ));
-        out
+        let (error, label) = match outcome {
+            ToolOutcome::Success => (None, Some(ToolOutcomeLabel::Success)),
+            ToolOutcome::Failure(error) => (Some(error), Some(ToolOutcomeLabel::Error)),
+            ToolOutcome::Unknown => (None, None),
+        };
+        out.extend(
+            self.finish_event(
+                &key,
+                e.ts_ms,
+                tool.tool_response.map(|v| v.0),
+                error,
+                label
+                    .map(|tool_outcome| serde_json::to_value(ToolEndMetadata { tool_outcome }))
+                    .transpose()?,
+            ),
+        );
+        Ok(out)
     }
-
     pub(super) fn close_events(&mut self, ts: i64, error: Option<&str>) -> Vec<SpanOp> {
         let keys: Vec<_> = self.events.open.keys().cloned().collect();
         keys.into_iter()
@@ -218,20 +308,6 @@ impl MuseTranslator {
             .collect()
     }
 }
-
-fn string<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
-    p.get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-}
-fn selected(p: &Value, keys: &[&str]) -> Value {
-    Value::Object(
-        keys.iter()
-            .filter_map(|key| p.get(key).map(|value| ((*key).into(), value.clone())))
-            .collect(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
