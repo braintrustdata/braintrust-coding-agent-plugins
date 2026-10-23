@@ -12,7 +12,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::agents::{registrar, Agent};
-use crate::args::{RunArgs, RunHookCommand};
+use crate::args::{RunArgs, RunHookCommand, RunSource};
 use crate::client::{flush_managed_run_in, shutdown_daemon};
 use crate::hook::MANAGED_RUN_ID_ENV;
 use crate::route::resolve_span_plugin_paths;
@@ -88,7 +88,28 @@ pub async fn run_traced(
     let executable =
         std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
     let managed_run_id = uuid::Uuid::new_v4().to_string();
-    let injection = agent.inject(&hook_command, &managed_run_id)?;
+    let mut injection = agent.inject(&hook_command, &managed_run_id)?;
+    if args.source == RunSource::Codex {
+        let executable_for_trust =
+            std::env::var_os("CODEX_BIN").unwrap_or_else(|| OsString::from("codex"));
+        let cwd = std::env::current_dir()?;
+        let (unix_command, windows_command) =
+            crate::managed_run::codex::managed_commands(&hook_command)?;
+        let expected_command = if cfg!(windows) {
+            windows_command
+        } else {
+            unix_command
+        };
+        let trust_override = crate::codex_hooks::run_trust_override(
+            &executable_for_trust,
+            &cwd,
+            &injection.args,
+            &expected_command,
+        )
+        .await?;
+        injection.args.push(OsString::from("-c"));
+        injection.args.push(trust_override);
+    }
     // A caller-supplied socket is already an explicit daemon boundary (for
     // example an integration harness or a deliberately isolated runtime).
     // Only create our own boundary when environment auth would otherwise use
@@ -231,7 +252,6 @@ pub(super) fn quote_windows_command_arg(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::codex::CODEX_RUN_HOOK_EVENTS;
     use super::*;
     use crate::agents::{Codex, Pi};
     use crate::args::RunSource;
@@ -328,10 +348,21 @@ mod tests {
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
-        assert_eq!(
-            args.iter().filter(|arg| *arg == "-c").count(),
-            CODEX_RUN_HOOK_EVENTS.len()
-        );
+        let hook_overrides: Vec<_> = args
+            .iter()
+            .filter_map(|arg| arg.to_str())
+            .filter(|arg| arg.starts_with("hooks."))
+            .collect();
+        let manifest: serde_json::Value =
+            serde_json::from_str(super::codex::PACKAGED_HOOKS).unwrap();
+        let expected_events = manifest["hooks"].as_object().unwrap();
+        assert_eq!(hook_overrides.len(), expected_events.len());
+        assert!(hook_overrides
+            .iter()
+            .any(|arg| arg.starts_with("hooks.Interrupt=")));
+        assert!(hook_overrides
+            .iter()
+            .any(|arg| arg.starts_with("hooks.SessionEnd=")));
         let config = args
             .iter()
             .find_map(|arg| {

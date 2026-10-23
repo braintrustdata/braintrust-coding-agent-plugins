@@ -15,6 +15,7 @@ pub mod paths;
 mod agents;
 mod args;
 mod client;
+mod codex_hooks;
 mod command_output;
 mod correlation;
 mod delivery_ledger;
