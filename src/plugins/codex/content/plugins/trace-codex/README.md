@@ -21,19 +21,13 @@ Install and configure the published plugin with the Braintrust CLI:
 bt trace enable codex --project my-coding-agent
 ```
 
-Use `--profile` or `--org` when needed. Setup automatically trusts the installed
-Braintrust hook definitions through Codex's configuration API. The same packaged
-event definitions are used by `bt trace run codex`; run trust is scoped to that
-Codex invocation. Restart Codex after setup so it loads the plugin and trust
-settings. `bt trace update codex` refreshes
-the plugin and trusts its current definitions, preserving unrelated hooks and
-unrelated trust settings. Setup reports an error if Codex hooks or a Braintrust
-hook definition are disabled.
+Use `--profile` or `--org` when needed. Setup activates Braintrust tracing in
+Codex. Restart Codex after setup so it loads the plugin. `bt trace update codex`
+refreshes the plugin and reapplies its setup.
 
-If activation fails, setup reports the cause. Update Codex and `bt`, then retry;
-older Codex versions can use manual approval through `/hooks`.
-`bt trace doctor codex` reports route, authentication, daemon, and plugin
-diagnostics; setup owns plugin installation and hook trust.
+If setup reports an error, update Codex and `bt`, then retry. Use
+`bt trace doctor codex` to inspect route, authentication, daemon, and plugin
+diagnostics.
 
 To inspect tracing configuration and daemon status:
 
