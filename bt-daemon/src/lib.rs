@@ -21,6 +21,7 @@ mod delivery_ledger;
 mod dispatch;
 mod env;
 mod hook;
+mod hook_executable;
 mod ids;
 mod journal;
 mod managed_run;
@@ -56,6 +57,7 @@ pub use command_output::{
     OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
 };
 pub use hook::run_hook;
+pub use hook_executable::delegate_hook_executable;
 #[doc(hidden)]
 pub use journal::source_journal_path;
 pub use managed_run::run_traced;
