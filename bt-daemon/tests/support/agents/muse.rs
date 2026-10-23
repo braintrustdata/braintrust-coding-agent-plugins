@@ -43,7 +43,7 @@ impl MuseAgent {
 
     pub async fn export_latest(&self, world: &AgentTestWorld) -> serde_json::Value {
         let path = world.temp_path("muse-export.json");
-        let mut command = super::command_from_env("MUSE_BIN", "muse");
+        let mut command = super::command_from_env("BRAINTRUST_MUSE_BIN", "muse");
         command
             .args(["export", "--last", "--out"])
             .arg(&path)

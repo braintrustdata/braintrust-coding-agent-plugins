@@ -46,7 +46,7 @@ impl NativeSession {
         .unwrap();
         Self {
             root,
-            binary: std::env::var_os("MUSE_BIN").unwrap_or_else(|| "muse".into()),
+            binary: std::env::var_os("BRAINTRUST_MUSE_BIN").unwrap_or_else(|| "muse".into()),
         }
     }
     fn command(&self, binary: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -64,7 +64,7 @@ impl NativeSession {
                 "BRAINTRUST_DAEMON_DATA_DIR",
                 self.root.path().join("import"),
             )
-            .env("MUSE_BIN", &self.binary)
+            .env("BRAINTRUST_MUSE_BIN", &self.binary)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (key, _) in std::env::vars_os() {

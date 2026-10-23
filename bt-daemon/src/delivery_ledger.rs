@@ -241,7 +241,10 @@ impl DeliveryLedger {
         self.pending.retain(|id| !known.contains(id));
         self.pending_late_merges
             .retain(|id| !known_late_merges.contains(id));
-        if self.pending.is_empty() && self.pending_late_merges.is_empty() && self.pending_versions.is_empty() {
+        if self.pending.is_empty()
+            && self.pending_late_merges.is_empty()
+            && self.pending_versions.is_empty()
+        {
             return Ok(());
         }
         // Only new acknowledgements are serialized. Retain pending state until
@@ -1163,7 +1166,7 @@ mod tests {
         assert_eq!(stored["span-1"].plugin_version.as_deref(), Some("v2"));
         assert_eq!(recovered.emit(&[terminal("span-0")]).await.unwrap(), 0);
         // Simulate upgrading a JSON checkpoint with versions and completion IDs.
-        let (_ledger, origins) = DeliveryLedger::load(temp.path(), "codex", "session-1", &config)
+        let (ledger, origins) = DeliveryLedger::load(temp.path(), "codex", "session-1", &config)
             .await
             .unwrap();
         tokio::fs::write(

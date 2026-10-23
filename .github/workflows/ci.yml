@@ -389,7 +389,7 @@ jobs:
           curl --fail --silent --show-error --location https://dev.meta.ai/install.sh -o "$RUNNER_TEMP/install-muse.sh"
           bash "$RUNNER_TEMP/install-muse.sh"
           "$MUSE_INSTALL_DIR/muse" --version
-          echo "MUSE_BIN=$MUSE_INSTALL_DIR/muse" >> "$GITHUB_ENV"
+          echo "BRAINTRUST_MUSE_BIN=$MUSE_INSTALL_DIR/muse" >> "$GITHUB_ENV"
       - name: Install Rust
         run: |
           rustup toolchain install 1.97.1 --profile minimal
