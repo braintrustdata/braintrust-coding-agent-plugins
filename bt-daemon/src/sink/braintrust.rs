@@ -1,6 +1,6 @@
 //! The Braintrust sink: maps sink-neutral [`SpanOp`]s onto `braintrust-sdk-rust`.
 //!
-//! Each routing branch owns its checked SDK queue. Clients are built lazily
+//! Each routing branch observes its own SDK write completions. Clients are built lazily
 //! using its configured backend URLs; flush results cannot include another
 //! branch's rejected operations. Within a client, each
 //! session's token/org travel per span (`span_builder_with_credentials`) and
@@ -46,26 +46,55 @@ struct ClientCacheState {
 
 struct CachedClient {
     client: BraintrustClient,
-    queued_bytes: AsyncMutex<usize>,
+    pending: AsyncMutex<PendingDelivery>,
 }
 
-impl CachedClient {
-    async fn account_and_flush(&self, bytes: usize) -> anyhow::Result<()> {
-        let mut queued_bytes = self.queued_bytes.lock().await;
-        *queued_bytes = queued_bytes.saturating_add(bytes);
-        if *queued_bytes < QUEUE_FLUSH_BYTE_BUDGET {
-            return Ok(());
+type PendingWrite = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+const MAX_PENDING_WRITES: usize = 256;
+#[derive(Default)]
+struct PendingDelivery {
+    bytes: usize,
+    writes: Vec<PendingWrite>,
+}
+impl PendingDelivery {
+    async fn drain(&mut self, client: &BraintrustClient) -> anyhow::Result<()> {
+        let flush = client.flush();
+        let writes = std::mem::take(&mut self.writes);
+        self.bytes = 0;
+        let mut failure = None;
+        // Observe every accepted token, including failures that retired before
+        // this flush's cutoff. Journal checkpoints must never rely on a queue
+        // retaining historical failures. The journal owns retries on failure.
+        for write in writes {
+            if let Err(error) = write.await {
+                failure.get_or_insert(error);
+            }
         }
-        self.client.flush().await.map_err(anyhow::Error::new)?;
-        *queued_bytes = 0;
+        if let Err(error) = flush.await {
+            failure.get_or_insert_with(|| anyhow::Error::new(error));
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+impl CachedClient {
+    async fn account_and_flush(
+        &self,
+        bytes: usize,
+        writes: Vec<PendingWrite>,
+    ) -> anyhow::Result<()> {
+        let mut pending = self.pending.lock().await;
+        pending.bytes = pending.bytes.saturating_add(bytes);
+        pending.writes.extend(writes);
+        if pending.bytes >= QUEUE_FLUSH_BYTE_BUDGET || pending.writes.len() >= MAX_PENDING_WRITES {
+            pending.drain(&self.client).await?;
+        }
         Ok(())
     }
-
     async fn flush(&self) -> anyhow::Result<()> {
-        let mut queued_bytes = self.queued_bytes.lock().await;
-        self.client.flush().await.map_err(anyhow::Error::new)?;
-        *queued_bytes = 0;
-        Ok(())
+        self.pending.lock().await.drain(&self.client).await
     }
 }
 
@@ -78,9 +107,13 @@ impl ClientCacheState {
     fn trim_inactive(&mut self) {
         while self.clients.len() >= CLIENT_CACHE_CAPACITY {
             let Some(index) = self.order.iter().position(|key| {
-                self.clients
-                    .get(key)
-                    .is_some_and(|client| Arc::strong_count(client) == 1)
+                self.clients.get(key).is_some_and(|client| {
+                    Arc::strong_count(client) == 1
+                        && client
+                            .pending
+                            .try_lock()
+                            .is_ok_and(|pending| pending.writes.is_empty())
+                })
             }) else {
                 // Every client is still referenced by a live session; those are
                 // active working state and cannot be evicted safely.
@@ -100,6 +133,20 @@ impl ClientCache {
         }
     }
 
+    async fn flush(&self) -> anyhow::Result<()> {
+        let clients: Vec<_> = self.state.lock().await.clients.values().cloned().collect();
+        let mut failure = None;
+        for client in clients {
+            if let Err(error) = client.flush().await {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     async fn get_or_build(
         &self,
         api_url: &str,
@@ -115,7 +162,6 @@ impl ClientCache {
         }
         let client = BraintrustClient::builder()
             .skip_login(true)
-            .checked_delivery(true)
             .api_url(api_url.to_string())
             .app_url(app_url.to_string())
             .build()
@@ -123,7 +169,7 @@ impl ClientCache {
             .map_err(|e| anyhow::anyhow!("braintrust client build failed: {e}"))?;
         let arc = Arc::new(CachedClient {
             client,
-            queued_bytes: AsyncMutex::new(0),
+            pending: AsyncMutex::new(PendingDelivery::default()),
         });
         state.trim_inactive();
         state.clients.insert(key.clone(), arc.clone());
@@ -195,7 +241,7 @@ struct BraintrustSink {
     client: Option<Arc<CachedClient>>,
     /// Live span handles keyed by deterministic span id, so a later op (e.g.
     /// setting `end`) merges onto the same row the SDK already knows.
-    open: HashMap<String, SpanHandle<BraintrustClient>>,
+    open: HashMap<String, SpanHandle>,
     /// Roots marked by translators as provisional, keyed by their local span
     /// id. Each is exported only once direct descendant work arrives.
     pending_roots: HashMap<String, Vec<SpanOp>>,
@@ -276,23 +322,37 @@ impl BraintrustSink {
         Ok(())
     }
 
-    fn update_open(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
+    fn update_open(
+        &mut self,
+        client: &BraintrustClient,
+        row: &SpanRow,
+    ) -> anyhow::Result<Vec<PendingWrite>> {
         self.ensure_handle(client, row)?;
         let handle = self.open.get(&row.span_id).ok_or_else(|| {
             anyhow::anyhow!("span handle was not initialized for {}", row.span_id)
         })?;
-        handle.log(build_log(row, &self.source, false)?);
+        let write = handle.log(build_log(row, &self.source, false)?);
+        let mut writes: Vec<PendingWrite> = vec![Box::pin(async move {
+            write.await.map(|_| ()).map_err(anyhow::Error::new)
+        })];
         if let Some(end) = row.end_ms {
-            handle.end_with_time(ms_to_secs(end));
+            let end = handle.end_with_time(ms_to_secs(end));
+            writes.push(Box::pin(async move {
+                end.await.map(|_| ()).map_err(anyhow::Error::new)
+            }));
             // SpanHandle retains the complete accumulated input/output. Once a
             // span is terminal, use stateless SDK merges for any unusually late
             // update instead of pinning that payload for the session lifetime.
             self.open.remove(&row.span_id);
         }
-        Ok(())
+        Ok(writes)
     }
 
-    fn merge_closed(&self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
+    fn merge_closed(
+        &self,
+        client: &BraintrustClient,
+        row: &SpanRow,
+    ) -> anyhow::Result<Vec<PendingWrite>> {
         let creds = self
             .creds
             .as_ref()
@@ -311,14 +371,15 @@ impl BraintrustSink {
                 context.remove("span_origin");
             }
         }
-        client
-            .update_span_with_credentials(
-                creds.token.clone(),
-                creds.org_id.clone(),
-                &components.to_str(),
-                build_log(row, &self.source, true)?,
-            )
-            .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))
+        let write = client.update_span_with_credentials(
+            creds.token.clone(),
+            creds.org_id.clone(),
+            &components.to_str(),
+            build_log(row, &self.source, true)?,
+        );
+        Ok(vec![Box::pin(async move {
+            write.await.map_err(anyhow::Error::new)
+        })])
     }
 
     fn span_components(&self, row: &SpanRow, creds: &Creds, project: &str) -> SpanComponents {
@@ -350,15 +411,15 @@ impl BraintrustSink {
 
     async fn emit_op(&mut self, op: &SpanOp) -> anyhow::Result<()> {
         let client = self.ensure_client().await?;
-        match op {
+        let writes = match op {
             SpanOp::Insert(row) => self.update_open(&client.client, row)?,
             SpanOp::Merge(row) if self.open.contains_key(&row.span_id) => {
                 self.update_open(&client.client, row)?
             }
             SpanOp::Merge(row) => self.merge_closed(&client.client, row)?,
-        }
+        };
         client
-            .account_and_flush(serialized_len(op).unwrap_or(0))
+            .account_and_flush(serialized_len(op).unwrap_or(0), writes)
             .await
     }
 }
@@ -443,10 +504,9 @@ impl Sink for BraintrustSink {
     }
 
     async fn flush(&mut self) -> anyhow::Result<()> {
-        match &self.client {
-            Some(client) => client.flush().await,
-            None => Ok(()),
-        }
+        // Configuration changes can leave accepted work on a previous URL.
+        // Observe every client owned by this branch before its checkpoint.
+        self.cache.flush().await
     }
 
     fn has_pending_delivery(&self) -> bool {
@@ -729,7 +789,6 @@ mod tests {
             .await;
         let client = BraintrustClient::builder()
             .skip_login(true)
-            .checked_delivery(true)
             .api_url(server.uri())
             .app_url(server.uri())
             .environment("test", Some("sink-test"))
@@ -770,6 +829,7 @@ mod tests {
                 &components.to_str(),
                 build_log(&row, "codex", true).unwrap(),
             )
+            .await
             .unwrap();
         client.flush().await.unwrap();
 
@@ -795,5 +855,71 @@ mod tests {
                 json!({"type": "test", "name": "sink-test"})
             );
         }
+    }
+    #[tokio::test]
+    async fn branch_observes_retired_write_failure_then_replays_fresh_work() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .api_url(server.uri())
+            .app_url(server.uri())
+            .build()
+            .await
+            .unwrap();
+        let span = client
+            .span_builder_with_credentials("test-token", "test-org")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "test-project".into(),
+            })
+            .build();
+        let write = span.log(SpanLog::default());
+        assert!(client.flush().await.is_err());
+        // The SDK has retired the failed batch. Its next flush cannot report it.
+        client.flush().await.unwrap();
+        let cached = CachedClient {
+            client,
+            pending: AsyncMutex::new(PendingDelivery::default()),
+        };
+        cached
+            .account_and_flush(
+                1,
+                vec![Box::pin(async move {
+                    write.await.map(|_| ()).map_err(anyhow::Error::new)
+                })],
+            )
+            .await
+            .unwrap();
+        assert!(cached.flush().await.is_err());
+        assert!(cached.pending.lock().await.writes.is_empty());
+        cached.flush().await.unwrap();
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let write = span.log(SpanLog::default());
+        cached
+            .account_and_flush(
+                1,
+                vec![Box::pin(async move {
+                    write.await.map(|_| ()).map_err(anyhow::Error::new)
+                })],
+            )
+            .await
+            .unwrap();
+        cached.flush().await.unwrap();
+        cached
+            .client
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 }

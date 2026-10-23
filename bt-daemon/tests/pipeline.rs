@@ -3889,10 +3889,12 @@ async fn changed_settings_resume_the_original_rejected_route_through_ingress() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
+    // Automatic delivery may send the root and event snapshots in separate
+    // physical requests; the checkpoint/recovery contract is batch-independent.
     let rejection = Mock::given(method("POST"))
         .and(path("/logs3"))
         .respond_with(ResponseTemplate::new(400).set_body_string("invalid row"))
-        .expect(1)
+        .expect(1..)
         .mount_as_scoped(&server)
         .await;
     let tmp = tempfile::tempdir().unwrap();
