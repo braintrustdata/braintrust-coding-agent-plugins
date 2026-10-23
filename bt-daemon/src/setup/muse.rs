@@ -90,7 +90,7 @@ pub(crate) fn muse_version(output: &[u8]) -> anyhow::Result<semver::Version> {
 /// Resolve the running executable rather than stamping an install-time version:
 /// Muse's launcher can upgrade independently of Braintrust's hook definitions.
 pub(crate) fn installed_muse_version() -> anyhow::Result<semver::Version> {
-    let executable = crate::env::var_os("MUSE_BIN").unwrap_or_else(|| "muse".into());
+    let executable = crate::env::var_os("BRAINTRUST_MUSE_BIN").unwrap_or_else(|| "muse".into());
     let output = crate::subprocess::background_command(executable)
         .arg("--version")
         .output()
@@ -188,9 +188,11 @@ fn update_muse_at(config_dir: &Path) -> anyhow::Result<()> {
 
 pub(crate) fn muse_doctor_warnings(config_dir: &Path) -> Vec<String> {
     let mut warnings = Vec::new();
-    match crate::subprocess::background_command("muse")
-        .arg("--version")
-        .output()
+    match crate::subprocess::background_command(
+        crate::env::var_os("BRAINTRUST_MUSE_BIN").unwrap_or_else(|| "muse".into()),
+    )
+    .arg("--version")
+    .output()
     {
         Ok(output) if output.status.success() => match muse_version(&output.stdout) {
             Ok(version) if version < semver::Version::new(1, 3, 0) => warnings

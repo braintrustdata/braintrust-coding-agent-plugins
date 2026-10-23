@@ -15,6 +15,17 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+#[derive(Clone, Copy)]
+pub(crate) enum ReadMode {
+    /// Completed-file API: finalize observed unfinished work.
+    #[cfg(test)]
+    Historical,
+    /// One-shot observation: require traceable work, keep active spans open.
+    Import,
+    /// Live polling may observe a session before its first run.
+    Attach,
+}
+
 #[derive(Default)]
 struct RunState {
     active_model: Option<ModelState>,
@@ -518,9 +529,9 @@ impl<F: FnMut(Envelope) -> Result<()>> Reader<'_, F> {
         }
         Ok(())
     }
-    fn finish(mut self, attach_snapshot: bool) -> Result<bool> {
+    fn finish(mut self, mode: ReadMode) -> Result<bool> {
         if self.activity_count == 0 {
-            if attach_snapshot {
+            if matches!(mode, ReadMode::Attach) {
                 return Ok(self.current_session_ended);
             }
             bail!(
@@ -532,7 +543,12 @@ impl<F: FnMut(Envelope) -> Result<()>> Reader<'_, F> {
             .last_ts
             .ok_or_else(|| anyhow!("Muse export {} has no timestamps", self.path.display()))?;
         let ended = self.current_session_ended;
-        if attach_snapshot && !ended {
+        let keep_active_open = match mode {
+            #[cfg(test)]
+            ReadMode::Historical => false,
+            _ => true,
+        };
+        if keep_active_open && !ended {
             return Ok(false);
         }
         for run_id in self.runs.keys().cloned().collect::<Vec<_>>() {
@@ -622,7 +638,8 @@ pub(crate) fn for_each_envelope_for_session<F>(
 where
     F: FnMut(Envelope) -> Result<()>,
 {
-    for_each_snapshot_envelope_for_session(path, expected_id, false, emit).map(|_| ())
+    for_each_snapshot_envelope_for_session(path, expected_id, ReadMode::Historical, emit)
+        .map(|_| ())
 }
 
 /// Parse a complete export without manufacturing terminal events for an
@@ -630,7 +647,7 @@ where
 pub(crate) fn for_each_snapshot_envelope_for_session<F>(
     path: &Path,
     expected_id: &str,
-    attach_snapshot: bool,
+    mode: ReadMode,
     emit: F,
 ) -> Result<bool>
 where
@@ -679,7 +696,7 @@ where
         .map_err(|error| anyhow!("parse Muse export {}: {error}", path.display()))?;
     de.end()
         .map_err(|error| anyhow!("parse Muse export {}: {error}", path.display()))?;
-    reader.finish(attach_snapshot)
+    reader.finish(mode)
 }
 
 fn read_header(path: &Path) -> Result<Header> {
@@ -1027,13 +1044,41 @@ mod tests {
             ]
         }));
         let mut events = Vec::new();
-        let ended = for_each_snapshot_envelope_for_session(&path, "session-1", true, |event| {
-            events.push(event.event);
-            Ok(())
-        })
-        .unwrap();
+        let ended =
+            for_each_snapshot_envelope_for_session(&path, "session-1", ReadMode::Attach, |event| {
+                events.push(event.event);
+                Ok(())
+            })
+            .unwrap();
         assert!(!ended);
         assert_eq!(events, ["SessionStart", "UserPromptSubmit", "PreLLMCall"]);
+    }
+
+    #[test]
+    fn one_shot_empty_import_fails_even_when_a_session_end_was_observed() {
+        for events in [
+            json!([]),
+            json!([{"recorded_at":1000,"envelope":{"payload":{"kind":"session_end"}}}]),
+        ] {
+            let (_temp, path) = write_export(
+                json!({"export_schema_version":1,"sessions":[{"session_id":"session-1"}],"events":events}),
+            );
+            let error = for_each_snapshot_envelope_for_session(
+                &path,
+                "session-1",
+                ReadMode::Import,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("no traceable run events"));
+            assert!(for_each_snapshot_envelope_for_session(
+                &path,
+                "session-1",
+                ReadMode::Attach,
+                |_| Ok(())
+            )
+            .is_ok());
+        }
     }
 
     #[test]
@@ -1044,11 +1089,12 @@ mod tests {
             "events": []
         }));
         let mut events = Vec::new();
-        let ended = for_each_snapshot_envelope_for_session(&path, "session-1", true, |event| {
-            events.push(event);
-            Ok(())
-        })
-        .unwrap();
+        let ended =
+            for_each_snapshot_envelope_for_session(&path, "session-1", ReadMode::Attach, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .unwrap();
         assert!(!ended);
         assert!(events.is_empty());
     }

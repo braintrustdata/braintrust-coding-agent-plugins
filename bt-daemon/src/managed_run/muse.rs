@@ -17,7 +17,7 @@ pub(crate) struct MuseManagedContext {
 
 impl ManagedRun for Muse {
     fn executable(&self) -> (&'static str, &'static str) {
-        ("MUSE_BIN", "muse")
+        ("BRAINTRUST_MUSE_BIN", "muse")
     }
 
     fn check(&self, args: &[OsString], _terminal: Terminal) -> anyhow::Result<()> {

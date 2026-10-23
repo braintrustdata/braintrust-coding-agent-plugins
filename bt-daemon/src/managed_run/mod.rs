@@ -131,7 +131,7 @@ async fn run_traced_inner(
     }
     let (executable_env, default_executable) = agent.executable();
     let executable =
-        std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
+        env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
     let managed_run_id = uuid::Uuid::new_v4().to_string();
     // A caller-supplied socket is already an explicit daemon boundary (for
     // example an integration harness or a deliberately isolated runtime).
@@ -149,21 +149,29 @@ async fn run_traced_inner(
         .unwrap_or_else(|| paths::socket_path(None));
     let injection = agent.inject_with_context(&hook_command, &managed_run_id, &route, &socket)?;
     if agent.needs_daemon_host() {
-        if let Some(runtime) = &isolated_runtime {
-            let host = host.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Muse managed runs require run_traced_with_host to start the invocation daemon"
-                )
-            })?;
+        if let Some(host) = host.as_ref() {
+            // Sanitized hooks cannot spawn a daemon. Prepare the resolved
+            // endpoint even when the caller supplied a fresh explicit socket.
             drop(
                 crate::client::ensure_daemon_in(
-                    &runtime.socket,
+                    &socket,
                     host,
                     false,
-                    Some(runtime.temp_dir.path()),
+                    isolated_runtime
+                        .as_ref()
+                        .map(|runtime| runtime.temp_dir.path()),
                 )
                 .await?,
             );
+        } else {
+            // Existing callers without host information may use an already
+            // listening explicit daemon, but must never launch untraceable work.
+            drop(crate::transport::connect(&socket).await.map_err(|_| {
+                anyhow::anyhow!(
+                    "Muse managed runs require run_traced_with_host to start a daemon at {}",
+                    socket.display()
+                )
+            })?);
         }
     }
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;

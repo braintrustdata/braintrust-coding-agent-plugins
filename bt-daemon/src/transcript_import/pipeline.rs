@@ -606,16 +606,27 @@ mod tests {
             .unwrap();
         };
         write(&events);
-        let (count, ended) = process_muse_snapshot(&mut processor, &export, "muse-attach", true, 0)
-            .await
-            .unwrap();
+        let (count, ended) = process_muse_snapshot(
+            &mut processor,
+            &export,
+            "muse-attach",
+            crate::transcript_import::muse::ReadMode::Attach,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(count, 3);
         assert!(!ended);
         processor.flush_open().await.unwrap();
-        let (same_count, ended) =
-            process_muse_snapshot(&mut processor, &export, "muse-attach", true, count)
-                .await
-                .unwrap();
+        let (same_count, ended) = process_muse_snapshot(
+            &mut processor,
+            &export,
+            "muse-attach",
+            crate::transcript_import::muse::ReadMode::Attach,
+            count,
+        )
+        .await
+        .unwrap();
         assert_eq!(same_count, count);
         assert!(!ended);
         events.extend([
@@ -625,9 +636,15 @@ mod tests {
             json!({"recorded_at":1_005_000,"envelope":{"payload":{"kind":"session_end"}}}),
         ]);
         write(&events);
-        let (_, ended) = process_muse_snapshot(&mut processor, &export, "muse-attach", true, count)
-            .await
-            .unwrap();
+        let (_, ended) = process_muse_snapshot(
+            &mut processor,
+            &export,
+            "muse-attach",
+            crate::transcript_import::muse::ReadMode::Attach,
+            count,
+        )
+        .await
+        .unwrap();
         assert!(ended);
         processor.finish().await.unwrap();
         let rows = std::fs::read_to_string(output.join("muse-attach.ndjson"))

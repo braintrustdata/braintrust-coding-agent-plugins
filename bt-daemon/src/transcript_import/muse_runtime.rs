@@ -1,6 +1,7 @@
 //! Muse exports are streamed through the shared import processor.
 use super::*;
 use crate::muse::msp::{drain_stderr, MuseMspClient};
+use crate::transcript_import::muse::ReadMode;
 use anyhow::Context;
 use std::ffi::OsString;
 use std::process::Stdio;
@@ -27,7 +28,8 @@ pub(super) async fn run(
 
 async fn export_muse_session(session_id: &str, path: &std::path::Path) -> anyhow::Result<()> {
     transcript_import::validate_session_id(session_id)?;
-    let executable = std::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
+    let executable =
+        crate::env::var_os("BRAINTRUST_MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
     let mut command: tokio::process::Command =
         crate::subprocess::background_command(&executable).into();
     let mut child = command
@@ -68,7 +70,8 @@ async fn export_muse_session(session_id: &str, path: &std::path::Path) -> anyhow
 /// resumes a session, obtains a writer lease, or subscribes to its view; the
 /// export command remains the authoritative content reader.
 async fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
-    let executable = crate::env::var_os("MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
+    let executable =
+        crate::env::var_os("BRAINTRUST_MUSE_BIN").unwrap_or_else(|| OsString::from("muse"));
     let client = MuseMspClient::connect(&executable).await?;
     let listing = client.session_ids().await;
     let shutdown = client.shutdown().await;
@@ -110,7 +113,7 @@ pub(super) async fn process_muse_export(
     export: &std::path::Path,
     session_id: &str,
 ) -> anyhow::Result<bool> {
-    process_muse_snapshot(processor, export, session_id, true, 0)
+    process_muse_snapshot(processor, export, session_id, ReadMode::Import, 0)
         .await
         .map(|(_, ended)| ended)
 }
@@ -122,7 +125,7 @@ pub(super) async fn process_muse_snapshot(
     processor: &mut ImportProcessor,
     export: &std::path::Path,
     session_id: &str,
-    attach_snapshot: bool,
+    mode: ReadMode,
     skip_envelopes: usize,
 ) -> anyhow::Result<(usize, bool)> {
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<Envelope>>(4);
@@ -134,7 +137,7 @@ pub(super) async fn process_muse_snapshot(
         let ended = transcript_import::muse::for_each_snapshot_envelope_for_session(
             &export_for_parser,
             &expected_id,
-            attach_snapshot,
+            mode,
             |entry| {
                 envelope_count += 1;
                 if envelope_count <= skip_envelopes {
@@ -214,8 +217,14 @@ pub(super) async fn attach_muse_export(
                 result = export_muse_session(session_id, export) => result?,
             }
         }
-        let (count, ended) =
-            process_muse_snapshot(&mut processor, export, session_id, true, emitted).await?;
+        let (count, ended) = process_muse_snapshot(
+            &mut processor,
+            export,
+            session_id,
+            ReadMode::Attach,
+            emitted,
+        )
+        .await?;
         if count != emitted {
             processor.flush_open().await?;
         }
