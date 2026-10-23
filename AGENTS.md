@@ -37,7 +37,11 @@ limitation and preserve known parent totals rather than inventing attribution.
 
 ## Local development
 
+Install the pinned tools with [mise](https://mise.jdx.dev). `mise install`
+reads `.tool-versions` and `mise.toml`, then runs `make install-deps`:
+
 ```bash
+mise install
 make build
 make build-codex
 make test
@@ -132,6 +136,13 @@ Codex and Cursor deployments can run their installed-plugin smoke workflows,
 which trace a real CLI session through the daemon when `OPENAI_API_KEY` or
 `CURSOR_API_KEY` is available. Cursor's generated distribution is separate from
 the existing Braintrust MCP extension; users may install either or both.
+
+The root `.tool-versions` pins Node, pnpm, and Rust for both local
+development and CI. Workflows do not use mise: they read the file through
+`actions/setup-node`, `.github/actions/setup-node-pnpm`, and
+`.github/actions/setup-rust`. Bump versions there rather than in individual
+workflows. CI requires each pnpm package's `packageManager` to match it.
+`mise.toml` holds local-only tools and hooks.
 
 CI builds and validates the plugin packages on Linux. It runs the JavaScript
 daemon client and the Pi and OpenCode unit tests, and builds, tests, and lints
