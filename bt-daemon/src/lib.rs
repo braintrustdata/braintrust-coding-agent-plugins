@@ -25,6 +25,7 @@ mod hook_executable;
 mod ids;
 mod journal;
 mod managed_run;
+mod muse;
 mod pipeline;
 mod plugin_diagnostics;
 pub(crate) mod process;
@@ -60,7 +61,7 @@ pub use hook::run_hook;
 pub use hook_executable::delegate_hook_executable;
 #[doc(hidden)]
 pub use journal::source_journal_path;
-pub use managed_run::run_traced;
+pub use managed_run::{run_traced, run_traced_with_host};
 pub use plugin_diagnostics::PluginDiagnostic;
 pub use server::{
     braintrust_serve_options, debug_serve_options, run_serve, AuthLease, AuthProvider,

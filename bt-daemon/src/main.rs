@@ -7,10 +7,10 @@
 use async_trait::async_trait;
 use bt_daemon::wire::{AuthSelection, AuthSource, BackendAuth, SessionRoute, TraceDestination};
 use bt_daemon::{
-    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, run_traced,
-    AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, DebugSinkFactory, HookArgs,
-    HostInfo, ImportArgs, OutputFormat, Registry, RunArgs, RunHookCommand, ServeArgs, ServeOptions,
-    StatusArgs, TraceCommandOutput,
+    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status,
+    run_traced_with_host, AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig,
+    DebugSinkFactory, HookArgs, HostInfo, ImportArgs, OutputFormat, Registry, RunArgs,
+    RunHookCommand, ServeArgs, ServeOptions, StatusArgs, TraceCommandOutput,
 };
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
@@ -300,7 +300,7 @@ async fn main() {
                 program: exe,
                 args: vec![OsString::from("hook")],
             };
-            match run_traced(args, hook_command, route.into_route()).await {
+            match run_traced_with_host(args, hook_command, route.into_route(), host_info()).await {
                 Ok(status) if status.success() => {}
                 Ok(status) => std::process::exit(status.code().unwrap_or(1)),
                 Err(error) => {

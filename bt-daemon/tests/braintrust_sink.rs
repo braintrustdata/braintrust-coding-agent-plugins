@@ -61,6 +61,7 @@ fn row(
         metrics: None,
         error: None,
         late_merge_key: None,
+        late_merge_version: None,
         turn_span_id: None,
         tags: None,
         origin: Some(OriginSnapshot {

@@ -8,7 +8,7 @@
 //! destination still receives the full trace.
 
 use crate::sink::Sink;
-use crate::translate::{OriginSnapshot, SpanOp, SpanRow};
+use crate::translate::{LateMergeVersion, OriginSnapshot, SpanOp, SpanRow};
 use crate::wire::SessionConfig;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -31,6 +31,8 @@ struct LedgerFile {
     late_merge_ids: HashSet<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     span_origins: HashMap<String, OriginSnapshot>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    late_merge_versions: HashMap<String, LateMergeVersion>,
 }
 
 // Closing this file releases the OS lock, including on cancellation or errors.
@@ -45,6 +47,8 @@ struct DeliveryLedger {
     pending: HashSet<String>,
     known_late_merges: HashSet<String>,
     pending_late_merges: HashSet<String>,
+    known_versions: HashMap<String, LateMergeVersion>,
+    pending_versions: HashMap<String, LateMergeVersion>,
 }
 
 impl DeliveryLedger {
@@ -80,6 +84,8 @@ impl DeliveryLedger {
             pending: HashSet::new(),
             known_late_merges: persisted.late_merge_ids,
             pending_late_merges: HashSet::new(),
+            known_versions: persisted.late_merge_versions,
+            pending_versions: HashMap::new(),
         };
         let lock = ledger.lock().await?;
         ledger
@@ -143,6 +149,9 @@ impl DeliveryLedger {
             let update: LedgerFile = serde_json::from_slice(&line)?;
             self.known.extend(update.completed_span_ids);
             self.known_late_merges.extend(update.late_merge_ids);
+            for (span, version) in update.late_merge_versions {
+                remember_version(&mut self.known_versions, &span, &version);
+            }
             for (span, origin) in update.span_origins {
                 if pending_origins.remove(&span).is_some() {
                     // Another writer persisted first while this writer's
@@ -170,10 +179,25 @@ impl DeliveryLedger {
     }
 
     fn filter(&self, ops: &[SpanOp]) -> Vec<SpanOp> {
-        ops.iter()
-            .filter(|op| self.should_emit(op))
-            .cloned()
-            .collect()
+        let mut versions = self.known_versions.clone();
+        for (span, version) in &self.pending_versions {
+            remember_version(&mut versions, span, version);
+        }
+        let mut filtered = Vec::new();
+        for op in ops {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            if !self.should_emit(op) {
+                continue;
+            }
+            if let Some(version) = &row.late_merge_version {
+                if !version_allowed(versions.get(&row.span_id), version) {
+                    continue;
+                }
+                remember_version(&mut versions, &row.span_id, version);
+            }
+            filtered.push(op.clone());
+        }
+        filtered
     }
 
     fn record_emitted(&mut self, ops: &[SpanOp]) {
@@ -181,6 +205,9 @@ impl DeliveryLedger {
             let row = match op {
                 SpanOp::Insert(row) | SpanOp::Merge(row) => row,
             };
+            if let Some(version) = &row.late_merge_version {
+                remember_version(&mut self.pending_versions, &row.span_id, version);
+            }
             if row.end_ms.is_some() {
                 self.pending.insert(row.span_id.clone());
             }
@@ -194,7 +221,10 @@ impl DeliveryLedger {
         self.pending.retain(|id| !self.known.contains(id));
         self.pending_late_merges
             .retain(|id| !self.known_late_merges.contains(id));
-        if self.pending.is_empty() && self.pending_late_merges.is_empty() {
+        if self.pending.is_empty()
+            && self.pending_late_merges.is_empty()
+            && self.pending_versions.is_empty()
+        {
             return Ok(());
         }
         // Only new acknowledgements are serialized. Retain pending state until
@@ -203,6 +233,7 @@ impl DeliveryLedger {
             &LedgerFile {
                 completed_span_ids: self.pending.clone(),
                 late_merge_ids: self.pending_late_merges.clone(),
+                late_merge_versions: self.pending_versions.clone(),
                 ..Default::default()
             },
             lock,
@@ -211,6 +242,9 @@ impl DeliveryLedger {
         self.known.extend(self.pending.drain());
         self.known_late_merges
             .extend(self.pending_late_merges.drain());
+        for (span, version) in self.pending_versions.drain() {
+            remember_version(&mut self.known_versions, &span, &version);
+        }
         Ok(())
     }
 
@@ -241,6 +275,26 @@ impl DeliveryLedger {
         file.flush().await?;
         self.journal_len += line.len() as u64;
         Ok(())
+    }
+}
+
+fn version_allowed(previous: Option<&LateMergeVersion>, next: &LateMergeVersion) -> bool {
+    previous.is_none_or(|previous| {
+        next.ts_ms >= previous.ts_ms
+            || (next.native_id.is_some() && next.native_id == previous.native_id)
+    })
+}
+
+fn remember_version(
+    versions: &mut HashMap<String, LateMergeVersion>,
+    span: &str,
+    next: &LateMergeVersion,
+) {
+    if versions
+        .get(span)
+        .is_none_or(|previous| next.ts_ms >= previous.ts_ms)
+    {
+        versions.insert(span.to_owned(), next.clone());
     }
 }
 
@@ -374,7 +428,7 @@ impl Sink for LedgerSink {
                     true
                 }
             });
-            filtered.retain(|op| ledger.should_emit(op));
+            filtered = ledger.filter(&filtered);
             Some(lock)
         } else {
             None
@@ -774,6 +828,7 @@ mod tests {
                 completed_span_ids: ledger.known,
                 late_merge_ids: ledger.known_late_merges,
                 span_origins: origins,
+                late_merge_versions: ledger.known_versions,
             })
             .unwrap(),
         )
@@ -962,6 +1017,92 @@ mod tests {
         assert_eq!(repeated.emit(&[partial_merge("span-1")]).await.unwrap(), 0);
         repeated.flush().await.unwrap();
         assert!(repeated_output.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregate_watermarks_reject_older_operations_but_allow_latest_native_enrichment() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = config("project-a");
+        let versioned = |key: &str, ts_ms, native: &str| {
+            let mut op = late_merge("root", key);
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut op;
+            row.late_merge_version = Some(LateMergeVersion {
+                ts_ms,
+                native_id: Some(native.into()),
+            });
+            op
+        };
+        let mut first = LedgerSink::new(
+            Box::new(RecordingSink::default()),
+            Some(temp.path()),
+            "muse",
+            "session",
+            Some(&cfg),
+            "test",
+        )
+        .await
+        .unwrap();
+        // Filtering must consider earlier rows in this same uncommitted batch.
+        assert_eq!(
+            first
+                .emit(&[
+                    versioned("t2-preview", 200, "t2"),
+                    versioned("t1-old", 100, "t1")
+                ])
+                .await
+                .unwrap(),
+            1
+        );
+        first.flush().await.unwrap();
+        drop(first);
+        let mut recovered = LedgerSink::new(
+            Box::new(RecordingSink::default()),
+            Some(temp.path()),
+            "muse",
+            "session",
+            Some(&cfg),
+            "test",
+        )
+        .await
+        .unwrap();
+        // Native exports precede hook capture timestamps, but belong to the
+        // same latest operation and can replace its truncated preview.
+        assert_eq!(
+            recovered
+                .emit(&[versioned("t2-full", 150, "t2")])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            recovered
+                .emit(&[versioned("t1-full", 190, "t1")])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            recovered
+                .emit(&[versioned("t2-full", 150, "t2")])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            recovered
+                .emit(&[versioned("t3-full", 201, "t3")])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            recovered
+                .emit(&[versioned("t2-different", 200, "t2")])
+                .await
+                .unwrap(),
+            0
+        );
+        recovered.flush().await.unwrap();
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 mod claude;
 mod codex;
 mod cursor;
+pub(crate) mod muse;
 mod opencode;
 mod pi;
 
@@ -39,6 +40,31 @@ pub(crate) trait ManagedRun: Agent {
         hook_command: &RunHookCommand,
         managed_run_id: &str,
     ) -> anyhow::Result<Injection>;
+
+    /// Combine invocation options with user arguments in the agent's native order.
+    fn invocation_args(
+        &self,
+        injection_args: Vec<OsString>,
+        agent_args: Vec<OsString>,
+    ) -> Vec<OsString> {
+        injection_args.into_iter().chain(agent_args).collect()
+    }
+
+    /// Agents that sanitize hook environments need an already-running daemon
+    /// and a private context file instead of relying on inherited settings.
+    fn needs_daemon_host(&self) -> bool {
+        false
+    }
+
+    fn inject_with_context(
+        &self,
+        hook: &RunHookCommand,
+        id: &str,
+        _route: &SessionRoute,
+        _socket: &std::path::Path,
+    ) -> anyhow::Result<Injection> {
+        self.inject(hook, id)
+    }
 }
 
 /// Whether the managed run's stdin and stdout are terminals.
@@ -64,7 +90,26 @@ pub(crate) struct Injection {
 pub async fn run_traced(
     args: RunArgs,
     hook_command: RunHookCommand,
+    route: SessionRoute,
+) -> anyhow::Result<std::process::ExitStatus> {
+    run_traced_inner(args, hook_command, route, None).await
+}
+
+/// Launch an agent whose sanitized hooks require the embedding daemon host.
+pub async fn run_traced_with_host(
+    args: RunArgs,
+    hook_command: RunHookCommand,
+    route: SessionRoute,
+    host: crate::HostInfo,
+) -> anyhow::Result<std::process::ExitStatus> {
+    run_traced_inner(args, hook_command, route, Some(host)).await
+}
+
+async fn run_traced_inner(
+    args: RunArgs,
+    hook_command: RunHookCommand,
     mut route: SessionRoute,
+    host: Option<crate::HostInfo>,
 ) -> anyhow::Result<std::process::ExitStatus> {
     apply_run_span_plugins(&mut route, &args.plugin)?;
     let name = args.source.identity().id;
@@ -86,23 +131,53 @@ pub async fn run_traced(
     }
     let (executable_env, default_executable) = agent.executable();
     let executable =
-        std::env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
+        env::var_os(executable_env).unwrap_or_else(|| OsString::from(default_executable));
     let managed_run_id = uuid::Uuid::new_v4().to_string();
-    let injection = agent.inject(&hook_command, &managed_run_id)?;
     // A caller-supplied socket is already an explicit daemon boundary (for
     // example an integration harness or a deliberately isolated runtime).
     // Only create our own boundary when environment auth would otherwise use
     // the ambient shared daemon.
-    let isolate_daemon = route.auth.effective_source() == wire::AuthSource::Environment
+    let isolate_daemon = (agent.needs_daemon_host()
+        || route.auth.effective_source() == wire::AuthSource::Environment)
         && env::var_os(paths::SOCKET_ENV).is_none();
     let isolated_runtime = isolate_daemon
         .then(|| ManagedRunRuntime::new(&managed_run_id))
         .transpose()?;
+    let socket = isolated_runtime
+        .as_ref()
+        .map(|runtime| runtime.socket.clone())
+        .unwrap_or_else(|| paths::socket_path(None));
+    let injection = agent.inject_with_context(&hook_command, &managed_run_id, &route, &socket)?;
+    if agent.needs_daemon_host() {
+        if let Some(host) = host.as_ref() {
+            // Sanitized hooks cannot spawn a daemon. Prepare the resolved
+            // endpoint even when the caller supplied a fresh explicit socket.
+            drop(
+                crate::client::ensure_daemon_in(
+                    &socket,
+                    host,
+                    false,
+                    isolated_runtime
+                        .as_ref()
+                        .map(|runtime| runtime.temp_dir.path()),
+                )
+                .await?,
+            );
+        } else {
+            // Existing callers without host information may use an already
+            // listening explicit daemon, but must never launch untraceable work.
+            drop(crate::transport::connect(&socket).await.map_err(|_| {
+                anyhow::anyhow!(
+                    "Muse managed runs require run_traced_with_host to start a daemon at {}",
+                    socket.display()
+                )
+            })?);
+        }
+    }
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut command: tokio::process::Command = subprocess::interactive_command(&executable).into();
     command
-        .args(injection.args)
-        .args(args.agent_args)
+        .args(agent.invocation_args(injection.args, args.agent_args))
         .env("_BT_TRACE_MANAGED_RUN", "1")
         .env(MANAGED_RUN_ID_ENV, &managed_run_id)
         .env(settings::INVOCATION_SETTINGS_ENV, invocation_settings);
@@ -113,9 +188,18 @@ pub async fn run_traced(
     }
     command.envs(injection.env);
     let _guards = injection.guards;
-    let mut child = command.spawn().map_err(|error| {
-        anyhow::anyhow!("failed to launch {}: {error}", executable.to_string_lossy())
-    })?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if agent.needs_daemon_host() && isolated_runtime.is_some() {
+                let _ = shutdown_daemon(&socket).await;
+            }
+            return Err(anyhow::anyhow!(
+                "failed to launch {}: {error}",
+                executable.to_string_lossy()
+            ));
+        }
+    };
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
 
@@ -240,6 +324,7 @@ mod tests {
     fn every_run_source_has_a_registered_managed_run() {
         for source in [
             RunSource::Codex,
+            RunSource::Muse,
             RunSource::Cursor,
             RunSource::Claude,
             RunSource::OpenCode,
