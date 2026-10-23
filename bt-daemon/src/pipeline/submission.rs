@@ -54,7 +54,10 @@ impl std::error::Error for Failure {
 
 impl Failure {
     fn classify(cause: anyhow::Error) -> Self {
-        let retry = match cause.downcast_ref::<braintrust_sdk_rust::BraintrustError>() {
+        let retry = match cause
+            .chain()
+            .find_map(|source| source.downcast_ref::<braintrust_sdk_rust::BraintrustError>())
+        {
             Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. }) => {
                 RetryCondition::Credentials
             }
@@ -68,6 +71,8 @@ impl Failure {
             | Some(braintrust_sdk_rust::BraintrustError::Http(_))
             | Some(braintrust_sdk_rust::BraintrustError::Network(_))
             | Some(braintrust_sdk_rust::BraintrustError::ChannelClosed)
+            | Some(braintrust_sdk_rust::BraintrustError::Admission(_))
+            | Some(braintrust_sdk_rust::BraintrustError::Execution(_))
             | None => RetryCondition::Transient,
             Some(_) => RetryCondition::Configuration { recheck: false },
         };

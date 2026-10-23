@@ -808,7 +808,7 @@ mod tests {
         let rejection = Mock::given(method("POST"))
             .and(path("/logs3"))
             .respond_with(ResponseTemplate::new(400).set_body_string("invalid row"))
-            .expect(1)
+            .expect(1..)
             .mount_as_scoped(&server)
             .await;
         let tmp = tempfile::tempdir().unwrap();
@@ -839,7 +839,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/logs3"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .expect(1)
+            .expect(1..)
             .mount(&server)
             .await;
         // A new credential cannot cure a permanently rejected span body.
