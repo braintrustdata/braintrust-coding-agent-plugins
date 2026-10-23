@@ -158,8 +158,6 @@ pub struct DoctorCommandOutput {
     pub daemon: DaemonDiagnostic,
     pub warnings: Vec<String>,
     pub plugin_diagnostics: Vec<crate::PluginDiagnostic>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codex_hooks: Option<crate::CodexHookReadiness>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,14 +275,6 @@ impl TraceCommandOutput {
                 }
                 for warning in &doctor.warnings {
                     rendered.push_str(&format!("\nWarning: {warning}"));
-                }
-                if let Some(hooks) = &doctor.codex_hooks {
-                    rendered.push_str(&format!("\nCodex hook trust: {}\n{}\nHooks: {} loaded, {} trusted, {} require review, {} disabled",
-                        hooks.state, hooks.detail, hooks.hook_count, hooks.trusted_count,
-                        hooks.review_required_count, hooks.disabled_count));
-                    if !hooks.missing_events.is_empty() {
-                        rendered.push_str(&format!("\nMissing hook events: {}", hooks.missing_events.join(", ")));
-                    }
                 }
                 for diagnostic in &doctor.plugin_diagnostics {
                     rendered.push_str(&format!(
@@ -567,15 +557,6 @@ mod tests {
                 error: None,
             },
             warnings: Vec::new(),
-            codex_hooks: Some(crate::CodexHookReadiness {
-                state: crate::CodexHookState::ReviewRequired,
-                hook_count: 10,
-                trusted_count: 0,
-                disabled_count: 0,
-                review_required_count: 10,
-                missing_events: Vec::new(),
-                detail: "Open /hooks to review Braintrust definitions".into(),
-            }),
             plugin_diagnostics: vec![crate::PluginDiagnostic {
                 source: "codex".into(),
                 plugin_path: PathBuf::from("/tmp/redact.mjs"),
@@ -592,11 +573,6 @@ mod tests {
         assert_eq!(value["auth"]["source"], "saved_profile");
         assert_eq!(value["daemon"]["status"], "running");
         assert_eq!(value["daemon"]["auth"]["status"], "error");
-        assert_eq!(value["codex_hooks"]["state"], "review_required");
-        assert!(output
-            .render(OutputFormat::Human)
-            .unwrap()
-            .contains("10 require review"));
         assert_eq!(
             value["daemon"]["session_errors"][0],
             "could not resolve Braintrust auth for codex"

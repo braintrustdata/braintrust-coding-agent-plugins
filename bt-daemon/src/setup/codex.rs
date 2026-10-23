@@ -5,7 +5,6 @@ use super::common::{
 };
 use crate::agents::Codex;
 use crate::setup::Setup;
-use anyhow::bail;
 use serde_json::Value;
 
 const MARKETPLACE_NAME: &str = "braintrust-codex-plugins";
@@ -63,7 +62,9 @@ impl Setup for Codex {
 
     fn update(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
         if installed_plugin(&list_plugins(runner)?).is_none() {
-            bail!("Codex tracing plugin is not installed; run `bt trace enable codex`");
+            // Setup owns the desired state: repair a removed plugin the same
+            // way enable does, then let the caller reapply and verify trust.
+            return self.enable(runner);
         }
         MARKETPLACE.refresh_published(runner, "Codex", "codex")?;
         runner.run("codex", &["plugin", "add", PLUGIN])
@@ -138,14 +139,18 @@ mod tests {
     }
 
     #[test]
-    fn update_refuses_to_install_a_missing_plugin() {
-        let mut runner = FakeRunner::new([serde_json::json!({"installed": []})]);
+    fn update_repairs_a_missing_plugin() {
+        let mut runner = FakeRunner::new([
+            serde_json::json!({"installed": []}),
+            serde_json::json!({"marketplaces": []}),
+        ]);
 
-        assert!(Codex.update(&mut runner).is_err());
-        assert!(!runner
-            .calls
-            .iter()
-            .any(|call| call.starts_with("codex plugin add ")));
+        Codex.update(&mut runner).unwrap();
+
+        assert!(
+            runner.called("codex plugin marketplace add braintrustdata/braintrust-codex-plugin")
+        );
+        assert!(runner.called("codex plugin add trace-codex@braintrust-codex-plugins"));
     }
 
     #[test]

@@ -497,26 +497,14 @@ async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorComma
     let source = args.agent.identity().id;
     let settings = crate::settings::AgentSettings::load(source);
     let socket = paths::socket_path(None);
-    let inspect_hooks = matches!(args.agent, DoctorAgent::Codex) && settings.tracing_enabled();
-    let hooks = async {
-        if inspect_hooks {
-            Some(crate::codex_hooks::probe().await)
-        } else {
-            None
-        }
-    };
-    let (mut output, hooks) = tokio::join!(
-        doctor_output_at(
-            host,
-            args,
-            &socket,
-            paths::agent_settings_path(source, None),
-            settings,
-        ),
-        hooks
-    );
-    output.codex_hooks = hooks;
-    output
+    doctor_output_at(
+        host,
+        args,
+        &socket,
+        paths::agent_settings_path(source, None),
+        settings,
+    )
+    .await
 }
 
 async fn doctor_output_at(
@@ -646,7 +634,6 @@ async fn doctor_output_at(
         daemon,
         warnings,
         plugin_diagnostics,
-        codex_hooks: None,
     }
 }
 
@@ -671,7 +658,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             let codex = matches!(enable_args.agent, SetupAgent::Codex);
             let output = run_enable(enable_args, route)?;
             if codex {
-                crate::codex_hooks::activate(false).await?;
+                crate::codex_hooks::activate().await?;
             }
             print_output(output, host.output_format)
         }
@@ -682,7 +669,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             let codex = matches!(update_args.agent, SetupAgent::Codex);
             let output = crate::run_update(update_args.agent)?;
             if codex {
-                crate::codex_hooks::activate(true).await?;
+                crate::codex_hooks::activate().await?;
             }
             print_output(output, host.output_format)
         }

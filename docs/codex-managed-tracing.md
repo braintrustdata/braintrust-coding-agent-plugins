@@ -18,7 +18,10 @@ definitions bundled with this version of `bt`, including Windows commands, and
 checks that Codex reports the expected commands and lifecycle events. Unexpected
 definitions fail activation; update `bt` and retry. Unrelated hook trust and
 existing configuration are preserved. Already trusted definitions need no write.
-Update preserves disabled hooks rather than enabling them.
+Setup repairs a removed plugin by installing it again. If a user or Codex
+changes hook definitions or trust, setup reapplies trust to the exact packaged
+definitions and verifies the result. Codex-level hook disablement prevents
+activation and is reported as a setup error.
 
 An unsupported API, failed write, missing definition, or configuration error makes
 setup report an activation failure instead of claiming success. Older Codex
@@ -30,12 +33,11 @@ write persistent trust or change the user's global plugin settings. The
 invocation-wide `--dangerously-bypass-hook-trust` flag is not used and remains
 rejected by `bt trace run codex`.
 
-`bt trace doctor codex` remains read-only. It probes the installed Codex app
-server for the current directory and distinguishes trusted, review-required,
-disabled, missing, erroneous, and unknown configurations. Trust readiness does
-not prove capture or delivery. See the
-[official OpenAI hook documentation](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks)
-for Codex's trust model.
+`bt trace doctor codex` reports tracing route, authentication, daemon, and
+plugin failures. Setup owns plugin installation and hook trust, so doctor does
+not duplicate that status. See the [official OpenAI hook
+documentation](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks) for
+Codex's trust model.
 
 ## Administrator-managed local Codex hooks
 
@@ -142,17 +144,14 @@ Keep all lifecycle events so sessions, turns, tools, and subagents retain their
 normal trace structure. Codex does not distribute the executable itself. The
 managed policy must include `Interrupt` to observe cancellation records even
 when the session stays idle, and `SessionEnd` to observe session termination.
-Doctor checks these managed-only requirements separately from the packaged
-plugin's event set. It reports a configuration error if plugin and managed
-Braintrust capture are both enabled, including after a later `bt trace enable
-codex` reinstalls the plugin. Keep only one capture source active.
+Keep only one capture source active; enabling the user plugin while this
+managed policy is active can forward lifecycle events twice.
 
 The policy above enables hooks without disabling other hook sources; an organization
 may separately choose `allow_managed_hooks_only` if that is its intended policy.
 
-After deployment, restart Codex and inspect `/hooks`: Braintrust definitions
-should be managed and enabled. Run `bt trace doctor codex` from the actual project
-directory, then run a short session and verify its matching trace in Braintrust.
+After deployment, restart Codex and run a short session, then verify its
+matching trace in Braintrust.
 A running daemon, trusted definitions, or historical traces alone do not confirm
 that the newly deployed path delivered the session.
 
