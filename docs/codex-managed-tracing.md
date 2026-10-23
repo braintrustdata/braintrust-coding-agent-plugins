@@ -112,11 +112,26 @@ command_windows = 'C:\Braintrust\bt.exe trace hook --source codex'
 type = "command"
 command = "/opt/company/braintrust/bt trace hook --source codex"
 command_windows = 'C:\Braintrust\bt.exe trace hook --source codex'
+timeout = 3
+
+[[hooks.Interrupt]]
+[[hooks.Interrupt.hooks]]
+type = "command"
+command = "/opt/company/braintrust/bt trace hook --source codex"
+command_windows = 'C:\Braintrust\bt.exe trace hook --source codex'
+timeout = 3
 ```
 
 Keep all lifecycle events so sessions, turns, tools, and subagents retain their
 normal trace structure. Codex does not distribute the executable itself. The
-policy above enables hooks without disabling other hook sources; an organization
+managed policy must include `Interrupt` to observe cancellation records even
+when the session stays idle, and `SessionEnd` to observe session termination.
+Doctor checks these managed-only requirements separately from the packaged
+plugin's event set. It reports a configuration error if plugin and managed
+Braintrust capture are both enabled, including after a later `bt trace enable
+codex` reinstalls the plugin. Keep only one capture source active.
+
+The policy above enables hooks without disabling other hook sources; an organization
 may separately choose `allow_managed_hooks_only` if that is its intended policy.
 
 After deployment, restart Codex and inspect `/hooks`: Braintrust definitions

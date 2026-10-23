@@ -13,7 +13,7 @@ use tokio::io::{
 
 const PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
 const TIMEOUT: Duration = Duration::from_secs(5);
-const EVENTS: &[&str] = &[
+const PLUGIN_EVENTS: &[&str] = &[
     "sessionStart",
     "userPromptSubmit",
     "preToolUse",
@@ -25,6 +25,9 @@ const EVENTS: &[&str] = &[
     "subagentStop",
     "stop",
 ];
+// Managed policy is independent of the marketplace artifact and must observe
+// terminal lifecycle records even when no subsequent hook fires.
+const MANAGED_EXTRA_EVENTS: &[&str] = &["interrupt", "sessionEnd"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -191,6 +194,8 @@ fn classify(hooks: &Value, config: &Value, plugins: &Value) -> anyhow::Result<Co
         .and_then(Value::as_array)
         .context("hooks/list has no data array")?;
     let mut selected = Vec::new();
+    let mut plugin_hooks = Vec::new();
+    let mut managed_hooks = Vec::new();
     let mut has_errors = false;
     for entry in entries {
         has_errors |= entry
@@ -208,6 +213,11 @@ fn classify(hooks: &Value, config: &Value, plugins: &Value) -> anyhow::Result<Co
                     .get("command")
                     .and_then(Value::as_str)
                     .is_some_and(|command| command.ends_with(" trace hook --source codex"));
+            if is_plugin {
+                plugin_hooks.push(hook);
+            } else if is_managed {
+                managed_hooks.push(hook);
+            }
             if is_plugin || is_managed {
                 selected.push(hook);
             }
@@ -219,13 +229,26 @@ fn classify(hooks: &Value, config: &Value, plugins: &Value) -> anyhow::Result<Co
         trusted_count: 0,
         disabled_count: 0,
         review_required_count: 0,
-        missing_events: EVENTS
+        missing_events: PLUGIN_EVENTS
             .iter()
             .filter(|event| {
-                !selected
-                    .iter()
-                    .any(|hook| hook.get("eventName").and_then(Value::as_str) == Some(**event))
+                // Check each source separately: a hook from one source cannot
+                // complete a partial definition in another source.
+                let has_event = |hooks: &[&Value]| {
+                    hooks
+                        .iter()
+                        .any(|hook| hook.get("eventName").and_then(Value::as_str) == Some(**event))
+                };
+                selected.is_empty()
+                    || (!plugin_hooks.is_empty() && !has_event(&plugin_hooks))
+                    || (!managed_hooks.is_empty() && !has_event(&managed_hooks))
             })
+            .chain(MANAGED_EXTRA_EVENTS.iter().filter(|event| {
+                !managed_hooks.is_empty()
+                    && !managed_hooks
+                        .iter()
+                        .any(|hook| hook.get("eventName").and_then(Value::as_str) == Some(**event))
+            }))
             .map(|event| (*event).to_owned())
             .collect(),
         detail: String::new(),
@@ -271,7 +294,15 @@ fn classify(hooks: &Value, config: &Value, plugins: &Value) -> anyhow::Result<Co
             && plugin.is_some_and(|plugin| {
                 plugin.get("enabled").and_then(Value::as_bool) == Some(false)
             });
-    let (state, detail) = if disabled || readiness.disabled_count > 0 {
+    let enabled = |hooks: &[&Value]| {
+        hooks
+            .iter()
+            .any(|hook| hook.get("enabled").and_then(Value::as_bool) == Some(true))
+    };
+    let duplicate_capture = enabled(&plugin_hooks) && enabled(&managed_hooks);
+    let (state, detail) = if duplicate_capture {
+        (CodexHookState::ConfigurationError, "Both plugin and managed Braintrust hooks are enabled, which can forward lifecycle events twice. Remove trace-codex@braintrust-codex-plugins from Codex when using managed capture, or remove the managed Braintrust policy when using the plugin.")
+    } else if disabled || readiness.disabled_count > 0 {
         (CodexHookState::Disabled, "Codex hooks or the Braintrust plugin are disabled. Enable them in Codex and inspect /hooks.")
     } else if has_errors {
         (CodexHookState::ConfigurationError, "Codex reported hook configuration errors. Inspect /hooks and Codex startup diagnostics.")
@@ -302,12 +333,124 @@ mod tests {
     use super::*;
 
     fn snapshot(trust: &str) -> Value {
-        json!({"data":[{"errors":[],"hooks":EVENTS.iter().map(|event|json!({
+        json!({"data":[{"errors":[],"hooks":PLUGIN_EVENTS.iter().map(|event|json!({
             "eventName":event,"pluginId":PLUGIN,"enabled":true,"trustStatus":trust
         })).collect::<Vec<_>>()}]})
     }
     fn installed() -> Value {
         json!({"marketplaces":[{"plugins":[{"id":PLUGIN,"installed":true,"enabled":true}]}]})
+    }
+
+    fn managed_snapshot() -> Value {
+        let hooks: Vec<_> = PLUGIN_EVENTS
+            .iter()
+            .chain(MANAGED_EXTRA_EVENTS)
+            .map(|event| {
+                json!({
+                    "eventName":event,"pluginId":null,"enabled":true,"trustStatus":"managed",
+                    "isManaged":true,"command":"/enterprise/bt trace hook --source codex"
+                })
+            })
+            .collect();
+        json!({"data":[{"errors":[],"hooks":hooks}]})
+    }
+
+    #[test]
+    fn managed_capture_requires_interrupt_and_session_end_without_changing_plugin_requirements() {
+        let config = json!({"config":{}});
+        let plugins = json!({"marketplaces":[]});
+        for missing in MANAGED_EXTRA_EVENTS {
+            let mut managed = managed_snapshot();
+            managed["data"][0]["hooks"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|hook| hook["eventName"] != *missing);
+            let result = classify(&managed, &config, &plugins).unwrap();
+            assert_eq!(result.state, CodexHookState::MissingHooks);
+            assert_eq!(result.missing_events, [*missing]);
+        }
+        let plugin = classify(&snapshot("trusted"), &config, &installed()).unwrap();
+        assert_eq!(plugin.state, CodexHookState::Trusted);
+        assert!(plugin.missing_events.is_empty());
+        let managed = classify(&managed_snapshot(), &config, &plugins).unwrap();
+        assert_eq!(managed.state, CodexHookState::Trusted);
+        assert!(managed.missing_events.is_empty());
+
+        let policy = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/codex-managed-tracing.md"
+        ));
+        for event in PLUGIN_EVENTS.iter().chain(MANAGED_EXTRA_EVENTS) {
+            let event = format!("{}{}", event[..1].to_ascii_uppercase(), &event[1..]);
+            assert!(
+                policy.contains(&format!("[[hooks.{event}.hooks]]")),
+                "policy omits {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn simultaneous_enabled_plugin_and_managed_capture_is_a_configuration_error() {
+        let config = json!({"config":{}});
+        let mut mixed = snapshot("trusted");
+        mixed["data"][0]["hooks"].as_array_mut().unwrap().extend(
+            managed_snapshot()["data"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        let result = classify(&mixed, &config, &installed()).unwrap();
+        assert_eq!(result.state, CodexHookState::ConfigurationError);
+        assert!(result.detail.contains("events twice"));
+
+        // A plugin hook cannot fill a missing terminal event in managed policy.
+        mixed["data"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|hook| hook["eventName"] != "interrupt");
+        let mut plugin_interrupt = snapshot("trusted")["data"][0]["hooks"][0].clone();
+        plugin_interrupt["eventName"] = json!("interrupt");
+        mixed["data"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(plugin_interrupt);
+        assert_eq!(
+            classify(&mixed, &config, &installed())
+                .unwrap()
+                .missing_events,
+            ["interrupt"]
+        );
+
+        let mut unrelated = snapshot("trusted");
+        let mut managed = managed_snapshot();
+        for hook in managed["data"][0]["hooks"].as_array_mut().unwrap() {
+            hook["command"] = json!("/enterprise/bt trace hook --source claude-code");
+        }
+        unrelated["data"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .extend(
+                managed["data"][0]["hooks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+        assert_eq!(
+            classify(&unrelated, &config, &installed()).unwrap().state,
+            CodexHookState::Trusted
+        );
+
+        for hook in mixed["data"][0]["hooks"].as_array_mut().unwrap() {
+            if hook["isManaged"] == true {
+                hook["enabled"] = json!(false);
+            }
+        }
+        assert_eq!(
+            classify(&mixed, &config, &installed()).unwrap().state,
+            CodexHookState::Disabled
+        );
     }
 
     #[test]
@@ -325,7 +468,10 @@ mod tests {
             .collect();
         assert_eq!(
             events,
-            EVENTS.iter().map(|event| (*event).to_owned()).collect()
+            PLUGIN_EVENTS
+                .iter()
+                .map(|event| (*event).to_owned())
+                .collect()
         );
     }
 
@@ -372,12 +518,7 @@ mod tests {
             .state,
             CodexHookState::Disabled
         );
-        let mut managed = snapshot("managed");
-        for hook in managed["data"][0]["hooks"].as_array_mut().unwrap() {
-            hook["pluginId"] = Value::Null;
-            hook["isManaged"] = json!(true);
-            hook["command"] = json!("/enterprise/bt trace hook --source codex");
-        }
+        let managed = managed_snapshot();
         assert_eq!(
             classify(&managed, &config, &json!({"marketplaces":[]}))
                 .unwrap()
@@ -492,7 +633,7 @@ mod tests {
             CodexHookState::ReviewRequired,
             "{readiness:?}"
         );
-        assert_eq!(readiness.review_required_count, EVENTS.len());
+        assert_eq!(readiness.review_required_count, PLUGIN_EVENTS.len());
         assert!(readiness.missing_events.is_empty());
     }
 }
