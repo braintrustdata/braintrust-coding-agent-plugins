@@ -28,10 +28,10 @@ const PLUGIN_EVENTS: &[&str] = &[
     "subagentStart",
     "subagentStop",
     "stop",
+    "interrupt",
+    "sessionEnd",
 ];
-// Managed policy is independent of the marketplace artifact and must observe
-// terminal lifecycle records even when no subsequent hook fires.
-const MANAGED_EXTRA_EVENTS: &[&str] = &["interrupt", "sessionEnd"];
+const MANAGED_EXTRA_EVENTS: &[&str] = &[];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +209,141 @@ async fn inspect_at(
         Ok(Err(error)) => CodexHookReadiness::unknown(error),
         Err(_) => CodexHookReadiness::unknown("probe timed out after 5 seconds"),
     }
+}
+
+/// Build a command-line-scoped hooks.state value for Codex managed runs. The
+/// keys and hashes come from Codex after it has loaded our exact hook overrides.
+pub(crate) async fn run_trust_override(
+    program: &std::ffi::OsStr,
+    cwd: &Path,
+    hook_args: &[std::ffi::OsString],
+    expected_command: &str,
+) -> anyhow::Result<std::ffi::OsString> {
+    let mut command: tokio::process::Command =
+        crate::subprocess::background_command(program).into();
+    command
+        .arg("--no-daemon")
+        .args(hook_args)
+        .args(["app-server", "--stdio"])
+        .current_dir(cwd)
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .context("start Codex to prepare managed hook trust")?;
+    let result =
+        tokio::time::timeout(TIMEOUT, async {
+            let mut stdin = child.stdin.take().context("Codex stdin unavailable")?;
+            let stdout = child.stdout.take().context("Codex stdout unavailable")?;
+            let mut stdout = BufReader::new(stdout.take(8 * 1024 * 1024));
+            request(&mut stdin, &mut stdout, 1, "initialize", json!({
+            "clientInfo":{"name":"braintrust_trace_run","version":env!("CARGO_PKG_VERSION")},
+            "capabilities":{"experimentalApi":true}
+        })).await?;
+            stdin.write_all(b"{\"method\":\"initialized\"}\n").await?;
+            let hooks = request(
+                &mut stdin,
+                &mut stdout,
+                2,
+                "hooks/list",
+                json!({"cwds":[cwd]}),
+            )
+            .await?;
+            managed_run_trust_state(&hooks, expected_command)
+        })
+        .await;
+    let _ = child.kill().await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "Codex managed hook trust inspection timed out after 5 seconds"
+        )),
+    }
+}
+
+fn managed_run_trust_state(
+    hooks: &Value,
+    expected_command: &str,
+) -> anyhow::Result<std::ffi::OsString> {
+    let expected: Value = serde_json::from_str(PACKAGED_HOOKS)?;
+    let expected_events: std::collections::HashSet<String> = expected["hooks"]
+        .as_object()
+        .context("packaged hooks missing")?
+        .keys()
+        .map(|event| format!("{}{}", event[..1].to_ascii_lowercase(), &event[1..]))
+        .collect();
+    let entries = hooks["data"]
+        .as_array()
+        .context("hooks/list has no data array")?;
+    let mut seen = std::collections::HashSet::new();
+    let mut trust = std::collections::BTreeMap::new();
+    for entry in entries {
+        anyhow::ensure!(
+            entry["errors"].as_array().is_some_and(Vec::is_empty),
+            "Codex reported hook errors during managed-run setup"
+        );
+        for hook in entry["hooks"]
+            .as_array()
+            .context("hooks/list entry has no hooks array")?
+        {
+            if hook["source"] != "sessionFlags" {
+                continue;
+            }
+            let Some(event) = hook["eventName"].as_str() else {
+                continue;
+            };
+            if !expected_events.contains(event) {
+                continue;
+            }
+            anyhow::ensure!(
+                seen.insert(event.to_owned())
+                    && hook["handlerType"] == "command"
+                    && hook["command"] == expected_command
+                    && hook["enabled"] == true
+                    && hook["isManaged"] == false,
+                "Codex changed a Braintrust hook while preparing this run"
+            );
+            anyhow::ensure!(
+                matches!(
+                    hook["trustStatus"].as_str(),
+                    Some("trusted" | "untrusted" | "modified")
+                ),
+                "Codex reported an unsupported trust state for a managed Braintrust hook"
+            );
+            let key = hook["key"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .context("Codex omitted a managed Braintrust hook key")?;
+            let hash = hook["currentHash"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .context("Codex omitted a managed Braintrust hook hash")?;
+            anyhow::ensure!(
+                trust.insert(key.to_owned(), hash.to_owned()).is_none(),
+                "duplicate managed Braintrust hook key"
+            );
+        }
+    }
+    anyhow::ensure!(
+        seen == expected_events,
+        "Codex did not load the complete Braintrust hook set for this run"
+    );
+    let fields = trust
+        .iter()
+        .map(|(key, hash)| {
+            Ok(format!(
+                "{}={{trusted_hash={}}}",
+                serde_json::to_string(key)?,
+                serde_json::to_string(hash)?
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .join(",");
+    Ok(std::ffi::OsString::from(format!(
+        "hooks.state={{{fields}}}"
+    )))
 }
 
 /// Validate the complete installed file, including the other platform's command,

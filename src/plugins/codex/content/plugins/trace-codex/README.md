@@ -22,7 +22,9 @@ bt trace enable codex --project my-coding-agent
 ```
 
 Use `--profile` or `--org` when needed. Setup automatically trusts the installed
-Braintrust hook definitions through Codex's configuration API. Restart Codex after
+Braintrust hook definitions through Codex's configuration API. The same packaged
+event definitions are used by `bt trace run codex`; run trust is scoped to that
+Codex invocation. Restart Codex after
 setup so it loads the plugin and trust settings. `bt trace update codex` refreshes
 the plugin and trusts its current definitions, preserving unrelated hooks and
 explicitly disabled hook settings.
