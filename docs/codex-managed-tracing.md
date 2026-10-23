@@ -24,8 +24,11 @@ An unsupported API, failed write, missing definition, or configuration error mak
 setup report an activation failure instead of claiming success. Older Codex
 versions can still use manual approval through `/hooks`. After a marketplace
 update changes definitions, run `bt trace update codex` to trust the current
-Braintrust definitions. The invocation-wide `--dangerously-bypass-hook-trust`
-flag is not used; `bt trace run codex` continues to reject it.
+Braintrust definitions. For `bt trace run codex`, the same packaged definitions and exact Codex keys and
+hashes are passed as invocation-only command-line configuration. Run does not
+write persistent trust or change the user's global plugin settings. The
+invocation-wide `--dangerously-bypass-hook-trust` flag is not used and remains
+rejected by `bt trace run codex`.
 
 `bt trace doctor codex` remains read-only. It probes the installed Codex app
 server for the current directory and distinguishes trusted, review-required,
