@@ -8,6 +8,8 @@ runs:
   using: composite
   steps:
     # pnpm/action-setup cannot read .tool-versions, so resolve the version here.
+    # pnpm also switches to each package's packageManager version, so require
+    # those to match the pin rather than silently running a different pnpm.
     - name: Read pnpm version
       id: versions
       shell: bash
@@ -17,6 +19,15 @@ runs:
           echo "::error file=.tool-versions::missing pnpm entry"
           exit 1
         fi
+        status=0
+        for manifest in "$GITHUB_WORKSPACE"/src/plugins/*/content/package.json; do
+          actual="$(sed -n 's/^ *"packageManager": *"\(pnpm@[^"]*\)".*/\1/p' "$manifest")"
+          if [ -n "$actual" ] && [ "$actual" != "pnpm@$pnpm_version" ]; then
+            echo "::error file=${manifest#"$GITHUB_WORKSPACE"/}::packageManager is $actual; .tool-versions pins pnpm@$pnpm_version"
+            status=1
+          fi
+        done
+        [ "$status" = 0 ] || exit 1
         echo "pnpm=$pnpm_version" >> "$GITHUB_OUTPUT"
     - name: Set up pnpm
       uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0

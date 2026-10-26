@@ -41,19 +41,6 @@ jobs:
             echo "OpenCode still contains a Bun lockfile" >&2
             exit 1
           fi
-      - name: Check packageManager matches .tool-versions
-        shell: bash
-        run: |
-          expected="pnpm@$(awk '$1 == "pnpm" { print $2 }' .tool-versions)"
-          status=0
-          for manifest in src/plugins/opencode/content/package.json src/plugins/pi/content/package.json; do
-            actual="$(node -p 'require(process.argv[1]).packageManager' "$PWD/$manifest")"
-            if [ "$actual" != "$expected" ]; then
-              echo "::error file=$manifest::packageManager is $actual; .tool-versions pins $expected"
-              status=1
-            fi
-          done
-          exit "$status"
       - name: Build and validate plugins
         run: make test
       - name: Package Cursor extension
