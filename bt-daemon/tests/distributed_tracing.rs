@@ -820,6 +820,7 @@ async fn indistinguishable_concurrent_tools_attach_to_the_known_session() {
     }
     flush("ambiguous-child", &socket).await;
 
+    flush("ambiguous-parent", &socket).await;
     assert_attached_to_session(recording.as_ref(), "ambiguous-parent", "ambiguous-child");
 
     shutdown_daemon(&socket).await.unwrap();
@@ -1411,6 +1412,7 @@ async fn completed_tools_are_not_candidates_for_later_children() {
         )
         .await;
         flush(&child_session, &socket).await;
+        flush(&parent_session, &socket).await;
         assert_attached_to_session(recording.as_ref(), &parent_session, &child_session);
     }
 
@@ -1514,6 +1516,7 @@ async fn child_output_does_not_guess_between_concurrent_tools() {
     .await;
     flush("output-child", &socket).await;
 
+    flush("output-parent", &socket).await;
     assert_attached_to_session(recording.as_ref(), "output-parent", "output-child");
 
     shutdown_daemon(&socket).await.unwrap();
@@ -1837,6 +1840,7 @@ async fn open_tool_prevents_idle_retirement_during_a_long_child_spawn() {
     )
     .await;
     flush("idle-child", &socket).await;
+    flush("idle-parent", &socket).await;
     assert_pair_linked(
         recording.as_ref(),
         "idle-parent",
@@ -1906,6 +1910,7 @@ async fn retired_parent_still_parents_a_child_from_its_next_tool() {
     flush("thinking-child", &socket).await;
     // The revived parent pipeline replays its root without redelivering it,
     // so only the new tool row is in its latest recording.
+    flush("thinking-parent", &socket).await;
     let parent_rows = inserted_rows(&recording.session("thinking-parent"));
     let tool = parent_rows
         .iter()
@@ -2015,6 +2020,7 @@ async fn concurrent_ambiguous_children_do_not_deadlock_or_cross_link() {
     }
     for (_, session, _) in &child_cases {
         flush(session, &socket).await;
+        flush("deadlock-parent", &socket).await;
         assert_attached_to_session(recording.as_ref(), "deadlock-parent", session);
     }
 
@@ -2090,6 +2096,7 @@ async fn one_tool_can_fan_out_to_concurrent_children_of_every_agent() {
         )
         .await;
         flush(session, &socket).await;
+        flush(parent_session, &socket).await;
         assert_pair_linked(
             recording.as_ref(),
             parent_session,
@@ -2521,6 +2528,7 @@ async fn standalone_parentage_is_not_reconsidered_on_later_session_start() {
     .await;
     flush("late-tool-child", &socket).await;
     // A later tool must not move a child already attached to its session.
+    flush("late-tool-parent", &socket).await;
     assert_attached_to_session(recording.as_ref(), "late-tool-parent", "late-tool-child");
 
     shutdown_daemon(&socket).await.unwrap();
@@ -2582,6 +2590,7 @@ async fn unconfirmed_child_is_visible_and_delivered_without_more_events() {
         assert_standalone(recording.as_ref(), "bounded-child");
         // No parent completion event has been sent: optional correlation must
         // not wait for the spawning tool to finish before delivering the root.
+        flush("bounded-parent", &socket).await;
         let parent = recording.session("bounded-parent");
         let parent_rows = inserted_rows(&parent);
         let tool = parent_rows
@@ -2724,6 +2733,7 @@ async fn explicit_parent_and_child_route_settings_win_over_ancestry() {
             assert_eq!(root.parent_span_ids, vec!["external-parent".to_owned()]);
             assert_eq!(root.root_span_id, "external-root");
         } else {
+            flush("bounded-parent", &socket).await;
             assert_pair_linked(
                 recording.as_ref(),
                 "bounded-parent",
@@ -3124,7 +3134,7 @@ async fn pending_child(
 }
 
 async fn wait_for_root(recording: &RecordingSinkFactory, session: &str) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let record = recording.sessions.lock().unwrap().get(session).cloned();
             if record.is_some_and(|record| {
@@ -3144,7 +3154,7 @@ async fn wait_for_root(recording: &RecordingSinkFactory, session: &str) {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("root for {session} was not delivered within 10 seconds"));
+    .unwrap_or_else(|_| panic!("root for {session} was not delivered within 45 seconds"));
 }
 
 fn assert_standalone(recording: &RecordingSinkFactory, session: &str) {

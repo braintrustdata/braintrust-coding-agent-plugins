@@ -338,11 +338,17 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
         .iter()
         .map(|(key, session)| (key.clone(), session.clone()))
         .collect();
+    let mut draining = tokio::task::JoinSet::new();
     for (key, session) in sessions {
         let target = targets
             .get(&crate::ids::session_namespace(&key.source, &key.session_id))
             .copied();
-        session.shutdown_through(target).await;
+        draining.spawn(async move { session.shutdown_through(target).await });
+    }
+    while let Some(result) = draining.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "route shutdown failed");
+        }
     }
     let sources: Vec<_> = daemon.translations.lock().values().cloned().collect();
     for source in sources {

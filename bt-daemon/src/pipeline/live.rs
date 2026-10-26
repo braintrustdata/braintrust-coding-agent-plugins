@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 pub(crate) type SharedOp = CowSpanOp;
 pub(crate) const BYTE_BUDGET: usize = 256 * 1024;
-pub(crate) const WINDOW: std::time::Duration = std::time::Duration::from_millis(5);
+pub(crate) const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) struct Record {
     pub position: u64,

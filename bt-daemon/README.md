@@ -311,7 +311,8 @@ canonical insert/merge operations as they become available and hands the same
 operations directly to the route multiplexer. Routes share owned copy-on-write
 references; route overlays and plugins cannot change another route's operation.
 Healthy delivery never reads those payloads back from SQLite. Route batches flush
-after 5 ms or 256 KiB; an operation larger than the byte cap travels alone.
+after 30 seconds or 256 KiB; an operation larger than the byte cap travels alone.
+Explicit flushes and shutdown drain available operations without waiting for the window.
 Byte-bounded live queues apply backpressure. Failed routes pause their live feed
 and recover through the shared, bounded SQLite reader.
 

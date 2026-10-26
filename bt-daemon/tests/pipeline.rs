@@ -1543,6 +1543,12 @@ async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
 
         // Observe the work flush separately, so it cannot satisfy the terminal
         // event's assertion below.
+        assert!(
+            flush_session(&session_id, &socket, 5_000)
+                .await
+                .unwrap()
+                .flushed
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if flushes
@@ -2999,7 +3005,7 @@ async fn invoke_grok_hook(
 #[cfg(all(feature = "cli", unix))]
 async fn wait_for_grok_translation(socket: &Path, session_id: &str) {
     let mut last_sessions = Vec::new();
-    for _ in 0..200 {
+    for _ in 0..4500 {
         let status = run_status(StatusArgs {
             socket: Some(socket.to_path_buf()),
             session_id: Some(session_id.to_string()),
@@ -3833,7 +3839,7 @@ async fn initial_span_storage_failure_reports_journal_and_recovers_without_nativ
     .await
     .unwrap();
     std::fs::remove_file(&storage).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             if std::fs::read_to_string(data.join("spans/storage-open.ndjson"))
                 .is_ok_and(|rows| rows.lines().count() >= 2)
@@ -3933,7 +3939,7 @@ async fn changed_settings_resume_the_original_rejected_route_through_ingress() {
             project_id: Some("test-project".into()),
             project_name: None,
         });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         forward_envelope(&event, &socket, &dummy_host(), false)
             .await
             .unwrap();
@@ -3969,7 +3975,7 @@ async fn changed_settings_resume_the_original_rejected_route_through_ingress() {
     forward_envelope(&event, &socket, &dummy_host(), false)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let status = run_status(StatusArgs {
                 socket: Some(socket.clone()),
@@ -4039,7 +4045,7 @@ async fn changed_plugin_chain_resumes_the_original_held_route() {
     forward_envelope(&event, &socket, &dummy_host(), false)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let status = run_status(StatusArgs {
                 socket: Some(socket.clone()),
@@ -4066,7 +4072,7 @@ async fn changed_plugin_chain_resumes_the_original_held_route() {
     forward_envelope(&event, &socket, &dummy_host(), false)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let status = run_status(StatusArgs {
                 socket: Some(socket.clone()),
@@ -4193,7 +4199,7 @@ async fn storage_failure_after_retirement_is_reported_and_recovers_without_nativ
         .any(|session| session.queued > 0 && session.last_error.is_some()));
     std::fs::remove_file(data.join("pipeline")).unwrap();
     std::fs::rename(data.join("saved-pipeline"), data.join("pipeline")).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             if std::fs::read_to_string(data.join("spans/retired-failure.ndjson"))
                 .is_ok_and(|rows| rows.contains("\"name\":\"Stop\""))

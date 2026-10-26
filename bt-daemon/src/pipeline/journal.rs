@@ -643,6 +643,7 @@ impl SpanJournal {
             completed: position,
             changes: self.changed.subscribe(),
             progress,
+            drain: watch::channel(position).0,
             abandoned: Arc::new(AtomicBool::new(false)),
             settings: None,
             version: String::new(),
@@ -946,6 +947,7 @@ pub(crate) struct Cursor {
     completed: u64,
     changes: watch::Receiver<u64>,
     progress: watch::Sender<u64>,
+    drain: watch::Sender<u64>,
     abandoned: Arc<AtomicBool>,
     settings: Option<watch::Receiver<SessionConfig>>,
     version: String,
@@ -962,6 +964,7 @@ pub(crate) struct Cursor {
 pub(crate) struct Progress {
     completed: watch::Receiver<u64>,
     published: watch::Receiver<u64>,
+    drain: watch::Sender<u64>,
 }
 #[cfg(test)]
 impl Default for Progress {
@@ -969,6 +972,7 @@ impl Default for Progress {
         Self {
             completed: watch::channel(0).1,
             published: watch::channel(0).1,
+            drain: watch::channel(0).0,
         }
     }
 }
@@ -981,6 +985,16 @@ impl Progress {
     }
 
     pub async fn through(&self, target: u64, error: &Mutex<Option<String>>) -> Result<(), String> {
+        // Flush callers already know the publication boundary they need. Wake
+        // collection and keep draining promptly until that boundary is reported.
+        self.drain.send_if_modified(|requested| {
+            if target > *requested {
+                *requested = target;
+                true
+            } else {
+                false
+            }
+        });
         let mut completed = self.completed.clone();
         loop {
             if *completed.borrow_and_update() >= target {
@@ -1013,6 +1027,7 @@ impl Cursor {
         let progress = Progress {
             completed: self.progress.subscribe(),
             published: self.changes.clone(),
+            drain: self.drain.clone(),
         };
         self.settings = Some(settings);
         self.version = version;
@@ -1090,11 +1105,22 @@ impl Cursor {
             self.live.clear();
         } else {
             let deadline = tokio::time::Instant::now() + WINDOW;
+            let mut drain = self.drain.subscribe();
             let mut bytes = records[0].bytes;
             while bytes < BYTE_BUDGET {
-                let next = match tokio::time::timeout_at(deadline, self.live.recv()).await {
-                    Ok(Some(record)) => record,
-                    _ => break,
+                let next = if *drain.borrow_and_update() > after {
+                    match self.live.try_recv() {
+                        Some(record) => record,
+                        None => break,
+                    }
+                } else {
+                    tokio::select! {
+                        next = tokio::time::timeout_at(deadline, self.live.recv()) => match next {
+                            Ok(Some(record)) => record,
+                            _ => break,
+                        },
+                        _ = drain.changed() => continue,
+                    }
                 };
                 if next.position != records.last().map_or(after, |record| record.position) + 1
                     || bytes + next.bytes > BYTE_BUDGET
@@ -1510,6 +1536,52 @@ mod tests {
             .unwrap();
         assert_eq!(restored.tail().await.unwrap(), 2);
         assert!(late.next_shared().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn explicit_flush_interrupts_live_batch_collection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("flush.sqlite"))
+            .await
+            .unwrap();
+        let mut cursor = journal.subscribe(&route("a"), 0).await.unwrap();
+        let progress = Progress {
+            completed: cursor.progress.subscribe(),
+            published: cursor.changes.clone(),
+            drain: cursor.drain.clone(),
+        };
+        journal.begin(10, true).await.unwrap();
+        journal
+            .append_live(10, &mut 0, &mut vec![op("one")])
+            .await
+            .unwrap();
+        let mut receiving = Box::pin(cursor.next_shared());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut receiving)
+                .await
+                .is_err(),
+            "a sparse batch should wait for more operations"
+        );
+        let error = Mutex::new(None);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let ((), result) = tokio::join!(
+                async {
+                    receiving
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .into_completed()
+                        .await
+                        .ok()
+                        .unwrap();
+                },
+                progress.through(1, &error)
+            );
+            result.unwrap();
+        })
+        .await
+        .expect("explicit flush must bypass the 30-second window");
+        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
