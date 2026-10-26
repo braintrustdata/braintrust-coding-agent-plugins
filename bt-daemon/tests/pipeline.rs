@@ -2714,6 +2714,28 @@ async fn managed_run_flushes_and_preserves_agent_exit_status() {
     std::fs::write(
         &agent,
         r#"#!/bin/sh
+for argument in "$@"; do
+  if [ "$argument" = app-server ]; then
+    while IFS= read -r request; do
+      case "$request" in
+        *'"method":"initialize"'*)
+          printf '{"id":1,"result":{}}\n'
+          ;;
+        *'"method":"hooks/list"'*)
+          hooks=
+          index=0
+          for event in sessionStart userPromptSubmit preToolUse permissionRequest postToolUse preCompact postCompact subagentStart subagentStop stop interrupt sessionEnd; do
+            index=$((index + 1))
+            [ -z "$hooks" ] || hooks="$hooks,"
+            hooks="$hooks{\"source\":\"sessionFlags\",\"eventName\":\"$event\",\"handlerType\":\"command\",\"command\":\"'unused-hook-command' '--source' 'codex' '--managed-run-hook'\",\"enabled\":true,\"isManaged\":false,\"trustStatus\":\"untrusted\",\"key\":\"hook-$index\",\"currentHash\":\"hash-$index\"}"
+          done
+          printf '{"id":2,"result":{"data":[{"errors":[],"hooks":[%s]}]}}\n' "$hooks"
+          ;;
+      esac
+    done
+    exit 0
+  fi
+done
 previous=
 last=
 for argument in "$@"; do

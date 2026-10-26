@@ -189,8 +189,9 @@ impl TraceCommandOutput {
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
+        let source = source.into();
         Self::Enable(SetupCommandOutput {
-            source: source.into(),
+            source,
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
@@ -219,8 +220,9 @@ impl TraceCommandOutput {
     }
 
     pub fn update(source: impl Into<String>, display_name: impl Into<String>) -> Self {
+        let source = source.into();
         Self::Update(UpdateCommandOutput {
-            source: source.into(),
+            source,
             display_name: display_name.into(),
             restart_required: true,
         })
@@ -437,6 +439,26 @@ mod tests {
             .render(OutputFormat::Human)
             .unwrap()
             .contains("removed for Google Antigravity"));
+    }
+
+    #[test]
+    fn codex_setup_and_updates_do_not_request_manual_trust() {
+        for output in [
+            TraceCommandOutput::setup("codex", "Codex", PathBuf::from("braintrust.json")),
+            TraceCommandOutput::update("codex", "Codex"),
+        ] {
+            let human = output.render(OutputFormat::Human).unwrap();
+            assert!(!human.contains("Open /hooks"));
+            let json: serde_json::Value =
+                serde_json::from_str(&output.render(OutputFormat::Json).unwrap()).unwrap();
+            assert!(json.get("next_steps").is_none());
+        }
+        let disabled =
+            TraceCommandOutput::disable("codex", "Codex", PathBuf::from("braintrust.json"));
+        assert!(!disabled
+            .render(OutputFormat::Human)
+            .unwrap()
+            .contains("Open /hooks"));
     }
 
     #[test]
