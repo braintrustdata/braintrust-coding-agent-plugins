@@ -8,8 +8,6 @@ runs:
   using: composite
   steps:
     # pnpm/action-setup cannot read .tool-versions, so resolve the version here.
-    # pnpm also switches to each package's packageManager version, so require
-    # those to match the pin rather than silently running a different pnpm.
     - name: Read pnpm version
       id: versions
       shell: bash
@@ -19,15 +17,6 @@ runs:
           echo "::error file=.tool-versions::missing pnpm entry"
           exit 1
         fi
-        status=0
-        for manifest in "$GITHUB_WORKSPACE"/src/plugins/*/content/package.json; do
-          actual="$(sed -n 's/^ *"packageManager": *"\(pnpm@[^"]*\)".*/\1/p' "$manifest")"
-          if [ -n "$actual" ] && [ "$actual" != "pnpm@$pnpm_version" ]; then
-            echo "::error file=${manifest#"$GITHUB_WORKSPACE"/}::packageManager is $actual; .tool-versions pins pnpm@$pnpm_version"
-            status=1
-          fi
-        done
-        [ "$status" = 0 ] || exit 1
         echo "pnpm=$pnpm_version" >> "$GITHUB_OUTPUT"
     - name: Set up pnpm
       uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
@@ -39,3 +28,20 @@ runs:
         node-version-file: .tool-versions
         cache: pnpm
         cache-dependency-path: ${{ inputs.cache-dependency-path }}
+    # pnpm switches to each package's packageManager version, so keep those
+    # in sync with the pin.
+    - name: Check packageManager matches .tool-versions
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        EXPECTED: pnpm@${{ steps.versions.outputs.pnpm }}
+      run: |
+        status=0
+        for manifest in src/plugins/opencode/content/package.json src/plugins/pi/content/package.json; do
+          actual="$(node -p 'require(process.argv[1]).packageManager' "$PWD/$manifest")"
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error file=$manifest::packageManager is $actual; .tool-versions pins $EXPECTED"
+            status=1
+          fi
+        done
+        exit "$status"
