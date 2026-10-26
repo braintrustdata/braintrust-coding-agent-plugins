@@ -64,8 +64,8 @@ with open(sys.argv[1]) as f:
     hooks = json.load(f)["hooks"]
 
 expected_events = {
-    "PermissionRequest", "PostCompact", "PostToolUse", "PreCompact",
-    "PreToolUse", "SessionStart", "Stop", "SubagentStart", "SubagentStop",
+    "Interrupt", "PermissionRequest", "PostCompact", "PostToolUse", "PreCompact",
+    "PreToolUse", "SessionEnd", "SessionStart", "Stop", "SubagentStart", "SubagentStop",
     "UserPromptSubmit",
 }
 assert set(hooks) == expected_events
