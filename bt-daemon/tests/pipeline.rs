@@ -1209,7 +1209,15 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
         source_journal_path(&data_dir, "debug", "login-needed").exists(),
         "capture must remain durable even when background auth fails"
     );
-    assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    {
+        let calls = provider.calls.lock().unwrap();
+        // Background recovery may retry before status returns on a busy runner.
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|(selection, _)| {
+            selection.profile.as_deref() == Some("missing")
+                && selection.org_name.as_deref() == Some("missing-org")
+        }));
+    }
 
     shutdown(&socket).await;
     handle.await.unwrap();

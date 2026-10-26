@@ -303,100 +303,29 @@ tracing for that invocation and override the persistent setup route without
 rewriting it, so ordinary agent sessions and concurrent managed runs may use
 different profiles, organizations, projects, experiments, or parent spans.
 
-### Memory and disk soak
-
-On macOS or Linux, run synthetic Claude-format sessions against a local accepting
-backend. No model or Braintrust account is needed:
-
-```bash
-cargo build --manifest-path bt-daemon/Cargo.toml --all-features --release --locked
-python3 scripts/daemon-soak.py \
-  --daemon-bin bt-daemon/target/release/bt-daemon \
-  --sessions 10 --turns-per-minute 10 --duration 600 \
-  --output /tmp/bt-soak
-```
-
-The rate is per session. Turn lengths follow a lognormal distribution, with mostly
-short turns and occasional long ones; `--sigma 0` uses constant lengths. Tool calls
-are spread through each turn. Generator overhead can reduce the achieved rate.
-Use `--duration 0` to run until Ctrl-C, `--result-kib` and `--tools-per-turn` to
-increase volume, or `--compact-kib 0` to stress growing context without compaction.
-Output directories must be new, and Unix socket paths should be kept short.
-
-`samples.csv` records daemon RSS, disk categories, pending SpanOps, and metadata
-counts. Console output includes a rolling RSS slope in MiB/minute; it is a trend
-indicator rather than proof of a leak. `turns.jsonl` records actual turn lengths.
-The final status and summary include resident-session counts. The default final
-quiet period is 60 seconds. Idle retirement is disabled and no SessionEnd is sent,
-so the same sessions stay resident through long turns and the quiet period.
-Only a rolling sample window is kept in the script's memory, including indefinite runs.
-
 ## Recovery and storage
 
-Capture requests return after the event is flushed to its journal. Daemon
-workers handle authentication, translation, and delivery. Translation persists
-canonical insert/merge operations as they become available and hands the same
-operations directly to the route multiplexer. Routes share owned copy-on-write
-references; route overlays and plugins cannot change another route's operation.
-Origin snapshots are owned by live operations and cached weakly, with dead keys
-removed as new work arrives. Late updates resolve original birth metadata from
-disk after its live references expire. The delivery ledger has a rebuildable
-metadata index with a bounded page cache, avoiding a full history scan per update.
-Healthy delivery never reads those payloads back from SQLite. Route batches flush
-after 30 seconds or 256 KiB; an operation larger than the byte cap travels alone.
-Explicit flushes and shutdown drain available operations without waiting for the window.
-Byte-bounded live queues apply backpressure. Failed routes pause their live feed
-and recover through the shared, bounded SQLite reader.
+The daemon saves captured events locally before acknowledging them, then uploads
+traces in the background. Pending work resumes after a daemon restart without
+requiring another event from the agent. Retries update the same spans rather than
+creating duplicate traces.
 
-Each route has an independent durable head that advances only after checked SDK
-flush acceptance or intentional filtering. The same transaction deletes payloads
-covered by every registered route's head. Captured routes are registered even
-while authentication is unavailable. A new route starts at the retained prefix;
-use transcript import to export already-reclaimed historical work to a new
-destination. SQLite reuses freed pages, so an existing database file may retain
-its previous high-water size. Small provenance, correlation, and publication
-watermarks survive payload reclamation. Plugin, authentication, and delivery
-recovery resumes
-from unresolved SpanOps without replaying translation. Retries use deterministic
-span IDs, so repeated delivery updates the same spans.
+Authentication, configuration, or plugin failures can delay uploads. The daemon
+retries when credentials or settings change, or after a retry delay for temporary
+failures. Run `bt trace doctor` to see what needs attention. Delivery to each
+destination recovers independently. To send older, completed session history to a
+new destination, use transcript import.
 
-Provisional session roots stay hidden until their first child arrives. Root
-candidates are saved with translation's input checkpoint, independently of route
-delivery, so an unused root does not hold completed turn batches open. When work
-arrives, the root's saved operations are published before its child.
+Uploads are batched for up to 30 seconds, with earlier uploads when the batch
+reaches its size limit. Turn endings, explicit flushes, and daemon shutdown drain
+available traces without waiting for that interval.
 
-Failures retain their reason and retry condition, including across restarts.
-The daemon waits for the relevant plugin/configuration change, fresh credentials,
-or retry delay before trying again. `bt trace doctor` reports the affected stage,
-pending position, reason, and retry eligibility.
-
-A later event with corrected delivery settings also resumes configuration-held
-subscriptions for the same source session, authentication selection, and
-destination. Each subscription keeps its original durable head and pinned backend;
-the correction is saved for restart recovery. Healthy routes and other destinations
-retain their own settings.
-
-Claude, Codex, and Cursor events reference daemon-owned transcript mirrors. Cursor
-preserves separate immutable generations when its native transcript is rewritten.
-Grok uses
-separate updates and events mirrors. Replay does not depend on the original
-transcript staying at its old path.
-
-The daemon streams journals and transcripts, applies queue backpressure, and
-retires idle sessions. Retirement preserves unresolved work and route heads;
-startup resumes pending subscriptions without waiting for another event.
-Translators rebuild their in-memory state from committed input when more
-translation is needed, suppressing already committed output. Durable operation
-ordinals also suppress already-published output when a crash interrupts a native
-event before its translation checkpoint. Journals and mirrors
-preserve conversation content; credentials are excluded from journaled routing data.
-
-Completed, inactive session partitions become eligible for cleanup after seven
-days without modification. Cleanup also requires translation to be caught up,
-all captured routes to have registered heads, every head to be complete, and no
-pending recovery. Retained event logs protect the transcript mirrors and
-correlation state needed for reconstruction. Cleanup runs at startup and hourly;
-the retention period is fixed in `src/server/maintenance.rs`.
+Local event logs and transcript copies contain conversation content. Credentials
+are excluded from saved routing settings. Storage can grow as sessions accumulate
+messages or uploads remain pending. Space used by completed delivery records is
+reused, so a database file may keep its previous size after delivery catches up.
+Completed sessions become eligible for cleanup after seven days without changes;
+unfinished work is retained for recovery.
 
 ## Platform and integration coverage
 
