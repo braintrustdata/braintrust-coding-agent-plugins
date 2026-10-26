@@ -33,6 +33,7 @@ impl Completion for Forward {
 
 pub(crate) struct RoutingSink {
     tx: mpsc::Sender<Delivery<Request>>,
+    task: tokio::task::JoinHandle<()>,
     config: Option<SessionConfig>,
     pending: bool,
     permalink: Option<String>,
@@ -47,7 +48,7 @@ impl RoutingSink {
         last_error: Arc<Mutex<Option<String>>>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Delivery<Request>>(16);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut plugins = Plugins::new(&source, &session_id);
             let mut prepare = Prepare::new(&source);
             let mut submission = Submission::new(sink);
@@ -56,14 +57,20 @@ impl RoutingSink {
                 let (result, state) = match &request.operation {
                     Operation::Emit(ops) => {
                         let mut ops = ops.clone();
-                        prepare.apply(&mut ops, &request.config);
+                        prepare.apply_shared(&mut ops, &request.config);
                         plugins.configure(&request.config.span_plugins);
                         let mut prepared = Vec::with_capacity(ops.len());
                         let mut failure = None;
                         let mut report = false;
                         for op in &ops {
-                            match plugins.process(op).await {
-                                PluginOutcome::Prepared(op) => prepared.push(*op),
+                            if request.config.span_plugins.is_empty() {
+                                prepared.push(op.clone());
+                                continue;
+                            }
+                            match plugins.process(op.as_ref()).await {
+                                PluginOutcome::Prepared(op) => {
+                                    prepared.push(super::live::SharedOp::new(*op))
+                                }
                                 PluginOutcome::Filtered => {}
                                 PluginOutcome::Failed(error) => {
                                     report |= error.failure.newly_seen;
@@ -171,9 +178,24 @@ impl RoutingSink {
         });
         Self {
             tx,
+            task,
             config: None,
             pending: false,
             permalink: None,
+        }
+    }
+
+    pub async fn shutdown(self) {
+        let Self { tx, mut task, .. } = self;
+        drop(tx);
+        // Join the sink owner so completed shutdown also releases ledger files.
+        // A stalled backend cannot keep daemon shutdown waiting indefinitely.
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
         }
     }
 
@@ -208,6 +230,15 @@ impl Sink for RoutingSink {
         self.config = Some(config.clone());
     }
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        self.emit_shared(
+            &ops.iter()
+                .cloned()
+                .map(super::live::SharedOp::new)
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+    async fn emit_shared(&mut self, ops: &[super::live::SharedOp]) -> anyhow::Result<u64> {
         self.request(Operation::Emit(ops.to_vec())).await
     }
     async fn flush(&mut self) -> anyhow::Result<()> {
@@ -240,6 +271,36 @@ mod tests {
         async fn flush(&mut self) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_the_owned_sink_before_returning() {
+        struct Owned(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl Sink for Owned {
+            async fn emit(&mut self, _: &[SpanOp]) -> anyhow::Result<u64> {
+                Ok(0)
+            }
+            async fn flush(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = RoutingSink::spawn(
+            Box::new(Owned(dropped.clone())),
+            "debug".into(),
+            "owned".into(),
+            tmp.path().into(),
+            Arc::new(Mutex::new(None)),
+        );
+        sink.shutdown().await;
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

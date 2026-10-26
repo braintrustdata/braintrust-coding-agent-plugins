@@ -18,6 +18,35 @@ impl Prepare {
         }
     }
 
+    pub fn apply_shared(&mut self, ops: &mut [super::live::SharedOp], config: &SessionConfig) {
+        let (parent, root) = config.attached_span_ids();
+        for op in ops {
+            let insert = matches!(op.as_ref(), SpanOp::Insert(_));
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+            let is_root = self.roots.contains(&row.span_id)
+                || (row.span_type == SpanType::Task
+                    && row.parent_span_ids.is_empty()
+                    && row.span_id == row.root_span_id);
+            let subagent = row.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("is_subagent").and_then(|v| v.as_bool()) == Some(true)
+                    || (self.source == "codex" && metadata.get("agent_id").is_some())
+            });
+            if is_root {
+                self.roots.insert(row.span_id.clone());
+            }
+            let needs_overlay = parent.is_some()
+                || root.is_some()
+                || (insert
+                    && (is_root || subagent)
+                    && (!config.tags.is_empty()
+                        || config.additional_metadata.is_some()
+                        || (self.source == "codex" && config.project_name().is_some())));
+            if needs_overlay {
+                self.apply(std::slice::from_mut(op.make_mut()), config);
+            }
+        }
+    }
+
     pub fn apply(&mut self, ops: &mut [SpanOp], config: &SessionConfig) {
         let (parent, root) = config.attached_span_ids();
         let root = root.or_else(|| parent.clone());

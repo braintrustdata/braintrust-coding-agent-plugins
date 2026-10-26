@@ -18,17 +18,13 @@ impl Roots {
     }
 }
 
-#[async_trait::async_trait]
-impl Stage for Roots {
-    type Input = Vec<SpanOp>;
-    type Outcome = Vec<SpanOp>;
-
-    async fn process(&mut self, ops: &Vec<SpanOp>) -> Vec<SpanOp> {
+impl Roots {
+    pub fn process_owned(&mut self, ops: Vec<SpanOp>) -> Vec<SpanOp> {
         let mut ready = Vec::new();
         for op in ops {
-            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &op;
             if let Some(root) = self.pending.get_mut(&row.span_id) {
-                root.push(op.clone());
+                root.push(op);
                 continue;
             }
             for parent in &row.parent_span_ids {
@@ -44,16 +40,25 @@ impl Stage for Roots {
                     }
                 }
             }
-            if matches!(op, SpanOp::Insert(_))
+            if matches!(&op, SpanOp::Insert(_))
                 && row.metadata.as_ref().and_then(|v| v.get("_bt_defer_root"))
                     == Some(&serde_json::Value::Bool(true))
             {
-                self.pending.insert(row.span_id.clone(), vec![op.clone()]);
+                self.pending.insert(row.span_id.clone(), vec![op]);
             } else {
-                ready.push(op.clone());
+                ready.push(op);
             }
         }
         ready
+    }
+}
+
+#[async_trait::async_trait]
+impl Stage for Roots {
+    type Input = Vec<SpanOp>;
+    type Outcome = Vec<SpanOp>;
+    async fn process(&mut self, ops: &Vec<SpanOp>) -> Vec<SpanOp> {
+        self.process_owned(ops.clone())
     }
 }
 

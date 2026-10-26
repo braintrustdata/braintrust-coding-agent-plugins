@@ -9,7 +9,6 @@ use crate::{
     delivery_ledger::{CommitFailure, LedgerSink},
     dispatch::Counters,
     sink::{Sink, SinkFactory},
-    translate::SpanOp,
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
     AuthProvider, AuthResolveReason,
 };
@@ -151,7 +150,9 @@ impl ConsumerOptions {
             Work::Resubmit => {
                 // Dropping unresolved obligations asks their source to replay.
                 // Recreate the consumed SDK batch and its in-memory ledger too.
-                *sink = None;
+                if let Some(previous) = sink.take() {
+                    previous.shutdown().await;
+                }
                 pending.clear();
                 return Ok(false);
             }
@@ -189,7 +190,7 @@ impl ConsumerOptions {
 
 impl Consumer {
     pub fn spawn(
-        mut input: Box<dyn InputPort<Item = Vec<SpanOp>>>,
+        mut input: Box<dyn InputPort<Item = Vec<super::live::SharedOp>>>,
         options: ConsumerOptions,
     ) -> Arc<Self> {
         let config = options.config.clone();
@@ -308,7 +309,7 @@ impl Consumer {
                         })?;
                         routing.configure(&current);
                         routing
-                            .emit(ops)
+                            .emit_shared(ops)
                             .await
                             .map_err(|error| options.routing(&error, &current, attempts))
                     }
@@ -339,6 +340,9 @@ impl Consumer {
                     }
                     Err(failure) => held = Some(failure),
                 }
+            }
+            if let Some(sink) = sink {
+                sink.shutdown().await;
             }
         });
         *handle.task.lock() = Some(task);
@@ -606,7 +610,8 @@ mod tests {
                 root_span_id: "one".into(),
                 end_ms: Some(1),
                 ..Default::default()
-            })],
+            })
+            .into()],
             Acknowledged(acknowledged.clone()),
         ))
         .await

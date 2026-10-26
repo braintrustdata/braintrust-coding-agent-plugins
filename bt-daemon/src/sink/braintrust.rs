@@ -739,11 +739,14 @@ mod tests {
         let row = SpanRow {
             span_id: "root".into(),
             root_span_id: "root".into(),
-            origin: Some(OriginSnapshot {
-                plugin_version: None,
-                bt_version: "birth-bt".into(),
-                source_version: None,
-            }),
+            origin: Some(
+                OriginSnapshot {
+                    plugin_version: None,
+                    bt_version: "birth-bt".into(),
+                    source_version: None,
+                }
+                .into(),
+            ),
             ..Default::default()
         };
         let handle = client

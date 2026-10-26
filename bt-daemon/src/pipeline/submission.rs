@@ -1,9 +1,9 @@
 //! The route-local sink adapter is one stage in the routing container.
 use super::{recovery::RetryCondition, Stage};
-use crate::{sink::Sink, translate::SpanOp, wire::SessionConfig};
+use crate::{sink::Sink, wire::SessionConfig};
 
 pub(crate) enum Operation {
-    Emit(Vec<SpanOp>),
+    Emit(Vec<crate::translate::CowSpanOp>),
     Flush,
 }
 
@@ -104,7 +104,7 @@ impl Stage for Submission {
                 let result = if ops.is_empty() {
                     Ok(0)
                 } else {
-                    self.sink.emit(ops).await.map_err(Failure::classify)
+                    self.sink.emit_shared(ops).await.map_err(Failure::classify)
                 };
                 Outcome::Emitted {
                     result,

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     journal::{ControlKind, JournalReader, JournalRecord, JournalWriter, PipelineControl},
-    translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp},
+    translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, WeakOrigins},
     wire::{SessionConfig, SessionRoute},
 };
 use parking_lot::Mutex;
@@ -16,7 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
@@ -49,13 +49,19 @@ impl Progress {
     }
 }
 
+#[derive(Default)]
+struct RouteLifetimes {
+    active: usize,
+    draining: usize,
+}
+
 pub(crate) struct Translation {
     tx: mpsc::Sender<Command>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     journal: SpanJournal,
     pub error: Arc<Mutex<Option<String>>>,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
-    pub routes: AtomicUsize,
+    routes: Mutex<RouteLifetimes>,
     pub progress: Arc<Progress>,
 }
 
@@ -102,7 +108,7 @@ impl Translation {
             translator: None,
             reader: None,
             observers: Vec::new(),
-            origins: HashMap::new(),
+            origins: WeakOrigins::default(),
             roots: Roots::default(),
             capture: None,
             pending_snapshots: HashSet::new(),
@@ -120,7 +126,7 @@ impl Translation {
             journal,
             error,
             recovery,
-            routes: AtomicUsize::new(0),
+            routes: Mutex::new(RouteLifetimes::default()),
             progress,
         }))
     }
@@ -135,11 +141,29 @@ impl Translation {
         }
     }
     pub async fn observe(&self, observer: Observation) -> anyhow::Result<()> {
-        self.routes.fetch_add(1, Ordering::Relaxed);
+        self.routes.lock().active += 1;
         self.tx
             .send(Command::Observe(Box::new(observer)))
             .await
             .map_err(|_| anyhow::anyhow!("translation actor is gone"))
+    }
+    pub fn begin_route_shutdown(&self) -> bool {
+        let mut routes = self.routes.lock();
+        routes.active -= 1;
+        routes.draining += 1;
+        routes.active == 0
+    }
+    pub async fn finish_route_shutdown(&self) {
+        let finished = {
+            let mut routes = self.routes.lock();
+            routes.draining -= 1;
+            routes.active == 0 && routes.draining == 0
+        };
+        // The last route to finish owns closing storage. Merely starting
+        // shutdown on every route does not mean their acknowledgements are saved.
+        if finished {
+            self.shutdown().await;
+        }
     }
     pub async fn unobserve(&self, key: String) {
         let _ = self.tx.send(Command::Unobserve(key)).await;
@@ -201,6 +225,7 @@ enum State {
 }
 struct Publication {
     input: u64,
+    ordinal: u64,
     observation: bool,
     capture: Option<OriginSnapshot>,
     ops: Option<Vec<SpanOp>>,
@@ -218,7 +243,7 @@ struct Producer {
     translator: Option<Box<dyn AgentTranslator>>,
     reader: Option<JournalReader>,
     observers: Vec<Observation>,
-    origins: HashMap<String, OriginSnapshot>,
+    origins: WeakOrigins,
     roots: Roots,
     capture: Option<OriginSnapshot>,
     pending_snapshots: HashSet<String>,
@@ -442,24 +467,7 @@ impl Producer {
             for op in ops {
                 let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
                 if let Some(origin) = &row.origin {
-                    self.origins
-                        .entry(row.span_id.clone())
-                        .or_insert_with(|| origin.clone());
-                }
-            }
-        }
-        // Load creation provenance so an upgrade cannot restamp old spans.
-        let mut after = 0;
-        loop {
-            let rows = self.journal.read_after(after, 128).await?;
-            if rows.is_empty() {
-                break;
-            }
-            for (position, op) in rows {
-                after = position;
-                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                if let Some(origin) = row.origin {
-                    self.origins.entry(row.span_id).or_insert(origin);
+                    self.origins.insert(row.span_id.clone(), origin);
                 }
             }
         }
@@ -511,6 +519,9 @@ impl Producer {
             let (first, capture) = match entry.record {
                 JournalRecord::Event(event) => {
                     let mut env = crate::journal::envelope_from_redacted(event);
+                    if let Some(route) = &env.route {
+                        self.journal.register(route).await?;
+                    }
                     if crate::translate::canonical_source_name(&env.source) != self.options.source {
                         self.position = input;
                         continue;
@@ -580,6 +591,7 @@ impl Producer {
             };
             self.publication = Some(Publication {
                 input,
+                ordinal: 0,
                 observation,
                 capture,
                 ops: Some(first),
@@ -617,19 +629,39 @@ impl Producer {
             while !pending.complete {
                 if let Some(ops) = pending.ops.as_mut() {
                     if !pending.prepared {
+                        let missing = ops
+                            .iter()
+                            .filter_map(|op| {
+                                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                                self.origins
+                                    .get(&row.span_id)
+                                    .is_none()
+                                    .then(|| row.span_id.clone())
+                            })
+                            .collect();
+                        let mut saved = self.journal.origins_for(missing).await?;
                         for op in ops.iter_mut() {
                             let insert = matches!(op, SpanOp::Insert(_));
                             let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                            if insert {
-                                self.origins.entry(row.span_id.clone()).or_insert_with(|| {
-                                    pending.capture.clone().unwrap_or_else(|| OriginSnapshot {
-                                        plugin_version: None,
-                                        source_version: None,
-                                        bt_version: self.options.version.clone(),
+                            let origin = self
+                                .origins
+                                .get(&row.span_id)
+                                .or_else(|| saved.remove(&row.span_id))
+                                .or_else(|| {
+                                    insert.then(|| {
+                                        Arc::new(pending.capture.clone().unwrap_or_else(|| {
+                                            OriginSnapshot {
+                                                plugin_version: None,
+                                                source_version: None,
+                                                bt_version: self.options.version.clone(),
+                                            }
+                                        }))
                                     })
                                 });
+                            if let Some(origin) = &origin {
+                                self.origins.insert(row.span_id.clone(), origin);
                             }
-                            row.origin = self.origins.get(&row.span_id).cloned();
+                            row.origin = origin;
                         }
                         self.phase = Boundary::Journal;
                         if pending.observation {
@@ -644,12 +676,14 @@ impl Producer {
                             }
                         }
                         if publish {
-                            *ops = self.roots.process(ops).await;
+                            *ops = self.roots.process_owned(std::mem::take(ops));
                         }
                         pending.prepared = true;
                     }
                     if publish {
-                        self.journal.append(pending.input, ops).await?;
+                        self.journal
+                            .append_live(pending.input, &mut pending.ordinal, ops)
+                            .await?;
                     }
                     pending.ops = None;
                 }
@@ -699,16 +733,8 @@ impl Producer {
             )
             .await?;
         }
-        let mut after = 0;
-        loop {
-            let rows = self.journal.read_after(after, 128).await?;
-            let Some(&(through, _)) = rows.last() else {
-                break;
-            };
-            after = through;
-            let ops = rows.into_iter().map(|(_, op)| op).collect::<Vec<_>>();
-            Self::observe(&self.options, &mut self.pending_snapshots, &ops, observer).await?;
-        }
+        let ops = self.journal.observations().await?;
+        Self::observe(&self.options, &mut self.pending_snapshots, &ops, observer).await?;
         Ok(())
     }
     async fn observe(
@@ -717,7 +743,10 @@ impl Producer {
         ops: &[SpanOp],
         observer: &Observation,
     ) -> anyhow::Result<()> {
-        let mut ops = ops.to_vec();
+        let mut ops = ops
+            .iter()
+            .map(super::journal::metadata_only)
+            .collect::<Vec<_>>();
         Prepare::new(&options.source).apply(&mut ops, &observer.config);
         if options
             .correlation
@@ -744,6 +773,35 @@ impl Producer {
 mod tests {
     use super::*;
     use crate::{pipeline::delivery::InputPort, translate::SpanRow};
+
+    #[tokio::test]
+    async fn shared_storage_stays_open_until_the_last_route_finishes_draining() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_path = tmp.path().join("events.ndjson");
+        let translation = Translation::spawn(TranslationOptions {
+            source: "debug".into(),
+            session_id: "draining".into(),
+            namespace: "draining".into(),
+            version: "test".into(),
+            data_dir: tmp.path().into(),
+            events: Arc::new(tokio::sync::Mutex::new(
+                JournalWriter::open_path(&event_path).await.unwrap(),
+            )),
+            event_path,
+            registry: Arc::new(Registry::default_agents()),
+            correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
+            correlation_changed: Arc::new(Notify::new()),
+        })
+        .await
+        .unwrap();
+        translation.routes.lock().active = 2;
+        assert!(!translation.begin_route_shutdown());
+        assert!(translation.begin_route_shutdown());
+        translation.finish_route_shutdown().await;
+        assert_eq!(translation.journal.tail().await.unwrap(), 0);
+        translation.finish_route_shutdown().await;
+        assert!(translation.journal.tail().await.is_err());
+    }
 
     #[tokio::test]
     async fn recreated_observer_restores_a_staged_session_root() {
@@ -921,7 +979,7 @@ mod tests {
             translator: Some(Box::new(CountedTranslation(drains.clone()))),
             reader: None,
             observers: Vec::new(),
-            origins: HashMap::new(),
+            origins: WeakOrigins::default(),
             roots: Roots::default(),
             capture: None,
             pending_snapshots: HashSet::new(),
@@ -932,6 +990,7 @@ mod tests {
             phase: Boundary::Journal,
             publication: Some(Publication {
                 input: 10,
+                ordinal: 0,
                 observation: true,
                 capture: None,
                 ops: Some(vec![
@@ -957,7 +1016,7 @@ mod tests {
         db.execute_batch("DROP TRIGGER fail_append; CREATE TRIGGER fail_commit BEFORE UPDATE OF committed ON batches BEGIN SELECT RAISE(FAIL,'commit'); END;").unwrap();
         assert!(producer.publish().await.is_err());
         assert_eq!(drains.load(Ordering::Relaxed), 1);
-        assert_eq!(journal.tail().await.unwrap(), 0);
+        assert_eq!(journal.tail().await.unwrap(), 1);
         db.execute_batch("DROP TRIGGER fail_commit").unwrap();
         producer.publish().await.unwrap();
         assert_eq!(drains.load(Ordering::Relaxed), 1);

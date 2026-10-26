@@ -8,11 +8,14 @@
 //! destination still receives the full trace.
 
 use crate::sink::Sink;
-use crate::translate::{OriginSnapshot, SpanOp, SpanRow};
+use crate::translate::{OriginSnapshot, SpanOp, SpanRow, WeakOrigins};
+mod origins;
 use crate::wire::SessionConfig;
+use origins::OriginIndex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt};
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -30,7 +33,7 @@ struct LedgerFile {
     )]
     late_merge_ids: HashSet<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    span_origins: HashMap<String, OriginSnapshot>,
+    span_origins: HashMap<String, Arc<OriginSnapshot>>,
 }
 
 // Closing this file releases the OS lock, including on cancellation or errors.
@@ -39,11 +42,11 @@ struct LedgerLock {
 }
 
 struct DeliveryLedger {
+    origins: OriginIndex,
     path: PathBuf,
     journal_len: u64,
-    known: HashSet<String>,
+    // Keep only SDK deliveries awaiting a durable acknowledgement in memory.
     pending: HashSet<String>,
-    known_late_merges: HashSet<String>,
     pending_late_merges: HashSet<String>,
 }
 
@@ -53,7 +56,7 @@ impl DeliveryLedger {
         source: &str,
         session_id: &str,
         config: &SessionConfig,
-    ) -> anyhow::Result<(Self, HashMap<String, OriginSnapshot>)> {
+    ) -> anyhow::Result<(Self, HashMap<String, Arc<OriginSnapshot>>)> {
         let fingerprint = serde_json::json!({
             "api_url": config.auth.api_url,
             "org_id": config.auth.org_id,
@@ -73,17 +76,36 @@ impl DeliveryLedger {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => LedgerFile::default(),
             Err(error) => return Err(error.into()),
         };
+        let origin_path = path.with_extension("origins.sqlite");
+        tokio::fs::create_dir_all(data_dir.join("delivery-ledger")).await?;
         let mut ledger = Self {
+            origins: OriginIndex::open(origin_path).await?,
             path: path.with_extension("ndjson"),
             journal_len: 0,
-            known: persisted.completed_span_ids,
             pending: HashSet::new(),
-            known_late_merges: persisted.late_merge_ids,
             pending_late_merges: HashSet::new(),
         };
         let lock = ledger.lock().await?;
         ledger
+            .origins
+            .rebuild_completed(
+                persisted.completed_span_ids,
+                persisted.late_merge_ids,
+                ledger.path.clone(),
+            )
+            .await?;
+        ledger
+            .origins
+            .remember(persisted.span_origins.clone())
+            .await?;
+        ledger
             .refresh(&mut persisted.span_origins, &mut HashMap::new(), &lock)
+            .await?;
+        // Rebuild atomically under the ledger lock. The sidecar is only an
+        // index; an upgraded/repaired checkpoint and log remain authoritative.
+        ledger
+            .origins
+            .rebuild(persisted.span_origins.clone())
             .await?;
         Ok((ledger, persisted.span_origins))
     }
@@ -112,8 +134,8 @@ impl DeliveryLedger {
 
     async fn refresh(
         &mut self,
-        origins: &mut HashMap<String, OriginSnapshot>,
-        pending_origins: &mut HashMap<String, OriginSnapshot>,
+        origins: &mut HashMap<String, Arc<OriginSnapshot>>,
+        pending_origins: &mut HashMap<String, Arc<OriginSnapshot>>,
         _lock: &LedgerLock,
     ) -> anyhow::Result<()> {
         let file = match tokio::fs::File::open(&self.path).await {
@@ -132,6 +154,8 @@ impl DeliveryLedger {
             .seek(std::io::SeekFrom::Start(self.journal_len))
             .await?;
         let mut line = Vec::new();
+        let mut fresh = HashMap::new();
+        let mut through = self.journal_len;
         loop {
             line.clear();
             let read = reader.read_until(b'\n', &mut line).await?;
@@ -141,8 +165,12 @@ impl DeliveryLedger {
                 break;
             }
             let update: LedgerFile = serde_json::from_slice(&line)?;
-            self.known.extend(update.completed_span_ids);
-            self.known_late_merges.extend(update.late_merge_ids);
+            for (span, origin) in &update.span_origins {
+                fresh.entry(span.clone()).or_insert_with(|| origin.clone());
+            }
+            self.origins
+                .remember_completed(update.completed_span_ids, update.late_merge_ids)
+                .await?;
             for (span, origin) in update.span_origins {
                 if pending_origins.remove(&span).is_some() {
                     // Another writer persisted first while this writer's
@@ -152,28 +180,28 @@ impl DeliveryLedger {
                     origins.entry(span).or_insert(origin);
                 }
             }
-            self.journal_len += read as u64;
+            through += read as u64;
         }
+        self.origins.remember(fresh).await?;
+        self.journal_len = through;
         Ok(())
     }
 
-    fn should_emit(&self, op: &SpanOp) -> bool {
+    fn should_emit(
+        &self,
+        op: &SpanOp,
+        known: &HashSet<String>,
+        known_late_merges: &HashSet<String>,
+    ) -> bool {
         let row = match op {
             SpanOp::Insert(row) | SpanOp::Merge(row) => row,
         };
         if let Some(key) = &row.late_merge_key {
             let id = late_merge_id(row, key);
-            !self.known_late_merges.contains(&id) && !self.pending_late_merges.contains(&id)
+            !known_late_merges.contains(&id) && !self.pending_late_merges.contains(&id)
         } else {
-            !self.known.contains(&row.span_id) && !self.pending.contains(&row.span_id)
+            !known.contains(&row.span_id) && !self.pending.contains(&row.span_id)
         }
-    }
-
-    fn filter(&self, ops: &[SpanOp]) -> Vec<SpanOp> {
-        ops.iter()
-            .filter(|op| self.should_emit(op))
-            .cloned()
-            .collect()
     }
 
     fn record_emitted(&mut self, ops: &[SpanOp]) {
@@ -191,9 +219,16 @@ impl DeliveryLedger {
     }
 
     async fn commit(&mut self, lock: &LedgerLock) -> anyhow::Result<()> {
-        self.pending.retain(|id| !self.known.contains(id));
+        let (known, known_late_merges) = self
+            .origins
+            .completed(
+                self.pending.iter().cloned().collect(),
+                self.pending_late_merges.iter().cloned().collect(),
+            )
+            .await?;
+        self.pending.retain(|id| !known.contains(id));
         self.pending_late_merges
-            .retain(|id| !self.known_late_merges.contains(id));
+            .retain(|id| !known_late_merges.contains(id));
         if self.pending.is_empty() && self.pending_late_merges.is_empty() {
             return Ok(());
         }
@@ -208,9 +243,8 @@ impl DeliveryLedger {
             lock,
         )
         .await?;
-        self.known.extend(self.pending.drain());
-        self.known_late_merges
-            .extend(self.pending_late_merges.drain());
+        self.pending.clear();
+        self.pending_late_merges.clear();
         Ok(())
     }
 
@@ -239,6 +273,13 @@ impl DeliveryLedger {
         // Match the event journal's process-crash durability: flush to the OS
         // before delivery without fsync on every hook event.
         file.flush().await?;
+        self.origins.remember(update.span_origins.clone()).await?;
+        self.origins
+            .remember_completed(
+                update.completed_span_ids.clone(),
+                update.late_merge_ids.clone(),
+            )
+            .await?;
         self.journal_len += line.len() as u64;
         Ok(())
     }
@@ -267,8 +308,8 @@ impl std::error::Error for CommitFailure {
 pub(crate) struct LedgerSink {
     inner: Box<dyn Sink>,
     ledger: Option<DeliveryLedger>,
-    span_origins: HashMap<String, OriginSnapshot>,
-    pending_origins: HashMap<String, OriginSnapshot>,
+    span_origins: WeakOrigins,
+    pending_origins: HashMap<String, Arc<OriginSnapshot>>,
     plugin_version: Option<String>,
     source_version: Option<String>,
     bt_version: String,
@@ -291,8 +332,8 @@ impl LedgerSink {
             _ => None,
         };
         let (ledger, span_origins) = match loaded {
-            Some((ledger, origins)) => (Some(ledger), origins),
-            None => (None, HashMap::new()),
+            Some((ledger, _)) => (Some(ledger), WeakOrigins::default()),
+            None => (None, WeakOrigins::default()),
         };
         Ok(Self {
             inner,
@@ -324,17 +365,30 @@ impl Sink for LedgerSink {
     }
 
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
-        let mut filtered = self
-            .ledger
-            .as_ref()
-            .map(|ledger| ledger.filter(ops))
-            .unwrap_or_else(|| ops.to_vec());
+        self.emit_shared(
+            &ops.iter()
+                .cloned()
+                .map(crate::translate::CowSpanOp::new)
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+
+    async fn emit_shared(&mut self, ops: &[crate::translate::CowSpanOp]) -> anyhow::Result<u64> {
+        let mut filtered = ops.to_vec();
         if filtered.is_empty() {
             return Ok(0);
         }
-        for op in &mut filtered {
-            let is_insert = matches!(op, SpanOp::Insert(_));
-            let row = match op {
+        let mut origins = HashMap::new();
+        for op in &filtered {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+            if let Some(origin) = self.span_origins.get(&row.span_id) {
+                origins.insert(row.span_id.clone(), origin);
+            }
+        }
+        for op in &filtered {
+            let is_insert = matches!(op.as_ref(), SpanOp::Insert(_));
+            let row = match op.as_ref() {
                 SpanOp::Insert(row) | SpanOp::Merge(row) => row,
             };
             // Every span emitted by the integration has plugin provenance,
@@ -342,13 +396,20 @@ impl Sink for LedgerSink {
             // an external parent that the session merely attaches to.
             if is_insert && self.attached_parent.as_deref() != Some(row.span_id.as_str()) {
                 if let std::collections::hash_map::Entry::Vacant(entry) =
-                    self.span_origins.entry(row.span_id.clone())
+                    origins.entry(row.span_id.clone())
                 {
-                    let origin = row.origin.clone().unwrap_or_else(|| OriginSnapshot {
-                        plugin_version: self.plugin_version.clone(),
-                        bt_version: self.bt_version.clone(),
-                        source_version: self.source_version.clone(),
-                    });
+                    let origin = self
+                        .pending_origins
+                        .get(&row.span_id)
+                        .cloned()
+                        .or_else(|| row.origin.clone())
+                        .unwrap_or_else(|| {
+                            Arc::new(OriginSnapshot {
+                                plugin_version: self.plugin_version.clone(),
+                                bt_version: self.bt_version.clone(),
+                                source_version: self.source_version.clone(),
+                            })
+                        });
                     if self.ledger.is_some() {
                         self.pending_origins
                             .insert(row.span_id.clone(), origin.clone());
@@ -362,19 +423,58 @@ impl Sink for LedgerSink {
         let lock = if let Some(ledger) = &mut self.ledger {
             let lock = ledger.lock().await?;
             ledger
-                .refresh(&mut self.span_origins, &mut self.pending_origins, &lock)
+                .refresh(&mut origins, &mut self.pending_origins, &lock)
+                .await?;
+            let saved = ledger
+                .origins
+                .find(
+                    filtered
+                        .iter()
+                        .map(|op| {
+                            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+                            row.span_id.clone()
+                        })
+                        .collect(),
+                )
+                .await?;
+            for (span, origin) in saved {
+                self.pending_origins.remove(&span);
+                origins.insert(span, origin);
+            }
+            let (known, known_late_merges) = ledger
+                .origins
+                .completed(
+                    filtered
+                        .iter()
+                        .map(|op| {
+                            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+                            row.span_id.clone()
+                        })
+                        .chain(self.pending_origins.keys().cloned())
+                        .collect(),
+                    filtered
+                        .iter()
+                        .filter_map(|op| {
+                            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+                            row.late_merge_key
+                                .as_deref()
+                                .map(|key| late_merge_id(row, key))
+                        })
+                        .collect(),
+                )
                 .await?;
             self.pending_origins.retain(|span, _| {
-                if ledger.known.contains(span) {
+                if known.contains(span) {
                     // A peer may have acknowledged a legacy span without an
                     // origin. Do not invent provenance for an already-saved row.
+                    origins.remove(span);
                     self.span_origins.remove(span);
                     false
                 } else {
                     true
                 }
             });
-            filtered.retain(|op| ledger.should_emit(op));
+            filtered.retain(|op| ledger.should_emit(op, &known, &known_late_merges));
             Some(lock)
         } else {
             None
@@ -383,12 +483,12 @@ impl Sink for LedgerSink {
             return Ok(0);
         }
         for op in &mut filtered {
-            let row = match op {
-                SpanOp::Insert(row) | SpanOp::Merge(row) => row,
-            };
-            // Repeat each span's birth snapshot, including stateless updates.
-            // This also discards provenance supplied by a span-processing plugin.
-            row.origin = self.span_origins.get(&row.span_id).cloned();
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+            let origin = origins.get(&row.span_id).cloned();
+            if row.origin != origin {
+                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.make_mut();
+                row.origin = origin;
+            }
         }
         if !self.pending_origins.is_empty() {
             // Persist birth versions before the SDK can queue a span. A crash
@@ -409,13 +509,21 @@ impl Sink for LedgerSink {
         }
         // Never hold a cross-process file lock over SDK/network delivery.
         drop(lock);
-        let emitted = self.inner.emit(&filtered).await?;
+        for op in &filtered {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+            if let Some(origin) = &row.origin {
+                self.span_origins.insert(row.span_id.clone(), origin);
+            }
+        }
+        let emitted = self.inner.emit_shared(&filtered).await?;
         // A deferred lifecycle root has not reached the backend yet. Do not
         // record it as delivered: a subsequent cold-worker replay needs to
         // retain the root until descendant work makes it exportable.
         if emitted > 0 {
             if let Some(ledger) = &mut self.ledger {
-                ledger.record_emitted(&filtered);
+                for op in &filtered {
+                    ledger.record_emitted(std::slice::from_ref(op.as_ref()));
+                }
             }
         }
         Ok(emitted)
@@ -427,7 +535,7 @@ impl Sink for LedgerSink {
             async {
                 let lock = ledger.lock().await?;
                 ledger
-                    .refresh(&mut self.span_origins, &mut self.pending_origins, &lock)
+                    .refresh(&mut HashMap::new(), &mut self.pending_origins, &lock)
                     .await?;
                 ledger.commit(&lock).await
             }
@@ -449,6 +557,16 @@ impl Sink for LedgerSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn completed(ledger: &DeliveryLedger, id: &str) -> bool {
+        ledger
+            .origins
+            .completed(vec![id.into()], vec![])
+            .await
+            .unwrap()
+            .0
+            .contains(id)
+    }
+
     use crate::translate::{SpanRow, SpanType};
     use crate::wire::{BackendAuth, FlushMode, TraceDestination};
     use parking_lot::Mutex;
@@ -491,6 +609,123 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn expired_origins_resolve_from_disk_and_rebuild_a_missing_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config("project");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = LedgerSink::new(
+            Box::new(RecordingSink {
+                emitted: emitted.clone(),
+            }),
+            Some(temp.path()),
+            "codex",
+            "weak",
+            Some(&config),
+            "birth-bt",
+        )
+        .await
+        .unwrap();
+        sink.set_capture_versions(Some("birth-plugin"), Some("birth-source"));
+        sink.emit(&[SpanOp::Insert(SpanRow {
+            span_id: "live".into(),
+            ..Default::default()
+        })])
+        .await
+        .unwrap();
+        let weak = {
+            let rows = emitted.lock();
+            let SpanOp::Insert(row) = &rows[0] else {
+                panic!("expected insert")
+            };
+            Arc::downgrade(row.origin.as_ref().unwrap())
+        };
+        emitted.lock().clear();
+        assert!(
+            weak.upgrade().is_none(),
+            "neither origin cache may own the snapshot"
+        );
+        assert!(sink.span_origins.get("live").is_none());
+        sink.set_capture_versions(Some("new-plugin"), Some("new-source"));
+        let merge = SpanOp::Merge(SpanRow {
+            span_id: "live".into(),
+            ..Default::default()
+        });
+        sink.emit(std::slice::from_ref(&merge)).await.unwrap();
+        let index = sink
+            .ledger
+            .as_ref()
+            .unwrap()
+            .path
+            .with_extension("origins.sqlite");
+        drop(sink);
+        std::fs::remove_file(index).unwrap();
+        let mut recovered = LedgerSink::new(
+            Box::new(RecordingSink {
+                emitted: emitted.clone(),
+            }),
+            Some(temp.path()),
+            "codex",
+            "weak",
+            Some(&config),
+            "new-bt",
+        )
+        .await
+        .unwrap();
+        recovered.emit(&[merge]).await.unwrap();
+        let rows = emitted.lock();
+        assert_eq!(rows.len(), 2);
+        for op in rows.iter() {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            let origin = row.origin.as_ref().unwrap();
+            assert_eq!(origin.bt_version, "birth-bt");
+            assert_eq!(origin.plugin_version.as_deref(), Some("birth-plugin"));
+            assert_eq!(origin.source_version.as_deref(), Some("birth-source"));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_origin_index_write_retries_before_sdk_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config("project");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = LedgerSink::new(
+            Box::new(RecordingSink {
+                emitted: emitted.clone(),
+            }),
+            Some(temp.path()),
+            "codex",
+            "index-failure",
+            Some(&config),
+            "birth-bt",
+        )
+        .await
+        .unwrap();
+        let path = sink
+            .ledger
+            .as_ref()
+            .unwrap()
+            .path
+            .with_extension("origins.sqlite");
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_origin BEFORE INSERT ON origins BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+        let op = SpanOp::Insert(SpanRow {
+            span_id: "live".into(),
+            ..Default::default()
+        });
+        assert!(sink.emit(std::slice::from_ref(&op)).await.is_err());
+        assert!(emitted.lock().is_empty());
+        db.execute_batch("DROP TRIGGER fail_origin").unwrap();
+        sink.bt_version = "new-bt".into();
+        sink.emit(&[op]).await.unwrap();
+        let rows = emitted.lock();
+        assert_eq!(rows.len(), 1);
+        let SpanOp::Insert(row) = &rows[0] else {
+            panic!("expected insert")
+        };
+        assert_eq!(row.origin.as_ref().unwrap().bt_version, "birth-bt");
+    }
+
     fn terminal(span_id: &str) -> SpanOp {
         SpanOp::Insert(SpanRow {
             span_id: span_id.into(),
@@ -525,6 +760,114 @@ mod tests {
             late_merge_key: Some(key.into()),
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn missing_index_rebuilds_completion_and_late_merge_suppression() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config("project");
+        let mut sink = LedgerSink::new(
+            Box::new(RecordingSink::default()),
+            Some(temp.path()),
+            "codex",
+            "missing-completion-index",
+            Some(&config),
+            "bt",
+        )
+        .await
+        .unwrap();
+        sink.emit(&[terminal("done"), late_merge("done", "usage")])
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+        let path = sink
+            .ledger
+            .as_ref()
+            .unwrap()
+            .path
+            .with_extension("origins.sqlite");
+        drop(sink);
+        std::fs::remove_file(path).unwrap();
+        let mut recovered = LedgerSink::new(
+            Box::new(RecordingSink::default()),
+            Some(temp.path()),
+            "codex",
+            "missing-completion-index",
+            Some(&config),
+            "bt",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered
+                .emit(&[
+                    terminal("done"),
+                    partial_merge("done"),
+                    late_merge("done", "usage"),
+                ])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            recovered
+                .emit(&[late_merge("done", "new-usage")])
+                .await
+                .unwrap(),
+            1
+        );
+        recovered.flush().await.unwrap();
+        assert_eq!(
+            recovered
+                .emit(&[late_merge("done", "new-usage")])
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_index_failure_retries_acknowledgement_without_redelivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config("project");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = LedgerSink::new(
+            Box::new(RecordingSink {
+                emitted: emitted.clone(),
+            }),
+            Some(temp.path()),
+            "codex",
+            "completion-index-failure",
+            Some(&config),
+            "bt",
+        )
+        .await
+        .unwrap();
+        sink.emit(&[terminal("accepted")]).await.unwrap();
+        let path = sink
+            .ledger
+            .as_ref()
+            .unwrap()
+            .path
+            .with_extension("origins.sqlite");
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_completion BEFORE INSERT ON completed BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+        let error = sink.flush().await.unwrap_err();
+        assert!(error.downcast_ref::<CommitFailure>().is_some());
+        assert!(sink.ledger.as_ref().unwrap().pending.contains("accepted"));
+        assert_eq!(
+            sink.emit(&[terminal("accepted")])
+                .await
+                .unwrap_err()
+                .to_string(),
+            "injected"
+        );
+        assert_eq!(emitted.lock().len(), 1);
+        db.execute_batch("DROP TRIGGER fail_completion").unwrap();
+        sink.flush().await.unwrap();
+        assert!(sink.ledger.as_ref().unwrap().pending.is_empty());
+        assert_eq!(sink.emit(&[terminal("accepted")]).await.unwrap(), 0);
+        assert_eq!(emitted.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -583,7 +926,7 @@ mod tests {
             let (restored, _) = DeliveryLedger::load(tmp.path(), "debug", "test", &config)
                 .await
                 .unwrap();
-            assert!(restored.known.contains("one"), "{phase}");
+            assert!(completed(&restored, "one").await, "{phase}");
         }
     }
 
@@ -697,7 +1040,7 @@ mod tests {
                 }),
                 unexpected => panic!("unexpected span: {unexpected}"),
             };
-            assert_eq!(row.origin, expected, "{}", row.span_id);
+            assert_eq!(row.origin.as_deref(), expected.as_ref(), "{}", row.span_id);
         }
     }
 
@@ -754,25 +1097,28 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(recovered.span_origins.len(), 256);
-        assert_eq!(
-            recovered.span_origins["span-0"].plugin_version.as_deref(),
-            Some("v1")
-        );
-        assert_eq!(
-            recovered.span_origins["span-1"].plugin_version.as_deref(),
-            Some("v2")
-        );
+        assert!(recovered.span_origins.get("span-0").is_none());
+        let stored = recovered
+            .ledger
+            .as_ref()
+            .unwrap()
+            .origins
+            .find((0..256).map(|i| format!("span-{i}")).collect())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 256);
+        assert_eq!(stored["span-0"].plugin_version.as_deref(), Some("v1"));
+        assert_eq!(stored["span-1"].plugin_version.as_deref(), Some("v2"));
         assert_eq!(recovered.emit(&[terminal("span-0")]).await.unwrap(), 0);
         // Simulate upgrading a JSON checkpoint with versions and completion IDs.
-        let (ledger, origins) = DeliveryLedger::load(temp.path(), "codex", "session-1", &config)
+        let (_ledger, origins) = DeliveryLedger::load(temp.path(), "codex", "session-1", &config)
             .await
             .unwrap();
         tokio::fs::write(
             path.with_extension("json"),
             serde_json::to_vec(&LedgerFile {
-                completed_span_ids: ledger.known,
-                late_merge_ids: ledger.known_late_merges,
+                completed_span_ids: (0..256).map(|i| format!("span-{i}")).collect(),
+                late_merge_ids: HashSet::new(),
                 span_origins: origins,
             })
             .unwrap(),
@@ -783,7 +1129,16 @@ mod tests {
         let (legacy, origins) = DeliveryLedger::load(temp.path(), "codex", "session-1", &config)
             .await
             .unwrap();
-        assert_eq!(legacy.known.len(), 256);
+        assert_eq!(
+            legacy
+                .origins
+                .completed((0..256).map(|i| format!("span-{i}")).collect(), vec![])
+                .await
+                .unwrap()
+                .0
+                .len(),
+            256
+        );
         assert_eq!(origins.len(), 256);
         assert_eq!(origins["span-0"].plugin_version.as_deref(), Some("v1"));
     }
@@ -904,12 +1259,18 @@ mod tests {
             assert_eq!(origins["shared"].plugin_version.as_deref(), Some("v1"));
             assert_eq!(origins["shared"].bt_version, "bt1");
             assert_eq!(origins["shared"].source_version.as_deref(), Some("native1"));
-            assert!(ledger.known.contains("parent-only"));
-            assert!(ledger.known_late_merges.contains("parent-only\u{1f}usage"));
+            assert!(completed(&ledger, "parent-only").await);
+            assert!(ledger
+                .origins
+                .completed(vec![], vec!["parent-only\u{1f}usage".into()])
+                .await
+                .unwrap()
+                .1
+                .contains("parent-only\u{1f}usage"));
             for i in 0..32 {
                 for (writer, version) in [("parent", "v1"), ("child", "v2")] {
                     let span = format!("{writer}-{i}");
-                    assert!(ledger.known.contains(&span), "lost completion: {span}");
+                    assert!(completed(&ledger, &span).await, "lost completion: {span}");
                     assert_eq!(origins[&span].plugin_version.as_deref(), Some(version));
                 }
             }

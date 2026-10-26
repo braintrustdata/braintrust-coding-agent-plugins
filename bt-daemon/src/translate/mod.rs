@@ -7,6 +7,9 @@
 //! whole pipeline be exercised with a debug sink and makes translators unit-
 //! testable without any network.
 
+mod shared;
+pub use shared::CowSpanOp;
+
 mod antigravity;
 mod claude;
 mod codex;
@@ -19,7 +22,9 @@ mod opencode;
 mod pi;
 pub(crate) use claude::successful_subagent_handback_message;
 pub(crate) use pi::request_config as pi_request_config;
+mod origins;
 mod recent;
+pub(crate) use origins::WeakOrigins;
 mod tool;
 mod turn_lineage;
 pub use turn_lineage::TURN_SPAN_ID_KEY;
@@ -103,9 +108,10 @@ pub struct SpanRow {
     /// Translator-owned marker for turn creation, not other task spans.
     #[serde(skip)]
     pub is_turn: bool,
-    /// Delivery-owned creation snapshot, present on each coding-agent span.
+    /// Creation snapshot shared by live operations; origin caches hold only
+    /// weak references so completed spans do not keep their snapshots resident.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<OriginSnapshot>,
+    pub origin: Option<std::sync::Arc<OriginSnapshot>>,
 }
 
 /// A span operation. `Insert` creates (or replaces) a row; `Merge` updates an

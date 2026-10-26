@@ -305,49 +305,27 @@ different profiles, organizations, projects, experiments, or parent spans.
 
 ## Recovery and storage
 
-Capture requests return after the event is flushed to its journal. Daemon
-workers handle authentication, translation, and delivery. Translation commits
-canonical SpanOps and its consumed event position to a SQLite journal. Each route
-has an independent durable head that advances only after checked sink acceptance
-or intentional filtering. Plugin, authentication, and delivery recovery resumes
-from unresolved SpanOps without replaying translation. Retries use deterministic
-span IDs, so repeated delivery updates the same spans.
+The daemon saves captured events locally before acknowledging them, then uploads
+traces in the background. Pending work resumes after a daemon restart without
+requiring another event from the agent. Retries update the same spans rather than
+creating duplicate traces.
 
-Provisional session roots stay hidden until their first child arrives. Root
-candidates are saved with translation's input checkpoint, independently of route
-delivery, so an unused root does not hold completed turn batches open. When work
-arrives, the root's saved operations are published before its child.
+Authentication, configuration, or plugin failures can delay uploads. The daemon
+retries when credentials or settings change, or after a retry delay for temporary
+failures. Run `bt trace doctor` to see what needs attention. Delivery to each
+destination recovers independently. To send older, completed session history to a
+new destination, use transcript import.
 
-Failures retain their reason and retry condition, including across restarts.
-The daemon waits for the relevant plugin/configuration change, fresh credentials,
-or retry delay before trying again. `bt trace doctor` reports the affected stage,
-pending position, reason, and retry eligibility.
+Uploads are batched for up to 30 seconds, with earlier uploads when the batch
+reaches its size limit. Turn endings, explicit flushes, and daemon shutdown drain
+available traces without waiting for that interval.
 
-A later event with corrected delivery settings also resumes configuration-held
-subscriptions for the same source session, authentication selection, and
-destination. Each subscription keeps its original durable head and pinned backend;
-the correction is saved for restart recovery. Healthy routes and other destinations
-retain their own settings.
-
-Claude, Codex, and Cursor events reference daemon-owned transcript mirrors. Cursor
-preserves separate immutable generations when its native transcript is rewritten.
-Grok uses
-separate updates and events mirrors. Replay does not depend on the original
-transcript staying at its old path.
-
-The daemon streams journals and transcripts, applies queue backpressure, and
-retires idle sessions. Retirement preserves unresolved work and route heads;
-startup resumes pending subscriptions without waiting for another event.
-Translators rebuild their in-memory state from committed input when more
-translation is needed, suppressing already committed output. Journals and mirrors
-preserve conversation content; credentials are excluded from journaled routing data.
-
-Completed, inactive session partitions become eligible for cleanup after seven
-days without modification. Cleanup also requires translation to be caught up,
-all captured routes to have registered heads, every head to be complete, and no
-pending recovery. Retained event logs protect the transcript mirrors and
-correlation state needed for reconstruction. Cleanup runs at startup and hourly;
-the retention period is fixed in `src/server/maintenance.rs`.
+Local event logs and transcript copies contain conversation content. Credentials
+are excluded from saved routing settings. Storage can grow as sessions accumulate
+messages or uploads remain pending. Space used by completed delivery records is
+reused, so a database file may keep its previous size after delivery catches up.
+Completed sessions become eligible for cleanup after seven days without changes;
+unfinished work is retained for recovery.
 
 ## Platform and integration coverage
 

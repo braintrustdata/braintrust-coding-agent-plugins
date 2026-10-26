@@ -22,6 +22,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Register a dormant route before any output exists, so completed peers cannot
+/// reclaim the recovery payloads this fixture deliberately leaves unresolved.
+fn seed_dormant_route(data: &Path, source: &str, session: &str, route: &SessionRoute) {
+    let journal = bt_daemon::source_journal_path(data, source, session);
+    let stem = journal.file_stem().unwrap().to_str().unwrap();
+    let id = stem.rsplit("--").next().unwrap();
+    std::fs::create_dir_all(data.join("pipeline")).unwrap();
+    let db =
+        rusqlite::Connection::open(data.join("pipeline").join(format!("{id}.sqlite"))).unwrap();
+    // The daemon upgrades this preparatory schema on first use.
+    db.execute_batch("CREATE TABLE heads(route TEXT PRIMARY KEY,position INTEGER NOT NULL DEFAULT 0,failure TEXT)").unwrap();
+    db.execute(
+        "INSERT INTO heads(route,position) VALUES (?,0)",
+        [serde_json::to_string(route).unwrap()],
+    )
+    .unwrap();
+}
+
 /// Smoke-test Cursor's portable direct command through the native Windows
 /// shell. This checks executable lookup, stdin forwarding, and its JSON
 /// response without relying on a POSIX-only launcher.
@@ -31,6 +49,7 @@ use std::time::Duration;
     reason = "Exercises a foreground command exactly as Cursor invokes Windows hooks."
 )]
 #[test]
+
 fn cursor_direct_hook_command_receives_native_stdin_on_windows() {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -548,6 +567,15 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
     let socket = endpoint(tmp.path());
     let native = tmp.path().join("native.jsonl");
     let daemon = start(&data, &socket).await;
+    let recovery_route = SessionRoute {
+        destination: Some(TraceDestination::ProjectLogs {
+            project_id: None,
+            project_name: Some("cursor-tests".into()),
+        }),
+        additional_metadata: Some(json!({"test_route":"recovery"})),
+        ..Default::default()
+    };
+    seed_dormant_route(&data, "cursor", "cursor-recovery", &recovery_route);
     send(
         &socket,
         "sessionStart",
@@ -684,7 +712,7 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
         .unwrap()
         .contains("cursor-test-secret"));
 
-    // Simulate unresolved sink delivery while retaining both durable source stores.
+    // Recover the dormant route as well as the primary route from the retained payloads.
     span_journal(&data)
         .execute("UPDATE heads SET position=0,failure=NULL", [])
         .unwrap();
