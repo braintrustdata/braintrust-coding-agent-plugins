@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     journal::{ControlKind, JournalReader, JournalRecord, JournalWriter, PipelineControl},
-    translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp},
+    translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, WeakOrigins},
     wire::{SessionConfig, SessionRoute},
 };
 use parking_lot::Mutex;
@@ -102,7 +102,7 @@ impl Translation {
             translator: None,
             reader: None,
             observers: Vec::new(),
-            origins: HashMap::new(),
+            origins: WeakOrigins::default(),
             roots: Roots::default(),
             capture: None,
             pending_snapshots: HashSet::new(),
@@ -219,7 +219,7 @@ struct Producer {
     translator: Option<Box<dyn AgentTranslator>>,
     reader: Option<JournalReader>,
     observers: Vec<Observation>,
-    origins: HashMap<String, OriginSnapshot>,
+    origins: WeakOrigins,
     roots: Roots,
     capture: Option<OriginSnapshot>,
     pending_snapshots: HashSet<String>,
@@ -443,15 +443,10 @@ impl Producer {
             for op in ops {
                 let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
                 if let Some(origin) = &row.origin {
-                    self.origins
-                        .entry(row.span_id.clone())
-                        .or_insert_with(|| origin.clone());
+                    self.origins.insert(row.span_id.clone(), origin);
                 }
             }
         }
-        // Payloads already accepted by every route have been reclaimed. Only
-        // small birth-version snapshots are needed to stamp later merges.
-        self.origins.extend(self.journal.origins().await?);
         self.translator = Some(
             self.options
                 .registry
@@ -610,19 +605,39 @@ impl Producer {
             while !pending.complete {
                 if let Some(ops) = pending.ops.as_mut() {
                     if !pending.prepared {
+                        let missing = ops
+                            .iter()
+                            .filter_map(|op| {
+                                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                                self.origins
+                                    .get(&row.span_id)
+                                    .is_none()
+                                    .then(|| row.span_id.clone())
+                            })
+                            .collect();
+                        let mut saved = self.journal.origins_for(missing).await?;
                         for op in ops.iter_mut() {
                             let insert = matches!(op, SpanOp::Insert(_));
                             let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                            if insert {
-                                self.origins.entry(row.span_id.clone()).or_insert_with(|| {
-                                    pending.capture.clone().unwrap_or_else(|| OriginSnapshot {
-                                        plugin_version: None,
-                                        source_version: None,
-                                        bt_version: self.options.version.clone(),
+                            let origin = self
+                                .origins
+                                .get(&row.span_id)
+                                .or_else(|| saved.remove(&row.span_id))
+                                .or_else(|| {
+                                    insert.then(|| {
+                                        Arc::new(pending.capture.clone().unwrap_or_else(|| {
+                                            OriginSnapshot {
+                                                plugin_version: None,
+                                                source_version: None,
+                                                bt_version: self.options.version.clone(),
+                                            }
+                                        }))
                                     })
                                 });
+                            if let Some(origin) = &origin {
+                                self.origins.insert(row.span_id.clone(), origin);
                             }
-                            row.origin = self.origins.get(&row.span_id).cloned();
+                            row.origin = origin;
                         }
                         self.phase = Boundary::Journal;
                         if pending.observation {
@@ -911,7 +926,7 @@ mod tests {
             translator: Some(Box::new(CountedTranslation(drains.clone()))),
             reader: None,
             observers: Vec::new(),
-            origins: HashMap::new(),
+            origins: WeakOrigins::default(),
             roots: Roots::default(),
             capture: None,
             pending_snapshots: HashSet::new(),

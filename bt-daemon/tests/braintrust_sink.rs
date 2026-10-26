@@ -63,11 +63,14 @@ fn row(
         late_merge_key: None,
         turn_span_id: None,
         tags: None,
-        origin: Some(OriginSnapshot {
-            plugin_version: None,
-            bt_version: "test".into(),
-            source_version: None,
-        }),
+        origin: Some(
+            OriginSnapshot {
+                plugin_version: None,
+                bt_version: "test".into(),
+                source_version: None,
+            }
+            .into(),
+        ),
         is_turn: false,
     }
 }
@@ -423,7 +426,7 @@ async fn span_updates_preserve_name_linkage_and_origin() {
             1,
             None,
         );
-        initial.origin = Some(origin.clone());
+        initial.origin = Some(origin.clone().into());
         let mut sink = factory.create(&span_id, source).unwrap();
         sink.configure(&session_config(&base));
         sink.emit(&[SpanOp::Insert(initial)]).await.unwrap();
@@ -434,7 +437,7 @@ async fn span_updates_preserve_name_linkage_and_origin() {
             root_span_id: "trace-root".into(),
             parent_span_ids: vec!["turn-parent".into()],
             span_type,
-            origin: Some(origin),
+            origin: Some(origin.into()),
             ..Default::default()
         };
         for (status, end_ms) in [("open", None), ("closed", Some(2)), ("late", None)] {
@@ -615,11 +618,14 @@ async fn exported_parent_preserves_object_root_and_propagated_event() {
         1,
         Some(2),
     );
-    root.origin = Some(OriginSnapshot {
-        plugin_version: Some("attached-plugin".into()),
-        bt_version: "attached-bt".into(),
-        source_version: Some("attached-codex".into()),
-    });
+    root.origin = Some(
+        OriginSnapshot {
+            plugin_version: Some("attached-plugin".into()),
+            bt_version: "attached-bt".into(),
+            source_version: Some("attached-codex".into()),
+        }
+        .into(),
+    );
     sink.emit(&[SpanOp::Insert(root)]).await.unwrap();
     sink.flush().await.unwrap();
 

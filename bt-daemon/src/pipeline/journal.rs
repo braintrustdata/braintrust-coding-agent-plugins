@@ -671,6 +671,30 @@ impl SpanJournal {
         .await
     }
 
+    pub async fn origins_for(
+        &self,
+        spans: Vec<String>,
+    ) -> anyhow::Result<BTreeMap<String, Arc<OriginSnapshot>>> {
+        if spans.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        self.with_db(move |db| {
+            let mut query = db.prepare_cached("SELECT value FROM origins WHERE span_id=?")?;
+            let mut origins = BTreeMap::new();
+            for span in spans {
+                if let Some(value) = query
+                    .query_row([&span], |r| r.get::<_, String>(0))
+                    .optional()?
+                {
+                    origins.insert(span, serde_json::from_str(&value)?);
+                }
+            }
+            Ok(origins)
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn origins(&self) -> anyhow::Result<BTreeMap<String, OriginSnapshot>> {
         self.with_db(|db| {
             let mut query = db.prepare("SELECT span_id,value FROM origins")?;
@@ -1379,11 +1403,14 @@ mod tests {
             late_merge_key: Some("late".into()),
             turn_span_id: Some("turn".into()),
             is_turn: true,
-            origin: Some(OriginSnapshot {
-                plugin_version: Some("capture".into()),
-                source_version: None,
-                bt_version: "test".into(),
-            }),
+            origin: Some(
+                OriginSnapshot {
+                    plugin_version: Some("capture".into()),
+                    source_version: None,
+                    bt_version: "test".into(),
+                }
+                .into(),
+            ),
             ..SpanRow::default()
         })
     }

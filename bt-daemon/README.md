@@ -338,6 +338,10 @@ workers handle authentication, translation, and delivery. Translation persists
 canonical insert/merge operations as they become available and hands the same
 operations directly to the route multiplexer. Routes share owned copy-on-write
 references; route overlays and plugins cannot change another route's operation.
+Origin snapshots are owned by live operations and cached weakly, with dead keys
+removed as new work arrives. Late updates resolve original birth metadata from
+disk after its live references expire. The delivery ledger has a rebuildable
+metadata index with a bounded page cache, avoiding a full history scan per update.
 Healthy delivery never reads those payloads back from SQLite. Route batches flush
 after 30 seconds or 256 KiB; an operation larger than the byte cap travels alone.
 Explicit flushes and shutdown drain available operations without waiting for the window.
