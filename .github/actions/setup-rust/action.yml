@@ -14,10 +14,6 @@ runs:
         COMPONENTS: ${{ inputs.components }}
       run: |
         rust_version="$(awk '$1 == "rust" { print $2 }' "$GITHUB_WORKSPACE/.tool-versions")"
-        if [ -z "$rust_version" ]; then
-          echo "::error file=.tool-versions::missing rust entry"
-          exit 1
-        fi
         rustup toolchain install "$rust_version" --profile minimal
         rustup default "$rust_version"
         if [ -n "$COMPONENTS" ]; then

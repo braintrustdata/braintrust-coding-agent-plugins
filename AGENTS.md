@@ -141,8 +141,7 @@ The root `.tool-versions` pins Node, pnpm, Rust, and vite-plus for local
 development; CI reads its Node, pnpm, and Rust pins without mise through
 `actions/setup-node`, `.github/actions/setup-node-pnpm`, and
 `.github/actions/setup-rust`. Bump versions there rather than in individual
-workflows. CI requires each pnpm package's `packageManager` to match it.
-`mise.toml` holds local-only mise hooks.
+workflows. `mise.toml` holds local-only mise hooks.
 
 CI builds and validates the plugin packages on Linux. It runs the JavaScript
 daemon client and the Pi and OpenCode unit tests, and builds, tests, and lints

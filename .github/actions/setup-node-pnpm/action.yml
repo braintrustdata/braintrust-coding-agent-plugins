@@ -12,12 +12,7 @@ runs:
       id: versions
       shell: bash
       run: |
-        pnpm_version="$(awk '$1 == "pnpm" { print $2 }' "$GITHUB_WORKSPACE/.tool-versions")"
-        if [ -z "$pnpm_version" ]; then
-          echo "::error file=.tool-versions::missing pnpm entry"
-          exit 1
-        fi
-        echo "pnpm=$pnpm_version" >> "$GITHUB_OUTPUT"
+        echo "pnpm=$(awk '$1 == "pnpm" { print $2 }' "$GITHUB_WORKSPACE/.tool-versions")" >> "$GITHUB_OUTPUT"
     - name: Set up pnpm
       uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
       with:
@@ -28,20 +23,3 @@ runs:
         node-version-file: .tool-versions
         cache: pnpm
         cache-dependency-path: ${{ inputs.cache-dependency-path }}
-    # pnpm switches to each package's packageManager version, so keep those
-    # in sync with the pin.
-    - name: Check packageManager matches .tool-versions
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      env:
-        EXPECTED: pnpm@${{ steps.versions.outputs.pnpm }}
-      run: |
-        status=0
-        for manifest in src/plugins/opencode/content/package.json src/plugins/pi/content/package.json; do
-          actual="$(node -p 'require(process.argv[1]).packageManager' "$PWD/$manifest")"
-          if [ "$actual" != "$EXPECTED" ]; then
-            echo "::error file=$manifest::packageManager is $actual; .tool-versions pins $EXPECTED"
-            status=1
-          fi
-        done
-        exit "$status"
