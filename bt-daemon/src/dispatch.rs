@@ -12,7 +12,7 @@ use crate::sink::SinkFactory;
 use crate::wire::Envelope;
 use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
@@ -159,7 +159,7 @@ impl Session {
                         });
                     }
                     SessionMsg::Shutdown(target, reply) => {
-                        let last = producer.routes.fetch_sub(1, Ordering::Relaxed) == 1;
+                        let last = producer.begin_route_shutdown();
                         let target = match target {
                             Some(tail) => Some(tail),
                             None if last => producer
@@ -177,9 +177,7 @@ impl Session {
                         }
                         producer.unobserve(observer_key.clone()).await;
                         route.shutdown().await;
-                        if producer.routes.load(Ordering::Relaxed) == 0 {
-                            producer.shutdown().await;
-                        }
+                        producer.finish_route_shutdown().await;
                         let _ = reply.send(());
                         break;
                     }

@@ -150,7 +150,9 @@ impl ConsumerOptions {
             Work::Resubmit => {
                 // Dropping unresolved obligations asks their source to replay.
                 // Recreate the consumed SDK batch and its in-memory ledger too.
-                *sink = None;
+                if let Some(previous) = sink.take() {
+                    previous.shutdown().await;
+                }
                 pending.clear();
                 return Ok(false);
             }
@@ -338,6 +340,9 @@ impl Consumer {
                     }
                     Err(failure) => held = Some(failure),
                 }
+            }
+            if let Some(sink) = sink {
+                sink.shutdown().await;
             }
         });
         *handle.task.lock() = Some(task);

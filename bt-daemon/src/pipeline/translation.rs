@@ -16,7 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
@@ -49,13 +49,19 @@ impl Progress {
     }
 }
 
+#[derive(Default)]
+struct RouteLifetimes {
+    active: usize,
+    draining: usize,
+}
+
 pub(crate) struct Translation {
     tx: mpsc::Sender<Command>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     journal: SpanJournal,
     pub error: Arc<Mutex<Option<String>>>,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
-    pub routes: AtomicUsize,
+    routes: Mutex<RouteLifetimes>,
     pub progress: Arc<Progress>,
 }
 
@@ -120,7 +126,7 @@ impl Translation {
             journal,
             error,
             recovery,
-            routes: AtomicUsize::new(0),
+            routes: Mutex::new(RouteLifetimes::default()),
             progress,
         }))
     }
@@ -135,11 +141,29 @@ impl Translation {
         }
     }
     pub async fn observe(&self, observer: Observation) -> anyhow::Result<()> {
-        self.routes.fetch_add(1, Ordering::Relaxed);
+        self.routes.lock().active += 1;
         self.tx
             .send(Command::Observe(Box::new(observer)))
             .await
             .map_err(|_| anyhow::anyhow!("translation actor is gone"))
+    }
+    pub fn begin_route_shutdown(&self) -> bool {
+        let mut routes = self.routes.lock();
+        routes.active -= 1;
+        routes.draining += 1;
+        routes.active == 0
+    }
+    pub async fn finish_route_shutdown(&self) {
+        let finished = {
+            let mut routes = self.routes.lock();
+            routes.draining -= 1;
+            routes.active == 0 && routes.draining == 0
+        };
+        // The last route to finish owns closing storage. Merely starting
+        // shutdown on every route does not mean their acknowledgements are saved.
+        if finished {
+            self.shutdown().await;
+        }
     }
     pub async fn unobserve(&self, key: String) {
         let _ = self.tx.send(Command::Unobserve(key)).await;
@@ -749,6 +773,35 @@ impl Producer {
 mod tests {
     use super::*;
     use crate::{pipeline::delivery::InputPort, translate::SpanRow};
+
+    #[tokio::test]
+    async fn shared_storage_stays_open_until_the_last_route_finishes_draining() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_path = tmp.path().join("events.ndjson");
+        let translation = Translation::spawn(TranslationOptions {
+            source: "debug".into(),
+            session_id: "draining".into(),
+            namespace: "draining".into(),
+            version: "test".into(),
+            data_dir: tmp.path().into(),
+            events: Arc::new(tokio::sync::Mutex::new(
+                JournalWriter::open_path(&event_path).await.unwrap(),
+            )),
+            event_path,
+            registry: Arc::new(Registry::default_agents()),
+            correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
+            correlation_changed: Arc::new(Notify::new()),
+        })
+        .await
+        .unwrap();
+        translation.routes.lock().active = 2;
+        assert!(!translation.begin_route_shutdown());
+        assert!(translation.begin_route_shutdown());
+        translation.finish_route_shutdown().await;
+        assert_eq!(translation.journal.tail().await.unwrap(), 0);
+        translation.finish_route_shutdown().await;
+        assert!(translation.journal.tail().await.is_err());
+    }
 
     #[tokio::test]
     async fn recreated_observer_restores_a_staged_session_root() {

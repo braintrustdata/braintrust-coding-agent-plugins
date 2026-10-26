@@ -3799,6 +3799,18 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
         HashSet::from(["left".into(), "right".into()])
     );
     let (head, tail) = head_and_tail(&data_dir);
+    let heads = pipeline_database(&data_dir)
+        .prepare("SELECT position FROM heads")
+        .unwrap()
+        .query_map([], |r| r.get::<_, u64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(heads.len(), 2);
+    assert!(
+        heads.iter().all(|position| *position == tail),
+        "route heads: {heads:?}; tail: {tail}"
+    );
     assert_eq!(
         head, tail,
         "every route durably completed the retirement output"
