@@ -2768,13 +2768,9 @@ async fn one_native_parent_session_selects_the_childs_delivery_route() {
         }
         let route = events[0].route.clone().unwrap();
         forward_all(&mut events, &socket, &host).await;
-        run_status(StatusArgs {
-            socket: Some(socket.clone()),
-            session_id: Some(parent_session.into()),
-        })
-        .await
-        .unwrap()
-        .unwrap();
+        // Status only settles translation; wait for asynchronous route delivery
+        // before looking up the sink created for this route.
+        flush(parent_session, &socket).await;
         // Keep both sinks: the fixture's session lookup retains only the latest.
         parents.push((route, recording.session(parent_session)));
     }

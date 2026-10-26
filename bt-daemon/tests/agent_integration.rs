@@ -201,20 +201,21 @@ async fn claude_session_emits_traces() {
             );
             MockReply::response(AnthropicTurn::text("CLAUDE_MOCK_OK"))
         }
-        2 => MockReply::http_error(
-            StatusCode::BAD_REQUEST,
-            json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "deterministic Claude inference failure"
-                }
-            }),
-        ),
-        index => panic!(
-            "unexpected Claude inference request {index}: {}",
-            request.body
-        ),
+        _ => {
+            // Claude may retry an invalid request with different inference
+            // settings even when transport retries are disabled.
+            assert!(request.contains_text("Trigger the deterministic inference error."));
+            MockReply::http_error(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "deterministic Claude inference failure"
+                    }
+                }),
+            )
+        }
     });
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
@@ -241,7 +242,7 @@ async fn claude_session_emits_traces() {
             .await;
         failed.assert_failure();
         failed.assert_contains("deterministic Claude inference failure");
-        assert_eq!(inference.requests().len(), 3);
+        assert!(inference.requests().len() >= 3);
     }
 
     let rows = world.wait_for_trace_delivery().await;
