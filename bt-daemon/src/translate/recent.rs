@@ -9,7 +9,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
-pub(super) const RECENT_ID_CAPACITY: usize = 4_096;
+pub(super) const RECENT_ID_CAPACITY: usize = 1_024;
 
 pub(super) struct RecentSet<K> {
     values: HashSet<K>,
