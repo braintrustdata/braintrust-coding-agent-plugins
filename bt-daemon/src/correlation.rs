@@ -311,10 +311,9 @@ impl CorrelationRegistry {
             }
             if row.end_ms.is_some() {
                 if let Some(tools) = state.active_tools.get_mut(key) {
-                    if let Some(tool) = tools.get_mut(&row.span_id) {
-                        tool.active = false;
-                        changed = true;
-                    }
+                    // Completed tools can no longer parent a child session.
+                    // Duplicate terminal operations are harmless after removal.
+                    changed |= tools.remove(&row.span_id).is_some();
                 }
                 continue;
             }
@@ -729,6 +728,25 @@ mod tests {
                 ..Default::default()
             })],
         );
+    }
+
+    #[test]
+    fn completed_tools_release_their_entries_without_retiring_the_session() {
+        let registry = parent_registry();
+        for i in 0..10_000 {
+            let id = format!("tool-{i}");
+            open_span(&registry, "parent", &id, SpanType::Tool);
+            close_span(&registry, "parent", &id);
+            close_span(&registry, "parent", &id);
+            assert!(registry.state.lock().active_tools["parent"].is_empty());
+        }
+        assert!(registry
+            .active_parent_snapshot("parent")
+            .unwrap()
+            .tools
+            .is_empty());
+        open_span(&registry, "parent", "next-tool", SpanType::Tool);
+        assert!(registry.has_active_tools("parent"));
     }
 
     #[test]
