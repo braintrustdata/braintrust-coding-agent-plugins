@@ -1,8 +1,5 @@
 # Mise will automatically read and use .tool-versions files as well as this file.
 # CI reads .tool-versions directly and does not use mise.
 
-[tools]
-"npm:vite-plus" = "0.2.9"
-
 [hooks]
 postinstall = "make install-deps"
