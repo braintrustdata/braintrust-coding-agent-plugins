@@ -285,6 +285,60 @@ fn codex_happy_path_builds_session_turn_llm_tool_tree() {
 }
 
 #[test]
+fn interrupt_hook_closes_aborted_work_without_a_later_hook_or_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let path = transcript.to_str().unwrap();
+    for record in [
+        json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"s","cwd":"/x/app"}}),
+        json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}),
+        json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working"}]}}),
+        json!({"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}","metadata":{"turn_id":"t1"}}}),
+    ] {
+        append(&transcript, record);
+    }
+    let mut translator = Registry::default_agents().create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let mut ops = translator
+        .handle(&envelope("s", "SessionStart", path, json!({})), &ctx)
+        .unwrap();
+    let before = reduce(ops.clone());
+    assert_eq!(find(&before, SpanType::Task, "turn: t1").end_ms, None);
+    assert_eq!(find(&before, SpanType::Tool, "shell").end_ms, None);
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:05Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t1","reason":"interrupted"}}),
+    );
+    ops.extend(
+        translator
+            .handle(
+                &envelope("s", "Interrupt", path, json!({"turn_id":"t1"})),
+                &ctx,
+            )
+            .unwrap(),
+    );
+    let after = reduce(ops);
+    for row in [
+        find(&after, SpanType::Task, "turn: t1"),
+        find(&after, SpanType::Tool, "shell"),
+    ] {
+        assert_eq!(row.end_ms, Some(1_767_225_605_000));
+        assert_eq!(row.metadata.as_ref().unwrap()["outcome"], "interrupted");
+        assert!(row.error.is_none());
+    }
+    let turn = find(&after, SpanType::Task, "turn: t1");
+    let llm = after
+        .values()
+        .find(|row| row.span_type == SpanType::Llm && row.parent_span_ids.contains(&turn.span_id))
+        .unwrap();
+    assert!(llm.end_ms.is_some());
+    assert_eq!(llm.metadata.as_ref().unwrap()["outcome"], "interrupted");
+}
+
+#[test]
 fn codex_turn_aborted_closes_open_work_as_interrupted() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("rollout.jsonl");

@@ -6,7 +6,7 @@
 //! the coding-agent integrations.
 
 use crate::route::{apply_additional_metadata, apply_tags, resolve_span_plugin_paths};
-use crate::trace_command::{DoctorAgent, DoctorArgs, TraceCommand};
+use crate::trace_command::{DoctorAgent, DoctorArgs, SetupAgent, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
     braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
@@ -504,12 +504,14 @@ fn daemon_warnings(
 
 async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorCommandOutput {
     let source = args.agent.identity().id;
+    let settings = crate::settings::AgentSettings::load(source);
+    let socket = paths::socket_path(None);
     doctor_output_at(
         host,
         args,
-        &paths::socket_path(None),
+        &socket,
         paths::agent_settings_path(source, None),
-        crate::settings::AgentSettings::load(source),
+        settings,
     )
     .await
 }
@@ -662,13 +664,23 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             if !enable_args.plugin.is_empty() {
                 route.span_plugins = resolve_span_plugin_paths(&enable_args.plugin)?;
             }
-            print_output(run_enable(enable_args, route)?, host.output_format)
+            let codex = matches!(enable_args.agent, SetupAgent::Codex);
+            let output = run_enable(enable_args, route)?;
+            if codex {
+                crate::codex_hooks::activate().await?;
+            }
+            print_output(output, host.output_format)
         }
         TraceCommand::Disable(disable_args) => {
             print_output(run_disable(disable_args.agent)?, host.output_format)
         }
         TraceCommand::Update(update_args) => {
-            print_output(crate::run_update(update_args.agent)?, host.output_format)
+            let codex = matches!(update_args.agent, SetupAgent::Codex);
+            let output = crate::run_update(update_args.agent)?;
+            if codex {
+                crate::codex_hooks::activate().await?;
+            }
+            print_output(output, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
             init_daemon_logging(host.verbose);
@@ -774,7 +786,7 @@ async fn run_hook_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace_command::{SetupAgent, SetupArgs, StopArgs};
+    use crate::trace_command::{SetupArgs, StopArgs};
     use crate::wire::{BackendAuth, TraceDestination};
     use crate::{ImportArgs, ImportSource, RunArgs, RunSource, StatusArgs, TraceCommand};
     use std::path::PathBuf;
