@@ -303,6 +303,34 @@ tracing for that invocation and override the persistent setup route without
 rewriting it, so ordinary agent sessions and concurrent managed runs may use
 different profiles, organizations, projects, experiments, or parent spans.
 
+### Memory and disk soak
+
+On macOS or Linux, run synthetic Claude-format sessions against a local accepting
+backend. No model or Braintrust account is needed:
+
+```bash
+cargo build --manifest-path bt-daemon/Cargo.toml --all-features --release --locked
+python3 scripts/daemon-soak.py \
+  --daemon-bin bt-daemon/target/release/bt-daemon \
+  --sessions 10 --turns-per-minute 10 --duration 600 \
+  --output /tmp/bt-soak
+```
+
+The rate is per session. Turn lengths follow a lognormal distribution, with mostly
+short turns and occasional long ones; `--sigma 0` uses constant lengths. Tool calls
+are spread through each turn. Generator overhead can reduce the achieved rate.
+Use `--duration 0` to run until Ctrl-C, `--result-kib` and `--tools-per-turn` to
+increase volume, or `--compact-kib 0` to stress growing context without compaction.
+Output directories must be new, and Unix socket paths should be kept short.
+
+`samples.csv` records daemon RSS, disk categories, pending SpanOps, and metadata
+counts. Console output includes a rolling RSS slope in MiB/minute; it is a trend
+indicator rather than proof of a leak. `turns.jsonl` records actual turn lengths.
+The final status and summary include resident-session counts. The default final
+quiet period is 60 seconds. Idle retirement is disabled and no SessionEnd is sent,
+so the same sessions stay resident through long turns and the quiet period.
+Only a rolling sample window is kept in the script's memory, including indefinite runs.
+
 ## Recovery and storage
 
 Capture requests return after the event is flushed to its journal. Daemon
