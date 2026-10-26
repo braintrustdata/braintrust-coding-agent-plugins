@@ -201,6 +201,7 @@ enum State {
 }
 struct Publication {
     input: u64,
+    ordinal: u64,
     observation: bool,
     capture: Option<OriginSnapshot>,
     ops: Option<Vec<SpanOp>>,
@@ -448,21 +449,9 @@ impl Producer {
                 }
             }
         }
-        // Load creation provenance so an upgrade cannot restamp old spans.
-        let mut after = 0;
-        loop {
-            let rows = self.journal.read_after(after, 128).await?;
-            if rows.is_empty() {
-                break;
-            }
-            for (position, op) in rows {
-                after = position;
-                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                if let Some(origin) = row.origin {
-                    self.origins.entry(row.span_id).or_insert(origin);
-                }
-            }
-        }
+        // Payloads already accepted by every route have been reclaimed. Only
+        // small birth-version snapshots are needed to stamp later merges.
+        self.origins.extend(self.journal.origins().await?);
         self.translator = Some(
             self.options
                 .registry
@@ -511,6 +500,9 @@ impl Producer {
             let (first, capture) = match entry.record {
                 JournalRecord::Event(event) => {
                     let mut env = crate::journal::envelope_from_redacted(event);
+                    if let Some(route) = &env.route {
+                        self.journal.register(route).await?;
+                    }
                     if crate::translate::canonical_source_name(&env.source) != self.options.source {
                         self.position = input;
                         continue;
@@ -580,6 +572,7 @@ impl Producer {
             };
             self.publication = Some(Publication {
                 input,
+                ordinal: 0,
                 observation,
                 capture,
                 ops: Some(first),
@@ -644,12 +637,14 @@ impl Producer {
                             }
                         }
                         if publish {
-                            *ops = self.roots.process(ops).await;
+                            *ops = self.roots.process_owned(std::mem::take(ops));
                         }
                         pending.prepared = true;
                     }
                     if publish {
-                        self.journal.append(pending.input, ops).await?;
+                        self.journal
+                            .append_live(pending.input, &mut pending.ordinal, ops)
+                            .await?;
                     }
                     pending.ops = None;
                 }
@@ -699,16 +694,8 @@ impl Producer {
             )
             .await?;
         }
-        let mut after = 0;
-        loop {
-            let rows = self.journal.read_after(after, 128).await?;
-            let Some(&(through, _)) = rows.last() else {
-                break;
-            };
-            after = through;
-            let ops = rows.into_iter().map(|(_, op)| op).collect::<Vec<_>>();
-            Self::observe(&self.options, &mut self.pending_snapshots, &ops, observer).await?;
-        }
+        let ops = self.journal.observations().await?;
+        Self::observe(&self.options, &mut self.pending_snapshots, &ops, observer).await?;
         Ok(())
     }
     async fn observe(
@@ -717,7 +704,10 @@ impl Producer {
         ops: &[SpanOp],
         observer: &Observation,
     ) -> anyhow::Result<()> {
-        let mut ops = ops.to_vec();
+        let mut ops = ops
+            .iter()
+            .map(super::journal::metadata_only)
+            .collect::<Vec<_>>();
         Prepare::new(&options.source).apply(&mut ops, &observer.config);
         if options
             .correlation
@@ -932,6 +922,7 @@ mod tests {
             phase: Boundary::Journal,
             publication: Some(Publication {
                 input: 10,
+                ordinal: 0,
                 observation: true,
                 capture: None,
                 ops: Some(vec![
@@ -957,7 +948,7 @@ mod tests {
         db.execute_batch("DROP TRIGGER fail_append; CREATE TRIGGER fail_commit BEFORE UPDATE OF committed ON batches BEGIN SELECT RAISE(FAIL,'commit'); END;").unwrap();
         assert!(producer.publish().await.is_err());
         assert_eq!(drains.load(Ordering::Relaxed), 1);
-        assert_eq!(journal.tail().await.unwrap(), 0);
+        assert_eq!(journal.tail().await.unwrap(), 1);
         db.execute_batch("DROP TRIGGER fail_commit").unwrap();
         producer.publish().await.unwrap();
         assert_eq!(drains.load(Ordering::Relaxed), 1);

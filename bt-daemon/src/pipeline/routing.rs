@@ -56,14 +56,20 @@ impl RoutingSink {
                 let (result, state) = match &request.operation {
                     Operation::Emit(ops) => {
                         let mut ops = ops.clone();
-                        prepare.apply(&mut ops, &request.config);
+                        prepare.apply_shared(&mut ops, &request.config);
                         plugins.configure(&request.config.span_plugins);
                         let mut prepared = Vec::with_capacity(ops.len());
                         let mut failure = None;
                         let mut report = false;
                         for op in &ops {
-                            match plugins.process(op).await {
-                                PluginOutcome::Prepared(op) => prepared.push(*op),
+                            if request.config.span_plugins.is_empty() {
+                                prepared.push(op.clone());
+                                continue;
+                            }
+                            match plugins.process(op.as_ref()).await {
+                                PluginOutcome::Prepared(op) => {
+                                    prepared.push(super::live::SharedOp::new(*op))
+                                }
                                 PluginOutcome::Filtered => {}
                                 PluginOutcome::Failed(error) => {
                                     report |= error.failure.newly_seen;
@@ -208,6 +214,15 @@ impl Sink for RoutingSink {
         self.config = Some(config.clone());
     }
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+        self.emit_shared(
+            &ops.iter()
+                .cloned()
+                .map(super::live::SharedOp::new)
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+    async fn emit_shared(&mut self, ops: &[super::live::SharedOp]) -> anyhow::Result<u64> {
         self.request(Operation::Emit(ops.to_vec())).await
     }
     async fn flush(&mut self) -> anyhow::Result<()> {

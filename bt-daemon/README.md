@@ -306,10 +306,24 @@ different profiles, organizations, projects, experiments, or parent spans.
 ## Recovery and storage
 
 Capture requests return after the event is flushed to its journal. Daemon
-workers handle authentication, translation, and delivery. Translation commits
-canonical SpanOps and its consumed event position to a SQLite journal. Each route
-has an independent durable head that advances only after checked sink acceptance
-or intentional filtering. Plugin, authentication, and delivery recovery resumes
+workers handle authentication, translation, and delivery. Translation persists
+canonical insert/merge operations as they become available and hands the same
+operations directly to the route multiplexer. Routes share owned copy-on-write
+references; route overlays and plugins cannot change another route's operation.
+Healthy delivery never reads those payloads back from SQLite. Route batches flush
+after 5 ms or 256 KiB; an operation larger than the byte cap travels alone.
+Byte-bounded live queues apply backpressure. Failed routes pause their live feed
+and recover through the shared, bounded SQLite reader.
+
+Each route has an independent durable head that advances only after checked SDK
+flush acceptance or intentional filtering. The same transaction deletes payloads
+covered by every registered route's head. Captured routes are registered even
+while authentication is unavailable. A new route starts at the retained prefix;
+use transcript import to export already-reclaimed historical work to a new
+destination. SQLite reuses freed pages, so an existing database file may retain
+its previous high-water size. Small provenance, correlation, and publication
+watermarks survive payload reclamation. Plugin, authentication, and delivery
+recovery resumes
 from unresolved SpanOps without replaying translation. Retries use deterministic
 span IDs, so repeated delivery updates the same spans.
 
@@ -339,7 +353,9 @@ The daemon streams journals and transcripts, applies queue backpressure, and
 retires idle sessions. Retirement preserves unresolved work and route heads;
 startup resumes pending subscriptions without waiting for another event.
 Translators rebuild their in-memory state from committed input when more
-translation is needed, suppressing already committed output. Journals and mirrors
+translation is needed, suppressing already committed output. Durable operation
+ordinals also suppress already-published output when a crash interrupts a native
+event before its translation checkpoint. Journals and mirrors
 preserve conversation content; credentials are excluded from journaled routing data.
 
 Completed, inactive session partitions become eligible for cleanup after seven

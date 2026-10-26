@@ -169,13 +169,6 @@ impl DeliveryLedger {
         }
     }
 
-    fn filter(&self, ops: &[SpanOp]) -> Vec<SpanOp> {
-        ops.iter()
-            .filter(|op| self.should_emit(op))
-            .cloned()
-            .collect()
-    }
-
     fn record_emitted(&mut self, ops: &[SpanOp]) {
         for op in ops {
             let row = match op {
@@ -324,17 +317,31 @@ impl Sink for LedgerSink {
     }
 
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
-        let mut filtered = self
-            .ledger
-            .as_ref()
-            .map(|ledger| ledger.filter(ops))
-            .unwrap_or_else(|| ops.to_vec());
+        self.emit_shared(
+            &ops.iter()
+                .cloned()
+                .map(crate::translate::CowSpanOp::new)
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+
+    async fn emit_shared(&mut self, ops: &[crate::translate::CowSpanOp]) -> anyhow::Result<u64> {
+        let mut filtered = ops
+            .iter()
+            .filter(|op| {
+                self.ledger
+                    .as_ref()
+                    .is_none_or(|ledger| ledger.should_emit(op))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if filtered.is_empty() {
             return Ok(0);
         }
-        for op in &mut filtered {
-            let is_insert = matches!(op, SpanOp::Insert(_));
-            let row = match op {
+        for op in &filtered {
+            let is_insert = matches!(op.as_ref(), SpanOp::Insert(_));
+            let row = match op.as_ref() {
                 SpanOp::Insert(row) | SpanOp::Merge(row) => row,
             };
             // Every span emitted by the integration has plugin provenance,
@@ -383,12 +390,12 @@ impl Sink for LedgerSink {
             return Ok(0);
         }
         for op in &mut filtered {
-            let row = match op {
-                SpanOp::Insert(row) | SpanOp::Merge(row) => row,
-            };
-            // Repeat each span's birth snapshot, including stateless updates.
-            // This also discards provenance supplied by a span-processing plugin.
-            row.origin = self.span_origins.get(&row.span_id).cloned();
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+            let origin = self.span_origins.get(&row.span_id).cloned();
+            if row.origin != origin {
+                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.make_mut();
+                row.origin = origin;
+            }
         }
         if !self.pending_origins.is_empty() {
             // Persist birth versions before the SDK can queue a span. A crash
@@ -409,13 +416,15 @@ impl Sink for LedgerSink {
         }
         // Never hold a cross-process file lock over SDK/network delivery.
         drop(lock);
-        let emitted = self.inner.emit(&filtered).await?;
+        let emitted = self.inner.emit_shared(&filtered).await?;
         // A deferred lifecycle root has not reached the backend yet. Do not
         // record it as delivered: a subsequent cold-worker replay needs to
         // retain the root until descendant work makes it exportable.
         if emitted > 0 {
             if let Some(ledger) = &mut self.ledger {
-                ledger.record_emitted(&filtered);
+                for op in &filtered {
+                    ledger.record_emitted(std::slice::from_ref(op.as_ref()));
+                }
             }
         }
         Ok(emitted)

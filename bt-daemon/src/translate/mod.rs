@@ -7,6 +7,9 @@
 //! whole pipeline be exercised with a debug sink and makes translators unit-
 //! testable without any network.
 
+mod shared;
+pub use shared::CowSpanOp;
+
 mod antigravity;
 mod claude;
 mod codex;

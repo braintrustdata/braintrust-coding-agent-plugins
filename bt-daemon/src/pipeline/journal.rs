@@ -1,11 +1,12 @@
 //! Concrete durable channel: one ordered SpanOp log and a head per route.
+use super::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
 use super::{
     delivery::InputPort,
     recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
     Completion, Delivery, Stage,
 };
 use crate::{
-    translate::SpanOp,
+    translate::{OriginSnapshot, SpanOp, SpanRow, SpanType},
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
 };
 use parking_lot::Mutex;
@@ -32,10 +33,16 @@ impl std::fmt::Display for BindingChanged {
 }
 impl std::error::Error for BindingChanged {}
 
+type ReplayWindow = Vec<(u64, std::sync::Weak<SpanOp>, usize)>;
+
 #[derive(Clone)]
 pub(crate) struct SpanJournal {
     connection: Arc<StorageMutex<Option<Connection>>>,
     changed: watch::Sender<u64>,
+    live: Arc<Multiplexer>,
+    replay: Arc<tokio::sync::Mutex<ReplayWindow>>,
+    #[cfg(test)]
+    payload_reads: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Explicit codec preserves fields intentionally omitted from wire/plugin JSON.
@@ -51,11 +58,19 @@ struct StoredOp {
 impl StoredOp {
     fn encode(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-        Ok(serde_json::to_vec(&Self {
+        #[derive(Serialize)]
+        struct Borrowed<'a> {
+            version: u32,
+            op: &'a SpanOp,
+            late_merge_key: &'a Option<String>,
+            turn_span_id: &'a Option<String>,
+            is_turn: bool,
+        }
+        Ok(serde_json::to_vec(&Borrowed {
             version: 1,
-            op: op.clone(),
-            late_merge_key: row.late_merge_key.clone(),
-            turn_span_id: row.turn_span_id.clone(),
+            op,
+            late_merge_key: &row.late_merge_key,
+            turn_span_id: &row.turn_span_id,
             is_turn: row.is_turn,
         })?)
     }
@@ -74,6 +89,84 @@ impl StoredOp {
     }
 }
 
+/// Metadata needed to restore correlation and provenance without retaining
+/// conversation input/output after all delivery obligations are complete.
+pub(super) fn metadata_only(op: &SpanOp) -> SpanOp {
+    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+    let row = SpanRow {
+        span_id: row.span_id.clone(),
+        root_span_id: row.root_span_id.clone(),
+        parent_span_ids: row.parent_span_ids.clone(),
+        name: row.name.clone(),
+        span_type: row.span_type,
+        start_ms: row.start_ms,
+        end_ms: row.end_ms,
+        metadata: row.metadata.clone(),
+        origin: row.origin.clone(),
+        is_turn: row.is_turn,
+        ..Default::default()
+    };
+    match op {
+        SpanOp::Insert(_) => SpanOp::Insert(row),
+        SpanOp::Merge(_) => SpanOp::Merge(row),
+    }
+}
+fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Result<()> {
+    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+    if let Some(origin) = &row.origin {
+        db.execute(
+            "INSERT OR IGNORE INTO origins(span_id,value) VALUES (?,?)",
+            params![row.span_id, serde_json::to_string(origin)?],
+        )?;
+    }
+    if !observation {
+        return Ok(());
+    }
+    if matches!(op, SpanOp::Insert(_))
+        && (row.span_type == SpanType::Tool
+            || (row.span_type == SpanType::Task && row.span_id == row.root_span_id))
+    {
+        let mut birth = metadata_only(op);
+        let (SpanOp::Insert(birth_row) | SpanOp::Merge(birth_row)) = &mut birth;
+        birth_row.end_ms = None;
+        db.execute(
+            "INSERT OR REPLACE INTO span_state(span_id,kind,value,end_ms) VALUES (?,?,?,?)",
+            params![
+                row.span_id,
+                if row.span_type == SpanType::Tool {
+                    "tool"
+                } else {
+                    "root"
+                },
+                StoredOp::encode(&birth)?,
+                row.end_ms
+            ],
+        )?;
+    } else {
+        db.execute(
+            "UPDATE span_state SET end_ms=? WHERE span_id=?",
+            params![row.end_ms, row.span_id],
+        )?;
+    }
+    db.execute(
+        "DELETE FROM span_state WHERE span_id=? AND kind='tool' AND end_ms IS NOT NULL",
+        [&row.span_id],
+    )?;
+    Ok(())
+}
+fn prune(db: &Connection) -> anyhow::Result<()> {
+    let through: Option<u64> = db.query_row("SELECT min(position) FROM heads", [], |r| r.get(0))?;
+    if let Some(through) = through {
+        db.execute("DELETE FROM ops WHERE position<=?", [through])?;
+        db.execute(
+            "UPDATE publication SET floor=max(floor,?) WHERE id=1",
+            [through],
+        )?;
+        db.execute("DELETE FROM receipts WHERE EXISTS(SELECT 1 FROM batches WHERE batches.input=receipts.input AND committed=1) AND NOT EXISTS(SELECT 1 FROM ops WHERE ops.input=receipts.input)", [])?;
+    }
+    Ok(())
+}
+
 impl SpanJournal {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let path = path.to_owned();
@@ -83,7 +176,7 @@ impl SpanJournal {
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            anyhow::ensure!(version <= 5, "unsupported SpanOp journal schema {version}");
+            anyhow::ensure!(version <= 6, "unsupported SpanOp journal schema {version}");
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
             if version < 3 {
                 db.execute_batch(
@@ -115,7 +208,27 @@ impl SpanJournal {
             if version < 5 {
                 db.execute_batch("BEGIN IMMEDIATE; ALTER TABLE heads ADD COLUMN settings TEXT; ALTER TABLE heads ADD COLUMN settings_through INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=5; COMMIT")?;
             }
-            let tail = db.query_row("SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1", [], |row| row.get(0))?;
+            if version < 6 {
+                db.execute_batch("BEGIN IMMEDIATE;
+                    DELETE FROM ops WHERE input IN (SELECT input FROM batches WHERE committed=0);
+                    CREATE TABLE receipts (input INTEGER NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(input,ordinal));
+                    CREATE TABLE publication (id INTEGER PRIMARY KEY CHECK(id=1), tail INTEGER NOT NULL, floor INTEGER NOT NULL);
+                    INSERT INTO publication VALUES(1,(SELECT coalesce(max(position),0) FROM ops),0);
+                    CREATE TABLE origins (span_id TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE span_state (span_id TEXT PRIMARY KEY, kind TEXT NOT NULL, value BLOB NOT NULL, end_ms INTEGER);
+                    ")?;
+                // One bounded upgrade pass extracts small recovery metadata.
+                let mut after = 0;
+                loop {
+                    let record: Option<(u64,Vec<u8>,bool)> = db.query_row("SELECT position,value,observation FROM ops JOIN batches USING(input) WHERE position>? ORDER BY position LIMIT 1", [after], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                    let Some((position,value,observation)) = record else { break; };
+                    save_metadata(&db, &StoredOp::decode(&value)?, observation)?;
+                    after = position;
+                }
+                prune(&db)?;
+                db.execute_batch("PRAGMA user_version=6; COMMIT")?;
+            }
+            let tail = db.query_row("SELECT tail FROM publication WHERE id=1", [], |row| row.get(0))?;
             Ok((db, tail))
         })
         .await??;
@@ -124,6 +237,10 @@ impl SpanJournal {
         Ok(Self {
             connection: Arc::new(StorageMutex::new(Some(connection))),
             changed,
+            live: Arc::new(Multiplexer::default()),
+            replay: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            payload_reads: Arc::default(),
         })
     }
 
@@ -172,7 +289,7 @@ impl SpanJournal {
         .await
     }
 
-    /// Restart abandons only invisible chunks; a committed identity is never rewritten.
+    /// Restart abandons only invisible receipts; a committed identity is never rewritten.
     pub async fn begin(&self, input: u64, observation: bool) -> anyhow::Result<bool> {
         self.with_db(move |db| {
             let tx = db.transaction()?;
@@ -186,7 +303,14 @@ impl SpanJournal {
             if done == Some(true) {
                 return Ok(false);
             }
-            tx.execute("DELETE FROM ops WHERE input=?", [input])?;
+            let published: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM receipts WHERE input=?)",
+                [input],
+                |r| r.get(0),
+            )?;
+            if !published {
+                tx.execute("DELETE FROM ops WHERE input=?", [input])?;
+            }
             tx.execute(
                 "INSERT OR REPLACE INTO batches(input,committed,observation) VALUES (?,0,?)",
                 params![input, observation],
@@ -197,6 +321,146 @@ impl SpanJournal {
         .await
     }
 
+    /// Journal available operations and hand the original instances to routes.
+    /// Per-input operation ordinals survive a crash halfway through translation,
+    /// so rebuilding translator state does not publish an accepted prefix twice.
+    pub async fn append_live(
+        &self,
+        input: u64,
+        ordinal: &mut u64,
+        ops: &mut Vec<SpanOp>,
+    ) -> anyhow::Result<()> {
+        while !ops.is_empty() {
+            let started = std::time::Instant::now();
+            let mut encoded = Vec::new();
+            let mut bytes = 0;
+            for op in ops.iter() {
+                let value = StoredOp::encode(op)?;
+                if !encoded.is_empty() && bytes + value.len() > BYTE_BUDGET {
+                    break;
+                }
+                bytes += value.len();
+                encoded.push(value);
+                if bytes >= BYTE_BUDGET || started.elapsed() >= WINDOW {
+                    break;
+                }
+            }
+            let sizes = encoded.iter().map(Vec::len).collect::<Vec<_>>();
+            let metadata = ops
+                .iter()
+                .take(encoded.len())
+                .map(metadata_only)
+                .collect::<Vec<_>>();
+            let first = *ordinal;
+            let positions = self
+                .with_db(move |db| {
+                    let tx = db.transaction()?;
+                    let mut positions = Vec::new();
+                    let (committed, observation): (bool, bool) = tx.query_row(
+                        "SELECT committed,observation FROM batches WHERE input=?",
+                        [input],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    for (index, value) in encoded.into_iter().enumerate() {
+                        let ordinal = first + index as u64;
+                        let exists = tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM receipts WHERE input=? AND ordinal=?)",
+                            params![input, ordinal],
+                            |r| r.get::<_, bool>(0),
+                        )?;
+                        if exists {
+                            positions.push(None);
+                            continue;
+                        }
+                        anyhow::ensure!(!committed, "cannot change a completed translation input");
+                        save_metadata(&tx, &metadata[index], observation)?;
+                        tx.execute(
+                            "INSERT INTO ops(input,value) VALUES (?,?)",
+                            params![input, value],
+                        )?;
+                        let position = tx.last_insert_rowid() as u64;
+                        positions.push(Some(position));
+                        tx.execute("UPDATE publication SET tail=? WHERE id=1", [position])?;
+                        tx.execute(
+                            "INSERT INTO receipts(input,ordinal) VALUES (?,?)",
+                            params![input, ordinal],
+                        )?;
+                    }
+                    tx.commit()?;
+                    Ok(positions)
+                })
+                .await?;
+            let count = positions.len();
+            *ordinal += count as u64;
+            for ((position, bytes), op) in positions.into_iter().zip(sizes).zip(ops.drain(..count))
+            {
+                if let Some(position) = position {
+                    self.live
+                        .publish(Record {
+                            position,
+                            bytes,
+                            op: SharedOp::new(op),
+                        })
+                        .await;
+                    self.changed.send_replace(position);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One serialized, weakly held recovery window is shared by all routes.
+    /// No decoded payload remains alive solely because of the replay cache.
+    async fn recover_after(&self, after: u64) -> anyhow::Result<Vec<Record>> {
+        let mut cache = self.replay.lock().await;
+        if cache
+            .first()
+            .is_some_and(|(position, _, _)| *position <= after + 1)
+            && cache
+                .last()
+                .is_some_and(|(position, _, _)| *position > after)
+        {
+            let shared = cache
+                .iter()
+                .filter(|(position, _, _)| *position > after)
+                .map(|(position, op, bytes)| {
+                    Some(Record {
+                        position: *position,
+                        op: SharedOp::from_arc(op.upgrade()?),
+                        bytes: *bytes,
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(shared) = shared {
+                return Ok(shared);
+            }
+        }
+        let records = self.with_db(move |db| {
+            let mut statement = db.prepare("SELECT position,value FROM ops JOIN batches USING(input) WHERE (committed=1 OR EXISTS(SELECT 1 FROM receipts WHERE receipts.input=ops.input)) AND position>? ORDER BY position")?;
+            let mut rows = statement.query([after])?;
+            let started = std::time::Instant::now();
+            let mut records = Vec::new();
+            let mut bytes = 0;
+            while let Some(row) = rows.next()? {
+                let value = row.get_ref(1)?.as_blob()?;
+                if !records.is_empty() && bytes + value.len() > BYTE_BUDGET { break; }
+                bytes += value.len();
+                records.push(Record { position:row.get(0)?, op:SharedOp::new(StoredOp::decode(value)?), bytes:value.len() });
+                if bytes >= BYTE_BUDGET || started.elapsed() >= WINDOW { break; }
+            }
+            Ok(records)
+        }).await?;
+        #[cfg(test)]
+        self.payload_reads
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        *cache = records
+            .iter()
+            .map(|record| (record.position, record.op.downgrade(), record.bytes))
+            .collect();
+        Ok(records)
+    }
+
+    #[cfg(test)]
     pub async fn append(&self, input: u64, ops: &[SpanOp]) -> anyhow::Result<()> {
         let encoded = ops
             .iter()
@@ -211,6 +475,7 @@ impl SpanJournal {
             )?;
             anyhow::ensure!(!done, "cannot change a committed translation input");
             for value in encoded {
+                save_metadata(&tx, &StoredOp::decode(&value)?, true)?;
                 tx.execute(
                     "INSERT INTO ops(input,value) VALUES (?,?)",
                     params![input, value],
@@ -309,6 +574,11 @@ impl SpanJournal {
                     [input],
                     |r| r.get(0),
                 )?;
+                let tail: u64 = tail;
+                tx.execute("UPDATE publication SET tail=max(tail,?) WHERE id=1", [tail])?;
+                let tail =
+                    tx.query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))?;
+                prune(&tx)?;
                 tx.commit()?;
                 Ok(tail)
             })
@@ -322,11 +592,30 @@ impl SpanJournal {
         route: &SessionRoute,
         legacy_through: u64,
     ) -> anyhow::Result<Cursor> {
+        let live = self.live.subscribe();
         let route = serde_json::to_string(route)?;
         let key = route.clone();
         let position = self
             .with_db(move |db| {
                 let tx = db.transaction()?;
+                // Auth can register a named-profile obligation before learning
+                // its stable ID. Move that unresolved placeholder to the resolved
+                // identity instead of leaving a second head that can never run.
+                let candidate: SessionRoute = serde_json::from_str(&key)?;
+                if candidate.auth.profile_id.is_some() {
+                    let aliases = {
+                        let mut query = tx.prepare("SELECT route FROM heads WHERE binding IS NULL AND route<>?")?;
+                        let rows = query.query_map([&key], |r|r.get::<_,String>(0))?;
+                        rows.collect::<Result<Vec<_>,_>>()?
+                    };
+                    for alias in aliases {
+                        let previous: SessionRoute = serde_json::from_str(&alias)?;
+                        if previous.auth.profile_id.is_none() && previous.same_route(&candidate) {
+                            tx.execute("UPDATE OR IGNORE heads SET route=? WHERE route=?", params![key,alias])?;
+                            tx.execute("DELETE FROM heads WHERE route=?",[alias])?;
+                        }
+                    }
+                }
                 // Seed only a new head, using released event checkpoints where provable.
                 let legacy: u64 = tx.query_row(
                     "SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input)
@@ -335,7 +624,7 @@ impl SpanJournal {
                     |r| r.get(0),
                 )?;
                 tx.execute(
-                    "INSERT OR IGNORE INTO heads(route,position) VALUES (?,?)",
+                    "INSERT OR IGNORE INTO heads(route,position) VALUES (?,max(?,(SELECT floor FROM publication WHERE id=1)))",
                     params![key, legacy],
                 )?;
                 let position =
@@ -358,14 +647,17 @@ impl SpanJournal {
             settings: None,
             version: String::new(),
             restored: false,
+            live,
+            queued: None,
             error: Arc::new(Mutex::new(None)),
             recovery: Arc::new(Mutex::new(None)),
         })
     }
 
+    #[cfg(test)]
     pub async fn read_after(&self, after: u64, limit: usize) -> anyhow::Result<Vec<(u64, SpanOp)>> {
         self.with_db(move |db| {
-            let mut statement = db.prepare("SELECT position,value FROM ops JOIN batches USING(input) WHERE committed=1 AND observation=1 AND position>? ORDER BY position LIMIT ?")?;
+            let mut statement = db.prepare("SELECT position,value FROM ops JOIN batches USING(input) WHERE (committed=1 OR EXISTS(SELECT 1 FROM receipts WHERE receipts.input=ops.input)) AND observation=1 AND position>? ORDER BY position LIMIT ?")?;
             let rows = statement.query_map(params![after,limit as u64], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,Vec<u8>>(1)?)))?;
             rows.map(|row| { let (position,bytes)=row?; Ok((position,StoredOp::decode(&bytes)?)) }).collect()
         }).await
@@ -373,30 +665,91 @@ impl SpanJournal {
 
     pub async fn tail(&self) -> anyhow::Result<u64> {
         self.with_db(|db| {
-            Ok(db.query_row(
-                "SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input)
-            WHERE committed=1",
-                [],
-                |r| r.get(0),
-            )?)
+            Ok(db.query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))?)
         })
         .await
+    }
+
+    pub async fn origins(&self) -> anyhow::Result<BTreeMap<String, OriginSnapshot>> {
+        self.with_db(|db| {
+            let mut query = db.prepare("SELECT span_id,value FROM origins")?;
+            let rows =
+                query.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.map(|row| {
+                let (id, value) = row?;
+                Ok((id, serde_json::from_str(&value)?))
+            })
+            .collect()
+        })
+        .await
+    }
+
+    pub async fn observations(&self) -> anyhow::Result<Vec<SpanOp>> {
+        self.with_db(|db| {
+            let mut query = db.prepare("SELECT value,end_ms FROM span_state ORDER BY rowid")?;
+            let rows = query.query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<i64>>(1)?))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                let (bytes, end) = row?;
+                let op = StoredOp::decode(&bytes)?;
+                let (SpanOp::Insert(birth) | SpanOp::Merge(birth)) = &op;
+                if let Some(end_ms) = end {
+                    let mut terminal = birth.clone();
+                    terminal.end_ms = Some(end_ms);
+                    result.push(op);
+                    result.push(SpanOp::Merge(terminal));
+                } else {
+                    result.push(op);
+                }
+            }
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn register(&self, route: &SessionRoute) -> anyhow::Result<()> {
+        let route = serde_json::to_string(route)?;
+        self.with_db(move |db| {
+            let candidate: SessionRoute = serde_json::from_str(&route)?;
+            let existing = {
+                let mut query = db.prepare("SELECT route FROM heads")?;
+                let rows = query.query_map([], |r|r.get::<_,String>(0))?;
+                let mut existing = false;
+                for row in rows { if serde_json::from_str::<SessionRoute>(&row?)?.same_route(&candidate) { existing = true; break; } }
+                existing
+            };
+            if !existing { db.execute("INSERT OR IGNORE INTO heads(route,position) VALUES (?,(SELECT floor FROM publication WHERE id=1))",[route])?; }
+            Ok(())
+        }).await
     }
 
     /// A completed subscription can remain dormant until its source has new work.
     pub async fn route_complete(&self, route: &SessionRoute, input: u64) -> anyhow::Result<bool> {
         let route = route.clone();
         self.with_db(move |db| {
-            let committed: u64 = db.query_row("SELECT coalesce(max(input),0) FROM batches WHERE committed=1",[],|r|r.get(0))?;
-            if committed < input {return Ok(false);}
-            let tail: u64 = db.query_row("SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1",[],|r|r.get(0))?;
-            let mut query = db.prepare("SELECT route FROM heads WHERE failure IS NULL AND position>=?")?;
-            for stored in query.query_map([tail],|r|r.get::<_,String>(0))? {
+            let committed: u64 = db.query_row(
+                "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
+                [],
+                |r| r.get(0),
+            )?;
+            if committed < input {
+                return Ok(false);
+            }
+            let tail: u64 =
+                db.query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))?;
+            let mut query =
+                db.prepare("SELECT route FROM heads WHERE failure IS NULL AND position>=?")?;
+            for stored in query.query_map([tail], |r| r.get::<_, String>(0))? {
                 let stored: SessionRoute = serde_json::from_str(&stored?)?;
-                if stored.same_route(&route) {return Ok(true);}
+                if stored.same_route(&route) {
+                    return Ok(true);
+                }
             }
             Ok(false)
-        }).await
+        })
+        .await
     }
 
     /// Tokens can change; a durable head's backend and organization cannot.
@@ -522,10 +875,11 @@ impl SpanJournal {
         })
         .await
     }
-    /// Whole-partition retention only; an empty subscriber set is not completion.
+    /// Remaining metadata can expire once input and every route are complete.
+    /// An empty subscriber set is not completion.
     pub async fn collectible(&self, input: u64) -> anyhow::Result<bool> {
         self.with_db(move |db| Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM heads)
-            AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position < (SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1))
+            AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position < (SELECT tail FROM publication WHERE id=1))
             AND NOT EXISTS(SELECT 1 FROM recovery WHERE failure IS NOT NULL)
             AND NOT EXISTS(SELECT 1 FROM batches WHERE committed=0)
             AND (SELECT coalesce(max(input),0) FROM batches WHERE committed=1)>=?",[input],|r|r.get(0))?)).await
@@ -596,6 +950,8 @@ pub(crate) struct Cursor {
     settings: Option<watch::Receiver<SessionConfig>>,
     version: String,
     restored: bool,
+    live: Receiver,
+    queued: Option<Record>,
     error: Arc<Mutex<Option<String>>>,
     recovery: Arc<Mutex<Option<RecoveryInfo>>>,
 }
@@ -642,7 +998,7 @@ impl Progress {
 }
 
 pub(crate) struct Subscription {
-    pub input: Box<dyn InputPort<Item = Vec<SpanOp>>>,
+    pub input: Box<dyn InputPort<Item = Vec<SharedOp>>>,
     pub progress: Progress,
 }
 
@@ -663,11 +1019,12 @@ impl Cursor {
         self.error = error;
         self.recovery = recovery;
         Subscription {
-            input: Box::new(self),
+            input: Box::new(SharedCursor(self)),
             progress,
         }
     }
 
+    #[cfg(test)]
     pub async fn next_batch(
         &mut self,
         limit: usize,
@@ -679,7 +1036,7 @@ impl Cursor {
             .with_db(move |db| {
                 let mut statement = db.prepare(
                     "SELECT position,value FROM ops JOIN batches USING(input)
-                WHERE committed=1 AND position>? ORDER BY position LIMIT ?",
+                WHERE (committed=1 OR EXISTS(SELECT 1 FROM receipts WHERE receipts.input=ops.input)) AND position>? ORDER BY position LIMIT ?",
                 )?;
                 let rows = statement.query_map(params![after, limit as u64], |r| {
                     Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -699,6 +1056,66 @@ impl Cursor {
             ops,
             HeadCompletion {
                 journal: self.journal.clone(),
+                live: self.live.control(),
+                route: self.route.clone(),
+                expected: after,
+                through,
+                progress: self.progress.clone(),
+                abandoned: self.abandoned.clone(),
+                acknowledged: false,
+                error: self.error.clone(),
+                recovery: self.recovery.clone(),
+            },
+        )))
+    }
+
+    async fn next_shared(&mut self) -> anyhow::Result<Option<Delivery<Vec<SharedOp>>>> {
+        let published = *self.changes.borrow();
+        if self.read >= published {
+            self.live.resume();
+            return Ok(None);
+        }
+        let after = self.read;
+        let first = self.queued.take().or_else(|| self.live.try_recv());
+        let mut records = Vec::new();
+        if let Some(first) = first {
+            if first.position == after + 1 {
+                records.push(first);
+            }
+        }
+        if records.is_empty() {
+            // Restart, abandoned delivery, a late subscription, or a bounded
+            // live-queue overrun. Healthy live delivery never enters this path.
+            records = self.journal.recover_after(after).await?;
+            self.live.clear();
+        } else {
+            let deadline = tokio::time::Instant::now() + WINDOW;
+            let mut bytes = records[0].bytes;
+            while bytes < BYTE_BUDGET {
+                let next = match tokio::time::timeout_at(deadline, self.live.recv()).await {
+                    Ok(Some(record)) => record,
+                    _ => break,
+                };
+                if next.position != records.last().map_or(after, |record| record.position) + 1
+                    || bytes + next.bytes > BYTE_BUDGET
+                {
+                    self.queued = Some(next);
+                    break;
+                }
+                bytes += next.bytes;
+                records.push(next);
+            }
+        }
+        let Some(last) = records.last() else {
+            return Ok(None);
+        };
+        let through = last.position;
+        self.read = through;
+        Ok(Some(Delivery::new(
+            records.into_iter().map(|record| record.op).collect(),
+            HeadCompletion {
+                journal: self.journal.clone(),
+                live: self.live.control(),
                 route: self.route.clone(),
                 expected: after,
                 through,
@@ -729,6 +1146,8 @@ impl Cursor {
             })
             .await?;
         self.read = self.completed;
+        self.queued = None;
+        self.live.clear();
         self.progress.send_replace(self.completed);
         Ok(())
     }
@@ -739,24 +1158,28 @@ impl Cursor {
     }
 }
 
+struct SharedCursor(Cursor);
+
 #[async_trait::async_trait]
-impl InputPort for Cursor {
-    type Item = Vec<SpanOp>;
+impl InputPort for SharedCursor {
+    type Item = Vec<SharedOp>;
     async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
-        let result = self.receive_managed().await;
+        let result = self.0.receive_managed().await;
         match result {
             Ok(delivery) => Ok(Some(delivery)),
             Err(error) => {
+                self.0.live.control().pause();
                 let error = match error.downcast::<Failure>() {
                     Ok(failure) => return Err(anyhow::Error::new(failure)),
                     Err(error) => error,
                 };
-                let failure = Failure::storage(&error, &self.version, 0).at(self.completed + 1);
+                let failure = Failure::storage(&error, &self.0.version, 0).at(self.0.completed + 1);
                 // An input failure has no delivery receipt to report through.
                 // Its source still owns persistence of the recovery evidence.
                 if let Err(error) = self
+                    .0
                     .journal
-                    .set_failure(&self.route, Some(serde_json::to_string(&failure)?))
+                    .set_failure(&self.0.route, Some(serde_json::to_string(&failure)?))
                     .await
                 {
                     tracing::warn!(%error, "input recovery evidence could not be persisted");
@@ -768,7 +1191,7 @@ impl InputPort for Cursor {
 }
 
 impl Cursor {
-    async fn receive_managed(&mut self) -> anyhow::Result<Delivery<Vec<SpanOp>>> {
+    async fn receive_managed(&mut self) -> anyhow::Result<Delivery<Vec<SharedOp>>> {
         let mut acknowledgements = self.progress.subscribe();
         loop {
             if self.abandoned.load(Ordering::Acquire) {
@@ -826,7 +1249,7 @@ impl Cursor {
                     return Err(error);
                 }
             }
-            if let Some(delivery) = self.next_batch(128).await? {
+            if let Some(delivery) = self.next_shared().await? {
                 if self.abandoned.load(Ordering::Acquire) {
                     drop(delivery);
                     continue;
@@ -842,8 +1265,20 @@ impl Cursor {
     }
 }
 
+#[cfg(test)]
+#[async_trait::async_trait]
+impl InputPort for Cursor {
+    type Item = Vec<SpanOp>;
+    async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
+        Ok(Some(self.receive_managed().await?.map(|ops| {
+            ops.into_iter().map(|op| op.as_ref().clone()).collect()
+        })))
+    }
+}
+
 struct HeadCompletion {
     journal: SpanJournal,
+    live: super::live::Control,
     route: String,
     expected: u64,
     through: u64,
@@ -856,6 +1291,7 @@ struct HeadCompletion {
 impl Drop for HeadCompletion {
     fn drop(&mut self) {
         if !self.acknowledged {
+            self.live.pause();
             self.abandoned.store(true, Ordering::Release);
             self.progress.send_modify(|_| {});
         }
@@ -880,6 +1316,7 @@ impl Completion for HeadCompletion {
                     "UPDATE heads SET position=?, failure=NULL WHERE route=?",
                     params![through, route],
                 )?;
+                prune(&tx)?;
                 tx.commit()?;
                 Ok(through)
             })
@@ -893,6 +1330,7 @@ impl Completion for HeadCompletion {
     }
 
     async fn failed(&mut self, failure: &mut Failure) -> anyhow::Result<()> {
+        self.live.pause();
         failure.position = self.expected + 1;
         failure.through = Some(self.through);
         *self.error.lock() = Some(failure.message());
@@ -928,6 +1366,293 @@ mod tests {
             tags: vec![name.into()],
             ..SessionRoute::default()
         }
+    }
+
+    #[tokio::test]
+    async fn schema_five_upgrade_reclaims_acknowledged_payloads_without_losing_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("upgrade.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        journal.register(&route("old")).await.unwrap();
+        journal.begin(10, true).await.unwrap();
+        journal.append(10, &[op("old")]).await.unwrap();
+        journal.commit(10).await.unwrap();
+        journal.close().await.unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("UPDATE heads SET position=1; DROP TABLE receipts; DROP TABLE publication; DROP TABLE origins; DROP TABLE span_state; PRAGMA user_version=5").unwrap();
+        drop(db);
+        let upgraded = SpanJournal::open(&path).await.unwrap();
+        assert_eq!(upgraded.tail().await.unwrap(), 1);
+        assert_eq!(upgraded.origins().await.unwrap()["old"].bt_version, "test");
+        assert_eq!(
+            upgraded
+                .with_db(|db| Ok(
+                    db.query_row("SELECT count(*) FROM ops", [], |r| r.get::<_, u64>(0))?
+                ))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(upgraded.collectible(10).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolved_profile_completes_the_pre_authentication_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("auth.sqlite"))
+            .await
+            .unwrap();
+        let mut named = route("profile");
+        named.auth.profile = Some("work".into());
+        journal.register(&named).await.unwrap();
+        journal.begin(10, true).await.unwrap();
+        journal
+            .append_live(10, &mut 0, &mut vec![op("one")])
+            .await
+            .unwrap();
+        journal.commit(10).await.unwrap();
+        let mut resolved = named.clone();
+        resolved.auth.profile_id = Some("stable-id".into());
+        let mut cursor = journal.subscribe(&resolved, 0).await.unwrap();
+        assert_eq!(journal.routes().await.unwrap().len(), 1);
+        cursor
+            .next_shared()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_completed()
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            journal
+                .with_db(|db| Ok(
+                    db.query_row("SELECT count(*) FROM ops", [], |r| r.get::<_, u64>(0))?
+                ))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_routes_at_different_heads_share_the_same_decode_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("shared-recovery.sqlite"))
+            .await
+            .unwrap();
+        journal.begin(10, true).await.unwrap();
+        journal
+            .append_live(10, &mut 0, &mut vec![op("one"), op("two"), op("three")])
+            .await
+            .unwrap();
+        let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
+        let mut b = journal.subscribe(&route("b"), 0).await.unwrap();
+        b.read = 1;
+        let first = a.next_shared().await.unwrap().unwrap();
+        let second = b.next_shared().await.unwrap().unwrap();
+        assert_eq!(first.value().len(), 3);
+        assert_eq!(second.value().len(), 2);
+        assert!(std::ptr::eq(
+            first.value()[1].as_ref(),
+            second.value()[0].as_ref()
+        ));
+        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn all_route_acknowledgements_reclaim_payloads_and_preserve_watermarks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cleanup.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
+        let mut b = journal.subscribe(&route("b"), 0).await.unwrap();
+        journal.begin(10, true).await.unwrap();
+        journal
+            .append_live(10, &mut 0, &mut vec![op("one")])
+            .await
+            .unwrap();
+        journal.commit(10).await.unwrap();
+        let first = a.next_shared().await.unwrap().unwrap();
+        let second = b.next_shared().await.unwrap().unwrap();
+        first.into_completed().await.ok().unwrap();
+        assert_eq!(
+            journal
+                .with_db(|db| Ok(
+                    db.query_row("SELECT count(*) FROM ops", [], |r| r.get::<_, u64>(0))?
+                ))
+                .await
+                .unwrap(),
+            1
+        );
+        second.into_completed().await.ok().unwrap();
+        assert_eq!(
+            journal
+                .with_db(|db| Ok(
+                    db.query_row("SELECT count(*) FROM ops", [], |r| r.get::<_, u64>(0))?
+                ))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(journal.tail().await.unwrap(), 1);
+        assert_eq!(journal.origins().await.unwrap()["one"].bt_version, "test");
+        journal.close().await.unwrap();
+        let restored = SpanJournal::open(&path).await.unwrap();
+        assert_eq!(restored.tail().await.unwrap(), 1);
+        assert_eq!(restored.translated_through().await.unwrap(), 10);
+        let mut late = restored.subscribe(&route("new"), 0).await.unwrap();
+        assert!(late.next_shared().await.unwrap().is_none());
+        restored.begin(20, true).await.unwrap();
+        restored
+            .append_live(20, &mut 0, &mut vec![op("two")])
+            .await
+            .unwrap();
+        assert_eq!(restored.tail().await.unwrap(), 2);
+        assert!(late.next_shared().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn live_routes_share_original_payload_without_sqlite_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("live.sqlite"))
+            .await
+            .unwrap();
+        let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
+        let mut second = journal.subscribe(&route("second"), 0).await.unwrap();
+        let payload = "x".repeat(BYTE_BUDGET * 2);
+        let pointer = payload.as_ptr();
+        let mut ops = vec![SpanOp::Insert(SpanRow {
+            input: Some(serde_json::Value::String(payload)),
+            ..Default::default()
+        })];
+        journal.begin(10, true).await.unwrap();
+        journal.append_live(10, &mut 0, &mut ops).await.unwrap();
+        assert!(ops.is_empty());
+        // Live delivery is possible before the native event has finished.
+        let a = first.next_shared().await.unwrap().unwrap();
+        let b = second.next_shared().await.unwrap().unwrap();
+        assert!(std::ptr::eq(a.value()[0].as_ref(), b.value()[0].as_ref()));
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = a.value()[0].as_ref();
+        assert_eq!(
+            row.input.as_ref().unwrap().as_str().unwrap().as_ptr(),
+            pointer
+        );
+        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 0);
+        let weak = a.value()[0].downgrade();
+        drop(a.into_completed().await.ok().unwrap());
+        drop(b.into_completed().await.ok().unwrap());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_decodes_once_for_concurrent_routes_and_keeps_only_weak_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("recovery.sqlite"))
+            .await
+            .unwrap();
+        journal.begin(10, true).await.unwrap();
+        journal
+            .append_live(10, &mut 0, &mut vec![op("recover")])
+            .await
+            .unwrap();
+        let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
+        let mut second = journal.subscribe(&route("second"), 0).await.unwrap();
+        let a = first.next_shared().await.unwrap().unwrap();
+        let b = second.next_shared().await.unwrap().unwrap();
+        assert!(std::ptr::eq(a.value()[0].as_ref(), b.value()[0].as_ref()));
+        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 1);
+        let weak = a.value()[0].downgrade();
+        drop(a);
+        drop(b);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_event_restart_preserves_published_operations_and_route_heads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("partial.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
+        journal.begin(10, true).await.unwrap();
+        journal
+            .append_live(10, &mut 0, &mut vec![op("one")])
+            .await
+            .unwrap();
+        first
+            .next_shared()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_completed()
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(journal.translated_through().await.unwrap(), 0);
+        journal.close().await.unwrap();
+        let journal = SpanJournal::open(&path).await.unwrap();
+        journal.begin(10, true).await.unwrap();
+        let mut ordinal = 0;
+        journal
+            .append_live(10, &mut ordinal, &mut vec![op("one"), op("two")])
+            .await
+            .unwrap();
+        journal.commit(10).await.unwrap();
+        let mut restored = journal.subscribe(&route("first"), 0).await.unwrap();
+        let delivery = restored.next_shared().await.unwrap().unwrap();
+        assert_eq!(delivery.value().len(), 1);
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = delivery.value()[0].as_ref();
+        assert_eq!(row.name, "two");
+        assert_eq!(journal.tail().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn paused_route_recovers_without_blocking_a_healthy_live_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("lag.sqlite"))
+            .await
+            .unwrap();
+        let mut fast = journal.subscribe(&route("fast"), 0).await.unwrap();
+        let mut slow = journal.subscribe(&route("slow"), 0).await.unwrap();
+        slow.live.control().pause();
+        journal.begin(10, true).await.unwrap();
+        let mut ordinal = 0;
+        for index in 0..3 {
+            journal
+                .append_live(
+                    10,
+                    &mut ordinal,
+                    &mut vec![SpanOp::Insert(SpanRow {
+                        name: index.to_string(),
+                        input: Some(serde_json::json!("x".repeat(BYTE_BUDGET))),
+                        ..Default::default()
+                    })],
+                )
+                .await
+                .unwrap();
+            fast.next_shared()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_completed()
+                .await
+                .ok()
+                .unwrap();
+        }
+        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 0);
+        journal.commit(10).await.unwrap();
+        for _ in 0..3 {
+            let delivery = slow.next_shared().await.unwrap().unwrap();
+            assert_eq!(
+                delivery.value().len(),
+                1,
+                "an oversized operation travels alone"
+            );
+            delivery.into_completed().await.ok().unwrap();
+        }
+        slow.rewind().await.unwrap();
+        assert_eq!(slow.completed_position(), 3);
+        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -1050,7 +1775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invisible_chunks_empty_commit_and_restart_preserve_the_boundary() {
+    async fn legacy_uncommitted_output_empty_commit_and_restart_preserve_the_boundary() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
         let journal = SpanJournal::open(&path).await.unwrap();

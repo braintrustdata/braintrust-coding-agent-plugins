@@ -38,6 +38,16 @@ pub trait Sink: Send {
     /// Emit span ops. Returns the number of rows written, for status counters.
     async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64>;
 
+    /// Shared canonical operations remain shared until a route changes them.
+    /// The default adapter borrows one operation without copying its payload.
+    async fn emit_shared(&mut self, ops: &[crate::translate::CowSpanOp]) -> anyhow::Result<u64> {
+        let mut emitted = 0;
+        for op in ops {
+            emitted += self.emit(std::slice::from_ref(op.as_ref())).await?;
+        }
+        Ok(emitted)
+    }
+
     /// Deliver everything buffered (bounded by the caller's flush timeout).
     async fn flush(&mut self) -> anyhow::Result<()>;
 

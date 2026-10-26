@@ -184,6 +184,24 @@ impl Sink for RouteRecordingSink {
     }
 }
 
+/// Register a dormant route before any output exists, so completed peers cannot
+/// reclaim the recovery payloads this fixture deliberately leaves unresolved.
+fn seed_dormant_route(data: &Path, source: &str, session: &str, route: &SessionRoute) {
+    let journal = bt_daemon::source_journal_path(data, source, session);
+    let stem = journal.file_stem().unwrap().to_str().unwrap();
+    let id = stem.rsplit("--").next().unwrap();
+    std::fs::create_dir_all(data.join("pipeline")).unwrap();
+    let db =
+        rusqlite::Connection::open(data.join("pipeline").join(format!("{id}.sqlite"))).unwrap();
+    // The daemon upgrades this preparatory schema on first use.
+    db.execute_batch("CREATE TABLE heads(route TEXT PRIMARY KEY,position INTEGER NOT NULL DEFAULT 0,failure TEXT)").unwrap();
+    db.execute(
+        "INSERT INTO heads(route,position) VALUES (?,0)",
+        [serde_json::to_string(route).unwrap()],
+    )
+    .unwrap();
+}
+
 fn dummy_host() -> HostInfo {
     // The daemon is started in-process, so the client never spawns; serve_argv
     // is unused but must be non-empty.
@@ -385,9 +403,13 @@ fn pipeline_database(data_dir: &Path) -> rusqlite::Connection {
     rusqlite::Connection::open(path).unwrap()
 }
 fn head_and_tail(data_dir: &Path) -> (u64, u64) {
-    pipeline_database(data_dir).query_row(
-        "SELECT position,(SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1) FROM heads",
-        [],|row| Ok((row.get(0)?,row.get(1)?))).unwrap()
+    pipeline_database(data_dir)
+        .query_row(
+            "SELECT position,(SELECT tail FROM publication WHERE id=1) FROM heads",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
 }
 
 async fn wait_for(endpoint: &Path) {
@@ -1046,7 +1068,7 @@ async fn a_route_backfills_observations_captured_by_another_route_once() {
 }
 
 #[tokio::test]
-async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() {
+async fn a_new_destination_starts_at_the_reclaimed_prefix_and_uses_its_own_checkpoint() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
@@ -1074,8 +1096,8 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
     first.await.unwrap();
 
     // A managed run or newly configured global route can select a second
-    // destination for the same native session. It gets the complete source
-    // history even though that history was originally captured via work.
+    // destination for the same native session. Fully reported payloads have
+    // been reclaimed, so it starts at the retained prefix and receives new work.
     let provider = Arc::new(TestAuthProvider {
         calls: Mutex::new(Vec::new()),
         fail: false,
@@ -1106,8 +1128,8 @@ async fn a_new_destination_receives_history_once_then_uses_its_own_checkpoint() 
         delivered[0]
             .emitted
             .load(std::sync::atomic::Ordering::Relaxed),
-        3,
-        "personal receives work's root and SessionStart plus its own Stop"
+        1,
+        "personal receives its Stop; fulfilled historical payloads were reclaimed"
     );
     assert_eq!(
         delivered[0].org.lock().unwrap().clone().as_deref(),
@@ -3611,6 +3633,9 @@ async fn startup_restores_a_durable_head_absent_from_captured_routes() {
     });
     let (data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
     let env = envelope("durable-subscription", "SessionStart", 1);
+    let mut dormant = env.route.clone().unwrap();
+    dormant.tags = vec!["dormant".into()];
+    seed_dormant_route(&data_dir, &env.source, &env.session_id, &dormant);
     forward_envelope(&env, &socket, &dummy_host(), false)
         .await
         .unwrap();
@@ -3622,21 +3647,6 @@ async fn startup_restores_a_durable_head_absent_from_captured_routes() {
     );
     shutdown(&socket).await;
     handle.await.unwrap();
-    let path = std::fs::read_dir(data_dir.join("pipeline"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
-        .unwrap();
-    let mut dormant = env.route.unwrap();
-    dormant.tags = vec!["dormant".into()];
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
-        "INSERT INTO heads(route,position) VALUES(?,0)",
-        [serde_json::to_string(&dormant).unwrap()],
-    )
-    .unwrap();
-    drop(db);
     let recording = Arc::new(RouteRecordingSinkFactory::default());
     let handle = start_daemon_at_with(
         data_dir.clone(),

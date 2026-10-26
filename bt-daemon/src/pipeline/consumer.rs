@@ -9,7 +9,6 @@ use crate::{
     delivery_ledger::{CommitFailure, LedgerSink},
     dispatch::Counters,
     sink::{Sink, SinkFactory},
-    translate::SpanOp,
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
     AuthProvider, AuthResolveReason,
 };
@@ -189,7 +188,7 @@ impl ConsumerOptions {
 
 impl Consumer {
     pub fn spawn(
-        mut input: Box<dyn InputPort<Item = Vec<SpanOp>>>,
+        mut input: Box<dyn InputPort<Item = Vec<super::live::SharedOp>>>,
         options: ConsumerOptions,
     ) -> Arc<Self> {
         let config = options.config.clone();
@@ -308,7 +307,7 @@ impl Consumer {
                         })?;
                         routing.configure(&current);
                         routing
-                            .emit(ops)
+                            .emit_shared(ops)
                             .await
                             .map_err(|error| options.routing(&error, &current, attempts))
                     }
@@ -606,7 +605,8 @@ mod tests {
                 root_span_id: "one".into(),
                 end_ms: Some(1),
                 ..Default::default()
-            })],
+            })
+            .into()],
             Acknowledged(acknowledged.clone()),
         ))
         .await
