@@ -201,7 +201,8 @@ async fn claude_session_emits_traces() {
             );
             MockReply::response(AnthropicTurn::text("CLAUDE_MOCK_OK"))
         }
-        2 => MockReply::http_error(
+        // Claude Code may retry the failed request, so keep failing it.
+        _ => MockReply::http_error(
             StatusCode::BAD_REQUEST,
             json!({
                 "type": "error",
@@ -210,10 +211,6 @@ async fn claude_session_emits_traces() {
                     "message": "deterministic Claude inference failure"
                 }
             }),
-        ),
-        index => panic!(
-            "unexpected Claude inference request {index}: {}",
-            request.body
         ),
     });
     let inference_server = TestServer::start(inference.router()).await;
@@ -241,7 +238,7 @@ async fn claude_session_emits_traces() {
             .await;
         failed.assert_failure();
         failed.assert_contains("deterministic Claude inference failure");
-        assert_eq!(inference.requests().len(), 3);
+        assert!(inference.requests().len() >= 3);
     }
 
     let rows = world.wait_for_trace_delivery().await;

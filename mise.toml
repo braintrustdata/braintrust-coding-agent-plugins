@@ -1,0 +1,5 @@
+# Mise will automatically read and use .tool-versions files as well as this file.
+# CI reads .tool-versions directly and does not use mise.
+
+[hooks]
+postinstall = "make install-deps"
