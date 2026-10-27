@@ -3,15 +3,7 @@
   "mcpServers": {
     "braintrust": {
       "type": "streamable-http",
-      "url": "https://api.braintrust.dev/mcp",
-      "extensions": {
-        "com.openai": {
-          "auth": {
-            "type": "oauth",
-            "client": { "mode": "dcr" }
-          }
-        }
-      }
+      "url": "https://api.braintrust.dev/mcp"
     }
   }
 }

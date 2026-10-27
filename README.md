@@ -90,6 +90,7 @@ make build                 # Build all plugins into dist/<agent>
 make build-codex            # Build one plugin
 make codex-submission      # Validate and build the MCP-only OpenAI ZIP
 make test-codex-packaging  # Test Codex packaging and release contracts
+make test-codex-mcp-loading # Check installed MCP loading with a local Codex CLI
 make test                  # Build and validate plugin packages and forwarders
 cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked
 ```

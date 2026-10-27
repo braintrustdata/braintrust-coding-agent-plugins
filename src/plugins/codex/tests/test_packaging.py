@@ -78,7 +78,7 @@ class PackagingTests(unittest.TestCase):
         icon.unlink()
         icon.symlink_to(CODEX / "content/plugins/braintrust/assets/icon.png")
         with self.assertRaisesRegex(ValueError, "symlink"):
-            package.validate_public(self.public)
+            package.validate_mcp_package(self.public)
 
     def test_zip_injection_rejected(self):
         original = package.build_zip(self.dist, self.root / "valid")
@@ -114,7 +114,7 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "regular file"):
             package.validate_zip(bad)
 
-    def test_mcp_auth_transport_and_template_misconfiguration_rejected(self):
+    def test_codex_transport_and_template_misconfiguration_rejected(self):
         path = self.public / "mcp.json"
         original = path.read_text()
         mutations = [
@@ -124,16 +124,58 @@ class PackagingTests(unittest.TestCase):
             lambda s: s.update(type="stdio", command="bt"),
             lambda s: s.update(headers={"Authorization": "Bearer fake-test-secret"}),
             lambda s: s.update(default="api.braintrust.dev"),
-            lambda s: s["extensions"]["com.openai"]["auth"].update(clientSecret="fake-test-secret"),
-            lambda s: s["extensions"]["com.openai"]["auth"].update(type="none"),
-            lambda s: s["extensions"]["com.openai"]["auth"]["client"].update(mode="provided", clientId="test"),
         ]
         for index, mutation in enumerate(mutations):
             with self.subTest(index=index):
                 path.write_text(original)
                 self.edit(path, lambda d: mutation(d["mcpServers"]["braintrust"]))
+                with self.assertRaisesRegex(ValueError, "Codex MCP"):
+                    package.validate_mcp_package(self.public)
+
+    def test_zip_adds_submission_auth_without_mutating_distribution(self):
+        path = self.public / "mcp.json"
+        original = path.read_bytes()
+        archive = package.build_zip(self.dist, self.root / "output")
+        with zipfile.ZipFile(archive) as zipped:
+            config = json.loads(zipped.read("mcp.json"))
+        self.assertEqual(config["mcpServers"]["braintrust"], {
+            "type": "streamable-http",
+            "url": "https://api.braintrust.dev/mcp",
+            "extensions": {"com.openai": {"auth": {"type": "oauth", "client": {"mode": "dcr"}}}},
+        })
+        self.assertEqual(path.read_bytes(), original)
+        self.assertNotIn("extensions", json.loads(original)["mcpServers"]["braintrust"])
+        package.validate_distribution(self.dist)
+
+    def test_codex_rejects_submission_auth_metadata(self):
+        path = self.public / "mcp.json"
+        path.write_text(json.dumps(package.submission_mcp_config(json.loads(path.read_text()))))
+        with self.assertRaisesRegex(ValueError, "without server extensions"):
+            package.validate_distribution(self.dist)
+
+    def test_submission_rejects_missing_or_invalid_auth(self):
+        archive = package.build_zip(self.dist, self.root / "valid")
+        mutations = [
+            lambda s: s.pop("extensions"),
+            lambda s: s["extensions"]["com.openai"]["auth"].update(clientSecret="fake-test-secret"),
+            lambda s: s["extensions"]["com.openai"]["auth"].update(type="none"),
+            lambda s: s["extensions"]["com.openai"]["auth"]["client"].update(mode="provided", clientId="test"),
+            lambda s: s.update(headers={"Authorization": "Bearer fake-test-secret"}),
+            lambda s: s.update(url="https://{data_plane_host}/mcp"),
+        ]
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index):
+                bad = self.root / "bad.zip"
+                with zipfile.ZipFile(archive) as source, zipfile.ZipFile(bad, "w") as target:
+                    for info in source.infolist():
+                        data = source.read(info.filename)
+                        if info.filename == "mcp.json":
+                            config = json.loads(data)
+                            mutation(config["mcpServers"]["braintrust"])
+                            data = json.dumps(config).encode()
+                        target.writestr(info, data)
                 with self.assertRaisesRegex(ValueError, "OAuth DCR"):
-                    package.validate_public(self.public)
+                    package.validate_zip(bad)
 
     def test_manifest_hook_app_and_template_fields_rejected(self):
         path = self.public / "plugin.json"
@@ -143,21 +185,21 @@ class PackagingTests(unittest.TestCase):
                 path.write_text(original)
                 self.edit(path, lambda d: d["extensions"]["com.openai"].update({field: "bad"}))
                 with self.assertRaisesRegex(ValueError, "fields"):
-                    package.validate_public(self.public)
+                    package.validate_mcp_package(self.public)
 
     def test_asset_reference_and_missing_asset_rejected(self):
         self.edit(self.public / "plugin.json", lambda d: d["extensions"]["com.openai"]["interface"].update(logo="../trace-codex/icon.png"))
         with self.assertRaisesRegex(ValueError, "logo path"):
-            package.validate_public(self.public)
+            package.validate_mcp_package(self.public)
         (self.public / "assets/icon.png").unlink()
         with self.assertRaisesRegex(ValueError, "allowlist"):
-            package.validate_public(self.public)
+            package.validate_mcp_package(self.public)
 
     def test_duplicate_json_keys_rejected(self):
         path = self.public / "mcp.json"
         path.write_text(path.read_text().replace('"type": "streamable-http"', '"type": "stdio", "type": "streamable-http"'))
         with self.assertRaisesRegex(ValueError, "duplicate JSON"):
-            package.validate_public(self.public)
+            package.validate_mcp_package(self.public)
 
     def test_marketplace_escape_identity_and_implicit_install_rejected(self):
         path = self.dist / ".agents/plugins/marketplace.json"

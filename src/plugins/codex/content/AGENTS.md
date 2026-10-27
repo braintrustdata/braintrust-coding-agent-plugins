@@ -27,6 +27,9 @@ Key files for the tracing plugin:
 
 - **MCP metadata**: edit `plugins/braintrust/plugin.json` and `mcp.json` in the
   source monorepo. Keep portable identity and OpenAI presentation in one manifest.
+  Keep server-level auth extensions out of the Codex `mcp.json`: current Codex
+  rejects them. The monorepo ZIP builder adds OAuth DCR metadata only to the
+  OpenAI submission archive and validates both formats separately.
 - **Plugin metadata**: edit `plugins/trace-codex/.codex-plugin/plugin.json`.
 - **Marketplace**: edit `.agents/plugins/marketplace.json` to change the plugin entry, category, or install policy.
 

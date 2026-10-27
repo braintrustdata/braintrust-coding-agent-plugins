@@ -11,6 +11,13 @@ endpoints. No API key, client secret, authorization header, local process, `bt`
 installation, hooks, or desktop execution is required by this package.
 MCP authorization is independent of optional `bt` session tracing.
 
+Codex discovers OAuth from the server. Its package declares only the HTTP
+transport and server URL because current Codex versions reject explicit OAuth
+metadata in `mcp.json`. The OpenAI submission ZIP adds the documented OAuth DCR
+declaration during packaging; it does not change the GitHub package. See the
+[Codex compatibility issue](https://github.com/openai/codex/issues/53658) and
+[OpenAI authentication fields](https://developers.openai.com/plugins/build/plugins#configure-mcp-authentication).
+
 ## GitHub marketplace
 
 After this version is released to the generated distribution repository:

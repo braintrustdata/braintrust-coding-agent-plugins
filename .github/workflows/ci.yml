@@ -357,6 +357,11 @@ jobs:
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- claude --version
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- opencode --version
           npm exec --prefix "${{ runner.temp }}/coding-agents" -- pi --version
+      - name: Check installed Codex MCP loading
+        if: runner.os == 'Linux'
+        env:
+          CODEX_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/codex
+        run: make test-codex-mcp-loading
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --manifest-path bt-daemon/Cargo.toml -- --check

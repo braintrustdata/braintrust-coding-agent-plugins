@@ -69,7 +69,38 @@ def inventory(root):
     return files
 
 
-def validate_public(root):
+def submission_mcp_config(config):
+    """Add portal auth metadata without changing the Codex-compatible source.
+
+    Codex currently rejects server-level extensions, even though OpenAI's
+    submission format documents them. Keep this projection in the ZIP builder.
+    """
+    # Round trip to leave the caller's validated distribution config untouched.
+    config = json.loads(json.dumps(config))
+    config["mcpServers"]["braintrust"]["extensions"] = {
+        "com.openai": {"auth": {"type": "oauth", "client": {"mode": "dcr"}}},
+    }
+    return config
+
+
+def validate_mcp_config(config, *, submission):
+    # Exact contracts reject headers, credentials, processes, speculative
+    # template fields, and submission-only metadata in the Codex distribution.
+    expected = {
+        "$schema": SCHEMA_BASE + "mcp.schema.json",
+        "mcpServers": {"braintrust": {
+            "type": "streamable-http", "url": "https://api.braintrust.dev/mcp",
+        }},
+    }
+    if submission:
+        expected = submission_mcp_config(expected)
+        message = "Submission MCP must use the concrete NA URL, Streamable HTTP, and discovery-based OAuth DCR"
+    else:
+        message = "Codex MCP must use the concrete NA URL and Streamable HTTP without server extensions or credentials"
+    require(config == expected, message)
+
+
+def validate_mcp_package(root, *, submission=False):
     require(inventory(root) == PUBLIC_FILES, "public package files must match MCP-only allowlist (no hooks, apps, skills, scripts, or marketplace)")
     require({p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_dir()} == {"assets"}, "unexpected public package directory")
     manifest = read_json(root / "plugin.json")
@@ -108,16 +139,7 @@ def validate_public(root):
     require(24 <= len(data) <= 5 * 1024 * 1024 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR", "invalid PNG asset")
     width, height = struct.unpack(">II", data[16:24])
     require(width == height and 48 <= width <= 4096, "listing icon must be square, 48..4096px")
-    config = read_json(root / "mcp.json")
-    # Exact contract forbids headers, tokens, processes, env interpolation, and
-    # speculative template/default fields at every nesting level.
-    require(config == {
-        "$schema": SCHEMA_BASE + "mcp.schema.json",
-        "mcpServers": {"braintrust": {
-            "type": "streamable-http", "url": "https://api.braintrust.dev/mcp",
-            "extensions": {"com.openai": {"auth": {"type": "oauth", "client": {"mode": "dcr"}}}},
-        }},
-    }, "MCP must use the concrete NA review URL, Streamable HTTP, and discovery-based OAuth DCR; templates belong in portal setup")
+    validate_mcp_config(read_json(root / "mcp.json"), submission=submission)
     return manifest
 
 
@@ -136,7 +158,7 @@ def validate_distribution(root):
         require(entry["source"] == {"source": "local", "path": f"./plugins/{name}"}, "unexpected marketplace source/path")
         require(entry["policy"] == {"installation": "AVAILABLE", "authentication": "ON_INSTALL"}, "plugins must be separately opt-in")
         require(entry["category"] == ("Developer Tools" if name == "braintrust" else "Observability"), "wrong marketplace category")
-    public = validate_public(root / "plugins/braintrust")
+    public = validate_mcp_package(root / "plugins/braintrust")
     tracing = root / "plugins/trace-codex"
     manifest = read_json(tracing / ".codex-plugin/plugin.json")
     require(manifest["name"] == "trace-codex" and manifest["hooks"] == "./hooks/hooks.json", "tracing identity/hooks changed")
@@ -170,7 +192,7 @@ def validate_zip(path):
             require(stat.S_IFMT(info.external_attr >> 16) == stat.S_IFREG, "ZIP entry must be a regular file")
             require(info.file_size <= 5 * 1024 * 1024, "oversized ZIP entry")
         archive.extractall(temp)  # Paths were checked against exact allowlist.
-        return validate_public(Path(temp))
+        return validate_mcp_package(Path(temp), submission=True)
 
 
 def build_zip(root, output):
@@ -186,7 +208,10 @@ def build_zip(root, output):
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
                 info.create_system = 3
                 info.external_attr = (stat.S_IFREG | 0o644) << 16
-                archive.writestr(info, (package / name).read_bytes())
+                data = (package / name).read_bytes()
+                if name == "mcp.json":
+                    data = (json.dumps(submission_mcp_config(read_json(package / name)), indent=2) + "\n").encode()
+                archive.writestr(info, data)
         validate_zip(staged)
         os.replace(staged, path)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -205,7 +230,7 @@ def main():
             require(args.output is not None, "zip requires output directory")
             print(build_zip(args.path, args.output))
         else:
-            {"validate": validate_distribution, "validate-public": validate_public, "validate-zip": validate_zip}[args.command](args.path)
+            {"validate": validate_distribution, "validate-public": lambda path: validate_mcp_package(path, submission=True), "validate-zip": validate_zip}[args.command](args.path)
             print(f"validate: {args.command} OK ({args.path})")
     except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as error:
         parser.exit(1, f"validate: {error}\n")
