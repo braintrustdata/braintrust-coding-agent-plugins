@@ -1,13 +1,13 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PI_PACKAGE = "@earendil-works/pi-coding-agent";
-const PI_PACKAGE_CONFIG_DIRS = new Map([
-  [PI_PACKAGE, ".pi"],
-  ["@mariozechner/pi-coding-agent", ".pi"],
-  ["@oh-my-pi/pi-coding-agent", ".omp"],
+const PI_PACKAGE_NAMES = new Set([
+  PI_PACKAGE,
+  "@mariozechner/pi-coding-agent",
+  "@oh-my-pi/pi-coding-agent",
 ]);
 
 interface PiPackageManifest {
@@ -45,9 +45,7 @@ export function loadPiPackageMetadata(candidates: (string | undefined)[]): PiPac
     name: typeof manifest?.name === "string" ? manifest.name : undefined,
     version: typeof manifest?.version === "string" ? manifest.version : undefined,
     configDir:
-      typeof manifest?.piConfig?.configDir === "string"
-        ? manifest.piConfig.configDir
-        : (PI_PACKAGE_CONFIG_DIRS.get(String(manifest?.name)) ?? ".pi"),
+      typeof manifest?.piConfig?.configDir === "string" ? manifest.piConfig.configDir : ".pi",
   };
 }
 
@@ -58,9 +56,8 @@ function findPiManifest(entry: string | undefined): PiPackageManifest | undefine
     const manifest = readManifest(join(directory, "package.json"));
     if (
       manifest &&
-      ((typeof manifest.name === "string" && PI_PACKAGE_CONFIG_DIRS.has(manifest.name)) ||
-        (manifest.piConfig !== null && typeof manifest.piConfig === "object") ||
-        (basename(entry) === "package.json" && typeof manifest.name === "string"))
+      ((typeof manifest.name === "string" && PI_PACKAGE_NAMES.has(manifest.name)) ||
+        typeof manifest.piConfig === "object")
     ) {
       return manifest;
     }

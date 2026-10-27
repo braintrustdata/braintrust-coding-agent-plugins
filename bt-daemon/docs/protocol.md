@@ -274,8 +274,7 @@ versions available at materialization, not unrecorded historical versions. See t
 Pi-compatible hosts retain the canonical transport source `pi` so they share its
 translator. The Pi extension sends the running host package's version as
 `source_version` and its package name as `payload.host_name`. The translator records
-`metadata.host_name` and uses a fork's package name as the session-root label;
-upstream Pi and older extension payloads retain the `Pi` label.
+`metadata.host_name`; the session-root label remains `Pi` for every Pi-compatible host.
 
 For acknowledged spans from legacy ledgers without saved snapshots, stateless
 updates omit `context.span_origin` entirely, including SDK defaults and inherited

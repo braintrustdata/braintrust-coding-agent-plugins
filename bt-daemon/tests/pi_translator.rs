@@ -73,7 +73,7 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
 }
 
 #[test]
-fn pi_records_the_running_fork_identity() {
+fn pi_records_the_running_host_identity() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("pi", "pi-session");
     let ctx = SessionCtx {
@@ -91,7 +91,7 @@ fn pi_records_the_running_fork_identity() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(root.name, "@oh-my-pi/pi-coding-agent");
+    assert_eq!(root.name, "Pi");
     assert_eq!(
         root.metadata.as_ref().unwrap()["host_name"],
         "@oh-my-pi/pi-coding-agent"

@@ -96,10 +96,11 @@ describe("loadPiPackageMetadata", () => {
       bin: { omp: "dist/cli.js" },
     });
     const peer = installPi(`plugins/node_modules/${PI}`, { name: PI, version: "1.4.0" });
+    // Recognizing OMP must not move the extension's existing `.pi` settings.
     expect(loadPiPackageMetadata([host, peer])).toEqual({
       name: "@oh-my-pi/pi-coding-agent",
       version: "18.12.6",
-      configDir: ".omp",
+      configDir: ".pi",
     });
   });
 
@@ -115,26 +116,6 @@ describe("loadPiPackageMetadata", () => {
       name: PI,
       version: "1.4.0",
       configDir: ".pi",
-    });
-  });
-
-  it("finds a compiled OMP host beside its executable before the upstream peer", () => {
-    writeJson(join(root, "omp-release", "package.json"), {
-      name: "@oh-my-pi/pi-coding-agent",
-      version: "18.12.6",
-    });
-    const peer = installPi(`plugins/node_modules/${PI}`, { name: PI, version: "1.4.0" });
-    expect(
-      loadPiPackageMetadata(["/$bunfs/root/cli.ts", join(root, "omp-release", "omp"), peer]),
-    ).toMatchObject({ name: "@oh-my-pi/pi-coding-agent", version: "18.12.6", configDir: ".omp" });
-  });
-
-  it("trusts the explicit PI_PACKAGE_DIR manifest for a custom host", () => {
-    writeJson(join(root, "custom", "package.json"), { name: "@acme/host", version: "3.2.1" });
-    const peer = installPi(`plugins/node_modules/${PI}`, { name: PI, version: "1.4.0" });
-    expect(loadPiPackageMetadata([join(root, "custom", "package.json"), peer])).toMatchObject({
-      name: "@acme/host",
-      version: "3.2.1",
     });
   });
 

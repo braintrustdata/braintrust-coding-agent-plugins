@@ -74,7 +74,7 @@ vi.mock("./pi-package.ts", () => ({
   runningPiPackage: () => ({
     name: "@oh-my-pi/pi-coding-agent",
     version: "18.12.6",
-    configDir: ".omp",
+    configDir: ".pi",
   }),
 }));
 
