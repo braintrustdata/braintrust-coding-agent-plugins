@@ -161,6 +161,7 @@ impl SinkFactory for BraintrustSinkFactory {
             client: None,
             open: HashMap::new(),
             pending_roots: HashMap::new(),
+            delivered_root: None,
         }))
     }
 }
@@ -199,6 +200,9 @@ struct BraintrustSink {
     /// Roots marked by translators as provisional, keyed by their local span
     /// id. Each is exported only once direct descendant work arrives.
     pending_roots: HashMap<String, Vec<SpanOp>>,
+    /// Root span id of the trace that most recently received a row, which
+    /// is also that root's deterministic row id in Braintrust.
+    delivered_root: Option<String>,
 }
 
 impl BraintrustSink {
@@ -438,6 +442,10 @@ impl Sink for BraintrustSink {
             }
             self.emit_op(op).await?;
             n += 1;
+            let root = op_root_span_id(op);
+            if self.delivered_root.as_deref() != Some(root) {
+                self.delivered_root = Some(root.to_string());
+            }
         }
         Ok(n)
     }
@@ -452,12 +460,61 @@ impl Sink for BraintrustSink {
     fn has_pending_delivery(&self) -> bool {
         !self.pending_roots.is_empty()
     }
+
+    fn permalink(&self) -> Option<String> {
+        let creds = self.creds.as_ref()?;
+        // Logs URLs address projects by name. Experiment and attached-parent
+        // destinations, and routes that only know a project id, have none.
+        match &creds.destination {
+            None
+            | Some(TraceDestination::ProjectLogs {
+                project_name: Some(_),
+                ..
+            })
+            | Some(TraceDestination::ProjectLogs {
+                project_id: None, ..
+            }) => {}
+            Some(_) => return None,
+        }
+        let org_name = creds.org_name.as_deref()?;
+        let root = self.delivered_root.as_deref()?;
+        let (_, app_url) = self.urls.as_ref()?;
+        Some(format!(
+            "{}/app/{}/p/{}/logs?r={}",
+            app_url.trim_end_matches('/'),
+            encode_url_component(org_name),
+            encode_url_component(&self.project(creds)),
+            encode_url_component(root),
+        ))
+    }
 }
 
 fn op_span_id(op: &SpanOp) -> &str {
     match op {
         SpanOp::Insert(row) | SpanOp::Merge(row) => &row.span_id,
     }
+}
+
+fn op_root_span_id(op: &SpanOp) -> &str {
+    match op {
+        SpanOp::Insert(row) | SpanOp::Merge(row) => &row.root_span_id,
+    }
+}
+
+/// Percent-encodes everything outside the RFC 3986 unreserved set.
+fn encode_url_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    encoded
 }
 
 fn direct_pending_parent(

@@ -909,3 +909,88 @@ async fn rejected_route_does_not_poison_a_sibling_flush_on_the_same_backend() {
     assert!(bad_result.is_err());
     good_result.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permalink_opens_the_most_recently_delivered_trace() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut sink = factory.create("linked", "pi").unwrap();
+    let mut config = session_config(&base);
+    config.auth.app_url = Some(format!("{base}/"));
+    config.auth.org_name = Some("Acme Labs".into());
+    config.destination = Some(TraceDestination::ProjectLogs {
+        project_id: None,
+        project_name: Some("coding agents".into()),
+    });
+    sink.configure(&config);
+
+    let mut root = row("root-a", "root-a", &[], "pi", SpanType::Task, 1, None);
+    root.metadata = Some(json!({"_bt_defer_root": true}));
+    sink.emit(&[SpanOp::Insert(root)]).await.unwrap();
+    sink.flush().await.unwrap();
+    assert_eq!(sink.permalink(), None, "a held root is not yet a trace");
+
+    let turn = row(
+        "turn-a",
+        "root-a",
+        &["root-a"],
+        "Turn 1",
+        SpanType::Task,
+        2,
+        Some(3),
+    );
+    sink.emit(&[SpanOp::Insert(turn)]).await.unwrap();
+    sink.flush().await.unwrap();
+    assert_eq!(
+        sink.permalink().as_deref(),
+        Some(format!("{base}/app/Acme%20Labs/p/coding%20agents/logs?r=root-a").as_str())
+    );
+
+    let next = row("root-b", "root-b", &[], "pi", SpanType::Task, 4, Some(5));
+    sink.emit(&[SpanOp::Insert(next)]).await.unwrap();
+    assert_eq!(
+        sink.permalink().as_deref(),
+        Some(format!("{base}/app/Acme%20Labs/p/coding%20agents/logs?r=root-b").as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permalink_is_absent_when_no_logs_url_can_be_built() {
+    let server = mock_backend().await;
+    let base = server.uri();
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut without_org = session_config(&base);
+    without_org.auth.org_name = None;
+    let mut project_id_only = session_config(&base);
+    project_id_only.destination = Some(TraceDestination::ProjectLogs {
+        project_id: Some("proj-1".into()),
+        project_name: None,
+    });
+    let mut experiment = session_config(&base);
+    experiment.destination = Some(TraceDestination::Experiment {
+        experiment_id: "exp-1".into(),
+    });
+
+    for (name, config) in [
+        ("without_org", without_org),
+        ("project_id_only", project_id_only),
+        ("experiment", experiment),
+    ] {
+        let mut sink = factory.create(name, "pi").unwrap();
+        sink.configure(&config);
+        sink.emit(&[SpanOp::Insert(row(
+            "root",
+            "root",
+            &[],
+            "pi",
+            SpanType::Task,
+            1,
+            Some(2),
+        ))])
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        assert_eq!(sink.permalink(), None, "{name} has no logs URL");
+    }
+}

@@ -180,7 +180,7 @@ Result:
       },
       "queued": 0,
       "spans_emitted": 42,
-      "permalink": "https://www.braintrust.dev/app/…",
+      "permalink": "https://www.braintrust.dev/app/acme/p/codex/logs?r=…",
       "last_error": null
     }
   ]
@@ -188,7 +188,10 @@ Result:
 ```
 `sessions` lists one entry **per route**, not per session_id: a session_id
 reporting to two destinations appears twice, each entry carrying its own
-`route`, counters, and permalink. Powers a `status` CLI and pi's trace-link
+`route`, counters, and permalink. `permalink` opens the route's most recently
+delivered trace once a flush succeeds. It stays `null` for experiment and
+parent-span destinations, for project logs addressed only by `project_id`, and
+when the route has no `org_name`. Powers a `status` CLI and pi's trace-link
 widget.
 
 ### `auth.diagnose` (request)
