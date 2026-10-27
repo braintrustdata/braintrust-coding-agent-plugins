@@ -9,6 +9,8 @@ const mockState = vi.hoisted(() => ({
   legacyContinuationFor: vi.fn(),
   logGate: undefined as Promise<void> | undefined,
   statusGate: undefined as Promise<void> | undefined,
+  statusCalls: 0,
+  permalink: "https://www.braintrust.dev/trace/1" as string | undefined,
 }));
 
 vi.mock("./runtime/daemon-client.ts", () => ({
@@ -24,6 +26,7 @@ vi.mock("./runtime/daemon-client.ts", () => ({
       return true;
     }
     async status(sessionId: string): Promise<Record<string, unknown>> {
+      mockState.statusCalls += 1;
       await mockState.statusGate;
       return {
         daemon_version: "test",
@@ -34,7 +37,7 @@ vi.mock("./runtime/daemon-client.ts", () => ({
             source: "pi",
             queued: 0,
             spans_emitted: 1,
-            permalink: "https://www.braintrust.dev/trace/1",
+            permalink: mockState.permalink,
           },
         ],
       };
@@ -104,6 +107,8 @@ describe("Pi daemon adapter", () => {
     mockState.legacyContinuationFor.mockClear();
     mockState.logGate = undefined;
     mockState.statusGate = undefined;
+    mockState.statusCalls = 0;
+    mockState.permalink = "https://www.braintrust.dev/trace/1";
   });
 
   it("does not register a duplicate managed adapter instance", async () => {
@@ -212,7 +217,7 @@ describe("Pi daemon adapter", () => {
     });
     let turnEnded = false;
     const turnEnd = handlers
-      .get("agent_end")?.({ messages: [] })
+      .get("agent_end")?.({ messages: [] }, ctx)
       .then(() => {
         turnEnded = true;
       });
@@ -279,6 +284,69 @@ describe("Pi daemon adapter", () => {
     ]);
     expect(statuses.length).toBeGreaterThan(0);
     expect(mockState.closed).toBe(2);
+  });
+
+  it("polls for the trace link until the daemon delivers the first turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const widgets: unknown[] = [];
+      const ctx = fakeContext({
+        setStatus: vi.fn(),
+        setWidget: (...args: unknown[]) => widgets.push(args),
+      });
+      const handlers = await loadExtension();
+
+      // Pi starts and finishes the first turn before the daemon uploads it.
+      mockState.permalink = undefined;
+      await handlers.get("session_start")?.({ reason: "new" }, ctx);
+      await handlers.get("agent_end")?.({ messages: [] }, ctx);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(widgets.at(-1)).toEqual([
+        "braintrust-trace-link",
+        undefined,
+        { placement: "belowEditor" },
+      ]);
+
+      mockState.permalink = "https://www.braintrust.dev/trace/1";
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(widgets.at(-1)).toEqual([
+        "braintrust-trace-link",
+        ["Braintrust trace", "https://www.braintrust.dev/trace/1"],
+        { placement: "belowEditor" },
+      ]);
+
+      // Once the link is shown, neither the timer nor later turns query again.
+      const calls = mockState.statusCalls;
+      await handlers.get("agent_end")?.({ messages: [] }, ctx);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mockState.statusCalls).toBe(calls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling for the trace link at its deadline and at shutdown", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = fakeContext();
+      const handlers = await loadExtension();
+      mockState.permalink = undefined;
+      await handlers.get("session_start")?.({ reason: "new" }, ctx);
+
+      await handlers.get("agent_end")?.({ messages: [] }, ctx);
+      await vi.advanceTimersByTimeAsync(120_000);
+      const afterDeadline = mockState.statusCalls;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(mockState.statusCalls).toBe(afterDeadline);
+
+      await handlers.get("agent_end")?.({ messages: [] }, ctx);
+      await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+      const atShutdown = mockState.statusCalls;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(mockState.statusCalls).toBe(atShutdown);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("forwards legacy continuation state, read once per Pi session", async () => {
