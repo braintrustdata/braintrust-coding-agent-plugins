@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockState = vi.hoisted(() => ({
   logs: [] as Array<Record<string, unknown>>,
@@ -106,6 +106,8 @@ function fakeContext(ui: Record<string, unknown> = { setStatus: vi.fn(), setWidg
 }
 
 describe("Pi daemon adapter", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   beforeEach(() => {
     mockState.logs.length = 0;
     mockState.flushes.length = 0;
@@ -365,6 +367,26 @@ describe("Pi daemon adapter", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("uses throttled tool-call deltas to keep long generations alive", async () => {
+    let now = 100_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const handlers = await loadExtension();
+    const ctx = fakeContext();
+    await handlers.get("context")?.({ messages: [] }, ctx);
+    const update = () => handlers.get("message_update")?.({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_delta", delta: "{" },
+    });
+
+    await update();
+    now += 9_999;
+    await update();
+    now += 1;
+    await update();
+
+    expect(mockState.logs.filter((log) => log.event === "message_update")).toHaveLength(2);
   });
 
   it("forwards legacy continuation state, read once per Pi session", async () => {

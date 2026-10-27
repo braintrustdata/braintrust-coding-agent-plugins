@@ -204,10 +204,12 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   pi.on("after_provider_response", async (event) => forward("after_provider_response", event));
   pi.on("message_update", async (event) => {
     const kind = streamingUpdateKind(event);
-    if (!kind || !["text_delta", "thinking_delta", "text", "thinking"].includes(kind)) return;
+    const tokenKinds = ["text_delta", "thinking_delta", "text", "thinking"];
+    const isFirstToken = awaitingFirstToken && !!kind && tokenKinds.includes(kind);
+    if (!kind || (!tokenKinds.includes(kind) && kind !== "toolcall_delta")) return;
     const now = Date.now();
-    if (!awaitingFirstToken && now - lastStreamingKeepaliveAt < 10_000) return;
-    awaitingFirstToken = false;
+    if (!isFirstToken && now - lastStreamingKeepaliveAt < 10_000) return;
+    if (isFirstToken) awaitingFirstToken = false;
     lastStreamingKeepaliveAt = now;
     await forward("message_update", event);
   });

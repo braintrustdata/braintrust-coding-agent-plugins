@@ -100,6 +100,56 @@ fn pi_records_the_running_host_identity() {
 }
 
 #[test]
+fn pi_captures_custom_trigger_input_and_keeps_following_spans_in_its_turn() {
+    let mut translator = Registry::default_agents().create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let events = [
+        event(
+            "before_agent_start",
+            1,
+            json!({"message":"run the custom task"}),
+        ),
+        event(
+            "context",
+            2,
+            json!({"messages":[{"role":"user","content":"run the custom task"}]}),
+        ),
+        event(
+            "message_end",
+            3,
+            json!({"message":{"role":"assistant","provider":"openai","model":"gpt-5","content":[{"type":"text","text":"working"}]}}),
+        ),
+        event(
+            "tool_execution_start",
+            4,
+            json!({"toolCallId":"call-1","toolName":"read","args":{"path":"README.md"}}),
+        ),
+        event(
+            "tool_execution_end",
+            5,
+            json!({"toolCallId":"call-1","toolName":"read","result":"contents","isError":false}),
+        ),
+    ];
+    let rows = reduce(
+        events
+            .iter()
+            .flat_map(|event| translator.handle(event, &ctx).unwrap())
+            .collect(),
+    );
+    let turn = rows.values().find(|row| row.is_turn).unwrap();
+    assert_eq!(turn.input, Some(json!("run the custom task")));
+    for row in rows
+        .values()
+        .filter(|row| matches!(row.span_type, SpanType::Llm | SpanType::Tool))
+    {
+        assert_eq!(row.parent_span_ids, vec![turn.span_id.clone()]);
+    }
+}
+
+#[test]
 fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
     let registry = Registry::default_agents();
     assert!(registry.sources().contains(&"pi".to_string()));
