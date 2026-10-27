@@ -134,6 +134,68 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
 }
 
 #[test]
+fn opencode_merges_late_tool_result_attachments_into_closed_tool_span() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        event(
+            "session.created",
+            1,
+            json!({"properties":{"info":{"id":"native"}}}),
+        ),
+        event(
+            "chat.message",
+            2,
+            json!({"input":{"sessionID":"native"},"output":{"parts":[]}}),
+        ),
+        event(
+            "tool.execute.before",
+            3,
+            json!({"input":{"sessionID":"native","callID":"call-1","tool":"read"},"output":{"args":{"path":"image.png"}}}),
+        ),
+        event(
+            "tool.execute.after",
+            4,
+            json!({"input":{"sessionID":"native","callID":"call-1","tool":"read"},"result":{"output":"image contents"}}),
+        ),
+        event(
+            "message.part.updated",
+            5,
+            json!({"properties":{"part":{"sessionID":"native","messageID":"assistant-1","type":"tool","callID":"call-1","tool":"read","state":{"status":"completed","input":{"path":"image.png"},"output":"image contents","attachments":[{"mime":"image/png","url":"file:///tmp/image.png"}]}}}}),
+        ),
+    ];
+
+    let ops = events
+        .iter()
+        .flat_map(|event| translator.handle(event, &ctx).unwrap())
+        .collect::<Vec<_>>();
+    let tool_id = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Merge(row) if row.span_type == SpanType::Tool => Some(row.span_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let late_attachment_merge = ops.iter().find(|op| {
+        matches!(op, SpanOp::Merge(row) if row.span_id == tool_id && row.output.as_ref().is_some_and(|output| output.to_string().contains("image_url")))
+    });
+    assert!(late_attachment_merge.is_some());
+
+    let rows = reduce(ops);
+    assert_eq!(
+        rows[&tool_id].output,
+        Some(json!([
+            {"type":"text","text":"image contents"},
+            {"type":"image_url","image_url":{"url":"file:///tmp/image.png"}}
+        ]))
+    );
+    assert_eq!(rows[&tool_id].end_ms, Some(4));
+}
+
+#[test]
 fn opencode_idle_updates_a_resumable_session_root() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("opencode", "root-session");
