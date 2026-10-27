@@ -55,6 +55,8 @@ impl TranslatorFactory for crate::agents::Pi {
 struct BeforeAgentStart {
     #[serde(default)]
     prompt: Option<Value>,
+    #[serde(default)]
+    message: Option<Value>,
 }
 
 /// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
@@ -649,7 +651,7 @@ impl PiTranslator {
         self.pending_llms.clear();
         self.tools.clear();
         let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_seq));
-        let input = event.prompt.unwrap_or(Value::Null);
+        let input = event.prompt.or(event.message).unwrap_or(Value::Null);
         let skills = input.as_str().map(explicit_skills).unwrap_or_default();
         let mut metadata = without_nulls(json!({
             "turn_number": self.turn_seq,
