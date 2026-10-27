@@ -264,7 +264,17 @@ struct ToolPartState {
     #[serde(default)]
     output: Option<Value>,
     #[serde(default)]
+    attachments: Vec<ToolAttachment>,
+    #[serde(default)]
     error: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ToolAttachment {
+    #[serde(default)]
+    mime: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -843,7 +853,12 @@ impl OpenCodeTranslator {
                     .and_then(|state| state.status.as_deref())
                 {
                     Some("completed") => {
-                        if let Some(v) = tool_state.and_then(|state| state.output) {
+                        if let Some(v) = tool_state.map(|state| {
+                            tool_result_content(
+                                state.output.unwrap_or(Value::Null),
+                                state.attachments,
+                            )
+                        }) {
                             state.tool_outputs.insert(call_id.into(), v.clone());
                             state
                                 .history_tool_results
@@ -1320,6 +1335,32 @@ impl OpenCodeTranslator {
         }
         ops
     }
+}
+
+fn tool_result_content(output: Value, attachments: Vec<ToolAttachment>) -> Value {
+    let images = attachments
+        .into_iter()
+        .filter(|attachment| {
+            attachment
+                .mime
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/"))
+        })
+        .filter_map(|attachment| attachment.url)
+        .map(|url| json!({"type":"image_url","image_url":{"url":url}}))
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return output;
+    }
+    let mut content = Vec::with_capacity(images.len() + 1);
+    match output {
+        Value::String(text) if !text.is_empty() => content.push(json!({"type":"text","text":text})),
+        Value::Array(parts) => content.extend(parts),
+        Value::Null => {}
+        other => content.push(json!({"type":"text","text":other})),
+    }
+    content.extend(images);
+    Value::Array(content)
 }
 
 fn native_session_id(v: &Value) -> Option<String> {
