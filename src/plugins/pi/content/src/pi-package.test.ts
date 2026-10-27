@@ -42,7 +42,7 @@ describe("loadPiPackageMetadata", () => {
         symlinkSync(installPi(`node_modules/${PI}`, { name: PI, version: "1.0.0" }), bin);
         return [bin];
       },
-      { version: "1.0.0", configDir: ".pi" },
+      { name: PI, version: "1.0.0", configDir: ".pi" },
     ],
     [
       "a fork with its own name and config directory",
@@ -53,7 +53,7 @@ describe("loadPiPackageMetadata", () => {
           piConfig: { configDir: ".acme" },
         }),
       ],
-      { version: "3.2.1", configDir: ".acme" },
+      { name: "@acme/agent", version: "3.2.1", configDir: ".acme" },
     ],
     [
       "a PI_PACKAGE_DIR override",
@@ -61,7 +61,7 @@ describe("loadPiPackageMetadata", () => {
         installPi("store/pi", { name: PI, version: "1.0.0" });
         return [join(root, "store", "pi", "package.json"), join(root, "store", "bin")];
       },
-      { version: "1.0.0", configDir: ".pi" },
+      { name: PI, version: "1.0.0", configDir: ".pi" },
     ],
     [
       "a Bun-compiled binary with package.json beside it",
@@ -69,7 +69,7 @@ describe("loadPiPackageMetadata", () => {
         writeJson(join(root, "pi-linux-x64", "package.json"), { name: PI, version: "1.0.0" });
         return [undefined, "/$bunfs/root/pi", join(root, "pi-linux-x64", "pi")];
       },
-      { version: "1.0.0", configDir: ".pi" },
+      { name: PI, version: "1.0.0", configDir: ".pi" },
     ],
     [
       "an SDK application that depends on Pi",
@@ -78,15 +78,64 @@ describe("loadPiPackageMetadata", () => {
         const pi = installPi(`app/node_modules/${PI}`, { name: PI, version: "0.99.2" });
         return [join(root, "app", "main.js"), pi];
       },
-      { version: "0.99.2", configDir: ".pi" },
+      { name: PI, version: "0.99.2", configDir: ".pi" },
     ],
     [
       "no discoverable Pi",
       () => [join(root, "missing.js")],
-      { version: undefined, configDir: ".pi" },
+      { name: undefined, version: undefined, configDir: ".pi" },
     ],
   ])("finds %s", (_name, setup, expected) => {
     expect(loadPiPackageMetadata(setup())).toEqual(expected);
+  });
+
+  it("prefers OMP's running manifest over an auto-installed upstream peer", () => {
+    const host = installPi("omp", {
+      name: "@oh-my-pi/pi-coding-agent",
+      version: "18.12.6",
+      bin: { omp: "dist/cli.js" },
+    });
+    const peer = installPi(`plugins/node_modules/${PI}`, { name: PI, version: "1.4.0" });
+    expect(loadPiPackageMetadata([host, peer])).toEqual({
+      name: "@oh-my-pi/pi-coding-agent",
+      version: "18.12.6",
+      configDir: ".omp",
+    });
+  });
+
+  it("reports the embedded Pi for an SDK application's own CLI", () => {
+    const app = installPi("app", {
+      name: "acme-agent",
+      version: "0.3.0",
+      bin: { acme: "dist/cli.js" },
+      dependencies: { [PI]: "^1.4.0" },
+    });
+    const pi = installPi(`app/node_modules/${PI}`, { name: PI, version: "1.4.0" });
+    expect(loadPiPackageMetadata([app, pi])).toEqual({
+      name: PI,
+      version: "1.4.0",
+      configDir: ".pi",
+    });
+  });
+
+  it("finds a compiled OMP host beside its executable before the upstream peer", () => {
+    writeJson(join(root, "omp-release", "package.json"), {
+      name: "@oh-my-pi/pi-coding-agent",
+      version: "18.12.6",
+    });
+    const peer = installPi(`plugins/node_modules/${PI}`, { name: PI, version: "1.4.0" });
+    expect(
+      loadPiPackageMetadata(["/$bunfs/root/cli.ts", join(root, "omp-release", "omp"), peer]),
+    ).toMatchObject({ name: "@oh-my-pi/pi-coding-agent", version: "18.12.6", configDir: ".omp" });
+  });
+
+  it("trusts the explicit PI_PACKAGE_DIR manifest for a custom host", () => {
+    writeJson(join(root, "custom", "package.json"), { name: "@acme/host", version: "3.2.1" });
+    const peer = installPi(`plugins/node_modules/${PI}`, { name: PI, version: "1.4.0" });
+    expect(loadPiPackageMetadata([join(root, "custom", "package.json"), peer])).toMatchObject({
+      name: "@acme/host",
+      version: "3.2.1",
+    });
   });
 
   it("resolves the installed Pi development dependency through ESM conditions", () => {

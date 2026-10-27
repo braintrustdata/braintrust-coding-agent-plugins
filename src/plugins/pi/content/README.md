@@ -69,6 +69,12 @@ from each of the last five stable Pi release lines. The compatibility job
 resolves these versions on each run, including releases from Pi's former npm
 package name when needed.
 
+Package detection prefers the running CLI to an extension-local peer dependency.
+Forks are recognized by a `piConfig` field, a known package name, or `PI_PACKAGE_DIR`. The trace records
+the host package name in `metadata.host_name` and its version in `metadata.pi_version`;
+fork sessions use their package name instead of the `Pi` root label.
+Oh My Pi (`@oh-my-pi/pi-coding-agent`) uses `.omp` as its default config directory.
+
 ## Configuration
 
 Settings load in this order, with later values taking precedence:

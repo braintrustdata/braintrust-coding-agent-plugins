@@ -73,6 +73,33 @@ fn reduce(ops: Vec<SpanOp>) -> HashMap<String, SpanRow> {
 }
 
 #[test]
+fn pi_records_the_running_fork_identity() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let mut start = event("session_start", 1, json!({"reason":"new"}));
+    start.source_version = Some("18.12.6".into());
+    start.payload["host_name"] = json!("@oh-my-pi/pi-coding-agent");
+    let ops = translator.handle(&start, &ctx).unwrap();
+    let root = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.parent_span_ids.is_empty() => Some(row),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(root.name, "@oh-my-pi/pi-coding-agent");
+    assert_eq!(
+        root.metadata.as_ref().unwrap()["host_name"],
+        "@oh-my-pi/pi-coding-agent"
+    );
+    assert_eq!(root.metadata.as_ref().unwrap()["pi_version"], "18.12.6");
+}
+
+#[test]
 fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
     let registry = Registry::default_agents();
     assert!(registry.sources().contains(&"pi".to_string()));

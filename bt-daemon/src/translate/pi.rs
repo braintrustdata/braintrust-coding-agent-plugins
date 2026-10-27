@@ -573,6 +573,14 @@ impl PiTranslator {
             metadata.insert("model".into(), json!(model));
         }
         metadata.insert("pi_version".into(), json!(envelope.source_version));
+        let host_name = envelope
+            .payload
+            .get("host_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty());
+        if let Some(host_name) = host_name {
+            metadata.insert("host_name".into(), json!(host_name));
+        }
         metadata.insert(
             "extension_version".into(),
             envelope
@@ -601,7 +609,11 @@ impl PiTranslator {
             span_id: self.root_span_id.clone(),
             root_span_id: self.effective_root_span_id.clone(),
             parent_span_ids: self.external_parent.clone().into_iter().collect(),
-            name: "Pi".into(),
+            name: match host_name {
+                Some("@earendil-works/pi-coding-agent" | "@mariozechner/pi-coding-agent")
+                | None => "Pi".into(),
+                Some(name) => name.into(),
+            },
             span_type: SpanType::Task,
             start_ms: Some(envelope.ts_ms),
             metadata: Some(Value::Object(metadata)),

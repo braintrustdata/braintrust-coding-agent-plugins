@@ -271,6 +271,12 @@ coding-agent span falls back to Rust SDK provenance. Transcript backfills captur
 versions available at materialization, not unrecorded historical versions. See the
 [span-origin contract](../../docs/coding-agent-tracing-plugin-spec.md#621-span-origin-versions).
 
+Pi-compatible hosts retain the canonical transport source `pi` so they share its
+translator. The Pi extension sends the running host package's version as
+`source_version` and its package name as `payload.host_name`. The translator records
+`metadata.host_name` and uses a fork's package name as the session-root label;
+upstream Pi and older extension payloads retain the `Pi` label.
+
 For acknowledged spans from legacy ledgers without saved snapshots, stateless
 updates omit `context.span_origin` entirely, including SDK defaults and inherited
 parent origin fields. This preserves existing backend provenance without guessing
