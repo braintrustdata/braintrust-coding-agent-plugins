@@ -77,6 +77,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   let legacyContinuationSessionId: string | undefined;
   let lastContext: ExtensionContext | undefined;
   let awaitingFirstToken = false;
+  let lastStreamingKeepaliveAt = 0;
   let uiGeneration = 0;
   // The session_start refresh runs before the daemon has delivered a trace,
   // so agent runs poll status until the current session shows its link.
@@ -196,20 +197,24 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event, ctx) => forward("before_agent_start", event, ctx));
   pi.on("context", async (event, ctx) => {
     awaitingFirstToken = true;
+    lastStreamingKeepaliveAt = 0;
     await forward("context", event, ctx);
   });
   pi.on("before_provider_request", async (event) => forward("before_provider_request", event));
   pi.on("after_provider_response", async (event) => forward("after_provider_response", event));
   pi.on("message_update", async (event) => {
-    if (!awaitingFirstToken) return;
     const kind = streamingUpdateKind(event);
     if (!kind || !["text_delta", "thinking_delta", "text", "thinking"].includes(kind)) return;
+    const now = Date.now();
+    if (!awaitingFirstToken && now - lastStreamingKeepaliveAt < 10_000) return;
     awaitingFirstToken = false;
+    lastStreamingKeepaliveAt = now;
     await forward("message_update", event);
   });
   pi.on("thinking_level_select", async (event) => forward("thinking_level_select", event));
   pi.on("message_end", async (event) => {
     awaitingFirstToken = false;
+    lastStreamingKeepaliveAt = 0;
     await forward("message_end", event);
   });
   pi.on("tool_execution_start", async (event) => forward("tool_execution_start", event));
