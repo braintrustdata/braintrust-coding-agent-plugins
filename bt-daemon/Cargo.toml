@@ -38,6 +38,7 @@ serde_json = "1"
 semver = "1"
 sha2 = "0.10"
 sysinfo = { version = "0.33.1", default-features = false, features = ["system"] }
+zstd = "0.13"
 thiserror = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal", "fs"] }
@@ -54,7 +55,6 @@ axum = "0.8"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 wiremock = "0.6"
-zstd = "0.13"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
