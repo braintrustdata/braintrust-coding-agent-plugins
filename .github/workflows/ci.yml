@@ -371,6 +371,42 @@ jobs:
         if: runner.os != 'macOS'
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings
 
+  muse-integration:
+    name: Muse native integration (Linux)
+    env:
+      TBH_CREDENTIAL_BACKEND: file
+      TBH_DISABLE_TELEMETRY: "1"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install current Muse using its official installer
+        shell: bash
+        env:
+          MUSE_INSTALL_DIR: ${{ runner.temp }}/muse
+          MUSE_NO_MODIFY_PATH: "1"
+        run: |
+          curl --fail --silent --show-error --location https://dev.meta.ai/install.sh -o "$RUNNER_TEMP/install-muse.sh"
+          bash "$RUNNER_TEMP/install-muse.sh"
+          "$MUSE_INSTALL_DIR/muse" --version
+          echo "BRAINTRUST_MUSE_BIN=$MUSE_INSTALL_DIR/muse" >> "$GITHUB_ENV"
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: bt-daemon -> target
+          shared-key: muse-integration
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Trace native tools, retries, and failures through mock ingest
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test muse_integration -- --ignored --nocapture
+      - name: Verify native active attach, detach, and resumed completion
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test muse_attach -- --ignored --nocapture
+      - name: Verify native managed-hook coexistence and sanitized environments
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test pipeline muse_managed_run -- --ignored --nocapture --test-threads=1
+
   checks-passed:
     name: checks-passed
     needs:
@@ -381,6 +417,7 @@ jobs:
       - pi-compatibility
       - resolve-coding-agent-versions
       - daemon
+      - muse-integration
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: always()

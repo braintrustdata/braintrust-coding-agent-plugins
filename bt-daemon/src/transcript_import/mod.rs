@@ -11,6 +11,7 @@ mod antigravity;
 mod claude;
 mod codex;
 mod cursor;
+pub(crate) mod muse;
 mod pipeline;
 
 pub use pipeline::{import_transcript, import_transcripts, run_import};
@@ -210,7 +211,7 @@ fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
     }
 }
 
-fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
     if session_id.is_empty()
         || !session_id
             .bytes()

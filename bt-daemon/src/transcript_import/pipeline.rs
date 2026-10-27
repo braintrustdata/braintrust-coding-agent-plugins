@@ -1,6 +1,9 @@
 //! Transcript import: run native transcript records through the translators
 //! and a sink without a daemon, recording deliveries in the ledger.
 
+#[path = "muse_runtime.rs"]
+mod muse_runtime;
+
 use anyhow::Context;
 use braintrust_sdk_rust::SpanComponents;
 use std::path::PathBuf;
@@ -27,6 +30,9 @@ pub async fn run_import(
         .map(|components| wire::TraceDestination::ParentSpan { components })
         .or_else(|| args.destination.clone());
     apply_import_destination(&mut config, destination)?;
+    if args.source == ImportSource::Muse {
+        return muse_runtime::run(args, opts, config, Some(paths::data_dir(None))).await;
+    }
     let files = transcript_import::resolve_transcripts(&args.session_ids, args.all, args.source)?;
     let ledger_dir = paths::data_dir(None);
     if args.attach {
@@ -193,6 +199,28 @@ async fn import_transcript_with_ledger(
     attach: bool,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
+    if source == ImportSource::Muse {
+        let session_id = transcript_import::muse::session_id(file)?;
+        if attach {
+            return muse_runtime::attach_muse_export(
+                file,
+                &session_id,
+                false,
+                opts,
+                config,
+                ledger_dir,
+            )
+            .await;
+        }
+        let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
+        let ended = muse_runtime::process_muse_export(&mut processor, file, &session_id).await?;
+        let summary = if ended {
+            processor.finish_session(&session_id).await?
+        } else {
+            processor.detach_session(&session_id).await?
+        };
+        return Ok(summary.into_iter().collect());
+    }
     let mut tail = transcript_import::TranscriptTail::new(file.to_path_buf(), source);
     if attach {
         tail.allow_incomplete_final_record_on_shutdown();
@@ -241,6 +269,22 @@ async fn import_transcripts_with_ledger(
     config: Option<SessionConfig>,
     ledger_dir: Option<PathBuf>,
 ) -> anyhow::Result<Vec<ImportSummary>> {
+    if source == ImportSource::Muse {
+        let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
+        let mut summaries = Vec::new();
+        for file in files {
+            let session_id = transcript_import::muse::session_id(file)?;
+            let ended =
+                muse_runtime::process_muse_export(&mut processor, file, &session_id).await?;
+            let summary = if ended {
+                processor.finish_session(&session_id).await?
+            } else {
+                processor.detach_session(&session_id).await?
+            };
+            summaries.extend(summary);
+        }
+        return Ok(summaries);
+    }
     let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
     let mut summaries = Vec::new();
     for file in files {
@@ -473,7 +517,7 @@ impl ImportProcessor {
             let ops = live.translator.flush(&live.ctx)?;
             Self::emit_translator_batches(&mut live, ops).await?;
             live.sink.flush().await?;
-            summaries.push(Self::summary(sid, live));
+            summaries.push(Self::summary(sid, live, true));
         }
         summaries.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         Ok(summaries)
@@ -486,27 +530,490 @@ impl ImportProcessor {
         let ops = live.translator.flush(&live.ctx)?;
         Self::emit_translator_batches(&mut live, ops).await?;
         live.sink.flush().await?;
-        Ok(Some(Self::summary(session_id.to_string(), live)))
+        Ok(Some(Self::summary(session_id.to_string(), live, true)))
     }
 
-    fn summary(session_id: String, live: ImportLive) -> ImportSummary {
+    async fn flush_open(&mut self) -> anyhow::Result<()> {
+        for live in self.sessions.values_mut() {
+            live.sink.flush().await?;
+            live.pending_ops = 0;
+        }
+        Ok(())
+    }
+
+    async fn detach_session(&mut self, session_id: &str) -> anyhow::Result<Option<ImportSummary>> {
+        let Some(mut live) = self.sessions.remove(session_id) else {
+            return Ok(None);
+        };
+        live.sink.flush().await?;
+        Ok(Some(Self::summary(session_id.to_string(), live, false)))
+    }
+
+    fn summary(session_id: String, live: ImportLive, finalized: bool) -> ImportSummary {
         ImportSummary {
             session_id,
             destination: live.destination,
             root_span_id: live.root_span_id,
             span_count: live.span_ids.len(),
-            finalized: true,
+            finalized,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::muse_runtime::*;
     use super::*;
     use crate::debug_serve_options;
+    use crate::{ids, DebugSinkFactory, Registry};
     use braintrust_sdk_rust::SpanObjectType;
     use clap::Parser;
     use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn muse_attach_snapshots_reuse_one_trace_and_keep_open_spans() {
+        let temp = tempfile::tempdir().unwrap();
+        let export = temp.path().join("export.json");
+        let output = temp.path().join("spans");
+        let mut processor = ImportProcessor::new(
+            ServeOptions {
+                version: "test".into(),
+                translators: Arc::new(Registry::default_agents()),
+                sink_factory: Arc::new(DebugSinkFactory {
+                    dir: output.clone(),
+                }),
+                auth_provider: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let mut events = vec![
+            json!({"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}}),
+            json!({"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_input_trace_recorded","request_record_id":"request-1"}}}}),
+        ];
+        let write = |events: &[serde_json::Value]| {
+            std::fs::write(
+                &export,
+                serde_json::to_vec(&json!({
+                    "export_schema_version":1,
+                    "sessions":[{"session_id":"muse-attach"}],
+                    "events":events,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write(&events);
+        let (count, ended) = process_muse_snapshot(
+            &mut processor,
+            &export,
+            "muse-attach",
+            crate::transcript_import::muse::ReadMode::Attach,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 3);
+        assert!(!ended);
+        processor.flush_open().await.unwrap();
+        let (same_count, ended) = process_muse_snapshot(
+            &mut processor,
+            &export,
+            "muse-attach",
+            crate::transcript_import::muse::ReadMode::Attach,
+            count,
+        )
+        .await
+        .unwrap();
+        assert_eq!(same_count, count);
+        assert!(!ended);
+        events.extend([
+            json!({"recorded_at":1_002_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_completed","usage":{"input_tokens":2}}}}}),
+            json!({"recorded_at":1_003_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"assistant_message_committed","text":"done"}}}}),
+            json!({"recorded_at":1_004_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}}),
+            json!({"recorded_at":1_005_000,"envelope":{"payload":{"kind":"session_end"}}}),
+        ]);
+        write(&events);
+        let (_, ended) = process_muse_snapshot(
+            &mut processor,
+            &export,
+            "muse-attach",
+            crate::transcript_import::muse::ReadMode::Attach,
+            count,
+        )
+        .await
+        .unwrap();
+        assert!(ended);
+        processor.finish().await.unwrap();
+        let rows = std::fs::read_to_string(output.join("muse-attach.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for identity in ["root", "turn:run-1", "llm:request-1"] {
+            let id = ids::span_id(&ids::session_namespace("muse", "muse-attach"), identity);
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row
+                        .pointer("/Insert/span_id")
+                        .and_then(|value| value.as_str())
+                        == Some(id.as_str()))
+                    .count(),
+                1,
+                "duplicate insert for {identity}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row
+                        .pointer("/Merge/span_id")
+                        .and_then(|value| value.as_str())
+                        == Some(id.as_str())
+                        && row.pointer("/Merge/end_ms").is_some())
+                    .count(),
+                1,
+                "missing or duplicate completion for {identity}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_muse_import_does_not_emit_a_second_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let export = temp.path().join("muse-export.json");
+        std::fs::write(
+            &export,
+            serde_json::to_vec(&json!({
+                "export_schema_version":1,
+                "sessions":[{"session_id":"muse-ledger"}],
+                "events":[
+                    {"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}},
+                    {"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}},
+                    {"recorded_at":1_002_000,"envelope":{"payload":{"kind":"session_end"}}}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let import = || {
+            import_transcript_with_ledger(
+                &export,
+                ImportSource::Muse,
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                false,
+                Some(ledger.clone()),
+            )
+        };
+        import().await.unwrap();
+        let rows = output.join("spans/muse-ledger.ndjson");
+        let first = std::fs::read_to_string(&rows).unwrap();
+        assert!(first.contains("Muse Code"));
+        import().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&rows).unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn later_muse_import_completes_an_active_snapshot_on_the_same_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let export = temp.path().join("muse-export.json");
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let started = json!({"recorded_at":1_000_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"hello"}}}});
+        let write = |events: Vec<serde_json::Value>| {
+            std::fs::write(
+                &export,
+                serde_json::to_vec(&json!({
+                    "export_schema_version":1,
+                    "sessions":[{"session_id":"muse-active-import"}],
+                    "events":events,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let import = || {
+            import_transcript_with_ledger(
+                &export,
+                ImportSource::Muse,
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                false,
+                Some(ledger.clone()),
+            )
+        };
+        write(vec![started.clone()]);
+        let summaries = import().await.unwrap();
+        assert!(!summaries[0].finalized);
+        let rows_path = output.join("spans/muse-active-import.ndjson");
+        let first = std::fs::read_to_string(&rows_path).unwrap();
+        assert!(!first.contains("\"Merge\""));
+
+        write(vec![
+            started,
+            json!({"recorded_at":1_001_000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}}),
+            json!({"recorded_at":1_002_000,"envelope":{"payload":{"kind":"session_end"}}}),
+        ]);
+        let summaries = import().await.unwrap();
+        assert!(summaries[0].finalized);
+        let rows = std::fs::read_to_string(&rows_path).unwrap();
+        let parsed = rows
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let root_id = ids::span_id(
+            &ids::session_namespace("muse", "muse-active-import"),
+            "root",
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|row| row
+                    .pointer("/Insert/span_id")
+                    .and_then(|value| value.as_str())
+                    == Some(root_id.as_str()))
+                .count(),
+            2
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|row| row
+                    .pointer("/Merge/span_id")
+                    .and_then(|value| value.as_str())
+                    == Some(root_id.as_str())
+                    && row.pointer("/Merge/end_ms").is_some())
+                .count(),
+            1
+        );
+        assert!(rows.contains("\"end_ms\":1002"));
+        let completed = rows.clone();
+        import().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&rows_path).unwrap(), completed);
+    }
+
+    #[tokio::test]
+    async fn muse_live_capture_then_export_reuses_model_and_late_updates_resumed_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let export = temp.path().join("export.json");
+        let make_processor = || {
+            ImportProcessor::new(
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                Some(ledger.clone()),
+            )
+            .unwrap()
+        };
+        let mut live = make_processor();
+        for (name, payload, ts) in [
+            (
+                "UserPromptSubmit",
+                json!({"turn_id":"run-1","prompt":"first"}),
+                1000,
+            ),
+            (
+                "PreLLMCall",
+                json!({"turn_id":"run-1","request_id":"run-1:0:1"}),
+                1001,
+            ),
+            (
+                "PostLLMCall",
+                json!({"turn_id":"run-1","request_id":"run-1:0:1","output_text_preview":"preview"}),
+                1003,
+            ),
+            (
+                "Stop",
+                json!({"turn_id":"run-1","last_assistant_message":"first answer"}),
+                1003,
+            ),
+            ("SessionEnd", json!({}), 1004),
+            (
+                "UserPromptSubmit",
+                json!({"turn_id":"run-2","prompt":"second"}),
+                2400,
+            ),
+            (
+                "Stop",
+                json!({"turn_id":"run-2","last_assistant_message":"latest preview"}),
+                2500,
+            ),
+            ("SessionEnd", json!({}), 2501),
+        ] {
+            live.process(vec![transcript_import::envelope(
+                "muse",
+                None,
+                "cross-ingress",
+                name,
+                ts,
+                payload,
+            )])
+            .await
+            .unwrap();
+        }
+        live.finish().await.unwrap();
+        std::fs::write(&export, serde_json::to_vec(&json!({
+            "export_schema_version":1,"sessions":[{"session_id":"cross-ingress"}],
+            "events":[
+                {"recorded_at":1000000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"first"}}}},
+                {"recorded_at":1001000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"model_input_trace_recorded","request_record_id":"uuid-1","model_step":0}}}},
+                {"recorded_at":1002000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"assistant_message_committed","text":"full exported answer"}}}},
+                {"recorded_at":1003000,"envelope":{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}},
+                {"recorded_at":1004000,"envelope":{"payload":{"kind":"session_end"}}},
+                {"recorded_at":2000000,"envelope":{"payload":{"kind":"run","run_id":"run-2","event":{"kind":"started","prompt":"second"}}}},
+                {"recorded_at":2001000,"envelope":{"payload":{"kind":"run","run_id":"run-2","event":{"kind":"assistant_message_committed","text":"latest answer"}}}},
+                {"recorded_at":2002000,"envelope":{"payload":{"kind":"run","run_id":"run-2","event":{"kind":"terminal","terminal":"completed"}}}},
+                {"recorded_at":2003000,"envelope":{"payload":{"kind":"session_end"}}}
+            ]
+        })).unwrap()).unwrap();
+        let mut imported = make_processor();
+        assert!(process_muse_export(&mut imported, &export, "cross-ingress")
+            .await
+            .unwrap());
+        imported.finish().await.unwrap();
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(output.join("spans/cross-ingress.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let namespace = ids::session_namespace("muse", "cross-ingress");
+        let model = ids::span_id(&namespace, "llm:run-1:0:1");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row
+                    .pointer("/Insert/span_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(model.as_str()))
+                .count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .filter_map(|row| row.get("Merge"))
+            .any(|row| row["span_id"] == model && row["output"] == "full exported answer"));
+        let root = ids::span_id(&namespace, "root");
+        let root_updates: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.get("Merge"))
+            .filter(|row| row["span_id"] == root)
+            .collect();
+        assert!(root_updates
+            .iter()
+            .any(|row| row["output"] == "latest answer"));
+        assert_eq!(root_updates.last().unwrap()["end_ms"], 2003);
+        assert_eq!(
+            root_updates
+                .iter()
+                .rev()
+                .find(|row| row.get("output").is_some())
+                .unwrap()["output"],
+            "latest answer"
+        );
+        // An older complete export must not roll the root back to run-1.
+        let rows_path = output.join("spans/cross-ingress.ndjson");
+        let before_stale = std::fs::read_to_string(&rows_path).unwrap();
+        let mut stale: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&export).unwrap()).unwrap();
+        stale["events"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|event| event["recorded_at"].as_i64().unwrap() < 2_000_000);
+        std::fs::write(&export, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let mut old = make_processor();
+        process_muse_export(&mut old, &export, "cross-ingress")
+            .await
+            .unwrap();
+        old.finish().await.unwrap();
+        assert_eq!(std::fs::read_to_string(rows_path).unwrap(), before_stale);
+    }
+
+    #[tokio::test]
+    async fn muse_native_tool_export_reuses_delivered_live_tool_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output");
+        let ledger = temp.path().join("ledger");
+        let make_processor = || {
+            ImportProcessor::new(
+                debug_serve_options("test", &output),
+                Some(import_test_config("project-a")),
+                Some(ledger.clone()),
+            )
+            .unwrap()
+        };
+        let mut live = make_processor();
+        for (name, payload, ts) in [
+            (
+                "UserPromptSubmit",
+                json!({"turn_id":"fixture-turn","prompt":"Print an integration marker."}),
+                1,
+            ),
+            (
+                "PreToolUse",
+                json!({"turn_id":"fixture-turn","tool_use_id":"call_muse_1","tool_name":"shell","tool_input":{"command":"printf MUSE_TOOL_OK"}}),
+                2,
+            ),
+            (
+                "PostToolUse",
+                json!({"turn_id":"fixture-turn","tool_use_id":"call_muse_1","tool_name":"shell","tool_response":"MUSE_TOOL_OK"}),
+                3,
+            ),
+            (
+                "Stop",
+                json!({"turn_id":"fixture-turn","last_assistant_message":"MUSE_TOOL_OK"}),
+                4,
+            ),
+            ("SessionEnd", json!({}), 5),
+        ] {
+            live.process(vec![transcript_import::envelope(
+                "muse",
+                Some("1.4.11".into()),
+                "muse-export-fixture",
+                name,
+                ts,
+                payload,
+            )])
+            .await
+            .unwrap();
+        }
+        live.finish().await.unwrap();
+        let export = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/muse-export-1.4.11.json");
+        let mut imported = make_processor();
+        assert!(
+            process_muse_export(&mut imported, &export, "muse-export-fixture")
+                .await
+                .unwrap()
+        );
+        imported.finish().await.unwrap();
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(output.join("spans/muse-export-fixture.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let tool = ids::span_id(
+            &ids::session_namespace("muse", "muse-export-fixture"),
+            "tool:call_muse_1",
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row
+                    .pointer("/Insert/span_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tool.as_str()))
+                .count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .filter_map(|row| row.get("Merge"))
+            .any(|row| row["span_id"] == tool && row["output"] == "MUSE_TOOL_OK"));
+    }
 
     #[derive(Debug, Parser)]
     struct ImportCli {

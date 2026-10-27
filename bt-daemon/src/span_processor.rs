@@ -399,6 +399,7 @@ fn process_inner(
             candidate.origin = row.origin.clone();
             candidate.turn_span_id = row.turn_span_id.clone();
             candidate.late_merge_key = row.late_merge_key.clone();
+            candidate.late_merge_version = row.late_merge_version.clone();
             row = candidate;
         }
         Ok(())

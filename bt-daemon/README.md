@@ -63,6 +63,8 @@ coding agent decides whether to continue its turn.
 Each coding agent reads an independent non-credential `braintrust.json` file:
 
 - Codex: `~/.codex/braintrust.json`
+- Muse Code: `$XDG_CONFIG_HOME/muse/braintrust.json`, falling back to
+  `~/.config/muse/braintrust.json`
 - Claude Code: `~/.claude/braintrust.json`
 - OpenCode: `$XDG_CONFIG_HOME/opencode/braintrust.json`, falling back to
   `~/.config/opencode/braintrust.json`
@@ -281,15 +283,21 @@ echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./bt-daemon/target
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
 
-`import <codex|claude|antigravity> <session-id>` has a different purpose from restart
+`import <codex|claude|antigravity|muse> <session-id>` has a different purpose from restart
 recovery. It locates the native transcript in the selected agent's standard
 session store, synthesizes the lifecycle triggers that can be recovered from
 that transcript, and sends them through the normal translator and sink to
 create a trace for the past session. Hook-only facts absent from a native
 transcript are not invented.
 
-Add `--attach` to keep following an active Codex, Claude, or Antigravity transcript until
-Ctrl-C. `run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent with
+Muse Code 1.3+ supports live tracing, managed runs, session import, and attach
+on macOS and Linux. Use `import muse --all` to import completed sessions.
+
+Add `--attach` to keep following an active Codex, Claude, Antigravity, or Muse
+session until Ctrl-C. Detaching from Muse leaves the session running; attach
+again or import it later to collect its completion.
+
+`run <codex|muse|claude|opencode|pi> [ARGS...]` launches the selected agent with
 inherited stdio and injects Braintrust hooks or an adapter for that invocation, so it
 does not depend on the tracing plugin being installed or enabled. Managed runs
 suppress inherited Braintrust plugin hooks to avoid logging the same session

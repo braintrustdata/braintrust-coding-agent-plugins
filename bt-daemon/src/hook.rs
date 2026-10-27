@@ -96,6 +96,9 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
         if suppress_hook(&args) {
             return Ok(());
         }
+        if args.managed_context.is_some() {
+            return run_hook_with_route(args, route, host).await;
+        }
         let settings = settings::AgentSettings::load_for_hook(&args.source)?;
         if !settings.tracing_enabled() {
             return Ok(());
@@ -185,6 +188,24 @@ async fn capture_hook(
     mut route: SessionRoute,
     host: HostInfo,
 ) -> anyhow::Result<()> {
+    let managed_context = if let Some(path) = &args.managed_context {
+        if crate::translate::canonical_source_name(&args.source) != "muse" || !args.managed_run_hook
+        {
+            anyhow::bail!("managed context is only valid for an injected Muse hook");
+        }
+        let context: crate::managed_run::muse::MuseManagedContext =
+            serde_json::from_slice(&tokio::fs::read(path).await?)?;
+        if context.managed_run_id.is_empty() || context.route.destination.is_none() {
+            anyhow::bail!("Muse managed hook context is incomplete");
+        }
+        route = context.route.clone();
+        if args.source_version.is_none() {
+            args.source_version = context.source_version.clone();
+        }
+        Some(context)
+    } else {
+        None
+    };
     let mut payload = read_stdin_json(args.transcript_path_field.as_deref())?;
 
     resolve_dynamic_hook_versions(&mut args, &payload);
@@ -208,18 +229,53 @@ async fn capture_hook(
         anyhow::bail!("trace destination is not configured for {}", args.source);
     }
     apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
-    let env = build_hook_envelope(&args, route, payload, session_id, event);
+    let mut env = build_hook_envelope(&args, route, payload, session_id, event);
+    if let Some(context) = &managed_context {
+        env.managed_run_id = Some(context.managed_run_id.clone());
+    }
 
-    let socket = paths::socket_path(args.socket.as_deref());
-    forward_envelope(&env, &socket, &host, args.no_spawn).await?;
+    let socket = managed_context
+        .as_ref()
+        .map(|context| context.socket.clone())
+        .unwrap_or_else(|| paths::socket_path(args.socket.as_deref()));
+    forward_envelope(
+        &env,
+        &socket,
+        &host,
+        args.no_spawn || managed_context.is_some(),
+    )
+    .await?;
 
     Ok(())
 }
 
 fn resolve_dynamic_hook_versions(args: &mut HookArgs, payload: &serde_json::Value) {
+    resolve_dynamic_hook_versions_with_muse_probe(args, payload, || {
+        crate::setup::muse::installed_muse_version()
+            .ok()
+            .map(|version| version.to_string())
+    });
+}
+
+fn resolve_dynamic_hook_versions_with_muse_probe(
+    args: &mut HookArgs,
+    payload: &serde_json::Value,
+    muse_probe: impl FnOnce() -> Option<String>,
+) {
     if args.source_version.is_none() {
         args.source_version = source_version_from_env(&args.source)
             .or_else(|| source_version_from_payload(&args.source, payload));
+        let event = args.event.as_deref().or_else(|| {
+            payload
+                .get(&args.event_field)
+                .and_then(serde_json::Value::as_str)
+        });
+        if args.source_version.is_none()
+            && crate::translate::canonical_source_name(&args.source) == "muse"
+            && matches!(event, Some("SessionStart" | "session_start"))
+        {
+            args.source_version = muse_probe();
+        }
     }
     if args.plugin_version.is_none() {
         args.plugin_version = plugin_version_from_plugin_root(&args.source);
@@ -438,6 +494,35 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn muse_managed_hook_rejects_missing_context_before_reading_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = HookCli::try_parse_from([
+            "test",
+            "--source",
+            "muse",
+            "--managed-run-hook",
+            "--managed-context",
+            temp.path().join("missing.json").to_str().unwrap(),
+        ])
+        .unwrap()
+        .args;
+        let error = run_hook(
+            args,
+            SessionRoute::default(),
+            HostInfo {
+                serve_argv: Vec::new(),
+                version: "test".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
     #[derive(Debug, Parser)]
     struct HookCli {
         #[command(flatten)]
@@ -561,6 +646,51 @@ mod tests {
         assert_eq!(initialize["client"]["daemon_version"], "1.0.13");
         assert_eq!(initialize["client"]["plugin_version"], "0.1.0");
         assert_ne!(initialize["client"]["plugin_version"], "1.0.13");
+    }
+
+    #[test]
+    fn muse_version_probe_is_session_start_only_and_fail_open() {
+        let mut args = HookCli::try_parse_from(["test", "--source", "muse"])
+            .unwrap()
+            .args;
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut args,
+            &json!({"hook_event_name":"UserPromptSubmit"}),
+            || panic!("must not spawn a version probe on each event"),
+        );
+        assert!(args.source_version.is_none());
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut args,
+            &json!({"hook_event_name":"SessionStart"}),
+            || None,
+        );
+        assert!(args.source_version.is_none());
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut args,
+            &json!({"hook_event_name":"SessionStart"}),
+            || Some("1.4.11".into()),
+        );
+        let envelope = build_hook_envelope(
+            &args,
+            SessionRoute::default(),
+            json!({}),
+            "session".into(),
+            "SessionStart".into(),
+        );
+        assert_eq!(envelope.source_version.as_deref(), Some("1.4.11"));
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut args,
+            &json!({"hook_event_name":"SessionStart"}),
+            || panic!("explicit context version must be preserved"),
+        );
+        let mut other = HookCli::try_parse_from(["test", "--source", "cursor"])
+            .unwrap()
+            .args;
+        resolve_dynamic_hook_versions_with_muse_probe(
+            &mut other,
+            &json!({"hook_event_name":"SessionStart"}),
+            || panic!("Muse probe must not run for other agents"),
+        );
     }
 
     #[test]

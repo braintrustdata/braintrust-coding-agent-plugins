@@ -253,6 +253,8 @@ impl OpenAiMock {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/v1/models", get(models))
+            .route("/muse-code/models", get(models))
+            .route("/responses", post(muse_responses))
             .route("/v1/responses", post(responses))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/backend-api/plugins/featured", get(featured_plugins))
@@ -267,7 +269,9 @@ impl OpenAiMock {
 async fn models() -> axum::Json<Value> {
     axum::Json(json!({
         "object": "list",
-        "data": [{"id": "mock-model", "object": "model", "owned_by": "mock"}]
+        "data": [{"id": "mock-model", "object": "model", "owned_by": "mock",
+            "metadata": {"muse-code": {"release_date": "2026-01-01", "is_hidden": false,
+                "limit": {"context": 1000000, "output": 1024}}}}]
     }))
 }
 
@@ -275,10 +279,29 @@ async fn featured_plugins() -> axum::Json<Value> {
     axum::Json(json!([]))
 }
 
+// Muse validates the complete Responses envelope, including sequence numbers.
+// Other agents intentionally also exercise the sparse mock response path.
+async fn muse_responses(
+    State(state): State<Arc<MockState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    respond(state, headers, body, true).await
+}
+
 async fn responses(
     State(state): State<Arc<MockState>>,
     headers: HeaderMap,
     body: Bytes,
+) -> axum::response::Response {
+    respond(state, headers, body, false).await
+}
+
+async fn respond(
+    state: Arc<MockState>,
+    headers: HeaderMap,
+    body: Bytes,
+    complete: bool,
 ) -> axum::response::Response {
     let body = match decode_json_body(&headers, &body) {
         Ok(body) => body,
@@ -297,11 +320,27 @@ async fn responses(
         },
         request,
     ) {
-        MockReply::Response(turn) => raw_response(
-            StatusCode::OK,
-            "text/event-stream",
-            sse(&turn.events(index)),
-        ),
+        MockReply::Response(turn) => {
+            let mut events = turn.events(index);
+            if complete {
+                for (sequence, event) in events.iter_mut().enumerate() {
+                    event["sequence_number"] = json!(sequence + 1);
+                    let completed = event["type"] == "response.completed";
+                    if let Some(response) = event.get_mut("response").and_then(Value::as_object_mut)
+                    {
+                        response.entry("object").or_insert(json!("response"));
+                        response.entry("model").or_insert(json!("mock-model"));
+                        response.entry("status").or_insert(json!(if completed {
+                            "completed"
+                        } else {
+                            "in_progress"
+                        }));
+                        response.entry("output").or_insert(json!([]));
+                    }
+                }
+            }
+            raw_response(StatusCode::OK, "text/event-stream", sse(&events))
+        }
         MockReply::HttpError { status, body } => json_response(status, body),
         MockReply::Raw {
             status,
