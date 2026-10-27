@@ -10,7 +10,8 @@ import { EXTENSION_VERSION } from "./version.ts";
 const STATUS_KEY = "braintrust-tracing";
 const WIDGET_KEY = "braintrust-trace-link";
 const UI_STATUS_TIMEOUT_MS = 250;
-const PI_HOST = runningPiPackage();
+const PI_VERSION = runningPiPackage().version;
+const PI_HOST_NAME = runningPiPackage().name;
 
 function sessionKeyFor(
   sessionFile: string | undefined,
@@ -138,14 +139,14 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     if (!sessionId) return;
     await client.log({
       source: "pi",
-      ...(PI_HOST.version ? { source_version: PI_HOST.version } : {}),
+      ...(PI_VERSION ? { source_version: PI_VERSION } : {}),
       session_id: sessionId,
       event: name,
       ts_ms: Date.now(),
       payload: {
         event: nativePayload(event),
         extension_version: EXTENSION_VERSION,
-        host_name: PI_HOST.name,
+        host_name: PI_HOST_NAME,
         session_file: descriptor?.sessionFile,
         native_session_id: descriptor?.nativeSessionId,
         legacy_resume: legacyContinuation,
