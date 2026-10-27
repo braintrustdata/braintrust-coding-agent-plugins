@@ -5,9 +5,11 @@ This monorepo contains the plugins and the shared Rust tracing daemon embedded
 in the Braintrust CLI (`bt`). Plugins forward native events locally; the daemon
 builds traces, journals events for recovery, and delivers spans to Braintrust.
 
-The Codex marketplace also includes an independent [Braintrust MCP
-package](src/plugins/codex/content/plugins/braintrust/README.md) for hosted tools
-with OAuth. It requires no `bt` installation and does not enable session tracing.
+This repository also packages the [Braintrust
+plugin](src/plugins/codex/content/plugins/braintrust/README.md) for submission to
+the official ChatGPT and Codex plugin directory. It connects to Braintrust's
+hosted MCP server through OAuth and requires no `bt` installation. Installing it
+does not enable session tracing.
 
 ## Get started
 

@@ -8,9 +8,7 @@
         "com.openai": {
           "auth": {
             "type": "oauth",
-            "client": {
-              "mode": "dcr"
-            }
+            "client": { "mode": "dcr" }
           }
         }
       }

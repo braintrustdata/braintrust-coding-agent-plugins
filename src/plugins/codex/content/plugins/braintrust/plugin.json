@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "braintrust",
   "version": "2.1.1",
-  "description": "Query Braintrust traces, manage prompts and datasets, and run evaluations through the hosted MCP server.",
+  "description": "Explore Braintrust traces, manage prompts and datasets, and run evaluations.",
   "author": {
     "name": "Braintrust",
     "email": "support@braintrust.dev",
@@ -17,7 +17,7 @@
       "interface": {
         "displayName": "Braintrust",
         "shortDescription": "Explore traces and run evals",
-        "longDescription": "Connect to Braintrust to query production traces, investigate failures, manage prompts and datasets, and run evaluations. For developers building and evaluating AI applications. Requires a Braintrust account and access to the selected organization's data plane. Tools act with your connected account's permissions and can read or modify Braintrust data. This package uses the NA (US) endpoint; public-directory template endpoint selection requires separate OpenAI setup. MCP sign-in is independent of optional bt session tracing.",
+        "longDescription": "Query production traces, investigate failures, manage prompts and datasets, and run evaluations in Braintrust. Sign in with a Braintrust account to access your organization's data. Tools use your account's permissions and can read or modify data. This package connects to Braintrust's US data plane.",
         "developerName": "Braintrust",
         "category": "Developer Tools",
         "capabilities": ["Read", "Write"],
