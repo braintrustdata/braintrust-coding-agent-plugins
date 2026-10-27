@@ -10,6 +10,11 @@ import { EXTENSION_VERSION } from "./version.ts";
 const STATUS_KEY = "braintrust-tracing";
 const WIDGET_KEY = "braintrust-trace-link";
 const UI_STATUS_TIMEOUT_MS = 250;
+// The daemon uploads a turn after Pi reports agent_end: about a second later
+// with flush_on_turn_end, and when its 30 s batch window closes with
+// fire_and_forget. Poll for the trace link long enough to cover both.
+const TRACE_LINK_POLL_INTERVAL_MS = 2_000;
+const TRACE_LINK_POLL_TIMEOUT_MS = 40_000;
 const PI_VERSION = runningPiPackage().version;
 
 function sessionKeyFor(
@@ -72,6 +77,11 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   let lastContext: ExtensionContext | undefined;
   let awaitingFirstToken = false;
   let uiGeneration = 0;
+  // The session_start refresh runs before the daemon has delivered a trace,
+  // so agent runs poll status until the current session shows its link.
+  let traceLinkShown = false;
+  let traceLinkPollGeneration: number | undefined;
+  let traceLinkPollTimer: ReturnType<typeof setTimeout> | undefined;
   const client = new DaemonClient({
     source: "pi",
     pluginVersion: EXTENSION_VERSION,
@@ -94,7 +104,10 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   ): Promise<ReturnType<typeof sessionDescriptor>> => {
     lastContext = ctx;
     const descriptor = sessionDescriptor(ctx);
-    if (sessionId !== descriptor.sessionId) uiGeneration += 1;
+    if (sessionId !== descriptor.sessionId) {
+      uiGeneration += 1;
+      traceLinkShown = false;
+    }
     sessionId = descriptor.sessionId;
     if (legacyContinuationSessionId !== descriptor.sessionId) {
       // The legacy file is immutable migration input. Read it asynchronously
@@ -119,13 +132,30 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     } else {
       ctx.ui.setStatus(STATUS_KEY, "Braintrust: tracing");
     }
-    ctx.ui.setWidget(
-      WIDGET_KEY,
-      config.showTraceLink && daemonSession?.permalink
-        ? ["Braintrust trace", daemonSession.permalink]
-        : undefined,
-      { placement: "belowEditor" },
-    );
+    const permalink = config.showTraceLink ? daemonSession?.permalink : undefined;
+    ctx.ui.setWidget(WIDGET_KEY, permalink ? ["Braintrust trace", permalink] : undefined, {
+      placement: "belowEditor",
+    });
+    traceLinkShown = Boolean(permalink);
+  };
+
+  const pollTraceLink = (ctx: ExtensionContext): void => {
+    if (!ctx.hasUI || !config.showUi || !config.showTraceLink) return;
+    if (traceLinkShown || traceLinkPollGeneration === uiGeneration) return;
+    const generation = uiGeneration;
+    const deadline = Date.now() + TRACE_LINK_POLL_TIMEOUT_MS;
+    traceLinkPollGeneration = generation;
+    const poll = async (): Promise<void> => {
+      traceLinkPollTimer = undefined;
+      if (generation === uiGeneration) await refreshUi(ctx);
+      if (traceLinkShown || generation !== uiGeneration || Date.now() >= deadline) {
+        if (traceLinkPollGeneration === generation) traceLinkPollGeneration = undefined;
+        return;
+      }
+      traceLinkPollTimer = setTimeout(() => void poll(), TRACE_LINK_POLL_INTERVAL_MS);
+      traceLinkPollTimer.unref?.();
+    };
+    void poll();
   };
 
   const forward = async (
@@ -189,12 +219,17 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   pi.on("session_before_tree", async (event, ctx) => forward("session_before_tree", event, ctx));
   pi.on("session_tree", async (event, ctx) => forward("session_tree", event, ctx, true));
   // All delivery flushing belongs to the daemon, including session shutdown.
-  pi.on("agent_end", async (event) => forward("agent_end", event));
+  pi.on("agent_end", async (event, ctx) => {
+    await forward("agent_end", event);
+    pollTraceLink(ctx);
+  });
   pi.on("session_shutdown", async (event, ctx) => {
     await forward("session_shutdown", event, ctx);
     // Invalidate fire-and-forget refreshes before clearing the UI so a status
     // request that finishes during shutdown cannot restore stale state.
     uiGeneration += 1;
+    clearTimeout(traceLinkPollTimer);
+    traceLinkPollTimer = undefined;
     sessionId = undefined;
     legacyContinuation = undefined;
     legacyContinuationSessionId = undefined;
