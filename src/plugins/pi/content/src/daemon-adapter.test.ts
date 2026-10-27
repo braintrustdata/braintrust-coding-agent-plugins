@@ -73,6 +73,14 @@ vi.mock("./legacy-session.ts", () => ({
   },
 }));
 
+vi.mock("./pi-package.ts", () => ({
+  runningPiPackage: () => ({
+    name: "@oh-my-pi/pi-coding-agent",
+    version: "18.12.6",
+    configDir: ".pi",
+  }),
+}));
+
 type Handler = (...args: unknown[]) => Promise<unknown>;
 
 /** Load the extension against a fake Pi and return its registered handlers. */
@@ -115,6 +123,16 @@ describe("Pi daemon adapter", () => {
     mockState.claim = false;
     const handlers = await loadExtension();
     expect(handlers.size).toBe(0);
+  });
+
+  it("forwards the running host name and version instead of an installed peer", async () => {
+    const handlers = await loadExtension();
+    await handlers.get("session_start")?.({ reason: "new" }, fakeContext());
+    expect(mockState.logs[0]).toMatchObject({
+      source: "pi",
+      source_version: "18.12.6",
+      payload: { host_name: "@oh-my-pi/pi-coding-agent" },
+    });
   });
 
   it("does not block session startup on daemon status", async () => {

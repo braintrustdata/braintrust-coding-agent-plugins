@@ -4,7 +4,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PI_PACKAGE = "@earendil-works/pi-coding-agent";
-const PI_PACKAGE_NAMES = new Set([PI_PACKAGE, "@mariozechner/pi-coding-agent"]);
+const PI_PACKAGE_NAMES = new Set([
+  PI_PACKAGE,
+  "@mariozechner/pi-coding-agent",
+  "@oh-my-pi/pi-coding-agent",
+]);
 
 interface PiPackageManifest {
   name?: unknown;
@@ -15,6 +19,7 @@ interface PiPackageManifest {
 }
 
 export interface PiPackageMetadata {
+  name?: string;
   version?: string;
   configDir: string;
 }
@@ -37,6 +42,7 @@ export function loadPiPackageMetadata(candidates: (string | undefined)[]): PiPac
     if (manifest) break;
   }
   return {
+    name: typeof manifest?.name === "string" ? manifest.name : undefined,
     version: typeof manifest?.version === "string" ? manifest.version : undefined,
     configDir:
       typeof manifest?.piConfig?.configDir === "string" ? manifest.piConfig.configDir : ".pi",

@@ -16,6 +16,7 @@ const UI_STATUS_TIMEOUT_MS = 250;
 const TRACE_LINK_POLL_INTERVAL_MS = 2_000;
 const TRACE_LINK_POLL_TIMEOUT_MS = 40_000;
 const PI_VERSION = runningPiPackage().version;
+const PI_HOST_NAME = runningPiPackage().name;
 
 function sessionKeyFor(
   sessionFile: string | undefined,
@@ -175,6 +176,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
       payload: {
         event: nativePayload(event),
         extension_version: EXTENSION_VERSION,
+        host_name: PI_HOST_NAME,
         session_file: descriptor?.sessionFile,
         native_session_id: descriptor?.nativeSessionId,
         legacy_resume: legacyContinuation,

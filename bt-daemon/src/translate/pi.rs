@@ -573,6 +573,14 @@ impl PiTranslator {
             metadata.insert("model".into(), json!(model));
         }
         metadata.insert("pi_version".into(), json!(envelope.source_version));
+        if let Some(host_name) = envelope
+            .payload
+            .get("host_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            metadata.insert("host_name".into(), json!(host_name));
+        }
         metadata.insert(
             "extension_version".into(),
             envelope
