@@ -375,10 +375,11 @@ describe("Pi daemon adapter", () => {
     const handlers = await loadExtension();
     const ctx = fakeContext();
     await handlers.get("context")?.({ messages: [] }, ctx);
-    const update = () => handlers.get("message_update")?.({
-      type: "message_update",
-      assistantMessageEvent: { type: "toolcall_delta", delta: "{" },
-    });
+    const update = () =>
+      handlers.get("message_update")?.({
+        type: "message_update",
+        assistantMessageEvent: { type: "toolcall_delta", delta: "{" },
+      });
 
     await update();
     now += 9_999;
