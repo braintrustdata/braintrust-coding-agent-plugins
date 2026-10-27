@@ -2,7 +2,7 @@
 //! this module owns span construction, correlation, and recovery.
 
 use super::git::GitMetadataCache;
-use super::recent::RecentSet;
+use super::recent::{RecentMap, RecentSet};
 use super::tool::{error_text, with_tool_approval, ToolApproval};
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -264,7 +264,17 @@ struct ToolPartState {
     #[serde(default)]
     output: Option<Value>,
     #[serde(default)]
+    attachments: Vec<ToolAttachment>,
+    #[serde(default)]
     error: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ToolAttachment {
+    #[serde(default)]
+    mime: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -351,6 +361,7 @@ struct NativeSession {
     tool_names: HashMap<String, String>,
     tool_args: HashMap<String, Value>,
     tool_outputs: HashMap<String, Value>,
+    closed_tool_spans: RecentMap<String, ClosedToolSpan>,
     tool_errors: HashMap<String, String>,
     tool_message_ids: HashMap<String, String>,
     denied_tools: HashSet<String>,
@@ -359,6 +370,12 @@ struct NativeSession {
     user_message_ids: HashSet<String>,
     user_parts: HashMap<String, Vec<(String, String)>>,
     history_tool_results: HashMap<String, HashMap<String, Value>>,
+}
+
+struct ClosedToolSpan {
+    span_id: String,
+    root_span_id: String,
+    parent_span_id: String,
 }
 
 impl NativeSession {
@@ -784,6 +801,7 @@ impl OpenCodeTranslator {
         let Some(state) = self.sessions.get_mut(&part.session_id) else {
             return Vec::new();
         };
+        let mut ops = Vec::new();
         let message_id = part.message_id.as_deref().unwrap_or("");
         match part.kind.as_deref() {
             Some("text") if part.text.is_some() => {
@@ -843,8 +861,25 @@ impl OpenCodeTranslator {
                     .and_then(|state| state.status.as_deref())
                 {
                     Some("completed") => {
-                        if let Some(v) = tool_state.and_then(|state| state.output) {
-                            state.tool_outputs.insert(call_id.into(), v.clone());
+                        if let Some(v) = tool_state.map(|state| {
+                            tool_result_content(
+                                state.output.unwrap_or(Value::Null),
+                                state.attachments,
+                            )
+                        }) {
+                            if let Some(closed) = state.closed_tool_spans.get(call_id) {
+                                if contains_image_attachment(&v) {
+                                    ops.push(SpanOp::Merge(SpanRow {
+                                        span_id: closed.span_id.clone(),
+                                        root_span_id: closed.root_span_id.clone(),
+                                        parent_span_ids: vec![closed.parent_span_id.clone()],
+                                        output: Some(v.clone()),
+                                        ..Default::default()
+                                    }));
+                                }
+                            } else {
+                                state.tool_outputs.insert(call_id.into(), v.clone());
+                            }
                             state
                                 .history_tool_results
                                 .entry(message_id.into())
@@ -872,7 +907,7 @@ impl OpenCodeTranslator {
             }
             _ => {}
         }
-        Vec::new()
+        ops
     }
 
     fn message_updated(&mut self, info: MessageInfo, ts_ms: i64) -> Vec<SpanOp> {
@@ -1080,8 +1115,19 @@ impl OpenCodeTranslator {
         }
         let had_start = s.tool_starts.contains_key(&call);
         let parent_span_id = s.tool_parent_span_ids.remove(&call).unwrap_or(turn);
+        let span_id = ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}"));
+        if had_start {
+            s.closed_tool_spans.insert(
+                call.clone(),
+                ClosedToolSpan {
+                    span_id: span_id.clone(),
+                    root_span_id: s.effective_root_span_id.clone(),
+                    parent_span_id: parent_span_id.clone(),
+                },
+            );
+        }
         let row = SpanRow {
-            span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
+            span_id,
             root_span_id: s.effective_root_span_id.clone(),
             parent_span_ids: vec![parent_span_id],
             turn_span_id: (!had_start).then(|| s.turn_owner()).flatten(),
@@ -1319,6 +1365,43 @@ impl OpenCodeTranslator {
             self.sessions.insert(sid.into(), s);
         }
         ops
+    }
+}
+
+fn tool_result_content(output: Value, attachments: Vec<ToolAttachment>) -> Value {
+    let images = attachments
+        .into_iter()
+        .filter(|attachment| {
+            attachment
+                .mime
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/"))
+        })
+        .filter_map(|attachment| attachment.url)
+        .map(|url| json!({"type":"image_url","image_url":{"url":url}}))
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return output;
+    }
+    let mut content = Vec::with_capacity(images.len() + 1);
+    match output {
+        Value::String(text) if !text.is_empty() => content.push(json!({"type":"text","text":text})),
+        Value::Array(parts) => content.extend(parts),
+        Value::Null => {}
+        other => content.push(json!({"type":"text","text":other})),
+    }
+    content.extend(images);
+    Value::Array(content)
+}
+
+fn contains_image_attachment(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(contains_image_attachment),
+        Value::Object(fields) => {
+            fields.get("type").and_then(Value::as_str) == Some("image_url")
+                || fields.values().any(contains_image_attachment)
+        }
+        _ => false,
     }
 }
 
