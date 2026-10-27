@@ -74,9 +74,14 @@ package name when needed.
 Settings load in this order, with later values taking precedence:
 
 1. Defaults
-2. `~/.pi/agent/braintrust.json`
-3. `.pi/braintrust.json` in the project (or Pi's configured project config directory)
-4. `bt trace run` settings for that invocation
+2. `~/.pi/agent/braintrust.json`, the file `bt trace enable pi` writes
+3. `braintrust.json` in the running host's agent directory, when it differs from `~/.pi/agent`
+4. `.pi/braintrust.json` in the project (or the running host's configured config directory)
+5. `bt trace run` settings for that invocation
+
+A host package's `piConfig.configDir` replaces `.pi` in steps 3 and 4. A host that
+sets `PI_CODING_AGENT_DIR` (for example, for named profiles) uses that directory in
+step 3.
 
 Example:
 

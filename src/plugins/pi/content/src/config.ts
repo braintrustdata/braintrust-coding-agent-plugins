@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { type DaemonSessionRoute, resolveDaemonTraceSettings } from "./runtime/daemon-client.ts";
 import { runningPiPackage } from "./pi-package.ts";
 
@@ -17,7 +17,7 @@ export interface PiConfig {
 
 type ConfigRecord = Record<string, unknown>;
 
-const PROJECT_CONFIG_DIR_NAME = runningPiPackage().configDir;
+const CONFIG_DIR_NAME = runningPiPackage().configDir;
 
 function record(value: unknown): ConfigRecord | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -101,8 +101,15 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
     },
   };
 
-  applyConfig(config, readConfig(join(homedir(), ".pi", "agent", "braintrust.json")));
-  applyConfig(config, readConfig(join(cwd, PROJECT_CONFIG_DIR_NAME, "braintrust.json")));
+  // `bt trace enable pi` writes Pi's global file, so it stays the base layer. A host
+  // with its own agent directory layers its settings on top.
+  const piAgentDir = join(homedir(), ".pi", "agent");
+  const hostAgentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), CONFIG_DIR_NAME, "agent");
+  applyConfig(config, readConfig(join(piAgentDir, "braintrust.json")));
+  if (resolve(hostAgentDir) !== resolve(piAgentDir)) {
+    applyConfig(config, readConfig(join(hostAgentDir, "braintrust.json")));
+  }
+  applyConfig(config, readConfig(join(cwd, CONFIG_DIR_NAME, "braintrust.json")));
 
   config.showUi = boolean(process.env.BRAINTRUST_SHOW_UI) ?? config.showUi;
   config.showTraceLink = boolean(process.env.BRAINTRUST_SHOW_TRACE_LINK) ?? config.showTraceLink;

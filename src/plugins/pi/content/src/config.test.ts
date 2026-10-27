@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "./config.ts";
 
 const ENVIRONMENT_KEYS = [
@@ -13,6 +13,7 @@ const ENVIRONMENT_KEYS = [
   "BRAINTRUST_SHOW_TRACE_LINK",
   "TRACE_TO_BRAINTRUST",
   "BT_TRACE_INVOCATION_SETTINGS",
+  "PI_CODING_AGENT_DIR",
 ] as const;
 
 const originalEnvironment = new Map<string, string | undefined>();
@@ -103,6 +104,59 @@ describe("loadConfig", () => {
         additional_metadata: { source: "global" },
       },
     });
+  });
+
+  it("honors the host's explicit agent directory without changing project precedence", () => {
+    process.env.PI_CODING_AGENT_DIR = join(home, ".omp", "profiles", "work", "agent");
+    writeJson(join(process.env.PI_CODING_AGENT_DIR, "braintrust.json"), {
+      trace_to_braintrust: true,
+      profile: "host-profile",
+      project: "profile-project",
+    });
+    expect(loadConfig(cwd)).toMatchObject({
+      enabled: true,
+      profile: "host-profile",
+      projectName: "profile-project",
+    });
+    writeJson(join(cwd, ".pi", "braintrust.json"), { project: "project-override" });
+    expect(loadConfig(cwd)).toMatchObject({
+      profile: "host-profile",
+      projectName: "project-override",
+    });
+  });
+
+  it("uses the running host's config directory for global and project settings", async () => {
+    vi.doMock("./pi-package.ts", () => ({
+      runningPiPackage: () => ({ configDir: ".omp", version: "18.12.6" }),
+    }));
+    vi.resetModules();
+    try {
+      // Reload the module boundary so its cached config directory sees this host.
+      const { loadConfig: loadHostConfig } = await import("./config.ts");
+      // `bt trace enable pi` writes Pi's global file; hosts still honor it.
+      writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+        trace_to_braintrust: true,
+        project: "bt-written",
+      });
+      expect(loadHostConfig(cwd)).toMatchObject({ enabled: true, projectName: "bt-written" });
+      writeJson(join(home, ".omp", "agent", "braintrust.json"), {
+        profile: "host-profile",
+        project: "host-project",
+      });
+      expect(loadHostConfig(cwd)).toMatchObject({
+        enabled: true,
+        profile: "host-profile",
+        projectName: "host-project",
+      });
+      writeJson(join(cwd, ".omp", "braintrust.json"), { project: "project-override" });
+      expect(loadHostConfig(cwd)).toMatchObject({
+        profile: "host-profile",
+        projectName: "project-override",
+      });
+    } finally {
+      vi.doUnmock("./pi-package.ts");
+      vi.resetModules();
+    }
   });
 
   it("prefers a canonical route over stale top-level routing", () => {
