@@ -4,14 +4,16 @@ allowBuilds:
   koffi: true
   protobufjs: true
 overrides:
-  "@vitest/mocker": 4.1.11
+  "@vitest/mocker": 5.0.5
   esbuild: 0.28.2
   postcss: 8.5.23
   source-map-js: 1.2.2
   tinypool: 2.1.2
   undici: 8.12.2
-  vite: 8.0.16
-  vitest: 4.1.11
+  vite: npm:@voidzero-dev/vite-plus-core@1.4.0
+  vitest: 5.0.5
+  nanoid: ^3.3.18
+  zod: ^4.6.6
 minimumReleaseAgeExclude:
   - "@earendil-works/chord@1.0.0"
   - "@earendil-works/pi-agent-core@1.0.0"
