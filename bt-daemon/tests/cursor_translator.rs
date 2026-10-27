@@ -1069,7 +1069,7 @@ fn synthetic_usage_without_verified_prompt_generation_stays_unavailable() {
 }
 
 #[test]
-fn synthetic_subagents_parent_to_spawning_tool_and_unmatched_stop_stays_incomplete() {
+fn synthetic_subagents_stay_on_the_spawning_turn() {
     let mut h = Harness::new("test-session");
     h.handle(&event(
         "beforeSubmitPrompt",
@@ -1092,69 +1092,23 @@ fn synthetic_subagents_parent_to_spawning_tool_and_unmatched_stop_stays_incomple
         json!({"subagent_id":"child-b","tool_call_id":"spawn","subagent_type":"explore","subagent_model":"auto","task":"explore"}),
     ));
     h.handle(&event(
+        "subagentStart",
+        135,
+        json!({"subagent_id":"child-c","tool_call_id":"spawn","subagent_type":"explore","subagent_model":"auto","task":"summarize"}),
+    ));
+    h.handle(&event(
         "subagentStop",
         140,
         json!({"subagent_id":"child-a","subagent_type":"explore","status":"completed","summary":"found the issue"}),
     ));
     h.handle(&event(
-        "sessionEnd",
-        160,
-        json!({"reason":"completed","final_status":"completed"}),
-    ));
-    h.finish();
-    let children: Vec<_> = h
-        .inserted(SpanType::Task)
-        .into_iter()
-        .filter(|r| r.name == "Cursor subagent")
-        .collect();
-    assert_eq!(children.len(), 2);
-    let rows = h.rows();
-    let spawn_tool_id = h
-        .inserted(SpanType::Tool)
-        .into_iter()
-        .find(|row| row.name == "Task")
-        .unwrap()
-        .span_id
-        .clone();
-    for child in children {
-        assert_eq!(child.parent_span_ids, vec![spawn_tool_id.clone()]);
-        assert_eq!(child.turn_span_id, Some(h.turns()[0].span_id.clone()));
-        assert_eq!(
-            child.metadata.as_ref().unwrap()["spawning_tool_call_id"],
-            "spawn"
-        );
-        assert_eq!(
-            child.metadata.as_ref().unwrap()["recursive_activity_verified"],
-            false
-        );
-        let row = &rows[&child.span_id];
-        if child.start_ms == Some(120) {
-            assert_eq!(row["end_ms"], 140);
-            assert_eq!(child.input, Some(json!("inspect the code")));
-            assert_eq!(row["output"], "found the issue");
-            assert_eq!(row["metadata"]["status"], "completed");
-        } else {
-            assert!(row.get("output").is_none());
-            assert_eq!(row["metadata"]["status"], "incomplete");
-        }
-    }
-    assert_eq!(
-        rows[&h.inserted(SpanType::Tool)[0].span_id]["metadata"]["status"],
-        "incomplete"
-    );
-}
-
-#[test]
-fn terminal_only_subagent_stop_synthesizes_estimated_span() {
-    let mut h = Harness::new("test-session");
-    h.handle(&event(
-        "beforeSubmitPrompt",
-        100,
-        json!({"generation_id":"t","prompt":"delegate"}),
+        "subagentStop",
+        145,
+        json!({"task":"summarize","subagent_type":"explore","status":"completed","summary":"summary done"}),
     ));
     h.handle(&event(
         "subagentStop",
-        140,
+        150,
         json!({
             "subagent_id":"child-terminal-only",
             "status":"completed",
@@ -1162,24 +1116,62 @@ fn terminal_only_subagent_stop_synthesizes_estimated_span() {
             "subagent_type":"explore"
         }),
     ));
+    h.handle(&event(
+        "sessionEnd",
+        160,
+        json!({"reason":"completed","final_status":"completed"}),
+    ));
     h.finish();
-
-    let child = h
+    let turns = h.turns();
+    let turn_id = turns[0].span_id.clone();
+    let root_id = turns[0].root_span_id.clone();
+    let rows = h.rows();
+    let children: Vec<_> = h
         .inserted(SpanType::Task)
         .into_iter()
-        .find(|row| row.name == "Cursor subagent")
-        .unwrap();
-    assert_eq!(child.start_ms, Some(140));
-    assert_eq!(child.end_ms, Some(140));
-    assert_eq!(child.output, Some(json!("finished work")));
-    let metadata = child.metadata.as_ref().unwrap();
-    assert_eq!(metadata["start_time_estimated"], true);
-    assert_eq!(metadata["result_completeness"], "terminal_observation_only");
-    assert_eq!(metadata["status"], "completed");
-    assert_eq!(metadata["subagent_type"], "explore");
-    // subagentStop does not report the subagent's model.
-    assert!(metadata.get("model").is_none());
-    assert_eq!(child.parent_span_ids, vec![h.turns()[0].span_id.clone()]);
+        .filter(|r| r.name == "Cursor subagent")
+        .collect();
+    assert_eq!(children.len(), 4);
+    for child in children {
+        assert_eq!(child.root_span_id, root_id);
+        assert_eq!(child.parent_span_ids, vec![turn_id.clone()]);
+        assert_eq!(child.metadata.as_ref().unwrap()["turn_span_id"], turn_id);
+        let row = &rows[&child.span_id];
+        match row["metadata"]["subagent_id"].as_str() {
+            Some("child-a") => {
+                assert_eq!(row["end_ms"], 140);
+                assert_eq!(
+                    child.input,
+                    Some(json!([{ "role": "user", "content": "inspect the code" }]))
+                );
+                assert_eq!(row["output"], "found the issue");
+                assert_eq!(row["metadata"]["status"], "completed");
+                assert_eq!(row["metadata"]["spawning_tool_call_id"], "spawn");
+                assert_eq!(row["metadata"]["recursive_activity_verified"], false);
+            }
+            Some("child-b") => {
+                assert!(row.get("output").is_none());
+                assert_eq!(row["metadata"]["status"], "incomplete");
+            }
+            Some("child-c") => {
+                assert_eq!(row["output"], "summary done");
+                assert_eq!(row["metadata"]["status"], "completed");
+                assert!(row["metadata"].get("result_completeness").is_none());
+            }
+            Some("child-terminal-only") => {
+                assert_eq!(child.end_ms, Some(150));
+                assert_eq!(row["output"], "finished work");
+                assert_eq!(row["metadata"]["status"], "completed");
+                assert_eq!(row["metadata"]["start_time_estimated"], true);
+                assert_eq!(
+                    row["metadata"]["result_completeness"],
+                    "terminal_observation_only"
+                );
+                assert!(row["metadata"].get("model").is_none());
+            }
+            other => panic!("unexpected subagent {other:?}"),
+        }
+    }
 }
 #[test]
 fn synthetic_compaction_is_observation_only_and_clears_unavailable_context() {
