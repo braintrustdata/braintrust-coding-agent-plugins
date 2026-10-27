@@ -154,6 +154,17 @@ impl TranscriptLayout {
     }
 
     fn single(&self, session_id: &str, paths: Vec<PathBuf>) -> anyhow::Result<PathBuf> {
+        if paths.len() == 2 {
+            if let Some(plain) = paths
+                .iter()
+                .find(|path| path.to_string_lossy().ends_with(".jsonl"))
+            {
+                let compressed = plain.with_extension("jsonl.zst");
+                if paths.contains(&compressed) {
+                    return Ok(plain.clone());
+                }
+            }
+        }
         match <[PathBuf; 1]>::try_from(paths) {
             Ok([path]) => Ok(path),
             Err(paths) => bail!(
@@ -191,7 +202,9 @@ fn find_jsonl_files(directory: &Path, matches: &mut Vec<PathBuf>) {
         let path = entry.path();
         if file_type.is_dir() {
             find_jsonl_files(&path, matches);
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+        } else if path.to_string_lossy().ends_with(".jsonl")
+            || path.to_string_lossy().ends_with(".jsonl.zst")
+        {
             matches.push(path);
         }
     }
@@ -244,6 +257,35 @@ impl IncrementalRecords {
         finalize: bool,
         allow_incomplete_final_record: bool,
     ) -> anyhow::Result<Refresh> {
+        if path.to_string_lossy().ends_with(".jsonl.zst") {
+            if !finalize {
+                anyhow::bail!(
+                    "compressed transcript {} cannot be attached or tailed",
+                    path.display()
+                );
+            }
+            let before = std::fs::metadata(path)
+                .with_context(|| format!("read transcript metadata {}", path.display()))?;
+            let values = read_jsonl_records(path)?;
+            let after = std::fs::metadata(path)
+                .with_context(|| format!("read transcript metadata {}", path.display()))?;
+            if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+                anyhow::bail!(
+                    "compressed transcript {} changed while it was being read; retry import",
+                    path.display()
+                );
+            }
+            self.values = values;
+            self.read_offset = after.len();
+            self.modified = after.modified().ok();
+            self.line_count = self.values.len();
+            self.end_offsets.clear();
+            self.anchor = read_anchor(path, self.read_offset, 64)?;
+            if self.values.is_empty() {
+                anyhow::bail!("transcript {} is empty", path.display());
+            }
+            return Ok(Refresh::Appended);
+        }
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("read transcript metadata {}", path.display()))?;
         let len = metadata.len();
@@ -353,6 +395,7 @@ fn read_anchor(path: &Path, through: u64, max_len: usize) -> anyhow::Result<Vec<
 /// turn/session; ordinary polls keep the newest turn open.
 pub(crate) struct TranscriptTail {
     path: PathBuf,
+    source: ImportSource,
     importer: &'static dyn TranscriptImport,
     session: Box<dyn TailSession>,
     records: IncrementalRecords,
@@ -366,6 +409,7 @@ impl TranscriptTail {
         let importer = importer(source);
         Self {
             path,
+            source,
             importer,
             session: importer.tail(),
             records: IncrementalRecords::default(),
@@ -380,6 +424,17 @@ impl TranscriptTail {
     }
 
     pub(crate) fn poll(&mut self, finalize: bool) -> anyhow::Result<Vec<Envelope>> {
+        if self.source == ImportSource::Codex {
+            if !self.path.exists() && self.path.to_string_lossy().ends_with(".jsonl") {
+                let compressed = self.path.with_extension("jsonl.zst");
+                if compressed.exists() {
+                    self.path = compressed;
+                }
+            }
+            if self.path.to_string_lossy().ends_with(".jsonl.zst") && !finalize {
+                bail!("compressed Codex rollout {} supports historical import only; live attach requires an uncompressed .jsonl rollout", self.path.display());
+            }
+        }
         let keeps_translator = self.session.keeps_translator_on_rewrite();
         let previous_records = if keeps_translator {
             self.records.values.clone()
@@ -392,6 +447,25 @@ impl TranscriptTail {
             self.session.tolerates_incomplete_final_record() && self.allow_incomplete_final_record,
         ) {
             Ok(refresh) => refresh,
+            Err(_)
+                if self.source == ImportSource::Codex
+                    && self.path.to_string_lossy().ends_with(".jsonl")
+                    && !self.path.exists() =>
+            {
+                let compressed = self.path.with_extension("jsonl.zst");
+                if !compressed.exists() {
+                    if !finalize {
+                        return Ok(Vec::new());
+                    }
+                    bail!("Codex rollout {} disappeared during import and no compressed replacement was found", self.path.display());
+                }
+                self.path = compressed;
+                if !finalize {
+                    bail!("compressed Codex rollout {} supports historical import only; live attach requires an uncompressed .jsonl rollout", self.path.display());
+                }
+                self.records
+                    .refresh_with_final_partial(&self.path, true, false)?
+            }
             Err(_) if !finalize => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
@@ -428,8 +502,30 @@ impl TranscriptTail {
 }
 
 fn read_jsonl_records(path: &Path) -> anyhow::Result<Vec<Value>> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("read transcript {}", path.display()))?;
+    let read_path = if !path.exists() && path.to_string_lossy().ends_with(".jsonl") {
+        let compressed = path.with_extension("jsonl.zst");
+        if compressed.exists() {
+            compressed
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let contents = if read_path.to_string_lossy().ends_with(".jsonl.zst") {
+        let file = std::fs::File::open(&read_path)
+            .with_context(|| format!("read transcript {}", read_path.display()))?;
+        let mut decoder = zstd::stream::read::Decoder::new(file)
+            .with_context(|| format!("decode compressed transcript {}", read_path.display()))?;
+        let mut contents = String::new();
+        decoder
+            .read_to_string(&mut contents)
+            .with_context(|| format!("decode compressed transcript {}", read_path.display()))?;
+        contents
+    } else {
+        std::fs::read_to_string(&read_path)
+            .with_context(|| format!("read transcript {}", read_path.display()))?
+    };
     contents
         .lines()
         .enumerate()
@@ -533,6 +629,67 @@ mod tests {
             codex::layout(vec![root]).find("session-123").unwrap(),
             transcript
         );
+    }
+
+    #[test]
+    fn discovers_and_imports_compressed_codex_rollout() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let transcript = root.join("2026/10/27/rollout-session-zstd.jsonl.zst");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let contents = format!(
+            "{}\n{}\n",
+            json!({"timestamp":"2026-10-27T00:00:01Z","type":"session_meta","payload":{"id":"session-zstd"}}),
+            json!({"timestamp":"2026-10-27T00:00:02Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
+        );
+        std::fs::write(
+            &transcript,
+            zstd::stream::encode_all(contents.as_bytes(), 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex::layout(vec![root]).discover().unwrap(),
+            vec![transcript.clone()]
+        );
+        let events = transcript_envelopes(&transcript, ImportSource::Codex).unwrap();
+        assert_eq!(events.first().unwrap().event, "SessionStart");
+        assert_eq!(events.last().unwrap().event, "Stop");
+    }
+
+    #[test]
+    fn compressed_codex_rollout_explicitly_rejects_live_attach() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout-session-zstd.jsonl.zst");
+        std::fs::write(&path, zstd::stream::encode_all(&b"{}\n"[..], 0).unwrap()).unwrap();
+
+        let error = TranscriptTail::new(path, ImportSource::Codex)
+            .poll(false)
+            .unwrap_err();
+        assert!(error.to_string().contains("historical import only"));
+    }
+
+    #[test]
+    fn codex_import_follows_jsonl_to_zstd_replacement_during_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = temp.path().join("rollout-session-zstd.jsonl");
+        let compressed = plain.with_extension("jsonl.zst");
+        let contents = format!(
+            "{}\n{}\n",
+            json!({"timestamp":"2026-10-27T00:00:01Z","type":"session_meta","payload":{"id":"session-zstd"}}),
+            json!({"timestamp":"2026-10-27T00:00:02Z","type":"event_msg","payload":{"type":"task_complete"}}),
+        );
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(contents.as_bytes(), 0).unwrap(),
+        )
+        .unwrap();
+
+        let events = TranscriptTail::new(plain, ImportSource::Codex)
+            .poll(true)
+            .unwrap();
+        assert_eq!(events.first().unwrap().event, "SessionStart");
+        assert_eq!(events.last().unwrap().event, "Stop");
     }
 
     #[test]
@@ -1124,7 +1281,7 @@ mod tests {
     fn codex_import_discovers_spawned_rollout_and_emits_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("rollout-parent.jsonl");
-        let child = temp.path().join("rollout-child-a.jsonl");
+        let child = temp.path().join("rollout-child-a.jsonl.zst");
         let records = vec![
             json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"parent"}}),
             json!({"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-a","name":"spawn_agent","arguments":"{\"agent_type\":\"reviewer\"}"}}),
@@ -1139,16 +1296,17 @@ mod tests {
                 .join("\n"),
         )
         .unwrap();
-        std::fs::write(
-            &child,
-            [
+        let child_contents = [
                 json!({"timestamp":"2026-01-01T00:00:02Z","type":"session_meta","payload":{"id":"child-a","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}}}),
                 json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"reviewed"}}),
             ]
             .iter()
             .map(Value::to_string)
             .collect::<Vec<_>>()
-            .join("\n"),
+                .join("\n");
+        std::fs::write(
+            &child,
+            zstd::stream::encode_all(child_contents.as_bytes(), 0).unwrap(),
         )
         .unwrap();
 

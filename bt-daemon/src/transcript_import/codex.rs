@@ -92,7 +92,14 @@ impl TailSession for Tail {
 
 fn transcript_session_id(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
-    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+    let reader: Box<dyn BufRead> = if path.to_string_lossy().ends_with(".jsonl.zst") {
+        Box::new(std::io::BufReader::new(
+            zstd::stream::read::Decoder::new(file).ok()?,
+        ))
+    } else {
+        Box::new(std::io::BufReader::new(file))
+    };
+    for line in reader.lines().map_while(Result::ok) {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -134,7 +141,10 @@ fn roots(home: &Path) -> Vec<PathBuf> {
 fn filename_matches(path: &Path, session_id: &str) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))
+        .is_some_and(|name| {
+            name.ends_with(&format!("{session_id}.jsonl"))
+                || name.ends_with(&format!("{session_id}.jsonl.zst"))
+        })
 }
 
 pub(super) fn envelopes(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Envelope>> {
