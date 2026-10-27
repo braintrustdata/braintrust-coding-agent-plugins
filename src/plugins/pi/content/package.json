@@ -47,8 +47,8 @@
     "@earendil-works/pi-coding-agent": "^1.0.0",
     "@types/node": "^26.6.4",
     "typescript": "^6.0.3",
-    "vite-plus": "^0.2.9",
-    "vitest": "4.1.11"
+    "vite-plus": "^1.4.0",
+    "vitest": "5.0.5"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

@@ -1,4 +1,4 @@
 node 24.22.1
 pnpm 11.21.0
 rust 1.99.1
-npm:vite-plus 0.2.9
+npm:vite-plus 1.4.0

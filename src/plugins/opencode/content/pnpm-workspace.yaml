@@ -2,6 +2,9 @@ allowBuilds:
   esbuild: true
   msgpackr-extract: false
 overrides:
-  "@vitest/mocker": 4.1.11
+  "@vitest/mocker": 5.0.5
   tinypool: 2.1.2
-  vitest: 4.1.11
+  vitest: 5.0.5
+  vite: npm:@voidzero-dev/vite-plus-core@1.4.0
+  toml: ^5.0.1
+  zod: ^4.6.6
