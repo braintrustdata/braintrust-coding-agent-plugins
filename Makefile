@@ -60,3 +60,11 @@ $(PUBLISH_RULES): publish-%:
 
 clean:
 	@rm -rf "$(DIST)"
+
+# MCP-only package for manual OpenAI submission. Never publish automatically.
+.PHONY: codex-submission test-codex-packaging
+codex-submission: validate-codex
+	python3 src/plugins/codex/package.py zip "$(DIST)/codex" "$(DIST)/submissions"
+
+test-codex-packaging:
+	python3 -m unittest discover -s src/plugins/codex/tests -p 'test_*.py' -v

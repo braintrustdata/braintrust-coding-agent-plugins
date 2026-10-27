@@ -5,6 +5,10 @@ This monorepo contains the plugins and the shared Rust tracing daemon embedded
 in the Braintrust CLI (`bt`). Plugins forward native events locally; the daemon
 builds traces, journals events for recovery, and delivers spans to Braintrust.
 
+The Codex marketplace also includes an independent [Braintrust MCP
+package](src/plugins/codex/content/plugins/braintrust/README.md) for hosted tools
+with OAuth. It requires no `bt` installation and does not enable session tracing.
+
 ## Get started
 
 Install your coding agent and the
@@ -82,6 +86,8 @@ JavaScript packages, and stable Rust for the daemon. Run from the monorepo root:
 ```bash
 make build                 # Build all plugins into dist/<agent>
 make build-codex            # Build one plugin
+make codex-submission      # Validate and build the MCP-only OpenAI ZIP
+make test-codex-packaging  # Test Codex packaging and release contracts
 make test                  # Build and validate plugin packages and forwarders
 cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked
 ```

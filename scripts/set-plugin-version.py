@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Set a release version on every distributed version surface for an agent.
 
-Versioning is per-plugin: every plugin under an agent carries its own
-.<agent>-plugin/plugin.json with a `version` field. The marketplace manifest is
-NOT touched.
+Versioning is per distribution: portable root manifests and compatibility
+manifests share one version. Marketplace manifests are NOT touched.
 
 Only version values are rewritten, so surrounding files keep their formatting.
 
@@ -14,12 +13,15 @@ import os
 import re
 import sys
 
-# agent -> glob of its per-plugin manifests (relative to repo root)
+# agent -> globs of its per-plugin manifests (relative to repo root)
 MANIFEST_GLOBS = {
-    "claude": "src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json",
-    "codex": "src/plugins/codex/content/plugins/*/.codex-plugin/plugin.json",
-    "grok": "src/plugins/grok/content/.grok-plugin/plugin.json",
-    "cursor": "src/plugins/cursor/content/.cursor-plugin/plugin.json",
+    "claude": ["src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json"],
+    "codex": [
+        "src/plugins/codex/content/plugins/*/.codex-plugin/plugin.json",
+        "src/plugins/codex/content/plugins/*/plugin.json",
+    ],
+    "grok": ["src/plugins/grok/content/.grok-plugin/plugin.json"],
+    "cursor": ["src/plugins/cursor/content/.cursor-plugin/plugin.json"],
 }
 
 VERSION_RE = re.compile(r'("version"\s*:\s*")[^"]*(")')
@@ -27,13 +29,18 @@ def main() -> None:
     if len(sys.argv) != 3:
         sys.exit("usage: set-plugin-version.py <agent> <version>")
     agent, version = sys.argv[1], sys.argv[2].lstrip("v")
-    pattern = MANIFEST_GLOBS.get(agent)
-    if not pattern:
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        sys.exit("version must be MAJOR.MINOR.PATCH")
+    patterns = MANIFEST_GLOBS.get(agent)
+    if not patterns:
         sys.exit(f"unknown agent '{agent}' (known: {', '.join(MANIFEST_GLOBS)})")
 
-    manifests = sorted(glob.glob(pattern))
-    if not manifests:
-        sys.exit(f"no plugin manifests found for '{agent}' ({pattern})")
+    manifests = []
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            sys.exit(f"no plugin manifests found for '{agent}' ({pattern})")
+        manifests.extend(matches)
 
     surfaces = [(path, VERSION_RE, "version") for path in manifests]
     if agent == "cursor":

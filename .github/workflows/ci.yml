@@ -43,6 +43,14 @@ jobs:
           fi
       - name: Build and validate plugins
         run: make test
+      - name: Test Codex packaging and release contracts
+        run: make test-codex-packaging codex-submission
+      - name: Save MCP submission ZIP
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: braintrust-mcp-submission
+          path: dist/submissions/braintrust-*.zip*
+          if-no-files-found: error
       - name: Package Cursor extension
         working-directory: dist/cursor
         run: |
