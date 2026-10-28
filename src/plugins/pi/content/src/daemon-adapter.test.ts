@@ -128,11 +128,16 @@ describe("Pi daemon adapter", () => {
   });
 
   it("forwards the running host name and version instead of an installed peer", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_234);
     const handlers = await loadExtension();
-    await handlers.get("session_start")?.({ reason: "new" }, fakeContext());
+    const ctx = fakeContext();
+    await handlers.get("session_start")?.({ reason: "new" }, ctx);
+    now.mockReturnValue(5_678);
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
     expect(mockState.logs[0]).toMatchObject({
       source: "pi",
       source_version: "18.12.6",
+      ts_ms: 1_234,
       payload: { host_name: "@oh-my-pi/pi-coding-agent" },
     });
   });
@@ -145,17 +150,10 @@ describe("Pi daemon adapter", () => {
     mockState.statusGate = new Promise<void>((resolve) => {
       releaseStatus = resolve;
     });
-    let started = false;
-    const startup = handlers
-      .get("session_start")?.({ reason: "new" }, ctx)
-      .then(() => {
-        started = true;
-      });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(started).toBe(true);
+    expect(handlers.get("session_start")?.({ reason: "new" }, ctx)).toBeUndefined();
+    await vi.waitFor(() => expect(mockState.statusCalls).toBe(1));
     releaseStatus();
-    await startup;
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
   });
 
   it("does not restore UI from a pending status refresh after shutdown", async () => {
@@ -235,19 +233,10 @@ describe("Pi daemon adapter", () => {
     mockState.logGate = new Promise<void>((resolve) => {
       acknowledge = resolve;
     });
-    let turnEnded = false;
-    const turnEnd = handlers
-      .get("agent_end")?.({ messages: [] }, ctx)
-      .then(() => {
-        turnEnded = true;
-      });
-    await Promise.resolve();
-    expect(turnEnded).toBe(false);
+    expect(handlers.get("agent_end")?.({ messages: [] }, ctx)).toBeUndefined();
     acknowledge();
-    await turnEnd;
     mockState.logGate = undefined;
     await handlers.get("input")?.({ text: "next turn" });
-    expect(mockState.logs.at(-1)?.event).toBe("input");
     await handlers.get("context")?.({ messages: [{ role: "user", content: "next" }] }, ctx);
     await handlers.get("message_update")?.({
       type: "message_update",
@@ -387,6 +376,7 @@ describe("Pi daemon adapter", () => {
     now += 1;
     await update();
 
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, fakeContext());
     expect(mockState.logs.filter((log) => log.event === "message_update")).toHaveLength(2);
   });
 
@@ -403,6 +393,7 @@ describe("Pi daemon adapter", () => {
     await handlers.get("session_start")?.({ reason: "resume" }, ctx);
     await handlers.get("context")?.({}, ctx);
     await handlers.get("tool_execution_end")?.({}, ctx);
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 
     expect(mockState.logs[0]?.payload).toMatchObject({
       legacy_resume: mockState.legacyContinuation,

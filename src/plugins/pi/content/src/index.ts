@@ -100,6 +100,10 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     pluginVersion: EXTENSION_VERSION,
     requestTimeoutMs: UI_STATUS_TIMEOUT_MS,
   });
+  // Pi applies a 30 second deadline to extension handlers. Daemon capture is
+  // durable but can wait behind disk or session work, so serialize forwarding
+  // in the extension and let ordinary Pi callbacks return immediately.
+  let forwarding = Promise.resolve();
 
   const updateSession = async (
     ctx: ExtensionContext,
@@ -165,6 +169,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     event: unknown,
     ctx?: ExtensionContext,
     updateUi = false,
+    timestamp = Date.now(),
   ): Promise<void> => {
     const descriptor = ctx ? await updateSession(ctx) : undefined;
     if (!sessionId) return;
@@ -173,7 +178,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
       ...(PI_VERSION ? { source_version: PI_VERSION } : {}),
       session_id: sessionId,
       event: name,
-      ts_ms: Date.now(),
+      ts_ms: timestamp,
       payload: {
         event: nativePayload(event),
         extension_version: EXTENSION_VERSION,
@@ -189,20 +194,42 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     if (updateUi && ctx) void refreshUi(ctx);
   };
 
-  pi.on("session_start", async (event, ctx) => {
-    await forward("session_start", event, ctx);
-    void refreshUi(ctx);
+  const enqueueForward = (
+    name: string,
+    event: unknown,
+    ctx?: ExtensionContext,
+    updateUi = false,
+  ): Promise<void> => {
+    const timestamp = Date.now();
+    forwarding = forwarding
+      .then(() => forward(name, event, ctx, updateUi, timestamp))
+      .catch((error) => {
+        if (lastContext?.hasUI && config.showUi) {
+          lastContext.ui.setStatus(STATUS_KEY, `Braintrust tracing unavailable: ${String(error)}`);
+        }
+      });
+    return forwarding;
+  };
+
+  pi.on("session_start", (event, ctx) => {
+    void enqueueForward("session_start", event, ctx).then(() => refreshUi(ctx));
   });
-  pi.on("input", async (event) => forward("input", event));
-  pi.on("before_agent_start", async (event, ctx) => forward("before_agent_start", event, ctx));
-  pi.on("context", async (event, ctx) => {
+  pi.on("input", (event) => void enqueueForward("input", event));
+  pi.on("before_agent_start", (event, ctx) => {
+    void enqueueForward("before_agent_start", event, ctx);
+  });
+  pi.on("context", (event, ctx) => {
     awaitingFirstToken = true;
     lastStreamingKeepaliveAt = 0;
-    await forward("context", event, ctx);
+    void enqueueForward("context", event, ctx);
   });
-  pi.on("before_provider_request", async (event) => forward("before_provider_request", event));
-  pi.on("after_provider_response", async (event) => forward("after_provider_response", event));
-  pi.on("message_update", async (event) => {
+  pi.on("before_provider_request", (event) => {
+    void enqueueForward("before_provider_request", event);
+  });
+  pi.on("after_provider_response", (event) => {
+    void enqueueForward("after_provider_response", event);
+  });
+  pi.on("message_update", (event) => {
     const kind = streamingUpdateKind(event);
     const tokenKinds = ["text_delta", "thinking_delta", "text", "thinking"];
     const isFirstToken = awaitingFirstToken && !!kind && tokenKinds.includes(kind);
@@ -211,29 +238,42 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     if (!isFirstToken && now - lastStreamingKeepaliveAt < 10_000) return;
     if (isFirstToken) awaitingFirstToken = false;
     lastStreamingKeepaliveAt = now;
-    await forward("message_update", event);
+    void enqueueForward("message_update", event);
   });
-  pi.on("thinking_level_select", async (event) => forward("thinking_level_select", event));
-  pi.on("message_end", async (event) => {
+  pi.on("thinking_level_select", (event) => {
+    void enqueueForward("thinking_level_select", event);
+  });
+  pi.on("message_end", (event) => {
     awaitingFirstToken = false;
     lastStreamingKeepaliveAt = 0;
-    await forward("message_end", event);
+    void enqueueForward("message_end", event);
   });
-  pi.on("tool_execution_start", async (event) => forward("tool_execution_start", event));
-  pi.on("tool_execution_end", async (event, ctx) => forward("tool_execution_end", event, ctx));
-  pi.on("session_before_compact", async (event, ctx) =>
-    forward("session_before_compact", event, ctx),
-  );
-  pi.on("session_compact", async (event, ctx) => forward("session_compact", event, ctx, true));
-  pi.on("session_before_tree", async (event, ctx) => forward("session_before_tree", event, ctx));
-  pi.on("session_tree", async (event, ctx) => forward("session_tree", event, ctx, true));
+  pi.on("tool_execution_start", (event) => {
+    void enqueueForward("tool_execution_start", event);
+  });
+  pi.on("tool_execution_end", (event, ctx) => {
+    void enqueueForward("tool_execution_end", event, ctx);
+  });
+  pi.on("session_before_compact", (event, ctx) => {
+    void enqueueForward("session_before_compact", event, ctx);
+  });
+  pi.on("session_compact", (event, ctx) => {
+    void enqueueForward("session_compact", event, ctx, true);
+  });
+  pi.on("session_before_tree", (event, ctx) => {
+    void enqueueForward("session_before_tree", event, ctx);
+  });
+  pi.on("session_tree", (event, ctx) => {
+    void enqueueForward("session_tree", event, ctx, true);
+  });
   // All delivery flushing belongs to the daemon, including session shutdown.
-  pi.on("agent_end", async (event, ctx) => {
-    await forward("agent_end", event);
-    pollTraceLink(ctx);
+  pi.on("agent_end", (event, ctx) => {
+    void enqueueForward("agent_end", event).then(() => pollTraceLink(ctx));
   });
   pi.on("session_shutdown", async (event, ctx) => {
-    await forward("session_shutdown", event, ctx);
+    // Shutdown is the final lifecycle boundary; drain prior events and persist
+    // this one before releasing the daemon clients.
+    await enqueueForward("session_shutdown", event, ctx);
     // Invalidate fire-and-forget refreshes before clearing the UI so a status
     // request that finishes during shutdown cannot restore stale state.
     uiGeneration += 1;
