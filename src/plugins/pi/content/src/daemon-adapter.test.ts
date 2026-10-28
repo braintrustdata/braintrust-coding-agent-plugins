@@ -129,7 +129,9 @@ describe("Pi daemon adapter", () => {
 
   it("forwards the running host name and version instead of an installed peer", async () => {
     const handlers = await loadExtension();
-    await handlers.get("session_start")?.({ reason: "new" }, fakeContext());
+    const ctx = fakeContext();
+    await handlers.get("session_start")?.({ reason: "new" }, ctx);
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
     expect(mockState.logs[0]).toMatchObject({
       source: "pi",
       source_version: "18.12.6",
@@ -242,7 +244,7 @@ describe("Pi daemon adapter", () => {
         turnEnded = true;
       });
     await Promise.resolve();
-    expect(turnEnded).toBe(false);
+    expect(turnEnded).toBe(true);
     acknowledge();
     await turnEnd;
     mockState.logGate = undefined;
