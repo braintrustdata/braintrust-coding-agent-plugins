@@ -169,6 +169,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     event: unknown,
     ctx?: ExtensionContext,
     updateUi = false,
+    timestamp = Date.now(),
   ): Promise<void> => {
     const descriptor = ctx ? await updateSession(ctx) : undefined;
     if (!sessionId) return;
@@ -177,7 +178,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
       ...(PI_VERSION ? { source_version: PI_VERSION } : {}),
       session_id: sessionId,
       event: name,
-      ts_ms: Date.now(),
+      ts_ms: timestamp,
       payload: {
         event: nativePayload(event),
         extension_version: EXTENSION_VERSION,
@@ -199,17 +200,19 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     ctx?: ExtensionContext,
     updateUi = false,
   ): Promise<void> => {
-    forwarding = forwarding.then(() => forward(name, event, ctx, updateUi)).catch((error) => {
-      if (lastContext?.hasUI && config.showUi) {
-        lastContext.ui.setStatus(STATUS_KEY, `Braintrust tracing unavailable: ${String(error)}`);
-      }
-    });
+    const timestamp = Date.now();
+    forwarding = forwarding
+      .then(() => forward(name, event, ctx, updateUi, timestamp))
+      .catch((error) => {
+        if (lastContext?.hasUI && config.showUi) {
+          lastContext.ui.setStatus(STATUS_KEY, `Braintrust tracing unavailable: ${String(error)}`);
+        }
+      });
     return forwarding;
   };
 
   pi.on("session_start", (event, ctx) => {
-    void enqueueForward("session_start", event, ctx);
-    void refreshUi(ctx);
+    void enqueueForward("session_start", event, ctx).then(() => refreshUi(ctx));
   });
   pi.on("input", (event) => void enqueueForward("input", event));
   pi.on("before_agent_start", (event, ctx) => {
