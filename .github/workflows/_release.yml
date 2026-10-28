@@ -52,6 +52,10 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      dist_owner: ${{ steps.vars.outputs.dist_owner }}
+      dist_name: ${{ steps.vars.outputs.dist_name }}
     steps:
       - name: Checkout monorepo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -165,6 +169,24 @@ jobs:
             fi
           fi
 
+      - name: Build and validate Codex submission from selected source
+        if: inputs.plugin == 'codex'
+        env:
+          RELEASE_VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          make test-codex-packaging codex-submission
+          test -f "dist/submissions/braintrust-$RELEASE_VERSION.zip"
+
+      - name: Save Codex submission ZIP
+        if: inputs.plugin == 'codex'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: braintrust-mcp-${{ inputs.source_sha }}-${{ steps.vars.outputs.version }}
+          path: dist/submissions/braintrust-${{ steps.vars.outputs.version }}.zip*
+          if-no-files-found: error
+          overwrite: true
+
       - name: Record monorepo release
         id: source-release
         if: ${{ inputs.record }}
@@ -225,6 +247,52 @@ jobs:
             --target "$target_sha" \
             --title "$DIST_TAG" \
             --generate-notes
+
+  # Separate job: if asset upload fails after release creation, Re-run failed
+  # jobs retries attachment without repeating deployment/tag preflight.
+  attach-codex-submission:
+    needs: release
+    if: inputs.plugin == 'codex' && inputs.record
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Download validated submission from release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: braintrust-mcp-${{ inputs.source_sha }}-${{ needs.release.outputs.version }}
+          path: submission
+
+      - name: Generate distribution-repo token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BRAINTRUST_BOT_APP_ID }}
+          private-key: ${{ secrets.BRAINTRUST_BOT_PRIVATE_KEY }}
+          owner: ${{ needs.release.outputs.dist_owner }}
+          repositories: ${{ needs.release.outputs.dist_name }}
+          permission-contents: write
+
+      - name: Attach MCP-only ZIP to distribution release
+        working-directory: submission
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DIST_REPO: ${{ inputs.dist_repo }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          archive = Path(f"braintrust-{sys.argv[1]}.zip")
+          expected = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+          if archive.with_suffix(".zip.sha256").read_text() != expected:
+              sys.exit("Submission ZIP checksum mismatch")
+          PY
+          gh release upload "v$VERSION" "braintrust-$VERSION.zip" "braintrust-$VERSION.zip.sha256" \
+            --repo "$DIST_REPO" --clobber
 
   # Post-deploy end-to-end smoke test (codex only): install the just-deployed
   # plugin from the marketplace on Linux + both macOS arches and assert a real

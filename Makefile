@@ -60,3 +60,16 @@ $(PUBLISH_RULES): publish-%:
 
 clean:
 	@rm -rf "$(DIST)"
+
+# MCP-only package for manual OpenAI submission. Never publish automatically.
+.PHONY: codex-submission test-codex-packaging test-codex-mcp-loading
+codex-submission: validate-codex
+	python3 src/plugins/codex/package.py zip "$(DIST)/codex" "$(DIST)/submissions"
+
+test-codex-packaging:
+	python3 -m unittest discover -s src/plugins/codex/tests -p 'test_*.py' -v
+
+# Requires Codex on PATH (or the integration harness's CODEX_BIN override).
+# Loads the installed MCP entry without OAuth, inference, or tool calls.
+test-codex-mcp-loading: validate-codex
+	node src/plugins/codex/tests/mcp-loading.mjs "$(DIST)/codex"
