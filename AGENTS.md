@@ -146,8 +146,8 @@ workflows. `mise.toml` holds local-only mise hooks.
 CI builds and validates the plugin packages on Linux. It runs the JavaScript
 daemon client and the Pi and OpenCode unit tests, and builds, tests, and lints
 the Rust daemon, on Linux, macOS, and Windows. Pushes to `main` and manual runs
-refresh the Rust build cache that pull requests restore. Concurrent runs for an
-obsolete branch revision are cancelled.
+refresh the Rust build cache that pull requests restore. Every push to `main`
+runs independently; superseded pull request runs are cancelled.
 
 ## Secrets
 
