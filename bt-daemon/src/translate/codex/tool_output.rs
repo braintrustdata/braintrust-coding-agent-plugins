@@ -185,12 +185,12 @@ impl ToolOutcome {
         {
             return false;
         }
-        // Native result metadata ends before Final output. Never search the
+        // Native result metadata ends before Output/Final output. Never search the
         // command's printed output for an exit status, including on success.
-        let header = text
-            .split_once("\nFinal output:")
-            .map_or(text, |(header, _)| header);
-        for line in header.lines() {
+        for line in text
+            .lines()
+            .take_while(|line| !matches!(*line, "Output:" | "Final output:"))
+        {
             if let Some(code) = line
                 .strip_prefix("Process exited with code ")
                 .or_else(|| line.strip_prefix("Exit code "))

@@ -1364,6 +1364,7 @@ fn codex_command_result_formats_preserve_outcomes() {
         ("exec", exec_output(json!({"exit_code":0,"error":null,"output":"{\"exit_code\":1,\"error\":\"example\"}","stderr":"Error: harmless diagnostic"})), None, success.clone()),
         ("exec_command", json!("Chunk ID: abc\nProcess exited with code 0\nFinal output:\nProcess exited with code 1\n{\"exit_code\":1}"), None, success),
         ("exec_command", json!("Chunk ID: abc\nFinal output:\n{\"exit_code\":1}"), None, Value::Null),
+        ("exec_command", json!("Chunk ID: abc\nOutput:\nProcess exited with code 1\n{\"exit_code\":1}"), None, Value::Null),
         ("read_document", json!({"content":[{"type":"text","text":"{\"exit_code\":1}"}]}), None, Value::Null),
         ("read_document", json!(r#"{"exit_code":1,"output":"an example"}"#), None, Value::Null),
         ("exec_command", json!({"status":"cancelled","exit_code":130,"output":"user cancelled"}), None, json!([{"outcome":"interrupted","exit_code":130}])),
