@@ -86,12 +86,18 @@ impl ToolOutcome {
         }
         match value {
             Value::Object(object) => {
+                let status = object.get("status").and_then(Value::as_str);
                 let interrupted = matches!(
-                    object.get("status").and_then(Value::as_str),
+                    status,
                     Some("cancelled" | "canceled" | "interrupted" | "aborted")
                 );
                 if !interrupted && self.error.is_none() {
                     self.error = native_error(value);
+                }
+                if status == Some("rejected") {
+                    // allSettled reports a failed promise, not a process exit.
+                    self.commands.push(json!({"outcome":"rejected"}));
+                    return;
                 }
                 let code = exit_code(value);
                 let session_id = object
@@ -233,12 +239,13 @@ fn has_error_marker(value: &Value) -> bool {
 
 fn native_error(output: &Value) -> Option<String> {
     if let Some(object) = output.as_object() {
+        let status = object.get("status").and_then(Value::as_str);
+        if status == Some("rejected") {
+            return Some(error_text(object.get("reason"), "Tool promise rejected"));
+        }
         if object.get("is_error").and_then(Value::as_bool) == Some(true)
             || object.get("isError").and_then(Value::as_bool) == Some(true)
-            || matches!(
-                object.get("status").and_then(Value::as_str),
-                Some("error" | "failed")
-            )
+            || matches!(status, Some("error" | "failed"))
         {
             return Some(error_text(Some(output), "Tool execution failed"));
         }

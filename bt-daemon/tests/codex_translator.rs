@@ -1348,9 +1348,10 @@ fn codex_command_result_formats_preserve_outcomes() {
     let success = json!([{"outcome":"success","exit_code":0}]);
     let mut multiple = exec_output(Value::Null);
     multiple[1]["text"] = json!(format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         json!({"status":"fulfilled","value":{"exit_code":2,"output":"no matches"}}),
         json!({"result":{"exit_code":0,"output":"ok"}}),
+        json!({"status":"rejected","reason":"command launch failed"}),
     ));
     // Each case covers a different native envelope or a false-positive boundary.
     // PR #71's test above already covers null, blank, and false error members.
@@ -1360,7 +1361,9 @@ fn codex_command_result_formats_preserve_outcomes() {
         ("exec_command", json!("Chunk ID: abc\nWall time: 0.1 seconds\nProcess exited with code 2\nFinal output:\nbad command"), Some("Command exited with code 2"), failed.clone()),
         ("exec_command", json!("Exit code 2\nbad command"), Some("Command exited with code 2"), failed.clone()),
         ("exec", json!("Script completed\nWall time 0.1 seconds\nOutput:\n{\"exit_code\":2,\"output\":\"bad command\"}"), Some("Command exited with code 2"), failed),
-        ("exec", multiple, Some("Command exited with code 2"), json!([{"outcome":"nonzero_exit","exit_code":2},{"outcome":"success","exit_code":0}])),
+        ("exec", multiple, Some("Command exited with code 2"), json!([{"outcome":"nonzero_exit","exit_code":2},{"outcome":"success","exit_code":0},{"outcome":"rejected"}])),
+        ("exec", exec_output(json!([{"status":"rejected","reason":{"message":"command launch failed"}},{"status":"fulfilled","value":{"exit_code":0,"output":"ok"}}])), Some("command launch failed"), json!([{"outcome":"rejected"},{"outcome":"success","exit_code":0}])),
+        ("exec", exec_output(json!({"status":"rejected","reason":{}})), Some("Tool promise rejected"), json!([{"outcome":"rejected"}])),
         ("exec", exec_output(json!({"exit_code":0,"error":null,"output":"{\"exit_code\":1,\"error\":\"example\"}","stderr":"Error: harmless diagnostic"})), None, success.clone()),
         ("exec_command", json!("Chunk ID: abc\nProcess exited with code 0\nFinal output:\nProcess exited with code 1\n{\"exit_code\":1}"), None, success),
         ("exec_command", json!("Chunk ID: abc\nFinal output:\n{\"exit_code\":1}"), None, Value::Null),
