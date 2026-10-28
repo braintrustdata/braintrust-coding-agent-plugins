@@ -19,35 +19,9 @@ use support::inference::{
 use support::ingest::IngestScenario;
 use support::server::TestServer;
 
-fn codex_tool_call(request: &OpenAiRequest) -> OpenAiTurn {
-    let names = request.tool_names();
-    if names.contains(&"exec_command") {
-        return OpenAiTurn::tool_call(
-            "call_mock_1",
-            "exec_command",
-            json!({"cmd":codex_tool_command(),"login":false}),
-        );
-    }
-    if names.contains(&"shell") {
-        return OpenAiTurn::tool_call(
-            "call_mock_1",
-            "shell",
-            json!({"command":codex_tool_command()}),
-        );
-    }
-    if names.contains(&"shell_command") {
-        return OpenAiTurn::tool_call(
-            "call_mock_1",
-            "shell_command",
-            json!({"command":codex_tool_command()}),
-        );
-    }
-    panic!("Codex offered no supported shell tool; offered tools: {names:?}");
-}
-
 fn shell_tool_call(request: &OpenAiRequest, call_id: &str, command: &str) -> OpenAiTurn {
     let names = request.tool_names();
-    let name = ["bash", "shell", "shell_command", "exec_command"]
+    let name = ["bash", "exec_command", "shell", "shell_command"]
         .into_iter()
         .find(|name| names.contains(name))
         .unwrap_or_else(|| {
@@ -72,17 +46,6 @@ fn tool_command(marker: &str) -> String {
     }
 }
 
-fn codex_tool_command() -> &'static str {
-    #[cfg(unix)]
-    {
-        "printf CODEX_TOOL_OK"
-    }
-    #[cfg(windows)]
-    {
-        "Write-Output CODEX_TOOL_OK"
-    }
-}
-
 fn row_contains(row: &Value, fragments: &[&str]) -> bool {
     let serialized = serde_json::to_string(row).expect("serialize trace row");
     fragments
@@ -102,7 +65,11 @@ async fn codex_session_emits_traces() {
                     "unexpected Codex request: {}",
                     request.body
                 );
-                MockReply::response(codex_tool_call(&request))
+                MockReply::response(shell_tool_call(
+                    &request,
+                    "call_mock_1",
+                    &tool_command("CODEX_TOOL_OK"),
+                ))
             }
             1 => {
                 assert!(
@@ -110,9 +77,17 @@ async fn codex_session_emits_traces() {
                     "Codex did not return the tool result: {}",
                     request.body
                 );
+                MockReply::response(shell_tool_call(
+                    &request,
+                    "call_mock_failure",
+                    &format!("{}; exit 7", tool_command("CODEX_TOOL_FAILED")),
+                ))
+            }
+            2 => {
+                assert!(request.has_function_output("call_mock_failure"));
                 MockReply::response(OpenAiTurn::text("CODEX_MOCK_OK"))
             }
-            2 => MockReply::http_error(
+            3 => MockReply::http_error(
                 StatusCode::BAD_REQUEST,
                 json!({
                     "error": {
@@ -142,7 +117,7 @@ async fn codex_session_emits_traces() {
     output.assert_success();
     if world.uses_mock_inference() {
         output.assert_contains("CODEX_MOCK_OK");
-        assert_eq!(inference.requests().len(), 2);
+        assert_eq!(inference.requests().len(), 3);
 
         let failed = codex
             .run(
@@ -153,7 +128,7 @@ async fn codex_session_emits_traces() {
             .await;
         failed.assert_failure();
         failed.assert_contains("deterministic Codex inference failure");
-        assert_eq!(inference.requests().len(), 3);
+        assert_eq!(inference.requests().len(), 4);
     }
 
     let rows = world.wait_for_trace_delivery().await;
@@ -171,6 +146,14 @@ async fn codex_session_emits_traces() {
             })
             .expect("Codex tool output", |row| {
                 row_contains(row, &[r#""type":"tool""#, "CODEX_TOOL_OK"])
+                    && row["error"].is_null()
+                    && row["metadata"]["command_outcomes"][0]["exit_code"] == 0
+            })
+            .expect("Codex command failure", |row| {
+                row_contains(row, &["CODEX_TOOL_FAILED"])
+                    && row["error"] == "Command exited with code 7"
+                    && row["metadata"]["command_outcomes"][0]["outcome"] == "nonzero_exit"
+                    && row["metadata"]["command_outcomes"][0]["exit_code"] == 7
             });
         world.wait_for_mock_ingest_scenario(&scenario).await;
     }
@@ -517,7 +500,7 @@ fn request_helpers_recognize_tool_results_and_advertised_tools() {
     };
     assert!(openai.has_function_output("call-1"));
     assert_eq!(openai.tool_names(), vec!["shell_command"]);
-    match codex_tool_call(&openai) {
+    match shell_tool_call(&openai, "call_mock_1", "echo CODEX_TOOL_OK") {
         OpenAiTurn::ToolCall {
             name, arguments, ..
         } => {

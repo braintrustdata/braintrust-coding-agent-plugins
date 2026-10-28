@@ -20,7 +20,7 @@
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
 use super::tool::{
-    error_text, explicit_skill_metadata, nonempty_error_text, tool_approval_metadata, ToolApproval,
+    add_tool_approval, explicit_skill_metadata, tool_approval_metadata, ToolApproval,
 };
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -34,6 +34,8 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+
+mod tool_output;
 
 const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 const MISSING_TOOL_OUTPUT_ERROR: &str = "Tool output missing before turn ended";
@@ -169,6 +171,13 @@ struct OpenLlm {
     output_preset: bool,
 }
 
+struct OpenTool {
+    span_id: String,
+    turn_id: String,
+    start_ms: i64,
+    name: String,
+}
+
 struct Scope {
     path: String,
     kind: ScopeKind,
@@ -182,7 +191,7 @@ struct Scope {
     open_turns: Vec<OpenTurn>,
     message_history: Vec<Value>,
     open_llm: Option<OpenLlm>,
-    open_tools: HashMap<String, (String, String, i64)>, // call_id -> (tool span_id, turn_id, start_ms)
+    open_tools: HashMap<String, OpenTool>, // call_id -> native tool invocation
     last_turn_end_ms: Option<i64>,
     last_turn_output: Option<Value>,
     turn_seq: u32,
@@ -1191,7 +1200,15 @@ impl CodexTranslator {
             tags: if tags.is_empty() { None } else { Some(tags) },
             ..Default::default()
         }));
-        scope.open_tools.insert(call_id, (span_id, turn_id, ts));
+        scope.open_tools.insert(
+            call_id,
+            OpenTool {
+                span_id,
+                turn_id,
+                start_ms: ts,
+                name: tool_name,
+            },
+        );
     }
 
     fn on_tool_output(
@@ -1206,13 +1223,13 @@ impl CodexTranslator {
             return;
         };
         push_tool_result(scope, Some(&call_id), payload);
-        let Some((span_id, turn_id, _start_ms)) = scope.open_tools.remove(&call_id) else {
+        let Some(tool) = scope.open_tools.remove(&call_id) else {
             return;
         };
         if let Some(turn) = scope
             .open_turns
             .iter_mut()
-            .find(|turn| turn.turn_id == turn_id)
+            .find(|turn| turn.turn_id == tool.turn_id)
         {
             turn.last_child_end_ms = Some(turn.last_child_end_ms.map_or(ts, |p| p.max(ts)));
         }
@@ -1220,15 +1237,19 @@ impl CodexTranslator {
             .get("output")
             .or_else(|| payload.get("result"))
             .cloned();
-        let error = output.as_ref().and_then(classify_tool_output);
+        let mut outcome = output
+            .as_ref()
+            .map(|output| tool_output::classify(&tool.name, output))
+            .unwrap_or_default();
+        add_tool_approval(&mut outcome.metadata, Some(ToolApproval::Approved));
         ops.push(SpanOp::Merge(SpanRow {
-            span_id,
+            span_id: tool.span_id,
             root_span_id: self.effective_root_span_id.clone(),
-            parent_span_ids: self.turn_parent_span_ids(&turn_id),
+            parent_span_ids: self.turn_parent_span_ids(&tool.turn_id),
             end_ms: Some(ts),
             output,
-            metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
-            error,
+            metadata: Some(Value::Object(outcome.metadata)),
+            error: outcome.error,
             ..Default::default()
         }));
     }
@@ -1321,7 +1342,7 @@ impl CodexTranslator {
         let has_open_tool = scope
             .open_tools
             .values()
-            .any(|(_, owner, _)| owner == &turn_id);
+            .any(|tool| tool.turn_id == turn_id);
 
         if scope
             .open_llm
@@ -1395,11 +1416,11 @@ impl CodexTranslator {
         let call_ids: Vec<String> = scope
             .open_tools
             .iter()
-            .filter(|(_, (_, owner, _))| owner == turn_id)
+            .filter(|(_, tool)| tool.turn_id == turn_id)
             .map(|(call_id, _)| call_id.clone())
             .collect();
         for call_id in call_ids {
-            if let Some((span_id, _, start_ms)) = scope.open_tools.remove(&call_id) {
+            if let Some(tool) = scope.open_tools.remove(&call_id) {
                 let mut metadata = tool_approval_metadata(Some(ToolApproval::Approved));
                 if let Some(reason) = interruption_reason {
                     if let Some(fields) = metadata.as_object_mut() {
@@ -1408,12 +1429,12 @@ impl CodexTranslator {
                     }
                 }
                 ops.push(SpanOp::Merge(SpanRow {
-                    span_id,
+                    span_id: tool.span_id,
                     root_span_id: self.effective_root_span_id.clone(),
                     parent_span_ids: parent_span_ids.clone(),
                     end_ms: Some(end_ms.map_or_else(
-                        || start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS),
-                        |end| end.min(start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS)),
+                        || tool.start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS),
+                        |end| end.min(tool.start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS)),
                     )),
                     metadata: Some(metadata),
                     error: interruption_reason
@@ -1586,29 +1607,18 @@ impl CodexTranslator {
                 ..Default::default()
             }));
         }
-        let tools: Vec<(String, String, i64, String)> = scope
-            .open_tools
-            .drain()
-            .map(|(_, (span_id, turn_id, start_ms))| {
-                (
-                    span_id,
-                    turn_id,
-                    start_ms,
-                    MISSING_TOOL_OUTPUT_ERROR.to_string(),
-                )
-            })
-            .collect();
-        for (sid, turn_id, start_ms, error) in tools {
+        let tools: Vec<OpenTool> = scope.open_tools.drain().map(|(_, tool)| tool).collect();
+        for tool in tools {
             ops.push(SpanOp::Merge(SpanRow {
-                span_id: sid,
+                span_id: tool.span_id,
                 root_span_id: self.effective_root_span_id.clone(),
-                parent_span_ids: self.turn_parent_span_ids(&turn_id),
+                parent_span_ids: self.turn_parent_span_ids(&tool.turn_id),
                 end_ms: Some(end_ms.map_or_else(
-                    || start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS),
-                    |end| end.min(start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS)),
+                    || tool.start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS),
+                    |end| end.min(tool.start_ms.saturating_add(MAX_OPEN_TOOL_SPAN_MS)),
                 )),
                 metadata: Some(tool_approval_metadata(Some(ToolApproval::Approved))),
-                error: Some(error),
+                error: Some(MISSING_TOOL_OUTPUT_ERROR.to_string()),
                 ..Default::default()
             }));
         }
@@ -1807,59 +1817,6 @@ fn args_object(args: Option<&Value>) -> Option<Map<String, Value>> {
             .and_then(|value| value.as_object().cloned()),
         _ => None,
     }
-}
-
-fn has_error_marker(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::String(_) => nonempty_error_text(value).is_some(),
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(values) => !values.is_empty(),
-        Value::Number(_) => true,
-    }
-}
-
-fn classify_tool_output(output: &Value) -> Option<String> {
-    if let Some(object) = output.as_object() {
-        if object.get("is_error").and_then(Value::as_bool) == Some(true)
-            || object.get("isError").and_then(Value::as_bool) == Some(true)
-            || matches!(
-                object.get("status").and_then(Value::as_str),
-                Some("error" | "failed")
-            )
-        {
-            return Some(error_text(Some(output), "Tool execution failed"));
-        }
-        if let Some(error) = object.get("error").filter(|error| has_error_marker(error)) {
-            return Some(error_text(Some(error), "Tool execution failed"));
-        }
-        if let Some(exit_code) = object
-            .get("exit_code")
-            .or_else(|| object.get("exitCode"))
-            .and_then(Value::as_i64)
-        {
-            if exit_code != 0 {
-                return Some(error_text(Some(output), &format!("Exit code {exit_code}")));
-            }
-        }
-    }
-    if let Some(text) = output.as_str() {
-        let first = text.lines().next().unwrap_or(text);
-        if first.to_ascii_lowercase().starts_with("error:") {
-            return Some(first.to_string());
-        }
-        if let Some(code) = first
-            .strip_prefix("Exit code ")
-            .and_then(|value| value.split_whitespace().next())
-            .and_then(|value| value.parse::<i64>().ok())
-        {
-            if code != 0 {
-                return Some(first.to_string());
-            }
-        }
-    }
-    None
 }
 
 #[derive(Default)]

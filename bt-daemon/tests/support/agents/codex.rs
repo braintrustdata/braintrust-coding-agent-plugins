@@ -112,13 +112,20 @@ impl CodexAgent {
 
     fn command(&self, world: &AgentTestWorld) -> Command {
         let mut command = command_from_env("CODEX_BIN", "codex");
+        // Mock inference emits fixed test commands. CI host sandbox support
+        // must not prevent those commands from reaching their expected exits.
+        let sandbox = if world.uses_mock_inference() {
+            "danger-full-access"
+        } else {
+            "read-only"
+        };
         command
             .args([
                 "exec",
                 "--skip-git-repo-check",
                 "--dangerously-bypass-hook-trust",
                 "--sandbox",
-                "read-only",
+                sandbox,
                 "-c",
                 r#"approval_policy="never""#,
             ])

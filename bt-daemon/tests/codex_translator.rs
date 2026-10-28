@@ -1286,6 +1286,184 @@ fn codex_successful_structured_tool_outputs_do_not_populate_error() {
     );
 }
 
+/// Exercise the public translator with the native code-mode output shape.
+fn exec_output(result: Value) -> Value {
+    json!([
+        {"type":"input_text","text":"Script completed\nWall time 0.2 seconds\nOutput:\n"},
+        {"type":"input_text","text":result.to_string()}
+    ])
+}
+
+fn translate_tool_output(name: &str, output: Value) -> SpanRow {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    for record in [
+        json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"s","cwd":"/x/app"}}),
+        json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}),
+        json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":name,"call_id":"c1","input":"text(await tools.exec_command({cmd:'git commit'}));"}}),
+        json!({"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":output}}),
+        json!({"timestamp":"2026-01-01T00:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}),
+    ] {
+        append(&transcript, record);
+    }
+    let mut translator = Registry::default_agents().create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let mut ops = translator
+        .handle(
+            &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(translator.flush(&ctx).unwrap());
+    assert_merges_preserve_insert_identity(&ops);
+    let rows = reduce(ops);
+    find(&rows, SpanType::Tool, name).clone()
+}
+
+#[test]
+fn codex_nested_command_failures_survive_wrapper_success() {
+    // Sanitized shape of SDK-708's completed write_stdin result, Codex 0.158.
+    let output = exec_output(json!({
+        "chunk_id":"a1b8b4", "wall_time_seconds":0.00001,
+        "exit_code":1, "original_token_count":291,
+        "output":"Passed\nDetect hardcoded secrets........Failed\n- hook id: gitleaks\n- exit code: 1\n"
+    }));
+    let tool = translate_tool_output("exec", output.clone());
+    assert_eq!(tool.error.as_deref(), Some("Command exited with code 1"));
+    assert_eq!(tool.output, Some(output));
+    let metadata = tool.metadata.unwrap();
+    assert_eq!(metadata["wrapper_outcome"], "completed");
+    assert_eq!(
+        metadata["command_outcomes"],
+        json!([{"outcome":"nonzero_exit","exit_code":1}])
+    );
+}
+
+#[test]
+fn codex_command_result_formats_preserve_outcomes() {
+    let failed = json!([{"outcome":"nonzero_exit","exit_code":2}]);
+    let success = json!([{"outcome":"success","exit_code":0}]);
+    let mut multiple = exec_output(Value::Null);
+    multiple[1]["text"] = json!(format!(
+        "{}\n{}\n{}",
+        json!({"status":"fulfilled","value":{"exit_code":2,"output":"no matches"}}),
+        json!({"result":{"exit_code":0,"output":"ok"}}),
+        json!({"status":"rejected","reason":"command launch failed"}),
+    ));
+    // Each case covers a different native envelope or a false-positive boundary.
+    // PR #71's test above already covers null, blank, and false error members.
+    for (name, output, error, commands) in [
+        ("functions.exec_command", json!({"exit_code":2,"output":"bad command"}), Some("Command exited with code 2"), failed.clone()),
+        ("shell", json!(r#"{"exitCode":2,"output":"bad command"}"#), Some("Command exited with code 2"), failed.clone()),
+        ("exec_command", json!("Chunk ID: abc\nWall time: 0.1 seconds\nProcess exited with code 2\nFinal output:\nbad command"), Some("Command exited with code 2"), failed.clone()),
+        ("exec_command", json!("Exit code 2\nbad command"), Some("Command exited with code 2"), failed.clone()),
+        ("exec", json!("Script completed\nWall time 0.1 seconds\nOutput:\n{\"exit_code\":2,\"output\":\"bad command\"}"), Some("Command exited with code 2"), failed),
+        ("exec", multiple, Some("Command exited with code 2"), json!([{"outcome":"nonzero_exit","exit_code":2},{"outcome":"success","exit_code":0},{"outcome":"rejected"}])),
+        ("exec", exec_output(json!([{"status":"rejected","reason":{"message":"command launch failed"}},{"status":"fulfilled","value":{"exit_code":0,"output":"ok"}}])), Some("command launch failed"), json!([{"outcome":"rejected"},{"outcome":"success","exit_code":0}])),
+        ("exec", exec_output(json!({"status":"rejected","reason":{}})), Some("Tool promise rejected"), json!([{"outcome":"rejected"}])),
+        ("exec", exec_output(json!({"exit_code":0,"error":null,"output":"{\"exit_code\":1,\"error\":\"example\"}","stderr":"Error: harmless diagnostic"})), None, success.clone()),
+        ("exec_command", json!("Chunk ID: abc\nProcess exited with code 0\nFinal output:\nProcess exited with code 1\n{\"exit_code\":1}"), None, success),
+        ("exec_command", json!("Chunk ID: abc\nFinal output:\n{\"exit_code\":1}"), None, Value::Null),
+        ("exec_command", json!("Chunk ID: abc\nOutput:\nProcess exited with code 1\n{\"exit_code\":1}"), None, Value::Null),
+        ("read_document", json!({"content":[{"type":"text","text":"{\"exit_code\":1}"}]}), None, Value::Null),
+        ("read_document", json!(r#"{"exit_code":1,"output":"an example"}"#), None, Value::Null),
+        ("exec_command", json!({"status":"cancelled","exit_code":130,"output":"user cancelled"}), None, json!([{"outcome":"interrupted","exit_code":130}])),
+        ("exec", exec_output(json!({"status":"interrupted","output":"user interrupted"})), None, json!([{"outcome":"interrupted"}])),
+        ("exec_command", json!({"session_id":77,"exit_code":null,"output":""}), None, json!([{"outcome":"running","session_id":77}])),
+        ("exec_command", json!("Error: sandbox denied execution"), Some("Error: sandbox denied execution"), Value::Null),
+    ] {
+        let tool = translate_tool_output(name, output.clone());
+        assert_eq!(tool.error.as_deref(), error, "{name}: {output}");
+        assert_eq!(tool.output, Some(output));
+        let metadata = tool.metadata.unwrap();
+        assert_eq!(metadata["command_outcomes"], commands, "{name}");
+        let interrupted = commands.as_array().is_some_and(|values| values.iter().any(|v| v["outcome"]=="interrupted"));
+        assert_eq!(metadata.get("outcome").and_then(Value::as_str), interrupted.then_some("interrupted"));
+    }
+}
+
+#[test]
+fn codex_command_polling_records_the_terminal_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    let path = transcript.to_str().unwrap();
+    let initial_output = exec_output(json!({"session_id":38764,"output":""}));
+    for record in [
+        json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"s","cwd":"/x/app"}}),
+        json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}),
+        json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"start","input":"text(await tools.exec_command({cmd:'git commit'}));"}}),
+        json!({"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"start","output":initial_output}}),
+        json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"poll","input":"text(await tools.write_stdin({session_id:38764,chars:''}));"}}),
+    ] {
+        append(&transcript, record);
+    }
+    let mut translator = Registry::default_agents().create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let mut ops = translator
+        .handle(&envelope("s", "SessionStart", path, json!({})), &ctx)
+        .unwrap();
+    let before = reduce(ops.clone());
+    let start = before
+        .values()
+        .find(|r| r.metadata.as_ref().is_some_and(|m| m["call_id"] == "start"))
+        .unwrap();
+    assert_eq!(start.error, None);
+    assert_eq!(
+        start.metadata.as_ref().unwrap()["command_outcomes"][0]["outcome"],
+        "running"
+    );
+    let output = exec_output(json!({"chunk_id":"a1b8b4","exit_code":1,"output":"gitleaks failed"}));
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"poll","output":output}}),
+    );
+    append(
+        &transcript,
+        json!({"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}),
+    );
+    ops.extend(translator.checkpoint(&ctx).unwrap());
+    // A repeated checkpoint must neither duplicate results nor lose the failure.
+    ops.extend(translator.checkpoint(&ctx).unwrap());
+    let after = reduce(ops);
+    let poll = after
+        .values()
+        .find(|r| r.metadata.as_ref().is_some_and(|m| m["call_id"] == "poll"))
+        .unwrap();
+    assert_eq!(poll.error.as_deref(), Some("Command exited with code 1"));
+    assert_eq!(poll.output, Some(output));
+    assert_eq!(
+        poll.metadata.as_ref().unwrap()["wrapper_outcome"],
+        "completed"
+    );
+    assert_eq!(
+        poll.metadata.as_ref().unwrap()["command_outcomes"],
+        json!([{"outcome":"nonzero_exit","exit_code":1}])
+    );
+    assert_eq!(
+        after
+            .values()
+            .filter(|r| r.span_type == SpanType::Tool)
+            .count(),
+        2
+    );
+    // Replaying the full durable transcript gives the same outcome and span IDs.
+    let mut replay = Registry::default_agents().create("codex", "s");
+    let replayed = reduce(
+        replay
+            .handle(&envelope("s", "SessionStart", path, json!({})), &ctx)
+            .unwrap(),
+    );
+    let replayed_poll = &replayed[&poll.span_id];
+    assert_eq!(replayed_poll.error, poll.error);
+    assert_eq!(replayed_poll.metadata, poll.metadata);
+}
+
 #[test]
 fn codex_mcp_error_results_keep_the_content_text() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1369,6 +1547,10 @@ fn missing_tool_output_is_an_error() {
     assert_eq!(
         tool.metadata.as_ref().unwrap()["tool_approval"],
         json!("approved")
+    );
+    assert!(
+        tool.metadata.as_ref().unwrap().get("outcome").is_none(),
+        "missing output does not establish cancellation"
     );
 }
 
