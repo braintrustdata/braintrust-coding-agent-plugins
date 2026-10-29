@@ -1138,26 +1138,21 @@ impl CursorTranslator {
         }
         self.ensure_turn(e.ts_ms, None, None, "hook_order", ops);
         let spawn = hook.tool_call_id.as_deref();
-        let Some((parent, turn)) = spawn
-            .and_then(|s| self.tools.get(s).or_else(|| self.completed.get(s)))
-            .map(|t| (t.row.span_id.clone(), t.turn.clone()))
-            .or_else(|| {
-                self.turn
-                    .as_ref()
-                    .map(|turn| (turn.id.clone(), turn.id.clone()))
-            })
+        let Some(turn) = spawn
+            .and_then(|call| self.tools.get(call).or_else(|| self.completed.get(call)))
+            .map(|tool| tool.turn.clone())
+            .or_else(|| self.turn.as_ref().map(|turn| turn.id.clone()))
         else {
             return;
         };
         let mut row = self.row(
             ids::span_id(&self.namespace, &format!("subagent:{id}")),
-            parent,
+            turn,
             "Cursor subagent",
             SpanType::Task,
         );
-        row.turn_span_id = Some(turn);
         row.start_ms = Some(e.ts_ms);
-        row.input = Some(json!(hook.task));
+        row.input = Some(user_prompt(&hook.task));
         row.metadata = Some(
             json!({"subagent_id":id,"spawning_tool_call_id":spawn,"model":hook.subagent_model,"subagent_type":hook.subagent_type,"recursive_activity_verified":false}),
         );
@@ -1182,9 +1177,10 @@ impl CursorTranslator {
                     return None;
                 }
                 let mut matching_ids = self.subagents.iter().filter_map(|(id, row)| {
-                    let task_matches = hook.task.as_ref().is_none_or(|task| {
-                        row.input.as_ref().and_then(Value::as_str) == Some(task.as_str())
-                    });
+                    let task_matches = hook
+                        .task
+                        .as_ref()
+                        .is_none_or(|task| row.input.as_ref() == Some(&user_prompt(task)));
                     let type_matches = hook.subagent_type.as_ref().is_none_or(|kind| {
                         row.metadata
                             .as_ref()
@@ -1248,7 +1244,7 @@ impl CursorTranslator {
         let duration = hook.duration_ms.and_then(|ms| i64::try_from(ms).ok());
         row.start_ms = Some(duration.map_or(e.ts_ms, |duration| e.ts_ms.saturating_sub(duration)));
         row.end_ms = Some(e.ts_ms);
-        row.input = hook.task.as_ref().map(|task| json!(task));
+        row.input = hook.task.as_ref().map(|task| user_prompt(task));
         row.output = hook.summary.as_ref().map(|summary| json!(summary));
         row.metadata = Some(json!({
             "subagent_id": hook.subagent_id,
@@ -1600,6 +1596,10 @@ impl AgentTranslator for CursorTranslator {
         Ok(ops)
     }
 }
+fn user_prompt(text: &str) -> Value {
+    json!([{ "role": "user", "content": text }])
+}
+
 fn assistant_message(content: &[Value]) -> Value {
     let mut text = String::new();
     let mut reasoning = Vec::new();
