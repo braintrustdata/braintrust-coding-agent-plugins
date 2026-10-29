@@ -268,7 +268,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=821bf4d331193e2c40abce5c22eefca794c91f25#821bf4d331193e2c40abce5c22eefca794c91f25"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=d8ada65116de28ea4300cc934b45495e268b622d#d8ada65116de28ea4300cc934b45495e268b622d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1917,7 +1917,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2701,7 +2701,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

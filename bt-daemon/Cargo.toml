@@ -23,7 +23,7 @@ expect_used = "deny"
 
 [dependencies]
 # Keep this pinned exactly, matching the dependency policy used by `bt`.
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "821bf4d331193e2c40abce5c22eefca794c91f25" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "d8ada65116de28ea4300cc934b45495e268b622d" }
 base64 = "0.22"
 anyhow = "1"
 muse-code-sdk = "=1.4.12"
