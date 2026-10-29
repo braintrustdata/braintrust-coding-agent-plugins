@@ -117,7 +117,25 @@ def validate_mcp_package(root, *, submission=False):
     require(isinstance(manifest["keywords"], list) and all(isinstance(k, str) and k.strip() for k in manifest["keywords"]), "invalid keywords")
     keys(manifest["extensions"], {"com.openai"})
     overlay = manifest["extensions"]["com.openai"]
-    keys(overlay, {"interface"})  # No hooks/apps/mcpServers/desktop requirements.
+    keys(overlay, {"interface", "review"})  # No hooks/apps/mcpServers/desktop requirements.
+    review = overlay["review"]
+    keys(review, {"test_cases"})
+    cases = review["test_cases"]
+    keys(cases, {"positive", "negative"})
+    # The submission guide requires five positive and three negative scenarios.
+    # Negative cases carry the reason and safe fallback in their description,
+    # matching the documented description/prompt format.
+    for kind, minimum, fields in [
+        ("positive", 5, {"description", "prompt", "tools_triggered", "expected_behavior"}),
+        ("negative", 3, {"description", "prompt"}),
+    ]:
+        entries = cases[kind]
+        require(isinstance(entries, list) and len(entries) >= minimum,
+                f"review requires at least {minimum} {kind} test cases")
+        for entry in entries:
+            keys(entry, fields)
+            require(all(isinstance(value, str) and value.strip() for value in entry.values()),
+                    f"review {kind} test case fields must be nonempty strings")
     interface = overlay["interface"]
     keys(interface, {"displayName", "shortDescription", "longDescription", "developerName", "category", "capabilities", "websiteURL", "supportURL", "privacyPolicyURL", "termsOfServiceURL", "defaultPrompt", "brandColor", "composerIcon", "logo"})
     require(interface["displayName"] == interface["developerName"] == "Braintrust", "unexpected display name/publisher")

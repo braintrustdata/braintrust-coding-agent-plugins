@@ -73,6 +73,44 @@ class PackagingTests(unittest.TestCase):
                     parent.rmdir()
                     parent = parent.parent
 
+    def test_review_cases_preserved_in_submission_zip(self):
+        source = json.loads((self.public / "plugin.json").read_text())
+        review = source["extensions"]["com.openai"]["review"]
+        self.assertEqual(len(review["test_cases"]["positive"]), 5)
+        self.assertEqual(len(review["test_cases"]["negative"]), 3)
+        archive = package.build_zip(self.dist, self.root / "output")
+        with zipfile.ZipFile(archive) as zipped:
+            manifest = json.loads(zipped.read("plugin.json"))
+        self.assertEqual(manifest["extensions"]["com.openai"]["review"], review)
+        package.validate_zip(archive)
+
+    def test_missing_or_malformed_review_cases_rejected(self):
+        path = self.public / "plugin.json"
+        original = path.read_text()
+        mutations = [
+            lambda o: o.pop("review"),
+            lambda o: o["review"].update(credentials="fake-test-secret"),
+            lambda o: o["review"].update(test_cases=[]),
+        ]
+        for kind, minimum in [("positive", 5), ("negative", 3)]:
+            mutations.extend([
+                lambda o, k=kind: o["review"]["test_cases"].update({k: {}}),
+                lambda o, k=kind, m=minimum: o["review"]["test_cases"].update({k: o["review"]["test_cases"][k][:m - 1]}),
+                lambda o, k=kind: o["review"]["test_cases"][k][0].pop("prompt"),
+                lambda o, k=kind: o["review"]["test_cases"][k][0].update(prompt=" "),
+                lambda o, k=kind: o["review"]["test_cases"][k][0].update(description=None),
+            ])
+        mutations.extend([
+            lambda o: o["review"]["test_cases"]["positive"][0].pop("tools_triggered"),
+            lambda o: o["review"]["test_cases"]["positive"][0].update(expected_behavior=[]),
+        ])
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index):
+                path.write_text(original)
+                self.edit(path, lambda d: mutation(d["extensions"]["com.openai"]))
+                with self.assertRaises(ValueError):
+                    package.build_zip(self.dist, self.root / "output")
+
     def test_symlink_rejected(self):
         icon = self.public / "assets/icon.png"
         icon.unlink()
