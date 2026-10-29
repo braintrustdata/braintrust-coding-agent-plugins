@@ -16,7 +16,7 @@
     "com.openai": {
       "interface": {
         "displayName": "Braintrust",
-        "shortDescription": "Explore traces and run evals in Braintrust",
+        "shortDescription": "Explore traces and run evals",
         "longDescription": "Braintrust is the observability platform for understanding and improving AI agents. Explore production traces to surface recurring issues, construct datasets, write and test scorers, run evals to compare changes, and set up alerts to monitor production. ChatGPT acts with your Braintrust account's permissions, including write access.",
         "developerName": "Braintrust",
         "category": "Developer Tools",
