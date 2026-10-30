@@ -8,7 +8,8 @@ Tools use that account's permissions and can read or change Braintrust data.
 ## Install
 
 ```text
-/plugin install braintrust --marketplace braintrustdata/braintrust-claude-plugin
+/plugin marketplace add braintrustdata/braintrust-claude-plugin
+/plugin install braintrust@braintrust-claude-plugin
 ```
 
 Or from your shell:
@@ -42,7 +43,7 @@ Braintrust data in response.
 
 The packaged server URL is Braintrust's North America (US) data plane. To use
 another data plane, copy this plugin into your own marketplace and replace
-`mcpServers.braintrust.url` in `.mcp.json` with the URL for your deployment.
+`braintrust.url` in `.mcp.json` with the URL for your deployment.
 Do not enable this plugin and a second connection to the same tools at once.
 
 | Data plane | MCP URL |

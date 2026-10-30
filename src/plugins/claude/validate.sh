@@ -91,8 +91,9 @@ assert marketplace["version"] == manifest["version"], "Claude catalog version mu
 assert not any("version" in entry for entry in marketplace["plugins"])
 
 # No headers or credentials: Claude Code discovers OAuth from the server.
+# Plugin-root .mcp.json is the server map itself, with no mcpServers wrapper.
 assert json.loads((root / ".mcp.json").read_text()) == {
-    "mcpServers": {"braintrust": {"type": "http", "url": "https://api.braintrust.dev/mcp"}},
+    "braintrust": {"type": "http", "url": "https://api.braintrust.dev/mcp"},
 }
 
 # Anthropic directory listing icon: square PNG, 512..2048px, under 2 MB.
