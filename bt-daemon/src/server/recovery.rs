@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
+pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<PendingEvent> {
     let pending: Vec<PendingEvent> = daemon
         .pending_sessions
         .lock()
@@ -10,7 +10,7 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
         .flat_map(|state| state.events.iter().cloned())
         .collect();
     let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
-        return;
+        return Vec::new();
     };
     let mut candidates = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -19,6 +19,12 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
             continue;
         }
         let recorded_len = journal::JournalReader::recorded_len(&path).await;
+        let recorded_len = daemon
+            .startup_cutoffs
+            .lock()
+            .as_ref()
+            .and_then(|cutoffs| cutoffs.get(&path).copied())
+            .map_or(recorded_len, |cutoff| recorded_len.min(cutoff));
         let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded_len).await else {
             continue;
         };
@@ -191,23 +197,25 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
     }
     candidates.sort_by_key(|event| event.env.ts_ms);
     let recovered = candidates.len();
-    for event in candidates {
-        let _ = daemon
-            .ingress_tx
-            .send(IngressMsg::Event(Box::new(event)))
-            .await;
-    }
-    // Reconciliation stays in the daemon worker and follows every recovered
-    // event in queue order. Dropping the receiver is intentional: startup and
-    // hook capture do not wait for translation or reporting.
-    let (reply, _ignored) = oneshot::channel();
-    let _ = daemon.ingress_tx.send(IngressMsg::Barrier(reply)).await;
     if recovered > 0 {
         tracing::info!(
             recovered,
             "queued unprocessed journal sessions for recovery"
         );
     }
+    candidates
+}
+
+#[cfg(test)]
+pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
+    for event in discover_unprocessed_journals(daemon).await {
+        let _ = daemon
+            .ingress_tx
+            .send(IngressMsg::Event(Box::new(event)))
+            .await;
+    }
+    let (reply, _ignored) = oneshot::channel();
+    let _ = daemon.ingress_tx.send(IngressMsg::Barrier(reply)).await;
 }
 
 #[cfg(test)]
