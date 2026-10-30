@@ -2339,3 +2339,78 @@ fn codex_root_records_last_turn_output_on_stop() {
         "the session outcome must land on the root span"
     );
 }
+
+#[test]
+fn codex_steering_and_interleaved_tools_replay_deterministically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    for record in [
+        json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"s","cwd":"/x/app"}}),
+        json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}),
+        json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect files"}]}}),
+        json!({"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"function_call","call_id":"a","name":"read_a","arguments":"{}"}}),
+        json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","call_id":"b","name":"read_b","arguments":"{}"}}),
+        json!({"timestamp":"2026-01-01T00:00:05.500Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}),
+        json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Also inspect tests"}]}}),
+        json!({"timestamp":"2026-01-01T00:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"b","output":"B result"}}),
+        json!({"timestamp":"2026-01-01T00:00:08Z","type":"response_item","payload":{"type":"function_call_output","call_id":"a","output":"A result"}}),
+        json!({"timestamp":"2026-01-01T00:00:09Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"c","name":"exec","input":"text(await tools.exec_command({cmd:'ls'}))"}}),
+        json!({"timestamp":"2026-01-01T00:00:10Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c","output":exec_output(json!({"status":"interrupted","output":"cancelled"}))}}),
+        json!({"timestamp":"2026-01-01T00:00:10.500Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}),
+        json!({"timestamp":"2026-01-01T00:00:11Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}),
+    ] {
+        append(&transcript, record);
+    }
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let replay = || {
+        let mut translator = Registry::default_agents().create("codex", "s");
+        let mut ops = translator
+            .handle(
+                &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+                &ctx,
+            )
+            .unwrap();
+        ops.extend(translator.flush(&ctx).unwrap());
+        assert_merges_preserve_insert_identity(&ops);
+        reduce(ops)
+    };
+    let rows = replay();
+    let replayed = replay();
+    assert_eq!(
+        rows.keys().collect::<std::collections::HashSet<_>>(),
+        replayed.keys().collect()
+    );
+    let turn = find(&rows, SpanType::Task, "turn: t1");
+    assert_eq!(turn.input, Some(json!("Inspect files")));
+    assert!(rows
+        .values()
+        .filter(|row| row.span_type == SpanType::Llm)
+        .any(|row| row
+            .input
+            .as_ref()
+            .is_some_and(|input| input.to_string().contains("Also inspect tests"))));
+    assert!(turn.end_ms.is_some());
+    for (name, output) in [("read_a", "A result"), ("read_b", "B result")] {
+        let tool = find(&rows, SpanType::Tool, name);
+        assert!(tool.end_ms.is_some());
+        assert_eq!(tool.output, Some(json!(output)));
+        assert!(
+            tool.parent_span_ids.contains(&turn.span_id)
+                || tool.parent_span_ids.iter().any(|id| rows
+                    .get(id)
+                    .is_some_and(|parent| parent.parent_span_ids.contains(&turn.span_id)))
+        );
+    }
+    let nested = find(&rows, SpanType::Tool, "exec");
+    assert!(nested.end_ms.is_some());
+    assert_eq!(nested.metadata.as_ref().unwrap()["outcome"], "interrupted");
+    assert_eq!(
+        rows.values()
+            .filter(|row| row.span_type == SpanType::Tool)
+            .count(),
+        3
+    );
+}
