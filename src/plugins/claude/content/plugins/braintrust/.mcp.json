@@ -1,0 +1,6 @@
+{
+  "braintrust": {
+    "type": "http",
+    "url": "https://api.braintrust.dev/mcp"
+  }
+}

@@ -71,7 +71,7 @@ jobs:
             printf 'dist_repo=%s\n' "$dist_repo"
             printf 'paths<<EOF\n.github/release-versions/%s\n' "$PLUGIN"
             case "$PLUGIN" in
-              claude) printf '%s\n' 'src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json' ;;
+              claude) printf '%s\n' 'src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json' 'src/plugins/claude/content/.claude-plugin/marketplace.json' ;;
               codex) printf '%s\n' 'src/plugins/codex/content/plugins/*/.codex-plugin/plugin.json' 'src/plugins/codex/content/plugins/*/plugin.json' ;;
               cursor) printf '%s\n' 'src/plugins/cursor/content/.cursor-plugin/plugin.json' 'src/plugins/cursor/content/package.json' 'src/plugins/cursor/content/package-lock.json' ;;
               grok) printf '%s\n' 'src/plugins/grok/content/.grok-plugin/plugin.json' 'src/plugins/grok/content/hooks/hooks.json' ;;
@@ -146,6 +146,8 @@ jobs:
             Cursor releases also publish `braintrustdata.braintrust` to Open VSX using trusted publishing.
 
             Codex releases attach an MCP-only `braintrust-<version>.zip` to the distribution GitHub Release. OpenAI submission remains manual.
+
+            Claude releases update `plugins/braintrust` in the distribution repository. Anthropic directory submission remains manual, from the developer portal.
 
             Human approval and merge into `main` authorize tagging the merge commit and publishing this version to the production destination. This preparation does not tag or deploy anything.
 

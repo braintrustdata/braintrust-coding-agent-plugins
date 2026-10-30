@@ -1,13 +1,19 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "braintrust-claude-plugin",
-  "version": "2.0.0",
-  "description": "Braintrust session tracing for Claude Code",
+  "version": "3.0.5",
+  "description": "Braintrust MCP tools and session tracing for Claude Code",
   "owner": {
     "name": "Braintrust",
     "email": "support@braintrust.dev"
   },
   "plugins": [
+    {
+      "name": "braintrust",
+      "description": "Explore Braintrust traces, manage prompts and datasets, and run evaluations through the hosted Braintrust MCP server.",
+      "source": "./plugins/braintrust",
+      "category": "development"
+    },
     {
       "name": "trace-claude-code",
       "description": "Automatically trace Claude Code conversations to Braintrust. Captures user messages, assistant responses, and tool calls for observability.",
