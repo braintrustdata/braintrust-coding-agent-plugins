@@ -289,6 +289,8 @@ struct MessageInfo {
     #[serde(default, rename = "modelID")]
     model_id: Option<String>,
     #[serde(default)]
+    variant: Option<String>,
+    #[serde(default)]
     time: Option<MessageTime>,
     #[serde(default)]
     tokens: Option<MessageTokens>,
@@ -987,6 +989,11 @@ impl OpenCodeTranslator {
         };
         let provider = info.provider_id.as_deref().unwrap_or("unknown");
         let model = info.model_id.as_deref().unwrap_or("unknown");
+        // Allowlist the selected OpenCode variant; do not copy arbitrary model options.
+        let mut metadata = json!({"model":model,"provider":provider,"message_id":mid});
+        if let Some(variant) = &info.variant {
+            metadata["variant"] = json!(variant);
+        }
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("llm:{sid}:{mid}")),
             root_span_id: state.effective_root_span_id.clone(),
@@ -1011,7 +1018,7 @@ impl OpenCodeTranslator {
                 .or(Some(ts_ms)),
             input: Some(Value::Array(input)),
             output: Some(Value::Array(vec![assistant])),
-            metadata: Some(json!({"model":model,"provider":provider,"message_id":mid})),
+            metadata: Some(metadata),
             metrics: Some(
                 json!({"prompt_tokens":prompt,"completion_tokens":completion,"tokens":prompt+completion+reasoning,"prompt_cached_tokens":cache_read,"prompt_cache_creation_tokens":cache_write,"reasoning_tokens":reasoning}),
             ),

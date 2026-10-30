@@ -91,7 +91,7 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
         event(
             "message.updated",
             5,
-            json!({"properties":{"info":{"id":"m1","sessionID":"native","role":"assistant","providerID":"openai","modelID":"gpt-5","time":{"created":2,"completed":5},"tokens":{"input":5,"output":2,"reasoning":1,"cache":{"read":3,"write":4}}}}}),
+            json!({"properties":{"info":{"id":"m1","sessionID":"native","role":"assistant","providerID":"openai","modelID":"gpt-5","variant":"high","time":{"created":2,"completed":5},"tokens":{"input":5,"output":2,"reasoning":1,"cache":{"read":3,"write":4}}}}}),
         ),
         event(
             "tool.execute.after",
@@ -120,6 +120,7 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
         .values()
         .find(|r| r.span_type == SpanType::Llm)
         .unwrap();
+    assert_eq!(llm.metadata.as_ref().unwrap()["variant"], "high");
     assert_eq!(llm.metrics.as_ref().unwrap()["prompt_tokens"], 12);
     assert_eq!(llm.output.as_ref().unwrap()[0]["content"], "world");
     let tool = rows
@@ -260,6 +261,10 @@ fn opencode_idle_updates_a_resumable_session_root() {
         .count();
     assert_eq!(reopened_roots, 1);
     let rows = reduce(ops);
+    assert!(rows
+        .values()
+        .filter(|row| row.span_type == SpanType::Llm)
+        .all(|row| row.metadata.as_ref().unwrap().get("variant").is_none()));
     let root = rows.values().find(|row| row.name == "OpenCode").unwrap();
     assert_eq!(root.metadata.as_ref().unwrap()["total_turns"], 2);
     assert_eq!(root.end_ms, Some(13));
