@@ -12,7 +12,7 @@ running if tracing fails.
 ## Quickstart
 
 Install OpenCode and the
-[Braintrust CLI](https://www.braintrust.dev/docs/reference/cli/quickstart), then run:
+[Braintrust CLI](https://docs.braintrust.dev/reference/cli/quickstart), then run:
 
 ```bash
 bt login

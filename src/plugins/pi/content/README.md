@@ -32,7 +32,7 @@ Session (task)
 ## Quickstart
 
 Install Pi and the
-[Braintrust CLI](https://www.braintrust.dev/docs/reference/cli/quickstart), then run:
+[Braintrust CLI](https://docs.braintrust.dev/reference/cli/quickstart), then run:
 
 ```bash
 bt login
