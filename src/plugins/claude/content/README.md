@@ -1,11 +1,26 @@
-# Braintrust tracing for Claude Code
+# Braintrust plugins for Claude Code
 
 > **This repository is generated.** It is built from
 > [braintrustdata/braintrust-coding-agent-plugins](https://github.com/braintrustdata/braintrust-coding-agent-plugins).
 > Don't edit files here — make changes and file issues in that repository, and they
 > will be rebuilt into this one.
 
-A Claude Code plugin marketplace for tracing Claude Code sessions to [Braintrust](https://braintrust.dev).
+This marketplace contains two independently opt-in plugins:
+
+- **Braintrust**, `braintrust@braintrust-claude-plugin`: hosted MCP tools with
+  OAuth. No `bt` dependency or tracing hooks. See the
+  [MCP installation and data plane guide](plugins/braintrust/README.md).
+- **Trace Claude Code**, `trace-claude-code@braintrust-claude-plugin`: session
+  tracing to [Braintrust](https://braintrust.dev) via `bt`.
+
+For MCP, install Braintrust from this marketplace:
+
+```bash
+claude plugin marketplace add braintrustdata/braintrust-claude-plugin
+claude plugin install braintrust@braintrust-claude-plugin
+```
+
+The sections below describe optional tracing setup only.
 
 ## Prerequisites
 
@@ -43,8 +58,8 @@ Every registered lifecycle event is forwarded synchronously to
 `bt trace hook --source claude-code`, preserving per-session ordering. Hook
 failures never fail a Claude Code turn.
 
-This marketplace does not install or configure the Braintrust MCP server. Use
-your agent's native connector or MCP configuration when you want MCP access.
+Tracing setup does not install the Braintrust MCP plugin. MCP sign-in and `bt`
+tracing sign-in are independent.
 
 ## Data handling
 

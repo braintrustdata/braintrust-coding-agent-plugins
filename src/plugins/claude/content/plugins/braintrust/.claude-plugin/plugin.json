@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "braintrust",
+  "displayName": "Braintrust",
+  "version": "3.0.5",
+  "description": "Explore Braintrust traces, manage prompts and datasets, and run evaluations.",
+  "author": {
+    "name": "Braintrust",
+    "email": "support@braintrust.dev",
+    "url": "https://www.braintrust.dev/"
+  },
+  "homepage": "https://www.braintrust.dev/docs/integrations/developer-tools/mcp",
+  "repository": "https://github.com/braintrustdata/braintrust-coding-agent-plugins",
+  "license": "MIT",
+  "keywords": ["braintrust", "evaluations", "observability", "mcp"],
+  "icon": "./.claude-plugin/icon.png",
+  "documentationUrl": "https://www.braintrust.dev/docs/integrations/developer-tools/mcp",
+  "supportUrl": "https://www.braintrust.dev/docs/kb/troubleshooting-guides",
+  "privacyPolicyUrl": "https://www.braintrust.dev/legal/privacy-policy",
+  "termsOfServiceUrl": "https://www.braintrust.dev/legal/terms-of-service"
+}

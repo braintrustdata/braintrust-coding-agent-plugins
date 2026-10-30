@@ -4,6 +4,7 @@
 #
 # The Claude Code marketplace consumes a repo whose ROOT is the marketplace:
 #   .claude-plugin/marketplace.json    marketplace manifest
+#   plugins/braintrust/                hosted MCP plugin (Anthropic directory listing)
 #   plugins/trace-claude-code/         tracing plugin (thin daemon hook shim)
 #
 # Everything is plain shell + config — no compiled artifacts — so the whole

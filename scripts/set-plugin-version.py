@@ -2,7 +2,8 @@
 """Set a release version on every distributed version surface for an agent.
 
 Versioning is per distribution: portable root manifests and compatibility
-manifests share one version. Marketplace manifests are NOT touched.
+manifests share one version. Claude's marketplace catalog version follows its
+plugins; other marketplace manifests are NOT touched.
 
 Only version values are rewritten, so surrounding files keep their formatting.
 
@@ -43,6 +44,11 @@ def main() -> None:
         manifests.extend(matches)
 
     surfaces = [(path, VERSION_RE, "version") for path in manifests]
+    if agent == "claude":
+        # Top-level catalog version; plugin entries carry no version of their own.
+        surfaces.append(
+            ("src/plugins/claude/content/.claude-plugin/marketplace.json", VERSION_RE, "catalog version")
+        )
     if agent == "cursor":
         content = "src/plugins/cursor/content"
         surfaces.extend([
