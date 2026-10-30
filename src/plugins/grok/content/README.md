@@ -12,7 +12,7 @@ Trace Grok coding sessions in Braintrust.
 Prerequisites:
 
 - The [Grok CLI](https://grok.com/build)
-- The [Braintrust CLI (`bt`)](https://www.braintrust.dev/docs/reference/cli/quickstart)
+- The [Braintrust CLI (`bt`)](https://docs.braintrust.dev/reference/cli/quickstart)
 
 Install:
 

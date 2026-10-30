@@ -12,7 +12,7 @@ Trace Google Antigravity coding sessions in Braintrust.
 Prerequisites:
 
 - [Google Antigravity](https://antigravity.google/)
-- The [Braintrust CLI (`bt`)](https://www.braintrust.dev/docs/reference/cli/quickstart)
+- The [Braintrust CLI (`bt`)](https://docs.braintrust.dev/reference/cli/quickstart)
 
 Install the plugin and choose where traces are sent:
 

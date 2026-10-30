@@ -14,7 +14,7 @@ does not enable session tracing.
 ## Get started
 
 Install your coding agent and the
-[Braintrust CLI](https://www.braintrust.dev/docs/reference/cli/quickstart),
+[Braintrust CLI](https://docs.braintrust.dev/reference/cli/quickstart),
 then authenticate and enable tracing. For example:
 
 ```bash
