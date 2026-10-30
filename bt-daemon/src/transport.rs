@@ -9,6 +9,40 @@ use std::path::Path;
 #[cfg(windows)]
 use std::time::Duration;
 
+/// Hold a stable lock file for the lifetime of a Unix listener. A timed-out
+/// RPC cannot establish that the process which bound the socket has died.
+#[cfg(unix)]
+pub(crate) fn lock_endpoint(endpoint: &Path) -> anyhow::Result<Option<std::fs::File>> {
+    let mut name = endpoint.as_os_str().to_os_string();
+    name.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(std::path::PathBuf::from(name))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A departing process (or a short-lived inherited file descriptor) can hold
+/// the lock briefly after removing the socket. Allow that handover to finish.
+#[cfg(unix)]
+pub(crate) async fn wait_for_endpoint_lock(
+    endpoint: &Path,
+) -> anyhow::Result<Option<std::fs::File>> {
+    for _ in 0..50 {
+        if let Some(lock) = lock_endpoint(endpoint)? {
+            return Ok(Some(lock));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(None)
+}
+
 #[cfg(unix)]
 pub(crate) type ClientStream = tokio::net::UnixStream;
 #[cfg(windows)]
@@ -144,14 +178,14 @@ where
 #[cfg(unix)]
 async fn claim_unix<F, Fut>(
     endpoint: &Path,
-    probe_alive: &mut F,
+    _probe_alive: &mut F,
 ) -> anyhow::Result<Option<Listener>>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
     if endpoint.exists() {
-        if probe_alive().await {
+        if unix_endpoint_in_use(endpoint).await? {
             return Ok(None);
         }
         cleanup(endpoint);
@@ -159,7 +193,7 @@ where
     match Listener::bind_raw(endpoint) {
         Ok(listener) => Ok(Some(listener)),
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            if probe_alive().await {
+            if unix_endpoint_in_use(endpoint).await? {
                 Ok(None)
             } else {
                 cleanup(endpoint);
@@ -167,6 +201,25 @@ where
             }
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+/// A successful transport connection proves ownership even when an older
+/// daemon has not started accepting RPCs. A timeout is ambiguous and must not
+/// authorize unlinking a potentially live listener.
+#[cfg(unix)]
+async fn unix_endpoint_in_use(endpoint: &Path) -> anyhow::Result<bool> {
+    match tokio::time::timeout(std::time::Duration::from_secs(1), connect(endpoint)).await {
+        Ok(Ok(_)) | Err(_) => Ok(true),
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Ok(Err(error)) => Err(error.into()),
     }
 }
 
@@ -213,6 +266,56 @@ pub(crate) fn cleanup(endpoint: &Path) {
 
 #[cfg(windows)]
 pub(crate) fn cleanup(_endpoint: &Path) {}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    #[test]
+    fn endpoint_lock_survives_an_unresponsive_owner_and_is_reusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = tmp.path().join("daemon.sock");
+        let owner = super::lock_endpoint(&endpoint).unwrap().unwrap();
+        assert!(super::lock_endpoint(&endpoint).unwrap().is_none());
+        drop(owner);
+        assert!(super::lock_endpoint(&endpoint).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_owner_excludes_a_contender_before_socket_bind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = tmp.path().join("daemon.sock");
+        let owner = super::lock_endpoint(&endpoint).unwrap().unwrap();
+        assert!(!endpoint.exists());
+        let contender_path = endpoint.clone();
+        let mut contender = tokio::spawn(async move {
+            super::wait_for_endpoint_lock(&contender_path)
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut contender)
+                .await
+                .is_err()
+        );
+        assert!(!endpoint.exists());
+        drop(owner);
+        assert!(contender.await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn unresponsive_legacy_listener_is_not_unlinked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = tmp.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        // A legacy daemon doesn't take the new lock or answer initialize while
+        // recovering. Its successful transport connection still owns the path.
+        let claimed = super::claim(&endpoint, || async { false }).await.unwrap();
+        assert!(claimed.is_none());
+        assert!(endpoint.exists());
+        drop(listener);
+        let claimed = super::claim(&endpoint, || async { false }).await.unwrap();
+        assert!(claimed.is_some());
+    }
+}
 
 #[cfg(all(test, windows))]
 mod tests {

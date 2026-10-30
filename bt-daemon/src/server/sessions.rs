@@ -277,6 +277,10 @@ impl Daemon {
             .await?;
         let mut writer = writer.lock().await;
         let before = writer.position();
+        if let Some(cutoffs) = self.startup_cutoffs.lock().as_mut() {
+            let path = journal::source_journal_path(&self.data_dir, &env.source, &env.session_id);
+            cutoffs.entry(path).or_insert(before);
+        }
         let through = writer.append(env).await?;
         Ok((before, through))
     }

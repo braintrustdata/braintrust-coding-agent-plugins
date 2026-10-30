@@ -3,6 +3,169 @@
 //! the journals as overflow when the queue is full.
 
 use super::*;
+use std::collections::VecDeque;
+
+/// Live startup captures remain ordered and bounded. Evicted entries are
+/// already durable; their source journal's high-water mark is replayed first.
+pub(super) struct StartupBuffer {
+    pub(super) events: VecDeque<PendingEvent>,
+    pub(super) evicted: HashMap<PathBuf, EvictedRange>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EvictedRange {
+    pub(super) from: u64,
+    pub(super) through: u64,
+}
+
+impl StartupBuffer {
+    pub(super) fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
+            evicted: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) {
+        if self.events.len() == INGRESS_QUEUE_CAPACITY {
+            if let Some(oldest) = self.events.pop_front() {
+                let path = journal::source_journal_path(
+                    data_dir,
+                    &oldest.env.source,
+                    &oldest.env.session_id,
+                );
+                self.evicted
+                    .entry(path)
+                    .and_modify(|range| range.through = range.through.max(oldest.journal_through))
+                    .or_insert(EvictedRange {
+                        from: oldest.replay_through,
+                        through: oldest.journal_through,
+                    });
+            }
+        }
+        self.events.push_back(event);
+    }
+}
+
+pub(super) enum StartupWork {
+    Evicted(HashMap<PathBuf, EvictedRange>),
+    Event(Box<PendingEvent>),
+    Finished,
+}
+
+impl Daemon {
+    pub(super) fn next_startup_work(&self) -> StartupWork {
+        let mut state = self.startup_buffer.lock();
+        let Some(buffer) = state.as_mut() else {
+            return StartupWork::Finished;
+        };
+        if !buffer.evicted.is_empty() {
+            return StartupWork::Evicted(std::mem::take(&mut buffer.evicted));
+        }
+        if let Some(event) = buffer.events.pop_front() {
+            return StartupWork::Event(Box::new(event));
+        }
+        *state = None;
+        StartupWork::Finished
+    }
+}
+
+pub(super) async fn drain_startup_buffer(daemon: &Arc<Daemon>) -> anyhow::Result<()> {
+    let mut cursors = HashMap::new();
+    loop {
+        match daemon.next_startup_work() {
+            StartupWork::Evicted(bounds) => {
+                replay_evicted_startup(daemon, &mut cursors, &bounds).await?
+            }
+            StartupWork::Event(event) => dispatch_ingress_event(daemon, *event).await,
+            StartupWork::Finished => return Ok(()),
+        }
+    }
+}
+
+pub(super) struct StartupCursor {
+    reader: journal::JournalReader,
+    position: u64,
+}
+
+/// Advance each evicted journal range from its previous position, retaining
+/// the reader's Pi delta context between advances. Older records are decoded
+/// only to initialize that context; they are not dispatched again.
+pub(super) async fn replay_evicted_startup(
+    daemon: &Arc<Daemon>,
+    cursors: &mut HashMap<PathBuf, StartupCursor>,
+    bounds: &HashMap<PathBuf, EvictedRange>,
+) -> anyhow::Result<()> {
+    for (path, range) in bounds {
+        anyhow::ensure!(
+            journal::JournalReader::recorded_len(path).await >= range.through,
+            "evicted startup journal is truncated"
+        );
+        if !cursors.contains_key(path) {
+            let reader = journal::JournalReader::open(path, range.from)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("evicted startup journal disappeared"))?;
+            cursors.insert(
+                path.clone(),
+                StartupCursor {
+                    reader,
+                    position: 0,
+                },
+            );
+        }
+        let cursor = cursors
+            .get_mut(path)
+            .ok_or_else(|| anyhow::anyhow!("startup cursor missing"))?;
+        anyhow::ensure!(
+            cursor.position <= range.from,
+            "evicted startup ranges overlap"
+        );
+        cursor.reader.extend(range.from);
+        while cursor.position < range.from {
+            let entry =
+                cursor.reader.next_record().await?.ok_or_else(|| {
+                    anyhow::anyhow!("evicted startup range begins inside a record")
+                })?;
+            cursor.position = entry.through;
+        }
+        anyhow::ensure!(
+            cursor.position == range.from,
+            "invalid evicted startup boundary"
+        );
+        cursor.reader.extend(range.through);
+        while cursor.position < range.through {
+            let before = cursor.position;
+            let entry = cursor
+                .reader
+                .next_record()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("evicted startup range ends inside a record"))?;
+            cursor.position = entry.through;
+            if let journal::JournalRecord::Event(redacted) = entry.record {
+                let mut env = journal::envelope_from_redacted(redacted);
+                let Some(source) = daemon.translators.canonical_source(&env.source) else {
+                    continue;
+                };
+                env.source = source.to_owned();
+                dispatch_ingress_event(
+                    daemon,
+                    PendingEvent {
+                        env,
+                        replay_through: before,
+                        journal_through: entry.through,
+                        settings_through: None,
+                    },
+                )
+                .await;
+            }
+        }
+        anyhow::ensure!(
+            cursor.position == range.through,
+            "invalid evicted startup end"
+        );
+    }
+    Ok(())
+}
 
 pub(super) enum IngressMsg {
     Event(Box<PendingEvent>),
@@ -14,8 +177,19 @@ pub(super) enum IngressMsg {
 /// journals become the overflow queue and the worker catches them up in place.
 pub(super) const INGRESS_QUEUE_CAPACITY: usize = 64;
 
-pub(super) fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::Receiver<IngressMsg>) {
+pub(super) fn spawn_ingress_worker(
+    daemon: Arc<Daemon>,
+    mut rx: mpsc::Receiver<IngressMsg>,
+    startup: Option<oneshot::Receiver<()>>,
+) {
     tokio::spawn(async move {
+        if let Some(startup) = startup {
+            if startup.await.is_err() {
+                tracing::error!("startup recovery failed; stopping ingress");
+                daemon.trigger_shutdown();
+                return;
+            }
+        }
         loop {
             if daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
                 recover_ingress_overflow(&daemon).await;
@@ -62,6 +236,10 @@ pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingE
     }) {
         return;
     }
+
+    // Startup discovery rebuilds these observations before this worker is
+    // released, so a historical event cannot overwrite a newer capture.
+    daemon.remember_claude_transcripts(&event.env);
 
     let journal_through = event.journal_through;
     // A child may arrive immediately after a parent's tool hook. Catch prior
@@ -323,15 +501,21 @@ impl Daemon {
             .append_to_journal(&mut env)
             .await
             .map_err(|error| format!("journal failed: {error}"))?;
-        self.remember_claude_transcripts(&env);
-        match self
-            .ingress_tx
-            .try_send(IngressMsg::Event(Box::new(PendingEvent {
-                env,
-                replay_through,
-                journal_through,
-                settings_through: None,
-            }))) {
+        let event = PendingEvent {
+            env,
+            replay_through,
+            journal_through,
+            settings_through: None,
+        };
+        let event = {
+            let mut state = self.startup_buffer.lock();
+            if let Some(buffer) = state.as_mut() {
+                buffer.push(&self.data_dir, event);
+                return Ok(true);
+            }
+            event
+        };
+        match self.ingress_tx.try_send(IngressMsg::Event(Box::new(event))) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.ingress_overflow.store(true, Ordering::Release);

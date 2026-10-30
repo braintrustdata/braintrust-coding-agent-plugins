@@ -131,6 +131,10 @@ pub struct Daemon {
     ingress_tx: mpsc::Sender<IngressMsg>,
     ingress_overflow: AtomicBool,
     ingress_dispatched: Mutex<HashMap<DeliveryKey, u64>>,
+    /// Earliest live append during startup, keyed by source journal path.
+    /// Recovery must not absorb queued live events into its historical head.
+    startup_cutoffs: Mutex<Option<HashMap<PathBuf, u64>>>,
+    startup_buffer: Mutex<Option<StartupBuffer>>,
     started: Instant,
     last_activity: Mutex<Instant>,
     /// Prevents a shutdown drain from racing capture that has passed the
@@ -143,8 +147,19 @@ pub struct Daemon {
 }
 
 impl Daemon {
+    #[cfg(test)]
     fn new(opts: ServeOptions, data_dir: PathBuf) -> Arc<Self> {
+        Self::new_with_startup(opts, data_dir, None)
+    }
+
+    fn new_with_startup(
+        opts: ServeOptions,
+        data_dir: PathBuf,
+        startup: Option<oneshot::Receiver<()>>,
+    ) -> Arc<Self> {
         let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_QUEUE_CAPACITY);
+        let startup_cutoffs = startup.as_ref().map(|_| HashMap::new());
+        let startup_buffer = startup.as_ref().map(|_| StartupBuffer::new());
         let daemon = Arc::new(Daemon {
             version: opts.version,
             data_dir,
@@ -171,6 +186,8 @@ impl Daemon {
             ingress_tx,
             ingress_overflow: AtomicBool::new(false),
             ingress_dispatched: Mutex::new(HashMap::new()),
+            startup_cutoffs: Mutex::new(startup_cutoffs),
+            startup_buffer: Mutex::new(startup_buffer),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
             capture_gate: tokio::sync::RwLock::new(()),
@@ -179,7 +196,7 @@ impl Daemon {
             shutting_down: AtomicBool::new(false),
             shutdown: Notify::new(),
         });
-        spawn_ingress_worker(daemon.clone(), ingress_rx);
+        spawn_ingress_worker(daemon.clone(), ingress_rx, startup);
         daemon
     }
 
@@ -228,6 +245,12 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
         paths::ensure_private_dir(parent)?;
     }
 
+    #[cfg(unix)]
+    let Some(ownership) = transport::wait_for_endpoint_lock(&socket).await?
+    else {
+        tracing::info!("another daemon owns {}; exiting", socket.display());
+        return Ok(());
+    };
     let listener = match transport::claim(&socket, || probe_alive(&socket)).await? {
         Some(l) => l,
         None => {
@@ -240,25 +263,50 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
     };
     tracing::info!(socket = %socket.display(), "bt-daemon listening");
 
-    let daemon = Daemon::new(opts, data_dir);
-    restore_active_parent_snapshots(&daemon.data_dir, &daemon.correlation).await;
-    restore_pending_sessions(&daemon).await;
-    collect_garbage(&daemon).await;
-    recover_unprocessed_journals(&daemon).await;
-    spawn_pending_reconciler(daemon.clone());
+    let (ready, startup) = oneshot::channel();
+    let daemon = Daemon::new_with_startup(opts, data_dir, Some(startup));
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
-    spawn_idle_watchdog(daemon.clone(), idle_timeout);
-    spawn_session_reaper(
-        daemon.clone(),
-        Duration::from_secs(args.session_idle_timeout_secs),
-    );
-    spawn_gc(daemon.clone());
+    let session_idle_timeout = Duration::from_secs(args.session_idle_timeout_secs);
+    let recovery_daemon = daemon.clone();
+    let recovery = tokio::spawn(async move {
+        restore_active_parent_snapshots(&recovery_daemon.data_dir, &recovery_daemon.correlation)
+            .await;
+        restore_pending_sessions(&recovery_daemon).await;
+        collect_garbage(&recovery_daemon).await;
+        let candidates = discover_unprocessed_journals(&recovery_daemon).await;
+        *recovery_daemon.startup_cutoffs.lock() = None;
+        for event in candidates {
+            dispatch_ingress_event(&recovery_daemon, event).await;
+        }
+        recovery_daemon.settle_session_actors().await;
+        let _ = retry_pending_sessions(&recovery_daemon).await;
+        if let Err(error) = drain_startup_buffer(&recovery_daemon).await {
+            tracing::error!(%error, "startup ingress recovery failed");
+            recovery_daemon.trigger_shutdown();
+            return;
+        }
+        let _ = ready.send(());
+        if !recovery_daemon.shutting_down.load(Ordering::SeqCst) {
+            spawn_pending_reconciler(recovery_daemon.clone());
+            spawn_idle_watchdog(recovery_daemon.clone(), idle_timeout);
+            spawn_session_reaper(recovery_daemon.clone(), session_idle_timeout);
+            spawn_gc(recovery_daemon);
+        }
+    });
 
     let accept_result = accept_loop(daemon.clone(), listener).await;
 
     // Graceful drain regardless of why we stopped.
+    daemon.trigger_shutdown();
+    if let Err(error) = recovery.await {
+        tracing::error!(%error, "startup recovery task failed");
+    }
     drain_all(&daemon).await;
     transport::cleanup(&socket);
+    #[cfg(unix)]
+    if let Err(error) = fs2::FileExt::unlock(&ownership) {
+        tracing::warn!(%error, "daemon endpoint lock release failed");
+    }
     accept_result
 }
 
