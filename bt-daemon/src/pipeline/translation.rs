@@ -1,4 +1,5 @@
 //! One ordered source consumer. Output publication is independent of route delivery.
+use super::input::{SourceEvent, SourceInput, SourcePosition, SourceRecord};
 use super::journal::{SpanJournal, TranslationCheckpoint};
 use super::prepare::Prepare;
 use super::roots::Roots;
@@ -7,9 +8,7 @@ use super::{
     Stage,
 };
 use crate::{
-    journal::{
-        ControlKind, JournalReader, JournalRecord, JournalWriter, LiveRecords, PipelineControl,
-    },
+    journal::{ControlKind, JournalReader, JournalRecord, JournalWriter, PipelineControl},
     translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, WeakOrigins},
     wire::{SessionConfig, SessionRoute},
 };
@@ -108,6 +107,7 @@ pub(crate) struct TranslationOptions {
     pub data_dir: PathBuf,
     pub events: Arc<tokio::sync::Mutex<JournalWriter>>,
     pub event_path: PathBuf,
+    pub input: SourceInput,
     pub registry: Arc<Registry>,
     pub correlation: Arc<crate::correlation::CorrelationRegistry>,
     pub correlation_changed: Arc<Notify>,
@@ -120,7 +120,6 @@ impl Translation {
             crate::ids::session_storage_id(&options.source, &options.session_id)
         ));
         let journal = SpanJournal::open(&path).await?;
-        let live = options.events.lock().await.live_records();
         let committed = journal.translated_through().await?;
         let progress = Arc::new(Progress {
             requested: AtomicU64::new(committed),
@@ -143,7 +142,7 @@ impl Translation {
             recovery: recovery.clone(),
             translator: None,
             reader: None,
-            live,
+            decoder: Default::default(),
             observers: Vec::new(),
             origins: WeakOrigins::default(),
             roots: Roots::default(),
@@ -285,7 +284,7 @@ struct Producer {
     recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     translator: Option<Box<dyn AgentTranslator>>,
     reader: Option<JournalReader>,
-    live: LiveRecords,
+    decoder: crate::journal::DecoderContext,
     observers: Vec<Observation>,
     origins: WeakOrigins,
     roots: Roots,
@@ -456,24 +455,21 @@ impl Producer {
         &mut self,
         input: u64,
     ) -> anyhow::Result<Option<TranslationCheckpoint>> {
-        if !self.checkpoint_safe || self.translator.is_none() || self.reader.is_none() {
+        if !self.checkpoint_safe || self.translator.is_none() {
             return Ok(None);
         }
         let translator = self
             .translator
             .take()
             .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
-        let reader = self
-            .reader
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("source reader is missing"))?;
+        let decoder = self.decoder.clone();
         let capture = self.capture.clone();
         let bounds = self.bounds.clone();
         let templates = self.templates.clone();
         let version = self.options.version.clone();
         // Context may include a long active conversation. Its encoding and
         // compression must not monopolize a runtime thread serving hook IPC.
-        let (translator, reader, checkpoint) = tokio::task::spawn_blocking(move || {
+        let (translator, checkpoint) = tokio::task::spawn_blocking(move || {
             let checkpoint = (|| -> anyhow::Result<Option<TranslationCheckpoint>> {
                 let Some(state) = translator.save_state()? else {
                     return Ok(None);
@@ -483,7 +479,7 @@ impl Producer {
                     translator: serde_json::value::RawValue::from_string(String::from_utf8(
                         state,
                     )?)?,
-                    decoder: reader.decoder_context().clone(),
+                    decoder,
                     capture,
                     bounds,
                     templates,
@@ -497,11 +493,10 @@ impl Producer {
                     state,
                 }))
             })();
-            (translator, reader, checkpoint)
+            (translator, checkpoint)
         })
         .await?;
         self.translator = Some(translator);
-        self.reader = Some(reader);
         checkpoint
     }
 
@@ -564,13 +559,16 @@ impl Producer {
             bounds.insert(path.clone(), through);
         }
         let control = PipelineControl { kind, bounds };
-        let through = self
-            .options
-            .events
-            .lock()
-            .await
-            .append_control(&control)
-            .await?;
+        let through = {
+            let mut writer = self.options.events.lock().await;
+            let position = writer.append_control_record(&control).await?;
+            let through = position.through;
+            self.options.input.push(SourceRecord {
+                event: SourceEvent::Control(control),
+                position,
+            });
+            through
+        };
         self.progress
             .requested
             .fetch_max(through, Ordering::Relaxed);
@@ -600,6 +598,7 @@ impl Producer {
                 )?,
         );
         self.position = 0;
+        self.decoder = Default::default();
         self.checkpoint_position = 0;
         self.checkpoint_events = 0;
         self.checkpoint_work_bytes = 0;
@@ -627,11 +626,12 @@ impl Producer {
                         &self.options.event_path,
                         input,
                         self.committed,
-                        context.decoder,
+                        context.decoder.clone(),
                     )
                     .await?;
                     self.translator = Some(translator);
                     self.reader = Some(reader);
+                    self.decoder = context.decoder;
                     self.capture = context.capture;
                     self.bounds = context.bounds;
                     self.templates = context.templates;
@@ -648,8 +648,63 @@ impl Producer {
                 }
             }
         }
-        self.reader = JournalReader::open(&self.options.event_path, self.committed).await?;
+        self.reader = if self.committed > 0 {
+            JournalReader::open(&self.options.event_path, self.committed).await?
+        } else {
+            None
+        };
         Ok(())
+    }
+
+    async fn next_input(&mut self, through: u64) -> anyhow::Result<Option<SourceRecord>> {
+        if let Some(record) = self.options.input.take(self.position, through) {
+            if let SourceEvent::Event(event) = &record.event {
+                self.decoder.record_live(&event.event, &record.position);
+            }
+            // A future gap resumes from this logical position. The live path
+            // does not open, seek, read, or pass payloads through a journal reader.
+            self.reader = None;
+            return Ok(Some(record));
+        }
+        if self.position >= through {
+            return Ok(None);
+        }
+        if self.reader.is_none() {
+            self.reader = Some(
+                JournalReader::resume(
+                    &self.options.event_path,
+                    self.position,
+                    through,
+                    self.decoder.clone(),
+                )
+                .await?,
+            );
+        }
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("recovery reader is missing"))?;
+        reader.extend(through);
+        let Some(entry) = reader.next_record().await? else {
+            return Ok(None);
+        };
+        self.decoder = reader.decoder_context().clone();
+        let event = match entry.record {
+            JournalRecord::Event(event) => {
+                SourceEvent::Event(Box::new(crate::journal::envelope_from_redacted(event)))
+            }
+            JournalRecord::Control(control) => SourceEvent::Control(control),
+            JournalRecord::DeliveryCheckpoint { .. } => SourceEvent::LegacyDeliveryCheckpoint,
+        };
+        Ok(Some(SourceRecord {
+            event,
+            position: SourcePosition {
+                before: self.position,
+                through: entry.through,
+                decoded_bytes: entry.decoded_bytes,
+                decoder_base: None,
+            },
+        }))
     }
 
     async fn advance(&mut self, through: u64) -> anyhow::Result<()> {
@@ -666,35 +721,16 @@ impl Producer {
         if self.position >= through {
             return Ok(());
         }
-        let reader = self
-            .reader
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("event journal is missing"))?;
-        reader.extend(through);
         self.phase = Boundary::Journal;
-        loop {
-            let reader = self
-                .reader
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("event journal is missing"))?;
-            // Captured records stay complete in memory. Only an evicted or
-            // historical gap needs a journal read to reconstruct source state.
-            let entry = match reader.next_live(&self.live, through) {
-                Some(entry) => Some(entry),
-                None => reader.next_record().await?,
-            };
-            let Some(entry) = entry else {
-                break;
-            };
-            let input = entry.through;
-            let observation = !matches!(&entry.record,JournalRecord::Control(control) if matches!(control.kind,ControlKind::Retire));
+        while let Some(entry) = self.next_input(through).await? {
+            let input = entry.position.through;
+            let observation = !matches!(&entry.event,SourceEvent::Control(control) if matches!(control.kind,ControlKind::Retire));
             let ctx = SessionCtx {
                 session_id: self.options.session_id.clone(),
                 config: None,
             };
-            let (first, capture) = match entry.record {
-                JournalRecord::Event(event) => {
-                    let mut env = crate::journal::envelope_from_redacted(event);
+            let (first, capture) = match entry.event {
+                SourceEvent::Event(mut env) => {
                     if let Some(route) = &env.route {
                         self.journal.register(route).await?;
                         // Discovery needs subscriptions and transcript references,
@@ -762,7 +798,7 @@ impl Producer {
                         Some(capture),
                     )
                 }
-                JournalRecord::Control(control) => {
+                SourceEvent::Control(control) => {
                     // Retirement exports defensive terminal updates but does not
                     // close native state when rebuilding for later captured work.
                     if input <= self.committed && matches!(control.kind, ControlKind::Retire) {
@@ -787,7 +823,7 @@ impl Producer {
                     };
                     (ops, self.capture.clone())
                 }
-                JournalRecord::DeliveryCheckpoint { .. } => {
+                SourceEvent::LegacyDeliveryCheckpoint => {
                     if input > self.committed {
                         self.journal.begin(input, observation).await?;
                         self.journal.commit(input).await?;
@@ -800,7 +836,7 @@ impl Producer {
             };
             self.publication = Some(Publication {
                 input,
-                decoded_bytes: entry.decoded_bytes,
+                decoded_bytes: entry.position.decoded_bytes,
                 ordinal: 0,
                 observation,
                 capture,
@@ -1027,6 +1063,7 @@ mod tests {
             data_dir: data_dir.into(),
             events,
             event_path: crate::journal::source_journal_path(data_dir, source, "checkpoint"),
+            input: SourceInput::default(),
             registry: Arc::new(Registry::default_agents()),
             correlation: Arc::default(),
             correlation_changed: Arc::default(),
@@ -1040,17 +1077,17 @@ mod tests {
         let writer = Arc::new(tokio::sync::Mutex::new(
             JournalWriter::open_path(&path).await.unwrap(),
         ));
-        let translation = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
-            .await
-            .unwrap();
+        let options = resume_options(tmp.path(), "debug", writer.clone());
+        let input = options.input.clone();
+        let translation = Translation::spawn(options).await.unwrap();
         let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
             "source":"debug", "session_id":"checkpoint", "event":"event", "ts_ms":1,
             "payload":{"history":"shared history".repeat(1024),"index":0}
         }))
         .unwrap();
-        writer.lock().await.append(&event).await.unwrap();
+        capture(&writer, &input, &event).await;
         event.payload["index"] = 1.into();
-        let through = writer.lock().await.append(&event).await.unwrap();
+        let through = capture(&writer, &input, &event).await;
         let original = tokio::fs::read(&path).await.unwrap();
         assert!(String::from_utf8_lossy(&original).contains("payload_delta_v1"));
         // A journal read would fail. The complete captured records are still
@@ -1096,6 +1133,72 @@ mod tests {
         resumed.shutdown().await;
     }
 
+    async fn capture(
+        writer: &Arc<tokio::sync::Mutex<JournalWriter>>,
+        input: &SourceInput,
+        event: &crate::wire::Envelope,
+    ) -> u64 {
+        let mut writer = writer.lock().await;
+        let position = writer.append_ordered(event, None).await.unwrap();
+        let through = position.through;
+        input.push_event(event.clone(), position);
+        through
+    }
+
+    #[tokio::test]
+    async fn evicted_input_recovers_only_the_gap_then_rejoins_direct_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "checkpoint");
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            JournalWriter::open_path(&path).await.unwrap(),
+        ));
+        let options = resume_options(tmp.path(), "debug", writer.clone());
+        let input = options.input.clone();
+        let translation = Translation::spawn(options).await.unwrap();
+        let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
+            "source":"debug", "session_id":"checkpoint", "event":"event", "ts_ms":1,
+            "payload":{"history":"shared".repeat(1024),"index":0}
+        }))
+        .unwrap();
+        for batch in 0..2 {
+            let mut recovery_end = 0;
+            let mut through = 0;
+            for index in 0..80 {
+                event.payload["index"] = (batch * 80 + index).into();
+                through = capture(&writer, &input, &event).await;
+                if index == 15 {
+                    recovery_end = through;
+                }
+            }
+            // Only the first 16 records were evicted. Poison the retained
+            // live suffix so any attempt to read it through storage fails.
+            let mut stored = tokio::fs::read(&path).await.unwrap();
+            for byte in &mut stored[recovery_end as usize..through as usize] {
+                if *byte != b'\n' {
+                    *byte = b'x';
+                }
+            }
+            tokio::fs::write(&path, stored).await.unwrap();
+            translation.advance(through).await.unwrap();
+            translation.barrier().await.unwrap();
+            assert!(input.is_empty());
+        }
+        let rows = translation.journal.read_after(0, 256).await.unwrap();
+        let inputs = rows
+            .iter()
+            .filter_map(|(_, op)| {
+                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                row.input.as_ref()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 160);
+        for (index, payload) in inputs.into_iter().enumerate() {
+            assert_eq!(payload["index"], index);
+            assert_eq!(payload["history"], event.payload["history"]);
+        }
+        translation.shutdown().await;
+    }
+
     struct BlockedCheckpoint {
         entered: Arc<Notify>,
         release: std::sync::mpsc::Receiver<()>,
@@ -1138,7 +1241,7 @@ mod tests {
                 release: resume,
             })),
             reader: JournalReader::open(&path, 0).await.unwrap(),
-            live: writer.lock().await.live_records(),
+            decoder: Default::default(),
             observers: Vec::new(),
             origins: WeakOrigins::default(),
             roots: Roots::default(),
@@ -1518,6 +1621,7 @@ mod tests {
                 JournalWriter::open_path(&event_path).await.unwrap(),
             )),
             event_path,
+            input: SourceInput::default(),
             registry: Arc::new(Registry::default_agents()),
             correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
             correlation_changed: Arc::new(Notify::new()),
@@ -1548,6 +1652,7 @@ mod tests {
                 JournalWriter::open_path(&event_path).await.unwrap(),
             )),
             event_path,
+            input: SourceInput::default(),
             registry: Arc::new(Registry::default_agents()),
             correlation: correlation.clone(),
             correlation_changed: Arc::new(Notify::new()),
@@ -1643,6 +1748,7 @@ mod tests {
                 JournalWriter::open_path(&event_path).await.unwrap(),
             )),
             event_path,
+            input: SourceInput::default(),
             registry: Arc::new(Registry::default_agents()),
             correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
             correlation_changed: Arc::new(Notify::new()),
@@ -1698,6 +1804,7 @@ mod tests {
                     JournalWriter::open_path(&event_path).await.unwrap(),
                 )),
                 event_path,
+                input: SourceInput::default(),
                 registry: Arc::new(Registry::default_agents()),
                 correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
                 correlation_changed: Arc::new(Notify::new()),
@@ -1708,7 +1815,7 @@ mod tests {
             recovery: Arc::new(Mutex::new(None)),
             translator: Some(Box::new(CountedTranslation(drains.clone()))),
             reader: None,
-            live: LiveRecords::default(),
+            decoder: Default::default(),
             observers: Vec::new(),
             origins: WeakOrigins::default(),
             roots: Roots::default(),

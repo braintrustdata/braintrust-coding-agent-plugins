@@ -550,11 +550,25 @@ impl Daemon {
 
     /// Caller holds the source-session capture lock; frozen observations enter
     /// the same durable queue as hooks without reacquiring that lock.
-    pub(super) async fn journal_and_enqueue(&self, mut env: Envelope) -> Result<bool, String> {
-        let (replay_through, journal_through) = self
-            .append_to_journal(&mut env)
+    pub(super) async fn journal_and_enqueue(&self, env: Envelope) -> Result<bool, String> {
+        let writer = self
+            .journal_writer_for(&env.source, &env.session_id)
             .await
             .map_err(|error| format!("journal failed: {error}"))?;
+        let input = self.source_input_for(&env.source, &env.session_id);
+        let (replay_through, journal_through) = {
+            let mut writer = writer.lock().await;
+            // Storage is a side branch: it receives a copy and returns only
+            // durable position/context metadata. The stage receives the
+            // original complete event directly from capture.
+            let position = self
+                .append_to_journal(&env, &mut writer)
+                .await
+                .map_err(|error| format!("journal failed: {error}"))?;
+            let bounds = (position.before, position.through);
+            input.push_event(env.clone(), position);
+            bounds
+        };
         let event = PendingEvent {
             env,
             replay_through,

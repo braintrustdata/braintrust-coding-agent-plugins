@@ -64,6 +64,7 @@ impl Daemon {
                         data_dir: self.data_dir.clone(),
                         events: journal.clone(),
                         event_path: event_path.clone(),
+                        input: self.source_input_for(&env.source, &env.session_id),
                         registry: self.translators.clone(),
                         correlation: self.correlation.clone(),
                         correlation_changed: self.correlation_changed.clone(),
@@ -222,6 +223,14 @@ impl Daemon {
                 candidate.source != key.source || candidate.session_id != key.session_id
             });
             self.journals.lock().remove(&storage_key);
+            let mut inputs = self.source_inputs.lock();
+            if inputs
+                .get(&storage_key)
+                .is_some_and(|input| input.is_empty())
+            {
+                inputs.remove(&storage_key);
+            }
+            drop(inputs);
             self.translations.lock().remove(&storage_key);
             {
                 let mut locks = self.session_locks.lock();
@@ -272,11 +281,23 @@ impl Daemon {
             .clone())
     }
 
-    pub(super) async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<(u64, u64)> {
-        let writer = self
-            .journal_writer_for(&env.source, &env.session_id)
-            .await?;
-        let mut writer = writer.lock().await;
+    pub(super) fn source_input_for(
+        &self,
+        source: &str,
+        session_id: &str,
+    ) -> crate::pipeline::input::SourceInput {
+        self.source_inputs
+            .lock()
+            .entry(crate::ids::session_namespace(source, session_id))
+            .or_default()
+            .clone()
+    }
+
+    pub(super) async fn append_to_journal(
+        &self,
+        env: &Envelope,
+        writer: &mut JournalWriter,
+    ) -> anyhow::Result<crate::pipeline::input::SourcePosition> {
         let before = writer.position();
         if let Some(cutoffs) = self.startup_cutoffs.lock().as_mut() {
             let path = journal::source_journal_path(&self.data_dir, &env.source, &env.session_id);
@@ -285,8 +306,7 @@ impl Daemon {
         // Related hooks cannot begin until their predecessor's durable append
         // is acknowledged. Concurrent sessions need no stronger total order.
         let sequence = self.capture_sequence.fetch_add(1, Ordering::Relaxed);
-        let through = writer.append_ordered(env, Some(sequence)).await?;
-        Ok((before, through))
+        writer.append_ordered(env, Some(sequence)).await
     }
 
     pub(super) fn session_lock(

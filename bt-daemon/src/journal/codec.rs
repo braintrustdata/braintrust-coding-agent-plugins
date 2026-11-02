@@ -191,6 +191,19 @@ pub(crate) struct DecoderContext {
     pub(crate) legacy_pi: Vec<Value>,
     pub(super) payloads: PayloadCache,
 }
+impl DecoderContext {
+    /// Observe storage metadata independently of the original live payload.
+    /// This base is saved for recovery; live translation never decodes it.
+    pub(crate) fn record_live(
+        &mut self,
+        event: &str,
+        position: &crate::pipeline::input::SourcePosition,
+    ) {
+        self.legacy_pi.clear();
+        self.payloads
+            .record(event, position.through, position.decoder_base.clone());
+    }
+}
 impl<'de> Deserialize<'de> for DecoderContext {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]

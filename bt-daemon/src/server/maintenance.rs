@@ -379,6 +379,7 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     daemon.sessions.lock().clear();
     daemon.translations.lock().clear();
     daemon.journals.lock().clear();
+    daemon.source_inputs.lock().clear();
     let (reply, done) = oneshot::channel();
     if daemon
         .ingress_tx

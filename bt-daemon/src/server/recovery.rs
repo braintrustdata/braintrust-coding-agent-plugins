@@ -359,6 +359,7 @@ mod tests {
             data_dir: tmp.path().into(),
             events: writer.clone(),
             event_path: raw.clone(),
+            input: crate::pipeline::input::SourceInput::default(),
             registry: Arc::new(Registry::default_agents()),
             correlation: Arc::default(),
             correlation_changed: Arc::default(),

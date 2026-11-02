@@ -11,9 +11,9 @@
 //! daemon that accepted them has restarted or idle-exited.
 
 mod codec;
-mod live;
+use crate::pipeline::input::SourcePosition;
+pub use crate::pipeline::input::{ControlKind, PipelineControl};
 pub(crate) use codec::DecoderContext;
-pub(crate) use live::LiveRecords;
 
 use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
 use serde::{Deserialize, Serialize};
@@ -227,7 +227,6 @@ pub struct JournalWriter {
     file: tokio::fs::File,
     position: u64,
     payloads: codec::PayloadCache,
-    live: LiveRecords,
 }
 
 impl JournalWriter {
@@ -245,16 +244,11 @@ impl JournalWriter {
             file,
             position,
             payloads: codec::PayloadCache::default(),
-            live: LiveRecords::default(),
         })
     }
 
     pub(crate) fn position(&self) -> u64 {
         self.position
-    }
-
-    pub(crate) fn live_records(&self) -> LiveRecords {
-        self.live.clone()
     }
 
     /// Append one redacted event and confirm its durable write before capture acknowledges it.
@@ -266,14 +260,16 @@ impl JournalWriter {
     /// byte once, and replay streams records without loading the whole log.
     #[cfg(test)]
     pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<u64> {
-        self.append_ordered(env, None).await
+        self.append_ordered(env, None)
+            .await
+            .map(|position| position.through)
     }
 
     pub(crate) async fn append_ordered(
         &mut self,
         env: &Envelope,
         sequence: Option<u64>,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<SourcePosition> {
         #[derive(Serialize)]
         struct Captured<'a> {
             #[serde(flatten)]
@@ -284,20 +280,17 @@ impl JournalWriter {
         }
         let mut redacted = env.redacted();
         let (json, delta) = self.payloads.encode(&env.event, &redacted.payload)?;
-        let (record_type, original) = if let Some(delta) = delta {
-            let original = std::mem::replace(&mut redacted.payload, serde_json::to_value(delta)?);
-            (codec::DELTA_RECORD, Some(original))
+        let record_type = if let Some(delta) = delta {
+            redacted.payload = serde_json::to_value(delta)?;
+            codec::DELTA_RECORD
         } else {
-            ("event", None)
+            "event"
         };
         let mut line = serde_json::to_vec(&Captured {
             envelope: &redacted,
             _bt_record_type: record_type,
             _bt_capture_sequence: sequence,
         })?;
-        if let Some(original) = original {
-            redacted.payload = original;
-        }
         line.push(b'\n');
         self.file.write_all(&line).await?;
         self.file.flush().await?;
@@ -306,24 +299,29 @@ impl JournalWriter {
         self.position += line.len() as u64;
         self.payloads
             .record(&env.event, self.position, json.clone());
-        self.live.push(live::LiveRecord {
+        Ok(SourcePosition {
             before,
-            entry: JournalRecordEntry {
-                record: JournalRecord::Event(redacted),
-                through: self.position,
-                decoded_bytes: (line.len() as u64)
-                    .max(json.as_ref().map_or(0, |json| json.len() as u64)),
-                capture_sequence: sequence,
-            },
-            json,
-        });
-        Ok(self.position)
+            through: self.position,
+            decoded_bytes: (line.len() as u64)
+                .max(json.as_ref().map_or(0, |json| json.len() as u64)),
+            decoder_base: json,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_control(
         &mut self,
         control: &PipelineControl,
     ) -> anyhow::Result<u64> {
+        self.append_control_record(control)
+            .await
+            .map(|position| position.through)
+    }
+
+    pub(crate) async fn append_control_record(
+        &mut self,
+        control: &PipelineControl,
+    ) -> anyhow::Result<SourcePosition> {
         let mut value = serde_json::to_value(control)?;
         value["_bt_record_type"] = "pipeline_control".into();
         let mut line = serde_json::to_vec(&value)?;
@@ -333,17 +331,12 @@ impl JournalWriter {
         self.file.sync_data().await?;
         let before = self.position;
         self.position += line.len() as u64;
-        self.live.push(live::LiveRecord {
+        Ok(SourcePosition {
             before,
-            entry: JournalRecordEntry {
-                record: JournalRecord::Control(control.clone()),
-                through: self.position,
-                decoded_bytes: line.len() as u64,
-                capture_sequence: None,
-            },
-            json: None,
-        });
-        Ok(self.position)
+            through: self.position,
+            decoded_bytes: line.len() as u64,
+            decoder_base: None,
+        })
     }
 }
 
@@ -363,20 +356,6 @@ pub enum JournalRecord {
     Event(RedactedEnvelope),
     Control(PipelineControl),
     DeliveryCheckpoint { route: SessionRoute, through: u64 },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlKind {
-    Checkpoint,
-    Finalize,
-    Retire,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineControl {
-    pub kind: ControlKind,
-    pub bounds: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug)]
@@ -400,34 +379,11 @@ pub struct JournalReader {
     line_no: usize,
     position: u64,
     decoder: DecoderContext,
-    through: u64,
-    needs_seek: bool,
-    #[cfg(test)]
-    disk_records: u64,
 }
 
 impl JournalReader {
     pub(crate) fn decoder_context(&self) -> &DecoderContext {
         &self.decoder
-    }
-
-    /// Consume a complete captured record without touching the journal file.
-    /// Keep its decoder base solely for checkpoints and later disk recovery.
-    pub(crate) fn next_live(
-        &mut self,
-        live: &LiveRecords,
-        through: u64,
-    ) -> Option<JournalRecordEntry> {
-        let record = live.take(self.position, through)?;
-        if let JournalRecord::Event(event) = &record.entry.record {
-            self.decoder.legacy_pi.clear();
-            self.decoder
-                .payloads
-                .record(&event.event, record.entry.through, record.json);
-        }
-        self.position = record.entry.through;
-        self.needs_seek = true;
-        Some(record.entry)
     }
 
     /// Resume any source journal at a committed byte offset with its saved
@@ -457,10 +413,6 @@ impl JournalReader {
             line_no: 0,
             position,
             decoder: decoder_context,
-            through,
-            needs_seek: false,
-            #[cfg(test)]
-            disk_records: 0,
         })
     }
     /// Open a journal for streaming, reading at most `through` bytes.
@@ -482,10 +434,6 @@ impl JournalReader {
             line_no: 0,
             position: 0,
             decoder: DecoderContext::default(),
-            through,
-            needs_seek: false,
-            #[cfg(test)]
-            disk_records: 0,
         }))
     }
 
@@ -511,33 +459,11 @@ impl JournalReader {
     /// The next journal record, including delivery checkpoints written by a
     /// previous daemon generation.
     pub async fn next_record(&mut self) -> anyhow::Result<Option<JournalRecordEntry>> {
-        if self.position >= self.through {
-            return Ok(None);
-        }
-        if self.needs_seek {
-            // Live records can skip beyond buffered disk data. Reposition only
-            // when an evicted or historical record actually needs recovery.
-            let buffered = self.reader.buffer().len();
-            self.reader.consume(buffered);
-            self.reader
-                .get_mut()
-                .get_mut()
-                .seek(std::io::SeekFrom::Start(self.position))
-                .await?;
-            self.reader
-                .get_mut()
-                .set_limit(self.through - self.position);
-            self.needs_seek = false;
-        }
         loop {
             let mut bytes = Vec::new();
             let read = self.reader.read_until(b'\n', &mut bytes).await?;
             if read == 0 {
                 return Ok(None);
-            }
-            #[cfg(test)]
-            {
-                self.disk_records += 1;
             }
             self.position += read as u64;
             self.line_no += 1;
@@ -626,10 +552,6 @@ impl JournalReader {
     }
 
     pub(crate) fn extend(&mut self, through: u64) {
-        self.through = through;
-        if self.needs_seek {
-            return;
-        }
         let buffered = self.reader.buffer().len() as u64;
         self.reader
             .get_mut()
@@ -948,99 +870,6 @@ mod tests {
             }
             assert_eq!(boundary, stored.len() as u64);
         }
-    }
-
-    #[tokio::test]
-    async fn complete_live_records_bypass_disk_and_delta_expansion_for_every_source() {
-        for source in crate::translate::Registry::default_agents().sources() {
-            let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("events.ndjson");
-            let mut writer = JournalWriter::open_path(&path).await.unwrap();
-            let live = writer.live_records();
-            let mut expected = Vec::new();
-            for index in 0..4 {
-                let mut event = pi_context(vec![], index);
-                event.source = source.clone();
-                event.payload =
-                    serde_json::json!({"history":"shared history".repeat(1024),"index":index});
-                writer.append(&event).await.unwrap();
-                expected.push(event);
-            }
-            let contents = tokio::fs::read_to_string(&path).await.unwrap();
-            assert!(contents.contains(codec::DELTA_RECORD));
-            let through = writer.position();
-            let mut reader = JournalReader::open(&path, through).await.unwrap().unwrap();
-            for expected in expected {
-                let entry = reader
-                    .next_live(&live, through)
-                    .expect("retained live event");
-                let JournalRecord::Event(actual) = entry.record else {
-                    panic!("expected event")
-                };
-                assert_eq!(actual.payload, expected.payload, "{source}");
-            }
-            assert!(reader.next_record().await.unwrap().is_none());
-            assert_eq!(reader.disk_records, 0, "{source} read back live events");
-        }
-    }
-
-    #[tokio::test]
-    async fn evicted_records_recover_from_disk_then_rejoin_the_complete_live_feed() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("events.ndjson");
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let live = writer.live_records();
-        let mut reader = JournalReader::open(&path, 0).await.unwrap().unwrap();
-        for batch in 0..2 {
-            for index in 0..80 {
-                let mut event = pi_context(vec![], index);
-                event.payload =
-                    serde_json::json!({"history":"repeated".repeat(1024),"index":batch*80+index});
-                writer.append(&event).await.unwrap();
-            }
-            let through = writer.position();
-            reader.extend(through);
-            for index in 0..80 {
-                let entry = match reader.next_live(&live, through) {
-                    Some(entry) => entry,
-                    None => reader.next_record().await.unwrap().unwrap(),
-                };
-                let JournalRecord::Event(event) = entry.record else {
-                    panic!("expected event")
-                };
-                assert_eq!(event.payload["index"], batch * 80 + index);
-                assert_eq!(event.payload["history"], "repeated".repeat(1024));
-            }
-            assert!(reader.next_record().await.unwrap().is_none());
-            assert_eq!(reader.disk_records, ((batch + 1) * 16) as u64);
-        }
-    }
-
-    #[tokio::test]
-    async fn live_feed_bounds_decoded_bytes_and_allows_one_oversized_event() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("events.ndjson");
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let live = writer.live_records();
-        let mut event = pi_context(vec![], 0);
-        event.payload = serde_json::json!({"history":"x".repeat(9 * 1024 * 1024)});
-        let first = writer.append(&event).await.unwrap();
-        let mut reader = JournalReader::open(&path, 0).await.unwrap().unwrap();
-        assert!(
-            reader.next_live(&live, first).is_some(),
-            "an oversized event must still flow directly"
-        );
-        let second = writer.append(&event).await.unwrap();
-        event.payload = serde_json::json!({"history":"x".repeat(3 * 1024 * 1024)});
-        let third = writer.append(&event).await.unwrap();
-        assert!(
-            reader.next_live(&live, third).is_none(),
-            "byte pressure must evict the oversized event"
-        );
-        reader.extend(second);
-        assert_eq!(reader.next_record().await.unwrap().unwrap().through, second);
-        assert_eq!(reader.next_live(&live, third).unwrap().through, third);
-        assert_eq!(reader.disk_records, 1);
     }
 
     #[tokio::test]
