@@ -358,12 +358,13 @@ impl JournalReader {
         &self.pi_context
     }
 
-    /// Resume at a committed record boundary with the Pi delta decoder's base.
+    /// Resume any source journal at a committed byte offset. Ordinary NDJSON
+    /// needs no decoder context; Pi's delta encoding also needs its saved base.
     pub(crate) async fn resume(
         path: &Path,
         position: u64,
         through: u64,
-        pi_context: Vec<serde_json::Value>,
+        decoder_context: Vec<serde_json::Value>,
     ) -> anyhow::Result<Self> {
         let mut file = tokio::fs::File::open(path).await?;
         anyhow::ensure!(
@@ -383,7 +384,7 @@ impl JournalReader {
             path: path.to_owned(),
             line_no: 0,
             position,
-            pi_context,
+            pi_context: decoder_context,
         })
     }
     /// Open a journal for streaming, reading at most `through` bytes.

@@ -1072,6 +1072,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_agent_journal_resumes_at_its_persisted_byte_offset() {
+        for source in Registry::default_agents().sources() {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = crate::journal::source_journal_path(tmp.path(), &source, "checkpoint");
+            let writer = Arc::new(tokio::sync::Mutex::new(
+                JournalWriter::open_path(&path).await.unwrap(),
+            ));
+            let translation =
+                Translation::spawn(resume_options(tmp.path(), &source, writer.clone()))
+                    .await
+                    .unwrap();
+            let control = PipelineControl {
+                kind: ControlKind::Checkpoint,
+                bounds: HashMap::new(),
+            };
+            let mut tail = 0;
+            // Ordered controls exercise the real producer and each concrete
+            // translator without depending on a particular native hook schema.
+            // Native open-span/state equivalence is covered separately.
+            for _ in 0..CHECKPOINT_EVENTS + 3 {
+                tail = writer.lock().await.append_control(&control).await.unwrap();
+            }
+            translation.advance(tail).await.unwrap();
+            translation.barrier().await.unwrap();
+            let checkpoint = translation
+                .journal
+                .translation_checkpoint()
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                checkpoint.input > 0 && checkpoint.input < tail,
+                "{source}: periodic checkpoint must precede the uncheckpointed suffix"
+            );
+            let task = translation.task.lock().await.take().unwrap();
+            task.abort();
+            let _ = task.await;
+            let mut contents = tokio::fs::read(&path).await.unwrap();
+            for byte in &mut contents[..checkpoint.input as usize] {
+                if *byte != b'\n' {
+                    *byte = b'x';
+                }
+            }
+            tokio::fs::write(&path, contents).await.unwrap();
+            tail = writer.lock().await.append_control(&control).await.unwrap();
+            let resumed = Translation::spawn(resume_options(tmp.path(), &source, writer.clone()))
+                .await
+                .unwrap();
+            resumed.advance(tail).await.unwrap();
+            resumed.barrier().await.unwrap_or_else(|error| {
+                panic!("{source} could not resume past its saved byte offset: {error}")
+            });
+            assert_eq!(
+                resumed.journal.translated_through().await.unwrap(),
+                tail,
+                "{source}"
+            );
+            resumed.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn checkpoint_seeks_past_completed_history_and_restores_pi_delta_context() {
         for source in ["debug", "pi"] {
             let tmp = tempfile::tempdir().unwrap();
