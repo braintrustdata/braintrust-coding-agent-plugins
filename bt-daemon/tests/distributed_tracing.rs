@@ -54,14 +54,20 @@ impl RecordingSinkFactory {
 
 impl SinkFactory for RecordingSinkFactory {
     fn create(&self, session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>> {
-        let record = Arc::new(RecordedSession {
-            source: source.into(),
-            ..RecordedSession::default()
-        });
-        self.sessions
+        // Reopening a delivery sink must preserve events already accepted before
+        // a daemon restart, just as the destination does.
+        let record = self
+            .sessions
             .lock()
             .unwrap()
-            .insert(session_id.into(), record.clone());
+            .entry(session_id.into())
+            .or_insert_with(|| {
+                Arc::new(RecordedSession {
+                    source: source.into(),
+                    ..RecordedSession::default()
+                })
+            })
+            .clone();
         Ok(Box::new(RecordingSink { record }))
     }
 }
@@ -3307,10 +3313,14 @@ async fn flush(session: &str, socket: &Path) {
     let result = flush_session(session, socket, 5_000)
         .await
         .unwrap_or_else(|error| panic!("flush {session}: {error}"));
-    assert!(
-        result.flushed && result.pending == 0,
-        "session {session} did not fully flush: {result:?}"
-    );
+    if !result.flushed || result.pending != 0 {
+        let status = run_status(StatusArgs {
+            socket: Some(socket.to_owned()),
+            session_id: Some(session.to_owned()),
+        })
+        .await;
+        panic!("session {session} did not fully flush: {result:?}; status: {status:?}");
+    }
 }
 
 async fn start_daemon() -> (

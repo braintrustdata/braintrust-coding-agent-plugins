@@ -1,4 +1,8 @@
 //! Concrete durable channel: one ordered SpanOp log and a head per route.
+//!
+//! Tracking mutations acquire SQLite write access before reading. Deferred
+//! read-to-write upgrades can fail without waiting when another connection
+//! writes concurrently, even with a busy timeout.
 use super::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
 use super::{
     delivery::InputPort,
@@ -331,7 +335,7 @@ impl SpanJournal {
         checkpoint: TranslationCheckpoint,
     ) -> anyhow::Result<()> {
         self.with_db(move |db| {
-            let tx = db.transaction()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let head: u64 = tx.query_row(
                 "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
                 [],
@@ -354,7 +358,7 @@ impl SpanJournal {
     /// Restart abandons only invisible receipts; a committed identity is never rewritten.
     pub async fn begin(&self, input: u64, observation: bool) -> anyhow::Result<bool> {
         self.with_db(move |db| {
-            let tx = db.transaction()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let done: Option<bool> = tx
                 .query_row(
                     "SELECT committed FROM batches WHERE input=?",
@@ -530,7 +534,7 @@ impl SpanJournal {
             .map(StoredOp::encode)
             .collect::<anyhow::Result<Vec<_>>>()?;
         self.with_db(move |db| {
-            let tx = db.transaction()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let done: bool = tx.query_row(
                 "SELECT committed FROM batches WHERE input=?",
                 [input],
@@ -614,7 +618,7 @@ impl SpanJournal {
     ) -> anyhow::Result<u64> {
         let tail = self
             .with_db(move |db| {
-                let tx = db.transaction()?;
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let previous: u64 = tx.query_row(
                     "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
                     [],
@@ -678,7 +682,7 @@ impl SpanJournal {
         let key = route.clone();
         let position = self
             .with_db(move |db| {
-                let tx = db.transaction()?;
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // Auth can register a named-profile obligation before learning
                 // its stable ID. Move that unresolved placeholder to the resolved
                 // identity instead of leaving a second head that can never run.
@@ -895,7 +899,7 @@ impl SpanJournal {
     ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
         let route = route.clone();
         self.with_db(move |db| {
-            let tx = db.transaction()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let updates = {
                 let mut query = tx.prepare(
                     "SELECT route,failure,settings FROM heads WHERE failure IS NOT NULL AND settings_through<?",
@@ -1434,7 +1438,7 @@ impl Completion for HeadCompletion {
         let (route, expected, through) = (self.route.clone(), self.expected, self.through);
         self.journal
             .with_db(move |db| {
-                let tx = db.transaction()?;
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let head: u64 =
                     tx.query_row("SELECT position FROM heads WHERE route=?", [&route], |r| {
                         r.get(0)
@@ -1615,6 +1619,32 @@ mod tests {
             second.value()[0].as_ref()
         ));
         assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn translation_begin_waits_for_a_concurrent_writer_before_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("concurrent.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let mut peer = Connection::open(&path).unwrap();
+        let transaction = peer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute("INSERT INTO batches(input,committed) VALUES(10,1)", [])
+            .unwrap();
+        let begin = tokio::spawn(async move { journal.begin(10, true).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let failed_early = begin.is_finished();
+        transaction.commit().unwrap();
+        assert!(
+            !begin.await.unwrap().unwrap(),
+            "a committed input must remain committed after waiting for its writer"
+        );
+        assert!(
+            !failed_early,
+            "a read-before-write transaction must wait rather than fail to upgrade its snapshot"
+        );
     }
 
     #[tokio::test]
