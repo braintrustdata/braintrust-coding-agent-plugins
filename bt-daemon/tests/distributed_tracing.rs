@@ -42,6 +42,7 @@ struct RecordingSinkFactory {
 }
 
 impl RecordingSinkFactory {
+    #[track_caller]
     fn session(&self, session_id: &str) -> Arc<RecordedSession> {
         self.sessions
             .lock()
@@ -3031,13 +3032,28 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         if format != "current" {
             let again_recording = Arc::new(RecordingSinkFactory::default());
             let again = spawn_daemon(socket.clone(), data_dir, again_recording.clone()).await;
+            // Exercise new work after restart. A Stop for a turn already
+            // completed during recovery may correctly produce no output and
+            // therefore never create a delivery sink.
+            forward_all(
+                &mut fixtures.start_turn(
+                    AgentKind::Claude,
+                    "bounded-child",
+                    &ProcessTree::child(40_002, 40_001, &ProcessTree::root(40_000)),
+                    "new work after upgrade",
+                    1_702_100_000_050,
+                ),
+                &socket,
+                &host,
+            )
+            .await;
             forward(
                 fixtures.close_session(
                     AgentKind::Claude,
                     "bounded-child",
                     &ProcessTree::child(40_002, 40_001, &ProcessTree::root(40_000)),
                     "after upgrade",
-                    1_702_100_000_050,
+                    1_702_100_000_060,
                 ),
                 &socket,
                 &host,
@@ -3045,6 +3061,10 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
             .await;
             flush("bounded-child", &socket).await;
             let child = again_recording.session("bounded-child");
+            assert!(inserted_rows(&child).iter().any(|row| row
+                .input
+                .as_ref()
+                .is_some_and(|input| input.to_string().contains("new work after upgrade"))));
             assert!(child
                 .configs
                 .lock()
@@ -3313,7 +3333,7 @@ async fn flush(session: &str, socket: &Path) {
     let result = flush_session(session, socket, 5_000)
         .await
         .unwrap_or_else(|error| panic!("flush {session}: {error}"));
-    if !result.flushed || result.pending != 0 {
+    if !result.flushed || result.pending != 0 || result.accepted_sessions == 0 {
         let status = run_status(StatusArgs {
             socket: Some(socket.to_owned()),
             session_id: Some(session.to_owned()),
