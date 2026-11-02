@@ -820,14 +820,6 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    mod streams {
-        use crate as bt_daemon;
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/translation_streams.rs"
-        ));
-    }
-
     fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
         Envelope {
             source: "pi".into(),
@@ -842,104 +834,6 @@ mod tests {
             route: None,
             config: None,
         }
-    }
-
-    #[tokio::test]
-    async fn compressed_recovery_matches_live_native_translation_for_every_source() {
-        use crate::translate::{AgentTranslator, Registry, SessionCtx, SpanOp};
-        fn collect(
-            translator: &mut dyn AgentTranslator,
-            env: &Envelope,
-            ctx: &SessionCtx,
-        ) -> Vec<String> {
-            let mut ops = translator.handle(env, ctx).unwrap();
-            while let Some(batch) = translator.drain_pending(ctx).unwrap() {
-                ops.extend(batch);
-            }
-            comparable(ops)
-        }
-        fn comparable(ops: Vec<SpanOp>) -> Vec<String> {
-            let mut values = ops
-                .into_iter()
-                .map(|op| {
-                    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &op;
-                    serde_json::to_string(&(
-                        &op,
-                        &row.turn_span_id,
-                        row.is_turn,
-                        &row.late_merge_key,
-                        &row.late_merge_version,
-                    ))
-                    .unwrap()
-                })
-                .collect::<Vec<_>>();
-            values.sort();
-            values
-        }
-        let registry = Registry::default_agents();
-        let mut covered = Vec::new();
-        for (source, mut events, _fixtures) in streams::native_streams() {
-            covered.push(source.clone());
-            // A retried first hook is valid native input and guarantees an
-            // actual delta for every agent, even a short unique-kind fixture.
-            events.insert(0, events[0].clone());
-            for event in &mut events {
-                event.payload["journal_codec_padding"] =
-                    serde_json::json!("é📚shared history".repeat(1024));
-            }
-            let tmp = tempfile::tempdir().unwrap();
-            let path = tmp.path().join("events.ndjson");
-            let mut writer = JournalWriter::open_path(&path).await.unwrap();
-            let mut tail = 0;
-            for event in &events {
-                tail = writer.append(event).await.unwrap();
-            }
-            assert!(tokio::fs::read_to_string(&path)
-                .await
-                .unwrap()
-                .contains(codec::DELTA_RECORD));
-            let session = events[0].session_id.clone();
-            let ctx = SessionCtx {
-                session_id: session.clone(),
-                config: None,
-            };
-            let mut live = registry.create(&source, &session);
-            let mut recovered = registry.create(&source, &session);
-            let mut reader = JournalReader::open(&path, tail).await.unwrap().unwrap();
-            for (index, original) in events.iter().enumerate() {
-                let replayed = reader.next_entry().await.unwrap().unwrap();
-                assert_eq!(
-                    serde_json::to_value(&replayed).unwrap(),
-                    serde_json::to_value(original.redacted()).unwrap(),
-                    "{source} payload {index}"
-                );
-                let replayed = envelope_from_redacted(replayed);
-                assert_eq!(
-                    collect(live.as_mut(), original, &ctx),
-                    collect(recovered.as_mut(), &replayed, &ctx),
-                    "{source} event {index}"
-                );
-                // Restart the decoder at every boundary, using only its saved
-                // cache. No previous record may be needed to expand the next.
-                let saved = serde_json::to_vec(reader.decoder_context()).unwrap();
-                reader = JournalReader::resume(
-                    &path,
-                    reader.position,
-                    tail,
-                    serde_json::from_slice(&saved).unwrap(),
-                )
-                .await
-                .unwrap();
-            }
-            assert!(reader.next_entry().await.unwrap().is_none());
-            assert_eq!(
-                comparable(live.finalize(&ctx).unwrap()),
-                comparable(recovered.finalize(&ctx).unwrap()),
-                "{source} finalization"
-            );
-        }
-        covered.sort();
-        assert_eq!(covered, registry.sources());
     }
 
     #[tokio::test]
@@ -1037,61 +931,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_source_journals_complete_payloads_in_event_order() {
-        for source in crate::translate::Registry::default_agents().sources() {
-            let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("events.ndjson");
-            let mut writer = JournalWriter::open_path(&path).await.unwrap();
-            let mut expected = Vec::new();
-            for (index, name) in [
-                "context",
-                "before_provider_request",
-                "message_update",
-                "agent_end",
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let mut event = pi_context(
-                    vec![serde_json::json!({"role":"user","content":"entire history"})],
-                    index as i64,
-                );
-                event.source = source.clone();
-                event.event = name.into();
-                event.payload["event"]["type"] = name.into();
-                event.payload["event"]["message"] =
-                    serde_json::json!({"role":"assistant","content":"growing message"});
-                event.payload["event"]["assistantMessageEvent"] = serde_json::json!({"type":"text_delta","delta":"token","partial":"partial message"});
-                event.payload["event"]["payload"] = serde_json::json!({"system":"system prompt","messages":[{"role":"user","content":"provider messages"}],"unknown_provider_field":{"preserve":true}});
-                writer.append(&event).await.unwrap();
-                expected.push(event);
-            }
-            drop(writer);
-            let stored = tokio::fs::read_to_string(&path).await.unwrap();
-            let records = stored
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-                .collect::<Vec<_>>();
-            let mut reader = JournalReader::open(&path, stored.len() as u64)
-                .await
-                .unwrap()
-                .unwrap();
-            for (index, event) in expected.iter().enumerate() {
-                assert_eq!(
-                    records[index]["payload"], event.payload,
-                    "{source}: {} was changed before persistence",
-                    event.event
-                );
-                let replayed = reader.next_entry().await.unwrap().unwrap();
-                assert_eq!(replayed.event, event.event);
-                assert_eq!(replayed.payload, event.payload);
-                assert!(
-                    reader.decoder_context().legacy_pi.is_empty(),
-                    "new {source} records must not require the legacy Pi message decoder"
-                );
-            }
-            assert!(reader.next_entry().await.unwrap().is_none());
-        }
+    async fn small_payloads_preserve_unknown_native_fields_without_deltas() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let mut event = pi_context(
+            vec![serde_json::json!({"role":"user","content":"history"})],
+            1,
+        );
+        event.payload["unknown_provider_field"] = serde_json::json!({"preserve":true});
+        let tail = writer.append(&event).await.unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert_eq!(stored["payload"], event.payload);
+        let mut reader = JournalReader::open(&path, tail).await.unwrap().unwrap();
+        assert_eq!(
+            reader.next_entry().await.unwrap().unwrap().payload,
+            event.payload
+        );
+        assert!(reader.decoder_context().legacy_pi.is_empty());
     }
 
     #[tokio::test]

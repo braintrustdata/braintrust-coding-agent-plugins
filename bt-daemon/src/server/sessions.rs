@@ -250,9 +250,6 @@ impl Daemon {
                 }
             }
             self.dispatch_locks.lock().remove(&storage_key);
-            self.ingress_dispatched.lock().retain(|candidate, _| {
-                candidate.source != key.source || candidate.session_id != key.session_id
-            });
         }
         tracing::info!(session_id = %key.session_id, "session retired");
     }
@@ -288,13 +285,6 @@ impl Daemon {
                 let path =
                     journal::ensure_source_journal(&self.data_dir, source, session_id).await?;
                 let writer = JournalWriter::open_path(&path).await?;
-                let mut history = self.ingress_history.lock();
-                if history
-                    .get(&path)
-                    .is_some_and(|before| *before > writer.position())
-                {
-                    history.remove(&path);
-                }
                 Ok::<_, anyhow::Error>(Arc::new(tokio::sync::Mutex::new(writer)))
             })
             .await?;

@@ -132,15 +132,10 @@ pub struct Daemon {
     correlation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     correlation_changed: Arc<Notify>,
     ingress_tx: mpsc::Sender<IngressMsg>,
-    ingress_overflow: AtomicBool,
-    ingress_dispatched: Mutex<HashMap<DeliveryKey, u64>>,
-    /// Historical prefixes already considered by startup recovery. Capture
-    /// ordinals in those prefixes belong to an earlier daemon incarnation.
-    ingress_history: Mutex<HashMap<PathBuf, u64>>,
     /// Earliest live append during startup, keyed by source journal path.
     /// Recovery must not absorb queued live events into its historical head.
     startup_cutoffs: Mutex<Option<HashMap<PathBuf, u64>>>,
-    startup_buffer: Mutex<Option<StartupBuffer>>,
+    capture_buffer: Mutex<CaptureBuffer>,
     capture_sequence: AtomicU64,
     started: Instant,
     last_activity: Mutex<Instant>,
@@ -166,7 +161,6 @@ impl Daemon {
     ) -> Arc<Self> {
         let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_QUEUE_CAPACITY);
         let startup_cutoffs = startup.as_ref().map(|_| HashMap::new());
-        let startup_buffer = startup.as_ref().map(|_| StartupBuffer::new());
         let daemon = Arc::new(Daemon {
             version: opts.version,
             data_dir,
@@ -192,11 +186,8 @@ impl Daemon {
             correlation_locks: Mutex::new(HashMap::new()),
             correlation_changed: Arc::new(Notify::new()),
             ingress_tx,
-            ingress_overflow: AtomicBool::new(false),
-            ingress_dispatched: Mutex::new(HashMap::new()),
-            ingress_history: Mutex::new(HashMap::new()),
             startup_cutoffs: Mutex::new(startup_cutoffs),
-            startup_buffer: Mutex::new(startup_buffer),
+            capture_buffer: Mutex::new(CaptureBuffer::new()),
             capture_sequence: AtomicU64::new(0),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
@@ -283,15 +274,13 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
             .await;
         restore_pending_sessions(&recovery_daemon).await;
         let candidates = discover_unprocessed_journals(&recovery_daemon).await;
-        if let Some(history) = recovery_daemon.startup_cutoffs.lock().take() {
-            recovery_daemon.ingress_history.lock().extend(history);
-        }
+        *recovery_daemon.startup_cutoffs.lock() = None;
         for event in candidates {
             dispatch_ingress_event(&recovery_daemon, event).await;
         }
         recovery_daemon.settle_session_actors().await;
         let _ = retry_pending_sessions(&recovery_daemon).await;
-        if let Err(error) = drain_startup_buffer(&recovery_daemon).await {
+        if let Err(error) = drain_capture_buffer(&recovery_daemon).await {
             tracing::error!(%error, "startup ingress recovery failed");
             recovery_daemon.trigger_shutdown();
             return;

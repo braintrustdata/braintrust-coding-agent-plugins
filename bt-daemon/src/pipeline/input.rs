@@ -136,43 +136,17 @@ mod tests {
     }
 
     #[test]
-    fn every_agent_can_supply_original_events_without_any_journal_adapter() {
-        for source in crate::translate::Registry::default_agents().sources() {
-            let input = SourceInput::default();
-            let first = event(&source, 0, 16 * 1024);
-            let first_position = position(0, &first);
-            let boundary = first_position.through;
-            input.push_event(first.clone(), first_position);
-            let second = event(&source, 1, 16 * 1024);
-            let second_position = position(boundary, &second);
-            let through = second_position.through;
-            input.push_event(second.clone(), second_position);
-            let record = input.take(0, boundary).unwrap();
-            let SourceEvent::Event(actual) = record.event else {
-                panic!("expected event")
-            };
-            assert_eq!(actual.payload, first.payload);
-            assert!(
-                input.take(boundary, boundary).is_none(),
-                "must not outrun the requested boundary"
-            );
-            let record = input.take(boundary, through).unwrap();
-            let SourceEvent::Event(actual) = record.event else {
-                panic!("expected event")
-            };
-            assert_eq!(actual.payload, second.payload);
-            assert!(input.is_empty());
-        }
-    }
-
-    #[test]
     fn oversized_events_flow_directly_but_eviction_keeps_the_input_bounded() {
         let input = SourceInput::default();
         let oversized = event("debug", 0, 9 * 1024 * 1024);
         let first = position(0, &oversized);
         let boundary = first.through;
         input.push_event(oversized.clone(), first);
-        assert!(input.take(0, boundary).is_some());
+        assert!(input.take(0, boundary - 1).is_none());
+        let SourceEvent::Event(actual) = input.take(0, boundary).unwrap().event else {
+            panic!("expected original event");
+        };
+        assert_eq!(actual.payload, oversized.payload);
         input.push_event(oversized.clone(), position(boundary, &oversized));
         let gap_end = position(boundary, &oversized).through;
         let next = event("debug", 1, 3 * 1024 * 1024);

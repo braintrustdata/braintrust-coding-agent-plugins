@@ -217,26 +217,17 @@ impl DecoderContext {
 impl<'de> Deserialize<'de> for DecoderContext {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Stored {
-            Legacy(Vec<Value>),
-            Current {
-                legacy_pi: Vec<Value>,
-                payloads: PayloadCache,
-            },
+        struct Stored {
+            legacy_pi: Vec<Value>,
+            payloads: PayloadCache,
         }
-        let context = match Stored::deserialize(deserializer)? {
-            Stored::Legacy(legacy_pi) => Self {
-                legacy_pi,
-                payloads: PayloadCache::default(),
-            },
-            Stored::Current {
-                legacy_pi,
-                payloads,
-            } => Self {
-                legacy_pi,
-                payloads,
-            },
+        let Stored {
+            legacy_pi,
+            payloads,
+        } = Stored::deserialize(deserializer)?;
+        let context = Self {
+            legacy_pi,
+            payloads,
         };
         context
             .payloads
@@ -300,10 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoints_read_legacy_decoder_state_and_preserve_shared_bases() {
-        let legacy = vec![json!({"role":"user","content":"legacy"})];
-        let context: DecoderContext = serde_json::from_value(json!(legacy)).unwrap();
-        assert_eq!(context.legacy_pi, legacy);
+    fn checkpoints_preserve_shared_bases() {
         let mut context = DecoderContext::default();
         let payload = json!({"messages":["content".repeat(1000)]});
         let (json, _) = context.payloads.encode("message", &payload).unwrap();

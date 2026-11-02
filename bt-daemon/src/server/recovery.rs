@@ -300,10 +300,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
 #[cfg(test)]
 pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
     for event in discover_unprocessed_journals(daemon).await {
-        let _ = daemon
-            .ingress_tx
-            .send(IngressMsg::Event(Box::new(event)))
-            .await;
+        dispatch_ingress_event(daemon, event).await;
     }
     let (reply, _ignored) = oneshot::channel();
     let _ = daemon.ingress_tx.send(IngressMsg::Barrier(reply)).await;
@@ -391,7 +388,9 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].env.event, "after");
         assert_eq!(candidates[0].journal_through, tail);
-        super::super::ingress::recover_ingress_overflow(&daemon).await;
+        for event in candidates {
+            dispatch_ingress_event(&daemon, event).await;
+        }
         let source = daemon.translations.lock().values().next().unwrap().clone();
         source.barrier().await.unwrap();
         assert!(source.error.lock().is_none());

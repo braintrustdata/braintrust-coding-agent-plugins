@@ -131,11 +131,6 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         if tokio::fs::remove_file(&storage).await.is_err() {
             continue;
         }
-        daemon.ingress_history.lock().remove(&path);
-        daemon
-            .ingress_dispatched
-            .lock()
-            .retain(|key, _| key.source != first.source || key.session_id != first.session_id);
         for sidecar in [wal, storage.with_extension("sqlite-shm"), path] {
             if let Err(error) = tokio::fs::remove_file(&sidecar).await {
                 if error.kind() != std::io::ErrorKind::NotFound {
@@ -504,7 +499,7 @@ mod tests {
             .unwrap()
             .contains("during-startup"));
         assert!(daemon.translations.lock().is_empty());
-        drain_startup_buffer(&daemon).await.unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(3), daemon.ingress_barrier())
             .await
@@ -537,7 +532,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         tokio::task::yield_now().await;
-        drain_startup_buffer(&daemon).await.unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), shutdown)
             .await
@@ -575,7 +570,7 @@ mod tests {
         for event in recovered {
             dispatch_ingress_event(&daemon, event).await;
         }
-        drain_startup_buffer(&daemon).await.unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(3), daemon.ingress_barrier())
             .await
@@ -613,12 +608,12 @@ mod tests {
             assert!(daemon.capture_event(next).await.unwrap());
         }
         {
-            let state = daemon.startup_buffer.lock();
-            let buffer = state.as_ref().unwrap();
+            let state = daemon.capture_buffer.lock();
+            let buffer = &state;
             assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
             assert_eq!(buffer.events.front().unwrap().env.payload["index"], 6);
         }
-        drain_startup_buffer(&daemon).await.unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         daemon.ingress_barrier().await;
         let source = daemon.translations.lock().values().next().unwrap().clone();
@@ -668,7 +663,7 @@ mod tests {
             next.payload = serde_json::json!({"index": i});
             assert!(daemon.capture_event(next).await.unwrap());
         }
-        let StartupWork::Evicted(first) = daemon.next_startup_work() else {
+        let CaptureWork::Evicted(first) = daemon.next_capture_work() else {
             panic!("the oldest events were not evicted");
         };
         for i in INGRESS_QUEUE_CAPACITY + 2..INGRESS_QUEUE_CAPACITY + 7 {
@@ -678,22 +673,20 @@ mod tests {
             assert!(daemon.capture_event(next).await.unwrap());
         }
         {
-            let state = daemon.startup_buffer.lock();
-            let buffer = state.as_ref().unwrap();
+            let state = daemon.capture_buffer.lock();
+            let buffer = &state;
             assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
             assert_eq!(buffer.events.front().unwrap().env.payload["index"], 7);
         }
         let mut cursors = HashMap::new();
-        replay_evicted_startup(&daemon, &mut cursors, &first)
-            .await
-            .unwrap();
-        let StartupWork::Evicted(second) = daemon.next_startup_work() else {
+        replay_evicted(&daemon, &mut cursors, &first).await.unwrap();
+        let CaptureWork::Evicted(second) = daemon.next_capture_work() else {
             panic!("new evictions did not advance recovery");
         };
-        replay_evicted_startup(&daemon, &mut cursors, &second)
+        replay_evicted(&daemon, &mut cursors, &second)
             .await
             .unwrap();
-        drain_startup_buffer(&daemon).await.unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         daemon.ingress_barrier().await;
         let source = daemon.translations.lock().values().next().unwrap().clone();
@@ -722,7 +715,6 @@ mod tests {
         let mut opts = debug_serve_options("test", tmp.path());
         opts.auth_provider = Some(Arc::new(TestAuth));
         let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup));
-        *daemon.startup_buffer.lock() = None;
         let mut env = event("durable-bound", SessionRoute::default());
         env.payload = serde_json::json!({"index":0});
         daemon.capture_event(env.clone()).await.unwrap();
@@ -736,7 +728,7 @@ mod tests {
         unacknowledged.extend(serde_json::to_vec(&env.redacted()).unwrap());
         unacknowledged.push(b'\n');
         tokio::fs::write(&path, unacknowledged).await.unwrap();
-        recover_ingress_overflow(&daemon).await;
+        drain_capture_buffer(&daemon).await.unwrap();
         let source = daemon.translations.lock().values().next().unwrap().clone();
         source.barrier().await.unwrap();
         let storage = tmp.path().join("pipeline").join(format!(
@@ -799,73 +791,7 @@ mod tests {
             filler.ts_ms = i as i64;
             daemon.capture_event(filler).await.unwrap();
         }
-        drain_startup_buffer(&daemon).await.unwrap();
-        ready.send(()).unwrap();
-        daemon.settle_ingress().await;
-        let route = daemon
-            .automatic_links
-            .lock()
-            .get(&child_key)
-            .cloned()
-            .expect("child must be linked");
-        let Some(crate::wire::TraceDestination::ParentSpan { components }) = route.destination
-        else {
-            panic!("child was not attached to the parent tool");
-        };
-        let tool_id = crate::ids::span_id(
-            &crate::ids::session_namespace("opencode", "parent"),
-            "tool:parent:tool",
-        );
-        assert_eq!(components.span_id.as_deref(), Some(tool_id.as_str()));
-        drain_all(&daemon).await;
-    }
-
-    #[tokio::test]
-    async fn steady_overflow_preserves_parent_child_tool_order() {
-        use distributed_fixture::{AgentKind, DistributedFixtures, ProcessTree};
-        let tmp = tempfile::tempdir().unwrap();
-        let (ready, startup) = oneshot::channel();
-        let mut opts = debug_serve_options("test", tmp.path());
-        opts.auth_provider = Some(Arc::new(TestAuth));
-        let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup));
-        // Pause the steady ingress worker while captures saturate its queue.
-        *daemon.startup_buffer.lock() = None;
-        let mut fixtures = DistributedFixtures::new();
-        let parent = ProcessTree::root(1000);
-        let child = ProcessTree::child(1002, 1001, &parent);
-        let mut events =
-            fixtures.start_turn(AgentKind::OpenCode, "parent", &parent, "delegate", 100);
-        events.push(fixtures.open_tool(
-            AgentKind::OpenCode,
-            "parent",
-            &parent,
-            "tool",
-            "do work",
-            102,
-        ));
-        let child_events =
-            fixtures.start_turn(AgentKind::OpenCode, "child", &child, "do work", 103);
-        let child_key = automatic_link_key(&child_events[0]);
-        events.extend(child_events);
-        events.push(fixtures.close_tool(
-            AgentKind::OpenCode,
-            "parent",
-            &parent,
-            "tool",
-            "do work",
-            "done",
-            105,
-        ));
-        for env in events {
-            daemon.capture_event(env).await.unwrap();
-        }
-        for i in 0..INGRESS_QUEUE_CAPACITY {
-            let mut filler = event("filler", SessionRoute::default());
-            filler.ts_ms = i as i64;
-            daemon.capture_event(filler).await.unwrap();
-        }
-        assert!(daemon.ingress_overflow.load(Ordering::Acquire));
-        recover_ingress_overflow(&daemon).await;
+        drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         daemon.settle_ingress().await;
         let route = daemon
@@ -903,11 +829,11 @@ mod tests {
             assert!(daemon.capture_event(env).await.unwrap());
         }
         {
-            let state = daemon.startup_buffer.lock();
-            let buffer = state.as_ref().unwrap();
+            let state = daemon.capture_buffer.lock();
+            let buffer = &state;
             assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
         }
-        drain_startup_buffer(&daemon).await.unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         daemon.ingress_barrier().await;
         let sources: Vec<_> = daemon.translations.lock().values().cloned().collect();
@@ -949,25 +875,23 @@ mod tests {
             env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
             assert!(daemon.capture_event(env.clone()).await.unwrap());
         }
-        let StartupWork::Evicted(first) = daemon.next_startup_work() else {
+        let CaptureWork::Evicted(first) = daemon.next_capture_work() else {
             panic!("missing first overflow")
         };
         let mut cursors = HashMap::new();
-        replay_evicted_startup(&daemon, &mut cursors, &first)
-            .await
-            .unwrap();
+        replay_evicted(&daemon, &mut cursors, &first).await.unwrap();
         for i in INGRESS_QUEUE_CAPACITY + 2..INGRESS_QUEUE_CAPACITY + 4 {
             env.ts_ms = i as i64;
             env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
             assert!(daemon.capture_event(env.clone()).await.unwrap());
         }
-        let StartupWork::Evicted(second) = daemon.next_startup_work() else {
+        let CaptureWork::Evicted(second) = daemon.next_capture_work() else {
             panic!("missing second overflow")
         };
-        replay_evicted_startup(&daemon, &mut cursors, &second)
+        replay_evicted(&daemon, &mut cursors, &second)
             .await
             .unwrap();
-        drain_startup_buffer(&daemon).await.unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         daemon.ingress_barrier().await;
         let source = daemon.translations.lock().values().next().unwrap().clone();
