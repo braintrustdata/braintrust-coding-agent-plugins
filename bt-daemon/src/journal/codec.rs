@@ -2,7 +2,7 @@
 //! kinds may reference their previous payload, with a bounded per-session cache.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::VecDeque, io::Write};
+use std::{collections::VecDeque, io::Write, sync::Arc};
 
 // These bounds are part of the v1 decoding contract.
 const MIN_BYTES: usize = 4 * 1024;
@@ -18,7 +18,7 @@ pub(crate) struct PayloadCache {
 struct Base {
     event: String,
     through: u64,
-    json: String,
+    json: Arc<str>,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct Delta {
@@ -49,7 +49,7 @@ impl Write for LimitedJson {
     }
 }
 
-pub(super) fn cache_json(event: &str, payload: &Value) -> anyhow::Result<Option<String>> {
+pub(super) fn cache_json(event: &str, payload: &Value) -> anyhow::Result<Option<Arc<str>>> {
     if event.len() >= MAX_BYTES {
         return Ok(None);
     }
@@ -66,7 +66,7 @@ pub(super) fn cache_json(event: &str, payload: &Value) -> anyhow::Result<Option<
     if output.bytes.len() < MIN_BYTES {
         return Ok(None);
     }
-    Ok(Some(String::from_utf8(output.bytes)?))
+    Ok(Some(String::from_utf8(output.bytes)?.into()))
 }
 
 impl PayloadCache {
@@ -74,7 +74,7 @@ impl PayloadCache {
         &self,
         event: &str,
         payload: &Value,
-    ) -> anyhow::Result<(Option<String>, Option<Delta>)> {
+    ) -> anyhow::Result<(Option<Arc<str>>, Option<Delta>)> {
         let Some(json) = cache_json(event, payload)? else {
             return Ok((None, None));
         };
@@ -115,7 +115,7 @@ impl PayloadCache {
         Ok((Some(json), worthwhile.then_some(delta)))
     }
 
-    pub(super) fn record(&mut self, event: &str, through: u64, json: Option<String>) {
+    pub(super) fn record(&mut self, event: &str, through: u64, json: Option<Arc<str>>) {
         self.entries.retain(|base| base.event != event);
         let Some(json) = json else {
             return;
@@ -142,7 +142,7 @@ impl PayloadCache {
         });
     }
 
-    pub(super) fn decode(&self, event: &str, encoded: Value) -> anyhow::Result<(Value, String)> {
+    pub(super) fn decode(&self, event: &str, encoded: Value) -> anyhow::Result<(Value, Arc<str>)> {
         let delta: Delta = serde_json::from_value(encoded)?;
         let base = self
             .entries
@@ -168,7 +168,7 @@ impl PayloadCache {
         json.push_str(&base.json[..delta.prefix]);
         json.push_str(&delta.insert);
         json.push_str(&base.json[base.json.len() - delta.suffix..]);
-        Ok((serde_json::from_str(&json)?, json))
+        Ok((serde_json::from_str(&json)?, json.into()))
     }
 
     pub(super) fn validate(&self) -> anyhow::Result<()> {
@@ -271,7 +271,7 @@ mod tests {
         assert!(json.is_none());
         assert!(delta.is_none());
         cache.record("large", 100, json);
-        cache.record("large", 101, Some("x".repeat(MAX_BYTES + 1)));
+        cache.record("large", 101, Some("x".repeat(MAX_BYTES + 1).into()));
         cache.validate().unwrap();
         assert!(cache.entries.iter().all(|base| base.event != "large"));
     }

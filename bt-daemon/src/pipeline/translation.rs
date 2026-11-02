@@ -7,7 +7,9 @@ use super::{
     Stage,
 };
 use crate::{
-    journal::{ControlKind, JournalReader, JournalRecord, JournalWriter, PipelineControl},
+    journal::{
+        ControlKind, JournalReader, JournalRecord, JournalWriter, LiveRecords, PipelineControl,
+    },
     translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, WeakOrigins},
     wire::{SessionConfig, SessionRoute},
 };
@@ -118,6 +120,7 @@ impl Translation {
             crate::ids::session_storage_id(&options.source, &options.session_id)
         ));
         let journal = SpanJournal::open(&path).await?;
+        let live = options.events.lock().await.live_records();
         let committed = journal.translated_through().await?;
         let progress = Arc::new(Progress {
             requested: AtomicU64::new(committed),
@@ -140,6 +143,7 @@ impl Translation {
             recovery: recovery.clone(),
             translator: None,
             reader: None,
+            live,
             observers: Vec::new(),
             origins: WeakOrigins::default(),
             roots: Roots::default(),
@@ -281,6 +285,7 @@ struct Producer {
     recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     translator: Option<Box<dyn AgentTranslator>>,
     reader: Option<JournalReader>,
+    live: LiveRecords,
     observers: Vec<Observation>,
     origins: WeakOrigins,
     roots: Roots,
@@ -667,13 +672,20 @@ impl Producer {
             .ok_or_else(|| anyhow::anyhow!("event journal is missing"))?;
         reader.extend(through);
         self.phase = Boundary::Journal;
-        while let Some(entry) = self
-            .reader
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("event journal is missing"))?
-            .next_record()
-            .await?
-        {
+        loop {
+            let reader = self
+                .reader
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("event journal is missing"))?;
+            // Captured records stay complete in memory. Only an evicted or
+            // historical gap needs a journal read to reconstruct source state.
+            let entry = match reader.next_live(&self.live, through) {
+                Some(entry) => Some(entry),
+                None => reader.next_record().await?,
+            };
+            let Some(entry) = entry else {
+                break;
+            };
             let input = entry.through;
             let observation = !matches!(&entry.record,JournalRecord::Control(control) if matches!(control.kind,ControlKind::Retire));
             let ctx = SessionCtx {
@@ -1021,6 +1033,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_translation_and_controls_do_not_read_events_back_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "checkpoint");
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            JournalWriter::open_path(&path).await.unwrap(),
+        ));
+        let translation = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
+            .await
+            .unwrap();
+        let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
+            "source":"debug", "session_id":"checkpoint", "event":"event", "ts_ms":1,
+            "payload":{"history":"shared history".repeat(1024),"index":0}
+        }))
+        .unwrap();
+        writer.lock().await.append(&event).await.unwrap();
+        event.payload["index"] = 1.into();
+        let through = writer.lock().await.append(&event).await.unwrap();
+        let original = tokio::fs::read(&path).await.unwrap();
+        assert!(String::from_utf8_lossy(&original).contains("payload_delta_v1"));
+        // A journal read would fail. The complete captured records are still
+        // available, so normal translation and flush controls must succeed.
+        let mut poisoned = original.clone();
+        for byte in &mut poisoned {
+            if *byte != b'\n' {
+                *byte = b'x';
+            }
+        }
+        tokio::fs::write(&path, poisoned).await.unwrap();
+        translation.advance(through).await.unwrap();
+        translation.barrier().await.unwrap();
+        translation.control(ControlKind::Checkpoint).await.unwrap();
+        let rows = translation.journal.read_after(0, 32).await.unwrap();
+        let inputs = rows
+            .iter()
+            .filter_map(|(_, op)| {
+                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                row.input.as_ref()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[1], &event.payload);
+        translation.shutdown().await;
+
+        // A cold recovery must restore the decoder bases learned from live
+        // records, then expand a delta written after the saved checkpoint.
+        event.payload["index"] = 2.into();
+        let tail = writer.lock().await.append(&event).await.unwrap();
+        *writer.lock().await = JournalWriter::open_path(&path).await.unwrap();
+        let resumed = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
+            .await
+            .unwrap();
+        resumed.advance(tail).await.unwrap();
+        resumed.barrier().await.unwrap();
+        assert_eq!(resumed.journal.translated_through().await.unwrap(), tail);
+        let rows = resumed.journal.read_after(0, 32).await.unwrap();
+        assert!(rows.iter().any(|(_, op)| {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            row.input.as_ref() == Some(&event.payload)
+        }));
+        resumed.shutdown().await;
+    }
+
     struct BlockedCheckpoint {
         entered: Arc<Notify>,
         release: std::sync::mpsc::Receiver<()>,
@@ -1063,6 +1138,7 @@ mod tests {
                 release: resume,
             })),
             reader: JournalReader::open(&path, 0).await.unwrap(),
+            live: writer.lock().await.live_records(),
             observers: Vec::new(),
             origins: WeakOrigins::default(),
             roots: Roots::default(),
@@ -1632,6 +1708,7 @@ mod tests {
             recovery: Arc::new(Mutex::new(None)),
             translator: Some(Box::new(CountedTranslation(drains.clone()))),
             reader: None,
+            live: LiveRecords::default(),
             observers: Vec::new(),
             origins: WeakOrigins::default(),
             roots: Roots::default(),

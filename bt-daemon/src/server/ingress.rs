@@ -89,7 +89,7 @@ pub(super) struct StartupCursor {
 }
 
 /// Advance each evicted journal range from its previous position, retaining
-/// the reader's Pi delta context between advances. Older records are decoded
+/// the reader's payload decoder context between advances. Older records are decoded
 /// only to initialize that context; they are not dispatched again.
 pub(super) async fn replay_evicted_startup(
     daemon: &Arc<Daemon>,
