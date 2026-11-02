@@ -182,6 +182,7 @@ impl Daemon {
     /// journal file for the rest of the daemon's life; deterministic span ids
     /// mean a late event simply rebuilds it from the journal.
     pub(super) async fn retire_session(&self, key: &DeliveryKey) {
+        self.ingress_barrier().await;
         self.observe_claude_transcripts(Some(key), false).await;
         self.ingress_barrier().await;
         let lock = self.dispatch_lock(&key.source, &key.session_id);

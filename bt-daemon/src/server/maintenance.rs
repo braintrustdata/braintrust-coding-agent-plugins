@@ -329,6 +329,9 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     }
     daemon.begin_quiesce();
     let _capture_guard = daemon.capture_gate.write().await;
+    // Captures already acknowledged may still be waiting to register their
+    // transcript paths in ingress. Observe only after those have dispatched.
+    daemon.settle_ingress().await;
     daemon.observe_claude_transcripts(None, true).await;
     daemon.settle_ingress().await;
     if let Err(error) = resolve_pending_sessions(daemon, |_| true).await {
@@ -467,6 +470,44 @@ mod tests {
             .unwrap();
         assert!(!daemon.translations.lock().is_empty());
         drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_observes_transcript_registered_by_queued_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        tokio::fs::write(&transcript, b"{}\n").await.unwrap();
+        let (ready, startup) = oneshot::channel();
+        let daemon = Daemon::new_with_startup(
+            debug_serve_options("test", tmp.path()),
+            tmp.path().into(),
+            Some(startup),
+        );
+        let mut env = event("late-transcript", SessionRoute::default());
+        env.source = "claude-code".into();
+        env.event = "Stop".into();
+        env.payload = serde_json::json!({"transcript_path": transcript});
+        daemon.capture_event(env.clone()).await.unwrap();
+        tokio::fs::write(&transcript, b"{}\n{}\n").await.unwrap();
+
+        let shutdown_daemon = daemon.clone();
+        let shutdown = tokio::spawn(async move { drain_all(&shutdown_daemon).await });
+        while !daemon.quiescing.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        drain_startup_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
+        let content = tokio::fs::read_to_string(path).await.unwrap();
+        assert!(
+            content.contains("TranscriptUpdate"),
+            "late transcript must be journaled before shutdown"
+        );
     }
 
     #[tokio::test]
