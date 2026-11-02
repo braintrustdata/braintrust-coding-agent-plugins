@@ -325,10 +325,8 @@ impl Daemon {
             let path = journal::source_journal_path(&self.data_dir, &env.source, &env.session_id);
             cutoffs.entry(path).or_insert(before);
         }
-        // Related hooks cannot begin until their predecessor's durable append
-        // is acknowledged. Concurrent sessions need no stronger total order.
-        let sequence = self.capture_sequence.fetch_add(1, Ordering::Relaxed);
-        writer.append_ordered(env, Some(sequence)).await
+        let through = writer.append(env).await?;
+        Ok(crate::pipeline::input::SourcePosition { before, through })
     }
 
     pub(super) fn session_lock(

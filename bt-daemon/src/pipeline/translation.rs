@@ -492,8 +492,9 @@ impl Producer {
             if writer.position() > self.position {
                 return Ok(None);
             }
-            let position = writer.append_control_record(&control).await?;
-            let through = position.through;
+            let before = writer.position();
+            let through = writer.append_control(&control).await?;
+            let position = SourcePosition { before, through };
             self.options.input.push(SourceRecord {
                 event: SourceEvent::Control(control),
                 position,
@@ -884,8 +885,9 @@ pub(crate) mod tests {
         }
         pub(crate) async fn write(&self, event: &crate::wire::Envelope, live: bool) -> u64 {
             let mut writer = self.options.events.lock().await;
-            let position = writer.append_ordered(event, None).await.unwrap();
-            let through = position.through;
+            let before = writer.position();
+            let through = writer.append(event).await.unwrap();
+            let position = SourcePosition { before, through };
             if live {
                 self.options.input.push_event(event.clone(), position);
             }
@@ -934,7 +936,7 @@ pub(crate) mod tests {
             covered.push(agent.clone());
             events.insert(0, events[0].clone());
             for event in &mut events {
-                event.payload["codec_padding"] = serde_json::json!("é📚history".repeat(1024));
+                event.payload["padding"] = serde_json::json!("é📚history".repeat(1024));
             }
             let mut cases = vec![("live", 0), ("overflow", 2)];
             cases.extend((1..=events.len()).map(|split| ("cold", split)));
@@ -946,16 +948,6 @@ pub(crate) mod tests {
                     positions.push(f.write(event, mode == "live" || mode == "overflow").await);
                 }
                 let tail = *positions.last().unwrap();
-                if mode == "cold" && split == 1 {
-                    let stored = tokio::fs::read_to_string(&f.options.event_path)
-                        .await
-                        .unwrap();
-                    assert_eq!(stored.lines().count(), events.len());
-                    for (line, event) in stored.lines().zip(&events) {
-                        let record: serde_json::Value = serde_json::from_str(line).unwrap();
-                        assert_eq!(record["payload"], event.payload);
-                    }
-                }
                 match mode {
                     "live" => {
                         f.process(positions[1]).await;

@@ -69,8 +69,8 @@ pub(super) async fn drain_capture_buffer(daemon: &Arc<Daemon>) -> anyhow::Result
     }
 }
 
-/// Read frozen evicted ranges, merging one lookahead per source in capture
-/// order. Current captures contain complete payloads and need no prefix replay.
+/// Read frozen evicted ranges in source order, merging by event timestamp as
+/// startup recovery does. Rebuild decoder context before each range.
 pub(super) async fn replay_evicted(
     daemon: &Arc<Daemon>,
     bounds: &HashMap<PathBuf, EvictedRange>,
@@ -78,10 +78,10 @@ pub(super) async fn replay_evicted(
     let mut ready = Vec::new();
     for (path, range) in bounds {
         let mut reader = journal::JournalReader::resume(path, range.from, range.through).await?;
-        if let Some((sequence, event)) =
+        if let Some((timestamp, event)) =
             next_evicted_event(daemon, &mut reader, range.through).await?
         {
-            ready.push((sequence, event, reader, range.through));
+            ready.push((timestamp, event, reader, range.through));
         }
     }
     while let Some(index) = ready
@@ -92,8 +92,8 @@ pub(super) async fn replay_evicted(
     {
         let (_, event, mut reader, through) = ready.swap_remove(index);
         dispatch_ingress_event(daemon, event).await;
-        if let Some((sequence, event)) = next_evicted_event(daemon, &mut reader, through).await? {
-            ready.push((sequence, event, reader, through));
+        if let Some((timestamp, event)) = next_evicted_event(daemon, &mut reader, through).await? {
+            ready.push((timestamp, event, reader, through));
         }
     }
     Ok(())
@@ -103,7 +103,7 @@ async fn next_evicted_event(
     daemon: &Daemon,
     reader: &mut journal::JournalReader,
     through: u64,
-) -> anyhow::Result<Option<(u64, PendingEvent)>> {
+) -> anyhow::Result<Option<(i64, PendingEvent)>> {
     while reader.position() < through {
         let before = reader.position();
         let entry = reader
@@ -118,9 +118,7 @@ async fn next_evicted_event(
             };
             env.source = source.to_owned();
             return Ok(Some((
-                entry
-                    .capture_sequence
-                    .ok_or_else(|| anyhow::anyhow!("captured event has no sequence"))?,
+                env.ts_ms,
                 PendingEvent {
                     env,
                     replay_through: before,

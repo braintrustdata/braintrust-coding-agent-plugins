@@ -1257,12 +1257,7 @@ async fn events_are_ordered_journaled_and_emitted() {
 
     let events: Vec<String> = jlines
         .iter()
-        .filter(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .unwrap()
-                .get("event")
-                .is_some()
-        })
+        .filter(|line| !line.contains("\"_bt_record_type\""))
         .map(|l| {
             serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
                 .as_str()
@@ -1314,10 +1309,7 @@ async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
     assert_eq!(
         jtext
             .lines()
-            .filter(|line| serde_json::from_str::<serde_json::Value>(line)
-                .unwrap()
-                .get("event")
-                .is_some())
+            .filter(|line| !line.contains("\"_bt_record_type\""))
             .count(),
         2
     );
@@ -1984,10 +1976,7 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     assert_eq!(
         journal
             .lines()
-            .filter(|line| serde_json::from_str::<serde_json::Value>(line)
-                .unwrap()
-                .get("event")
-                .is_some())
+            .filter(|line| !line.contains("\"_bt_record_type\""))
             .count(),
         2,
         "the event history remains separate from ordered pipeline controls"
@@ -2543,10 +2532,9 @@ async fn claude_journal_does_not_grow_with_the_transcript_on_every_turn() {
 
     // Re-journaling the transcript every turn would put this near
     // TURNS * transcript_len / 2 (tens of megabytes). References are ~a few
-    // hundred bytes each. Allow for longer Windows paths and concurrent
-    // transcript observations while remaining far below the duplicated data.
+    // hundred bytes each.
     assert!(
-        journal_len < 256 * 1024,
+        journal_len < 64 * 1024,
         "journal grew with the transcript: {journal_len} bytes for {TURNS} events \
          over a {transcript_len}-byte transcript"
     );
@@ -3501,7 +3489,7 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     let journal: Vec<serde_json::Value> = journal_text
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record.get("event").is_some())
+        .filter(|record: &serde_json::Value| record.get("_bt_record_type").is_none())
         .collect();
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0]["source"], "grok");

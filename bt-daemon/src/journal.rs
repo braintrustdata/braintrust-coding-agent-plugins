@@ -10,14 +10,11 @@
 //! still tell which delivery pipelines a managed child produced after the
 //! daemon that accepted them has restarted or idle-exited.
 
-use crate::pipeline::input::SourcePosition;
-pub use crate::pipeline::input::{ControlKind, PipelineControl};
-
 use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 pub fn journal_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("journal")
@@ -224,33 +221,7 @@ pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) 
 pub struct JournalWriter {
     file: tokio::fs::File,
     position: u64,
-    failed_write: bool,
-}
-
-/// Ignore only an unterminated trailing write. Complete records, including
-/// malformed ones, remain visible so corruption cannot silently discard data.
-async fn complete_position(file: &mut tokio::fs::File) -> std::io::Result<u64> {
-    let len = file.metadata().await?.len();
-    if len == 0 {
-        return Ok(0);
-    }
-    file.seek(std::io::SeekFrom::Start(len - 1)).await?;
-    if file.read_u8().await? == b'\n' {
-        return Ok(len);
-    }
-    let mut end = len;
-    let mut buffer = vec![0; 8192];
-    while end > 0 {
-        let start = end.saturating_sub(buffer.len() as u64);
-        let bytes = &mut buffer[..(end - start) as usize];
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-        file.read_exact(bytes).await?;
-        if let Some(index) = bytes.iter().rposition(|byte| *byte == b'\n') {
-            return Ok(start + index as u64 + 1);
-        }
-        end = start;
-    }
-    Ok(0)
+    pi_context: Vec<serde_json::Value>,
 }
 
 impl JournalWriter {
@@ -258,21 +229,16 @@ impl JournalWriter {
         if let Some(dir) = path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
-        let mut file = tokio::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .create(true)
-            .read(true)
             .append(true)
             .open(path)
             .await?;
-        let position = complete_position(&mut file).await?;
-        if position < file.metadata().await?.len() {
-            file.set_len(position).await?;
-        }
-        file.sync_data().await?;
+        let position = file.metadata().await?.len();
         Ok(Self {
             file,
             position,
-            failed_write: false,
+            pi_context: Vec::new(),
         })
     }
 
@@ -280,91 +246,38 @@ impl JournalWriter {
         self.position
     }
 
-    async fn append_bytes(&mut self, line: &[u8]) -> anyhow::Result<u64> {
-        if self.failed_write {
-            self.file.set_len(self.position).await?;
-            self.file.sync_data().await?;
-            self.failed_write = false;
-        }
-        if let Err(error) = async {
-            self.file.write_all(line).await?;
-            self.file.flush().await?;
-            self.file.sync_data().await
-        }
-        .await
-        {
-            self.failed_write = true;
-            return Err(error.into());
-        }
-        let before = self.position;
-        self.position += line.len() as u64;
-        Ok(before)
-    }
-
     /// Append one redacted event and confirm its durable write before capture acknowledges it.
     ///
-    /// Complete journal records are never capped or truncated. An unfinished
-    /// trailing write is discarded on reopen, before new appends. Its size is
-    /// managed by age-based GC. Native event payloads are preserved, including
-    /// repeated message snapshots. External transcript mirrors capture each
-    /// byte once, and replay streams records without loading the whole log.
-    #[cfg(test)]
+    /// The journal is a durability record and is never capped or truncated:
+    /// dropping entries would silently cost recovery fidelity. Its size is
+    /// bounded instead by writing each transcript byte once (see
+    /// [`crate::transcript_mirror`]) and by age-based GC, and replay reads it
+    /// as a stream so a large journal never becomes a large allocation.
     pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<u64> {
-        self.append_ordered(env, None)
-            .await
-            .map(|position| position.through)
-    }
-
-    pub(crate) async fn append_ordered(
-        &mut self,
-        env: &Envelope,
-        sequence: Option<u64>,
-    ) -> anyhow::Result<SourcePosition> {
-        #[derive(Serialize)]
-        struct Captured<'a> {
-            #[serde(flatten)]
-            envelope: &'a RedactedEnvelope,
-            _bt_record_type: &'static str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            _bt_capture_sequence: Option<u64>,
-        }
-        let redacted = env.redacted();
-        let mut line = serde_json::to_vec(&Captured {
-            envelope: &redacted,
-            _bt_record_type: "event",
-            _bt_capture_sequence: sequence,
-        })?;
+        let mut redacted = env.redacted();
+        compact_pi_payload(&mut redacted, &mut self.pi_context);
+        let mut line = serde_json::to_vec(&redacted)?;
         line.push(b'\n');
-        let before = self.append_bytes(&line).await?;
-        Ok(SourcePosition {
-            before,
-            through: self.position,
-        })
+        self.file.write_all(&line).await?;
+        self.file.flush().await?;
+        self.file.sync_data().await?;
+        self.position += line.len() as u64;
+        Ok(self.position)
     }
 
-    #[cfg(test)]
     pub(crate) async fn append_control(
         &mut self,
         control: &PipelineControl,
     ) -> anyhow::Result<u64> {
-        self.append_control_record(control)
-            .await
-            .map(|position| position.through)
-    }
-
-    pub(crate) async fn append_control_record(
-        &mut self,
-        control: &PipelineControl,
-    ) -> anyhow::Result<SourcePosition> {
         let mut value = serde_json::to_value(control)?;
         value["_bt_record_type"] = "pipeline_control".into();
         let mut line = serde_json::to_vec(&value)?;
         line.push(b'\n');
-        let before = self.append_bytes(&line).await?;
-        Ok(SourcePosition {
-            before,
-            through: self.position,
-        })
+        self.file.write_all(&line).await?;
+        self.file.flush().await?;
+        self.file.sync_data().await?;
+        self.position += line.len() as u64;
+        Ok(self.position)
     }
 }
 
@@ -386,13 +299,25 @@ pub enum JournalRecord {
     DeliveryCheckpoint { route: SessionRoute, through: u64 },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlKind {
+    Checkpoint,
+    Finalize,
+    Retire,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineControl {
+    pub kind: ControlKind,
+    pub bounds: std::collections::HashMap<String, u64>,
+}
+
 #[derive(Debug)]
 pub struct JournalRecordEntry {
     pub record: JournalRecord,
     /// Exclusive byte offset after this record in the journal.
     pub through: u64,
-    /// Daemon-local capture order. Kept outside the native event payload.
-    pub(crate) capture_sequence: Option<u64>,
 }
 
 /// Streaming reader over one session's journal.
@@ -404,7 +329,7 @@ pub struct JournalReader {
     path: PathBuf,
     line_no: usize,
     position: u64,
-    legacy_pi: Vec<serde_json::Value>,
+    pi_context: Vec<serde_json::Value>,
 }
 
 impl JournalReader {
@@ -412,30 +337,22 @@ impl JournalReader {
         self.position
     }
 
-    /// Seek within new, self-contained records. Legacy delta streams must be
-    /// read from the beginning to reconstruct their prior message context.
+    /// Rebuild decoder context before continuing at a saved record boundary.
     pub(crate) async fn resume(path: &Path, position: u64, through: u64) -> anyhow::Result<Self> {
-        let mut file = tokio::fs::File::open(path).await?;
-        anyhow::ensure!(
-            position <= through && through <= file.metadata().await?.len(),
-            "checkpoint is beyond the source journal"
-        );
-        if position > 0 {
-            file.seek(std::io::SeekFrom::Start(position - 1)).await?;
+        anyhow::ensure!(position <= through, "invalid recovery range");
+        let mut reader = Self::open(path, through)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("recovery journal is missing"))?;
+        while reader.position < position {
             anyhow::ensure!(
-                file.read_u8().await? == b'\n',
-                "checkpoint is not at a journal record boundary"
+                reader.next_record().await?.is_some(),
+                "recovery journal ended before its boundary"
             );
         }
-        file.seek(std::io::SeekFrom::Start(position)).await?;
-        Ok(Self {
-            reader: tokio::io::BufReader::new(file.take(through - position)),
-            path: path.to_owned(),
-            line_no: 0,
-            position,
-            legacy_pi: Vec::new(),
-        })
+        anyhow::ensure!(reader.position == position, "invalid recovery boundary");
+        Ok(reader)
     }
+
     /// Open a journal for streaming, reading at most `through` bytes.
     ///
     /// That bound is what keeps replay from consuming the very event that
@@ -454,17 +371,17 @@ impl JournalReader {
             path: path.to_path_buf(),
             line_no: 0,
             position: 0,
-            legacy_pi: Vec::new(),
+            pi_context: Vec::new(),
         }))
     }
 
     /// The journal's current length, which is the bound a session created now
     /// should replay through. A missing journal replays nothing.
     pub async fn recorded_len(path: &Path) -> u64 {
-        let Ok(mut file) = tokio::fs::File::open(path).await else {
-            return 0;
-        };
-        complete_position(&mut file).await.unwrap_or(0)
+        tokio::fs::metadata(path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0)
     }
 
     /// The next entry, or `None` at end of file.
@@ -488,24 +405,18 @@ impl JournalReader {
             }
             self.position += read as u64;
             self.line_no += 1;
-            anyhow::ensure!(
-                bytes.last() == Some(&b'\n'),
-                "unterminated source journal record"
-            );
             let path = self.path.clone();
             let line_no = self.line_no;
             let position = self.position;
-            let mut decoder = std::mem::take(&mut self.legacy_pi);
-            // Expanding and parsing a large history can be CPU-heavy even
-            // when file reads are async. Never run it on the hook IPC thread.
-            let (decoder, decoded) = tokio::task::spawn_blocking(move || {
-                let decoded = decode_record(&bytes, &path, line_no, position, &mut decoder);
-                (decoder, decoded)
+            let mut pi_context = std::mem::take(&mut self.pi_context);
+            let (pi_context, record) = tokio::task::spawn_blocking(move || {
+                let record = decode_record(&bytes, &path, line_no, position, &mut pi_context);
+                (pi_context, record)
             })
             .await?;
-            self.legacy_pi = decoder;
-            if let Some(entry) = decoded? {
-                return Ok(Some(entry));
+            self.pi_context = pi_context;
+            if let Some(record) = record? {
+                return Ok(Some(record));
             }
         }
     }
@@ -521,9 +432,6 @@ impl JournalReader {
     /// journal being recovered. Older journals contain no checkpoints and
     /// therefore retain their existing replay behavior.
     pub async fn acknowledged_through(path: &Path, through: u64, route: &SessionRoute) -> u64 {
-        if through == 0 {
-            return 0;
-        }
         let Ok(Some(mut reader)) = Self::open(path, through).await else {
             return 0;
         };
@@ -548,7 +456,7 @@ fn decode_record(
     path: &Path,
     line_no: usize,
     position: u64,
-    legacy_pi: &mut Vec<serde_json::Value>,
+    pi_context: &mut Vec<serde_json::Value>,
 ) -> anyhow::Result<Option<JournalRecordEntry>> {
     let line = std::str::from_utf8(bytes)
         .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?
@@ -558,9 +466,6 @@ fn decode_record(
     }
     let value: serde_json::Value = serde_json::from_str(line)
         .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-    let capture_sequence = value
-        .get("_bt_capture_sequence")
-        .and_then(serde_json::Value::as_u64);
     let record = if value
         .get("_bt_record_type")
         .and_then(serde_json::Value::as_str)
@@ -579,33 +484,83 @@ fn decode_record(
     {
         JournalRecord::Control(serde_json::from_value(value)?)
     } else {
-        let record_type = value
-            .get("_bt_record_type")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let mut event: RedactedEnvelope = serde_json::from_value(value)
+        let mut event = serde_json::from_value(value)
             .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-        match record_type.as_deref() {
-            Some("event") => legacy_pi.clear(),
-            None => expand_legacy_pi_payload(&mut event, legacy_pi).map_err(|error| {
-                anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no)
-            })?,
-            Some(kind) => anyhow::bail!("unsupported journal record type {kind:?}"),
-        }
+        expand_pi_payload(&mut event, pi_context)
+            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
         JournalRecord::Event(event)
     };
     Ok(Some(JournalRecordEntry {
         record,
         through: position,
-        capture_sequence,
     }))
 }
 
-const LEGACY_PI_MESSAGES_DELTA: &str = "_bt_messages_delta";
+const PI_MESSAGES_DELTA: &str = "_bt_messages_delta";
 
-// Read compatibility for journals written before native payload preservation.
-// New event records are tagged explicitly and never enter this decoder.
-fn expand_legacy_pi_payload(
+fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_json::Value>) {
+    if event.source != "pi" {
+        return;
+    }
+    let Some(native) = event
+        .payload
+        .get_mut("event")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    match event.event.as_str() {
+        "context" => {
+            let Some(messages) = native
+                .remove("messages")
+                .and_then(|messages| messages.as_array().cloned())
+            else {
+                return;
+            };
+            let common_prefix = previous
+                .iter()
+                .zip(&messages)
+                .take_while(|(left, right)| left == right)
+                .count();
+            native.insert(
+                PI_MESSAGES_DELTA.into(),
+                serde_json::json!({
+                    "common_prefix": common_prefix,
+                    "suffix": messages[common_prefix..],
+                }),
+            );
+            *previous = messages;
+        }
+        "before_provider_request" => {
+            // The translator records only the allowlisted request
+            // configuration and tool definitions, never the prompt or messages.
+            if let Some(payload) = native.get_mut("payload") {
+                *payload = serde_json::Value::Object(crate::translate::pi_request_config(payload));
+            }
+        }
+        "agent_end" => {
+            // The translator only consumes willRetry from this lifecycle event.
+            native.remove("messages");
+        }
+        "message_update" => {
+            // Pi repeats the progressively growing assistant message on every
+            // streaming update. Translation only needs the update type to mark
+            // time-to-first-token; the completed message arrives separately in
+            // message_end.
+            native.remove("message");
+            if let Some(update) = native
+                .get_mut("assistantMessageEvent")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                update.retain(|key, _| key == "type");
+            }
+            native.retain(|key, _| key == "type" || key == "assistantMessageEvent");
+        }
+        _ => {}
+    }
+}
+
+fn expand_pi_payload(
     event: &mut RedactedEnvelope,
     previous: &mut Vec<serde_json::Value>,
 ) -> anyhow::Result<()> {
@@ -619,7 +574,7 @@ fn expand_legacy_pi_payload(
     else {
         return Ok(());
     };
-    let Some(delta) = native.remove(LEGACY_PI_MESSAGES_DELTA) else {
+    let Some(delta) = native.remove(PI_MESSAGES_DELTA) else {
         if let Some(messages) = native.get("messages").and_then(serde_json::Value::as_array) {
             *previous = messages.clone();
         }
@@ -767,6 +722,7 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
         Envelope {
             source: "pi".into(),
@@ -784,76 +740,184 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn released_pi_deltas_remain_readable_alongside_complete_new_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.ndjson");
-        let first = pi_context(vec![serde_json::json!({"role":"user","content":"old"})], 1);
-        let mut delta = pi_context(Vec::new(), 2);
-        delta.payload = serde_json::json!({"event":{"_bt_messages_delta":{"common_prefix":1,"suffix":[{"role":"assistant","content":"answer"}]}}});
-        tokio::fs::write(
-            &path,
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&first.redacted()).unwrap(),
-                serde_json::to_string(&delta.redacted()).unwrap()
-            ),
-        )
-        .await
-        .unwrap();
+    async fn pi_context_history_is_delta_encoded_and_replayed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pi.ndjson");
         let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let mut native = first.clone();
-        native.payload["event"]["_bt_messages_delta"] = serde_json::json!({"native":"preserve"});
-        let through = writer.append(&native).await.unwrap();
+        let mut messages = Vec::new();
+        let mut naive_bytes = 0usize;
+        for index in 0..20 {
+            messages.push(serde_json::json!({
+                "role":"user",
+                "content": format!("{index}:{}", "x".repeat(4096)),
+            }));
+            let event = pi_context(messages.clone(), index);
+            naive_bytes += serde_json::to_vec(&event.redacted()).unwrap().len() + 1;
+            writer.append(&event).await.unwrap();
+        }
+        let compacted = vec![
+            serde_json::json!({"role":"compactionSummary","summary":"bounded"}),
+            serde_json::json!({"role":"user","content":"after"}),
+        ];
+        let event = pi_context(compacted.clone(), 20);
+        naive_bytes += serde_json::to_vec(&event.redacted()).unwrap().len() + 1;
+        writer.append(&event).await.unwrap();
+        drop(writer);
+
+        let stored = tokio::fs::read(&path).await.unwrap();
+        assert!(
+            stored.len() < naive_bytes / 3,
+            "Pi journal did not eliminate cumulative context copies: stored={} naive={naive_bytes}",
+            stored.len()
+        );
+        assert!(!String::from_utf8_lossy(&stored).contains("\"messages\""));
+
+        let through = stored.len() as u64;
         let mut reader = JournalReader::open(&path, through).await.unwrap().unwrap();
+        let mut contexts = Vec::new();
+        while let Some(entry) = reader.next_entry().await.unwrap() {
+            contexts.push(
+                entry
+                    .payload
+                    .pointer("/event/messages")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(contexts.len(), 21);
+        assert_eq!(contexts[19].len(), 20);
+        assert_eq!(contexts[20], compacted);
+    }
+
+    #[tokio::test]
+    async fn pi_streaming_updates_do_not_persist_growing_partial_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pi.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let marker = "growing-partial-marker".repeat(4096);
+        let event = Envelope {
+            source: "pi".into(),
+            source_version: None,
+            plugin_version: None,
+            session_id: "pi-session".into(),
+            event: "message_update".into(),
+            ts_ms: 1,
+            managed_run_id: None,
+            capture: None,
+            payload: serde_json::json!({
+                "event": {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_delta",
+                        "partial": marker,
+                    },
+                    "message": {"role": "assistant", "content": marker},
+                }
+            }),
+            route: None,
+            config: None,
+        };
+        writer.append(&event).await.unwrap();
+        drop(writer);
+
+        let stored = tokio::fs::read(&path).await.unwrap();
+        assert!(!String::from_utf8_lossy(&stored).contains("growing-partial-marker"));
+
+        let mut reader = JournalReader::open(&path, stored.len() as u64)
+            .await
+            .unwrap()
+            .unwrap();
+        let replayed = reader.next_entry().await.unwrap().unwrap();
         assert_eq!(
-            reader.next_entry().await.unwrap().unwrap().payload,
-            first.payload
-        );
-        let expanded = reader.next_entry().await.unwrap().unwrap();
-        assert_eq!(
-            expanded.payload["event"]["messages"],
-            serde_json::json!([{"role":"user","content":"old"},{"role":"assistant","content":"answer"}])
-        );
-        assert_eq!(
-            reader.next_entry().await.unwrap().unwrap().payload,
-            native.payload
+            replayed
+                .payload
+                .pointer("/event/assistantMessageEvent/type"),
+            Some(&serde_json::json!("text_delta"))
         );
     }
 
     #[tokio::test]
-    async fn partial_writes_recover_on_retry_and_reopen_without_losing_payloads() {
-        for reopen in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("events.ndjson");
-            let mut writer = JournalWriter::open_path(&path).await.unwrap();
-            let first = pi_context(
-                vec![serde_json::json!({"content":"history".repeat(1024)})],
-                1,
+    async fn pi_provider_requests_persist_only_request_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pi.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let event = Envelope {
+            source: "pi".into(),
+            source_version: None,
+            plugin_version: None,
+            session_id: "pi-session".into(),
+            event: "before_provider_request".into(),
+            ts_ms: 1,
+            managed_run_id: None,
+            capture: None,
+            payload: serde_json::json!({
+                "event": {
+                    "type": "before_provider_request",
+                    "payload": {
+                        "system": "system-prompt-marker",
+                        "messages": [{"role": "user", "content": "message-marker"}],
+                        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+                        "max_tokens": 1024,
+                    },
+                }
+            }),
+            route: None,
+            config: None,
+        };
+        writer.append(&event).await.unwrap();
+        drop(writer);
+
+        let stored = tokio::fs::read(&path).await.unwrap();
+        let stored_text = String::from_utf8_lossy(&stored);
+        assert!(!stored_text.contains("system-prompt-marker"));
+        assert!(!stored_text.contains("message-marker"));
+
+        let mut reader = JournalReader::open(&path, stored.len() as u64)
+            .await
+            .unwrap()
+            .unwrap();
+        let replayed = reader.next_entry().await.unwrap().unwrap();
+        assert_eq!(
+            replayed.payload.pointer("/event/payload"),
+            Some(&serde_json::json!({
+                "max_tokens": 1024,
+                "tools": [{"type": "function", "function": {
+                    "name": "read",
+                    "parameters": {"type": "object"},
+                }}],
+            }))
+        );
+    }
+
+    #[test]
+    fn pi_journaled_request_configuration_replays_unchanged() {
+        let schema = serde_json::json!({"type": "object"});
+        for payload in [
+            serde_json::json!({
+                "max_tokens": 1024,
+                "tools": [
+                    {"name": "read", "input_schema": schema, "strict": true},
+                    {"type": "web_search_20250305", "name": "web_search"},
+                ],
+                "tool_choice": {"type": "tool", "name": "read", "disable_parallel_tool_use": true},
+            }),
+            serde_json::json!({"config": {
+                "temperature": 0.5,
+                "tools": [{"functionDeclarations": [{"name": "read", "parameters": schema}]}, {"googleSearch": {}}],
+                "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+            }}),
+            serde_json::json!({
+                "toolConfig": {"tools": [{"toolSpec": {"name": "read", "inputSchema": {"json": schema}}}]},
+                "inferenceConfig": {"maxTokens": 512},
+            }),
+        ] {
+            let journaled =
+                serde_json::Value::Object(crate::translate::pi_request_config(&payload));
+            assert_eq!(
+                serde_json::Value::Object(crate::translate::pi_request_config(&journaled)),
+                journaled
             );
-            let through = writer.append(&first).await.unwrap();
-            writer.file.write_all(b"{unfinished").await.unwrap();
-            writer.file.flush().await.unwrap();
-            assert_eq!(JournalReader::recorded_len(&path).await, through);
-            if reopen {
-                writer = JournalWriter::open_path(&path).await.unwrap();
-            } else {
-                writer.failed_write = true;
-            }
-            let mut second = first.clone();
-            second.payload["tail"] = "after recovery".into();
-            let position = writer.append_ordered(&second, None).await.unwrap();
-            assert_eq!(position.before, through);
-            let mut reader = JournalReader::open(&path, position.through)
-                .await
-                .unwrap()
-                .unwrap();
-            for event in [first, second] {
-                assert_eq!(
-                    reader.next_entry().await.unwrap().unwrap().payload,
-                    event.payload
-                );
-            }
-            assert!(reader.next_entry().await.unwrap().is_none());
         }
     }
 

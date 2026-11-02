@@ -45,7 +45,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -137,7 +137,6 @@ pub struct Daemon {
     /// Recovery must not absorb queued live events into its historical head.
     startup_cutoffs: Mutex<Option<HashMap<PathBuf, u64>>>,
     capture_buffer: Mutex<CaptureBuffer>,
-    capture_sequence: AtomicU64,
     started: Instant,
     last_activity: Mutex<Instant>,
     /// Prevents a shutdown drain from racing capture that has passed the
@@ -190,7 +189,6 @@ impl Daemon {
             ingress_tx,
             startup_cutoffs: Mutex::new(startup_cutoffs),
             capture_buffer: Mutex::new(CaptureBuffer::default()),
-            capture_sequence: AtomicU64::new(0),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
             capture_gate: tokio::sync::RwLock::new(()),

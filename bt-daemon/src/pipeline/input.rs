@@ -1,9 +1,8 @@
 //! Stage input shared by direct capture and recovery. Storage supplies only
 //! byte positions; original live payloads arrive from capture.
+pub use crate::journal::PipelineControl;
 use crate::wire::Envelope;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::{collections::VecDeque, sync::Arc};
 
 const RECORD_BUDGET: usize = 64;
@@ -31,20 +30,6 @@ impl SourceRecord {
     fn bytes(&self) -> u64 {
         self.position.through.saturating_sub(self.position.before)
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlKind {
-    Checkpoint,
-    Finalize,
-    Retire,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineControl {
-    pub kind: ControlKind,
-    pub bounds: HashMap<String, u64>,
 }
 
 #[derive(Default)]

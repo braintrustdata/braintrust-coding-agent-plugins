@@ -22,6 +22,7 @@ mod muse;
 mod opencode;
 mod pi;
 pub(crate) use claude::successful_subagent_handback_message;
+pub(crate) use pi::request_config as pi_request_config;
 mod origins;
 mod recent;
 pub(crate) use origins::WeakOrigins;

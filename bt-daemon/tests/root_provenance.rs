@@ -493,19 +493,8 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
     let raw = std::fs::read_to_string(&journal).unwrap();
     let mut history = raw
         .lines()
-        .filter_map(|line| {
-            let mut record: Value = serde_json::from_str(line).unwrap();
-            record.get("event")?;
-            // These small fixture payloads are full records. Remove the new
-            // framing to model the untagged legacy format faithfully.
-            assert_eq!(record["_bt_record_type"], "event");
-            record.as_object_mut().unwrap().remove("_bt_record_type");
-            record
-                .as_object_mut()
-                .unwrap()
-                .remove("_bt_capture_sequence");
-            Some(format!("{record}\n"))
-        })
+        .filter(|line| !line.contains("_bt_record_type"))
+        .map(|line| format!("{line}\n"))
         .collect::<String>();
     let through = history.len() as u64;
     history.push_str(&format!("{}\n",json!({"_bt_record_type":"delivery_checkpoint", "route":capture("UserPromptSubmit","v1","native1",1_000).route, "through":through})));
