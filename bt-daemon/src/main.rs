@@ -123,7 +123,7 @@ enum Command {
 
 /// Build a non-secret route from its constituent selections. Shared by
 /// [`RouteArgs`] and [`RunRouteArgs`], which differ only in whether their
-/// flags also fall back to an environment variable.
+/// flags also fall back to an environment variable and where parent is parsed.
 fn build_route(
     profile: Option<String>,
     org_name: Option<String>,
@@ -203,8 +203,6 @@ struct RunRouteArgs {
     project: Option<String>,
     #[arg(long, env = "BRAINTRUST_DESTINATION", conflicts_with = "parent")]
     destination: Option<TraceDestination>,
-    #[arg(long, value_name = "SPAN_COMPONENTS")]
-    parent: Option<braintrust_sdk_rust::SpanComponents>,
 }
 
 impl RunRouteArgs {
@@ -214,7 +212,7 @@ impl RunRouteArgs {
             self.org_name,
             self.project,
             self.destination,
-            self.parent,
+            None,
         )
     }
 }
