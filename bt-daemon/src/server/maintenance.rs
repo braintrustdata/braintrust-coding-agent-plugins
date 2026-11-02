@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_overflow_keeps_pi_delta_context_across_recovery_advances() {
+    async fn startup_overflow_keeps_pi_context_across_recovery_advances() {
         let tmp = tempfile::tempdir().unwrap();
         let (ready, startup) = oneshot::channel();
         let daemon = Daemon::new_with_startup(

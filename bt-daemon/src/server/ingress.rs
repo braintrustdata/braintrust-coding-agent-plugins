@@ -337,7 +337,7 @@ pub(super) async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
             checkpoints = reader;
             start = position;
         }
-        let decoder = checkpoints.decoder_context().to_vec();
+        let decoder = checkpoints.decoder_context().clone();
         let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
         while let Ok(Some(entry)) = checkpoints.next_record().await {
             if let journal::JournalRecord::DeliveryCheckpoint { route, through } = entry.record {

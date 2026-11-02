@@ -29,7 +29,7 @@ const CHECKPOINT_BYTES: u64 = 1024 * 1024;
 pub(crate) struct RecoveryContext {
     format: u32,
     translator: Box<serde_json::value::RawValue>,
-    pub decoder: Vec<serde_json::Value>,
+    pub decoder: crate::journal::DecoderContext,
     capture: Option<OriginSnapshot>,
     bounds: HashMap<String, u64>,
     pub templates: HashMap<String, crate::wire::RedactedEnvelope>,
@@ -151,6 +151,7 @@ impl Translation {
             committed,
             checkpoint_position: 0,
             checkpoint_events: 0,
+            checkpoint_work_bytes: 0,
             checkpoint_safe: true,
             state,
             publication: None,
@@ -262,6 +263,7 @@ enum State {
 }
 struct Publication {
     input: u64,
+    decoded_bytes: u64,
     ordinal: u64,
     observation: bool,
     capture: Option<OriginSnapshot>,
@@ -290,6 +292,7 @@ struct Producer {
     committed: u64,
     checkpoint_position: u64,
     checkpoint_events: u64,
+    checkpoint_work_bytes: u64,
     checkpoint_safe: bool,
     state: State,
     publication: Option<Publication>,
@@ -475,7 +478,7 @@ impl Producer {
                     translator: serde_json::value::RawValue::from_string(String::from_utf8(
                         state,
                     )?)?,
-                    decoder: reader.decoder_context().to_vec(),
+                    decoder: reader.decoder_context().clone(),
                     capture,
                     bounds,
                     templates,
@@ -505,6 +508,7 @@ impl Producer {
             self.journal.save_translation_checkpoint(checkpoint).await?;
             self.checkpoint_position = self.committed;
             self.checkpoint_events = 0;
+            self.checkpoint_work_bytes = 0;
         }
         Ok(())
     }
@@ -593,6 +597,7 @@ impl Producer {
         self.position = 0;
         self.checkpoint_position = 0;
         self.checkpoint_events = 0;
+        self.checkpoint_work_bytes = 0;
         self.checkpoint_safe = true;
         if let Some(checkpoint) = self.journal.translation_checkpoint().await? {
             if checkpoint.version == self.options.version && checkpoint.input <= self.committed {
@@ -783,6 +788,7 @@ impl Producer {
             };
             self.publication = Some(Publication {
                 input,
+                decoded_bytes: entry.decoded_bytes,
                 ordinal: 0,
                 observation,
                 capture,
@@ -892,6 +898,10 @@ impl Producer {
                 self.phase = Boundary::Journal;
                 let checkpoint = if self.checkpoint_events + 1 >= CHECKPOINT_EVENTS
                     || pending.input.saturating_sub(self.checkpoint_position) >= CHECKPOINT_BYTES
+                    || self
+                        .checkpoint_work_bytes
+                        .saturating_add(pending.decoded_bytes)
+                        >= CHECKPOINT_BYTES
                 {
                     self.checkpoint_context(pending.input).await?
                 } else {
@@ -904,13 +914,25 @@ impl Producer {
                 if checkpointed {
                     self.checkpoint_position = pending.input;
                     self.checkpoint_events = 0;
+                    self.checkpoint_work_bytes = 0;
                 } else {
                     self.checkpoint_events += 1;
+                    self.checkpoint_work_bytes = self
+                        .checkpoint_work_bytes
+                        .saturating_add(pending.decoded_bytes);
                 }
                 self.committed = pending.input;
                 self.progress
                     .committed
                     .store(pending.input, Ordering::Relaxed);
+            } else {
+                // Restoring a checkpoint replays the committed suffix too.
+                // Count that work so repeated short-lived processes cannot
+                // keep extending the distance from the same old checkpoint.
+                self.checkpoint_events += 1;
+                self.checkpoint_work_bytes = self
+                    .checkpoint_work_bytes
+                    .saturating_add(pending.decoded_bytes);
             }
             self.position = pending.input;
             Ok(())
@@ -1052,6 +1074,7 @@ mod tests {
             committed: 0,
             checkpoint_position: 0,
             checkpoint_events: 0,
+            checkpoint_work_bytes: 0,
             checkpoint_safe: true,
             state: State::Processing,
             publication: None,
@@ -1069,6 +1092,89 @@ mod tests {
         assert!(through > 0);
         release.send(()).unwrap();
         assert!(checkpoint.await.unwrap().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_budget_counts_decoded_payloads_after_compression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "checkpoint");
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            JournalWriter::open_path(&path).await.unwrap(),
+        ));
+        let source = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
+            .await
+            .unwrap();
+        let env = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"event","ts_ms":1,"payload":{"history":"x".repeat(256 * 1024)}})).unwrap();
+        let mut first = 0;
+        let mut tail = 0;
+        for index in 0..10 {
+            tail = writer.lock().await.append(&env).await.unwrap();
+            if index == 0 {
+                first = tail;
+            }
+        }
+        assert!(
+            tail < CHECKPOINT_BYTES,
+            "fixture must compress below the physical byte threshold"
+        );
+        source.advance(tail).await.unwrap();
+        source.barrier().await.unwrap();
+        let checkpoint = source
+            .journal
+            .translation_checkpoint()
+            .await
+            .unwrap()
+            .expect("decoded work must trigger a checkpoint before 64 inputs");
+        assert!(checkpoint.input > first);
+        source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_window_accounts_for_committed_suffix_on_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "checkpoint");
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            JournalWriter::open_path(&path).await.unwrap(),
+        ));
+        let source = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
+            .await
+            .unwrap();
+        let env = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"event","ts_ms":1,"payload":{}})).unwrap();
+        let mut tail = 0;
+        for _ in 0..2 * CHECKPOINT_EVENTS - 1 {
+            tail = writer.lock().await.append(&env).await.unwrap();
+        }
+        source.advance(tail).await.unwrap();
+        source.barrier().await.unwrap();
+        let before = source
+            .journal
+            .translation_checkpoint()
+            .await
+            .unwrap()
+            .unwrap()
+            .input;
+        assert!(before < tail);
+        let task = source.task.lock().await.take().unwrap();
+        task.abort();
+        let _ = task.await;
+        tail = writer.lock().await.append(&env).await.unwrap();
+        let resumed = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
+            .await
+            .unwrap();
+        resumed.advance(tail).await.unwrap();
+        resumed.barrier().await.unwrap();
+        assert_eq!(
+            resumed
+                .journal
+                .translation_checkpoint()
+                .await
+                .unwrap()
+                .unwrap()
+                .input,
+            tail,
+            "the 63 reconstructed inputs must count toward the next periodic checkpoint"
+        );
+        resumed.shutdown().await;
     }
 
     #[tokio::test]
@@ -1134,8 +1240,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_seeks_past_completed_history_and_restores_pi_delta_context() {
-        for source in ["debug", "pi"] {
+    async fn checkpoint_seeks_past_history_for_native_and_legacy_journals() {
+        for format in ["debug", "pi", "legacy-pi"] {
+            let source = if format == "legacy-pi" { "pi" } else { format };
             let tmp = tempfile::tempdir().unwrap();
             let path = crate::journal::source_journal_path(tmp.path(), source, "checkpoint");
             let writer = Arc::new(tokio::sync::Mutex::new(
@@ -1159,10 +1266,32 @@ mod tests {
                 plugin_version: None,
             };
             let mut boundary = 0;
+            let mut legacy = String::new();
             for i in 0..CHECKPOINT_EVENTS + 3 {
                 env.ts_ms = i as i64;
-                env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
-                boundary = writer.lock().await.append(&env).await.unwrap();
+                env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared".repeat(1024)},{"role":"assistant","content":i}]}});
+                if format == "legacy-pi" {
+                    let mut event = env.redacted();
+                    event.payload["event"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("messages");
+                    let suffix = if i == 0 {
+                        env.payload["event"]["messages"].clone()
+                    } else {
+                        serde_json::json!([{"role":"assistant","content":i}])
+                    };
+                    event.payload["event"]["_bt_messages_delta"] = serde_json::json!({"common_prefix": if i == 0 { 0 } else { 1 }, "suffix":suffix});
+                    legacy.push_str(&serde_json::to_string(&event).unwrap());
+                    legacy.push('\n');
+                    boundary = legacy.len() as u64;
+                } else {
+                    boundary = writer.lock().await.append(&env).await.unwrap();
+                }
+            }
+            if format == "legacy-pi" {
+                tokio::fs::write(&path, legacy).await.unwrap();
+                *writer.lock().await = JournalWriter::open_path(&path).await.unwrap();
             }
             translation.advance(boundary).await.unwrap();
             translation.barrier().await.unwrap();
@@ -1175,6 +1304,12 @@ mod tests {
             assert!(
                 checkpoint.input < boundary,
                 "test must replay a suffix after a periodic checkpoint"
+            );
+            let saved = RecoveryContext::decode(&checkpoint, "test", boundary).unwrap();
+            assert_eq!(
+                saved.decoder.legacy_pi.is_empty(),
+                format != "legacy-pi",
+                "only legacy delta records should need a saved journal decoder base"
             );
             let task = translation.task.lock().await.take().unwrap();
             task.abort();
@@ -1508,11 +1643,13 @@ mod tests {
             committed: 0,
             checkpoint_position: 0,
             checkpoint_events: 0,
+            checkpoint_work_bytes: 0,
             checkpoint_safe: true,
             state: State::Processing,
             phase: Boundary::Journal,
             publication: Some(Publication {
                 input: 10,
+                decoded_bytes: 0,
                 ordinal: 0,
                 observation: true,
                 capture: None,

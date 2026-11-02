@@ -1257,7 +1257,12 @@ async fn events_are_ordered_journaled_and_emitted() {
 
     let events: Vec<String> = jlines
         .iter()
-        .filter(|line| !line.contains("\"_bt_record_type\""))
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap()
+                .get("event")
+                .is_some()
+        })
         .map(|l| {
             serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
                 .as_str()
@@ -1309,7 +1314,10 @@ async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
     assert_eq!(
         jtext
             .lines()
-            .filter(|line| !line.contains("\"_bt_record_type\""))
+            .filter(|line| serde_json::from_str::<serde_json::Value>(line)
+                .unwrap()
+                .get("event")
+                .is_some())
             .count(),
         2
     );
@@ -1976,7 +1984,10 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     assert_eq!(
         journal
             .lines()
-            .filter(|line| !line.contains("\"_bt_record_type\""))
+            .filter(|line| serde_json::from_str::<serde_json::Value>(line)
+                .unwrap()
+                .get("event")
+                .is_some())
             .count(),
         2,
         "the event history remains separate from ordered pipeline controls"
@@ -3490,7 +3501,7 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
     let journal: Vec<serde_json::Value> = journal_text
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record.get("_bt_record_type").is_none())
+        .filter(|record: &serde_json::Value| record.get("event").is_some())
         .collect();
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0]["source"], "grok");

@@ -1414,3 +1414,37 @@ fn bash_status(tool: &str, v: Option<&Value>) -> Option<String> {
     .any(|prefix| status.starts_with(prefix))
     .then(|| status.to_string())
 }
+
+#[cfg(test)]
+mod legacy_journal_tests {
+    use super::*;
+    #[test]
+    fn legacy_request_config_normalization_is_idempotent() {
+        let schema = serde_json::json!({"type": "object"});
+        for payload in [
+            serde_json::json!({
+                "max_tokens": 1024,
+                "tools": [
+                    {"name": "read", "input_schema": schema, "strict": true},
+                    {"type": "web_search_20250305", "name": "web_search"},
+                ],
+                "tool_choice": {"type": "tool", "name": "read", "disable_parallel_tool_use": true},
+            }),
+            serde_json::json!({"config": {
+                "temperature": 0.5,
+                "tools": [{"functionDeclarations": [{"name": "read", "parameters": schema}]}, {"googleSearch": {}}],
+                "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+            }}),
+            serde_json::json!({
+                "toolConfig": {"tools": [{"toolSpec": {"name": "read", "inputSchema": {"json": schema}}}]},
+                "inferenceConfig": {"maxTokens": 512},
+            }),
+        ] {
+            let journaled = serde_json::Value::Object(request_config(&payload));
+            assert_eq!(
+                serde_json::Value::Object(request_config(&journaled)),
+                journaled
+            );
+        }
+    }
+}
