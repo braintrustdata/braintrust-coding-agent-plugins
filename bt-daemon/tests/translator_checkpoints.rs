@@ -15,24 +15,6 @@ fn collect(translator: &mut dyn AgentTranslator, env: &Envelope, ctx: &SessionCt
     }
     ops
 }
-fn comparable(ops: Vec<SpanOp>) -> Vec<String> {
-    let mut values = ops
-        .into_iter()
-        .map(|op| {
-            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &op;
-            serde_json::to_string(&(
-                &op,
-                &row.turn_span_id,
-                row.is_turn,
-                &row.late_merge_key,
-                &row.late_merge_version,
-            ))
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    values.sort();
-    values
-}
 fn assert_stream(source: &str, events: Vec<Envelope>) {
     let registry = Registry::default_agents();
     let session = events
@@ -56,56 +38,26 @@ fn assert_stream(source: &str, events: Vec<Envelope>) {
         restored.restore_state(&state).unwrap();
         for env in &events[split..] {
             assert_eq!(
-                comparable(collect(original.as_mut(), env, &ctx)),
-                comparable(collect(restored.as_mut(), env, &ctx)),
+                streams::comparable(collect(original.as_mut(), env, &ctx)),
+                streams::comparable(collect(restored.as_mut(), env, &ctx)),
                 "{source} split {split} event {}",
                 env.event
             );
         }
         assert_eq!(
-            comparable(original.finalize(&ctx).unwrap()),
-            comparable(restored.finalize(&ctx).unwrap()),
+            streams::comparable(original.finalize(&ctx).unwrap()),
+            streams::comparable(restored.finalize(&ctx).unwrap()),
             "{source} split {split} finalization"
         );
     }
 }
 #[test]
-fn checkpoints_preserve_native_turns_tools_transcripts_and_later_turn_ids() {
+fn every_translator_preserves_native_state_at_every_event_boundary() {
+    let mut covered = Vec::new();
     for (source, events, _fixtures) in streams::native_streams() {
-        if ["claude-code", "codex", "pi", "opencode"].contains(&source.as_str()) {
-            assert_stream(&source, events);
-        }
+        covered.push(source.clone());
+        assert_stream(&source, events);
     }
-}
-#[test]
-fn muse_checkpoints_preserve_open_operations_and_cumulative_usage() {
-    for (source, events, _fixtures) in streams::native_streams() {
-        if source == "muse" {
-            assert_stream(&source, events);
-        }
-    }
-}
-#[test]
-fn cursor_checkpoints_preserve_open_tools_and_internal_span_fields() {
-    for (source, events, _fixtures) in streams::native_streams() {
-        if source == "cursor" {
-            assert_stream(&source, events);
-        }
-    }
-}
-#[test]
-fn antigravity_checkpoints_preserve_invocations_across_native_boundaries() {
-    for (source, events, _fixtures) in streams::native_streams() {
-        if source == "antigravity" {
-            assert_stream(&source, events);
-        }
-    }
-}
-#[test]
-fn grok_checkpoints_preserve_transcript_cursors_and_pending_model_work() {
-    for (source, events, _fixtures) in streams::native_streams() {
-        if source == "grok" {
-            assert_stream(&source, events);
-        }
-    }
+    covered.sort();
+    assert_eq!(covered, Registry::default_agents().sources());
 }

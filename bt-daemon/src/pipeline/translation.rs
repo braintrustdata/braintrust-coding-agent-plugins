@@ -28,7 +28,6 @@ const CHECKPOINT_BYTES: u64 = 1024 * 1024;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct RecoveryContext {
-    format: u32,
     translator: Box<serde_json::value::RawValue>,
     pub decoder: crate::journal::DecoderContext,
     capture: Option<OriginSnapshot>,
@@ -48,10 +47,6 @@ impl RecoveryContext {
         );
         let decoder = zstd::stream::read::Decoder::new(checkpoint.state.as_slice())?;
         let context: Self = serde_json::from_reader(std::io::BufReader::new(decoder))?;
-        anyhow::ensure!(
-            context.format == 1,
-            "unsupported translation context format"
-        );
         Ok(context)
     }
 }
@@ -115,51 +110,12 @@ pub(crate) struct TranslationOptions {
 
 impl Translation {
     pub async fn spawn(options: TranslationOptions) -> anyhow::Result<Arc<Self>> {
-        let path = options.data_dir.join("pipeline").join(format!(
-            "{}.sqlite",
-            crate::ids::session_storage_id(&options.source, &options.session_id)
-        ));
-        let journal = SpanJournal::open(&path).await?;
-        let committed = journal.translated_through().await?;
-        let progress = Arc::new(Progress {
-            requested: AtomicU64::new(committed),
-            committed: AtomicU64::new(committed),
-        });
-        let recovery = Arc::new(Mutex::new(None));
-        let error = Arc::new(Mutex::new(None));
+        let actor = Producer::open(options).await?;
+        let journal = actor.journal.clone();
+        let progress = actor.progress.clone();
+        let error = actor.error.clone();
+        let recovery = actor.recovery.clone();
         let (tx, rx) = mpsc::channel(64);
-        let state = match journal.source_failure().await? {
-            Some(raw) => State::Recovering(serde_json::from_str(&raw).unwrap_or_else(|_| {
-                Failure::revision(Boundary::Journal, committed + 1, raw, &options.version)
-            })),
-            None => State::Processing,
-        };
-        let actor = Producer {
-            options,
-            progress: progress.clone(),
-            journal: journal.clone(),
-            error: error.clone(),
-            recovery: recovery.clone(),
-            translator: None,
-            reader: None,
-            decoder: Default::default(),
-            observers: Vec::new(),
-            origins: WeakOrigins::default(),
-            roots: Roots::default(),
-            capture: None,
-            pending_snapshots: HashSet::new(),
-            bounds: HashMap::new(),
-            templates: HashMap::new(),
-            position: 0,
-            committed,
-            checkpoint_position: 0,
-            checkpoint_events: 0,
-            checkpoint_work_bytes: 0,
-            checkpoint_safe: true,
-            state,
-            publication: None,
-            phase: Boundary::Journal,
-        };
         let task = tokio::spawn(actor.run(rx));
         Ok(Arc::new(Self {
             tx,
@@ -308,6 +264,53 @@ struct Producer {
 }
 
 impl Producer {
+    async fn open(options: TranslationOptions) -> anyhow::Result<Self> {
+        let path = options.data_dir.join("pipeline").join(format!(
+            "{}.sqlite",
+            crate::ids::session_storage_id(&options.source, &options.session_id)
+        ));
+        let journal = SpanJournal::open(&path).await?;
+        let committed = journal.translated_through().await?;
+        let progress = Arc::new(Progress {
+            requested: AtomicU64::new(committed),
+            committed: AtomicU64::new(committed),
+        });
+        let recovery = Arc::new(Mutex::new(None));
+        let error = Arc::new(Mutex::new(None));
+        let state = match journal.source_failure().await? {
+            Some(raw) => State::Recovering(serde_json::from_str(&raw).unwrap_or_else(|_| {
+                Failure::revision(Boundary::Journal, committed + 1, raw, &options.version)
+            })),
+            None => State::Processing,
+        };
+        Ok(Self {
+            options,
+            progress,
+            journal,
+            error,
+            recovery,
+            translator: None,
+            reader: None,
+            decoder: Default::default(),
+            observers: Vec::new(),
+            origins: WeakOrigins::default(),
+            roots: Roots::default(),
+            capture: None,
+            pending_snapshots: HashSet::new(),
+            bounds: HashMap::new(),
+            templates: HashMap::new(),
+            position: 0,
+            committed,
+            checkpoint_position: 0,
+            checkpoint_events: 0,
+            checkpoint_work_bytes: 0,
+            checkpoint_safe: true,
+            state,
+            publication: None,
+            phase: Boundary::Journal,
+        })
+    }
+
     /// Translators perform synchronous native transcript I/O and reduction.
     /// Keep both replay and live reduction off the runtime serving hook IPC.
     async fn translate<T: Send + 'static>(
@@ -504,7 +507,6 @@ impl Producer {
                     return Ok(None);
                 };
                 let state = RecoveryContext {
-                    format: 1,
                     translator: serde_json::value::RawValue::from_string(String::from_utf8(
                         state,
                     )?)?,
@@ -1089,24 +1091,6 @@ mod tests {
 
     #[tokio::test]
     async fn native_source_output_matches_live_overflow_and_cold_recovery() {
-        fn comparable(ops: Vec<(u64, SpanOp)>) -> Vec<String> {
-            let mut rows = ops
-                .into_iter()
-                .map(|(_, op)| {
-                    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &op;
-                    serde_json::to_string(&(
-                        &op,
-                        &row.turn_span_id,
-                        row.is_turn,
-                        &row.late_merge_key,
-                        &row.late_merge_version,
-                    ))
-                    .unwrap()
-                })
-                .collect::<Vec<_>>();
-            rows.sort();
-            rows
-        }
         let mut covered = Vec::new();
         for (source, mut events, _fixtures) in streams::native_streams() {
             covered.push(source.clone());
@@ -1164,7 +1148,16 @@ mod tests {
                     .await
                     .unwrap_or_else(|error| panic!("{source} {mode}: {error}"));
                 translation.control(ControlKind::Finalize).await.unwrap();
-                let rows = comparable(translation.journal.read_after(0, 10000).await.unwrap());
+                let rows = streams::comparable(
+                    translation
+                        .journal
+                        .read_after(0, 10000)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|(_, op)| op)
+                        .collect(),
+                );
                 assert!(!rows.is_empty(), "{source} produced no observations");
                 if let Some(expected) = &expected {
                     assert_eq!(&rows, expected, "{source} {mode}");
@@ -1395,38 +1388,12 @@ mod tests {
         let entered = Arc::new(Notify::new());
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (release, receiver) = std::sync::mpsc::channel();
-        let mut producer = Producer {
-            options,
-            journal: SpanJournal::open(&tmp.path().join("work.sqlite"))
-                .await
-                .unwrap(),
-            progress: Arc::default(),
-            error: Arc::default(),
-            recovery: Arc::default(),
-            translator: Some(Box::new(BlockedReplay {
-                entered: entered.clone(),
-                finished: finished.clone(),
-                release: receiver,
-            })),
-            reader: None,
-            decoder: Default::default(),
-            observers: Vec::new(),
-            origins: WeakOrigins::default(),
-            roots: Roots::default(),
-            capture: None,
-            pending_snapshots: HashSet::new(),
-            bounds: HashMap::new(),
-            templates: HashMap::new(),
-            position: 0,
-            committed: 0,
-            checkpoint_position: 0,
-            checkpoint_events: 0,
-            checkpoint_work_bytes: 0,
-            checkpoint_safe: true,
-            state: State::Processing,
-            publication: None,
-            phase: Boundary::Journal,
-        };
+        let mut producer = Producer::open(options).await.unwrap();
+        producer.translator = Some(Box::new(BlockedReplay {
+            entered: entered.clone(),
+            finished: finished.clone(),
+            release: receiver,
+        }));
         let started = std::time::Instant::now();
         let processing = tokio::spawn(async move {
             let result = producer.advance(through).await;
@@ -1477,40 +1444,16 @@ mod tests {
 
     #[tokio::test]
     async fn slow_checkpoint_encoding_does_not_block_journal_capture_on_the_runtime() {
-        let (tmp, path, writer) = source_journal("debug").await;
+        let (tmp, _, writer) = source_journal("debug").await;
         let entered = Arc::new(Notify::new());
         let (release, resume) = std::sync::mpsc::channel();
-        let mut producer = Producer {
-            options: resume_options(tmp.path(), "debug", writer.clone()),
-            journal: SpanJournal::open(&tmp.path().join("checkpoint.sqlite"))
-                .await
-                .unwrap(),
-            progress: Arc::default(),
-            error: Arc::default(),
-            recovery: Arc::default(),
-            translator: Some(Box::new(BlockedCheckpoint {
-                entered: entered.clone(),
-                release: resume,
-            })),
-            reader: JournalReader::open(&path, 0).await.unwrap(),
-            decoder: Default::default(),
-            observers: Vec::new(),
-            origins: WeakOrigins::default(),
-            roots: Roots::default(),
-            capture: None,
-            pending_snapshots: HashSet::new(),
-            bounds: HashMap::new(),
-            templates: HashMap::new(),
-            position: 0,
-            committed: 0,
-            checkpoint_position: 0,
-            checkpoint_events: 0,
-            checkpoint_work_bytes: 0,
-            checkpoint_safe: true,
-            state: State::Processing,
-            publication: None,
-            phase: Boundary::Journal,
-        };
+        let mut producer = Producer::open(resume_options(tmp.path(), "debug", writer.clone()))
+            .await
+            .unwrap();
+        producer.translator = Some(Box::new(BlockedCheckpoint {
+            entered: entered.clone(),
+            release: resume,
+        }));
         let checkpoint = tokio::spawn(async move { producer.checkpoint_context(0).await });
         entered.notified().await;
         let env = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"during-checkpoint","ts_ms":1,"payload":{}})).unwrap();
@@ -1961,72 +1904,39 @@ mod tests {
     }
     #[tokio::test]
     async fn failed_append_and_commit_retain_the_built_chunk() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("spans.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
-        let db = rusqlite::Connection::open(&path).unwrap();
-        let event_path = tmp.path().join("events.ndjson");
+        let (tmp, _, writer) = source_journal("debug").await;
+        let mut producer = Producer::open(resume_options(tmp.path(), "debug", writer))
+            .await
+            .unwrap();
+        let journal = producer.journal.clone();
+        let path = tmp.path().join("pipeline").join(format!(
+            "{}.sqlite",
+            crate::ids::session_storage_id("debug", "checkpoint")
+        ));
+        let db = rusqlite::Connection::open(path).unwrap();
         let drains = Arc::new(AtomicU64::new(0));
-        let mut producer = Producer {
-            options: TranslationOptions {
-                source: "debug".into(),
-                session_id: "test".into(),
-                namespace: "test".into(),
-                version: "test".into(),
-                data_dir: tmp.path().into(),
-                events: Arc::new(tokio::sync::Mutex::new(
-                    JournalWriter::open_path(&event_path).await.unwrap(),
-                )),
-                event_path,
-                input: SourceInput::default(),
-                registry: Arc::new(Registry::default_agents()),
-                correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
-                correlation_changed: Arc::new(Notify::new()),
-            },
-            progress: Arc::new(Progress::default()),
-            journal: journal.clone(),
-            error: Arc::new(Mutex::new(None)),
-            recovery: Arc::new(Mutex::new(None)),
-            translator: Some(Box::new(CountedTranslation(drains.clone()))),
-            reader: None,
-            decoder: Default::default(),
-            observers: Vec::new(),
-            origins: WeakOrigins::default(),
-            roots: Roots::default(),
+        producer.translator = Some(Box::new(CountedTranslation(drains.clone())));
+        producer.publication = Some(Publication {
+            input: 10,
+            decoded_bytes: 0,
+            ordinal: 0,
+            observation: true,
             capture: None,
-            pending_snapshots: HashSet::new(),
-            bounds: HashMap::new(),
-            templates: HashMap::new(),
-            position: 0,
-            committed: 0,
-            checkpoint_position: 0,
-            checkpoint_events: 0,
-            checkpoint_work_bytes: 0,
-            checkpoint_safe: true,
-            state: State::Processing,
-            phase: Boundary::Journal,
-            publication: Some(Publication {
-                input: 10,
-                decoded_bytes: 0,
-                ordinal: 0,
-                observation: true,
-                capture: None,
-                ops: Some(vec![
-                    SpanOp::Insert(SpanRow {
-                        span_id: "unused-root".into(),
-                        metadata: Some(serde_json::json!({"_bt_defer_root": true})),
-                        ..Default::default()
-                    }),
-                    SpanOp::Insert(SpanRow {
-                        span_id: "built".into(),
-                        ..Default::default()
-                    }),
-                ]),
-                begun: false,
-                prepared: false,
-                complete: false,
-            }),
-        };
+            ops: Some(vec![
+                SpanOp::Insert(SpanRow {
+                    span_id: "unused-root".into(),
+                    metadata: Some(serde_json::json!({"_bt_defer_root": true})),
+                    ..Default::default()
+                }),
+                SpanOp::Insert(SpanRow {
+                    span_id: "built".into(),
+                    ..Default::default()
+                }),
+            ]),
+            begun: false,
+            prepared: false,
+            complete: false,
+        });
         db.execute_batch("CREATE TRIGGER fail_append BEFORE INSERT ON ops BEGIN SELECT RAISE(FAIL,'append'); END;").unwrap();
         assert!(producer.publish().await.is_err());
         assert_eq!(drains.load(Ordering::Relaxed), 0);

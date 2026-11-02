@@ -428,6 +428,10 @@ pub struct JournalReader {
 }
 
 impl JournalReader {
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
     #[cfg(test)]
     pub(crate) fn decoder_context(&self) -> &DecoderContext {
         &self.decoder

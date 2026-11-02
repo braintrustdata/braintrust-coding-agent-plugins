@@ -76,84 +76,57 @@ pub(super) async fn drain_capture_buffer(daemon: &Arc<Daemon>) -> anyhow::Result
     }
 }
 
-pub(super) struct ReplayCursor {
-    reader: journal::JournalReader,
-    position: u64,
-}
-
-/// Advance each evicted journal range from its previous position, retaining
-/// the reader's payload decoder context between advances. Older records are decoded
-/// only to initialize that context; they are not dispatched again.
+/// Resume frozen evicted ranges, merging one lookahead per source in capture
+/// order. Retain readers between advances so another eviction can extend them.
 pub(super) async fn replay_evicted(
     daemon: &Arc<Daemon>,
-    cursors: &mut HashMap<PathBuf, ReplayCursor>,
+    cursors: &mut HashMap<PathBuf, journal::JournalReader>,
     bounds: &HashMap<PathBuf, EvictedRange>,
 ) -> anyhow::Result<()> {
-    for (path, range) in bounds {
-        anyhow::ensure!(
-            journal::JournalReader::recorded_len(path).await >= range.through,
-            "evicted capture journal is truncated"
-        );
-        if !cursors.contains_key(path) {
-            let (reader, position) = match resume_discovery(daemon, path, range.from).await {
-                Ok(Some((reader, position, _))) => (reader, position),
-                _ => (
-                    journal::JournalReader::open(path, range.from)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("evicted capture journal disappeared"))?,
-                    0,
-                ),
-            };
-            cursors.insert(path.clone(), ReplayCursor { reader, position });
-        }
-        let cursor = cursors
-            .get_mut(path)
-            .ok_or_else(|| anyhow::anyhow!("recovery cursor missing"))?;
-        anyhow::ensure!(
-            cursor.position <= range.from,
-            "evicted capture ranges overlap"
-        );
-        cursor.reader.extend(range.from);
-        while cursor.position < range.from {
-            let entry =
-                cursor.reader.next_record().await?.ok_or_else(|| {
-                    anyhow::anyhow!("evicted capture range begins inside a record")
-                })?;
-            cursor.position = entry.through;
-        }
-        anyhow::ensure!(
-            cursor.position == range.from,
-            "invalid evicted capture boundary"
-        );
-        cursor.reader.extend(range.through);
-    }
-    // Keep one lookahead per source. The sequence is persisted in the same
-    // NDJSON append as its event, so capture needs no secondary write queue.
     let mut ready = Vec::new();
     for (path, range) in bounds {
-        let cursor = cursors
-            .get_mut(path)
-            .ok_or_else(|| anyhow::anyhow!("recovery cursor missing"))?;
-        if let Some((sequence, event)) = next_evicted_event(daemon, cursor, range.through).await? {
-            ready.push((sequence, path.clone(), event));
+        let mut reader = match cursors.remove(path) {
+            Some(reader) => reader,
+            None => match resume_discovery(daemon, path, range.from).await {
+                Ok(Some((reader, _, _))) => reader,
+                _ => journal::JournalReader::open(path, range.from)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("evicted capture journal disappeared"))?,
+            },
+        };
+        anyhow::ensure!(
+            reader.position() <= range.from,
+            "evicted capture ranges overlap"
+        );
+        // Decode only to reconstruct the payload cache across a gap whose
+        // events were already dispatched from memory.
+        reader.extend(range.from);
+        while reader.next_record().await?.is_some() {}
+        anyhow::ensure!(
+            reader.position() == range.from,
+            "invalid evicted capture boundary"
+        );
+        reader.extend(range.through);
+        if let Some((sequence, event)) =
+            next_evicted_event(daemon, &mut reader, range.through).await?
+        {
+            ready.push((sequence, event, path.clone(), reader, range.through));
+        } else {
+            cursors.insert(path.clone(), reader);
         }
     }
-    while !ready.is_empty() {
-        let index = ready
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, (sequence, _, _))| *sequence)
-            .map(|(index, _)| index)
-            .ok_or_else(|| anyhow::anyhow!("recovery lookahead missing"))?;
-        let (_, path, event) = ready.swap_remove(index);
+    while let Some(index) = ready
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, item)| item.0)
+        .map(|(index, _)| index)
+    {
+        let (_, event, path, mut reader, through) = ready.swap_remove(index);
         dispatch_ingress_event(daemon, event).await;
-        let cursor = cursors
-            .get_mut(&path)
-            .ok_or_else(|| anyhow::anyhow!("recovery cursor missing"))?;
-        if let Some((sequence, event)) =
-            next_evicted_event(daemon, cursor, bounds[&path].through).await?
-        {
-            ready.push((sequence, path, event));
+        if let Some((sequence, event)) = next_evicted_event(daemon, &mut reader, through).await? {
+            ready.push((sequence, event, path, reader, through));
+        } else {
+            cursors.insert(path, reader);
         }
     }
     Ok(())
@@ -161,18 +134,16 @@ pub(super) async fn replay_evicted(
 
 async fn next_evicted_event(
     daemon: &Daemon,
-    cursor: &mut ReplayCursor,
+    reader: &mut journal::JournalReader,
     through: u64,
 ) -> anyhow::Result<Option<(u64, PendingEvent)>> {
-    while cursor.position < through {
-        let before = cursor.position;
-        let entry = cursor
-            .reader
+    while reader.position() < through {
+        let before = reader.position();
+        let entry = reader
             .next_record()
             .await?
             .ok_or_else(|| anyhow::anyhow!("replay range ends inside a record"))?;
         anyhow::ensure!(entry.through <= through, "invalid replay end boundary");
-        cursor.position = entry.through;
         if let journal::JournalRecord::Event(redacted) = entry.record {
             let mut env = journal::envelope_from_redacted(redacted);
             let Some(source) = daemon.translators.canonical_source(&env.source) else {
@@ -192,7 +163,7 @@ async fn next_evicted_event(
             )));
         }
     }
-    anyhow::ensure!(cursor.position == through, "invalid replay end boundary");
+    anyhow::ensure!(reader.position() == through, "invalid replay end boundary");
     Ok(None)
 }
 

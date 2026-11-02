@@ -2,7 +2,7 @@
 //! kinds may reference their previous payload, with a bounded per-session cache.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::VecDeque, io::Write, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 
 // These bounds are part of the v1 decoding contract.
 const MIN_BYTES: usize = 4 * 1024;
@@ -28,45 +28,10 @@ pub(super) struct Delta {
     insert: String,
 }
 
-/// Stop serialization once the cache budget is exceeded. Large events remain
-/// complete raw records without allocating another unbounded payload copy.
-struct LimitedJson {
-    bytes: Vec<u8>,
-    limit: usize,
-    exceeded: bool,
-}
-impl Write for LimitedJson {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
-            self.exceeded = true;
-            return Err(std::io::Error::other("journal codec cache budget exceeded"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 pub(super) fn cache_json(event: &str, payload: &Value) -> anyhow::Result<Option<Arc<str>>> {
-    if event.len() >= MAX_BYTES {
-        return Ok(None);
-    }
-    let mut output = LimitedJson {
-        bytes: Vec::new(),
-        limit: MAX_BYTES - event.len(),
-        exceeded: false,
-    };
-    let result = serde_json::to_writer(&mut output, payload);
-    if output.exceeded {
-        return Ok(None);
-    }
-    result?;
-    if output.bytes.len() < MIN_BYTES {
-        return Ok(None);
-    }
-    Ok(Some(String::from_utf8(output.bytes)?.into()))
+    // Oversized JSON is dropped before the raw record is serialized. The
+    // limit bounds retained decoder state; it never truncates event data.
+    Ok(cache_serialized(event, &serde_json::to_string(payload)?))
 }
 
 /// Delta offsets refer to the exact stored JSON, including key order and

@@ -157,3 +157,23 @@ pub fn native_streams() -> Vec<NativeStream> {
     ));
     cases
 }
+
+// Include reducer-only correlation fields omitted by public SpanOp JSON.
+pub fn comparable(ops: Vec<bt_daemon::SpanOp>) -> Vec<String> {
+    let mut rows = ops
+        .into_iter()
+        .map(|op| {
+            let (bt_daemon::SpanOp::Insert(row) | bt_daemon::SpanOp::Merge(row)) = &op;
+            serde_json::to_string(&(
+                &op,
+                &row.turn_span_id,
+                row.is_turn,
+                &row.late_merge_key,
+                &row.late_merge_version,
+            ))
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
+}
