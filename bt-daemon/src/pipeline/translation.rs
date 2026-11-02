@@ -1,6 +1,6 @@
 //! One ordered source consumer. Output publication is independent of route delivery.
 use super::input::{SourceEvent, SourceInput, SourcePosition, SourceRecord};
-use super::journal::{SpanJournal, TranslationCheckpoint};
+use super::journal::SpanJournal;
 use super::prepare::Prepare;
 use super::roots::Roots;
 use super::{
@@ -22,35 +22,6 @@ use std::{
     },
 };
 use tokio::sync::{mpsc, oneshot, Notify};
-
-const CHECKPOINT_EVENTS: u64 = 64;
-const CHECKPOINT_BYTES: u64 = 1024 * 1024;
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct RecoveryContext {
-    translator: Box<serde_json::value::RawValue>,
-    pub decoder: crate::journal::CodecState,
-    capture: Option<OriginSnapshot>,
-    bounds: HashMap<String, u64>,
-    pub templates: HashMap<String, crate::wire::RedactedEnvelope>,
-}
-
-impl RecoveryContext {
-    pub fn decode(
-        checkpoint: &TranslationCheckpoint,
-        version: &str,
-        through: u64,
-    ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            checkpoint.version == version && checkpoint.input <= through,
-            "translation checkpoint is incompatible with the current head"
-        );
-        let decoder = zstd::stream::read::Decoder::new(checkpoint.state.as_slice())?;
-        let context: Self = serde_json::from_reader(std::io::BufReader::new(decoder))?;
-        context.decoder.validate()?;
-        Ok(context)
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct Observation {
@@ -207,10 +178,6 @@ impl Translation {
         self.journal.route_settings(route).await
     }
 
-    pub async fn has_head(&self, route: &SessionRoute) -> anyhow::Result<bool> {
-        self.journal.has_head(route).await
-    }
-
     /// Connect a route to the committed SpanOp stream without exposing its
     /// storage adapter to the route actor.
     pub async fn subscribe(
@@ -228,7 +195,6 @@ enum State {
 }
 struct Publication {
     input: u64,
-    decoded_bytes: u64,
     ordinal: u64,
     observation: bool,
     capture: Option<OriginSnapshot>,
@@ -246,19 +212,14 @@ struct Producer {
     recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     translator: Option<Box<dyn AgentTranslator>>,
     reader: Option<JournalReader>,
-    decoder: crate::journal::CodecState,
     observers: Vec<Observation>,
     origins: WeakOrigins,
     roots: Roots,
     capture: Option<OriginSnapshot>,
     pending_snapshots: HashSet<String>,
     bounds: HashMap<String, u64>,
-    templates: HashMap<String, crate::wire::RedactedEnvelope>,
     position: u64,
     committed: u64,
-    checkpoint_position: u64,
-    checkpoint_work: u64,
-    checkpoint_safe: bool,
     state: State,
     publication: Option<Publication>,
     phase: Boundary,
@@ -292,19 +253,14 @@ impl Producer {
             recovery,
             translator: None,
             reader: None,
-            decoder: Default::default(),
             observers: Vec::new(),
             origins: WeakOrigins::default(),
             roots: Roots::default(),
             capture: None,
             pending_snapshots: HashSet::new(),
             bounds: HashMap::new(),
-            templates: HashMap::new(),
             position: 0,
             committed,
-            checkpoint_position: 0,
-            checkpoint_work: 0,
-            checkpoint_safe: true,
             state,
             publication: None,
             phase: Boundary::Journal,
@@ -476,73 +432,8 @@ impl Producer {
                 self.state = State::Recovering(self.failure(error, attempts));
             }
         }
-        if self.publication.is_none() && self.position == self.committed {
-            if let Err(error) = self.persist_current_context().await {
-                tracing::warn!(%error, "translation checkpoint could not be saved at shutdown");
-            }
-        }
     }
 
-    async fn checkpoint_context(
-        &mut self,
-        input: u64,
-    ) -> anyhow::Result<Option<TranslationCheckpoint>> {
-        if !self.checkpoint_safe || self.translator.is_none() {
-            return Ok(None);
-        }
-        let translator = self
-            .translator
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
-        let decoder = std::mem::take(&mut self.decoder);
-        let capture = self.capture.clone();
-        let bounds = self.bounds.clone();
-        let templates = self.templates.clone();
-        let version = self.options.version.clone();
-        // Context may include a long active conversation. Its encoding and
-        // compression must not monopolize a runtime thread serving hook IPC.
-        let (translator, decoder, checkpoint) = tokio::task::spawn_blocking(move || {
-            let checkpoint = (|| -> anyhow::Result<Option<TranslationCheckpoint>> {
-                let Some(state) = translator.save_state()? else {
-                    return Ok(None);
-                };
-                let state = RecoveryContext {
-                    translator: serde_json::value::RawValue::from_string(String::from_utf8(
-                        state,
-                    )?)?,
-                    decoder: decoder.clone(),
-                    capture,
-                    bounds,
-                    templates,
-                };
-                let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1)?;
-                serde_json::to_writer(&mut encoder, &state)?;
-                let state = encoder.finish()?;
-                Ok(Some(TranslationCheckpoint {
-                    input,
-                    version,
-                    state,
-                }))
-            })();
-            (translator, decoder, checkpoint)
-        })
-        .await?;
-        self.translator = Some(translator);
-        self.decoder = decoder;
-        checkpoint
-    }
-
-    async fn persist_current_context(&mut self) -> anyhow::Result<()> {
-        if self.checkpoint_position == self.committed {
-            return Ok(());
-        }
-        if let Some(checkpoint) = self.checkpoint_context(self.committed).await? {
-            self.journal.save_translation_checkpoint(checkpoint).await?;
-            self.checkpoint_position = self.committed;
-            self.checkpoint_work = 0;
-        }
-        Ok(())
-    }
     fn failure(&self, error: anyhow::Error, attempt: u32) -> Failure {
         let position = self.committed.saturating_add(1);
         let mut failure = if matches!(self.phase, Boundary::Translation) {
@@ -639,55 +530,6 @@ impl Producer {
             .await??,
         );
         self.position = 0;
-        self.decoder = Default::default();
-        self.checkpoint_position = 0;
-        self.checkpoint_work = 0;
-        self.checkpoint_safe = true;
-        if let Some(checkpoint) = self.journal.translation_checkpoint().await? {
-            if checkpoint.version == self.options.version && checkpoint.input <= self.committed {
-                let restored = async {
-                    let registry = self.options.registry.clone();
-                    let source = self.options.source.clone();
-                    let namespace = self.options.namespace.clone();
-                    let version = self.options.version.clone();
-                    let committed = self.committed;
-                    let input = checkpoint.input;
-                    let (translator, context) =
-                        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                            let context =
-                                RecoveryContext::decode(&checkpoint, &version, committed)?;
-                            let mut translator = registry
-                                .create_checked_with_session_namespace(&source, &namespace)?;
-                            translator.restore_state(context.translator.get().as_bytes())?;
-                            Ok((translator, context))
-                        })
-                        .await??;
-                    let reader = JournalReader::resume(
-                        &self.options.event_path,
-                        input,
-                        self.committed,
-                        Default::default(),
-                    )
-                    .await?;
-                    self.translator = Some(translator);
-                    self.reader = Some(reader);
-                    self.decoder = context.decoder;
-                    self.capture = context.capture;
-                    self.bounds = context.bounds;
-                    self.templates = context.templates;
-                    self.position = input;
-                    self.checkpoint_position = input;
-                    Ok::<_, anyhow::Error>(())
-                }
-                .await;
-                match restored {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        tracing::warn!(%error, "invalid translation checkpoint; rebuilding from journal")
-                    }
-                }
-            }
-        }
         self.reader = if self.committed > 0 {
             JournalReader::open(&self.options.event_path, self.committed).await?
         } else {
@@ -698,9 +540,6 @@ impl Producer {
 
     async fn next_input(&mut self, through: u64) -> anyhow::Result<Option<SourceRecord>> {
         if let Some(record) = self.options.input.take(self.position, through) {
-            if matches!(&record.event, SourceEvent::Event(_)) {
-                self.decoder.record_live(&record.position);
-            }
             // A future gap resumes from this logical position. The live path
             // does not open, seek, read, or pass payloads through a journal reader.
             self.reader = None;
@@ -711,13 +550,7 @@ impl Producer {
         }
         if self.reader.is_none() {
             self.reader = Some(
-                JournalReader::resume(
-                    &self.options.event_path,
-                    self.position,
-                    through,
-                    Default::default(),
-                )
-                .await?,
+                JournalReader::resume(&self.options.event_path, self.position, through).await?,
             );
         }
         let reader = self
@@ -725,10 +558,7 @@ impl Producer {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("recovery reader is missing"))?;
         reader.extend(through);
-        reader.swap_decoder_context(&mut self.decoder);
-        let entry = reader.next_record().await;
-        reader.swap_decoder_context(&mut self.decoder);
-        let Some(entry) = entry? else {
+        let Some(entry) = reader.next_record().await? else {
             return Ok(None);
         };
         let event = match entry.record {
@@ -743,8 +573,6 @@ impl Producer {
             position: SourcePosition {
                 before: self.position,
                 through: entry.through,
-                decoded_bytes: entry.decoded_bytes,
-                decoder_base: None,
             },
         }))
     }
@@ -771,33 +599,6 @@ impl Producer {
                 SourceEvent::Event(mut env) => {
                     if let Some(route) = &env.route {
                         self.journal.register(route).await?;
-                        // Discovery needs subscriptions and transcript references,
-                        // not copies of native prompts, responses, or credentials.
-                        let mut template = env.redacted();
-                        template.payload = env
-                            .payload
-                            .as_object()
-                            .map(|payload| {
-                                serde_json::Value::Object(
-                                    payload
-                                        .iter()
-                                        .filter(|(key, _)| {
-                                            matches!(
-                                                key.as_str(),
-                                                "transcript_path"
-                                                    | "agent_transcript_path"
-                                                    | "cwd"
-                                                    | "_bt_transcript_mirror"
-                                                    | "_bt_claude_transcript_mirrors"
-                                            )
-                                        })
-                                        .map(|(key, value)| (key.clone(), value.clone()))
-                                        .collect(),
-                                )
-                            })
-                            .unwrap_or_else(|| serde_json::json!({}));
-                        self.templates
-                            .insert(serde_json::to_string(route)?, template);
                     }
                     if crate::translate::canonical_source_name(&env.source) != self.options.source {
                         self.position = input;
@@ -841,12 +642,6 @@ impl Producer {
                         self.position = input;
                         continue;
                     }
-                    if matches!(control.kind, ControlKind::Retire) {
-                        // Retirement emits defensive ends without making them
-                        // part of the logical state restored on a later resume.
-                        self.persist_current_context().await?;
-                        self.checkpoint_safe = false;
-                    }
                     self.phase = Boundary::Translation;
                     let ops = self
                         .translate(move |translator, ctx| {
@@ -872,7 +667,6 @@ impl Producer {
             };
             self.publication = Some(Publication {
                 input,
-                decoded_bytes: entry.position.decoded_bytes,
                 ordinal: 0,
                 observation,
                 capture,
@@ -972,40 +766,15 @@ impl Producer {
                 pending.complete = pending.ops.is_none();
                 pending.prepared = false;
             }
-            // Charge at least 1/64 of the budget per record, bounding both
-            // event count and decoded bytes with one replay-work counter.
-            let work = self.checkpoint_work.saturating_add(
-                pending
-                    .decoded_bytes
-                    .max(pending.input.saturating_sub(self.position))
-                    .max(CHECKPOINT_BYTES / CHECKPOINT_EVENTS),
-            );
             if publish {
                 self.phase = Boundary::Journal;
-                let checkpoint = if work >= CHECKPOINT_BYTES {
-                    self.checkpoint_context(pending.input).await?
-                } else {
-                    None
-                };
-                let checkpointed = checkpoint.is_some();
                 self.journal
-                    .commit_with_context(pending.input, self.roots.pending(), checkpoint)
+                    .commit_with_roots(pending.input, self.roots.pending())
                     .await?;
-                if checkpointed {
-                    self.checkpoint_position = pending.input;
-                    self.checkpoint_work = 0;
-                } else {
-                    self.checkpoint_work = work;
-                }
                 self.committed = pending.input;
                 self.progress
                     .committed
                     .store(pending.input, Ordering::Relaxed);
-            } else {
-                // Restoring a checkpoint replays the committed suffix too.
-                // Count that work so repeated short-lived processes cannot
-                // keep extending the distance from the same old checkpoint.
-                self.checkpoint_work = work;
             }
             self.position = pending.input;
             Ok(())
@@ -1091,13 +860,21 @@ pub(crate) mod tests {
         pub(crate) async fn new(agent: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let path = crate::journal::source_journal_path(dir.path(), agent, "checkpoint");
-            let options = resume_options(
-                dir.path(),
-                agent,
-                Arc::new(tokio::sync::Mutex::new(
+            let options = TranslationOptions {
+                source: agent.into(),
+                session_id: "checkpoint".into(),
+                namespace: crate::ids::session_namespace(agent, "checkpoint"),
+                version: "test".into(),
+                data_dir: dir.path().into(),
+                events: Arc::new(tokio::sync::Mutex::new(
                     JournalWriter::open_path(&path).await.unwrap(),
                 )),
-            );
+                event_path: path,
+                input: SourceInput::default(),
+                registry: Arc::new(Registry::default_agents()),
+                correlation: Arc::default(),
+                correlation_changed: Arc::default(),
+            };
             let source = Translation::spawn(options.clone()).await.unwrap();
             Self {
                 _dir: dir,
@@ -1130,14 +907,6 @@ pub(crate) mod tests {
             self.options.input = SourceInput::default();
             self.source = Translation::spawn(self.options.clone()).await.unwrap();
         }
-        async fn checkpoint(&self) -> TranslationCheckpoint {
-            self.source
-                .journal
-                .translation_checkpoint()
-                .await
-                .unwrap()
-                .unwrap()
-        }
         fn db(&self) -> rusqlite::Connection {
             rusqlite::Connection::open(self.options.data_dir.join("pipeline").join(format!(
                 "{}.sqlite",
@@ -1169,9 +938,6 @@ pub(crate) mod tests {
             }
             let mut cases = vec![("live", 0), ("overflow", 2)];
             cases.extend((1..=events.len()).map(|split| ("cold", split)));
-            if agent == "debug" {
-                cases.extend([("old", 1), ("corrupt", 1)]);
-            }
             let mut expected = None;
             for (mode, split) in cases {
                 let mut f = SourceFixture::new(&agent).await;
@@ -1181,21 +947,15 @@ pub(crate) mod tests {
                 }
                 let tail = *positions.last().unwrap();
                 if mode == "cold" && split == 1 {
-                    let mut reader = JournalReader::open(&f.options.event_path, tail)
+                    let stored = tokio::fs::read_to_string(&f.options.event_path)
                         .await
-                        .unwrap()
                         .unwrap();
-                    for event in &events {
-                        assert_eq!(
-                            reader.next_entry().await.unwrap().unwrap().payload,
-                            event.payload
-                        );
+                    assert_eq!(stored.lines().count(), events.len());
+                    for (line, event) in stored.lines().zip(&events) {
+                        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                        assert_eq!(record["payload"], event.payload);
                     }
                 }
-                assert!(tokio::fs::read_to_string(&f.options.event_path)
-                    .await
-                    .unwrap()
-                    .contains("payload_zstd_v1"));
                 match mode {
                     "live" => {
                         f.process(positions[1]).await;
@@ -1215,17 +975,6 @@ pub(crate) mod tests {
                     _ => {
                         f.process(positions[split]).await;
                         f.source.shutdown().await;
-                        if mode == "cold" {
-                            f.poison(0..positions[split]).await;
-                        } else {
-                            f.db()
-                                .execute_batch(if mode == "old" {
-                                    "UPDATE translation_checkpoint SET version='old'"
-                                } else {
-                                    "UPDATE translation_checkpoint SET state=x'00'"
-                                })
-                                .unwrap();
-                        }
                         f.reopen().await;
                     }
                 }
@@ -1255,7 +1004,6 @@ pub(crate) mod tests {
     }
 
     struct BlockedTranslator {
-        checkpoint: bool,
         entered: Arc<Notify>,
         release: std::sync::mpsc::Receiver<()>,
     }
@@ -1273,167 +1021,48 @@ pub(crate) mod tests {
             _: &crate::wire::Envelope,
             _: &SessionCtx,
         ) -> anyhow::Result<Vec<SpanOp>> {
-            if !self.checkpoint {
-                self.block();
-            }
+            self.block();
             Ok(Vec::new())
         }
-        fn save_state(&self) -> anyhow::Result<Option<Vec<u8>>> {
-            if self.checkpoint {
-                self.block();
-            }
-            Ok(Some(b"{}".to_vec()))
-        }
-    }
-    #[tokio::test]
-    async fn synchronous_replay_and_checkpoint_work_do_not_block_capture() {
-        for checkpoint in [false, true] {
-            let f = SourceFixture::new("debug").await;
-            let event = streams::native_streams().pop().unwrap().1.remove(0);
-            let through = f.write(&event, false).await;
-            let mut producer = Producer::open(f.options.clone()).await.unwrap();
-            let entered = Arc::new(Notify::new());
-            let (release, receiver) = std::sync::mpsc::channel();
-            producer.translator = Some(Box::new(BlockedTranslator {
-                checkpoint,
-                entered: entered.clone(),
-                release: receiver,
-            }));
-            let started = std::time::Instant::now();
-            let work = tokio::spawn(async move {
-                let result = if checkpoint {
-                    producer.checkpoint_context(0).await.map(|_| ())
-                } else {
-                    producer.advance(through).await
-                };
-                (producer, result)
-            });
-            entered.notified().await;
-            assert!(started.elapsed() < std::time::Duration::from_secs(1));
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_secs(1), f.write(&event, true))
-                    .await
-                    .unwrap()
-                    > through
-            );
-            assert!(
-                !work.is_finished(),
-                "capture must complete before replay is released"
-            );
-            release.send(()).unwrap();
-            let (producer, result) = work.await.unwrap();
-            result.unwrap();
-            assert_eq!(
-                producer.journal.translated_through().await.unwrap(),
-                if checkpoint { 0 } else { through }
-            );
-            f.source.shutdown().await;
-        }
     }
 
     #[tokio::test]
-    async fn checkpoint_budget_counts_reconstructed_inputs_and_decoded_bytes() {
-        let mut f = SourceFixture::new("debug").await;
-        let mut event = streams::native_streams().pop().unwrap().1.remove(0);
-        let mut tail = 0;
-        for _ in 0..2 * CHECKPOINT_EVENTS - 1 {
-            tail = f.write(&event, false).await;
-        }
-        f.process(tail).await;
-        assert!(f.checkpoint().await.input < tail);
-        let task = f.source.task.lock().await.take().unwrap();
-        task.abort();
-        let _ = task.await;
-        tail = f.write(&event, false).await;
-        f.reopen().await;
-        f.process(tail).await;
-        assert_eq!(
-            f.checkpoint().await.input,
-            tail,
-            "reconstructed suffix counts toward the next checkpoint"
-        );
-        let before = tail;
-        event.payload["history"] = "x".repeat(256 * 1024).into();
-        for _ in 0..5 {
-            tail = f.write(&event, false).await;
-        }
+    async fn synchronous_replay_does_not_block_capture_or_chase_new_events() {
+        let f = SourceFixture::new("debug").await;
+        let event = streams::native_streams().pop().unwrap().1.remove(0);
+        let through = f.write(&event, false).await;
+        let mut producer = Producer::open(f.options.clone()).await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let (release, receiver) = std::sync::mpsc::channel();
+        producer.translator = Some(Box::new(BlockedTranslator {
+            entered: entered.clone(),
+            release: receiver,
+        }));
+        let started = std::time::Instant::now();
+        let work = tokio::spawn(async move {
+            let result = producer.advance(through).await;
+            (producer, result)
+        });
+        entered.notified().await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(
-            tail - before < CHECKPOINT_BYTES,
-            "stored deltas must be below the physical byte threshold"
-        );
-        f.process(tail).await;
-        assert!(
-            f.checkpoint().await.input > before,
-            "decoded work must trigger a checkpoint before 64 inputs"
-        );
-        f.source.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn legacy_pi_decoder_context_resumes_without_reading_its_prefix() {
-        let mut f = SourceFixture::new("pi").await;
-        let mut event = streams::native_streams().pop().unwrap().1.remove(0);
-        event.source = "pi".into();
-        event.event = "context".into();
-        let mut contents = String::new();
-        let mut positions = Vec::new();
-        for i in 0..CHECKPOINT_EVENTS + 3 {
-            event.payload = serde_json::json!({"event":{"_bt_messages_delta":{"common_prefix":if i == 0 {0} else {1}, "suffix":[{"role":"user","content":"shared".repeat(1024)}]}}});
-            contents.push_str(&serde_json::to_string(&event.redacted()).unwrap());
-            contents.push('\n');
-            positions.push(contents.len() as u64);
-        }
-        tokio::fs::write(&f.options.event_path, contents)
-            .await
-            .unwrap();
-        f.reopen().await;
-        let tail = *positions.last().unwrap();
-        f.process(tail).await;
-        let saved = f.checkpoint().await;
-        assert!(saved.input < tail);
-        assert!(!RecoveryContext::decode(&saved, "test", tail)
-            .unwrap()
-            .decoder
-            .legacy_pi
-            .is_empty());
-        let task = f.source.task.lock().await.take().unwrap();
-        task.abort();
-        let _ = task.await;
-        f.poison(0..saved.input).await;
-        f.reopen().await;
-        f.process(tail).await;
-        event.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"native"}],"_bt_messages_delta":{"native_field":"preserve"}}});
-        let native = f.write(&event, false).await;
-        f.process(native).await;
-        let mut reader =
-            JournalReader::resume(&f.options.event_path, tail, native, Default::default())
+            tokio::time::timeout(std::time::Duration::from_secs(1), f.write(&event, true))
                 .await
-                .unwrap();
+                .unwrap()
+                > through
+        );
+        assert!(
+            !work.is_finished(),
+            "capture must complete before replay is released"
+        );
+        release.send(()).unwrap();
+        let (producer, result) = work.await.unwrap();
+        result.unwrap();
         assert_eq!(
-            reader.next_entry().await.unwrap().unwrap().payload,
-            event.payload
+            producer.journal.translated_through().await.unwrap(),
+            through
         );
         f.source.shutdown().await;
-    }
-
-    fn resume_options(
-        data_dir: &std::path::Path,
-        source: &str,
-        events: Arc<tokio::sync::Mutex<JournalWriter>>,
-    ) -> TranslationOptions {
-        TranslationOptions {
-            source: source.into(),
-            session_id: "checkpoint".into(),
-            namespace: crate::ids::session_namespace(source, "checkpoint"),
-            version: "test".into(),
-            data_dir: data_dir.into(),
-            events,
-            event_path: crate::journal::source_journal_path(data_dir, source, "checkpoint"),
-            input: SourceInput::default(),
-            registry: Arc::new(Registry::default_agents()),
-            correlation: Arc::default(),
-            correlation_changed: Arc::default(),
-        }
     }
 
     #[tokio::test]
@@ -1595,7 +1224,6 @@ pub(crate) mod tests {
         producer.translator = Some(Box::new(CountedTranslation(drains.clone())));
         producer.publication = Some(Publication {
             input: 10,
-            decoded_bytes: 0,
             ordinal: 0,
             observation: true,
             capture: None,

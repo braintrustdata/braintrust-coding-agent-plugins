@@ -6,7 +6,7 @@
 
 use serde_json::{json, Map, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolApproval {
     Approved,
     Denied,

@@ -26,13 +26,12 @@ impl TranslatorFactory for crate::agents::Muse {
         Box::new(MuseTranslator::new(session_id, GitMetadataCache::shared()))
     }
 }
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone)]
 struct OpenOp {
     id: String,
     parents: Vec<String>,
     turn_span_id: Option<String>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
 struct MuseTranslator {
     session_id: String,
     root_id: String,
@@ -50,7 +49,6 @@ struct MuseTranslator {
     usage: UsageTracker,
     last_completed_turn: Option<String>,
     last_ts: i64,
-    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 impl MuseTranslator {
@@ -331,7 +329,6 @@ impl MuseTranslator {
     }
 }
 impl AgentTranslator for MuseTranslator {
-    translator_checkpoint!();
     fn handle(&mut self, e: &Envelope, ctx: &SessionCtx) -> Result<Vec<SpanOp>> {
         self.last_ts = self.last_ts.max(e.ts_ms);
         let event = match MuseEvent::decode(e) {

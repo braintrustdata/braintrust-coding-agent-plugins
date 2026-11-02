@@ -32,7 +32,7 @@ impl TranslatorFactory for crate::agents::Grok {
     }
 }
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default)]
 struct BoundedOutput {
     values: Vec<Value>,
     bytes: usize,
@@ -111,7 +111,6 @@ impl BoundedOutput {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenTurn {
     span_id: String,
     key: String,
@@ -129,7 +128,6 @@ struct TurnCompletion {
     late_merge_key: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenLlm {
     span_id: String,
     parent_span_id: String,
@@ -141,14 +139,12 @@ struct OpenLlm {
     last_ms: i64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenTool {
     span_id: String,
     parent_span_id: String,
     start_ms: i64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
 struct CompletedTool {
     span_id: String,
     parent_span_id: String,
@@ -158,7 +154,7 @@ struct CompletedTool {
     failure_recorded: bool,
 }
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default)]
 struct TranscriptCursor {
     path: Option<String>,
     offset: u64,
@@ -196,12 +192,11 @@ struct TranscriptBatch {
     reset: bool,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone)]
 struct PendingWork {
     event: Envelope,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
 struct GrokTranslator {
     session_id: String,
     session_span_id: String,
@@ -226,7 +221,6 @@ struct GrokTranslator {
     first_llm_user_input: Option<Value>,
     pending: Option<PendingWork>,
     cwd: Option<String>,
-    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
     last_ts_ms: i64,
 }
@@ -1228,7 +1222,6 @@ impl GrokTranslator {
 }
 
 impl AgentTranslator for GrokTranslator {
-    translator_checkpoint!();
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),

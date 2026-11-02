@@ -7,25 +7,10 @@
 //! whole pipeline be exercised with a debug sink and makes translators unit-
 //! testable without any network.
 
-// Checkpoint codecs stay local to each concrete reducer; the producer owns
-// format compatibility, compression, and the atomic SQLite input boundary.
-macro_rules! translator_checkpoint {
-    () => {
-        fn save_state(&self) -> anyhow::Result<Option<Vec<u8>>> {
-            Ok(Some(serde_json::to_vec(self)?))
-        }
-        fn restore_state(&mut self, state: &[u8]) -> anyhow::Result<()> {
-            *self = serde_json::from_slice(state)?;
-            Ok(())
-        }
-    };
-}
-
 mod shared;
 pub use shared::CowSpanOp;
 
 mod antigravity;
-mod checkpoint;
 mod claude;
 mod codex;
 pub(crate) mod cursor;
@@ -162,15 +147,6 @@ pub struct SessionCtx {
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
 pub trait AgentTranslator: Send {
-    /// Reducer context after a completely drained source event. These bytes
-    /// are versioned by the producer and committed alongside its input head.
-    fn save_state(&self) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-    fn restore_state(&mut self, _state: &[u8]) -> anyhow::Result<()> {
-        anyhow::bail!("translator does not support checkpoints")
-    }
-
     /// Handle one event, returning span ops to emit.
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>>;
 

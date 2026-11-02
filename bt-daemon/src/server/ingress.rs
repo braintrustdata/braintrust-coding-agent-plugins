@@ -60,53 +60,28 @@ impl Daemon {
 }
 
 pub(super) async fn drain_capture_buffer(daemon: &Arc<Daemon>) -> anyhow::Result<()> {
-    let mut cursors = HashMap::new();
     loop {
         match daemon.next_capture_work() {
-            CaptureWork::Evicted(bounds) => replay_evicted(daemon, &mut cursors, &bounds).await?,
+            CaptureWork::Evicted(bounds) => replay_evicted(daemon, &bounds).await?,
             CaptureWork::Event(event) => dispatch_ingress_event(daemon, *event).await,
             CaptureWork::Finished => return Ok(()),
         }
     }
 }
 
-/// Resume frozen evicted ranges, merging one lookahead per source in capture
-/// order. Retain readers between advances so another eviction can extend them.
+/// Read frozen evicted ranges, merging one lookahead per source in capture
+/// order. Current captures contain complete payloads and need no prefix replay.
 pub(super) async fn replay_evicted(
     daemon: &Arc<Daemon>,
-    cursors: &mut HashMap<PathBuf, journal::JournalReader>,
     bounds: &HashMap<PathBuf, EvictedRange>,
 ) -> anyhow::Result<()> {
     let mut ready = Vec::new();
     for (path, range) in bounds {
-        let mut reader = match cursors.remove(path) {
-            Some(reader) => reader,
-            None => match resume_discovery(daemon, path, range.from).await {
-                Ok(Some((reader, _))) => reader,
-                _ => journal::JournalReader::open(path, range.from)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("evicted capture journal disappeared"))?,
-            },
-        };
-        anyhow::ensure!(
-            reader.position() <= range.from,
-            "evicted capture ranges overlap"
-        );
-        // Decode only to reconstruct the payload cache across a gap whose
-        // events were already dispatched from memory.
-        reader.extend(range.from);
-        while reader.next_record().await?.is_some() {}
-        anyhow::ensure!(
-            reader.position() == range.from,
-            "invalid evicted capture boundary"
-        );
-        reader.extend(range.through);
+        let mut reader = journal::JournalReader::resume(path, range.from, range.through).await?;
         if let Some((sequence, event)) =
             next_evicted_event(daemon, &mut reader, range.through).await?
         {
-            ready.push((sequence, event, path.clone(), reader, range.through));
-        } else {
-            cursors.insert(path.clone(), reader);
+            ready.push((sequence, event, reader, range.through));
         }
     }
     while let Some(index) = ready
@@ -115,12 +90,10 @@ pub(super) async fn replay_evicted(
         .min_by_key(|(_, item)| item.0)
         .map(|(index, _)| index)
     {
-        let (_, event, path, mut reader, through) = ready.swap_remove(index);
+        let (_, event, mut reader, through) = ready.swap_remove(index);
         dispatch_ingress_event(daemon, event).await;
         if let Some((sequence, event)) = next_evicted_event(daemon, &mut reader, through).await? {
-            ready.push((sequence, event, path, reader, through));
-        } else {
-            cursors.insert(path, reader);
+            ready.push((sequence, event, reader, through));
         }
     }
     Ok(())

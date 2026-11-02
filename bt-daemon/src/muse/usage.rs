@@ -26,7 +26,7 @@ pub(crate) enum UsageScope {
     Model,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub(crate) struct TokenMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,

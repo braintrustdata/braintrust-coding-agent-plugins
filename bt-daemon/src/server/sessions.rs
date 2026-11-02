@@ -107,15 +107,10 @@ impl Daemon {
         // delivery checkpoint controlling which rows reach its sink.
         let journal_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
-        let translation = self.translation_for(env).await?;
-        // Existing SQLite heads are authoritative; subscribe never reseeds
-        // them from legacy checkpoints. Avoid decoding the entire old prefix.
-        let legacy_through = if translation.has_head(&route).await? {
-            0
-        } else {
+        let legacy_through =
             journal::JournalReader::acknowledged_through(&journal_path, replay_through, &route)
-                .await
-        };
+                .await;
+        let translation = self.translation_for(env).await?;
         let settings = translation.route_settings(&route).await?;
         let config = settings.with_auth(config.auth);
         env.config = Some(config.clone());

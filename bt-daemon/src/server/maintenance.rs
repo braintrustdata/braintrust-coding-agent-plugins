@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_overflow_preserves_each_session_and_its_compressed_context() {
+    async fn repeated_overflow_preserves_each_session_and_event_order() {
         let tmp = tempfile::tempdir().unwrap();
         let (daemon, ready) = paused_ingress(tmp.path());
         // Four journals interleave through two eviction ranges and a live tail.
@@ -584,25 +584,16 @@ mod tests {
                 total - INGRESS_QUEUE_CAPACITY
             );
         }
-        let mut cursors = HashMap::new();
-        replay_evicted(&daemon, &mut cursors, &first.unwrap())
-            .await
-            .unwrap();
+        replay_evicted(&daemon, &first.unwrap()).await.unwrap();
         let CaptureWork::Evicted(second) = daemon.next_capture_work() else {
             panic!("new captures must extend recovery");
         };
-        replay_evicted(&daemon, &mut cursors, &second)
-            .await
-            .unwrap();
+        replay_evicted(&daemon, &second).await.unwrap();
         drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
         daemon.settle_ingress().await;
         for (slot, env) in envs.iter().enumerate() {
             let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-            assert!(tokio::fs::read_to_string(&path)
-                .await
-                .unwrap()
-                .contains("payload_zstd_v1"));
             let storage = tmp.path().join("pipeline").join(format!(
                 "{}.sqlite",
                 crate::ids::session_storage_id(&env.source, &env.session_id)

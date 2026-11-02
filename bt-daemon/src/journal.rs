@@ -10,10 +10,8 @@
 //! still tell which delivery pipelines a managed child produced after the
 //! daemon that accepted them has restarted or idle-exited.
 
-mod codec;
 use crate::pipeline::input::SourcePosition;
 pub use crate::pipeline::input::{ControlKind, PipelineControl};
-pub(crate) use codec::CodecState;
 
 use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
 use serde::{Deserialize, Serialize};
@@ -226,7 +224,6 @@ pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) 
 pub struct JournalWriter {
     file: tokio::fs::File,
     position: u64,
-    codec: CodecState,
     failed_write: bool,
 }
 
@@ -275,7 +272,6 @@ impl JournalWriter {
         Ok(Self {
             file,
             position,
-            codec: CodecState::default(),
             failed_write: false,
         })
     }
@@ -332,28 +328,17 @@ impl JournalWriter {
             #[serde(skip_serializing_if = "Option::is_none")]
             _bt_capture_sequence: Option<u64>,
         }
-        let mut redacted = env.redacted();
-        let (json, delta) = self.codec.encode(&redacted.payload)?;
-        let record_type = if let Some(delta) = delta {
-            redacted.payload = serde_json::to_value(delta)?;
-            codec::DELTA_RECORD
-        } else {
-            "event"
-        };
+        let redacted = env.redacted();
         let mut line = serde_json::to_vec(&Captured {
             envelope: &redacted,
-            _bt_record_type: record_type,
+            _bt_record_type: "event",
             _bt_capture_sequence: sequence,
         })?;
         line.push(b'\n');
         let before = self.append_bytes(&line).await?;
-        self.codec.record(self.position, json.clone());
         Ok(SourcePosition {
             before,
             through: self.position,
-            decoded_bytes: (line.len() as u64)
-                .max(json.as_ref().map_or(0, |json| json.len() as u64)),
-            decoder_base: json,
         })
     }
 
@@ -379,8 +364,6 @@ impl JournalWriter {
         Ok(SourcePosition {
             before,
             through: self.position,
-            decoded_bytes: line.len() as u64,
-            decoder_base: None,
         })
     }
 }
@@ -408,8 +391,6 @@ pub struct JournalRecordEntry {
     pub record: JournalRecord,
     /// Exclusive byte offset after this record in the journal.
     pub through: u64,
-    /// Decoded work, which can be much larger than a compressed record.
-    pub(crate) decoded_bytes: u64,
     /// Daemon-local capture order. Kept outside the native event payload.
     pub(crate) capture_sequence: Option<u64>,
 }
@@ -423,7 +404,7 @@ pub struct JournalReader {
     path: PathBuf,
     line_no: usize,
     position: u64,
-    decoder: CodecState,
+    legacy_pi: Vec<serde_json::Value>,
 }
 
 impl JournalReader {
@@ -431,20 +412,9 @@ impl JournalReader {
         self.position
     }
 
-    /// The source consumer owns decoding state between recovery reads.
-    pub(crate) fn swap_decoder_context(&mut self, context: &mut CodecState) {
-        std::mem::swap(&mut self.decoder, context);
-    }
-
-    /// Resume any source journal at a committed byte offset with its saved
-    /// lossless payload cache (and, for old Pi logs, their legacy message base).
-    pub(crate) async fn resume(
-        path: &Path,
-        position: u64,
-        through: u64,
-        decoder_context: CodecState,
-    ) -> anyhow::Result<Self> {
-        decoder_context.validate()?;
+    /// Seek within new, self-contained records. Legacy delta streams must be
+    /// read from the beginning to reconstruct their prior message context.
+    pub(crate) async fn resume(path: &Path, position: u64, through: u64) -> anyhow::Result<Self> {
         let mut file = tokio::fs::File::open(path).await?;
         anyhow::ensure!(
             position <= through && through <= file.metadata().await?.len(),
@@ -463,7 +433,7 @@ impl JournalReader {
             path: path.to_owned(),
             line_no: 0,
             position,
-            decoder: decoder_context,
+            legacy_pi: Vec::new(),
         })
     }
     /// Open a journal for streaming, reading at most `through` bytes.
@@ -484,7 +454,7 @@ impl JournalReader {
             path: path.to_path_buf(),
             line_no: 0,
             position: 0,
-            decoder: CodecState::default(),
+            legacy_pi: Vec::new(),
         }))
     }
 
@@ -525,7 +495,7 @@ impl JournalReader {
             let path = self.path.clone();
             let line_no = self.line_no;
             let position = self.position;
-            let mut decoder = std::mem::take(&mut self.decoder);
+            let mut decoder = std::mem::take(&mut self.legacy_pi);
             // Expanding and parsing a large history can be CPU-heavy even
             // when file reads are async. Never run it on the hook IPC thread.
             let (decoder, decoded) = tokio::task::spawn_blocking(move || {
@@ -533,7 +503,7 @@ impl JournalReader {
                 (decoder, decoded)
             })
             .await?;
-            self.decoder = decoder;
+            self.legacy_pi = decoder;
             if let Some(entry) = decoded? {
                 return Ok(Some(entry));
             }
@@ -578,7 +548,7 @@ fn decode_record(
     path: &Path,
     line_no: usize,
     position: u64,
-    decoder: &mut CodecState,
+    legacy_pi: &mut Vec<serde_json::Value>,
 ) -> anyhow::Result<Option<JournalRecordEntry>> {
     let line = std::str::from_utf8(bytes)
         .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?
@@ -591,7 +561,6 @@ fn decode_record(
     let capture_sequence = value
         .get("_bt_capture_sequence")
         .and_then(serde_json::Value::as_u64);
-    let mut decoded_bytes = bytes.len() as u64;
     let record = if value
         .get("_bt_record_type")
         .and_then(serde_json::Value::as_str)
@@ -617,30 +586,10 @@ fn decode_record(
         let mut event: RedactedEnvelope = serde_json::from_value(value)
             .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
         match record_type.as_deref() {
-            Some("event") | Some(codec::DELTA_RECORD) => {
-                decoder.legacy_pi.clear();
-                let json = if record_type.as_deref() == Some(codec::DELTA_RECORD) {
-                    let (payload, json) = decoder.decode(event.payload)?;
-                    decoded_bytes = decoded_bytes.max(json.len() as u64);
-                    event.payload = payload;
-                    Some(json)
-                } else {
-                    #[derive(Deserialize)]
-                    struct StoredPayload<'a> {
-                        #[serde(borrow)]
-                        payload: &'a serde_json::value::RawValue,
-                    }
-                    let stored: StoredPayload<'_> = serde_json::from_str(line)?;
-                    codec::cache_serialized(stored.payload.get())
-                };
-                decoder.record(position, json);
-            }
-            None => {
-                decoder.base = None;
-                expand_legacy_pi_payload(&mut event, &mut decoder.legacy_pi).map_err(|error| {
-                    anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no)
-                })?;
-            }
+            Some("event") => legacy_pi.clear(),
+            None => expand_legacy_pi_payload(&mut event, legacy_pi).map_err(|error| {
+                anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no)
+            })?,
             Some(kind) => anyhow::bail!("unsupported journal record type {kind:?}"),
         }
         JournalRecord::Event(event)
@@ -648,7 +597,6 @@ fn decode_record(
     Ok(Some(JournalRecordEntry {
         record,
         through: position,
-        decoded_bytes,
         capture_sequence,
     }))
 }
@@ -836,34 +784,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delta_recovery_uses_original_json_bytes_not_reader_serialization() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("original-json.ndjson");
-        // Key order and number formatting may differ across serde feature
-        // sets/versions. Dictionaries use the writer's exact JSON.
-        let raw = format!(r#"{{"z":"{}","a":1e-3}}"#, "x".repeat(4096));
-        let first = format!("{{\"_bt_record_type\":\"event\",\"source\":\"debug\",\"session_id\":\"bytes\",\"event\":\"native\",\"ts_ms\":1,\"payload\":{raw}}}\n");
-        let mut cache = CodecState::default();
-        cache.record(first.len() as u64, Some(raw.clone().into()));
-        let (_, delta) = cache
-            .encode(&serde_json::json!({"z":"x".repeat(4096),"a":0.002}))
-            .unwrap();
-        let delta = serde_json::json!({
-            "_bt_record_type":codec::DELTA_RECORD, "source":"debug", "session_id":"bytes", "event":"native", "ts_ms":2,
-            "payload":delta.unwrap()
-        });
-        tokio::fs::write(&path, format!("{first}{delta}\n"))
-            .await
-            .unwrap();
-        let through = JournalReader::recorded_len(&path).await;
+    async fn released_pi_deltas_remain_readable_alongside_complete_new_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.ndjson");
+        let first = pi_context(vec![serde_json::json!({"role":"user","content":"old"})], 1);
+        let mut delta = pi_context(Vec::new(), 2);
+        delta.payload = serde_json::json!({"event":{"_bt_messages_delta":{"common_prefix":1,"suffix":[{"role":"assistant","content":"answer"}]}}});
+        tokio::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first.redacted()).unwrap(),
+                serde_json::to_string(&delta.redacted()).unwrap()
+            ),
+        )
+        .await
+        .unwrap();
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let mut native = first.clone();
+        native.payload["event"]["_bt_messages_delta"] = serde_json::json!({"native":"preserve"});
+        let through = writer.append(&native).await.unwrap();
         let mut reader = JournalReader::open(&path, through).await.unwrap().unwrap();
         assert_eq!(
-            reader.next_entry().await.unwrap().unwrap().payload["a"],
-            0.001
+            reader.next_entry().await.unwrap().unwrap().payload,
+            first.payload
         );
-        let next = reader.next_entry().await.unwrap().unwrap();
-        assert_eq!(next.payload["a"], 0.002);
-        assert_eq!(next.payload["z"], "x".repeat(4096));
+        let expanded = reader.next_entry().await.unwrap().unwrap();
+        assert_eq!(
+            expanded.payload["event"]["messages"],
+            serde_json::json!([{"role":"user","content":"old"},{"role":"assistant","content":"answer"}])
+        );
+        assert_eq!(
+            reader.next_entry().await.unwrap().unwrap().payload,
+            native.payload
+        );
     }
 
     #[tokio::test]

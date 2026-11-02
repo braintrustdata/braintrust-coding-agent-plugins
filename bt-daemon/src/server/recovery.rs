@@ -2,59 +2,6 @@
 
 use super::*;
 
-/// Checkpoint templates replace the completed prefix scan. Legacy journals
-/// and incompatible checkpoints retain the full-log recovery path.
-pub(super) async fn resume_discovery(
-    daemon: &Daemon,
-    path: &std::path::Path,
-    through: u64,
-) -> anyhow::Result<Option<(journal::JournalReader, Vec<crate::wire::RedactedEnvelope>)>> {
-    let Some((_, id)) = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.rsplit_once("--"))
-    else {
-        return Ok(None);
-    };
-    if uuid::Uuid::parse_str(id).is_err() {
-        return Ok(None);
-    }
-    let storage = daemon
-        .data_dir
-        .join("pipeline")
-        .join(format!("{id}.sqlite"));
-    if !tokio::fs::try_exists(&storage).await? {
-        return Ok(None);
-    }
-    let partition = crate::pipeline::journal::SpanJournal::open(&storage).await?;
-    let Some(checkpoint) = partition.translation_checkpoint().await? else {
-        return Ok(None);
-    };
-    let head = through.min(partition.translated_through().await?);
-    let version = daemon.version.clone();
-    let input = checkpoint.input;
-    let context = tokio::task::spawn_blocking(move || {
-        crate::pipeline::translation::RecoveryContext::decode(&checkpoint, &version, head)
-    })
-    .await??;
-    let Some(env) = context.templates.values().next() else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        path == journal::source_journal_path(&daemon.data_dir, &env.source, &env.session_id),
-        "checkpoint does not belong to this journal"
-    );
-    anyhow::ensure!(
-        context
-            .templates
-            .values()
-            .all(|template| template.source == env.source && template.session_id == env.session_id),
-        "checkpoint contains another source session"
-    );
-    let reader = journal::JournalReader::resume(path, input, through, context.decoder).await?;
-    Ok(Some((reader, context.templates.into_values().collect())))
-}
-
 pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<PendingEvent> {
     let pending: Vec<PendingEvent> = daemon
         .pending_sessions
@@ -87,32 +34,6 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         let mut before = 0u64;
         let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
         let mut latest_by_route: HashMap<String, PendingEvent> = HashMap::new();
-        match resume_discovery(daemon, &path, recorded_len).await {
-            Ok(Some((resumed, templates))) => {
-                reader = resumed;
-                let input = reader.position();
-                before = input;
-                for template in templates {
-                    let env = journal::envelope_from_redacted(template);
-                    daemon.remember_claude_transcripts(&env);
-                    if let Some(route) = &env.route {
-                        latest_by_route.insert(
-                            serde_json::to_string(route).unwrap_or_default(),
-                            PendingEvent {
-                                env,
-                                replay_through: input,
-                                journal_through: input,
-                                settings_through: Some(input),
-                            },
-                        );
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%error, path=%path.display(), "source discovery checkpoint unavailable; scanning journal")
-            }
-        }
         while let Ok(Some(entry)) = reader.next_record().await {
             let through = entry.through;
             match entry.record {
@@ -322,45 +243,6 @@ pub(super) mod tests {
                 expires_at_ms: None,
             })
         }
-    }
-
-    #[tokio::test]
-    async fn startup_discovery_uses_the_session_checkpoint_instead_of_scanning_history() {
-        use crate::pipeline::translation::tests::SourceFixture;
-        let f = SourceFixture::new("debug").await;
-        let mut env: Envelope = serde_json::from_value(serde_json::json!({
-            "source":"debug", "session_id":"checkpoint", "event":"old", "ts_ms":1,
-            "payload":{}, "route":SessionRoute::default(),
-        }))
-        .unwrap();
-        let mut through = 0;
-        for i in 0..64 {
-            env.ts_ms = i;
-            through = f.write(&env, false).await;
-        }
-        f.process(through).await;
-        f.source.shutdown().await;
-        f.poison(0..through).await;
-        env.event = "after".into();
-        let tail = f.write(&env, false).await;
-        let raw = &f.options.event_path;
-        let daemon = Daemon::new(
-            debug_serve_options("test", &f.options.data_dir),
-            f.options.data_dir.clone(),
-        );
-        let (reader, _) = resume_discovery(&daemon, raw, tail).await.unwrap().unwrap();
-        assert_eq!(reader.position(), through);
-        let candidates = discover_unprocessed_journals(&daemon).await;
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].env.event, "after");
-        assert_eq!(candidates[0].journal_through, tail);
-        for event in candidates {
-            dispatch_ingress_event(&daemon, event).await;
-        }
-        let source = daemon.translations.lock().values().next().unwrap().clone();
-        source.barrier().await.unwrap();
-        assert!(source.error.lock().is_none());
-        super::super::maintenance::drain_all(&daemon).await;
     }
 
     #[tokio::test]

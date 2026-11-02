@@ -1,5 +1,5 @@
 //! Stage input shared by direct capture and recovery. Storage supplies only
-//! position/decoder metadata; original live payloads arrive from capture.
+//! byte positions; original live payloads arrive from capture.
 use crate::wire::Envelope;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -9,14 +9,11 @@ use std::{collections::VecDeque, sync::Arc};
 const RECORD_BUDGET: usize = 64;
 const BYTE_BUDGET: u64 = 8 * 1024 * 1024;
 
-/// Durable input position, returned by the storage side path. Decoder data is
-/// used only to checkpoint future recovery, never to construct a live payload.
+/// Durable byte range returned by the journal append.
 #[derive(Clone)]
 pub(crate) struct SourcePosition {
     pub before: u64,
     pub through: u64,
-    pub decoded_bytes: u64,
-    pub decoder_base: Option<Arc<str>>,
 }
 
 pub(crate) enum SourceEvent {
@@ -32,12 +29,7 @@ pub(crate) struct SourceRecord {
 
 impl SourceRecord {
     fn bytes(&self) -> u64 {
-        self.position.decoded_bytes.saturating_add(
-            self.position
-                .decoder_base
-                .as_ref()
-                .map_or(0, |json| json.len() as u64),
-        )
+        self.position.through.saturating_sub(self.position.before)
     }
 }
 
@@ -121,25 +113,24 @@ mod tests {
     fn oversized_events_flow_alone_and_eviction_exposes_a_recovery_gap() {
         let input = SourceInput::default();
         let event: Envelope = serde_json::from_value(json!({"source":"debug","session_id":"direct","event":"native","ts_ms":1,"payload":{"history":"x".repeat(9 * 1024 * 1024)}})).unwrap();
-        let position = |before, through| SourcePosition {
+        let stride = 9 * 1024 * 1024;
+        let position = |before| SourcePosition {
             before,
-            through,
-            decoded_bytes: 9 * 1024 * 1024,
-            decoder_base: None,
+            through: before + stride,
         };
-        input.push_event(event.clone(), position(0, 1));
+        input.push_event(event.clone(), position(0));
         assert!(input.take(0, 0).is_none());
-        let SourceEvent::Event(actual) = input.take(0, 1).unwrap().event else {
+        let SourceEvent::Event(actual) = input.take(0, stride).unwrap().event else {
             panic!("expected original event");
         };
         assert_eq!(actual.payload, event.payload);
-        input.push_event(event.clone(), position(1, 2));
-        input.push_event(event, position(2, 3));
+        input.push_event(event.clone(), position(stride));
+        input.push_event(event, position(2 * stride));
         assert!(
-            input.take(1, 3).is_none(),
+            input.take(stride, 3 * stride).is_none(),
             "eviction requires recovery of the gap"
         );
-        assert!(input.take(2, 3).is_some());
+        assert!(input.take(2 * stride, 3 * stride).is_some());
         assert!(input.is_empty());
     }
 }

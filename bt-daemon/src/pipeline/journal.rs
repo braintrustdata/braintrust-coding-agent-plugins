@@ -49,13 +49,6 @@ pub(crate) struct SpanJournal {
     payload_reads: Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[derive(Clone)]
-pub(crate) struct TranslationCheckpoint {
-    pub input: u64,
-    pub version: String,
-    pub state: Vec<u8>,
-}
-
 /// Explicit codec preserves fields intentionally omitted from wire/plugin JSON.
 #[derive(Serialize, Deserialize)]
 struct StoredOp {
@@ -195,7 +188,7 @@ impl SpanJournal {
             // Read the version under the same write transaction as every
             // upgrade, so another opener cannot run a stale migration plan.
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            anyhow::ensure!(version <= 7, "unsupported SpanOp journal schema {version}");
+            anyhow::ensure!(version <= 6, "unsupported SpanOp journal schema {version}");
             if version < 3 {
                 db.execute_batch(
                     "CREATE TABLE IF NOT EXISTS batches (
@@ -244,11 +237,6 @@ impl SpanJournal {
                 }
                 prune(&db)?;
                 db.execute_batch("PRAGMA user_version=6")?;
-            }
-            if version < 7 {
-                db.execute_batch("
-                    CREATE TABLE IF NOT EXISTS translation_checkpoint (id INTEGER PRIMARY KEY CHECK(id=1), input INTEGER NOT NULL, version TEXT NOT NULL, state BLOB NOT NULL);
-                    PRAGMA user_version=7")?;
             }
             let tail = db.query_row("SELECT tail FROM publication WHERE id=1", [], |row| row.get(0))?;
             db.execute_batch("COMMIT")?;
@@ -312,52 +300,6 @@ impl SpanJournal {
         .await
     }
 
-    pub async fn translation_checkpoint(&self) -> anyhow::Result<Option<TranslationCheckpoint>> {
-        self.with_db(|db| {
-            Ok(db
-                .query_row(
-                    "SELECT input,version,state FROM translation_checkpoint WHERE id=1",
-                    [],
-                    |row| {
-                        Ok(TranslationCheckpoint {
-                            input: row.get(0)?,
-                            version: row.get(1)?,
-                            state: row.get(2)?,
-                        })
-                    },
-                )
-                .optional()?)
-        })
-        .await
-    }
-
-    /// Refresh idle context only at the already committed translation head.
-    pub async fn save_translation_checkpoint(
-        &self,
-        checkpoint: TranslationCheckpoint,
-    ) -> anyhow::Result<()> {
-        self.with_db(move |db| {
-            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let head: u64 = tx.query_row(
-                "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
-                [],
-                |row| row.get(0),
-            )?;
-            anyhow::ensure!(
-                checkpoint.input == head,
-                "checkpoint must match the translation head"
-            );
-            tx.execute(
-                "INSERT OR REPLACE INTO translation_checkpoint VALUES(1,?,?,?)",
-                params![checkpoint.input, checkpoint.version, checkpoint.state],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Restart abandons only invisible receipts; a committed identity is never rewritten.
     pub async fn begin(&self, input: u64, observation: bool) -> anyhow::Result<bool> {
         self.with_db(move |db| {
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -557,24 +499,14 @@ impl SpanJournal {
     }
 
     pub async fn commit(&self, input: u64) -> anyhow::Result<u64> {
-        self.commit_output(input, None, None).await
+        self.commit_output(input, None).await
     }
 
     /// Root candidates and translated output share the consumed-input boundary.
-    #[cfg(test)]
     pub async fn commit_with_roots(
         &self,
         input: u64,
         roots: &BTreeMap<String, Vec<SpanOp>>,
-    ) -> anyhow::Result<u64> {
-        self.commit_with_context(input, roots, None).await
-    }
-
-    pub async fn commit_with_context(
-        &self,
-        input: u64,
-        roots: &BTreeMap<String, Vec<SpanOp>>,
-        checkpoint: Option<TranslationCheckpoint>,
     ) -> anyhow::Result<u64> {
         let roots = roots
             .iter()
@@ -586,7 +518,7 @@ impl SpanJournal {
                 Ok((id.clone(), serde_json::to_vec(&ops)?))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        self.commit_output(input, Some(roots), checkpoint).await
+        self.commit_output(input, Some(roots)).await
     }
 
     pub async fn root_candidates(&self) -> anyhow::Result<BTreeMap<String, Vec<SpanOp>>> {
@@ -616,7 +548,6 @@ impl SpanJournal {
         &self,
         input: u64,
         roots: Option<Vec<(String, Vec<u8>)>>,
-        checkpoint: Option<TranslationCheckpoint>,
     ) -> anyhow::Result<u64> {
         let tail = self
             .with_db(move |db| {
@@ -640,13 +571,6 @@ impl SpanJournal {
                     tx.execute("UPDATE batches SET committed=1 WHERE input=?", [input])? == 1,
                     "missing translation batch"
                 );
-                if let Some(checkpoint) = checkpoint {
-                    anyhow::ensure!(checkpoint.input == input, "checkpoint input mismatch");
-                    tx.execute(
-                        "INSERT OR REPLACE INTO translation_checkpoint VALUES(1,?,?,?)",
-                        params![input, checkpoint.version, checkpoint.state],
-                    )?;
-                }
                 if let Some(roots) = roots {
                     tx.execute("DELETE FROM root_candidates", [])?;
                     for (id, value) in roots {
@@ -835,18 +759,6 @@ impl SpanJournal {
             if !existing { db.execute("INSERT OR IGNORE INTO heads(route,position) VALUES (?,(SELECT floor FROM publication WHERE id=1))",[route])?; }
             Ok(())
         }).await
-    }
-
-    pub async fn has_head(&self, route: &SessionRoute) -> anyhow::Result<bool> {
-        let route = serde_json::to_string(route)?;
-        self.with_db(move |db| {
-            Ok(db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM heads WHERE route=?)",
-                [route],
-                |row| row.get(0),
-            )?)
-        })
-        .await
     }
 
     /// A completed subscription can remain dormant until its source has new work.
@@ -1640,7 +1552,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("concurrent-upgrade.sqlite");
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0); PRAGMA user_version=1;").unwrap();
+        db.execute_batch("CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0); PRAGMA user_version=1;").unwrap();
         drop(db);
         let ready = Arc::new(tokio::sync::Barrier::new(8));
         let mut tasks = Vec::new();
@@ -1658,7 +1570,6 @@ mod tests {
         }
         for journal in opened {
             assert_eq!(journal.tail().await.unwrap(), 0);
-            assert!(journal.translation_checkpoint().await.unwrap().is_none());
         }
     }
 
@@ -1941,35 +1852,18 @@ mod tests {
         assert!(roots.process(&vec![root]).await.is_empty());
         journal.begin(10, true).await.unwrap();
         let db = Connection::open(&path).unwrap();
-        let context = TranslationCheckpoint {
-            input: 10,
-            version: "test".into(),
-            state: vec![1, 2],
-        };
-        for table in ["root_candidates", "translation_checkpoint"] {
-            db.execute_batch(&format!("CREATE TRIGGER fail_state BEFORE INSERT ON {table} BEGIN SELECT RAISE(FAIL,'state write'); END;")).unwrap();
-            assert!(journal
-                .commit_with_context(10, roots.pending(), Some(context.clone()))
-                .await
-                .is_err());
-            assert_eq!(journal.translated_through().await.unwrap(), 0);
-            assert!(journal.root_candidates().await.unwrap().is_empty());
-            assert!(journal.translation_checkpoint().await.unwrap().is_none());
-            db.execute_batch("DROP TRIGGER fail_state").unwrap();
-        }
+        db.execute_batch("CREATE TRIGGER fail_roots BEFORE INSERT ON root_candidates BEGIN SELECT RAISE(FAIL,'root write'); END;").unwrap();
+        assert!(journal
+            .commit_with_roots(10, roots.pending())
+            .await
+            .is_err());
+        assert_eq!(journal.translated_through().await.unwrap(), 0);
+        assert!(journal.root_candidates().await.unwrap().is_empty());
+        db.execute_batch("DROP TRIGGER fail_roots").unwrap();
         journal
-            .commit_with_context(10, roots.pending(), Some(context))
+            .commit_with_roots(10, roots.pending())
             .await
             .unwrap();
-        assert_eq!(
-            journal
-                .translation_checkpoint()
-                .await
-                .unwrap()
-                .unwrap()
-                .input,
-            10
-        );
         journal.close().await.unwrap();
 
         let journal = SpanJournal::open(&path).await.unwrap();
