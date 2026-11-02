@@ -469,6 +469,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_recovery_and_dispatch_share_one_source_producer() {
+        let f = crate::pipeline::translation::tests::SourceFixture::new("debug").await;
+        f.source.shutdown().await;
+        let (daemon, ready) = paused_ingress(&f.options.data_dir);
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+        let mut opening = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let daemon = daemon.clone();
+            let start = start.clone();
+            opening.spawn(async move {
+                start.wait().await;
+                daemon
+                    .translation_for(&event("checkpoint", SessionRoute::default()))
+                    .await
+                    .unwrap()
+            });
+        }
+        let first = opening.join_next().await.unwrap().unwrap();
+        while let Some(source) = opening.join_next().await {
+            assert!(
+                Arc::ptr_eq(&first, &source.unwrap()),
+                "source initialization must have one owner"
+            );
+        }
+        ready.send(()).unwrap();
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
     async fn capture_is_durable_during_startup_and_recovery_stops_before_it() {
         let tmp = tempfile::tempdir().unwrap();
         let mut env = event("resuming", SessionRoute::default());

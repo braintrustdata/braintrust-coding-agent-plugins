@@ -37,6 +37,16 @@ impl Daemon {
         &self,
         env: &Envelope,
     ) -> anyhow::Result<Arc<crate::pipeline::translation::Translation>> {
+        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
+        if let Some(source) = self.translations.lock().get(&storage_key).cloned() {
+            return Ok(source);
+        }
+        // Initialization owns one reducer per source. This lock covers only
+        // opening its SQLite head and spawning the actor, never capture/replay.
+        let _init = self.translation_init.lock().await;
+        if let Some(source) = self.translations.lock().get(&storage_key).cloned() {
+            return Ok(source);
+        }
         let event_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
         let namespace =
@@ -45,38 +55,29 @@ impl Daemon {
             {
                 env.session_id.clone()
             } else {
-                crate::ids::session_namespace(&env.source, &env.session_id)
+                storage_key.clone()
             };
-        let journal = self
+        let events = self
             .journal_writer_for(&env.source, &env.session_id)
             .await?;
-        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
-        let existing = self.translations.lock().get(&storage_key).cloned();
-        Ok(match existing {
-            Some(translation) => translation,
-            None => {
-                let translation = crate::pipeline::translation::Translation::spawn(
-                    crate::pipeline::translation::TranslationOptions {
-                        source: env.source.clone(),
-                        session_id: env.session_id.clone(),
-                        namespace: namespace.clone(),
-                        version: self.version.clone(),
-                        data_dir: self.data_dir.clone(),
-                        events: journal.clone(),
-                        event_path: event_path.clone(),
-                        input: self.source_input_for(&env.source, &env.session_id),
-                        registry: self.translators.clone(),
-                        correlation: self.correlation.clone(),
-                        correlation_changed: self.correlation_changed.clone(),
-                    },
-                )
-                .await?;
-                self.translations
-                    .lock()
-                    .insert(storage_key, translation.clone());
-                translation
-            }
-        })
+        let source = crate::pipeline::translation::Translation::spawn(
+            crate::pipeline::translation::TranslationOptions {
+                source: env.source.clone(),
+                session_id: env.session_id.clone(),
+                namespace,
+                version: self.version.clone(),
+                data_dir: self.data_dir.clone(),
+                events,
+                event_path,
+                input: self.source_input_for(&env.source, &env.session_id),
+                registry: self.translators.clone(),
+                correlation: self.correlation.clone(),
+                correlation_changed: self.correlation_changed.clone(),
+            },
+        )
+        .await?;
+        self.translations.lock().insert(storage_key, source.clone());
+        Ok(source)
     }
 
     pub(super) async fn session_for(
