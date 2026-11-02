@@ -425,6 +425,38 @@ mod tests {
         wire::Envelope,
     };
 
+    #[allow(dead_code)]
+    mod distributed_fixture {
+        use crate as bt_daemon;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/distributed.rs"
+        ));
+    }
+
+    struct TestAuth;
+
+    #[async_trait]
+    impl AuthProvider for TestAuth {
+        async fn resolve(
+            &self,
+            selection: &AuthSelection,
+            _: AuthResolveReason,
+        ) -> anyhow::Result<AuthLease> {
+            Ok(AuthLease {
+                selection: selection.clone().canonicalized()?,
+                auth: BackendAuth {
+                    token: "test".into(),
+                    api_url: Some("http://127.0.0.1.invalid".into()),
+                    app_url: None,
+                    org_name: Some("test".into()),
+                    org_id: Some("test".into()),
+                },
+                expires_at_ms: None,
+            })
+        }
+    }
+
     fn event(session: &str, route: SessionRoute) -> Envelope {
         Envelope {
             source: "debug".into(),
@@ -565,24 +597,16 @@ mod tests {
         );
         let env = event("overflow", SessionRoute::default());
         let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-        let mut evicted_end = 0;
         for i in 0..(INGRESS_QUEUE_CAPACITY + 6) {
             let mut next = env.clone();
             next.ts_ms = i as i64;
             next.payload = serde_json::json!({"index": i});
             assert!(daemon.capture_event(next).await.unwrap());
-            if i == 5 {
-                evicted_end = journal::JournalReader::recorded_len(&path).await;
-            }
         }
         {
             let state = daemon.startup_buffer.lock();
             let buffer = state.as_ref().unwrap();
             assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
-            assert_eq!(
-                buffer.evicted.get(&path).map(|range| range.through),
-                Some(evicted_end)
-            );
             assert_eq!(buffer.events.front().unwrap().env.payload["index"], 6);
         }
         drain_startup_buffer(&daemon).await.unwrap();
@@ -629,17 +653,15 @@ mod tests {
             Some(startup),
         );
         let env = event("chasing", SessionRoute::default());
-        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
         for i in 0..(INGRESS_QUEUE_CAPACITY + 2) {
             let mut next = env.clone();
             next.ts_ms = i as i64;
             next.payload = serde_json::json!({"index": i});
             assert!(daemon.capture_event(next).await.unwrap());
         }
-        let StartupWork::Evicted(first) = daemon.next_startup_work() else {
+        let StartupWork::Evicted(first) = daemon.next_startup_work().await.unwrap() else {
             panic!("the oldest events were not evicted");
         };
-        let first_end = first[&path].through;
         for i in INGRESS_QUEUE_CAPACITY + 2..INGRESS_QUEUE_CAPACITY + 7 {
             let mut next = env.clone();
             next.ts_ms = i as i64;
@@ -650,14 +672,13 @@ mod tests {
             let state = daemon.startup_buffer.lock();
             let buffer = state.as_ref().unwrap();
             assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
-            assert!(buffer.evicted[&path].through > first_end);
             assert_eq!(buffer.events.front().unwrap().env.payload["index"], 7);
         }
         let mut cursors = HashMap::new();
         replay_evicted_startup(&daemon, &mut cursors, &first)
             .await
             .unwrap();
-        let StartupWork::Evicted(second) = daemon.next_startup_work() else {
+        let StartupWork::Evicted(second) = daemon.next_startup_work().await.unwrap() else {
             panic!("new evictions did not advance recovery");
         };
         replay_evicted_startup(&daemon, &mut cursors, &second)
@@ -686,6 +707,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_overflow_preserves_parent_child_tool_order() {
+        use distributed_fixture::{AgentKind, DistributedFixtures, ProcessTree};
+        let tmp = tempfile::tempdir().unwrap();
+        let (ready, startup) = oneshot::channel();
+        let mut opts = debug_serve_options("test", tmp.path());
+        opts.auth_provider = Some(Arc::new(TestAuth));
+        let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup));
+        let mut fixtures = DistributedFixtures::new();
+        let parent = ProcessTree::root(1000);
+        let child = ProcessTree::child(1002, 1001, &parent);
+        let mut events =
+            fixtures.start_turn(AgentKind::OpenCode, "parent", &parent, "delegate", 100);
+        events.push(fixtures.open_tool(
+            AgentKind::OpenCode,
+            "parent",
+            &parent,
+            "tool",
+            "do work",
+            102,
+        ));
+        let child_events =
+            fixtures.start_turn(AgentKind::OpenCode, "child", &child, "do work", 103);
+        let child_key = automatic_link_key(&child_events[0]);
+        events.extend(child_events);
+        events.push(fixtures.close_tool(
+            AgentKind::OpenCode,
+            "parent",
+            &parent,
+            "tool",
+            "do work",
+            "done",
+            105,
+        ));
+        for env in events {
+            daemon.capture_event(env).await.unwrap();
+        }
+        for i in 0..INGRESS_QUEUE_CAPACITY {
+            let mut filler = event("filler", SessionRoute::default());
+            filler.ts_ms = i as i64;
+            daemon.capture_event(filler).await.unwrap();
+        }
+        drain_startup_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        daemon.settle_ingress().await;
+        let route = daemon
+            .automatic_links
+            .lock()
+            .get(&child_key)
+            .cloned()
+            .expect("child must be linked");
+        let Some(crate::wire::TraceDestination::ParentSpan { components }) = route.destination
+        else {
+            panic!("child was not attached to the parent tool");
+        };
+        let tool_id = crate::ids::span_id(
+            &crate::ids::session_namespace("opencode", "parent"),
+            "tool:parent:tool",
+        );
+        assert_eq!(components.span_id.as_deref(), Some(tool_id.as_str()));
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
     async fn startup_overflow_tracks_each_source_journal_independently() {
         let tmp = tempfile::tempdir().unwrap();
         let (ready, startup) = oneshot::channel();
@@ -704,7 +788,6 @@ mod tests {
         {
             let state = daemon.startup_buffer.lock();
             let buffer = state.as_ref().unwrap();
-            assert_eq!(buffer.evicted.len(), 2);
             assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
         }
         drain_startup_buffer(&daemon).await.unwrap();
@@ -749,7 +832,7 @@ mod tests {
             env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
             assert!(daemon.capture_event(env.clone()).await.unwrap());
         }
-        let StartupWork::Evicted(first) = daemon.next_startup_work() else {
+        let StartupWork::Evicted(first) = daemon.next_startup_work().await.unwrap() else {
             panic!("missing first overflow")
         };
         let mut cursors = HashMap::new();
@@ -761,7 +844,7 @@ mod tests {
             env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
             assert!(daemon.capture_event(env.clone()).await.unwrap());
         }
-        let StartupWork::Evicted(second) = daemon.next_startup_work() else {
+        let StartupWork::Evicted(second) = daemon.next_startup_work().await.unwrap() else {
             panic!("missing second overflow")
         };
         replay_evicted_startup(&daemon, &mut cursors, &second)

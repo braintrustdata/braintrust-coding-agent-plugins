@@ -4,46 +4,116 @@
 
 use super::*;
 use std::collections::VecDeque;
+use std::io::{BufRead, BufReader as StdBufReader, Seek, SeekFrom, Write};
 
-/// Live startup captures remain ordered and bounded. Evicted entries are
-/// already durable; their source journal's high-water mark is replayed first.
+/// Evicted captures are indexed on disk in capture order. The index is
+/// temporary: the source journals remain the durable recovery record.
 pub(super) struct StartupBuffer {
     pub(super) events: VecDeque<PendingEvent>,
-    pub(super) evicted: HashMap<PathBuf, EvictedRange>,
+    evicted: Option<StartupIndex>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(super) struct EvictedRange {
     pub(super) from: u64,
     pub(super) through: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexedRange {
+    filename: String,
+    range: EvictedRange,
+}
+
+struct StartupIndex {
+    file: tempfile::NamedTempFile,
+    reader: Option<std::fs::File>,
+    written: u64,
+    read: u64,
+}
+
+impl StartupIndex {
+    fn new() -> anyhow::Result<Self> {
+        let file = tempfile::NamedTempFile::new()?;
+        let reader = Some(file.reopen()?);
+        Ok(Self {
+            file,
+            reader,
+            written: 0,
+            read: 0,
+        })
+    }
+
+    fn push(&mut self, range: &IndexedRange) -> anyhow::Result<()> {
+        let mut line = serde_json::to_vec(range)?;
+        line.push(b'\n');
+        self.file.write_all(&line)?;
+        self.written += 1;
+        Ok(())
+    }
+
+    fn reserve_read(&mut self) -> anyhow::Result<Option<std::fs::File>> {
+        if self.read == self.written {
+            return Ok(None);
+        }
+        let reader = self
+            .reader
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("startup index reader missing"))?;
+        self.read += 1;
+        Ok(Some(reader))
+    }
+}
+
+fn read_startup_index(file: std::fs::File) -> anyhow::Result<(std::fs::File, IndexedRange)> {
+    let mut reader = StdBufReader::new(file);
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line)?;
+    anyhow::ensure!(line.last() == Some(&b'\n'), "truncated startup index");
+    let position = reader.stream_position()?;
+    let mut file = reader.into_inner();
+    file.seek(SeekFrom::Start(position))?;
+    Ok((file, serde_json::from_slice(&line)?))
 }
 
 impl StartupBuffer {
     pub(super) fn new() -> Self {
         Self {
             events: VecDeque::new(),
-            evicted: HashMap::new(),
+            evicted: None,
         }
     }
 
-    fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) {
+    fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) -> anyhow::Result<()> {
         if self.events.len() == INGRESS_QUEUE_CAPACITY {
-            if let Some(oldest) = self.events.pop_front() {
-                let path = journal::source_journal_path(
-                    data_dir,
-                    &oldest.env.source,
-                    &oldest.env.session_id,
-                );
-                self.evicted
-                    .entry(path)
-                    .and_modify(|range| range.through = range.through.max(oldest.journal_through))
-                    .or_insert(EvictedRange {
-                        from: oldest.replay_through,
-                        through: oldest.journal_through,
-                    });
+            let oldest = self
+                .events
+                .front()
+                .ok_or_else(|| anyhow::anyhow!("startup buffer is empty"))?;
+            let path =
+                journal::source_journal_path(data_dir, &oldest.env.source, &oldest.env.session_id);
+            let range = IndexedRange {
+                filename: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid startup journal name"))?
+                    .to_owned(),
+                range: EvictedRange {
+                    from: oldest.replay_through,
+                    through: oldest.journal_through,
+                },
+            };
+            if self.evicted.is_none() {
+                self.evicted = Some(StartupIndex::new()?);
             }
+            self.evicted
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("startup index missing"))?
+                .push(&range)?;
+            self.events.pop_front();
         }
         self.events.push_back(event);
+        Ok(())
     }
 }
 
@@ -54,26 +124,48 @@ pub(super) enum StartupWork {
 }
 
 impl Daemon {
-    pub(super) fn next_startup_work(&self) -> StartupWork {
-        let mut state = self.startup_buffer.lock();
-        let Some(buffer) = state.as_mut() else {
-            return StartupWork::Finished;
+    pub(super) async fn next_startup_work(&self) -> anyhow::Result<StartupWork> {
+        let reader = {
+            let mut state = self.startup_buffer.lock();
+            let Some(buffer) = state.as_mut() else {
+                return Ok(StartupWork::Finished);
+            };
+            if let Some(reader) = buffer
+                .evicted
+                .as_mut()
+                .map(StartupIndex::reserve_read)
+                .transpose()?
+                .flatten()
+            {
+                reader
+            } else if let Some(event) = buffer.events.pop_front() {
+                return Ok(StartupWork::Event(Box::new(event)));
+            } else {
+                *state = None;
+                return Ok(StartupWork::Finished);
+            }
         };
-        if !buffer.evicted.is_empty() {
-            return StartupWork::Evicted(std::mem::take(&mut buffer.evicted));
-        }
-        if let Some(event) = buffer.events.pop_front() {
-            return StartupWork::Event(Box::new(event));
-        }
-        *state = None;
-        StartupWork::Finished
+        // Recovery reads outside the capture lock; a slow disk read cannot
+        // prevent hooks from enqueueing their already-journaled events.
+        let (reader, entry) =
+            tokio::task::spawn_blocking(move || read_startup_index(reader)).await??;
+        let mut state = self.startup_buffer.lock();
+        let index = state
+            .as_mut()
+            .and_then(|buffer| buffer.evicted.as_mut())
+            .ok_or_else(|| anyhow::anyhow!("startup index disappeared"))?;
+        index.reader = Some(reader);
+        Ok(StartupWork::Evicted(HashMap::from([(
+            journal::journal_dir(&self.data_dir).join(entry.filename),
+            entry.range,
+        )])))
     }
 }
 
 pub(super) async fn drain_startup_buffer(daemon: &Arc<Daemon>) -> anyhow::Result<()> {
     let mut cursors = HashMap::new();
     loop {
-        match daemon.next_startup_work() {
+        match daemon.next_startup_work().await? {
             StartupWork::Evicted(bounds) => {
                 replay_evicted_startup(daemon, &mut cursors, &bounds).await?
             }
@@ -510,7 +602,10 @@ impl Daemon {
         let event = {
             let mut state = self.startup_buffer.lock();
             if let Some(buffer) = state.as_mut() {
-                buffer.push(&self.data_dir, event);
+                if let Err(error) = buffer.push(&self.data_dir, event) {
+                    self.trigger_shutdown();
+                    return Err(format!("startup index failed: {error}"));
+                }
                 return Ok(true);
             }
             event

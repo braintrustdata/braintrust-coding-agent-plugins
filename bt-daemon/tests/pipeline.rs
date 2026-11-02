@@ -2532,9 +2532,10 @@ async fn claude_journal_does_not_grow_with_the_transcript_on_every_turn() {
 
     // Re-journaling the transcript every turn would put this near
     // TURNS * transcript_len / 2 (tens of megabytes). References are ~a few
-    // hundred bytes each.
+    // hundred bytes each. Allow for longer Windows paths and concurrent
+    // transcript observations while remaining far below the duplicated data.
     assert!(
-        journal_len < 64 * 1024,
+        journal_len < 256 * 1024,
         "journal grew with the transcript: {journal_len} bytes for {TURNS} events \
          over a {transcript_len}-byte transcript"
     );
