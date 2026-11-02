@@ -3,8 +3,24 @@
 use super::{Injection, ManagedRun};
 use crate::agents::OpenCode;
 use crate::args::RunHookCommand;
+use std::ffi::OsString;
 
-fn opencode_managed_config(existing: Option<&str>) -> anyhow::Result<String> {
+fn is_v2() -> bool {
+    let executable = crate::env::var_os("OPENCODE_BIN").unwrap_or_else(|| "opencode".into());
+    crate::subprocess::background_command(executable)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .last()
+                .is_some_and(|v| v.trim_start_matches('v').starts_with("2."))
+        })
+}
+
+fn opencode_managed_config(existing: Option<&str>, v2: bool) -> anyhow::Result<String> {
     let mut config = match existing {
         Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
             .map_err(|error| anyhow::anyhow!("invalid OPENCODE_CONFIG_CONTENT: {error}"))?,
@@ -18,8 +34,14 @@ fn opencode_managed_config(existing: Option<&str>) -> anyhow::Result<String> {
         .or_insert_with(|| serde_json::Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("OPENCODE_CONFIG_CONTENT.plugin must be an array"))?;
-    let plugin = crate::env::var("BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC")
-        .unwrap_or_else(|| "@braintrust/trace-opencode/tracing".to_string());
+    let plugin = crate::env::var("BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC").unwrap_or_else(|| {
+        if v2 {
+            "@braintrust/trace-opencode"
+        } else {
+            "@braintrust/trace-opencode/tracing"
+        }
+        .to_string()
+    });
     if !plugins.iter().any(|value| value.as_str() == Some(&plugin)) {
         plugins.push(serde_json::Value::String(plugin));
     }
@@ -31,15 +53,32 @@ impl ManagedRun for OpenCode {
         ("OPENCODE_BIN", "opencode")
     }
 
+    fn check(&self, args: &[OsString], _terminal: super::Terminal) -> anyhow::Result<()> {
+        if is_v2()
+            && args
+                .iter()
+                .any(|arg| arg == "--server" || arg.to_string_lossy().starts_with("--server="))
+        {
+            anyhow::bail!("OpenCode 2 managed tracing requires a private server; remove --server");
+        }
+        Ok(())
+    }
+
     fn inject(
         &self,
         _hook_command: &RunHookCommand,
         _managed_run_id: &str,
     ) -> anyhow::Result<Injection> {
+        let v2 = is_v2();
         let config =
-            opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?;
+            opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(), v2)?;
         Ok(Injection {
             env: vec![("OPENCODE_CONFIG_CONTENT", config)],
+            args: if v2 {
+                vec!["--standalone".into()]
+            } else {
+                Vec::new()
+            },
             ..Injection::default()
         })
     }
@@ -52,7 +91,8 @@ mod tests {
     #[test]
     fn opencode_managed_run_preserves_inline_config_and_adds_plugin() {
         let config =
-            opencode_managed_config(Some(r#"{"model":"test/model","plugin":["other"]}"#)).unwrap();
+            opencode_managed_config(Some(r#"{"model":"test/model","plugin":["other"]}"#), false)
+                .unwrap();
         let config: serde_json::Value = serde_json::from_str(&config).unwrap();
         assert_eq!(config["model"], "test/model");
         assert_eq!(
@@ -70,5 +110,18 @@ mod tests {
             .unwrap()
             .args
             .is_empty());
+    }
+
+    #[test]
+    fn opencode_v2_managed_run_uses_server_package() {
+        let config =
+            opencode_managed_config(Some(r#"{"model":"test/model","plugin":["other"]}"#), true)
+                .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(config["model"], "test/model");
+        assert_eq!(
+            config["plugin"],
+            serde_json::json!(["other", "@braintrust/trace-opencode"])
+        );
     }
 }

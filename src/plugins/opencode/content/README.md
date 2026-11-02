@@ -33,15 +33,15 @@ Historical import and live attach are not supported for OpenCode.
 
 ## Compatibility
 
-This plugin supports OpenCode 1.x. OpenCode 2 uses a different plugin API and
-is not supported yet; its `@opencode/cli` distribution cannot run this plugin.
-Use the 1.x `opencode-ai` distribution for tracing. See the
-[OpenCode 2 migration guide](https://opencode.ai/v2/docs/build/plugins/migrate-v1).
+The plugin supports OpenCode 1.x and has experimental support for OpenCode 2
+through its `@opencode/cli` distribution. OpenCode 2 text sessions are tested
+with the installed package. Coverage for tool calls, subagents, attachments,
+permissions, compaction and interrupted sessions is still being verified.
+Managed runs start a private OpenCode 2 server to keep routing scoped to the run.
 
 The package declares `@opencode-ai/plugin` and `@opencode-ai/sdk` peers at
 `>=1.2.25`. CI checks package installation at that minimum and at the latest
-1.x peers, and runs real-agent integration tests with the latest `opencode-ai`
-CLI.
+1.x peers, and runs real-agent integration tests with both distributions.
 
 ## Configuration
 

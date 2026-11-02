@@ -519,3 +519,65 @@ fn request_helpers_recognize_tool_results_and_advertised_tools() {
     };
     assert!(anthropic.has_tool_result("toolu-1"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires OpenCode 2 and a built OpenCode package"]
+async fn opencode_v2_session_emits_traces() {
+    let inference = OpenAiMock::new(|_, _| MockReply::response(OpenAiTurn::text("OPENCODE_V2_OK")));
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let workspace = world.workspace();
+    let home = world.temp_path("opencode-v2-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let config = json!({
+        "model": "mock/mock-model",
+        "providers": {"mock": {"package":"@opencode/ai/providers/openai-compatible", "settings":{"baseURL":format!("{}/v1", inference_server.uri()),"apiKey":"test-key"},"models":{"mock-model":{"name":"Mock Model"}}}}
+    });
+    std::fs::write(
+        workspace.join("opencode.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let mut command = support::agent_process::daemon_command();
+    command
+        .args([
+            "run",
+            "--project",
+            "agent-e2e",
+            "opencode",
+            "run",
+            "--model",
+            "mock/mock-model",
+            "say hello",
+        ])
+        .current_dir(&workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("OPENCODE_CONFIG_CONTENT", config.to_string())
+        .env(
+            "OPENCODE_BIN",
+            std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
+        )
+        .env(
+            "BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC",
+            std::env::var_os("OPENCODE_V2_PLUGIN_DIR").expect("set OPENCODE_V2_PLUGIN_DIR"),
+        );
+    world.configure(&mut command);
+    let output = world.output(&mut command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let scenario = IngestScenario::new()
+        .expect("v2 input", |row| {
+            row_contains(row, &["Turn 1", "say hello"])
+        })
+        .expect("v2 LLM", |row| {
+            row_contains(row, &[r#""type":"llm""#, "OPENCODE_V2_OK"])
+        });
+    world.wait_for_mock_ingest_scenario(&scenario).await;
+}

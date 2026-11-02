@@ -47,6 +47,10 @@ pub struct AgentTestWorld {
     config_path: PathBuf,
 }
 
+pub fn daemon_command() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_bt-daemon"))
+}
+
 impl AgentTestWorld {
     pub async fn start() -> Self {
         let inference_mode = TestBackendMode::from_env(INFERENCE_MODE_ENV);
