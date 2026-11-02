@@ -756,10 +756,11 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             print_output(TraceCommandOutput::import(summaries), host.output_format)
         }
         TraceCommand::Run(run_args) => {
+            run_args.validate_parent()?;
             let mut route = resolve_command_route(
                 &host,
                 RouteRequirements {
-                    destination_required: true,
+                    destination_required: run_args.parent.is_none(),
                     interactive_auth: true,
                     persistent_auth: false,
                 },
@@ -986,8 +987,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_and_run_require_a_host_resolved_destination() {
-        for (command, persistent_auth) in [
+    async fn setup_and_run_request_a_destination_only_when_needed() {
+        let run = RunArgs {
+            source: RunSource::Codex,
+            parent: None,
+            additional_metadata: None,
+            tags: Vec::new(),
+            plugin: Vec::new(),
+            agent_args: Vec::new(),
+        };
+        let parent = serde_json::from_value(serde_json::json!({
+            "object_type": 2,
+            "object_id": "project-id",
+            "span_id": "parent-span",
+            "root_span_id": "trace-root"
+        }))
+        .unwrap();
+        for (command, persistent_auth, destination_required) in [
             (
                 TraceCommand::Setup(SetupArgs {
                     agent: SetupAgent::OpenCode,
@@ -996,31 +1012,65 @@ mod tests {
                     plugin: Vec::new(),
                 }),
                 true,
+                true,
             ),
+            (TraceCommand::Run(run.clone()), false, true),
             (
                 TraceCommand::Run(RunArgs {
-                    source: RunSource::Codex,
-                    additional_metadata: None,
-                    tags: Vec::new(),
-                    plugin: Vec::new(),
-                    agent_args: Vec::new(),
+                    parent: Some(parent),
+                    ..run
                 }),
+                false,
                 false,
             ),
         ] {
-            let services = Arc::new(RecordingHost::new(Some("no destination"), None));
+            let services = Arc::new(RecordingHost::new(Some("stop after route request"), None));
             let error = run_trace(TraceArgs { command }, test_host(services.clone()))
                 .await
                 .unwrap_err();
-            assert_eq!(error.to_string(), "no destination");
+            assert_eq!(error.to_string(), "stop after route request");
             assert_eq!(
                 *services.route_requests.lock().unwrap(),
                 [RouteRequirements {
                     persistent_auth,
+                    destination_required,
                     ..COMMAND_REQUIREMENTS
                 }]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn run_rejects_incomplete_parent_before_resolving_auth_or_launching() {
+        let parent = serde_json::from_value(
+            serde_json::json!({"object_type": 2, "object_id": "project-id"}),
+        )
+        .unwrap();
+        let args = RunArgs {
+            source: RunSource::Claude,
+            parent: Some(parent),
+            additional_metadata: None,
+            tags: Vec::new(),
+            plugin: Vec::new(),
+            agent_args: Vec::new(),
+        };
+        let error = run_trace(
+            TraceArgs {
+                command: TraceCommand::Run(args.clone()),
+            },
+            test_host(Arc::new(PanicHost)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid --parent value"));
+        let error = crate::run_traced(
+            args,
+            test_host(Arc::new(PanicHost)).command,
+            SessionRoute::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid --parent value"));
     }
 
     #[tokio::test]

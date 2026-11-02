@@ -58,6 +58,7 @@ if [ "$1" = "--version" ]; then echo 'Muse Code 1.4.11'; exit 0; fi
     let result = run_traced_with_host(
         RunArgs {
             source: RunSource::Muse,
+            parent: None,
             additional_metadata: None,
             tags: Vec::new(),
             plugin: Vec::new(),

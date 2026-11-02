@@ -2748,6 +2748,96 @@ impl Drop for EnvVarGuard {
 
 #[cfg(all(feature = "cli", unix))]
 #[tokio::test]
+async fn managed_run_parent_continues_trace_through_live_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let mut opts = debug_serve_options(env!("CARGO_PKG_VERSION"), &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
+    let args = ServeArgs {
+        socket: Some(socket.clone()),
+        data_dir: Some(data_dir.clone()),
+        idle_timeout_secs: 0,
+        session_idle_timeout_secs: 0,
+    };
+    let handle = tokio::spawn(run_serve(args, opts));
+    wait_for(&socket).await;
+
+    let agent = tmp.path().join("fake claude.sh");
+    std::fs::write(
+        &agent,
+        r#"#!/bin/sh
+set -eu
+printf '{"session_id":"managed-parent","hook_event_name":"UserPromptSubmit","prompt":"hello"}\n' |
+  "$BT_DAEMON_TEST_BIN" hook --source claude --managed-run-hook --no-spawn
+printf '{"session_id":"managed-parent","hook_event_name":"SessionEnd"}\n' |
+  "$BT_DAEMON_TEST_BIN" hook --source claude --managed-run-hook --no-spawn
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let parent: braintrust_sdk_rust::SpanComponents = serde_json::from_value(serde_json::json!({
+        "object_type": 2,
+        "object_id": "project-id",
+        "span_id": "external-parent",
+        "root_span_id": "existing-trace"
+    }))
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_bt-daemon");
+    let output = tokio::process::Command::new(binary)
+        .args([
+            "run",
+            "--parent",
+            &parent.to_str(),
+            "claude",
+            "--",
+            "-p",
+            "hello",
+        ])
+        .env("CLAUDE_BIN", &agent)
+        .env("BT_DAEMON_TEST_BIN", binary)
+        .env("BRAINTRUST_DAEMON_SOCKET", &socket)
+        .env("BRAINTRUST_DAEMON_DATA_DIR", &data_dir)
+        .env_remove("BRAINTRUST_PROJECT")
+        .env_remove("BRAINTRUST_DESTINATION")
+        .output()
+        .await
+        .unwrap();
+
+    shutdown(&socket).await;
+    handle.await.unwrap().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let spans = std::fs::read_to_string(data_dir.join("spans/managed-parent.ndjson")).unwrap();
+    let rows: Vec<_> = spans
+        .lines()
+        .filter_map(|line| match serde_json::from_str::<SpanOp>(line).unwrap() {
+            SpanOp::Insert(row) => Some(row),
+            SpanOp::Merge(_) => None,
+        })
+        .collect();
+    assert!(rows.len() >= 2, "expected session and turn spans: {spans}");
+    assert!(rows.iter().all(|row| row.root_span_id == "existing-trace"));
+    let session = rows
+        .iter()
+        .find(|row| row.parent_span_ids == ["external-parent"])
+        .unwrap();
+    assert!(rows
+        .iter()
+        .any(|row| row.parent_span_ids == [session.span_id.clone()]));
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[tokio::test]
 async fn managed_run_flushes_and_preserves_agent_exit_status() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2825,6 +2915,7 @@ esac
         run_traced(
             RunArgs {
                 source: RunSource::Codex,
+                parent: None,
                 additional_metadata: None,
                 tags: Vec::new(),
                 plugin: Vec::new(),
@@ -2927,6 +3018,7 @@ async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
     let status = run_traced(
         RunArgs {
             source: RunSource::Muse,
+            parent: None,
             additional_metadata: None,
             tags: Vec::new(),
             plugin: Vec::new(),
@@ -3033,6 +3125,7 @@ async fn muse_managed_run_starts_its_isolated_daemon_before_sanitized_hooks() {
         let status = run_traced(
             RunArgs {
                 source: RunSource::Muse,
+                parent: None,
                 additional_metadata: None,
                 tags: Vec::new(),
                 plugin: Vec::new(),

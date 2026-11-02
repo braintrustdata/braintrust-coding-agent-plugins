@@ -248,6 +248,9 @@ pub struct RunArgs {
     /// Coding agent to launch.
     #[arg(value_enum)]
     pub source: RunSource,
+    /// Continue a trace below the opaque value returned by a Braintrust SDK span.export().
+    #[arg(long, value_name = "SPAN_EXPORT")]
+    pub parent: Option<SpanComponents>,
     /// JSON object merged into root-span metadata for this invocation.
     #[arg(long, env = "BRAINTRUST_ADDITIONAL_METADATA")]
     pub additional_metadata: Option<String>,
@@ -261,6 +264,17 @@ pub struct RunArgs {
     /// Arguments forwarded verbatim to the coding agent.
     #[arg(allow_hyphen_values = true)]
     pub agent_args: Vec<OsString>,
+}
+
+impl RunArgs {
+    pub(crate) fn validate_parent(&self) -> anyhow::Result<()> {
+        if let Some(parent) = &self.parent {
+            parent
+                .to_parent_span_info()
+                .map_err(|error| anyhow::anyhow!("invalid --parent value: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Front-end command used by a managed agent run to forward one hook payload.
