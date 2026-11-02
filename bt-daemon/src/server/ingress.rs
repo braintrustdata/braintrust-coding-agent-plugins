@@ -25,7 +25,7 @@ impl StartupBuffer {
         }
     }
 
-    fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) -> anyhow::Result<()> {
+    fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) {
         if self.events.len() == INGRESS_QUEUE_CAPACITY {
             if let Some(oldest) = self.events.pop_front() {
                 let path = journal::source_journal_path(
@@ -43,7 +43,6 @@ impl StartupBuffer {
             }
         }
         self.events.push_back(event);
-        Ok(())
     }
 }
 
@@ -54,26 +53,26 @@ pub(super) enum StartupWork {
 }
 
 impl Daemon {
-    pub(super) async fn next_startup_work(&self) -> anyhow::Result<StartupWork> {
+    pub(super) fn next_startup_work(&self) -> StartupWork {
         let mut state = self.startup_buffer.lock();
         let Some(buffer) = state.as_mut() else {
-            return Ok(StartupWork::Finished);
+            return StartupWork::Finished;
         };
         if !buffer.evicted.is_empty() {
-            return Ok(StartupWork::Evicted(std::mem::take(&mut buffer.evicted)));
+            return StartupWork::Evicted(std::mem::take(&mut buffer.evicted));
         }
         if let Some(event) = buffer.events.pop_front() {
-            return Ok(StartupWork::Event(Box::new(event)));
+            return StartupWork::Event(Box::new(event));
         }
         *state = None;
-        Ok(StartupWork::Finished)
+        StartupWork::Finished
     }
 }
 
 pub(super) async fn drain_startup_buffer(daemon: &Arc<Daemon>) -> anyhow::Result<()> {
     let mut cursors = HashMap::new();
     loop {
-        match daemon.next_startup_work().await? {
+        match daemon.next_startup_work() {
             StartupWork::Evicted(bounds) => {
                 replay_evicted_startup(daemon, &mut cursors, &bounds).await?
             }
@@ -83,7 +82,7 @@ pub(super) async fn drain_startup_buffer(daemon: &Arc<Daemon>) -> anyhow::Result
     }
 }
 
-pub(super) struct StartupCursor {
+pub(super) struct ReplayCursor {
     reader: journal::JournalReader,
     position: u64,
 }
@@ -93,7 +92,7 @@ pub(super) struct StartupCursor {
 /// only to initialize that context; they are not dispatched again.
 pub(super) async fn replay_evicted_startup(
     daemon: &Arc<Daemon>,
-    cursors: &mut HashMap<PathBuf, StartupCursor>,
+    cursors: &mut HashMap<PathBuf, ReplayCursor>,
     bounds: &HashMap<PathBuf, EvictedRange>,
 ) -> anyhow::Result<()> {
     for (path, range) in bounds {
@@ -111,7 +110,7 @@ pub(super) async fn replay_evicted_startup(
                     0,
                 ),
             };
-            cursors.insert(path.clone(), StartupCursor { reader, position });
+            cursors.insert(path.clone(), ReplayCursor { reader, position });
         }
         let cursor = cursors
             .get_mut(path)
@@ -168,17 +167,30 @@ pub(super) async fn replay_evicted_startup(
 
 async fn next_evicted_event(
     daemon: &Daemon,
-    cursor: &mut StartupCursor,
+    cursor: &mut ReplayCursor,
     through: u64,
 ) -> anyhow::Result<Option<(u64, PendingEvent)>> {
+    let Some((sequence, event)) = next_replayed_event(daemon, cursor, through).await? else {
+        return Ok(None);
+    };
+    let sequence =
+        sequence.ok_or_else(|| anyhow::anyhow!("live startup event has no capture sequence"))?;
+    Ok(Some((sequence, event)))
+}
+
+async fn next_replayed_event(
+    daemon: &Daemon,
+    cursor: &mut ReplayCursor,
+    through: u64,
+) -> anyhow::Result<Option<(Option<u64>, PendingEvent)>> {
     while cursor.position < through {
         let before = cursor.position;
         let entry = cursor
             .reader
             .next_record()
             .await?
-            .ok_or_else(|| anyhow::anyhow!("evicted startup range ends inside a record"))?;
-        anyhow::ensure!(entry.through <= through, "invalid evicted startup end");
+            .ok_or_else(|| anyhow::anyhow!("replay range ends inside a record"))?;
+        anyhow::ensure!(entry.through <= through, "invalid replay end boundary");
         cursor.position = entry.through;
         if let journal::JournalRecord::Event(redacted) = entry.record {
             let mut env = journal::envelope_from_redacted(redacted);
@@ -186,11 +198,8 @@ async fn next_evicted_event(
                 continue;
             };
             env.source = source.to_owned();
-            let sequence = entry
-                .capture_sequence
-                .ok_or_else(|| anyhow::anyhow!("live startup event has no capture sequence"))?;
             return Ok(Some((
-                sequence,
+                entry.capture_sequence,
                 PendingEvent {
                     env,
                     replay_through: before,
@@ -200,7 +209,7 @@ async fn next_evicted_event(
             )));
         }
     }
-    anyhow::ensure!(cursor.position == through, "invalid evicted startup end");
+    anyhow::ensure!(cursor.position == through, "invalid replay end boundary");
     Ok(None)
 }
 
@@ -314,102 +323,147 @@ pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingE
     }
 }
 
-/// Drain events omitted from the bounded in-memory queue. The queue contains
-/// only a latency fast path; journals remain the complete source of ingress.
+struct OverflowCursor {
+    path: PathBuf,
+    replay: ReplayCursor,
+    through: u64,
+    acknowledged: HashMap<String, u64>,
+}
+
+type OverflowEvent = ((bool, u64), PendingEvent);
+
+async fn next_overflow_event(
+    daemon: &Arc<Daemon>,
+    cursor: &mut OverflowCursor,
+) -> Option<OverflowEvent> {
+    loop {
+        let (sequence, event) = match next_replayed_event(
+            daemon,
+            &mut cursor.replay,
+            cursor.through,
+        )
+        .await
+        {
+            Ok(Some(event)) => event,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%error, path=%cursor.path.display(), "ingress overflow replay failed");
+                return None;
+            }
+        };
+        if event.journal_through
+            <= daemon
+                .ingress_history
+                .lock()
+                .get(&cursor.path)
+                .copied()
+                .unwrap_or(0)
+        {
+            continue;
+        }
+        let Some(route) = event.env.route.as_ref() else {
+            continue;
+        };
+        let Ok(key) = DeliveryKey::new(&event.env.source, &event.env.session_id, route) else {
+            continue;
+        };
+        let dispatched = daemon
+            .ingress_dispatched
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if event.journal_through <= dispatched {
+            continue;
+        }
+        let route_json = recovered_delivery_route(daemon, &event.env)
+            .await
+            .as_ref()
+            .and_then(|route| serde_json::to_string(route).ok())
+            .unwrap_or_else(|| serde_json::to_string(route).unwrap_or_default());
+        if event.journal_through <= cursor.acknowledged.get(&route_json).copied().unwrap_or(0) {
+            continue;
+        }
+        return Some(((sequence.is_some(), sequence.unwrap_or(0)), event));
+    }
+}
+
+/// Recover a frozen durable range, merging one lookahead per source by capture
+/// ordinal. Per-file replay would close a parent's tool before dispatching a
+/// child captured between that tool's start and completion.
 pub(super) async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
     let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
         return;
     };
-    let mut recovered = 0usize;
+    let mut ready = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
             continue;
         }
-        let recorded_len = journal::JournalReader::recorded_len(&path).await;
-        let Ok(Some(mut checkpoints)) = journal::JournalReader::open(&path, recorded_len).await
-        else {
-            continue;
-        };
-        let mut start = 0;
-        if let Ok(Some((reader, position, _))) = resume_discovery(daemon, &path, recorded_len).await
-        {
-            checkpoints = reader;
-            start = position;
-        }
-        let decoder = checkpoints.decoder_context().clone();
-        let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
-        while let Ok(Some(entry)) = checkpoints.next_record().await {
-            if let journal::JournalRecord::DeliveryCheckpoint { route, through } = entry.record {
-                let key = serde_json::to_string(&route).unwrap_or_default();
-                let acknowledged = acknowledged_by_route.entry(key).or_default();
-                *acknowledged = (*acknowledged).max(through);
-            }
-        }
-
-        let mut reader = if start > 0 {
-            let Ok(reader) =
-                journal::JournalReader::resume(&path, start, recorded_len, decoder).await
-            else {
-                continue;
-            };
-            reader
-        } else {
-            let Ok(Some(reader)) = journal::JournalReader::open(&path, recorded_len).await else {
-                continue;
-            };
-            reader
-        };
-        let mut before = start;
-        while let Ok(Some(entry)) = reader.next_record().await {
-            let through = entry.through;
-            let journal::JournalRecord::Event(redacted) = entry.record else {
-                before = through;
-                continue;
-            };
-            let mut env = journal::envelope_from_redacted(redacted);
-            let Some(source) = daemon.translators.canonical_source(&env.source) else {
-                before = through;
-                continue;
-            };
-            env.source = source.to_string();
-            let Some(route) = env.route.as_ref() else {
-                before = through;
-                continue;
-            };
-            let route_json = recovered_delivery_route(daemon, &env)
-                .await
-                .as_ref()
-                .and_then(|route| serde_json::to_string(route).ok())
-                .unwrap_or_else(|| serde_json::to_string(route).unwrap_or_default());
-            let key = match DeliveryKey::new(&env.source, &env.session_id, route) {
-                Ok(key) => key,
-                Err(_) => {
-                    before = through;
-                    continue;
-                }
-            };
-            let dispatched = daemon
-                .ingress_dispatched
+        let through = daemon.journal_snapshot(&path).await;
+        if through
+            <= daemon
+                .ingress_history
                 .lock()
-                .get(&key)
+                .get(&path)
                 .copied()
-                .unwrap_or(0);
-            let acknowledged = acknowledged_by_route.get(&route_json).copied().unwrap_or(0);
-            if through > dispatched.max(acknowledged) {
-                dispatch_ingress_event(
-                    daemon,
-                    PendingEvent {
-                        env,
-                        replay_through: before,
-                        journal_through: through,
-                        settings_through: None,
-                    },
-                )
-                .await;
-                recovered += 1;
+                .unwrap_or(0)
+        {
+            continue;
+        }
+        let mut acknowledged = HashMap::<String, u64>::new();
+        let (reader, start) = if let Ok(Some((reader, position, _))) =
+            resume_discovery(daemon, &path, through).await
+        {
+            // A compatible checkpoint already uses SQLite delivery heads.
+            (reader, position)
+        } else {
+            let Ok(Some(mut legacy)) = journal::JournalReader::open(&path, through).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = legacy.next_record().await {
+                if let journal::JournalRecord::DeliveryCheckpoint { route, through } = entry.record
+                {
+                    let key = serde_json::to_string(&route).unwrap_or_default();
+                    let head = acknowledged.entry(key).or_default();
+                    *head = (*head).max(through);
+                }
             }
-            before = through;
+            let Ok(Some(reader)) = journal::JournalReader::open(&path, through).await else {
+                continue;
+            };
+            (reader, 0)
+        };
+        let mut cursor = OverflowCursor {
+            path,
+            replay: ReplayCursor {
+                reader,
+                position: start,
+            },
+            through,
+            acknowledged,
+        };
+        if let Some((order, event)) = next_overflow_event(daemon, &mut cursor).await {
+            ready.push((order, event, cursor));
+        }
+    }
+    let mut recovered = 0;
+    while !ready.is_empty() {
+        let Some(index) = ready
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (order, _, _))| *order)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let (_, event, mut cursor) = ready.swap_remove(index);
+        debug_assert!(event.journal_through <= cursor.through);
+        dispatch_ingress_event(daemon, event).await;
+        recovered += 1;
+        if let Some((order, event)) = next_overflow_event(daemon, &mut cursor).await {
+            ready.push((order, event, cursor));
         }
     }
     if recovered > 0 {
@@ -578,10 +632,7 @@ impl Daemon {
         let event = {
             let mut state = self.startup_buffer.lock();
             if let Some(buffer) = state.as_mut() {
-                if let Err(error) = buffer.push(&self.data_dir, event) {
-                    self.trigger_shutdown();
-                    return Err(format!("startup index failed: {error}"));
-                }
+                buffer.push(&self.data_dir, event);
                 return Ok(true);
             }
             event

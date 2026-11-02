@@ -191,13 +191,14 @@ impl SpanJournal {
             std::fs::create_dir_all(parent)?;
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
+            // Read the version under the same write transaction as every
+            // upgrade, so another opener cannot run a stale migration plan.
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
             anyhow::ensure!(version <= 7, "unsupported SpanOp journal schema {version}");
-            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
             if version < 3 {
                 db.execute_batch(
-                    "BEGIN IMMEDIATE;
-                    CREATE TABLE IF NOT EXISTS batches (
+                    "CREATE TABLE IF NOT EXISTS batches (
                         input INTEGER PRIMARY KEY, committed INTEGER NOT NULL DEFAULT 0,
                         observation INTEGER NOT NULL DEFAULT 1);
                     CREATE TABLE IF NOT EXISTS ops (
@@ -216,16 +217,16 @@ impl SpanJournal {
                     )?;
                 }
                 db.execute_batch("ALTER TABLE heads ADD COLUMN binding TEXT")?;
-                db.execute_batch("PRAGMA user_version=3; COMMIT")?;
+                db.execute_batch("PRAGMA user_version=3")?;
             }
             if version < 4 {
-                db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE root_candidates (span_id TEXT PRIMARY KEY, value BLOB NOT NULL); PRAGMA user_version=4; COMMIT")?;
+                db.execute_batch("CREATE TABLE root_candidates (span_id TEXT PRIMARY KEY, value BLOB NOT NULL); PRAGMA user_version=4")?;
             }
             if version < 5 {
-                db.execute_batch("BEGIN IMMEDIATE; ALTER TABLE heads ADD COLUMN settings TEXT; ALTER TABLE heads ADD COLUMN settings_through INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=5; COMMIT")?;
+                db.execute_batch("ALTER TABLE heads ADD COLUMN settings TEXT; ALTER TABLE heads ADD COLUMN settings_through INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=5")?;
             }
             if version < 6 {
-                db.execute_batch("BEGIN IMMEDIATE;
+                db.execute_batch("
                     DELETE FROM ops WHERE input IN (SELECT input FROM batches WHERE committed=0);
                     CREATE TABLE receipts (input INTEGER NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(input,ordinal));
                     CREATE TABLE publication (id INTEGER PRIMARY KEY CHECK(id=1), tail INTEGER NOT NULL, floor INTEGER NOT NULL);
@@ -242,14 +243,15 @@ impl SpanJournal {
                     after = position;
                 }
                 prune(&db)?;
-                db.execute_batch("PRAGMA user_version=6; COMMIT")?;
+                db.execute_batch("PRAGMA user_version=6")?;
             }
             if version < 7 {
-                db.execute_batch("BEGIN IMMEDIATE;
+                db.execute_batch("
                     CREATE TABLE IF NOT EXISTS translation_checkpoint (id INTEGER PRIMARY KEY CHECK(id=1), input INTEGER NOT NULL, version TEXT NOT NULL, state BLOB NOT NULL);
-                    PRAGMA user_version=7; COMMIT")?;
+                    PRAGMA user_version=7")?;
             }
             let tail = db.query_row("SELECT tail FROM publication WHERE id=1", [], |row| row.get(0))?;
+            db.execute_batch("COMMIT")?;
             Ok((db, tail))
         })
         .await??;
@@ -833,6 +835,18 @@ impl SpanJournal {
             if !existing { db.execute("INSERT OR IGNORE INTO heads(route,position) VALUES (?,(SELECT floor FROM publication WHERE id=1))",[route])?; }
             Ok(())
         }).await
+    }
+
+    pub async fn has_head(&self, route: &SessionRoute) -> anyhow::Result<bool> {
+        let route = serde_json::to_string(route)?;
+        self.with_db(move |db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM heads WHERE route=?)",
+                [route],
+                |row| row.get(0),
+            )?)
+        })
+        .await
     }
 
     /// A completed subscription can remain dormant until its source has new work.
@@ -1619,6 +1633,33 @@ mod tests {
             second.value()[0].as_ref()
         ));
         assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_opens_upgrade_one_schema_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("concurrent-upgrade.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0); PRAGMA user_version=1;").unwrap();
+        drop(db);
+        let ready = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let path = path.clone();
+            let ready = ready.clone();
+            tasks.push(tokio::spawn(async move {
+                ready.wait().await;
+                SpanJournal::open(&path).await
+            }));
+        }
+        let mut opened = Vec::new();
+        for task in tasks {
+            opened.push(task.await.unwrap().unwrap());
+        }
+        for journal in opened {
+            assert_eq!(journal.tail().await.unwrap(), 0);
+            assert!(journal.translation_checkpoint().await.unwrap().is_none());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

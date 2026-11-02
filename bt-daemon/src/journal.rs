@@ -227,6 +227,33 @@ pub struct JournalWriter {
     file: tokio::fs::File,
     position: u64,
     payloads: codec::PayloadCache,
+    failed_write: bool,
+}
+
+/// Ignore only an unterminated trailing write. Complete records, including
+/// malformed ones, remain visible so corruption cannot silently discard data.
+async fn complete_position(file: &mut tokio::fs::File) -> std::io::Result<u64> {
+    let len = file.metadata().await?.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    file.seek(std::io::SeekFrom::Start(len - 1)).await?;
+    if file.read_u8().await? == b'\n' {
+        return Ok(len);
+    }
+    let mut end = len;
+    let mut buffer = vec![0; 8192];
+    while end > 0 {
+        let start = end.saturating_sub(buffer.len() as u64);
+        let bytes = &mut buffer[..(end - start) as usize];
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        file.read_exact(bytes).await?;
+        if let Some(index) = bytes.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + index as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 impl JournalWriter {
@@ -234,16 +261,22 @@ impl JournalWriter {
         if let Some(dir) = path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
-        let file = tokio::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(path)
             .await?;
-        let position = file.metadata().await?.len();
+        let position = complete_position(&mut file).await?;
+        if position < file.metadata().await?.len() {
+            file.set_len(position).await?;
+        }
+        file.sync_data().await?;
         Ok(Self {
             file,
             position,
             payloads: codec::PayloadCache::default(),
+            failed_write: false,
         })
     }
 
@@ -251,10 +284,31 @@ impl JournalWriter {
         self.position
     }
 
+    async fn append_bytes(&mut self, line: &[u8]) -> anyhow::Result<u64> {
+        if self.failed_write {
+            self.file.set_len(self.position).await?;
+            self.file.sync_data().await?;
+            self.failed_write = false;
+        }
+        if let Err(error) = async {
+            self.file.write_all(line).await?;
+            self.file.flush().await?;
+            self.file.sync_data().await
+        }
+        .await
+        {
+            self.failed_write = true;
+            return Err(error.into());
+        }
+        let before = self.position;
+        self.position += line.len() as u64;
+        Ok(before)
+    }
+
     /// Append one redacted event and confirm its durable write before capture acknowledges it.
     ///
-    /// The journal is a durability record and is never capped or truncated:
-    /// dropping entries would silently cost recovery fidelity. Its size is
+    /// Complete journal records are never capped or truncated. An unfinished
+    /// trailing write is discarded on reopen, before new appends. Its size is
     /// managed by age-based GC. Native event payloads are preserved, including
     /// repeated message snapshots. External transcript mirrors capture each
     /// byte once, and replay streams records without loading the whole log.
@@ -292,11 +346,7 @@ impl JournalWriter {
             _bt_capture_sequence: sequence,
         })?;
         line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.flush().await?;
-        self.file.sync_data().await?;
-        let before = self.position;
-        self.position += line.len() as u64;
+        let before = self.append_bytes(&line).await?;
         self.payloads
             .record(&env.event, self.position, json.clone());
         Ok(SourcePosition {
@@ -326,11 +376,7 @@ impl JournalWriter {
         value["_bt_record_type"] = "pipeline_control".into();
         let mut line = serde_json::to_vec(&value)?;
         line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.flush().await?;
-        self.file.sync_data().await?;
-        let before = self.position;
-        self.position += line.len() as u64;
+        let before = self.append_bytes(&line).await?;
         Ok(SourcePosition {
             before,
             through: self.position,
@@ -382,8 +428,14 @@ pub struct JournalReader {
 }
 
 impl JournalReader {
+    #[cfg(test)]
     pub(crate) fn decoder_context(&self) -> &DecoderContext {
         &self.decoder
+    }
+
+    /// The source consumer owns decoding state between recovery reads.
+    pub(crate) fn swap_decoder_context(&mut self, context: &mut DecoderContext) {
+        std::mem::swap(&mut self.decoder, context);
     }
 
     /// Resume any source journal at a committed byte offset with its saved
@@ -440,10 +492,10 @@ impl JournalReader {
     /// The journal's current length, which is the bound a session created now
     /// should replay through. A missing journal replays nothing.
     pub async fn recorded_len(path: &Path) -> u64 {
-        tokio::fs::metadata(path)
-            .await
-            .map(|meta| meta.len())
-            .unwrap_or(0)
+        let Ok(mut file) = tokio::fs::File::open(path).await else {
+            return 0;
+        };
+        complete_position(&mut file).await.unwrap_or(0)
     }
 
     /// The next entry, or `None` at end of file.
@@ -467,87 +519,25 @@ impl JournalReader {
             }
             self.position += read as u64;
             self.line_no += 1;
-            let line = std::str::from_utf8(&bytes)
-                .map_err(|error| {
-                    anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-                })?
-                .trim();
-            if line.is_empty() {
-                continue;
+            anyhow::ensure!(
+                bytes.last() == Some(&b'\n'),
+                "unterminated source journal record"
+            );
+            let path = self.path.clone();
+            let line_no = self.line_no;
+            let position = self.position;
+            let mut decoder = std::mem::take(&mut self.decoder);
+            // Expanding and parsing a large history can be CPU-heavy even
+            // when file reads are async. Never run it on the hook IPC thread.
+            let (decoder, decoded) = tokio::task::spawn_blocking(move || {
+                let decoded = decode_record(&bytes, &path, line_no, position, &mut decoder);
+                (decoder, decoded)
+            })
+            .await?;
+            self.decoder = decoder;
+            if let Some(entry) = decoded? {
+                return Ok(Some(entry));
             }
-            let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
-                anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-            })?;
-            let capture_sequence = value
-                .get("_bt_capture_sequence")
-                .and_then(serde_json::Value::as_u64);
-            let mut decoded_bytes = read as u64;
-            let record = if value
-                .get("_bt_record_type")
-                .and_then(serde_json::Value::as_str)
-                == Some("delivery_checkpoint")
-            {
-                let checkpoint: DeliveryCheckpointRecord =
-                    serde_json::from_value(value).map_err(|error| {
-                        anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-                    })?;
-                JournalRecord::DeliveryCheckpoint {
-                    route: checkpoint.route,
-                    through: checkpoint.through,
-                }
-            } else if value
-                .get("_bt_record_type")
-                .and_then(serde_json::Value::as_str)
-                == Some("pipeline_control")
-            {
-                JournalRecord::Control(serde_json::from_value(value)?)
-            } else {
-                let record_type = value
-                    .get("_bt_record_type")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                let mut event: RedactedEnvelope =
-                    serde_json::from_value(value).map_err(|error| {
-                        anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-                    })?;
-                match record_type.as_deref() {
-                    Some("event") | Some(codec::DELTA_RECORD) => {
-                        self.decoder.legacy_pi.clear();
-                        let json = if record_type.as_deref() == Some(codec::DELTA_RECORD) {
-                            let (payload, json) =
-                                self.decoder.payloads.decode(&event.event, event.payload)?;
-                            decoded_bytes = decoded_bytes.max(json.len() as u64);
-                            event.payload = payload;
-                            Some(json)
-                        } else {
-                            codec::cache_json(&event.event, &event.payload)?
-                        };
-                        self.decoder
-                            .payloads
-                            .record(&event.event, self.position, json);
-                    }
-                    None => {
-                        self.decoder.payloads = codec::PayloadCache::default();
-                        expand_legacy_pi_payload(&mut event, &mut self.decoder.legacy_pi).map_err(
-                            |error| {
-                                anyhow::anyhow!(
-                                    "journal {}:{}: {error}",
-                                    self.path.display(),
-                                    self.line_no
-                                )
-                            },
-                        )?;
-                    }
-                    Some(kind) => anyhow::bail!("unsupported journal record type {kind:?}"),
-                }
-                JournalRecord::Event(event)
-            };
-            return Ok(Some(JournalRecordEntry {
-                record,
-                through: self.position,
-                decoded_bytes,
-                capture_sequence,
-            }));
         }
     }
 
@@ -562,6 +552,9 @@ impl JournalReader {
     /// journal being recovered. Older journals contain no checkpoints and
     /// therefore retain their existing replay behavior.
     pub async fn acknowledged_through(path: &Path, through: u64, route: &SessionRoute) -> u64 {
+        if through == 0 {
+            return 0;
+        }
         let Ok(Some(mut reader)) = Self::open(path, through).await else {
             return 0;
         };
@@ -579,6 +572,86 @@ impl JournalReader {
         }
         acknowledged
     }
+}
+
+fn decode_record(
+    bytes: &[u8],
+    path: &Path,
+    line_no: usize,
+    position: u64,
+    decoder: &mut DecoderContext,
+) -> anyhow::Result<Option<JournalRecordEntry>> {
+    let line = std::str::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?
+        .trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
+    let capture_sequence = value
+        .get("_bt_capture_sequence")
+        .and_then(serde_json::Value::as_u64);
+    let mut decoded_bytes = bytes.len() as u64;
+    let record = if value
+        .get("_bt_record_type")
+        .and_then(serde_json::Value::as_str)
+        == Some("delivery_checkpoint")
+    {
+        let checkpoint: DeliveryCheckpointRecord = serde_json::from_value(value)
+            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
+        JournalRecord::DeliveryCheckpoint {
+            route: checkpoint.route,
+            through: checkpoint.through,
+        }
+    } else if value
+        .get("_bt_record_type")
+        .and_then(serde_json::Value::as_str)
+        == Some("pipeline_control")
+    {
+        JournalRecord::Control(serde_json::from_value(value)?)
+    } else {
+        let record_type = value
+            .get("_bt_record_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let mut event: RedactedEnvelope = serde_json::from_value(value)
+            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
+        match record_type.as_deref() {
+            Some("event") | Some(codec::DELTA_RECORD) => {
+                decoder.legacy_pi.clear();
+                let json = if record_type.as_deref() == Some(codec::DELTA_RECORD) {
+                    let (payload, json) = decoder.payloads.decode(&event.event, event.payload)?;
+                    decoded_bytes = decoded_bytes.max(json.len() as u64);
+                    event.payload = payload;
+                    Some(json)
+                } else {
+                    #[derive(Deserialize)]
+                    struct StoredPayload<'a> {
+                        #[serde(borrow)]
+                        payload: &'a serde_json::value::RawValue,
+                    }
+                    let stored: StoredPayload<'_> = serde_json::from_str(line)?;
+                    codec::cache_serialized(&event.event, stored.payload.get())
+                };
+                decoder.payloads.record(&event.event, position, json);
+            }
+            None => {
+                decoder.payloads = codec::PayloadCache::default();
+                expand_legacy_pi_payload(&mut event, &mut decoder.legacy_pi).map_err(|error| {
+                    anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no)
+                })?;
+            }
+            Some(kind) => anyhow::bail!("unsupported journal record type {kind:?}"),
+        }
+        JournalRecord::Event(event)
+    };
+    Ok(Some(JournalRecordEntry {
+        record,
+        through: position,
+        decoded_bytes,
+        capture_sequence,
+    }))
 }
 
 const LEGACY_PI_MESSAGES_DELTA: &str = "_bt_messages_delta";
@@ -747,6 +820,13 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod streams {
+        use crate as bt_daemon;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/translation_streams.rs"
+        ));
+    }
 
     fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
         Envelope {
@@ -762,6 +842,198 @@ mod tests {
             route: None,
             config: None,
         }
+    }
+
+    #[tokio::test]
+    async fn compressed_recovery_matches_live_native_translation_for_every_source() {
+        use crate::translate::{AgentTranslator, Registry, SessionCtx, SpanOp};
+        fn collect(
+            translator: &mut dyn AgentTranslator,
+            env: &Envelope,
+            ctx: &SessionCtx,
+        ) -> Vec<String> {
+            let mut ops = translator.handle(env, ctx).unwrap();
+            while let Some(batch) = translator.drain_pending(ctx).unwrap() {
+                ops.extend(batch);
+            }
+            comparable(ops)
+        }
+        fn comparable(ops: Vec<SpanOp>) -> Vec<String> {
+            let mut values = ops
+                .into_iter()
+                .map(|op| {
+                    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &op;
+                    serde_json::to_string(&(
+                        &op,
+                        &row.turn_span_id,
+                        row.is_turn,
+                        &row.late_merge_key,
+                        &row.late_merge_version,
+                    ))
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            values.sort();
+            values
+        }
+        let registry = Registry::default_agents();
+        let mut covered = Vec::new();
+        for (source, mut events, _fixtures) in streams::native_streams() {
+            covered.push(source.clone());
+            // A retried first hook is valid native input and guarantees an
+            // actual delta for every agent, even a short unique-kind fixture.
+            events.insert(0, events[0].clone());
+            for event in &mut events {
+                event.payload["journal_codec_padding"] =
+                    serde_json::json!("é📚shared history".repeat(1024));
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("events.ndjson");
+            let mut writer = JournalWriter::open_path(&path).await.unwrap();
+            let mut tail = 0;
+            for event in &events {
+                tail = writer.append(event).await.unwrap();
+            }
+            assert!(tokio::fs::read_to_string(&path)
+                .await
+                .unwrap()
+                .contains(codec::DELTA_RECORD));
+            let session = events[0].session_id.clone();
+            let ctx = SessionCtx {
+                session_id: session.clone(),
+                config: None,
+            };
+            let mut live = registry.create(&source, &session);
+            let mut recovered = registry.create(&source, &session);
+            let mut reader = JournalReader::open(&path, tail).await.unwrap().unwrap();
+            for (index, original) in events.iter().enumerate() {
+                let replayed = reader.next_entry().await.unwrap().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&replayed).unwrap(),
+                    serde_json::to_value(original.redacted()).unwrap(),
+                    "{source} payload {index}"
+                );
+                let replayed = envelope_from_redacted(replayed);
+                assert_eq!(
+                    collect(live.as_mut(), original, &ctx),
+                    collect(recovered.as_mut(), &replayed, &ctx),
+                    "{source} event {index}"
+                );
+                // Restart the decoder at every boundary, using only its saved
+                // cache. No previous record may be needed to expand the next.
+                let saved = serde_json::to_vec(reader.decoder_context()).unwrap();
+                reader = JournalReader::resume(
+                    &path,
+                    reader.position,
+                    tail,
+                    serde_json::from_slice(&saved).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            assert!(reader.next_entry().await.unwrap().is_none());
+            assert_eq!(
+                comparable(live.finalize(&ctx).unwrap()),
+                comparable(recovered.finalize(&ctx).unwrap()),
+                "{source} finalization"
+            );
+        }
+        covered.sort();
+        assert_eq!(covered, registry.sources());
+    }
+
+    #[tokio::test]
+    async fn delta_recovery_uses_original_json_bytes_not_reader_serialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("original-json.ndjson");
+        // Key order and number formatting may differ across serde feature
+        // sets/versions. Offsets always refer to the writer's exact JSON.
+        let raw = format!(r#"{{"z":"{}","a":1e-3}}"#, "x".repeat(4096));
+        let first = format!("{{\"_bt_record_type\":\"event\",\"source\":\"debug\",\"session_id\":\"bytes\",\"event\":\"native\",\"ts_ms\":1,\"payload\":{raw}}}\n");
+        let prefix = raw.find("1e-3").unwrap();
+        let delta = serde_json::json!({
+            "_bt_record_type":codec::DELTA_RECORD, "source":"debug", "session_id":"bytes", "event":"native", "ts_ms":2,
+            "payload":{"base":first.len(),"prefix":prefix,"suffix":raw.len()-prefix-4,"insert":"2e-3"}
+        });
+        tokio::fs::write(&path, format!("{first}{delta}\n"))
+            .await
+            .unwrap();
+        let through = JournalReader::recorded_len(&path).await;
+        let mut reader = JournalReader::open(&path, through).await.unwrap().unwrap();
+        assert_eq!(
+            reader.next_entry().await.unwrap().unwrap().payload["a"],
+            0.001
+        );
+        let next = reader.next_entry().await.unwrap().unwrap();
+        assert_eq!(next.payload["a"], 0.002);
+        assert_eq!(next.payload["z"], "x".repeat(4096));
+    }
+
+    #[tokio::test]
+    async fn failed_append_retry_preserves_the_durable_prefix_and_delta_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("retry.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let first = pi_context(
+            vec![serde_json::json!({"content":"history".repeat(1024)})],
+            1,
+        );
+        let through = writer.append(&first).await.unwrap();
+        // Model a failed write which left OS-visible bytes but did not finish
+        // durability or update the codec's acknowledged base.
+        writer.file.write_all(b"{unfinished").await.unwrap();
+        writer.file.flush().await.unwrap();
+        writer.failed_write = true;
+        let mut second = first.clone();
+        second.payload["tail"] = "after retry".into();
+        let position = writer.append_ordered(&second, None).await.unwrap();
+        assert_eq!(position.before, through);
+        let stored = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(stored.contains(codec::DELTA_RECORD));
+        let mut reader = JournalReader::open(&path, position.through)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader.next_entry().await.unwrap().unwrap().payload,
+            first.payload
+        );
+        assert_eq!(
+            reader.next_entry().await.unwrap().unwrap().payload,
+            second.payload
+        );
+        assert!(reader.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn torn_tail_is_excluded_and_removed_before_new_appends() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let event = pi_context(vec![serde_json::json!({"content":"complete"})], 1);
+        let through = writer.append(&event).await.unwrap();
+        drop(writer);
+        let mut stored = tokio::fs::read(&path).await.unwrap();
+        stored.extend_from_slice(b"{\"source\":\"pi\",\"payload\":");
+        tokio::fs::write(&path, stored).await.unwrap();
+        assert_eq!(
+            JournalReader::recorded_len(&path).await,
+            through,
+            "a torn trailing write is outside the recovery snapshot"
+        );
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        assert_eq!(writer.position(), through);
+        let tail = writer.append(&event).await.unwrap();
+        let mut reader = JournalReader::open(&path, tail).await.unwrap().unwrap();
+        assert_eq!(
+            reader.next_entry().await.unwrap().unwrap().payload,
+            event.payload
+        );
+        assert_eq!(
+            reader.next_entry().await.unwrap().unwrap().payload,
+            event.payload
+        );
+        assert!(reader.next_entry().await.unwrap().is_none());
     }
 
     #[tokio::test]

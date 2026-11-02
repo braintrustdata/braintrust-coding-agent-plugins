@@ -249,6 +249,10 @@ impl Translation {
         self.journal.route_settings(route).await
     }
 
+    pub async fn has_head(&self, route: &SessionRoute) -> anyhow::Result<bool> {
+        self.journal.has_head(route).await
+    }
+
     /// Connect a route to the committed SpanOp stream without exposing its
     /// storage adapter to the route actor.
     pub async fn subscribe(
@@ -304,6 +308,31 @@ struct Producer {
 }
 
 impl Producer {
+    /// Translators perform synchronous native transcript I/O and reduction.
+    /// Keep both replay and live reduction off the runtime serving hook IPC.
+    async fn translate<T: Send + 'static>(
+        &mut self,
+        operation: impl FnOnce(&mut dyn AgentTranslator, &SessionCtx) -> anyhow::Result<T>
+            + Send
+            + 'static,
+    ) -> anyhow::Result<T> {
+        let mut translator = self
+            .translator
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
+        let ctx = SessionCtx {
+            session_id: self.options.session_id.clone(),
+            config: None,
+        };
+        let (translator, result) = tokio::task::spawn_blocking(move || {
+            let result = operation(translator.as_mut(), &ctx);
+            (translator, result)
+        })
+        .await?;
+        self.translator = Some(translator);
+        result
+    }
+
     async fn run(mut self, mut rx: mpsc::Receiver<Command>) {
         let mut recorded = None;
         let mut record_retry = 0;
@@ -462,14 +491,14 @@ impl Producer {
             .translator
             .take()
             .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
-        let decoder = self.decoder.clone();
+        let decoder = std::mem::take(&mut self.decoder);
         let capture = self.capture.clone();
         let bounds = self.bounds.clone();
         let templates = self.templates.clone();
         let version = self.options.version.clone();
         // Context may include a long active conversation. Its encoding and
         // compression must not monopolize a runtime thread serving hook IPC.
-        let (translator, checkpoint) = tokio::task::spawn_blocking(move || {
+        let (translator, decoder, checkpoint) = tokio::task::spawn_blocking(move || {
             let checkpoint = (|| -> anyhow::Result<Option<TranslationCheckpoint>> {
                 let Some(state) = translator.save_state()? else {
                     return Ok(None);
@@ -479,7 +508,7 @@ impl Producer {
                     translator: serde_json::value::RawValue::from_string(String::from_utf8(
                         state,
                     )?)?,
-                    decoder,
+                    decoder: decoder.clone(),
                     capture,
                     bounds,
                     templates,
@@ -493,10 +522,11 @@ impl Producer {
                     state,
                 }))
             })();
-            (translator, checkpoint)
+            (translator, decoder, checkpoint)
         })
         .await?;
         self.translator = Some(translator);
+        self.decoder = decoder;
         checkpoint
     }
 
@@ -543,12 +573,15 @@ impl Producer {
             matches!(self.state, State::Processing),
             "translation is recovering"
         );
-        self.append_control(kind).await?;
+        self.initialize().await?;
         self.advance(self.progress.requested.load(Ordering::Relaxed))
             .await?;
+        if let Some(through) = self.append_control(kind).await? {
+            self.advance(through).await?;
+        }
         self.journal.tail().await
     }
-    async fn append_control(&mut self, kind: ControlKind) -> anyhow::Result<()> {
+    async fn append_control(&mut self, kind: ControlKind) -> anyhow::Result<Option<u64>> {
         self.phase = Boundary::Journal;
         let mut bounds = HashMap::new();
         for path in self.bounds.keys() {
@@ -561,6 +594,12 @@ impl Producer {
         let control = PipelineControl { kind, bounds };
         let through = {
             let mut writer = self.options.events.lock().await;
+            // A checkpoint observes dispatched work. If capture is ahead,
+            // flush the published tail and let queued events arrive normally;
+            // chasing the file here can reorder parent/child processing.
+            if writer.position() > self.position {
+                return Ok(None);
+            }
             let position = writer.append_control_record(&control).await?;
             let through = position.through;
             self.options.input.push(SourceRecord {
@@ -572,7 +611,7 @@ impl Producer {
         self.progress
             .requested
             .fetch_max(through, Ordering::Relaxed);
-        Ok(())
+        Ok(Some(through))
     }
 
     async fn initialize(&mut self) -> anyhow::Result<()> {
@@ -589,13 +628,14 @@ impl Producer {
                 }
             }
         }
+        let registry = self.options.registry.clone();
+        let source = self.options.source.clone();
+        let namespace = self.options.namespace.clone();
         self.translator = Some(
-            self.options
-                .registry
-                .create_checked_with_session_namespace(
-                    &self.options.source,
-                    &self.options.namespace,
-                )?,
+            tokio::task::spawn_blocking(move || {
+                registry.create_checked_with_session_namespace(&source, &namespace)
+            })
+            .await??,
         );
         self.position = 0;
         self.decoder = Default::default();
@@ -626,7 +666,7 @@ impl Producer {
                         &self.options.event_path,
                         input,
                         self.committed,
-                        context.decoder.clone(),
+                        Default::default(),
                     )
                     .await?;
                     self.translator = Some(translator);
@@ -675,7 +715,7 @@ impl Producer {
                     &self.options.event_path,
                     self.position,
                     through,
-                    self.decoder.clone(),
+                    Default::default(),
                 )
                 .await?,
             );
@@ -685,10 +725,12 @@ impl Producer {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("recovery reader is missing"))?;
         reader.extend(through);
-        let Some(entry) = reader.next_record().await? else {
+        reader.swap_decoder_context(&mut self.decoder);
+        let entry = reader.next_record().await;
+        reader.swap_decoder_context(&mut self.decoder);
+        let Some(entry) = entry? else {
             return Ok(None);
         };
-        self.decoder = reader.decoder_context().clone();
         let event = match entry.record {
             JournalRecord::Event(event) => {
                 SourceEvent::Event(Box::new(crate::journal::envelope_from_redacted(event)))
@@ -725,10 +767,6 @@ impl Producer {
         while let Some(entry) = self.next_input(through).await? {
             let input = entry.position.through;
             let observation = !matches!(&entry.event,SourceEvent::Control(control) if matches!(control.kind,ControlKind::Retire));
-            let ctx = SessionCtx {
-                session_id: self.options.session_id.clone(),
-                config: None,
-            };
             let (first, capture) = match entry.event {
                 SourceEvent::Event(mut env) => {
                     if let Some(route) = &env.route {
@@ -791,10 +829,8 @@ impl Producer {
                     self.capture = Some(capture.clone());
                     self.phase = Boundary::Translation;
                     (
-                        self.translator
-                            .as_mut()
-                            .ok_or_else(|| anyhow::anyhow!("translator is missing"))?
-                            .handle(&env, &ctx)?,
+                        self.translate(move |translator, ctx| translator.handle(&env, ctx))
+                            .await?,
                         Some(capture),
                     )
                 }
@@ -812,15 +848,15 @@ impl Producer {
                         self.checkpoint_safe = false;
                     }
                     self.phase = Boundary::Translation;
-                    let translator = self
-                        .translator
-                        .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
-                    let ops = if !matches!(control.kind, ControlKind::Checkpoint) {
-                        translator.finalize_at(&ctx, &control.bounds)?
-                    } else {
-                        translator.checkpoint_at(&ctx, &control.bounds)?
-                    };
+                    let ops = self
+                        .translate(move |translator, ctx| {
+                            if !matches!(control.kind, ControlKind::Checkpoint) {
+                                translator.finalize_at(ctx, &control.bounds)
+                            } else {
+                                translator.checkpoint_at(ctx, &control.bounds)
+                            }
+                        })
+                        .await?;
                     (ops, self.capture.clone())
                 }
                 SourceEvent::LegacyDeliveryCheckpoint => {
@@ -861,10 +897,6 @@ impl Producer {
             .ok_or_else(|| anyhow::anyhow!("pending publication is missing"))?;
         let result = async {
             let publish = pending.input > self.committed;
-            let ctx = SessionCtx {
-                session_id: self.options.session_id.clone(),
-                config: None,
-            };
             if publish && !pending.begun {
                 self.phase = Boundary::Journal;
                 self.journal
@@ -935,10 +967,8 @@ impl Producer {
                 }
                 self.phase = Boundary::Translation;
                 pending.ops = self
-                    .translator
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("translator is missing"))?
-                    .drain_pending(&ctx)?;
+                    .translate(|translator, ctx| translator.drain_pending(ctx))
+                    .await?;
                 pending.complete = pending.ops.is_none();
                 pending.prepared = false;
             }
@@ -1049,6 +1079,96 @@ impl Producer {
 mod tests {
     use super::*;
     use crate::{pipeline::delivery::InputPort, translate::SpanRow};
+    mod streams {
+        use crate as bt_daemon;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/translation_streams.rs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_source_output_matches_live_overflow_and_cold_recovery() {
+        fn comparable(ops: Vec<(u64, SpanOp)>) -> Vec<String> {
+            let mut rows = ops
+                .into_iter()
+                .map(|(_, op)| {
+                    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &op;
+                    serde_json::to_string(&(
+                        &op,
+                        &row.turn_span_id,
+                        row.is_turn,
+                        &row.late_merge_key,
+                        &row.late_merge_version,
+                    ))
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        }
+        for (source, mut events, _fixtures) in streams::native_streams() {
+            events.insert(0, events[0].clone());
+            for event in &mut events {
+                event.payload["codec_padding"] = serde_json::json!("é📚history".repeat(1024));
+            }
+            let mut expected = None;
+            for mode in ["live", "overflow", "cold"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = crate::journal::source_journal_path(tmp.path(), &source, "checkpoint");
+                let writer = Arc::new(tokio::sync::Mutex::new(
+                    JournalWriter::open_path(&path).await.unwrap(),
+                ));
+                let options = resume_options(tmp.path(), &source, writer.clone());
+                let input = options.input.clone();
+                let mut translation = Translation::spawn(options).await.unwrap();
+                let mut positions = Vec::new();
+                for (index, event) in events.iter().enumerate() {
+                    let through = if mode == "cold" && index > 0 {
+                        writer.lock().await.append(event).await.unwrap()
+                    } else {
+                        capture(&writer, &input, event).await
+                    };
+                    positions.push(through);
+                }
+                if mode == "overflow" {
+                    // Emulate losing the first two queued records while their
+                    // complete persisted forms remain recoverable.
+                    assert!(input.take(0, positions[0]).is_some());
+                    assert!(input.take(positions[0], positions[1]).is_some());
+                }
+                if mode == "cold" {
+                    translation.advance(positions[0]).await.unwrap();
+                    translation.barrier().await.unwrap();
+                    translation.shutdown().await;
+                    // New writer and input: the following stored delta must
+                    // rely on the SQLite decoder/reducer checkpoint alone.
+                    *writer.lock().await = JournalWriter::open_path(&path).await.unwrap();
+                    translation =
+                        Translation::spawn(resume_options(tmp.path(), &source, writer.clone()))
+                            .await
+                            .unwrap();
+                }
+                translation
+                    .advance(*positions.last().unwrap())
+                    .await
+                    .unwrap();
+                translation
+                    .barrier()
+                    .await
+                    .unwrap_or_else(|error| panic!("{source} {mode}: {error}"));
+                translation.control(ControlKind::Finalize).await.unwrap();
+                let rows = comparable(translation.journal.read_after(0, 10000).await.unwrap());
+                assert!(!rows.is_empty(), "{source} produced no observations");
+                if let Some(expected) = &expected {
+                    assert_eq!(&rows, expected, "{source} {mode}");
+                } else {
+                    expected = Some(rows);
+                }
+                translation.shutdown().await;
+            }
+        }
+    }
 
     fn resume_options(
         data_dir: &std::path::Path,
@@ -1068,6 +1188,38 @@ mod tests {
             correlation: Arc::default(),
             correlation_changed: Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoints_cannot_absorb_captured_events_before_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "checkpoint");
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            JournalWriter::open_path(&path).await.unwrap(),
+        ));
+        let options = resume_options(tmp.path(), "debug", writer.clone());
+        let input = options.input.clone();
+        let source = Translation::spawn(options).await.unwrap();
+        let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"event","ts_ms":1,"payload":{"index":0}})).unwrap();
+        let first = capture(&writer, &input, &event).await;
+        source.advance(first).await.unwrap();
+        source.barrier().await.unwrap();
+        event.payload["index"] = 1.into();
+        let second = capture(&writer, &input, &event).await;
+        // Capture has acknowledged a later event whose routing/ancestry has
+        // not been dispatched. A flush must not translate it ahead of that.
+        source.control(ControlKind::Checkpoint).await.unwrap();
+        assert_eq!(source.journal.translated_through().await.unwrap(), first);
+        assert_eq!(
+            writer.lock().await.position(),
+            second,
+            "no control marker should leap over undispatched work"
+        );
+        source.advance(second).await.unwrap();
+        source.barrier().await.unwrap();
+        source.control(ControlKind::Checkpoint).await.unwrap();
+        assert!(source.journal.translated_through().await.unwrap() > second);
+        source.shutdown().await;
     }
 
     #[tokio::test]
@@ -1202,6 +1354,103 @@ mod tests {
     struct BlockedCheckpoint {
         entered: Arc<Notify>,
         release: std::sync::mpsc::Receiver<()>,
+    }
+
+    struct BlockedReplay {
+        entered: Arc<Notify>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl AgentTranslator for BlockedReplay {
+        fn handle(
+            &mut self,
+            _: &crate::wire::Envelope,
+            _: &SessionCtx,
+        ) -> anyhow::Result<Vec<SpanOp>> {
+            self.entered.notify_one();
+            let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
+            self.finished.store(true, Ordering::Release);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_replay_work_cannot_block_the_hook_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "checkpoint");
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            JournalWriter::open_path(&path).await.unwrap(),
+        ));
+        let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"event","ts_ms":1,"payload":{}})).unwrap();
+        let through = writer.lock().await.append(&event).await.unwrap();
+        let options = resume_options(tmp.path(), "debug", writer.clone());
+        let input = options.input.clone();
+        let entered = Arc::new(Notify::new());
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, receiver) = std::sync::mpsc::channel();
+        let mut producer = Producer {
+            options,
+            journal: SpanJournal::open(&tmp.path().join("work.sqlite"))
+                .await
+                .unwrap(),
+            progress: Arc::default(),
+            error: Arc::default(),
+            recovery: Arc::default(),
+            translator: Some(Box::new(BlockedReplay {
+                entered: entered.clone(),
+                finished: finished.clone(),
+                release: receiver,
+            })),
+            reader: None,
+            decoder: Default::default(),
+            observers: Vec::new(),
+            origins: WeakOrigins::default(),
+            roots: Roots::default(),
+            capture: None,
+            pending_snapshots: HashSet::new(),
+            bounds: HashMap::new(),
+            templates: HashMap::new(),
+            position: 0,
+            committed: 0,
+            checkpoint_position: 0,
+            checkpoint_events: 0,
+            checkpoint_work_bytes: 0,
+            checkpoint_safe: true,
+            state: State::Processing,
+            publication: None,
+            phase: Boundary::Journal,
+        };
+        let started = std::time::Instant::now();
+        let processing = tokio::spawn(async move {
+            let result = producer.advance(through).await;
+            (producer, result)
+        });
+        entered.notified().await;
+        let elapsed = started.elapsed();
+        event.ts_ms = 2;
+        let captured = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            capture(&writer, &input, &event),
+        )
+        .await;
+        let replay_still_blocked = !finished.load(Ordering::Acquire);
+        let _ = release.send(());
+        let (producer, result) = processing.await.unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "replay monopolized the hook runtime for {elapsed:?}"
+        );
+        assert!(captured.unwrap() > through);
+        assert!(
+            replay_still_blocked,
+            "capture only completed after synchronous replay returned"
+        );
+        result.unwrap();
+        assert_eq!(
+            producer.journal.translated_through().await.unwrap(),
+            through,
+            "replay must retain its original stopping point"
+        );
     }
     impl AgentTranslator for BlockedCheckpoint {
         fn handle(

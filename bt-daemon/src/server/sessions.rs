@@ -106,10 +106,15 @@ impl Daemon {
         // delivery checkpoint controlling which rows reach its sink.
         let journal_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
-        let legacy_through =
-            journal::JournalReader::acknowledged_through(&journal_path, replay_through, &route)
-                .await;
         let translation = self.translation_for(env).await?;
+        // Existing SQLite heads are authoritative; subscribe never reseeds
+        // them from legacy checkpoints. Avoid decoding the entire old prefix.
+        let legacy_through = if translation.has_head(&route).await? {
+            0
+        } else {
+            journal::JournalReader::acknowledged_through(&journal_path, replay_through, &route)
+                .await
+        };
         let settings = translation.route_settings(&route).await?;
         let config = settings.with_auth(config.auth);
         env.config = Some(config.clone());
@@ -222,7 +227,11 @@ impl Daemon {
             self.claude_transcripts.lock().retain(|candidate, _| {
                 candidate.source != key.source || candidate.session_id != key.session_id
             });
-            self.journals.lock().remove(&storage_key);
+            self.journals.lock().remove(&journal::source_journal_path(
+                &self.data_dir,
+                &key.source,
+                &key.session_id,
+            ));
             let mut inputs = self.source_inputs.lock();
             if inputs
                 .get(&storage_key)
@@ -265,20 +274,47 @@ impl Daemon {
         source: &str,
         session_id: &str,
     ) -> anyhow::Result<Arc<tokio::sync::Mutex<JournalWriter>>> {
-        let storage_key = crate::ids::session_namespace(source, session_id);
-        if let Some(writer) = self.journals.lock().get(&storage_key).cloned() {
-            return Ok(writer);
-        }
-        let path = journal::ensure_source_journal(&self.data_dir, source, session_id).await?;
-        let writer = Arc::new(tokio::sync::Mutex::new(
-            JournalWriter::open_path(&path).await?,
-        ));
-        Ok(self
+        let path = journal::source_journal_path(&self.data_dir, source, session_id);
+        let slot = self
             .journals
             .lock()
-            .entry(storage_key)
-            .or_insert_with(|| writer.clone())
-            .clone())
+            .entry(path.clone())
+            .or_default()
+            .clone();
+        // A recovery actor and capture may open the same source concurrently.
+        // Tail repair must finish exactly once before either can append.
+        let writer = slot
+            .get_or_try_init(|| async {
+                let path =
+                    journal::ensure_source_journal(&self.data_dir, source, session_id).await?;
+                let writer = JournalWriter::open_path(&path).await?;
+                let mut history = self.ingress_history.lock();
+                if history
+                    .get(&path)
+                    .is_some_and(|before| *before > writer.position())
+                {
+                    history.remove(&path);
+                }
+                Ok::<_, anyhow::Error>(Arc::new(tokio::sync::Mutex::new(writer)))
+            })
+            .await?;
+        Ok(writer.clone())
+    }
+
+    /// Take only the durable append position, never hold the writer while
+    /// reading/replaying records. Recheck after metadata I/O if it opened meanwhile.
+    pub(super) async fn journal_snapshot(&self, path: &std::path::Path) -> u64 {
+        let slot = self.journals.lock().get(path).cloned();
+        if let Some(writer) = slot.and_then(|slot| slot.get().cloned()) {
+            return writer.lock().await.position();
+        }
+        let recorded = journal::JournalReader::recorded_len(path).await;
+        let slot = self.journals.lock().get(path).cloned();
+        if let Some(writer) = slot.and_then(|slot| slot.get().cloned()) {
+            recorded.min(writer.lock().await.position())
+        } else {
+            recorded
+        }
     }
 
     pub(super) fn source_input_for(

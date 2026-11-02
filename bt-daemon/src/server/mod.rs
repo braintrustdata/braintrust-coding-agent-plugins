@@ -102,6 +102,8 @@ struct SessionAuthState {
     lease: AuthLease,
 }
 
+type JournalSlot = Arc<tokio::sync::OnceCell<Arc<tokio::sync::Mutex<JournalWriter>>>>;
+
 pub struct Daemon {
     version: String,
     data_dir: PathBuf,
@@ -115,7 +117,7 @@ pub struct Daemon {
     /// Serializes daemon-side routing and actor creation independently of
     /// capture, which must never inherit actor or sink backpressure.
     dispatch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    journals: Mutex<HashMap<String, Arc<tokio::sync::Mutex<JournalWriter>>>>,
+    journals: Mutex<HashMap<PathBuf, JournalSlot>>,
     source_inputs: Mutex<HashMap<String, crate::pipeline::input::SourceInput>>,
     claude_transcripts: Mutex<HashMap<DeliveryKey, ClaudeTranscriptObservation>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
@@ -132,6 +134,9 @@ pub struct Daemon {
     ingress_tx: mpsc::Sender<IngressMsg>,
     ingress_overflow: AtomicBool,
     ingress_dispatched: Mutex<HashMap<DeliveryKey, u64>>,
+    /// Historical prefixes already considered by startup recovery. Capture
+    /// ordinals in those prefixes belong to an earlier daemon incarnation.
+    ingress_history: Mutex<HashMap<PathBuf, u64>>,
     /// Earliest live append during startup, keyed by source journal path.
     /// Recovery must not absorb queued live events into its historical head.
     startup_cutoffs: Mutex<Option<HashMap<PathBuf, u64>>>,
@@ -189,6 +194,7 @@ impl Daemon {
             ingress_tx,
             ingress_overflow: AtomicBool::new(false),
             ingress_dispatched: Mutex::new(HashMap::new()),
+            ingress_history: Mutex::new(HashMap::new()),
             startup_cutoffs: Mutex::new(startup_cutoffs),
             startup_buffer: Mutex::new(startup_buffer),
             capture_sequence: AtomicU64::new(0),
@@ -277,7 +283,9 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
             .await;
         restore_pending_sessions(&recovery_daemon).await;
         let candidates = discover_unprocessed_journals(&recovery_daemon).await;
-        *recovery_daemon.startup_cutoffs.lock() = None;
+        if let Some(history) = recovery_daemon.startup_cutoffs.lock().take() {
+            recovery_daemon.ingress_history.lock().extend(history);
+        }
         for event in candidates {
             dispatch_ingress_event(&recovery_daemon, event).await;
         }

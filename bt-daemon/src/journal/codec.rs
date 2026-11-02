@@ -69,6 +69,16 @@ pub(super) fn cache_json(event: &str, payload: &Value) -> anyhow::Result<Option<
     Ok(Some(String::from_utf8(output.bytes)?.into()))
 }
 
+/// Delta offsets refer to the exact stored JSON, including key order and
+/// number spelling. Re-serializing a decoded Value is not a portable base.
+pub(super) fn cache_serialized(event: &str, json: &str) -> Option<Arc<str>> {
+    if json.len() < MIN_BYTES || json.len() > MAX_BYTES.saturating_sub(event.len()) {
+        None
+    } else {
+        Some(Arc::from(json))
+    }
+}
+
 impl PayloadCache {
     pub(super) fn encode(
         &self,

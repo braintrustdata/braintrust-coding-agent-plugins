@@ -84,7 +84,7 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         let lock = daemon.session_lock(&first.source, &first.session_id);
         let _guard = lock.lock().await;
         let namespace = crate::ids::session_namespace(&first.source, &first.session_id);
-        if daemon.journals.lock().contains_key(&namespace)
+        if daemon.journals.lock().contains_key(&path)
             || daemon.translations.lock().contains_key(&namespace)
         {
             continue;
@@ -131,6 +131,11 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         if tokio::fs::remove_file(&storage).await.is_err() {
             continue;
         }
+        daemon.ingress_history.lock().remove(&path);
+        daemon
+            .ingress_dispatched
+            .lock()
+            .retain(|key, _| key.source != first.source || key.session_id != first.session_id);
         for sidecar in [wal, storage.with_extension("sqlite-shm"), path] {
             if let Err(error) = tokio::fs::remove_file(&sidecar).await {
                 if error.kind() != std::io::ErrorKind::NotFound {
@@ -663,7 +668,7 @@ mod tests {
             next.payload = serde_json::json!({"index": i});
             assert!(daemon.capture_event(next).await.unwrap());
         }
-        let StartupWork::Evicted(first) = daemon.next_startup_work().await.unwrap() else {
+        let StartupWork::Evicted(first) = daemon.next_startup_work() else {
             panic!("the oldest events were not evicted");
         };
         for i in INGRESS_QUEUE_CAPACITY + 2..INGRESS_QUEUE_CAPACITY + 7 {
@@ -682,7 +687,7 @@ mod tests {
         replay_evicted_startup(&daemon, &mut cursors, &first)
             .await
             .unwrap();
-        let StartupWork::Evicted(second) = daemon.next_startup_work().await.unwrap() else {
+        let StartupWork::Evicted(second) = daemon.next_startup_work() else {
             panic!("new evictions did not advance recovery");
         };
         replay_evicted_startup(&daemon, &mut cursors, &second)
@@ -707,6 +712,48 @@ mod tests {
             .unwrap();
         assert_eq!(count, (INGRESS_QUEUE_CAPACITY + 7) as u64);
         drop(db);
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn overflow_snapshot_excludes_unacknowledged_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ready, startup) = oneshot::channel();
+        let mut opts = debug_serve_options("test", tmp.path());
+        opts.auth_provider = Some(Arc::new(TestAuth));
+        let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup));
+        *daemon.startup_buffer.lock() = None;
+        let mut env = event("durable-bound", SessionRoute::default());
+        env.payload = serde_json::json!({"index":0});
+        daemon.capture_event(env.clone()).await.unwrap();
+        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
+        let acknowledged = tokio::fs::read(&path).await.unwrap();
+        let through = acknowledged.len() as u64;
+        // OS-visible bytes need not have completed fsync. Model a complete
+        // record written after the writer's acknowledged durable position.
+        env.payload = serde_json::json!({"index":1});
+        let mut unacknowledged = acknowledged.clone();
+        unacknowledged.extend(serde_json::to_vec(&env.redacted()).unwrap());
+        unacknowledged.push(b'\n');
+        tokio::fs::write(&path, unacknowledged).await.unwrap();
+        recover_ingress_overflow(&daemon).await;
+        let source = daemon.translations.lock().values().next().unwrap().clone();
+        source.barrier().await.unwrap();
+        let storage = tmp.path().join("pipeline").join(format!(
+            "{}.sqlite",
+            crate::ids::session_storage_id(&env.source, &env.session_id)
+        ));
+        let partition = crate::pipeline::journal::SpanJournal::open(&storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            partition.translated_through().await.unwrap(),
+            through,
+            "recovery must not commit beyond the durable capture head"
+        );
+        tokio::fs::write(&path, acknowledged).await.unwrap();
+        ready.send(()).unwrap();
+        daemon.settle_ingress().await;
         drain_all(&daemon).await;
     }
 
@@ -753,6 +800,72 @@ mod tests {
             daemon.capture_event(filler).await.unwrap();
         }
         drain_startup_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        daemon.settle_ingress().await;
+        let route = daemon
+            .automatic_links
+            .lock()
+            .get(&child_key)
+            .cloned()
+            .expect("child must be linked");
+        let Some(crate::wire::TraceDestination::ParentSpan { components }) = route.destination
+        else {
+            panic!("child was not attached to the parent tool");
+        };
+        let tool_id = crate::ids::span_id(
+            &crate::ids::session_namespace("opencode", "parent"),
+            "tool:parent:tool",
+        );
+        assert_eq!(components.span_id.as_deref(), Some(tool_id.as_str()));
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn steady_overflow_preserves_parent_child_tool_order() {
+        use distributed_fixture::{AgentKind, DistributedFixtures, ProcessTree};
+        let tmp = tempfile::tempdir().unwrap();
+        let (ready, startup) = oneshot::channel();
+        let mut opts = debug_serve_options("test", tmp.path());
+        opts.auth_provider = Some(Arc::new(TestAuth));
+        let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup));
+        // Pause the steady ingress worker while captures saturate its queue.
+        *daemon.startup_buffer.lock() = None;
+        let mut fixtures = DistributedFixtures::new();
+        let parent = ProcessTree::root(1000);
+        let child = ProcessTree::child(1002, 1001, &parent);
+        let mut events =
+            fixtures.start_turn(AgentKind::OpenCode, "parent", &parent, "delegate", 100);
+        events.push(fixtures.open_tool(
+            AgentKind::OpenCode,
+            "parent",
+            &parent,
+            "tool",
+            "do work",
+            102,
+        ));
+        let child_events =
+            fixtures.start_turn(AgentKind::OpenCode, "child", &child, "do work", 103);
+        let child_key = automatic_link_key(&child_events[0]);
+        events.extend(child_events);
+        events.push(fixtures.close_tool(
+            AgentKind::OpenCode,
+            "parent",
+            &parent,
+            "tool",
+            "do work",
+            "done",
+            105,
+        ));
+        for env in events {
+            daemon.capture_event(env).await.unwrap();
+        }
+        for i in 0..INGRESS_QUEUE_CAPACITY {
+            let mut filler = event("filler", SessionRoute::default());
+            filler.ts_ms = i as i64;
+            daemon.capture_event(filler).await.unwrap();
+        }
+        assert!(daemon.ingress_overflow.load(Ordering::Acquire));
+        recover_ingress_overflow(&daemon).await;
         ready.send(()).unwrap();
         daemon.settle_ingress().await;
         let route = daemon
@@ -836,7 +949,7 @@ mod tests {
             env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
             assert!(daemon.capture_event(env.clone()).await.unwrap());
         }
-        let StartupWork::Evicted(first) = daemon.next_startup_work().await.unwrap() else {
+        let StartupWork::Evicted(first) = daemon.next_startup_work() else {
             panic!("missing first overflow")
         };
         let mut cursors = HashMap::new();
@@ -848,7 +961,7 @@ mod tests {
             env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
             assert!(daemon.capture_event(env.clone()).await.unwrap());
         }
-        let StartupWork::Evicted(second) = daemon.next_startup_work().await.unwrap() else {
+        let StartupWork::Evicted(second) = daemon.next_startup_work() else {
             panic!("missing second overflow")
         };
         replay_evicted_startup(&daemon, &mut cursors, &second)

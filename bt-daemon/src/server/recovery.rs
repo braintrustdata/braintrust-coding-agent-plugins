@@ -81,13 +81,16 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
             continue;
         }
-        let recorded_len = journal::JournalReader::recorded_len(&path).await;
+        let recorded_len = daemon.journal_snapshot(&path).await;
         let recorded_len = daemon
             .startup_cutoffs
             .lock()
             .as_ref()
             .and_then(|cutoffs| cutoffs.get(&path).copied())
             .map_or(recorded_len, |cutoff| recorded_len.min(cutoff));
+        if let Some(cutoffs) = daemon.startup_cutoffs.lock().as_mut() {
+            cutoffs.entry(path.clone()).or_insert(recorded_len);
+        }
         let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded_len).await else {
             continue;
         };
