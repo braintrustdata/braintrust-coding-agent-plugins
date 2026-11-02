@@ -17,13 +17,69 @@ use std::sync::Arc;
 
 impl TranslatorFactory for crate::agents::OpenCode {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(OpenCodeTranslator {
-            daemon_session_id: session_id.to_string(),
-            sessions: HashMap::new(),
-            permission_requests: HashMap::new(),
-            git: GitMetadataCache::shared(),
-            last_ts_ms: 0,
+        Box::new(OpenCodeVersionedTranslator {
+            v1: new_translator(session_id),
+            v2: super::opencode_v2::OpenCodeV2Translator::new(session_id),
+            version: None,
         })
+    }
+}
+
+pub(super) fn new_translator(session_id: &str) -> Box<dyn AgentTranslator> {
+    Box::new(OpenCodeTranslator {
+        daemon_session_id: session_id.to_string(),
+        sessions: HashMap::new(),
+        permission_requests: HashMap::new(),
+        git: GitMetadataCache::shared(),
+        last_ts_ms: 0,
+    })
+}
+
+struct OpenCodeVersionedTranslator {
+    v1: Box<dyn AgentTranslator>,
+    v2: super::opencode_v2::OpenCodeV2Translator,
+    version: Option<bool>,
+}
+
+impl AgentTranslator for OpenCodeVersionedTranslator {
+    fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        if self.version.is_none() && event.event == "session_start" {
+            return Ok(Vec::new());
+        }
+        let v2 = *self
+            .version
+            .get_or_insert_with(|| match event.source_version.as_deref() {
+                Some(version) => version.trim_start_matches('v').split('.').next() == Some("2"),
+                None => {
+                    event.payload.get("type").and_then(Value::as_str) == Some(event.event.as_str())
+                        && event
+                            .payload
+                            .pointer("/data/sessionID")
+                            .and_then(Value::as_str)
+                            .is_some()
+                }
+            });
+        if v2 {
+            self.v2.handle(event, ctx)
+        } else {
+            self.v1.handle(event, ctx)
+        }
+    }
+
+    fn checkpoint(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        if self.version == Some(true) {
+            self.v2.checkpoint(ctx)
+        } else {
+            self.v1.checkpoint(ctx)
+        }
+    }
+
+    fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        if self.version == Some(true) {
+            self.v2.finalize(ctx)
+        } else {
+            self.v1.finalize(ctx)
+        }
     }
 }
 

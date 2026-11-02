@@ -972,3 +972,123 @@ fn opencode_idle_root_merge_keeps_external_parent() {
     );
     assert_merges_preserve_insert_identity(&ops);
 }
+
+#[test]
+fn opencode_v2_reduces_native_text_session_without_session_created() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    // Shapes observed from OpenCode 2.2.5 with a local mock model.
+    let events = [
+        (
+            "session.inbox.enqueued",
+            1,
+            json!({"sessionID":"native", "inboxID":"user-1", "item":{"type":"user", "payload":{"text":"hello", "files":[]}, "delivery":"steer"}}),
+        ),
+        (
+            "session.inbox.delivered",
+            2,
+            json!({"sessionID":"native", "inboxID":"user-1"}),
+        ),
+        (
+            "session.step.started",
+            3,
+            json!({"sessionID":"native", "assistantMessageID":"assistant-1", "model":{"id":"mock-model", "providerID":"mock"}, "started":2}),
+        ),
+        (
+            "session.text.ended",
+            4,
+            json!({"sessionID":"native", "assistantMessageID":"assistant-1", "ordinal":0, "text":"world"}),
+        ),
+        (
+            "session.step.ended",
+            5,
+            json!({"sessionID":"native", "assistantMessageID":"assistant-1", "finish":"stop", "tokens":{"input":3,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}),
+        ),
+        (
+            "session.execution.succeeded",
+            6,
+            json!({"sessionID":"native"}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (name, ts, data) in events {
+        let mut e = event(
+            name,
+            ts,
+            json!({"id":format!("event-{ts}"),"type":name,"data":data}),
+        );
+        e.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+        assert!(translator.handle(&e, &ctx).unwrap().is_empty());
+    }
+    let rows = reduce(ops);
+    let turn = rows.values().find(|r| r.name == "Turn 1").unwrap();
+    assert_eq!(turn.input, Some(json!("hello")));
+    let llm = rows
+        .values()
+        .find(|r| r.span_type == SpanType::Llm)
+        .unwrap();
+    assert_eq!(llm.name, "mock/mock-model");
+    assert_eq!(
+        llm.output,
+        Some(json!([{"role":"assistant","content":"world"}]))
+    );
+    assert_eq!(llm.metrics.as_ref().unwrap()["prompt_tokens"], 3);
+    assert_eq!(llm.parent_span_ids, vec![turn.span_id.clone()]);
+}
+
+#[test]
+fn opencode_v2_emits_tool_span_from_native_events() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"native","inboxID":"u","item":{"type":"user","payload":{"text":"read"}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"native","inboxID":"u"}),
+        ),
+        (
+            "session.tool.input.started",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"call","name":"read"}),
+        ),
+        (
+            "session.tool.called",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"call","input":{"path":"README.md"},"executed":false}),
+        ),
+        (
+            "session.tool.success",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"call","content":[{"type":"text","text":"contents"}],"executed":true}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        let mut e = event(
+            name,
+            i as i64 + 1,
+            json!({"id":format!("event-{i}"),"type":name,"data":data}),
+        );
+        e.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let tool = rows
+        .values()
+        .find(|r| r.span_type == SpanType::Tool)
+        .unwrap();
+    assert_eq!(tool.name, "read");
+    assert_eq!(tool.input, Some(json!({"path":"README.md"})));
+    assert_eq!(
+        tool.output,
+        Some(json!([{"type":"text","text":"contents"}]))
+    );
+    assert!(tool.end_ms.is_some());
+}
