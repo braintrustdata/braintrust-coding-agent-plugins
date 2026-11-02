@@ -285,6 +285,9 @@ pub(super) fn spawn_session_reaper(daemon: Arc<Daemon>, idle_timeout: Duration) 
 
 pub(super) fn spawn_gc(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
+        // Retention may scan old transcripts. Start it after recovery releases
+        // live ingress, so it cannot delay resuming an active source session.
+        collect_garbage(&daemon).await;
         loop {
             tokio::select! {
                 _ = daemon.shutdown.notified() => return,

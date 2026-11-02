@@ -27,6 +27,7 @@ impl TranslatorFactory for crate::agents::Antigravity {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Turn {
     span_id: String,
     number: u32,
@@ -34,6 +35,7 @@ struct Turn {
     last_output: Option<Value>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Invocation {
     span_id: String,
     parent_span_id: String,
@@ -41,12 +43,14 @@ struct Invocation {
     record_start: usize,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingTool {
     span_id: String,
     parent_span_id: String,
     name: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct AntigravityTranslator {
     session_id: String,
     session_span_id: String,
@@ -63,6 +67,7 @@ struct AntigravityTranslator {
     invocations: HashMap<i64, Invocation>,
     tools: HashMap<i64, PendingTool>,
     last_ts_ms: i64,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 
@@ -494,6 +499,7 @@ impl AntigravityTranslator {
 }
 
 impl AgentTranslator for AntigravityTranslator {
+    translator_checkpoint!();
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut ops = Vec::new();

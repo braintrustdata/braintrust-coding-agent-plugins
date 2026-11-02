@@ -45,6 +45,13 @@ pub(crate) struct SpanJournal {
     payload_reads: Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[derive(Clone)]
+pub(crate) struct TranslationCheckpoint {
+    pub input: u64,
+    pub version: String,
+    pub state: Vec<u8>,
+}
+
 /// Explicit codec preserves fields intentionally omitted from wire/plugin JSON.
 #[derive(Serialize, Deserialize)]
 struct StoredOp {
@@ -181,7 +188,7 @@ impl SpanJournal {
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            anyhow::ensure!(version <= 6, "unsupported SpanOp journal schema {version}");
+            anyhow::ensure!(version <= 7, "unsupported SpanOp journal schema {version}");
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
             if version < 3 {
                 db.execute_batch(
@@ -232,6 +239,11 @@ impl SpanJournal {
                 }
                 prune(&db)?;
                 db.execute_batch("PRAGMA user_version=6; COMMIT")?;
+            }
+            if version < 7 {
+                db.execute_batch("BEGIN IMMEDIATE;
+                    CREATE TABLE IF NOT EXISTS translation_checkpoint (id INTEGER PRIMARY KEY CHECK(id=1), input INTEGER NOT NULL, version TEXT NOT NULL, state BLOB NOT NULL);
+                    PRAGMA user_version=7; COMMIT")?;
             }
             let tail = db.query_row("SELECT tail FROM publication WHERE id=1", [], |row| row.get(0))?;
             Ok((db, tail))
@@ -290,6 +302,51 @@ impl SpanJournal {
                 [],
                 |row| row.get(0),
             )?)
+        })
+        .await
+    }
+
+    pub async fn translation_checkpoint(&self) -> anyhow::Result<Option<TranslationCheckpoint>> {
+        self.with_db(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT input,version,state FROM translation_checkpoint WHERE id=1",
+                    [],
+                    |row| {
+                        Ok(TranslationCheckpoint {
+                            input: row.get(0)?,
+                            version: row.get(1)?,
+                            state: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Refresh idle context only at the already committed translation head.
+    pub async fn save_translation_checkpoint(
+        &self,
+        checkpoint: TranslationCheckpoint,
+    ) -> anyhow::Result<()> {
+        self.with_db(move |db| {
+            let tx = db.transaction()?;
+            let head: u64 = tx.query_row(
+                "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                checkpoint.input == head,
+                "checkpoint must match the translation head"
+            );
+            tx.execute(
+                "INSERT OR REPLACE INTO translation_checkpoint VALUES(1,?,?,?)",
+                params![checkpoint.input, checkpoint.version, checkpoint.state],
+            )?;
+            tx.commit()?;
+            Ok(())
         })
         .await
     }
@@ -359,7 +416,8 @@ impl SpanJournal {
             let first = *ordinal;
             let positions = self
                 .with_db(move |db| {
-                    let tx = db.transaction()?;
+                    let tx =
+                        db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let mut positions = Vec::new();
                     let (committed, observation): (bool, bool) = tx.query_row(
                         "SELECT committed,observation FROM batches WHERE input=?",
@@ -493,14 +551,24 @@ impl SpanJournal {
     }
 
     pub async fn commit(&self, input: u64) -> anyhow::Result<u64> {
-        self.commit_output(input, None).await
+        self.commit_output(input, None, None).await
     }
 
     /// Root candidates and translated output share the consumed-input boundary.
+    #[cfg(test)]
     pub async fn commit_with_roots(
         &self,
         input: u64,
         roots: &BTreeMap<String, Vec<SpanOp>>,
+    ) -> anyhow::Result<u64> {
+        self.commit_with_context(input, roots, None).await
+    }
+
+    pub async fn commit_with_context(
+        &self,
+        input: u64,
+        roots: &BTreeMap<String, Vec<SpanOp>>,
+        checkpoint: Option<TranslationCheckpoint>,
     ) -> anyhow::Result<u64> {
         let roots = roots
             .iter()
@@ -512,7 +580,7 @@ impl SpanJournal {
                 Ok((id.clone(), serde_json::to_vec(&ops)?))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        self.commit_output(input, Some(roots)).await
+        self.commit_output(input, Some(roots), checkpoint).await
     }
 
     pub async fn root_candidates(&self) -> anyhow::Result<BTreeMap<String, Vec<SpanOp>>> {
@@ -542,6 +610,7 @@ impl SpanJournal {
         &self,
         input: u64,
         roots: Option<Vec<(String, Vec<u8>)>>,
+        checkpoint: Option<TranslationCheckpoint>,
     ) -> anyhow::Result<u64> {
         let tail = self
             .with_db(move |db| {
@@ -565,6 +634,13 @@ impl SpanJournal {
                     tx.execute("UPDATE batches SET committed=1 WHERE input=?", [input])? == 1,
                     "missing translation batch"
                 );
+                if let Some(checkpoint) = checkpoint {
+                    anyhow::ensure!(checkpoint.input == input, "checkpoint input mismatch");
+                    tx.execute(
+                        "INSERT OR REPLACE INTO translation_checkpoint VALUES(1,?,?,?)",
+                        params![input, checkpoint.version, checkpoint.state],
+                    )?;
+                }
                 if let Some(roots) = roots {
                     tx.execute("DELETE FROM root_candidates", [])?;
                     for (id, value) in roots {

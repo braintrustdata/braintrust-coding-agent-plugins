@@ -61,7 +61,7 @@ struct BeforeAgentStart {
 
 /// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
 /// routes each request to a physical model.
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct SelectedModel {
     provider: String,
     id: String,
@@ -309,6 +309,7 @@ fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingLlm {
     start_ms: i64,
     input: Value,
@@ -316,13 +317,14 @@ struct PendingLlm {
     request_config: Map<String, Value>,
     selected_model: Option<SelectedModel>,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ToolStart {
     start_ms: i64,
     name: String,
     args: Value,
     parent_call: Option<String>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PiTranslator {
     session_id: String,
     root_span_id: String,
@@ -349,10 +351,12 @@ struct PiTranslator {
     branch_summary: Option<(String, i64, Value)>,
     last_ts: i64,
     thinking_level: Option<String>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 
 impl AgentTranslator for PiTranslator {
+    translator_checkpoint!();
     fn handle(&mut self, envelope: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts = self.last_ts.max(envelope.ts_ms);
         let event = envelope.payload.get("event").unwrap_or(&envelope.payload);

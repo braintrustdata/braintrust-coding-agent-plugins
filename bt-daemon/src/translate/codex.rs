@@ -139,12 +139,13 @@ impl TranslatorFactory for crate::agents::Codex {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum ScopeKind {
     Main,
     Subagent,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenTurn {
     turn_id: String,
     span_id: String,
@@ -156,12 +157,13 @@ struct OpenTurn {
     native_prompt_seen: bool,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum TurnInputSource {
     Native,
     Authoritative,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenLlm {
     span_id: String,
     turn_id: String,
@@ -171,6 +173,7 @@ struct OpenLlm {
     output_preset: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenTool {
     span_id: String,
     turn_id: String,
@@ -178,6 +181,7 @@ struct OpenTool {
     name: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Scope {
     path: String,
     kind: ScopeKind,
@@ -212,6 +216,7 @@ impl Scope {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 enum DeferredHook {
     None,
     PostToolUse(Value),
@@ -230,6 +235,7 @@ enum DeferredHook {
     },
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 enum PendingWork {
     Hook {
         path: String,
@@ -246,6 +252,7 @@ enum PendingWork {
     },
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CodexTranslator {
     session_id: String,
     /// The daemon-owned session row. Child spans always parent to this id.
@@ -267,10 +274,12 @@ struct CodexTranslator {
     compaction_trigger_by_turn: RecentMap<String, String>,
     compaction_spans: RecentSet<String>,
     pending: Option<PendingWork>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 
 impl AgentTranslator for CodexTranslator {
+    translator_checkpoint!();
     fn handle(&mut self, event: &Envelope, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),

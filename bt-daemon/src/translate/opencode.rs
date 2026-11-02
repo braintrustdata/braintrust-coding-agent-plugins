@@ -340,7 +340,7 @@ fn properties<T: DeserializeOwned>(payload: &Value, field: &str) -> Option<T> {
         .and_then(decode)
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct NativeSession {
     root_span_id: String,
     effective_root_span_id: String,
@@ -374,6 +374,7 @@ struct NativeSession {
     history_tool_results: HashMap<String, HashMap<String, Value>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ClosedToolSpan {
     span_id: String,
     root_span_id: String,
@@ -389,17 +390,19 @@ impl NativeSession {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct MessageHistory {
     entries: Vec<HistoryEntry>,
     pending_compaction: Option<CompactionBoundary>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct HistoryEntry {
     message_id: String,
     values: Vec<Value>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CompactionBoundary {
     tail_start_id: Option<String>,
 }
@@ -493,7 +496,7 @@ impl MessageHistory {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct PermissionRequest {
     id: Option<String>,
     session_id: Option<String>,
@@ -504,15 +507,18 @@ struct PermissionRequest {
     permission_type: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenCodeTranslator {
     daemon_session_id: String,
     sessions: HashMap<String, NativeSession>,
     permission_requests: HashMap<String, PermissionRequest>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
     last_ts_ms: i64,
 }
 
 impl AgentTranslator for OpenCodeTranslator {
+    translator_checkpoint!();
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut ops = match event.event.as_str() {

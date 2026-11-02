@@ -36,6 +36,7 @@ impl TranslatorFactory for DebugTranslatorFactory {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct DebugTranslator {
     root_span_id: String,
     root_emitted: bool,
@@ -43,6 +44,7 @@ struct DebugTranslator {
 }
 
 impl AgentTranslator for DebugTranslator {
+    translator_checkpoint!();
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         let mut ops = Vec::new();
 

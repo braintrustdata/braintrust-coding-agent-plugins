@@ -45,7 +45,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -135,6 +135,7 @@ pub struct Daemon {
     /// Recovery must not absorb queued live events into its historical head.
     startup_cutoffs: Mutex<Option<HashMap<PathBuf, u64>>>,
     startup_buffer: Mutex<Option<StartupBuffer>>,
+    capture_sequence: AtomicU64,
     started: Instant,
     last_activity: Mutex<Instant>,
     /// Prevents a shutdown drain from racing capture that has passed the
@@ -188,6 +189,7 @@ impl Daemon {
             ingress_dispatched: Mutex::new(HashMap::new()),
             startup_cutoffs: Mutex::new(startup_cutoffs),
             startup_buffer: Mutex::new(startup_buffer),
+            capture_sequence: AtomicU64::new(0),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
             capture_gate: tokio::sync::RwLock::new(()),
@@ -272,7 +274,6 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
         restore_active_parent_snapshots(&recovery_daemon.data_dir, &recovery_daemon.correlation)
             .await;
         restore_pending_sessions(&recovery_daemon).await;
-        collect_garbage(&recovery_daemon).await;
         let candidates = discover_unprocessed_journals(&recovery_daemon).await;
         *recovery_daemon.startup_cutoffs.lock() = None;
         for event in candidates {

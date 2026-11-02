@@ -1,5 +1,5 @@
 //! One ordered source consumer. Output publication is independent of route delivery.
-use super::journal::SpanJournal;
+use super::journal::{SpanJournal, TranslationCheckpoint};
 use super::prepare::Prepare;
 use super::roots::Roots;
 use super::{
@@ -21,6 +21,39 @@ use std::{
     },
 };
 use tokio::sync::{mpsc, oneshot, Notify};
+
+const CHECKPOINT_EVENTS: u64 = 64;
+const CHECKPOINT_BYTES: u64 = 1024 * 1024;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RecoveryContext {
+    format: u32,
+    translator: Box<serde_json::value::RawValue>,
+    pub decoder: Vec<serde_json::Value>,
+    capture: Option<OriginSnapshot>,
+    bounds: HashMap<String, u64>,
+    pub templates: HashMap<String, crate::wire::RedactedEnvelope>,
+}
+
+impl RecoveryContext {
+    pub fn decode(
+        checkpoint: &TranslationCheckpoint,
+        version: &str,
+        through: u64,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            checkpoint.version == version && checkpoint.input <= through,
+            "translation checkpoint is incompatible with the current head"
+        );
+        let decoder = zstd::stream::read::Decoder::new(checkpoint.state.as_slice())?;
+        let context: Self = serde_json::from_reader(std::io::BufReader::new(decoder))?;
+        anyhow::ensure!(
+            context.format == 1,
+            "unsupported translation context format"
+        );
+        Ok(context)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Observation {
@@ -113,8 +146,12 @@ impl Translation {
             capture: None,
             pending_snapshots: HashSet::new(),
             bounds: HashMap::new(),
+            templates: HashMap::new(),
             position: 0,
             committed,
+            checkpoint_position: 0,
+            checkpoint_events: 0,
+            checkpoint_safe: true,
             state,
             publication: None,
             phase: Boundary::Journal,
@@ -248,8 +285,12 @@ struct Producer {
     capture: Option<OriginSnapshot>,
     pending_snapshots: HashSet<String>,
     bounds: HashMap<String, u64>,
+    templates: HashMap<String, crate::wire::RedactedEnvelope>,
     position: u64,
     committed: u64,
+    checkpoint_position: u64,
+    checkpoint_events: u64,
+    checkpoint_safe: bool,
     state: State,
     publication: Option<Publication>,
     phase: Boundary,
@@ -396,6 +437,76 @@ impl Producer {
                 self.state = State::Recovering(self.failure(error, attempts));
             }
         }
+        if self.publication.is_none() && self.position == self.committed {
+            if let Err(error) = self.persist_current_context().await {
+                tracing::warn!(%error, "translation checkpoint could not be saved at shutdown");
+            }
+        }
+    }
+
+    async fn checkpoint_context(
+        &mut self,
+        input: u64,
+    ) -> anyhow::Result<Option<TranslationCheckpoint>> {
+        if !self.checkpoint_safe || self.translator.is_none() || self.reader.is_none() {
+            return Ok(None);
+        }
+        let translator = self
+            .translator
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
+        let reader = self
+            .reader
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("source reader is missing"))?;
+        let capture = self.capture.clone();
+        let bounds = self.bounds.clone();
+        let templates = self.templates.clone();
+        let version = self.options.version.clone();
+        // Context may include a long active conversation. Its encoding and
+        // compression must not monopolize a runtime thread serving hook IPC.
+        let (translator, reader, checkpoint) = tokio::task::spawn_blocking(move || {
+            let checkpoint = (|| -> anyhow::Result<Option<TranslationCheckpoint>> {
+                let Some(state) = translator.save_state()? else {
+                    return Ok(None);
+                };
+                let state = RecoveryContext {
+                    format: 1,
+                    translator: serde_json::value::RawValue::from_string(String::from_utf8(
+                        state,
+                    )?)?,
+                    decoder: reader.decoder_context().to_vec(),
+                    capture,
+                    bounds,
+                    templates,
+                };
+                let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1)?;
+                serde_json::to_writer(&mut encoder, &state)?;
+                let state = encoder.finish()?;
+                Ok(Some(TranslationCheckpoint {
+                    input,
+                    version,
+                    state,
+                }))
+            })();
+            (translator, reader, checkpoint)
+        })
+        .await?;
+        self.translator = Some(translator);
+        self.reader = Some(reader);
+        checkpoint
+    }
+
+    async fn persist_current_context(&mut self) -> anyhow::Result<()> {
+        if self.checkpoint_position == self.committed {
+            return Ok(());
+        }
+        if let Some(checkpoint) = self.checkpoint_context(self.committed).await? {
+            self.journal.save_translation_checkpoint(checkpoint).await?;
+            self.checkpoint_position = self.committed;
+            self.checkpoint_events = 0;
+        }
+        Ok(())
     }
     fn failure(&self, error: anyhow::Error, attempt: u32) -> Failure {
         let position = self.committed.saturating_add(1);
@@ -479,6 +590,54 @@ impl Producer {
                     &self.options.namespace,
                 )?,
         );
+        self.position = 0;
+        self.checkpoint_position = 0;
+        self.checkpoint_events = 0;
+        self.checkpoint_safe = true;
+        if let Some(checkpoint) = self.journal.translation_checkpoint().await? {
+            if checkpoint.version == self.options.version && checkpoint.input <= self.committed {
+                let restored = async {
+                    let registry = self.options.registry.clone();
+                    let source = self.options.source.clone();
+                    let namespace = self.options.namespace.clone();
+                    let version = self.options.version.clone();
+                    let committed = self.committed;
+                    let input = checkpoint.input;
+                    let (translator, context) =
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                            let context =
+                                RecoveryContext::decode(&checkpoint, &version, committed)?;
+                            let mut translator = registry
+                                .create_checked_with_session_namespace(&source, &namespace)?;
+                            translator.restore_state(context.translator.get().as_bytes())?;
+                            Ok((translator, context))
+                        })
+                        .await??;
+                    let reader = JournalReader::resume(
+                        &self.options.event_path,
+                        input,
+                        self.committed,
+                        context.decoder,
+                    )
+                    .await?;
+                    self.translator = Some(translator);
+                    self.reader = Some(reader);
+                    self.capture = context.capture;
+                    self.bounds = context.bounds;
+                    self.templates = context.templates;
+                    self.position = input;
+                    self.checkpoint_position = input;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                match restored {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid translation checkpoint; rebuilding from journal")
+                    }
+                }
+            }
+        }
         self.reader = JournalReader::open(&self.options.event_path, self.committed).await?;
         Ok(())
     }
@@ -521,6 +680,33 @@ impl Producer {
                     let mut env = crate::journal::envelope_from_redacted(event);
                     if let Some(route) = &env.route {
                         self.journal.register(route).await?;
+                        // Discovery needs subscriptions and transcript references,
+                        // not copies of native prompts, responses, or credentials.
+                        let mut template = env.redacted();
+                        template.payload = env
+                            .payload
+                            .as_object()
+                            .map(|payload| {
+                                serde_json::Value::Object(
+                                    payload
+                                        .iter()
+                                        .filter(|(key, _)| {
+                                            matches!(
+                                                key.as_str(),
+                                                "transcript_path"
+                                                    | "agent_transcript_path"
+                                                    | "cwd"
+                                                    | "_bt_transcript_mirror"
+                                                    | "_bt_claude_transcript_mirrors"
+                                            )
+                                        })
+                                        .map(|(key, value)| (key.clone(), value.clone()))
+                                        .collect(),
+                                )
+                            })
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        self.templates
+                            .insert(serde_json::to_string(route)?, template);
                     }
                     if crate::translate::canonical_source_name(&env.source) != self.options.source {
                         self.position = input;
@@ -565,6 +751,12 @@ impl Producer {
                     if input <= self.committed && matches!(control.kind, ControlKind::Retire) {
                         self.position = input;
                         continue;
+                    }
+                    if matches!(control.kind, ControlKind::Retire) {
+                        // Retirement emits defensive ends without making them
+                        // part of the logical state restored on a later resume.
+                        self.persist_current_context().await?;
+                        self.checkpoint_safe = false;
                     }
                     self.phase = Boundary::Translation;
                     let translator = self
@@ -698,9 +890,23 @@ impl Producer {
             }
             if publish {
                 self.phase = Boundary::Journal;
+                let checkpoint = if self.checkpoint_events + 1 >= CHECKPOINT_EVENTS
+                    || pending.input.saturating_sub(self.checkpoint_position) >= CHECKPOINT_BYTES
+                {
+                    self.checkpoint_context(pending.input).await?
+                } else {
+                    None
+                };
+                let checkpointed = checkpoint.is_some();
                 self.journal
-                    .commit_with_roots(pending.input, self.roots.pending())
+                    .commit_with_context(pending.input, self.roots.pending(), checkpoint)
                     .await?;
+                if checkpointed {
+                    self.checkpoint_position = pending.input;
+                    self.checkpoint_events = 0;
+                } else {
+                    self.checkpoint_events += 1;
+                }
                 self.committed = pending.input;
                 self.progress
                     .committed
@@ -773,6 +979,257 @@ impl Producer {
 mod tests {
     use super::*;
     use crate::{pipeline::delivery::InputPort, translate::SpanRow};
+
+    fn resume_options(
+        data_dir: &std::path::Path,
+        source: &str,
+        events: Arc<tokio::sync::Mutex<JournalWriter>>,
+    ) -> TranslationOptions {
+        TranslationOptions {
+            source: source.into(),
+            session_id: "checkpoint".into(),
+            namespace: crate::ids::session_namespace(source, "checkpoint"),
+            version: "test".into(),
+            data_dir: data_dir.into(),
+            events,
+            event_path: crate::journal::source_journal_path(data_dir, source, "checkpoint"),
+            registry: Arc::new(Registry::default_agents()),
+            correlation: Arc::default(),
+            correlation_changed: Arc::default(),
+        }
+    }
+
+    struct BlockedCheckpoint {
+        entered: Arc<Notify>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl AgentTranslator for BlockedCheckpoint {
+        fn handle(
+            &mut self,
+            _: &crate::wire::Envelope,
+            _: &SessionCtx,
+        ) -> anyhow::Result<Vec<SpanOp>> {
+            Ok(Vec::new())
+        }
+        fn save_state(&self) -> anyhow::Result<Option<Vec<u8>>> {
+            self.entered.notify_one();
+            self.release
+                .recv_timeout(std::time::Duration::from_secs(10))?;
+            Ok(Some(b"{}".to_vec()))
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_checkpoint_encoding_does_not_block_journal_capture_on_the_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "checkpoint");
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            JournalWriter::open_path(&path).await.unwrap(),
+        ));
+        let entered = Arc::new(Notify::new());
+        let (release, resume) = std::sync::mpsc::channel();
+        let mut producer = Producer {
+            options: resume_options(tmp.path(), "debug", writer.clone()),
+            journal: SpanJournal::open(&tmp.path().join("checkpoint.sqlite"))
+                .await
+                .unwrap(),
+            progress: Arc::default(),
+            error: Arc::default(),
+            recovery: Arc::default(),
+            translator: Some(Box::new(BlockedCheckpoint {
+                entered: entered.clone(),
+                release: resume,
+            })),
+            reader: JournalReader::open(&path, 0).await.unwrap(),
+            observers: Vec::new(),
+            origins: WeakOrigins::default(),
+            roots: Roots::default(),
+            capture: None,
+            pending_snapshots: HashSet::new(),
+            bounds: HashMap::new(),
+            templates: HashMap::new(),
+            position: 0,
+            committed: 0,
+            checkpoint_position: 0,
+            checkpoint_events: 0,
+            checkpoint_safe: true,
+            state: State::Processing,
+            publication: None,
+            phase: Boundary::Journal,
+        };
+        let checkpoint = tokio::spawn(async move { producer.checkpoint_context(0).await });
+        entered.notified().await;
+        let env = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"during-checkpoint","ts_ms":1,"payload":{}})).unwrap();
+        let through = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            writer.lock().await.append(&env).await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(through > 0);
+        release.send(()).unwrap();
+        assert!(checkpoint.await.unwrap().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_seeks_past_completed_history_and_restores_pi_delta_context() {
+        for source in ["debug", "pi"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = crate::journal::source_journal_path(tmp.path(), source, "checkpoint");
+            let writer = Arc::new(tokio::sync::Mutex::new(
+                JournalWriter::open_path(&path).await.unwrap(),
+            ));
+            let translation =
+                Translation::spawn(resume_options(tmp.path(), source, writer.clone()))
+                    .await
+                    .unwrap();
+            let mut env = crate::wire::Envelope {
+                source: source.into(),
+                session_id: "checkpoint".into(),
+                event: "context".into(),
+                ts_ms: 0,
+                payload: serde_json::json!({}),
+                route: Some(SessionRoute::default()),
+                config: None,
+                managed_run_id: None,
+                capture: None,
+                source_version: None,
+                plugin_version: None,
+            };
+            let mut boundary = 0;
+            for i in 0..CHECKPOINT_EVENTS + 3 {
+                env.ts_ms = i as i64;
+                env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
+                boundary = writer.lock().await.append(&env).await.unwrap();
+            }
+            translation.advance(boundary).await.unwrap();
+            translation.barrier().await.unwrap();
+            let checkpoint = translation
+                .journal
+                .translation_checkpoint()
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                checkpoint.input < boundary,
+                "test must replay a suffix after a periodic checkpoint"
+            );
+            let task = translation.task.lock().await.take().unwrap();
+            task.abort();
+            let _ = task.await; // crash, without the idle checkpoint
+                                // Keep boundaries intact but make all pre-checkpoint JSON invalid.
+                                // Recovery must seek over this prefix rather than decode/retranslate it.
+            let mut contents = tokio::fs::read(&path).await.unwrap();
+            for byte in &mut contents[..checkpoint.input as usize] {
+                if *byte != b'\n' {
+                    *byte = b'x';
+                }
+            }
+            tokio::fs::write(&path, contents).await.unwrap();
+            env.ts_ms += 1;
+            env.payload["event"]["messages"][1]["content"] = serde_json::json!("after restart");
+            let tail = writer.lock().await.append(&env).await.unwrap();
+            let resumed = Translation::spawn(resume_options(tmp.path(), source, writer.clone()))
+                .await
+                .unwrap();
+            resumed.advance(tail).await.unwrap();
+            resumed.barrier().await.unwrap();
+            assert!(
+                resumed.error.lock().is_none(),
+                "{source}: {:?}",
+                resumed.error.lock()
+            );
+            assert_eq!(resumed.journal.translated_through().await.unwrap(), tail);
+            resumed.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_or_old_context_rebuilds_safely_from_the_source_journal() {
+        for alteration in [
+            "UPDATE translation_checkpoint SET state=x'00'",
+            "UPDATE translation_checkpoint SET version='old'",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = crate::journal::source_journal_path(tmp.path(), "debug", "checkpoint");
+            let writer = Arc::new(tokio::sync::Mutex::new(
+                JournalWriter::open_path(&path).await.unwrap(),
+            ));
+            let env: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
+                "source":"debug", "session_id":"checkpoint", "event":"event", "ts_ms":1,"payload":{},
+            })).unwrap();
+            let translation =
+                Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
+                    .await
+                    .unwrap();
+            let mut tail = 0;
+            for _ in 0..CHECKPOINT_EVENTS {
+                tail = writer.lock().await.append(&env).await.unwrap();
+            }
+            translation.advance(tail).await.unwrap();
+            translation.barrier().await.unwrap();
+            translation.shutdown().await;
+            let storage = tmp.path().join("pipeline").join(format!(
+                "{}.sqlite",
+                crate::ids::session_storage_id("debug", "checkpoint")
+            ));
+            let db = rusqlite::Connection::open(storage).unwrap();
+            db.execute_batch(alteration).unwrap();
+            tail = writer.lock().await.append(&env).await.unwrap();
+            let resumed = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
+                .await
+                .unwrap();
+            resumed.advance(tail).await.unwrap();
+            resumed.barrier().await.unwrap();
+            assert!(resumed.error.lock().is_none());
+            assert_eq!(resumed.journal.translated_through().await.unwrap(), tail);
+            let batches: u64 = db
+                .query_row(
+                    "SELECT count(*) FROM batches WHERE committed=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(batches, CHECKPOINT_EVENTS + 1);
+            resumed.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn translation_checkpoint_commit_failure_does_not_move_the_source_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("atomic.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        journal.begin(10, true).await.unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_context BEFORE INSERT ON translation_checkpoint BEGIN SELECT RAISE(FAIL,'checkpoint write failed'); END;").unwrap();
+        let context = TranslationCheckpoint {
+            input: 10,
+            version: "test".into(),
+            state: vec![1, 2],
+        };
+        assert!(journal
+            .commit_with_context(10, &Default::default(), Some(context.clone()))
+            .await
+            .is_err());
+        assert_eq!(journal.translated_through().await.unwrap(), 0);
+        assert!(journal.translation_checkpoint().await.unwrap().is_none());
+        db.execute_batch("DROP TRIGGER fail_context;").unwrap();
+        journal
+            .commit_with_context(10, &Default::default(), Some(context))
+            .await
+            .unwrap();
+        assert_eq!(journal.translated_through().await.unwrap(), 10);
+        assert_eq!(
+            journal
+                .translation_checkpoint()
+                .await
+                .unwrap()
+                .unwrap()
+                .input,
+            10
+        );
+    }
 
     #[tokio::test]
     async fn shared_storage_stays_open_until_the_last_route_finishes_draining() {
@@ -984,8 +1441,12 @@ mod tests {
             capture: None,
             pending_snapshots: HashSet::new(),
             bounds: HashMap::new(),
+            templates: HashMap::new(),
             position: 0,
             committed: 0,
+            checkpoint_position: 0,
+            checkpoint_events: 0,
+            checkpoint_safe: true,
             state: State::Processing,
             phase: Boundary::Journal,
             publication: Some(Publication {

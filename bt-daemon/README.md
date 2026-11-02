@@ -58,6 +58,13 @@ or `bt trace doctor <agent>` for configuration, authentication, and recent
 session diagnostics. Hook exit codes can be observed by the caller while the
 coding agent decides whether to continue its turn.
 
+Hooks continue recording events while the daemon recovers earlier work. Each
+source session has one translation position and a periodic context checkpoint
+in its existing SQLite store; each destination has its own SpanOp delivery
+position. Recovery restores open turns, tools, and transcript cursors from the
+checkpoint and replays only the remaining suffix. An unavailable or incompatible
+checkpoint falls back to rebuilding from the event journal.
+
 ## Per-agent plugin settings
 
 Each coding agent reads an independent non-credential `braintrust.json` file:

@@ -14,7 +14,7 @@ use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub fn journal_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("journal")
@@ -253,10 +253,29 @@ impl JournalWriter {
     /// bounded instead by writing each transcript byte once (see
     /// [`crate::transcript_mirror`]) and by age-based GC, and replay reads it
     /// as a stream so a large journal never becomes a large allocation.
+    #[cfg(test)]
     pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<u64> {
+        self.append_ordered(env, None).await
+    }
+
+    pub(crate) async fn append_ordered(
+        &mut self,
+        env: &Envelope,
+        sequence: Option<u64>,
+    ) -> anyhow::Result<u64> {
+        #[derive(Serialize)]
+        struct Captured<'a> {
+            #[serde(flatten)]
+            envelope: &'a RedactedEnvelope,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            _bt_capture_sequence: Option<u64>,
+        }
         let mut redacted = env.redacted();
         compact_pi_payload(&mut redacted, &mut self.pi_context);
-        let mut line = serde_json::to_vec(&redacted)?;
+        let mut line = serde_json::to_vec(&Captured {
+            envelope: &redacted,
+            _bt_capture_sequence: sequence,
+        })?;
         line.push(b'\n');
         self.file.write_all(&line).await?;
         self.file.flush().await?;
@@ -318,6 +337,8 @@ pub struct JournalRecordEntry {
     pub record: JournalRecord,
     /// Exclusive byte offset after this record in the journal.
     pub through: u64,
+    /// Daemon-local capture order. Kept outside the native event payload.
+    pub(crate) capture_sequence: Option<u64>,
 }
 
 /// Streaming reader over one session's journal.
@@ -333,6 +354,38 @@ pub struct JournalReader {
 }
 
 impl JournalReader {
+    pub(crate) fn decoder_context(&self) -> &[serde_json::Value] {
+        &self.pi_context
+    }
+
+    /// Resume at a committed record boundary with the Pi delta decoder's base.
+    pub(crate) async fn resume(
+        path: &Path,
+        position: u64,
+        through: u64,
+        pi_context: Vec<serde_json::Value>,
+    ) -> anyhow::Result<Self> {
+        let mut file = tokio::fs::File::open(path).await?;
+        anyhow::ensure!(
+            position <= through && through <= file.metadata().await?.len(),
+            "checkpoint is beyond the source journal"
+        );
+        if position > 0 {
+            file.seek(std::io::SeekFrom::Start(position - 1)).await?;
+            anyhow::ensure!(
+                file.read_u8().await? == b'\n',
+                "checkpoint is not at a journal record boundary"
+            );
+        }
+        file.seek(std::io::SeekFrom::Start(position)).await?;
+        Ok(Self {
+            reader: tokio::io::BufReader::new(file.take(through - position)),
+            path: path.to_owned(),
+            line_no: 0,
+            position,
+            pi_context,
+        })
+    }
     /// Open a journal for streaming, reading at most `through` bytes.
     ///
     /// That bound is what keeps replay from consuming the very event that
@@ -396,6 +449,9 @@ impl JournalReader {
             let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
                 anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
             })?;
+            let capture_sequence = value
+                .get("_bt_capture_sequence")
+                .and_then(serde_json::Value::as_u64);
             let record = if value
                 .get("_bt_record_type")
                 .and_then(serde_json::Value::as_str)
@@ -427,6 +483,7 @@ impl JournalReader {
             return Ok(Some(JournalRecordEntry {
                 record,
                 through: self.position,
+                capture_sequence,
             }));
         }
     }

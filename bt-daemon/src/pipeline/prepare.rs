@@ -5,6 +5,7 @@ use crate::{
 };
 use std::collections::HashSet;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Prepare {
     source: String,
     roots: HashSet<String>,
@@ -129,6 +130,18 @@ impl ConfiguredTranslator {
 }
 
 impl crate::translate::AgentTranslator for ConfiguredTranslator {
+    fn save_state(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(state) = self.inner.save_state()? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::to_vec(&(state, &self.prepare))?))
+    }
+    fn restore_state(&mut self, state: &[u8]) -> anyhow::Result<()> {
+        let (inner, prepare): (Vec<u8>, Prepare) = serde_json::from_slice(state)?;
+        self.inner.restore_state(&inner)?;
+        self.prepare = prepare;
+        Ok(())
+    }
     fn handle(
         &mut self,
         env: &crate::wire::Envelope,

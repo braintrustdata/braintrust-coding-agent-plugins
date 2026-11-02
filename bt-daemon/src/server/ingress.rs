@@ -4,113 +4,43 @@
 
 use super::*;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader as StdBufReader, Seek, SeekFrom, Write};
-
-/// Evicted captures are indexed on disk in capture order. The index is
-/// temporary: the source journals remain the durable recovery record.
+/// Live startup captures remain ordered and bounded. Evicted entries are
+/// already durable; their source journal's high-water mark is replayed first.
 pub(super) struct StartupBuffer {
     pub(super) events: VecDeque<PendingEvent>,
-    evicted: Option<StartupIndex>,
+    pub(super) evicted: HashMap<PathBuf, EvictedRange>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct EvictedRange {
     pub(super) from: u64,
     pub(super) through: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct IndexedRange {
-    filename: String,
-    range: EvictedRange,
-}
-
-struct StartupIndex {
-    file: tempfile::NamedTempFile,
-    reader: Option<std::fs::File>,
-    written: u64,
-    read: u64,
-}
-
-impl StartupIndex {
-    fn new() -> anyhow::Result<Self> {
-        let file = tempfile::NamedTempFile::new()?;
-        let reader = Some(file.reopen()?);
-        Ok(Self {
-            file,
-            reader,
-            written: 0,
-            read: 0,
-        })
-    }
-
-    fn push(&mut self, range: &IndexedRange) -> anyhow::Result<()> {
-        let mut line = serde_json::to_vec(range)?;
-        line.push(b'\n');
-        self.file.write_all(&line)?;
-        self.written += 1;
-        Ok(())
-    }
-
-    fn reserve_read(&mut self) -> anyhow::Result<Option<std::fs::File>> {
-        if self.read == self.written {
-            return Ok(None);
-        }
-        let reader = self
-            .reader
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("startup index reader missing"))?;
-        self.read += 1;
-        Ok(Some(reader))
-    }
-}
-
-fn read_startup_index(file: std::fs::File) -> anyhow::Result<(std::fs::File, IndexedRange)> {
-    let mut reader = StdBufReader::new(file);
-    let mut line = Vec::new();
-    reader.read_until(b'\n', &mut line)?;
-    anyhow::ensure!(line.last() == Some(&b'\n'), "truncated startup index");
-    let position = reader.stream_position()?;
-    let mut file = reader.into_inner();
-    file.seek(SeekFrom::Start(position))?;
-    Ok((file, serde_json::from_slice(&line)?))
 }
 
 impl StartupBuffer {
     pub(super) fn new() -> Self {
         Self {
             events: VecDeque::new(),
-            evicted: None,
+            evicted: HashMap::new(),
         }
     }
 
     fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) -> anyhow::Result<()> {
         if self.events.len() == INGRESS_QUEUE_CAPACITY {
-            let oldest = self
-                .events
-                .front()
-                .ok_or_else(|| anyhow::anyhow!("startup buffer is empty"))?;
-            let path =
-                journal::source_journal_path(data_dir, &oldest.env.source, &oldest.env.session_id);
-            let range = IndexedRange {
-                filename: path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| anyhow::anyhow!("invalid startup journal name"))?
-                    .to_owned(),
-                range: EvictedRange {
-                    from: oldest.replay_through,
-                    through: oldest.journal_through,
-                },
-            };
-            if self.evicted.is_none() {
-                self.evicted = Some(StartupIndex::new()?);
+            if let Some(oldest) = self.events.pop_front() {
+                let path = journal::source_journal_path(
+                    data_dir,
+                    &oldest.env.source,
+                    &oldest.env.session_id,
+                );
+                self.evicted
+                    .entry(path)
+                    .and_modify(|range| range.through = range.through.max(oldest.journal_through))
+                    .or_insert(EvictedRange {
+                        from: oldest.replay_through,
+                        through: oldest.journal_through,
+                    });
             }
-            self.evicted
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("startup index missing"))?
-                .push(&range)?;
-            self.events.pop_front();
         }
         self.events.push_back(event);
         Ok(())
@@ -125,40 +55,18 @@ pub(super) enum StartupWork {
 
 impl Daemon {
     pub(super) async fn next_startup_work(&self) -> anyhow::Result<StartupWork> {
-        let reader = {
-            let mut state = self.startup_buffer.lock();
-            let Some(buffer) = state.as_mut() else {
-                return Ok(StartupWork::Finished);
-            };
-            if let Some(reader) = buffer
-                .evicted
-                .as_mut()
-                .map(StartupIndex::reserve_read)
-                .transpose()?
-                .flatten()
-            {
-                reader
-            } else if let Some(event) = buffer.events.pop_front() {
-                return Ok(StartupWork::Event(Box::new(event)));
-            } else {
-                *state = None;
-                return Ok(StartupWork::Finished);
-            }
-        };
-        // Recovery reads outside the capture lock; a slow disk read cannot
-        // prevent hooks from enqueueing their already-journaled events.
-        let (reader, entry) =
-            tokio::task::spawn_blocking(move || read_startup_index(reader)).await??;
         let mut state = self.startup_buffer.lock();
-        let index = state
-            .as_mut()
-            .and_then(|buffer| buffer.evicted.as_mut())
-            .ok_or_else(|| anyhow::anyhow!("startup index disappeared"))?;
-        index.reader = Some(reader);
-        Ok(StartupWork::Evicted(HashMap::from([(
-            journal::journal_dir(&self.data_dir).join(entry.filename),
-            entry.range,
-        )])))
+        let Some(buffer) = state.as_mut() else {
+            return Ok(StartupWork::Finished);
+        };
+        if !buffer.evicted.is_empty() {
+            return Ok(StartupWork::Evicted(std::mem::take(&mut buffer.evicted)));
+        }
+        if let Some(event) = buffer.events.pop_front() {
+            return Ok(StartupWork::Event(Box::new(event)));
+        }
+        *state = None;
+        Ok(StartupWork::Finished)
     }
 }
 
@@ -194,16 +102,16 @@ pub(super) async fn replay_evicted_startup(
             "evicted startup journal is truncated"
         );
         if !cursors.contains_key(path) {
-            let reader = journal::JournalReader::open(path, range.from)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("evicted startup journal disappeared"))?;
-            cursors.insert(
-                path.clone(),
-                StartupCursor {
-                    reader,
-                    position: 0,
-                },
-            );
+            let (reader, position) = match resume_discovery(daemon, path, range.from).await {
+                Ok(Some((reader, position, _))) => (reader, position),
+                _ => (
+                    journal::JournalReader::open(path, range.from)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("evicted startup journal disappeared"))?,
+                    0,
+                ),
+            };
+            cursors.insert(path.clone(), StartupCursor { reader, position });
         }
         let cursor = cursors
             .get_mut(path)
@@ -225,38 +133,75 @@ pub(super) async fn replay_evicted_startup(
             "invalid evicted startup boundary"
         );
         cursor.reader.extend(range.through);
-        while cursor.position < range.through {
-            let before = cursor.position;
-            let entry = cursor
-                .reader
-                .next_record()
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("evicted startup range ends inside a record"))?;
-            cursor.position = entry.through;
-            if let journal::JournalRecord::Event(redacted) = entry.record {
-                let mut env = journal::envelope_from_redacted(redacted);
-                let Some(source) = daemon.translators.canonical_source(&env.source) else {
-                    continue;
-                };
-                env.source = source.to_owned();
-                dispatch_ingress_event(
-                    daemon,
-                    PendingEvent {
-                        env,
-                        replay_through: before,
-                        journal_through: entry.through,
-                        settings_through: None,
-                    },
-                )
-                .await;
-            }
+    }
+    // Keep one lookahead per source. The sequence is persisted in the same
+    // NDJSON append as its event, so capture needs no secondary write queue.
+    let mut ready = Vec::new();
+    for (path, range) in bounds {
+        let cursor = cursors
+            .get_mut(path)
+            .ok_or_else(|| anyhow::anyhow!("startup cursor missing"))?;
+        if let Some((sequence, event)) = next_evicted_event(daemon, cursor, range.through).await? {
+            ready.push((sequence, path.clone(), event));
         }
-        anyhow::ensure!(
-            cursor.position == range.through,
-            "invalid evicted startup end"
-        );
+    }
+    while !ready.is_empty() {
+        let index = ready
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (sequence, _, _))| *sequence)
+            .map(|(index, _)| index)
+            .ok_or_else(|| anyhow::anyhow!("startup lookahead missing"))?;
+        let (_, path, event) = ready.swap_remove(index);
+        dispatch_ingress_event(daemon, event).await;
+        let cursor = cursors
+            .get_mut(&path)
+            .ok_or_else(|| anyhow::anyhow!("startup cursor missing"))?;
+        if let Some((sequence, event)) =
+            next_evicted_event(daemon, cursor, bounds[&path].through).await?
+        {
+            ready.push((sequence, path, event));
+        }
     }
     Ok(())
+}
+
+async fn next_evicted_event(
+    daemon: &Daemon,
+    cursor: &mut StartupCursor,
+    through: u64,
+) -> anyhow::Result<Option<(u64, PendingEvent)>> {
+    while cursor.position < through {
+        let before = cursor.position;
+        let entry = cursor
+            .reader
+            .next_record()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("evicted startup range ends inside a record"))?;
+        anyhow::ensure!(entry.through <= through, "invalid evicted startup end");
+        cursor.position = entry.through;
+        if let journal::JournalRecord::Event(redacted) = entry.record {
+            let mut env = journal::envelope_from_redacted(redacted);
+            let Some(source) = daemon.translators.canonical_source(&env.source) else {
+                continue;
+            };
+            env.source = source.to_owned();
+            let sequence = entry
+                .capture_sequence
+                .ok_or_else(|| anyhow::anyhow!("live startup event has no capture sequence"))?;
+            return Ok(Some((
+                sequence,
+                PendingEvent {
+                    env,
+                    replay_through: before,
+                    journal_through: entry.through,
+                    settings_through: None,
+                },
+            )));
+        }
+    }
+    anyhow::ensure!(cursor.position == through, "invalid evicted startup end");
+    Ok(None)
 }
 
 pub(super) enum IngressMsg {
@@ -386,6 +331,13 @@ pub(super) async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
         else {
             continue;
         };
+        let mut start = 0;
+        if let Ok(Some((reader, position, _))) = resume_discovery(daemon, &path, recorded_len).await
+        {
+            checkpoints = reader;
+            start = position;
+        }
+        let decoder = checkpoints.decoder_context().to_vec();
         let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
         while let Ok(Some(entry)) = checkpoints.next_record().await {
             if let journal::JournalRecord::DeliveryCheckpoint { route, through } = entry.record {
@@ -395,10 +347,20 @@ pub(super) async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
             }
         }
 
-        let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded_len).await else {
-            continue;
+        let mut reader = if start > 0 {
+            let Ok(reader) =
+                journal::JournalReader::resume(&path, start, recorded_len, decoder).await
+            else {
+                continue;
+            };
+            reader
+        } else {
+            let Ok(Some(reader)) = journal::JournalReader::open(&path, recorded_len).await else {
+                continue;
+            };
+            reader
         };
-        let mut before = 0u64;
+        let mut before = start;
         while let Ok(Some(entry)) = reader.next_record().await {
             let through = entry.through;
             let journal::JournalRecord::Event(redacted) = entry.record else {

@@ -282,7 +282,10 @@ impl Daemon {
             let path = journal::source_journal_path(&self.data_dir, &env.source, &env.session_id);
             cutoffs.entry(path).or_insert(before);
         }
-        let through = writer.append(env).await?;
+        // Related hooks cannot begin until their predecessor's durable append
+        // is acknowledged. Concurrent sessions need no stronger total order.
+        let sequence = self.capture_sequence.fetch_add(1, Ordering::Relaxed);
+        let through = writer.append_ordered(env, Some(sequence)).await?;
         Ok((before, through))
     }
 
