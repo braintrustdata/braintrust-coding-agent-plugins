@@ -51,6 +51,10 @@ pub fn daemon_command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bt-daemon"))
 }
 
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::new(program)
+}
+
 impl AgentTestWorld {
     pub async fn start() -> Self {
         let inference_mode = TestBackendMode::from_env(INFERENCE_MODE_ENV);

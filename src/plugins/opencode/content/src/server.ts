@@ -81,6 +81,7 @@ export default {
     const abort = new AbortController();
     const roots = new Map<string, string>();
     const started = new Set<string>();
+    let pending = Promise.resolve();
     const task = (async () => {
       for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
         if (!forwarded.has(event.type)) continue;
@@ -100,17 +101,22 @@ export default {
           payload: event,
           route: config.route,
         };
-        if (!started.has(root)) {
+        const first = !started.has(root);
+        if (first) {
           started.add(root);
-          if (event.type !== "session.created")
-            await daemon.log({ ...envelope, event: "session_start" });
         }
-        await daemon.log(envelope);
+        pending = pending.then(async () => {
+          if (first && event.type !== "session.created") {
+            await daemon.log({ ...envelope, event: "session_start" });
+          }
+          await daemon.log(envelope);
+        });
       }
     })().catch(() => {});
     return async () => {
       abort.abort();
       await task;
+      await pending;
       await daemon.close();
     };
   },

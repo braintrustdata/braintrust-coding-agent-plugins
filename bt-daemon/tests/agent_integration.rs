@@ -523,7 +523,21 @@ fn request_helpers_recognize_tool_results_and_advertised_tools() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires OpenCode 2 and a built OpenCode package"]
 async fn opencode_v2_session_emits_traces() {
-    let inference = OpenAiMock::new(|_, _| MockReply::response(OpenAiTurn::text("OPENCODE_V2_OK")));
+    let inference = OpenAiMock::new(|_, request| {
+        let tools = request.body["tools"].as_array();
+        let has_tool_result = request.body["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
+        if tools.is_some() && !has_tool_result {
+            MockReply::response(OpenAiTurn::tool_call(
+                "call_v2",
+                "shell",
+                json!({"command":tool_command("OPENCODE_V2_TOOL_OK"),"description":"Print a marker"}),
+            ))
+        } else {
+            MockReply::response(OpenAiTurn::text("OPENCODE_V2_OK"))
+        }
+    });
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
     let workspace = world.workspace();
@@ -546,17 +560,18 @@ async fn opencode_v2_session_emits_traces() {
             "agent-e2e",
             "opencode",
             "run",
+            "--auto",
             "--model",
             "mock/mock-model",
             "say hello",
         ])
         .current_dir(&workspace)
+        .env("PWD", &workspace)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CACHE_HOME", home.join("cache"))
-        .env("OPENCODE_CONFIG_CONTENT", config.to_string())
         .env(
             "OPENCODE_BIN",
             std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
@@ -576,8 +591,68 @@ async fn opencode_v2_session_emits_traces() {
         .expect("v2 input", |row| {
             row_contains(row, &["Turn 1", "say hello"])
         })
+        .expect("v2 tool", |row| {
+            row_contains(row, &[r#""type":"tool""#, "OPENCODE_V2_TOOL_OK"])
+        })
         .expect("v2 LLM", |row| {
             row_contains(row, &[r#""type":"llm""#, "OPENCODE_V2_OK"])
         });
     world.wait_for_mock_ingest_scenario(&scenario).await;
+
+    // Exercise the persistent plugin configuration separately from managed runs.
+    let mut persistent_config = config.clone();
+    persistent_config["plugin"] = json!([std::env::var("OPENCODE_V2_PLUGIN_DIR").unwrap()]);
+    std::fs::write(
+        workspace.join("opencode.json"),
+        serde_json::to_vec(&persistent_config).unwrap(),
+    )
+    .unwrap();
+    let config_dir = home.join("config/opencode");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("braintrust.json"),
+        serde_json::to_vec(&json!({
+            "trace_to_braintrust": true,
+            "route": {"destination":{"type":"project_logs","project_name":"agent-e2e"}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut persistent =
+        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    persistent
+        .args([
+            "--standalone",
+            "run",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "persistent marker",
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"));
+    world.configure(&mut persistent);
+    let output = world.output(&mut persistent).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        inference
+            .requests()
+            .iter()
+            .any(|request| request.contains_text("braintrust_list_projects")),
+        "Braintrust tools were not exposed to OpenCode 2"
+    );
+    world
+        .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("persistent v2 turn", |row| {
+            row_contains(row, &["Turn 1", "persistent marker"])
+        }))
+        .await;
 }

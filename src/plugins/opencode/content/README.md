@@ -34,8 +34,8 @@ Historical import and live attach are not supported for OpenCode.
 ## Compatibility
 
 The plugin supports OpenCode 1.x and has experimental support for OpenCode 2
-through its `@opencode/cli` distribution. OpenCode 2 text sessions are tested
-with the installed package. Coverage for tool calls, subagents, attachments,
+through its `@opencode/cli` distribution. OpenCode 2 text and shell-tool sessions
+are tested with the installed package. Coverage for subagents, attachments,
 permissions, compaction and interrupted sessions is still being verified.
 Managed runs start a private OpenCode 2 server to keep routing scoped to the run.
 
