@@ -117,47 +117,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn event(source: &str, index: usize, bytes: usize) -> Envelope {
-        serde_json::from_value(json!({
-            "source":source, "session_id":"direct", "event":"native", "ts_ms":index,
-            "payload":{"history":"x".repeat(bytes),"index":index}
-        }))
-        .unwrap()
-    }
-
-    fn position(before: u64, event: &Envelope) -> SourcePosition {
-        let bytes = serde_json::to_vec(event).unwrap().len() as u64;
-        SourcePosition {
-            before,
-            through: before + bytes,
-            decoded_bytes: bytes,
-            decoder_base: None,
-        }
-    }
-
     #[test]
-    fn oversized_events_flow_directly_but_eviction_keeps_the_input_bounded() {
+    fn oversized_events_flow_alone_and_eviction_exposes_a_recovery_gap() {
         let input = SourceInput::default();
-        let oversized = event("debug", 0, 9 * 1024 * 1024);
-        let first = position(0, &oversized);
-        let boundary = first.through;
-        input.push_event(oversized.clone(), first);
-        assert!(input.take(0, boundary - 1).is_none());
-        let SourceEvent::Event(actual) = input.take(0, boundary).unwrap().event else {
+        let event: Envelope = serde_json::from_value(json!({"source":"debug","session_id":"direct","event":"native","ts_ms":1,"payload":{"history":"x".repeat(9 * 1024 * 1024)}})).unwrap();
+        let position = |before, through| SourcePosition {
+            before,
+            through,
+            decoded_bytes: 9 * 1024 * 1024,
+            decoder_base: None,
+        };
+        input.push_event(event.clone(), position(0, 1));
+        assert!(input.take(0, 0).is_none());
+        let SourceEvent::Event(actual) = input.take(0, 1).unwrap().event else {
             panic!("expected original event");
         };
-        assert_eq!(actual.payload, oversized.payload);
-        input.push_event(oversized.clone(), position(boundary, &oversized));
-        let gap_end = position(boundary, &oversized).through;
-        let next = event("debug", 1, 3 * 1024 * 1024);
-        let next_position = position(gap_end, &next);
-        let through = next_position.through;
-        input.push_event(next, next_position);
+        assert_eq!(actual.payload, event.payload);
+        input.push_event(event.clone(), position(1, 2));
+        input.push_event(event, position(2, 3));
         assert!(
-            input.take(boundary, through).is_none(),
-            "evicted input requires recovery of the gap"
+            input.take(1, 3).is_none(),
+            "eviction requires recovery of the gap"
         );
-        assert!(input.take(gap_end, through).is_some());
+        assert!(input.take(2, 3).is_some());
         assert!(input.is_empty());
     }
 }

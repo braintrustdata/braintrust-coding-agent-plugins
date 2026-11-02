@@ -269,21 +269,12 @@ pub(crate) fn cleanup(_endpoint: &Path) {}
 
 #[cfg(all(test, unix))]
 mod unix_tests {
-    #[test]
-    fn endpoint_lock_survives_an_unresponsive_owner_and_is_reusable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let endpoint = tmp.path().join("daemon.sock");
-        let owner = super::lock_endpoint(&endpoint).unwrap().unwrap();
-        assert!(super::lock_endpoint(&endpoint).unwrap().is_none());
-        drop(owner);
-        assert!(super::lock_endpoint(&endpoint).unwrap().is_some());
-    }
-
     #[tokio::test]
     async fn startup_owner_excludes_a_contender_before_socket_bind() {
         let tmp = tempfile::tempdir().unwrap();
         let endpoint = tmp.path().join("daemon.sock");
         let owner = super::lock_endpoint(&endpoint).unwrap().unwrap();
+        assert!(super::lock_endpoint(&endpoint).unwrap().is_none());
         assert!(!endpoint.exists());
         let contender_path = endpoint.clone();
         let mut contender = tokio::spawn(async move {

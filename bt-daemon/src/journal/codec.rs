@@ -1,204 +1,95 @@
-//! Lossless payload encoding shared by every source journal. Repeated event
-//! kinds may reference their previous payload, with a bounded per-session cache.
+//! Lossless history compression using the last eligible payload as a zstd
+//! dictionary. All sources share this storage codec; live events stay intact.
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
-// These bounds are part of the v1 decoding contract.
 const MIN_BYTES: usize = 4 * 1024;
-const MAX_BASES: usize = 8;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
-pub(super) const DELTA_RECORD: &str = "payload_delta_v1";
+pub(super) const DELTA_RECORD: &str = "payload_zstd_v1";
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub(crate) struct PayloadCache {
-    entries: VecDeque<Base>,
+pub(crate) struct CodecState {
+    pub(crate) legacy_pi: Vec<Value>,
+    pub(super) base: Option<Base>,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct Base {
-    event: String,
+pub(super) struct Base {
     through: u64,
     json: Arc<str>,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct Delta {
     base: u64,
-    prefix: usize,
-    suffix: usize,
-    insert: String,
+    data: String,
 }
 
-pub(super) fn cache_json(event: &str, payload: &Value) -> anyhow::Result<Option<Arc<str>>> {
-    // Oversized JSON is dropped before the raw record is serialized. The
-    // limit bounds retained decoder state; it never truncates event data.
-    Ok(cache_serialized(event, &serde_json::to_string(payload)?))
+// Cache limits govern retained state, never which event data is journaled.
+// Preserve the writer's exact JSON bytes as the compression dictionary.
+pub(super) fn cache_serialized(json: &str) -> Option<Arc<str>> {
+    (MIN_BYTES..=MAX_BYTES)
+        .contains(&json.len())
+        .then(|| Arc::from(json))
 }
 
-/// Delta offsets refer to the exact stored JSON, including key order and
-/// number spelling. Re-serializing a decoded Value is not a portable base.
-pub(super) fn cache_serialized(event: &str, json: &str) -> Option<Arc<str>> {
-    if json.len() < MIN_BYTES || json.len() > MAX_BYTES.saturating_sub(event.len()) {
-        None
-    } else {
-        Some(Arc::from(json))
-    }
-}
-
-impl PayloadCache {
+impl CodecState {
     pub(super) fn encode(
         &self,
-        event: &str,
         payload: &Value,
     ) -> anyhow::Result<(Option<Arc<str>>, Option<Delta>)> {
-        let Some(json) = cache_json(event, payload)? else {
+        let Some(json) = cache_serialized(&serde_json::to_string(payload)?) else {
             return Ok((None, None));
         };
-        let Some(base) = self.entries.iter().find(|base| base.event == event) else {
+        let Some(base) = &self.base else {
             return Ok((Some(json), None));
         };
-        let mut prefix = base
-            .json
-            .bytes()
-            .zip(json.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        while !base.json.is_char_boundary(prefix) || !json.is_char_boundary(prefix) {
-            prefix -= 1;
-        }
-        let remaining = (base.json.len() - prefix).min(json.len() - prefix);
-        let mut suffix = base
-            .json
-            .bytes()
-            .rev()
-            .zip(json.bytes().rev())
-            .take(remaining)
-            .take_while(|(a, b)| a == b)
-            .count();
-        while !base.json.is_char_boundary(base.json.len() - suffix)
-            || !json.is_char_boundary(json.len() - suffix)
-        {
-            suffix -= 1;
-        }
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(1, base.json.as_bytes())?;
+        compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
         let delta = Delta {
             base: base.through,
-            prefix,
-            suffix,
-            insert: json[prefix..json.len() - suffix].to_owned(),
+            data: STANDARD.encode(compressor.compress(json.as_bytes())?),
         };
-        // Account for the extra record tag and avoid expanding small payloads.
         let worthwhile = serde_json::to_vec(&delta)?.len() + 16 < json.len();
         Ok((Some(json), worthwhile.then_some(delta)))
     }
 
-    pub(super) fn record(&mut self, event: &str, through: u64, json: Option<Arc<str>>) {
-        self.entries.retain(|base| base.event != event);
-        let Some(json) = json else {
-            return;
-        };
-        if json.len() > MAX_BYTES.saturating_sub(event.len()) {
-            return;
+    pub(super) fn record(&mut self, through: u64, json: Option<Arc<str>>) {
+        // Small intervening hooks need not discard the last history base.
+        if let Some(json) = json {
+            self.base = Some(Base { through, json });
         }
-        while self.entries.len() >= MAX_BASES
-            || self
-                .entries
-                .iter()
-                .map(|base| base.json.len() + base.event.len())
-                .sum::<usize>()
-                + json.len()
-                + event.len()
-                > MAX_BYTES
-        {
-            self.entries.pop_front();
-        }
-        self.entries.push_back(Base {
-            event: event.to_owned(),
-            through,
-            json,
-        });
     }
 
-    pub(super) fn decode(&self, event: &str, encoded: Value) -> anyhow::Result<(Value, Arc<str>)> {
+    pub(super) fn decode(&self, encoded: Value) -> anyhow::Result<(Value, Arc<str>)> {
         let delta: Delta = serde_json::from_value(encoded)?;
         let base = self
-            .entries
-            .iter()
-            .find(|base| base.event == event && base.through == delta.base)
-            .ok_or_else(|| anyhow::anyhow!("journal payload delta base is unavailable"))?;
-        let kept = delta
-            .prefix
-            .checked_add(delta.suffix)
-            .ok_or_else(|| anyhow::anyhow!("invalid journal delta bounds"))?;
+            .base
+            .as_ref()
+            .filter(|base| base.through == delta.base)
+            .ok_or_else(|| anyhow::anyhow!("journal dictionary base is unavailable"))?;
         anyhow::ensure!(
-            kept <= base.json.len()
-                && base.json.is_char_boundary(delta.prefix)
-                && base.json.is_char_boundary(base.json.len() - delta.suffix),
-            "invalid journal delta bounds"
+            delta.data.len() <= MAX_BYTES,
+            "compressed payload exceeds codec budget"
         );
-        let budget = MAX_BYTES.saturating_sub(event.len());
-        anyhow::ensure!(
-            delta.insert.len() <= budget && kept <= budget - delta.insert.len(),
-            "journal delta exceeds codec budget"
-        );
-        let mut json = String::with_capacity(kept + delta.insert.len());
-        json.push_str(&base.json[..delta.prefix]);
-        json.push_str(&delta.insert);
-        json.push_str(&base.json[base.json.len() - delta.suffix..]);
+        let bytes = zstd::bulk::Decompressor::with_dictionary(base.json.as_bytes())?
+            .decompress(&STANDARD.decode(delta.data)?, MAX_BYTES)?;
+        let json = String::from_utf8(bytes)?;
         Ok((serde_json::from_str(&json)?, json.into()))
     }
 
-    pub(super) fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.entries.len() <= MAX_BASES
-                && self
-                    .entries
-                    .iter()
-                    .map(|base| base.json.len() + base.event.len())
-                    .sum::<usize>()
-                    <= MAX_BYTES,
-            "journal decoder checkpoint exceeds codec budget"
+            self.base
+                .as_ref()
+                .is_none_or(|base| base.json.len() <= MAX_BYTES),
+            "journal dictionary exceeds codec budget"
         );
         Ok(())
     }
-}
-
-#[derive(Clone, Default, Serialize)]
-pub(crate) struct DecoderContext {
-    pub(crate) legacy_pi: Vec<Value>,
-    pub(super) payloads: PayloadCache,
-}
-impl DecoderContext {
-    /// Observe storage metadata independently of the original live payload.
-    /// This base is saved for recovery; live translation never decodes it.
-    pub(crate) fn record_live(
-        &mut self,
-        event: &str,
-        position: &crate::pipeline::input::SourcePosition,
-    ) {
+    pub(crate) fn record_live(&mut self, position: &crate::pipeline::input::SourcePosition) {
         self.legacy_pi.clear();
-        self.payloads
-            .record(event, position.through, position.decoder_base.clone());
-    }
-}
-impl<'de> Deserialize<'de> for DecoderContext {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Stored {
-            legacy_pi: Vec<Value>,
-            payloads: PayloadCache,
-        }
-        let Stored {
-            legacy_pi,
-            payloads,
-        } = Stored::deserialize(deserializer)?;
-        let context = Self {
-            legacy_pi,
-            payloads,
-        };
-        context
-            .payloads
-            .validate()
-            .map_err(serde::de::Error::custom)?;
-        Ok(context)
+        self.record(position.through, position.decoder_base.clone());
     }
 }
 
@@ -208,69 +99,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn unicode_prefix_suffix_deltas_are_lossless_and_reject_missing_bases() {
-        let first = json!({"data":format!("{}é{}", "é".repeat(1000), "tail".repeat(1000))});
-        let next = json!({"data":format!("{}ê{}", "é".repeat(1000), "tail".repeat(1000))});
-        let mut cache = PayloadCache::default();
-        let (base, delta) = cache.encode("arbitrary-event", &first).unwrap();
+    fn dictionary_roundtrip_is_lossless_bounded_and_rejects_invalid_bases() {
+        let first = json!({"history":"é📚".repeat(1024),"index":1});
+        let next = json!({"history":format!("{}more context", "é📚".repeat(1024)),"index":2});
+        let mut cache = CodecState::default();
+        let (base, delta) = cache.encode(&first).unwrap();
         assert!(delta.is_none());
-        cache.record("arbitrary-event", 123, base);
-        let (_, delta) = cache.encode("arbitrary-event", &next).unwrap();
+        cache.record(100, base);
+        let (_, delta) = cache.encode(&next).unwrap();
         let encoded = serde_json::to_value(delta.unwrap()).unwrap();
-        assert_eq!(
-            cache.decode("arbitrary-event", encoded.clone()).unwrap().0,
-            next
-        );
-        assert!(PayloadCache::default()
-            .decode("arbitrary-event", encoded.clone())
-            .is_err());
-        let mut invalid = encoded;
-        invalid["prefix"] = json!(usize::MAX);
-        assert!(cache.decode("arbitrary-event", invalid).is_err());
-    }
-
-    #[test]
-    fn cache_limits_evict_old_bases_and_preserve_oversized_payloads() {
-        let mut cache = PayloadCache::default();
-        let payload = json!({"data":"x".repeat(MAX_BYTES / 3)});
-        for index in 0..MAX_BASES + 2 {
-            let name = format!("event-{index}");
-            let (json, _) = cache.encode(&name, &payload).unwrap();
-            cache.record(&name, index as u64, json);
-            cache.validate().unwrap();
+        assert!(encoded.to_string().len() < first.to_string().len() / 3);
+        assert_eq!(cache.decode(encoded.clone()).unwrap().0, next);
+        assert!(CodecState::default().decode(encoded.clone()).is_err());
+        cache.record(101, cache.base.as_ref().map(|base| base.json.clone()));
+        assert!(cache.decode(encoded.clone()).is_err());
+        cache.record(100, Some("different dictionary".into()));
+        assert!(cache.decode(encoded).is_err());
+        for payload in [
+            json!({"small":1}),
+            json!({"large":"x".repeat(MAX_BYTES + 1)}),
+        ] {
+            let (base, delta) = cache.encode(&payload).unwrap();
+            assert!(base.is_none() && delta.is_none());
         }
-        assert!(cache.entries.iter().all(|base| base.event != "event-0"));
-        let (small, delta) = cache.encode("small", &json!({"value":1})).unwrap();
-        assert!(
-            small.is_none() && delta.is_none(),
-            "small hook payloads should retain the direct serialization path"
-        );
-        let oversized = json!({"data":"x".repeat(MAX_BYTES + 1)});
-        let (json, delta) = cache.encode("large", &oversized).unwrap();
-        assert!(json.is_none());
-        assert!(delta.is_none());
-        cache.record("large", 100, json);
-        cache.record("large", 101, Some("x".repeat(MAX_BYTES + 1).into()));
-        cache.validate().unwrap();
-        assert!(cache.entries.iter().all(|base| base.event != "large"));
-    }
-
-    #[test]
-    fn checkpoints_preserve_shared_bases() {
-        let mut context = DecoderContext::default();
-        let payload = json!({"messages":["content".repeat(1000)]});
-        let (json, _) = context.payloads.encode("message", &payload).unwrap();
-        context.payloads.record("message", 100, json);
-        let saved = serde_json::to_vec(&context).unwrap();
-        let restored: DecoderContext = serde_json::from_slice(&saved).unwrap();
-        let (_, delta) = context.payloads.encode("message", &payload).unwrap();
-        assert_eq!(
-            restored
-                .payloads
-                .decode("message", serde_json::to_value(delta.unwrap()).unwrap())
-                .unwrap()
-                .0,
-            payload
-        );
     }
 }

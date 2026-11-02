@@ -1941,18 +1941,35 @@ mod tests {
         assert!(roots.process(&vec![root]).await.is_empty());
         journal.begin(10, true).await.unwrap();
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TRIGGER fail_roots BEFORE INSERT ON root_candidates BEGIN SELECT RAISE(FAIL,'root write'); END;").unwrap();
-        assert!(journal
-            .commit_with_roots(10, roots.pending())
-            .await
-            .is_err());
-        assert_eq!(journal.translated_through().await.unwrap(), 0);
-        assert!(journal.root_candidates().await.unwrap().is_empty());
-        db.execute_batch("DROP TRIGGER fail_roots").unwrap();
+        let context = TranslationCheckpoint {
+            input: 10,
+            version: "test".into(),
+            state: vec![1, 2],
+        };
+        for table in ["root_candidates", "translation_checkpoint"] {
+            db.execute_batch(&format!("CREATE TRIGGER fail_state BEFORE INSERT ON {table} BEGIN SELECT RAISE(FAIL,'state write'); END;")).unwrap();
+            assert!(journal
+                .commit_with_context(10, roots.pending(), Some(context.clone()))
+                .await
+                .is_err());
+            assert_eq!(journal.translated_through().await.unwrap(), 0);
+            assert!(journal.root_candidates().await.unwrap().is_empty());
+            assert!(journal.translation_checkpoint().await.unwrap().is_none());
+            db.execute_batch("DROP TRIGGER fail_state").unwrap();
+        }
         journal
-            .commit_with_roots(10, roots.pending())
+            .commit_with_context(10, roots.pending(), Some(context))
             .await
             .unwrap();
+        assert_eq!(
+            journal
+                .translation_checkpoint()
+                .await
+                .unwrap()
+                .unwrap()
+                .input,
+            10
+        );
         journal.close().await.unwrap();
 
         let journal = SpanJournal::open(&path).await.unwrap();

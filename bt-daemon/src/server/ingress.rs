@@ -6,6 +6,7 @@ use super::*;
 use std::collections::VecDeque;
 /// Captures remain ordered and bounded. Evicted entries are
 /// already durable; their source journal's high-water mark is replayed first.
+#[derive(Default)]
 pub(super) struct CaptureBuffer {
     pub(super) events: VecDeque<PendingEvent>,
     pub(super) evicted: HashMap<PathBuf, EvictedRange>,
@@ -18,13 +19,6 @@ pub(super) struct EvictedRange {
 }
 
 impl CaptureBuffer {
-    pub(super) fn new() -> Self {
-        Self {
-            events: VecDeque::new(),
-            evicted: HashMap::new(),
-        }
-    }
-
     fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) {
         if self.events.len() == INGRESS_QUEUE_CAPACITY {
             if let Some(oldest) = self.events.pop_front() {
@@ -88,7 +82,7 @@ pub(super) async fn replay_evicted(
         let mut reader = match cursors.remove(path) {
             Some(reader) => reader,
             None => match resume_discovery(daemon, path, range.from).await {
-                Ok(Some((reader, _, _))) => reader,
+                Ok(Some((reader, _))) => reader,
                 _ => journal::JournalReader::open(path, range.from)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("evicted capture journal disappeared"))?,

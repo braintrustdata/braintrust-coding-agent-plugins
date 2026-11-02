@@ -29,7 +29,7 @@ const CHECKPOINT_BYTES: u64 = 1024 * 1024;
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct RecoveryContext {
     translator: Box<serde_json::value::RawValue>,
-    pub decoder: crate::journal::DecoderContext,
+    pub decoder: crate::journal::CodecState,
     capture: Option<OriginSnapshot>,
     bounds: HashMap<String, u64>,
     pub templates: HashMap<String, crate::wire::RedactedEnvelope>,
@@ -47,6 +47,7 @@ impl RecoveryContext {
         );
         let decoder = zstd::stream::read::Decoder::new(checkpoint.state.as_slice())?;
         let context: Self = serde_json::from_reader(std::io::BufReader::new(decoder))?;
+        context.decoder.validate()?;
         Ok(context)
     }
 }
@@ -94,6 +95,7 @@ pub(crate) struct Translation {
     pub progress: Arc<Progress>,
 }
 
+#[derive(Clone)]
 pub(crate) struct TranslationOptions {
     pub source: String,
     pub session_id: String,
@@ -244,7 +246,7 @@ struct Producer {
     recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     translator: Option<Box<dyn AgentTranslator>>,
     reader: Option<JournalReader>,
-    decoder: crate::journal::DecoderContext,
+    decoder: crate::journal::CodecState,
     observers: Vec<Observation>,
     origins: WeakOrigins,
     roots: Roots,
@@ -255,8 +257,7 @@ struct Producer {
     position: u64,
     committed: u64,
     checkpoint_position: u64,
-    checkpoint_events: u64,
-    checkpoint_work_bytes: u64,
+    checkpoint_work: u64,
     checkpoint_safe: bool,
     state: State,
     publication: Option<Publication>,
@@ -302,8 +303,7 @@ impl Producer {
             position: 0,
             committed,
             checkpoint_position: 0,
-            checkpoint_events: 0,
-            checkpoint_work_bytes: 0,
+            checkpoint_work: 0,
             checkpoint_safe: true,
             state,
             publication: None,
@@ -539,8 +539,7 @@ impl Producer {
         if let Some(checkpoint) = self.checkpoint_context(self.committed).await? {
             self.journal.save_translation_checkpoint(checkpoint).await?;
             self.checkpoint_position = self.committed;
-            self.checkpoint_events = 0;
-            self.checkpoint_work_bytes = 0;
+            self.checkpoint_work = 0;
         }
         Ok(())
     }
@@ -642,8 +641,7 @@ impl Producer {
         self.position = 0;
         self.decoder = Default::default();
         self.checkpoint_position = 0;
-        self.checkpoint_events = 0;
-        self.checkpoint_work_bytes = 0;
+        self.checkpoint_work = 0;
         self.checkpoint_safe = true;
         if let Some(checkpoint) = self.journal.translation_checkpoint().await? {
             if checkpoint.version == self.options.version && checkpoint.input <= self.committed {
@@ -700,8 +698,8 @@ impl Producer {
 
     async fn next_input(&mut self, through: u64) -> anyhow::Result<Option<SourceRecord>> {
         if let Some(record) = self.options.input.take(self.position, through) {
-            if let SourceEvent::Event(event) = &record.event {
-                self.decoder.record_live(&event.event, &record.position);
+            if matches!(&record.event, SourceEvent::Event(_)) {
+                self.decoder.record_live(&record.position);
             }
             // A future gap resumes from this logical position. The live path
             // does not open, seek, read, or pass payloads through a journal reader.
@@ -974,15 +972,17 @@ impl Producer {
                 pending.complete = pending.ops.is_none();
                 pending.prepared = false;
             }
+            // Charge at least 1/64 of the budget per record, bounding both
+            // event count and decoded bytes with one replay-work counter.
+            let work = self.checkpoint_work.saturating_add(
+                pending
+                    .decoded_bytes
+                    .max(pending.input.saturating_sub(self.position))
+                    .max(CHECKPOINT_BYTES / CHECKPOINT_EVENTS),
+            );
             if publish {
                 self.phase = Boundary::Journal;
-                let checkpoint = if self.checkpoint_events + 1 >= CHECKPOINT_EVENTS
-                    || pending.input.saturating_sub(self.checkpoint_position) >= CHECKPOINT_BYTES
-                    || self
-                        .checkpoint_work_bytes
-                        .saturating_add(pending.decoded_bytes)
-                        >= CHECKPOINT_BYTES
-                {
+                let checkpoint = if work >= CHECKPOINT_BYTES {
                     self.checkpoint_context(pending.input).await?
                 } else {
                     None
@@ -993,13 +993,9 @@ impl Producer {
                     .await?;
                 if checkpointed {
                     self.checkpoint_position = pending.input;
-                    self.checkpoint_events = 0;
-                    self.checkpoint_work_bytes = 0;
+                    self.checkpoint_work = 0;
                 } else {
-                    self.checkpoint_events += 1;
-                    self.checkpoint_work_bytes = self
-                        .checkpoint_work_bytes
-                        .saturating_add(pending.decoded_bytes);
+                    self.checkpoint_work = work;
                 }
                 self.committed = pending.input;
                 self.progress
@@ -1009,10 +1005,7 @@ impl Producer {
                 // Restoring a checkpoint replays the committed suffix too.
                 // Count that work so repeated short-lived processes cannot
                 // keep extending the distance from the same old checkpoint.
-                self.checkpoint_events += 1;
-                self.checkpoint_work_bytes = self
-                    .checkpoint_work_bytes
-                    .saturating_add(pending.decoded_bytes);
+                self.checkpoint_work = work;
             }
             self.position = pending.input;
             Ok(())
@@ -1078,7 +1071,7 @@ impl Producer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{pipeline::delivery::InputPort, translate::SpanRow};
     mod streams {
@@ -1089,101 +1082,338 @@ mod tests {
         ));
     }
 
+    pub(crate) struct SourceFixture {
+        _dir: tempfile::TempDir,
+        pub(crate) options: TranslationOptions,
+        pub(crate) source: Arc<Translation>,
+    }
+    impl SourceFixture {
+        pub(crate) async fn new(agent: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = crate::journal::source_journal_path(dir.path(), agent, "checkpoint");
+            let options = resume_options(
+                dir.path(),
+                agent,
+                Arc::new(tokio::sync::Mutex::new(
+                    JournalWriter::open_path(&path).await.unwrap(),
+                )),
+            );
+            let source = Translation::spawn(options.clone()).await.unwrap();
+            Self {
+                _dir: dir,
+                options,
+                source,
+            }
+        }
+        pub(crate) async fn write(&self, event: &crate::wire::Envelope, live: bool) -> u64 {
+            let mut writer = self.options.events.lock().await;
+            let position = writer.append_ordered(event, None).await.unwrap();
+            let through = position.through;
+            if live {
+                self.options.input.push_event(event.clone(), position);
+            }
+            through
+        }
+        pub(crate) async fn process(&self, through: u64) {
+            self.source.advance(through).await.unwrap();
+            self.source.barrier().await.unwrap();
+            assert_eq!(
+                self.source.journal.translated_through().await.unwrap(),
+                through
+            );
+        }
+        async fn reopen(&mut self) {
+            self.source.shutdown().await;
+            *self.options.events.lock().await = JournalWriter::open_path(&self.options.event_path)
+                .await
+                .unwrap();
+            self.options.input = SourceInput::default();
+            self.source = Translation::spawn(self.options.clone()).await.unwrap();
+        }
+        async fn checkpoint(&self) -> TranslationCheckpoint {
+            self.source
+                .journal
+                .translation_checkpoint()
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        fn db(&self) -> rusqlite::Connection {
+            rusqlite::Connection::open(self.options.data_dir.join("pipeline").join(format!(
+                "{}.sqlite",
+                crate::ids::session_storage_id(&self.options.source, &self.options.session_id)
+            )))
+            .unwrap()
+        }
+        pub(crate) async fn poison(&self, range: std::ops::Range<u64>) {
+            let mut bytes = tokio::fs::read(&self.options.event_path).await.unwrap();
+            for byte in &mut bytes[range.start as usize..range.end as usize] {
+                if *byte != b'\n' {
+                    *byte = b'x';
+                }
+            }
+            tokio::fs::write(&self.options.event_path, bytes)
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
-    async fn native_source_output_matches_live_overflow_and_cold_recovery() {
+    async fn every_agent_recovers_equivalent_spans_at_every_native_boundary() {
         let mut covered = Vec::new();
-        for (source, mut events, _fixtures) in streams::native_streams() {
-            covered.push(source.clone());
+        for (agent, mut events, _files) in streams::native_streams() {
+            covered.push(agent.clone());
             events.insert(0, events[0].clone());
             for event in &mut events {
                 event.payload["codec_padding"] = serde_json::json!("é📚history".repeat(1024));
             }
+            let mut cases = vec![("live", 0), ("overflow", 2)];
+            cases.extend((1..=events.len()).map(|split| ("cold", split)));
+            if agent == "debug" {
+                cases.extend([("old", 1), ("corrupt", 1)]);
+            }
             let mut expected = None;
-            for mode in ["live", "overflow", "cold"] {
-                let (tmp, path, writer) = source_journal(&source).await;
-                let options = resume_options(tmp.path(), &source, writer.clone());
-                let input = options.input.clone();
-                let mut translation = Translation::spawn(options).await.unwrap();
-                let mut positions = Vec::new();
-                for (index, event) in events.iter().enumerate() {
-                    let through = if mode == "cold" && index > 0 {
-                        writer.lock().await.append(event).await.unwrap()
-                    } else {
-                        capture(&writer, &input, event).await
-                    };
-                    positions.push(through);
+            for (mode, split) in cases {
+                let mut f = SourceFixture::new(&agent).await;
+                let mut positions = vec![0];
+                for event in &events {
+                    positions.push(f.write(event, mode == "live" || mode == "overflow").await);
                 }
-                if mode == "overflow" {
-                    // Emulate losing the first two queued records while their
-                    // complete persisted forms remain recoverable.
-                    assert!(input.take(0, positions[0]).is_some());
-                    assert!(input.take(positions[0], positions[1]).is_some());
-                }
-                if mode == "cold" {
-                    translation.advance(positions[0]).await.unwrap();
-                    translation.barrier().await.unwrap();
-                    translation.shutdown().await;
-                    // A restart must seek over this prefix, not replay it.
-                    let mut bytes = tokio::fs::read(&path).await.unwrap();
-                    for byte in &mut bytes[..positions[0] as usize] {
-                        if *byte != b'\n' {
-                            *byte = b'x';
-                        }
-                    }
-                    tokio::fs::write(&path, bytes).await.unwrap();
-                    // New writer and input: the following stored delta must
-                    // rely on the SQLite decoder/reducer checkpoint alone.
-                    *writer.lock().await = JournalWriter::open_path(&path).await.unwrap();
-                    translation =
-                        Translation::spawn(resume_options(tmp.path(), &source, writer.clone()))
-                            .await
-                            .unwrap();
-                }
-                translation
-                    .advance(*positions.last().unwrap())
-                    .await
-                    .unwrap();
-                translation
-                    .barrier()
-                    .await
-                    .unwrap_or_else(|error| panic!("{source} {mode}: {error}"));
-                translation.control(ControlKind::Finalize).await.unwrap();
-                let rows = streams::comparable(
-                    translation
-                        .journal
-                        .read_after(0, 10000)
+                let tail = *positions.last().unwrap();
+                if mode == "cold" && split == 1 {
+                    let mut reader = JournalReader::open(&f.options.event_path, tail)
                         .await
                         .unwrap()
-                        .into_iter()
-                        .map(|(_, op)| op)
-                        .collect(),
-                );
-                assert!(!rows.is_empty(), "{source} produced no observations");
+                        .unwrap();
+                    for event in &events {
+                        assert_eq!(
+                            reader.next_entry().await.unwrap().unwrap().payload,
+                            event.payload
+                        );
+                    }
+                }
+                assert!(tokio::fs::read_to_string(&f.options.event_path)
+                    .await
+                    .unwrap()
+                    .contains("payload_zstd_v1"));
+                match mode {
+                    "live" => {
+                        f.process(positions[1]).await;
+                        f.source.control(ControlKind::Checkpoint).await.unwrap();
+                        assert_eq!(
+                            f.source.journal.translated_through().await.unwrap(),
+                            positions[1]
+                        );
+                        assert_eq!(f.options.events.lock().await.position(), tail);
+                        f.poison(0..tail).await;
+                    }
+                    "overflow" => {
+                        assert!(f.options.input.take(0, positions[1]).is_some());
+                        assert!(f.options.input.take(positions[1], positions[2]).is_some());
+                        f.poison(positions[2]..tail).await;
+                    }
+                    _ => {
+                        f.process(positions[split]).await;
+                        f.source.shutdown().await;
+                        if mode == "cold" {
+                            f.poison(0..positions[split]).await;
+                        } else {
+                            f.db()
+                                .execute_batch(if mode == "old" {
+                                    "UPDATE translation_checkpoint SET version='old'"
+                                } else {
+                                    "UPDATE translation_checkpoint SET state=x'00'"
+                                })
+                                .unwrap();
+                        }
+                        f.reopen().await;
+                    }
+                }
+                f.process(tail).await;
+                f.source.control(ControlKind::Finalize).await.unwrap();
+                assert!(f.source.journal.translated_through().await.unwrap() > tail);
+                // StoredOp already includes the private correlation fields;
+                // compare its complete encoding rather than duplicate its codec.
+                let db = f.db();
+                let mut query = db.prepare("SELECT value FROM ops ORDER BY value").unwrap();
+                let rows: Vec<Vec<u8>> = query
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert!(!rows.is_empty(), "{agent} {mode} produced no observations");
                 if let Some(expected) = &expected {
-                    assert_eq!(&rows, expected, "{source} {mode}");
+                    assert_eq!(&rows, expected, "{agent} {mode} split {split}");
                 } else {
                     expected = Some(rows);
                 }
-                translation.shutdown().await;
+                f.source.shutdown().await;
             }
         }
         covered.sort();
         assert_eq!(covered, Registry::default_agents().sources());
     }
 
-    async fn source_journal(
-        source: &str,
-    ) -> (
-        tempfile::TempDir,
-        PathBuf,
-        Arc<tokio::sync::Mutex<JournalWriter>>,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = crate::journal::source_journal_path(dir.path(), source, "checkpoint");
-        let writer = Arc::new(tokio::sync::Mutex::new(
-            JournalWriter::open_path(&path).await.unwrap(),
-        ));
-        (dir, path, writer)
+    struct BlockedTranslator {
+        checkpoint: bool,
+        entered: Arc<Notify>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl BlockedTranslator {
+        fn block(&self) {
+            self.entered.notify_one();
+            self.release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+    impl AgentTranslator for BlockedTranslator {
+        fn handle(
+            &mut self,
+            _: &crate::wire::Envelope,
+            _: &SessionCtx,
+        ) -> anyhow::Result<Vec<SpanOp>> {
+            if !self.checkpoint {
+                self.block();
+            }
+            Ok(Vec::new())
+        }
+        fn save_state(&self) -> anyhow::Result<Option<Vec<u8>>> {
+            if self.checkpoint {
+                self.block();
+            }
+            Ok(Some(b"{}".to_vec()))
+        }
+    }
+    #[tokio::test]
+    async fn synchronous_replay_and_checkpoint_work_do_not_block_capture() {
+        for checkpoint in [false, true] {
+            let f = SourceFixture::new("debug").await;
+            let event = streams::native_streams().pop().unwrap().1.remove(0);
+            let through = f.write(&event, false).await;
+            let mut producer = Producer::open(f.options.clone()).await.unwrap();
+            let entered = Arc::new(Notify::new());
+            let (release, receiver) = std::sync::mpsc::channel();
+            producer.translator = Some(Box::new(BlockedTranslator {
+                checkpoint,
+                entered: entered.clone(),
+                release: receiver,
+            }));
+            let started = std::time::Instant::now();
+            let work = tokio::spawn(async move {
+                let result = if checkpoint {
+                    producer.checkpoint_context(0).await.map(|_| ())
+                } else {
+                    producer.advance(through).await
+                };
+                (producer, result)
+            });
+            entered.notified().await;
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), f.write(&event, true))
+                    .await
+                    .unwrap()
+                    > through
+            );
+            assert!(
+                !work.is_finished(),
+                "capture must complete before replay is released"
+            );
+            release.send(()).unwrap();
+            let (producer, result) = work.await.unwrap();
+            result.unwrap();
+            assert_eq!(
+                producer.journal.translated_through().await.unwrap(),
+                if checkpoint { 0 } else { through }
+            );
+            f.source.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_budget_counts_reconstructed_inputs_and_decoded_bytes() {
+        let mut f = SourceFixture::new("debug").await;
+        let mut event = streams::native_streams().pop().unwrap().1.remove(0);
+        let mut tail = 0;
+        for _ in 0..2 * CHECKPOINT_EVENTS - 1 {
+            tail = f.write(&event, false).await;
+        }
+        f.process(tail).await;
+        assert!(f.checkpoint().await.input < tail);
+        let task = f.source.task.lock().await.take().unwrap();
+        task.abort();
+        let _ = task.await;
+        tail = f.write(&event, false).await;
+        f.reopen().await;
+        f.process(tail).await;
+        assert_eq!(
+            f.checkpoint().await.input,
+            tail,
+            "reconstructed suffix counts toward the next checkpoint"
+        );
+        let before = tail;
+        event.payload["history"] = "x".repeat(256 * 1024).into();
+        for _ in 0..5 {
+            tail = f.write(&event, false).await;
+        }
+        assert!(
+            tail - before < CHECKPOINT_BYTES,
+            "stored deltas must be below the physical byte threshold"
+        );
+        f.process(tail).await;
+        assert!(
+            f.checkpoint().await.input > before,
+            "decoded work must trigger a checkpoint before 64 inputs"
+        );
+        f.source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_pi_decoder_context_resumes_without_reading_its_prefix() {
+        let mut f = SourceFixture::new("pi").await;
+        let mut event = streams::native_streams().pop().unwrap().1.remove(0);
+        event.source = "pi".into();
+        event.event = "context".into();
+        let mut contents = String::new();
+        let mut positions = Vec::new();
+        for i in 0..CHECKPOINT_EVENTS + 3 {
+            event.payload = serde_json::json!({"event":{"_bt_messages_delta":{"common_prefix":if i == 0 {0} else {1}, "suffix":[{"role":"user","content":"shared".repeat(1024)}]}}});
+            contents.push_str(&serde_json::to_string(&event.redacted()).unwrap());
+            contents.push('\n');
+            positions.push(contents.len() as u64);
+        }
+        tokio::fs::write(&f.options.event_path, contents)
+            .await
+            .unwrap();
+        f.reopen().await;
+        let tail = *positions.last().unwrap();
+        f.process(tail).await;
+        let saved = f.checkpoint().await;
+        assert!(saved.input < tail);
+        assert!(!RecoveryContext::decode(&saved, "test", tail)
+            .unwrap()
+            .decoder
+            .legacy_pi
+            .is_empty());
+        let task = f.source.task.lock().await.take().unwrap();
+        task.abort();
+        let _ = task.await;
+        f.poison(0..saved.input).await;
+        f.reopen().await;
+        f.process(tail).await;
+        event.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"native"}],"_bt_messages_delta":{"native_field":"preserve"}}});
+        let native = f.write(&event, false).await;
+        f.process(native).await;
+        let mut reader =
+            JournalReader::resume(&f.options.event_path, tail, native, Default::default())
+                .await
+                .unwrap();
+        assert_eq!(
+            reader.next_entry().await.unwrap().unwrap().payload,
+            event.payload
+        );
+        f.source.shutdown().await;
     }
 
     fn resume_options(
@@ -1207,544 +1437,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoints_cannot_absorb_captured_events_before_dispatch() {
-        let (tmp, _, writer) = source_journal("debug").await;
-        let options = resume_options(tmp.path(), "debug", writer.clone());
-        let input = options.input.clone();
-        let source = Translation::spawn(options).await.unwrap();
-        let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"event","ts_ms":1,"payload":{"index":0}})).unwrap();
-        let first = capture(&writer, &input, &event).await;
-        source.advance(first).await.unwrap();
-        source.barrier().await.unwrap();
-        event.payload["index"] = 1.into();
-        let second = capture(&writer, &input, &event).await;
-        // Capture has acknowledged a later event whose routing/ancestry has
-        // not been dispatched. A flush must not translate it ahead of that.
-        source.control(ControlKind::Checkpoint).await.unwrap();
-        assert_eq!(source.journal.translated_through().await.unwrap(), first);
-        assert_eq!(
-            writer.lock().await.position(),
-            second,
-            "no control marker should leap over undispatched work"
-        );
-        source.advance(second).await.unwrap();
-        source.barrier().await.unwrap();
-        source.control(ControlKind::Checkpoint).await.unwrap();
-        assert!(source.journal.translated_through().await.unwrap() > second);
-        source.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn live_translation_and_controls_do_not_read_events_back_from_disk() {
-        let (tmp, path, writer) = source_journal("debug").await;
-        let options = resume_options(tmp.path(), "debug", writer.clone());
-        let input = options.input.clone();
-        let translation = Translation::spawn(options).await.unwrap();
-        let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
-            "source":"debug", "session_id":"checkpoint", "event":"event", "ts_ms":1,
-            "payload":{"history":"shared history".repeat(1024),"index":0}
-        }))
-        .unwrap();
-        capture(&writer, &input, &event).await;
-        event.payload["index"] = 1.into();
-        let through = capture(&writer, &input, &event).await;
-        let original = tokio::fs::read(&path).await.unwrap();
-        assert!(String::from_utf8_lossy(&original).contains("payload_delta_v1"));
-        // A journal read would fail. The complete captured records are still
-        // available, so normal translation and flush controls must succeed.
-        let mut poisoned = original.clone();
-        for byte in &mut poisoned {
-            if *byte != b'\n' {
-                *byte = b'x';
-            }
-        }
-        tokio::fs::write(&path, poisoned).await.unwrap();
-        translation.advance(through).await.unwrap();
-        translation.barrier().await.unwrap();
-        translation.control(ControlKind::Checkpoint).await.unwrap();
-        let rows = translation.journal.read_after(0, 32).await.unwrap();
-        let inputs = rows
-            .iter()
-            .filter_map(|(_, op)| {
-                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                row.input.as_ref()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs[1], &event.payload);
-        translation.shutdown().await;
-
-        // A cold recovery must restore the decoder bases learned from live
-        // records, then expand a delta written after the saved checkpoint.
-        event.payload["index"] = 2.into();
-        let tail = writer.lock().await.append(&event).await.unwrap();
-        *writer.lock().await = JournalWriter::open_path(&path).await.unwrap();
-        let resumed = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
-            .await
-            .unwrap();
-        resumed.advance(tail).await.unwrap();
-        resumed.barrier().await.unwrap();
-        assert_eq!(resumed.journal.translated_through().await.unwrap(), tail);
-        let rows = resumed.journal.read_after(0, 32).await.unwrap();
-        assert!(rows.iter().any(|(_, op)| {
-            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-            row.input.as_ref() == Some(&event.payload)
-        }));
-        resumed.shutdown().await;
-    }
-
-    async fn capture(
-        writer: &Arc<tokio::sync::Mutex<JournalWriter>>,
-        input: &SourceInput,
-        event: &crate::wire::Envelope,
-    ) -> u64 {
-        let mut writer = writer.lock().await;
-        let position = writer.append_ordered(event, None).await.unwrap();
-        let through = position.through;
-        input.push_event(event.clone(), position);
-        through
-    }
-
-    #[tokio::test]
-    async fn evicted_input_recovers_only_the_gap_then_rejoins_direct_capture() {
-        let (tmp, path, writer) = source_journal("debug").await;
-        let options = resume_options(tmp.path(), "debug", writer.clone());
-        let input = options.input.clone();
-        let translation = Translation::spawn(options).await.unwrap();
-        let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
-            "source":"debug", "session_id":"checkpoint", "event":"event", "ts_ms":1,
-            "payload":{"history":"shared".repeat(1024),"index":0}
-        }))
-        .unwrap();
-        for batch in 0..2 {
-            let mut recovery_end = 0;
-            let mut through = 0;
-            for index in 0..80 {
-                event.payload["index"] = (batch * 80 + index).into();
-                through = capture(&writer, &input, &event).await;
-                if index == 15 {
-                    recovery_end = through;
-                }
-            }
-            // Only the first 16 records were evicted. Poison the retained
-            // live suffix so any attempt to read it through storage fails.
-            let mut stored = tokio::fs::read(&path).await.unwrap();
-            for byte in &mut stored[recovery_end as usize..through as usize] {
-                if *byte != b'\n' {
-                    *byte = b'x';
-                }
-            }
-            tokio::fs::write(&path, stored).await.unwrap();
-            translation.advance(through).await.unwrap();
-            translation.barrier().await.unwrap();
-            assert!(input.is_empty());
-        }
-        let rows = translation.journal.read_after(0, 256).await.unwrap();
-        let inputs = rows
-            .iter()
-            .filter_map(|(_, op)| {
-                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                row.input.as_ref()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(inputs.len(), 160);
-        for (index, payload) in inputs.into_iter().enumerate() {
-            assert_eq!(payload["index"], index);
-            assert_eq!(payload["history"], event.payload["history"]);
-        }
-        translation.shutdown().await;
-    }
-
-    struct BlockedCheckpoint {
-        entered: Arc<Notify>,
-        release: std::sync::mpsc::Receiver<()>,
-    }
-
-    struct BlockedReplay {
-        entered: Arc<Notify>,
-        finished: Arc<std::sync::atomic::AtomicBool>,
-        release: std::sync::mpsc::Receiver<()>,
-    }
-    impl AgentTranslator for BlockedReplay {
-        fn handle(
-            &mut self,
-            _: &crate::wire::Envelope,
-            _: &SessionCtx,
-        ) -> anyhow::Result<Vec<SpanOp>> {
-            self.entered.notify_one();
-            let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
-            self.finished.store(true, Ordering::Release);
-            Ok(Vec::new())
-        }
-    }
-
-    #[tokio::test]
-    async fn synchronous_replay_work_cannot_block_the_hook_runtime() {
-        let (tmp, _, writer) = source_journal("debug").await;
-        let mut event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"event","ts_ms":1,"payload":{}})).unwrap();
-        let through = writer.lock().await.append(&event).await.unwrap();
-        let options = resume_options(tmp.path(), "debug", writer.clone());
-        let input = options.input.clone();
-        let entered = Arc::new(Notify::new());
-        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (release, receiver) = std::sync::mpsc::channel();
-        let mut producer = Producer::open(options).await.unwrap();
-        producer.translator = Some(Box::new(BlockedReplay {
-            entered: entered.clone(),
-            finished: finished.clone(),
-            release: receiver,
-        }));
-        let started = std::time::Instant::now();
-        let processing = tokio::spawn(async move {
-            let result = producer.advance(through).await;
-            (producer, result)
-        });
-        entered.notified().await;
-        let elapsed = started.elapsed();
-        event.ts_ms = 2;
-        let captured = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            capture(&writer, &input, &event),
-        )
-        .await;
-        let replay_still_blocked = !finished.load(Ordering::Acquire);
-        let _ = release.send(());
-        let (producer, result) = processing.await.unwrap();
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "replay monopolized the hook runtime for {elapsed:?}"
-        );
-        assert!(captured.unwrap() > through);
-        assert!(
-            replay_still_blocked,
-            "capture only completed after synchronous replay returned"
-        );
-        result.unwrap();
-        assert_eq!(
-            producer.journal.translated_through().await.unwrap(),
-            through,
-            "replay must retain its original stopping point"
-        );
-    }
-    impl AgentTranslator for BlockedCheckpoint {
-        fn handle(
-            &mut self,
-            _: &crate::wire::Envelope,
-            _: &SessionCtx,
-        ) -> anyhow::Result<Vec<SpanOp>> {
-            Ok(Vec::new())
-        }
-        fn save_state(&self) -> anyhow::Result<Option<Vec<u8>>> {
-            self.entered.notify_one();
-            self.release
-                .recv_timeout(std::time::Duration::from_secs(10))?;
-            Ok(Some(b"{}".to_vec()))
-        }
-    }
-
-    #[tokio::test]
-    async fn slow_checkpoint_encoding_does_not_block_journal_capture_on_the_runtime() {
-        let (tmp, _, writer) = source_journal("debug").await;
-        let entered = Arc::new(Notify::new());
-        let (release, resume) = std::sync::mpsc::channel();
-        let mut producer = Producer::open(resume_options(tmp.path(), "debug", writer.clone()))
-            .await
-            .unwrap();
-        producer.translator = Some(Box::new(BlockedCheckpoint {
-            entered: entered.clone(),
-            release: resume,
-        }));
-        let checkpoint = tokio::spawn(async move { producer.checkpoint_context(0).await });
-        entered.notified().await;
-        let env = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"during-checkpoint","ts_ms":1,"payload":{}})).unwrap();
-        let through = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            writer.lock().await.append(&env).await
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(through > 0);
-        release.send(()).unwrap();
-        assert!(checkpoint.await.unwrap().unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn checkpoint_budget_counts_decoded_payloads_after_compression() {
-        let (tmp, _, writer) = source_journal("debug").await;
-        let source = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
-            .await
-            .unwrap();
-        let env = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"event","ts_ms":1,"payload":{"history":"x".repeat(256 * 1024)}})).unwrap();
-        let mut first = 0;
-        let mut tail = 0;
-        for index in 0..10 {
-            tail = writer.lock().await.append(&env).await.unwrap();
-            if index == 0 {
-                first = tail;
-            }
-        }
-        assert!(
-            tail < CHECKPOINT_BYTES,
-            "fixture must compress below the physical byte threshold"
-        );
-        source.advance(tail).await.unwrap();
-        source.barrier().await.unwrap();
-        let checkpoint = source
-            .journal
-            .translation_checkpoint()
-            .await
-            .unwrap()
-            .expect("decoded work must trigger a checkpoint before 64 inputs");
-        assert!(checkpoint.input > first);
-        source.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn checkpoint_window_accounts_for_committed_suffix_on_restart() {
-        let (tmp, _, writer) = source_journal("debug").await;
-        let source = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
-            .await
-            .unwrap();
-        let env = serde_json::from_value(serde_json::json!({"source":"debug","session_id":"checkpoint","event":"event","ts_ms":1,"payload":{}})).unwrap();
-        let mut tail = 0;
-        for _ in 0..2 * CHECKPOINT_EVENTS - 1 {
-            tail = writer.lock().await.append(&env).await.unwrap();
-        }
-        source.advance(tail).await.unwrap();
-        source.barrier().await.unwrap();
-        let before = source
-            .journal
-            .translation_checkpoint()
-            .await
-            .unwrap()
-            .unwrap()
-            .input;
-        assert!(before < tail);
-        let task = source.task.lock().await.take().unwrap();
-        task.abort();
-        let _ = task.await;
-        tail = writer.lock().await.append(&env).await.unwrap();
-        let resumed = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
-            .await
-            .unwrap();
-        resumed.advance(tail).await.unwrap();
-        resumed.barrier().await.unwrap();
-        assert_eq!(
-            resumed
-                .journal
-                .translation_checkpoint()
-                .await
-                .unwrap()
-                .unwrap()
-                .input,
-            tail,
-            "the 63 reconstructed inputs must count toward the next periodic checkpoint"
-        );
-        resumed.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn checkpoint_seeks_past_history_for_native_and_legacy_journals() {
-        for format in ["debug", "pi", "legacy-pi"] {
-            let source = if format == "legacy-pi" { "pi" } else { format };
-            let (tmp, path, writer) = source_journal(source).await;
-            let translation =
-                Translation::spawn(resume_options(tmp.path(), source, writer.clone()))
-                    .await
-                    .unwrap();
-            let mut env = crate::wire::Envelope {
-                source: source.into(),
-                session_id: "checkpoint".into(),
-                event: "context".into(),
-                ts_ms: 0,
-                payload: serde_json::json!({}),
-                route: Some(SessionRoute::default()),
-                config: None,
-                managed_run_id: None,
-                capture: None,
-                source_version: None,
-                plugin_version: None,
-            };
-            let mut boundary = 0;
-            let mut legacy = String::new();
-            for i in 0..CHECKPOINT_EVENTS + 3 {
-                env.ts_ms = i as i64;
-                env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared".repeat(1024)},{"role":"assistant","content":i}]}});
-                if format == "legacy-pi" {
-                    let mut event = env.redacted();
-                    event.payload["event"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("messages");
-                    let suffix = if i == 0 {
-                        env.payload["event"]["messages"].clone()
-                    } else {
-                        serde_json::json!([{"role":"assistant","content":i}])
-                    };
-                    event.payload["event"]["_bt_messages_delta"] = serde_json::json!({"common_prefix": if i == 0 { 0 } else { 1 }, "suffix":suffix});
-                    legacy.push_str(&serde_json::to_string(&event).unwrap());
-                    legacy.push('\n');
-                    boundary = legacy.len() as u64;
-                } else {
-                    boundary = writer.lock().await.append(&env).await.unwrap();
-                }
-            }
-            if format == "legacy-pi" {
-                tokio::fs::write(&path, legacy).await.unwrap();
-                *writer.lock().await = JournalWriter::open_path(&path).await.unwrap();
-            }
-            translation.advance(boundary).await.unwrap();
-            translation.barrier().await.unwrap();
-            let checkpoint = translation
-                .journal
-                .translation_checkpoint()
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                checkpoint.input < boundary,
-                "test must replay a suffix after a periodic checkpoint"
-            );
-            let saved = RecoveryContext::decode(&checkpoint, "test", boundary).unwrap();
-            assert_eq!(
-                saved.decoder.legacy_pi.is_empty(),
-                format != "legacy-pi",
-                "only legacy delta records should need a saved journal decoder base"
-            );
-            let task = translation.task.lock().await.take().unwrap();
-            task.abort();
-            let _ = task.await; // crash, without the idle checkpoint
-                                // Keep boundaries intact but make all pre-checkpoint JSON invalid.
-                                // Recovery must seek over this prefix rather than decode/retranslate it.
-            let mut contents = tokio::fs::read(&path).await.unwrap();
-            for byte in &mut contents[..checkpoint.input as usize] {
-                if *byte != b'\n' {
-                    *byte = b'x';
-                }
-            }
-            tokio::fs::write(&path, contents).await.unwrap();
-            env.ts_ms += 1;
-            env.payload["event"]["messages"][1]["content"] = serde_json::json!("after restart");
-            let tail = writer.lock().await.append(&env).await.unwrap();
-            let resumed = Translation::spawn(resume_options(tmp.path(), source, writer.clone()))
-                .await
-                .unwrap();
-            resumed.advance(tail).await.unwrap();
-            resumed.barrier().await.unwrap();
-            assert!(
-                resumed.error.lock().is_none(),
-                "{source}: {:?}",
-                resumed.error.lock()
-            );
-            assert_eq!(resumed.journal.translated_through().await.unwrap(), tail);
-            resumed.shutdown().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn invalid_or_old_context_rebuilds_safely_from_the_source_journal() {
-        for alteration in [
-            "UPDATE translation_checkpoint SET state=x'00'",
-            "UPDATE translation_checkpoint SET version='old'",
-        ] {
-            let (tmp, _, writer) = source_journal("debug").await;
-            let env: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
-                "source":"debug", "session_id":"checkpoint", "event":"event", "ts_ms":1,"payload":{},
-            })).unwrap();
-            let translation =
-                Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
-                    .await
-                    .unwrap();
-            let mut tail = 0;
-            for _ in 0..CHECKPOINT_EVENTS {
-                tail = writer.lock().await.append(&env).await.unwrap();
-            }
-            translation.advance(tail).await.unwrap();
-            translation.barrier().await.unwrap();
-            translation.shutdown().await;
-            let storage = tmp.path().join("pipeline").join(format!(
-                "{}.sqlite",
-                crate::ids::session_storage_id("debug", "checkpoint")
-            ));
-            let db = rusqlite::Connection::open(storage).unwrap();
-            db.execute_batch(alteration).unwrap();
-            tail = writer.lock().await.append(&env).await.unwrap();
-            let resumed = Translation::spawn(resume_options(tmp.path(), "debug", writer.clone()))
-                .await
-                .unwrap();
-            resumed.advance(tail).await.unwrap();
-            resumed.barrier().await.unwrap();
-            assert!(resumed.error.lock().is_none());
-            assert_eq!(resumed.journal.translated_through().await.unwrap(), tail);
-            let batches: u64 = db
-                .query_row(
-                    "SELECT count(*) FROM batches WHERE committed=1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(batches, CHECKPOINT_EVENTS + 1);
-            resumed.shutdown().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn translation_checkpoint_commit_failure_does_not_move_the_source_head() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("atomic.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TRIGGER fail_context BEFORE INSERT ON translation_checkpoint BEGIN SELECT RAISE(FAIL,'checkpoint write failed'); END;").unwrap();
-        let context = TranslationCheckpoint {
-            input: 10,
-            version: "test".into(),
-            state: vec![1, 2],
-        };
-        assert!(journal
-            .commit_with_context(10, &Default::default(), Some(context.clone()))
-            .await
-            .is_err());
-        assert_eq!(journal.translated_through().await.unwrap(), 0);
-        assert!(journal.translation_checkpoint().await.unwrap().is_none());
-        db.execute_batch("DROP TRIGGER fail_context;").unwrap();
-        journal
-            .commit_with_context(10, &Default::default(), Some(context))
-            .await
-            .unwrap();
-        assert_eq!(journal.translated_through().await.unwrap(), 10);
-        assert_eq!(
-            journal
-                .translation_checkpoint()
-                .await
-                .unwrap()
-                .unwrap()
-                .input,
-            10
-        );
-    }
-
-    #[tokio::test]
     async fn shared_storage_stays_open_until_the_last_route_finishes_draining() {
-        let tmp = tempfile::tempdir().unwrap();
-        let event_path = tmp.path().join("events.ndjson");
-        let translation = Translation::spawn(TranslationOptions {
-            source: "debug".into(),
-            session_id: "draining".into(),
-            namespace: "draining".into(),
-            version: "test".into(),
-            data_dir: tmp.path().into(),
-            events: Arc::new(tokio::sync::Mutex::new(
-                JournalWriter::open_path(&event_path).await.unwrap(),
-            )),
-            event_path,
-            input: SourceInput::default(),
-            registry: Arc::new(Registry::default_agents()),
-            correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
-            correlation_changed: Arc::new(Notify::new()),
-        })
-        .await
-        .unwrap();
+        let f = SourceFixture::new("debug").await;
+        let translation = &f.source;
         translation.routes.lock().active = 2;
         assert!(!translation.begin_route_shutdown());
         assert!(translation.begin_route_shutdown());
@@ -1756,26 +1451,9 @@ mod tests {
 
     #[tokio::test]
     async fn recreated_observer_restores_a_staged_session_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let event_path = tmp.path().join("events.ndjson");
-        let correlation = Arc::new(crate::correlation::CorrelationRegistry::default());
-        let translation = Translation::spawn(TranslationOptions {
-            source: "debug".into(),
-            session_id: "staged".into(),
-            namespace: "staged".into(),
-            version: "test".into(),
-            data_dir: tmp.path().into(),
-            events: Arc::new(tokio::sync::Mutex::new(
-                JournalWriter::open_path(&event_path).await.unwrap(),
-            )),
-            event_path,
-            input: SourceInput::default(),
-            registry: Arc::new(Registry::default_agents()),
-            correlation: correlation.clone(),
-            correlation_changed: Arc::new(Notify::new()),
-        })
-        .await
-        .unwrap();
+        let f = SourceFixture::new("debug").await;
+        let translation = &f.source;
+        let correlation = &f.options.correlation;
         let mut roots = Roots::default();
         roots
             .process(&vec![
@@ -1904,12 +1582,11 @@ mod tests {
     }
     #[tokio::test]
     async fn failed_append_and_commit_retain_the_built_chunk() {
-        let (tmp, _, writer) = source_journal("debug").await;
-        let mut producer = Producer::open(resume_options(tmp.path(), "debug", writer))
-            .await
-            .unwrap();
+        let f = SourceFixture::new("debug").await;
+        f.source.shutdown().await;
+        let mut producer = Producer::open(f.options.clone()).await.unwrap();
         let journal = producer.journal.clone();
-        let path = tmp.path().join("pipeline").join(format!(
+        let path = f.options.data_dir.as_path().join("pipeline").join(format!(
             "{}.sqlite",
             crate::ids::session_storage_id("debug", "checkpoint")
         ));

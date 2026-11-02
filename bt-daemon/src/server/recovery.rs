@@ -8,13 +8,7 @@ pub(super) async fn resume_discovery(
     daemon: &Daemon,
     path: &std::path::Path,
     through: u64,
-) -> anyhow::Result<
-    Option<(
-        journal::JournalReader,
-        u64,
-        Vec<crate::wire::RedactedEnvelope>,
-    )>,
-> {
+) -> anyhow::Result<Option<(journal::JournalReader, Vec<crate::wire::RedactedEnvelope>)>> {
     let Some((_, id)) = path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -58,11 +52,7 @@ pub(super) async fn resume_discovery(
         "checkpoint contains another source session"
     );
     let reader = journal::JournalReader::resume(path, input, through, context.decoder).await?;
-    Ok(Some((
-        reader,
-        input,
-        context.templates.into_values().collect(),
-    )))
+    Ok(Some((reader, context.templates.into_values().collect())))
 }
 
 pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<PendingEvent> {
@@ -98,8 +88,9 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
         let mut latest_by_route: HashMap<String, PendingEvent> = HashMap::new();
         match resume_discovery(daemon, &path, recorded_len).await {
-            Ok(Some((resumed, input, templates))) => {
+            Ok(Some((resumed, templates))) => {
                 reader = resumed;
+                let input = reader.position();
                 before = input;
                 for template in templates {
                     let env = journal::envelope_from_redacted(template);
@@ -307,11 +298,11 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::translate::{SpanOp, SpanRow};
 
-    struct TestAuth;
+    pub(crate) struct TestAuth;
     #[async_trait::async_trait]
     impl AuthProvider for TestAuth {
         async fn resolve(
@@ -335,12 +326,8 @@ mod tests {
 
     #[tokio::test]
     async fn startup_discovery_uses_the_session_checkpoint_instead_of_scanning_history() {
-        use crate::pipeline::translation::{Translation, TranslationOptions};
-        let tmp = tempfile::tempdir().unwrap();
-        let raw = journal::source_journal_path(tmp.path(), "debug", "checkpoint");
-        let writer = Arc::new(tokio::sync::Mutex::new(
-            JournalWriter::open_path(&raw).await.unwrap(),
-        ));
+        use crate::pipeline::translation::tests::SourceFixture;
+        let f = SourceFixture::new("debug").await;
         let mut env: Envelope = serde_json::from_value(serde_json::json!({
             "source":"debug", "session_id":"checkpoint", "event":"old", "ts_ms":1,
             "payload":{}, "route":SessionRoute::default(),
@@ -349,41 +336,20 @@ mod tests {
         let mut through = 0;
         for i in 0..64 {
             env.ts_ms = i;
-            through = writer.lock().await.append(&env).await.unwrap();
+            through = f.write(&env, false).await;
         }
-        let translation = Translation::spawn(TranslationOptions {
-            source: "debug".into(),
-            session_id: "checkpoint".into(),
-            namespace: crate::ids::session_namespace("debug", "checkpoint"),
-            version: "test".into(),
-            data_dir: tmp.path().into(),
-            events: writer.clone(),
-            event_path: raw.clone(),
-            input: crate::pipeline::input::SourceInput::default(),
-            registry: Arc::new(Registry::default_agents()),
-            correlation: Arc::default(),
-            correlation_changed: Arc::default(),
-        })
-        .await
-        .unwrap();
-        translation.advance(through).await.unwrap();
-        translation.barrier().await.unwrap();
-        translation.shutdown().await;
-        let mut contents = tokio::fs::read(&raw).await.unwrap();
-        for byte in &mut contents[..through as usize] {
-            if *byte != b'\n' {
-                *byte = b'x';
-            }
-        }
-        tokio::fs::write(&raw, contents).await.unwrap();
+        f.process(through).await;
+        f.source.shutdown().await;
+        f.poison(0..through).await;
         env.event = "after".into();
-        let tail = writer.lock().await.append(&env).await.unwrap();
-        let daemon = Daemon::new(debug_serve_options("test", tmp.path()), tmp.path().into());
-        let (_, start, _) = resume_discovery(&daemon, &raw, tail)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(start, through);
+        let tail = f.write(&env, false).await;
+        let raw = &f.options.event_path;
+        let daemon = Daemon::new(
+            debug_serve_options("test", &f.options.data_dir),
+            f.options.data_dir.clone(),
+        );
+        let (reader, _) = resume_discovery(&daemon, raw, tail).await.unwrap().unwrap();
+        assert_eq!(reader.position(), through);
         let candidates = discover_unprocessed_journals(&daemon).await;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].env.event, "after");

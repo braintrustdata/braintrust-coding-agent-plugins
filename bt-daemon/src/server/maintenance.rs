@@ -438,28 +438,7 @@ mod tests {
         ));
     }
 
-    struct TestAuth;
-
-    #[async_trait]
-    impl AuthProvider for TestAuth {
-        async fn resolve(
-            &self,
-            selection: &AuthSelection,
-            _: AuthResolveReason,
-        ) -> anyhow::Result<AuthLease> {
-            Ok(AuthLease {
-                selection: selection.clone().canonicalized()?,
-                auth: BackendAuth {
-                    token: "test".into(),
-                    api_url: Some("http://127.0.0.1.invalid".into()),
-                    app_url: None,
-                    org_name: Some("test".into()),
-                    org_id: Some("test".into()),
-                },
-                expires_at_ms: None,
-            })
-        }
-    }
+    use super::super::recovery::tests::TestAuth;
 
     fn event(session: &str, route: SessionRoute) -> Envelope {
         Envelope {
@@ -477,34 +456,162 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn capture_is_durable_while_startup_dispatch_is_blocked() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn paused_ingress(root: &std::path::Path) -> (Arc<Daemon>, oneshot::Sender<()>) {
         let (ready, startup) = oneshot::channel();
-        let daemon = Daemon::new_with_startup(
-            debug_serve_options("test", tmp.path()),
-            tmp.path().into(),
-            Some(startup),
-        );
-        let env = event("during-startup", SessionRoute::default());
+        (
+            Daemon::new_with_startup(
+                debug_serve_options("test", root),
+                root.into(),
+                Some(startup),
+            ),
+            ready,
+        )
+    }
+
+    #[tokio::test]
+    async fn capture_is_durable_during_startup_and_recovery_stops_before_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = event("resuming", SessionRoute::default());
+        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
+        let old_end = JournalWriter::open_path(&path)
+            .await
+            .unwrap()
+            .append(&env)
+            .await
+            .unwrap();
+        let (daemon, ready) = paused_ingress(tmp.path());
+        env.ts_ms = 2;
+        env.event = "next".into();
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), daemon.capture_event(env.clone()))
+            tokio::time::timeout(Duration::from_secs(1), daemon.capture_event(env))
                 .await
                 .unwrap()
                 .unwrap()
         );
-        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-        assert!(tokio::fs::read_to_string(path)
+        assert!(tokio::fs::read_to_string(&path)
             .await
             .unwrap()
-            .contains("during-startup"));
+            .contains("next"));
         assert!(daemon.translations.lock().is_empty());
+        let recovered = discover_unprocessed_journals(&daemon).await;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].journal_through, old_end);
+        for event in recovered {
+            dispatch_ingress_event(&daemon, event).await;
+        }
         drain_capture_buffer(&daemon).await.unwrap();
         ready.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), daemon.ingress_barrier())
+        daemon.settle_ingress().await;
+        let source = daemon.translations.lock().values().next().unwrap().clone();
+        assert!(source.barrier().await.unwrap() > 0);
+        let storage = tmp.path().join("pipeline").join(format!(
+            "{}.sqlite",
+            crate::ids::session_storage_id("debug", "resuming")
+        ));
+        let partition = crate::pipeline::journal::SpanJournal::open(&storage)
             .await
             .unwrap();
-        assert!(!daemon.translations.lock().is_empty());
+        assert_eq!(
+            partition.translated_through().await.unwrap(),
+            journal::JournalReader::recorded_len(&path).await
+        );
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_overflow_preserves_each_session_and_its_compressed_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (daemon, ready) = paused_ingress(tmp.path());
+        // Four journals interleave through two eviction ranges and a live tail.
+        let mut envs = Vec::new();
+        for source in ["debug", "pi"] {
+            for session in ["first", "second"] {
+                let mut env = event(session, SessionRoute::default());
+                env.source = source.into();
+                env.event = "context".into();
+                envs.push(env);
+            }
+        }
+        let mut first = None;
+        let total = 2 * INGRESS_QUEUE_CAPACITY + 12;
+        for index in 0..total {
+            let mut env = envs[index % envs.len()].clone();
+            env.ts_ms = index as i64;
+            env.payload = serde_json::json!({"index":index,"event":{"messages":[{"role":"user","content":"history".repeat(1024)},{"role":"assistant","content":index}]}});
+            daemon.capture_event(env).await.unwrap();
+            if index + 1 == 2 * INGRESS_QUEUE_CAPACITY {
+                let CaptureWork::Evicted(bounds) = daemon.next_capture_work() else {
+                    panic!("missing first eviction");
+                };
+                assert_eq!(bounds.len(), envs.len());
+                first = Some(bounds);
+            }
+        }
+        {
+            let buffer = daemon.capture_buffer.lock();
+            assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
+            assert_eq!(
+                buffer.events.front().unwrap().env.payload["index"],
+                total - INGRESS_QUEUE_CAPACITY
+            );
+        }
+        let mut cursors = HashMap::new();
+        replay_evicted(&daemon, &mut cursors, &first.unwrap())
+            .await
+            .unwrap();
+        let CaptureWork::Evicted(second) = daemon.next_capture_work() else {
+            panic!("new captures must extend recovery");
+        };
+        replay_evicted(&daemon, &mut cursors, &second)
+            .await
+            .unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        daemon.settle_ingress().await;
+        for (slot, env) in envs.iter().enumerate() {
+            let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
+            assert!(tokio::fs::read_to_string(&path)
+                .await
+                .unwrap()
+                .contains("payload_zstd_v1"));
+            let storage = tmp.path().join("pipeline").join(format!(
+                "{}.sqlite",
+                crate::ids::session_storage_id(&env.source, &env.session_id)
+            ));
+            let partition = crate::pipeline::journal::SpanJournal::open(&storage)
+                .await
+                .unwrap();
+            assert_eq!(
+                partition.translated_through().await.unwrap(),
+                journal::JournalReader::recorded_len(&path).await
+            );
+            let db = rusqlite::Connection::open(storage).unwrap();
+            let count: usize = db
+                .query_row(
+                    "SELECT count(*) FROM batches WHERE committed=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let expected: Vec<_> = (slot..total).step_by(envs.len()).collect();
+            assert_eq!(count, expected.len());
+            if env.source == "debug" {
+                let actual: Vec<_> = partition
+                    .read_after(0, total)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|(_, op)| {
+                        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                        row.input?.get("index")?.as_u64()
+                    })
+                    .collect();
+                assert_eq!(
+                    actual,
+                    expected.into_iter().map(|i| i as u64).collect::<Vec<_>>()
+                );
+            }
+        }
         drain_all(&daemon).await;
     }
 
@@ -513,12 +620,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let transcript = tmp.path().join("transcript.jsonl");
         tokio::fs::write(&transcript, b"{}\n").await.unwrap();
-        let (ready, startup) = oneshot::channel();
-        let daemon = Daemon::new_with_startup(
-            debug_serve_options("test", tmp.path()),
-            tmp.path().into(),
-            Some(startup),
-        );
+        let (daemon, ready) = paused_ingress(tmp.path());
         let mut env = event("late-transcript", SessionRoute::default());
         env.source = "claude-code".into();
         env.event = "Stop".into();
@@ -544,209 +646,6 @@ mod tests {
             content.contains("TranscriptUpdate"),
             "late transcript must be journaled before shutdown"
         );
-    }
-
-    #[tokio::test]
-    async fn startup_recovery_dispatches_old_session_before_new_capture() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = event("resuming", SessionRoute::default());
-        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let old_end = writer.append(&env).await.unwrap();
-        drop(writer);
-        let (ready, startup) = oneshot::channel();
-        let daemon = Daemon::new_with_startup(
-            debug_serve_options("test", tmp.path()),
-            tmp.path().into(),
-            Some(startup),
-        );
-        let mut next = env.clone();
-        next.event = "next".into();
-        next.ts_ms = 2;
-        assert!(daemon.capture_event(next).await.unwrap());
-        let recovered = discover_unprocessed_journals(&daemon).await;
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].journal_through, old_end);
-        for event in recovered {
-            dispatch_ingress_event(&daemon, event).await;
-        }
-        drain_capture_buffer(&daemon).await.unwrap();
-        ready.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), daemon.ingress_barrier())
-            .await
-            .unwrap();
-        let source = daemon.translations.lock().values().next().unwrap().clone();
-        source.barrier().await.unwrap();
-        let storage = tmp.path().join("pipeline").join(format!(
-            "{}.sqlite",
-            crate::ids::session_storage_id(&env.source, &env.session_id)
-        ));
-        let partition = crate::pipeline::journal::SpanJournal::open(&storage)
-            .await
-            .unwrap();
-        let through = partition.translated_through().await.unwrap();
-        assert!(through > old_end);
-        assert_eq!(through, journal::JournalReader::recorded_len(&path).await);
-        drain_all(&daemon).await;
-    }
-
-    #[tokio::test]
-    async fn startup_overflow_replays_oldest_events_before_the_buffered_tail() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (ready, startup) = oneshot::channel();
-        let daemon = Daemon::new_with_startup(
-            debug_serve_options("test", tmp.path()),
-            tmp.path().into(),
-            Some(startup),
-        );
-        let env = event("overflow", SessionRoute::default());
-        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-        for i in 0..(INGRESS_QUEUE_CAPACITY + 6) {
-            let mut next = env.clone();
-            next.ts_ms = i as i64;
-            next.payload = serde_json::json!({"index": i});
-            assert!(daemon.capture_event(next).await.unwrap());
-        }
-        {
-            let state = daemon.capture_buffer.lock();
-            let buffer = &state;
-            assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
-            assert_eq!(buffer.events.front().unwrap().env.payload["index"], 6);
-        }
-        drain_capture_buffer(&daemon).await.unwrap();
-        ready.send(()).unwrap();
-        daemon.ingress_barrier().await;
-        let source = daemon.translations.lock().values().next().unwrap().clone();
-        source.barrier().await.unwrap();
-        let storage = tmp.path().join("pipeline").join(format!(
-            "{}.sqlite",
-            crate::ids::session_storage_id(&env.source, &env.session_id)
-        ));
-        let db = rusqlite::Connection::open(storage).unwrap();
-        let count: u64 = db
-            .query_row(
-                "SELECT count(*) FROM batches WHERE committed=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, (INGRESS_QUEUE_CAPACITY + 6) as u64);
-        let partition = crate::pipeline::journal::SpanJournal::open(
-            &tmp.path().join("pipeline").join(format!(
-                "{}.sqlite",
-                crate::ids::session_storage_id(&env.source, &env.session_id)
-            )),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            partition.translated_through().await.unwrap(),
-            journal::JournalReader::recorded_len(&path).await
-        );
-        drop(db);
-        drain_all(&daemon).await;
-    }
-
-    #[tokio::test]
-    async fn startup_overflow_advances_again_while_evicted_records_are_catching_up() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (ready, startup) = oneshot::channel();
-        let daemon = Daemon::new_with_startup(
-            debug_serve_options("test", tmp.path()),
-            tmp.path().into(),
-            Some(startup),
-        );
-        let env = event("chasing", SessionRoute::default());
-        for i in 0..(INGRESS_QUEUE_CAPACITY + 2) {
-            let mut next = env.clone();
-            next.ts_ms = i as i64;
-            next.payload = serde_json::json!({"index": i});
-            assert!(daemon.capture_event(next).await.unwrap());
-        }
-        let CaptureWork::Evicted(first) = daemon.next_capture_work() else {
-            panic!("the oldest events were not evicted");
-        };
-        for i in INGRESS_QUEUE_CAPACITY + 2..INGRESS_QUEUE_CAPACITY + 7 {
-            let mut next = env.clone();
-            next.ts_ms = i as i64;
-            next.payload = serde_json::json!({"index": i});
-            assert!(daemon.capture_event(next).await.unwrap());
-        }
-        {
-            let state = daemon.capture_buffer.lock();
-            let buffer = &state;
-            assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
-            assert_eq!(buffer.events.front().unwrap().env.payload["index"], 7);
-        }
-        let mut cursors = HashMap::new();
-        replay_evicted(&daemon, &mut cursors, &first).await.unwrap();
-        let CaptureWork::Evicted(second) = daemon.next_capture_work() else {
-            panic!("new evictions did not advance recovery");
-        };
-        replay_evicted(&daemon, &mut cursors, &second)
-            .await
-            .unwrap();
-        drain_capture_buffer(&daemon).await.unwrap();
-        ready.send(()).unwrap();
-        daemon.ingress_barrier().await;
-        let source = daemon.translations.lock().values().next().unwrap().clone();
-        source.barrier().await.unwrap();
-        let storage = tmp.path().join("pipeline").join(format!(
-            "{}.sqlite",
-            crate::ids::session_storage_id(&env.source, &env.session_id)
-        ));
-        let db = rusqlite::Connection::open(storage).unwrap();
-        let count: u64 = db
-            .query_row(
-                "SELECT count(*) FROM batches WHERE committed=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, (INGRESS_QUEUE_CAPACITY + 7) as u64);
-        drop(db);
-        drain_all(&daemon).await;
-    }
-
-    #[tokio::test]
-    async fn overflow_snapshot_excludes_unacknowledged_writes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (ready, startup) = oneshot::channel();
-        let mut opts = debug_serve_options("test", tmp.path());
-        opts.auth_provider = Some(Arc::new(TestAuth));
-        let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup));
-        let mut env = event("durable-bound", SessionRoute::default());
-        env.payload = serde_json::json!({"index":0});
-        daemon.capture_event(env.clone()).await.unwrap();
-        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-        let acknowledged = tokio::fs::read(&path).await.unwrap();
-        let through = acknowledged.len() as u64;
-        // OS-visible bytes need not have completed fsync. Model a complete
-        // record written after the writer's acknowledged durable position.
-        env.payload = serde_json::json!({"index":1});
-        let mut unacknowledged = acknowledged.clone();
-        unacknowledged.extend(serde_json::to_vec(&env.redacted()).unwrap());
-        unacknowledged.push(b'\n');
-        tokio::fs::write(&path, unacknowledged).await.unwrap();
-        drain_capture_buffer(&daemon).await.unwrap();
-        let source = daemon.translations.lock().values().next().unwrap().clone();
-        source.barrier().await.unwrap();
-        let storage = tmp.path().join("pipeline").join(format!(
-            "{}.sqlite",
-            crate::ids::session_storage_id(&env.source, &env.session_id)
-        ));
-        let partition = crate::pipeline::journal::SpanJournal::open(&storage)
-            .await
-            .unwrap();
-        assert_eq!(
-            partition.translated_through().await.unwrap(),
-            through,
-            "recovery must not commit beyond the durable capture head"
-        );
-        tokio::fs::write(&path, acknowledged).await.unwrap();
-        ready.send(()).unwrap();
-        daemon.settle_ingress().await;
-        drain_all(&daemon).await;
     }
 
     #[tokio::test]
@@ -812,106 +711,6 @@ mod tests {
         drain_all(&daemon).await;
     }
 
-    #[tokio::test]
-    async fn startup_overflow_tracks_each_source_journal_independently() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (ready, startup) = oneshot::channel();
-        let daemon = Daemon::new_with_startup(
-            debug_serve_options("test", tmp.path()),
-            tmp.path().into(),
-            Some(startup),
-        );
-        for i in 0..(INGRESS_QUEUE_CAPACITY + 6) {
-            let session = if i % 2 == 0 { "first" } else { "second" };
-            let mut env = event(session, SessionRoute::default());
-            env.ts_ms = i as i64;
-            env.payload = serde_json::json!({"index": i});
-            assert!(daemon.capture_event(env).await.unwrap());
-        }
-        {
-            let state = daemon.capture_buffer.lock();
-            let buffer = &state;
-            assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
-        }
-        drain_capture_buffer(&daemon).await.unwrap();
-        ready.send(()).unwrap();
-        daemon.ingress_barrier().await;
-        let sources: Vec<_> = daemon.translations.lock().values().cloned().collect();
-        for source in sources {
-            source.barrier().await.unwrap();
-        }
-        for session in ["first", "second"] {
-            let storage = tmp.path().join("pipeline").join(format!(
-                "{}.sqlite",
-                crate::ids::session_storage_id("debug", session)
-            ));
-            let db = rusqlite::Connection::open(storage).unwrap();
-            let count: u64 = db
-                .query_row(
-                    "SELECT count(*) FROM batches WHERE committed=1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, ((INGRESS_QUEUE_CAPACITY + 6) / 2) as u64);
-        }
-        drain_all(&daemon).await;
-    }
-
-    #[tokio::test]
-    async fn startup_overflow_keeps_pi_context_across_recovery_advances() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (ready, startup) = oneshot::channel();
-        let daemon = Daemon::new_with_startup(
-            debug_serve_options("test", tmp.path()),
-            tmp.path().into(),
-            Some(startup),
-        );
-        let mut env = event("pi-overflow", SessionRoute::default());
-        env.source = "pi".into();
-        env.event = "context".into();
-        for i in 0..(INGRESS_QUEUE_CAPACITY + 2) {
-            env.ts_ms = i as i64;
-            env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
-            assert!(daemon.capture_event(env.clone()).await.unwrap());
-        }
-        let CaptureWork::Evicted(first) = daemon.next_capture_work() else {
-            panic!("missing first overflow")
-        };
-        let mut cursors = HashMap::new();
-        replay_evicted(&daemon, &mut cursors, &first).await.unwrap();
-        for i in INGRESS_QUEUE_CAPACITY + 2..INGRESS_QUEUE_CAPACITY + 4 {
-            env.ts_ms = i as i64;
-            env.payload = serde_json::json!({"event":{"messages":[{"role":"user","content":"shared"},{"role":"assistant","content":i}]}});
-            assert!(daemon.capture_event(env.clone()).await.unwrap());
-        }
-        let CaptureWork::Evicted(second) = daemon.next_capture_work() else {
-            panic!("missing second overflow")
-        };
-        replay_evicted(&daemon, &mut cursors, &second)
-            .await
-            .unwrap();
-        drain_capture_buffer(&daemon).await.unwrap();
-        ready.send(()).unwrap();
-        daemon.ingress_barrier().await;
-        let source = daemon.translations.lock().values().next().unwrap().clone();
-        source.barrier().await.unwrap();
-        let storage = tmp.path().join("pipeline").join(format!(
-            "{}.sqlite",
-            crate::ids::session_storage_id(&env.source, &env.session_id)
-        ));
-        let db = rusqlite::Connection::open(storage).unwrap();
-        let count: u64 = db
-            .query_row(
-                "SELECT count(*) FROM batches WHERE committed=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, (INGRESS_QUEUE_CAPACITY + 4) as u64);
-        drop(db);
-        drain_all(&daemon).await;
-    }
     #[tokio::test]
     async fn retention_requires_complete_inactive_partitions_and_nonempty_heads() {
         for scenario in [

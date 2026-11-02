@@ -187,7 +187,7 @@ impl Daemon {
             correlation_changed: Arc::new(Notify::new()),
             ingress_tx,
             startup_cutoffs: Mutex::new(startup_cutoffs),
-            capture_buffer: Mutex::new(CaptureBuffer::new()),
+            capture_buffer: Mutex::new(CaptureBuffer::default()),
             capture_sequence: AtomicU64::new(0),
             started: Instant::now(),
             last_activity: Mutex::new(Instant::now()),
