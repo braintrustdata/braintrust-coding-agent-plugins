@@ -323,7 +323,10 @@ impl Daemon {
         let before = writer.position();
         if let Some(cutoffs) = self.startup_cutoffs.lock().as_mut() {
             let path = journal::source_journal_path(&self.data_dir, &env.source, &env.session_id);
-            cutoffs.entry(path).or_insert(before);
+            cutoffs
+                .entry(path)
+                .and_modify(|cutoff| *cutoff = (*cutoff).min(before))
+                .or_insert(before);
         }
         let through = writer.append(env).await?;
         Ok(crate::pipeline::input::SourcePosition { before, through })
