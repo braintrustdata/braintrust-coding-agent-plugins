@@ -53,6 +53,22 @@ fn row_contains(row: &Value, fragments: &[&str]) -> bool {
         .all(|fragment| serialized.contains(fragment))
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_output_does_not_wait_for_inherited_descendant_handles() {
+    let world = AgentTestWorld::start().await;
+    let mut command = support::agent_process::command("sh");
+    command.args(["-c", "sleep 5 & printf captured"]);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        world.output(&mut command),
+    )
+    .await
+    .expect("foreground command should not wait for its background child");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"captured");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the Codex CLI installed on PATH"]
 async fn codex_session_emits_traces() {

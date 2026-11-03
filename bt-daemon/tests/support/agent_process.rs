@@ -194,6 +194,7 @@ impl AgentTestWorld {
     }
 
     pub async fn output(&self, command: &mut Command) -> std::process::Output {
+        use std::io::{Read, Seek};
         let program = command
             .as_std()
             .get_program()
@@ -204,12 +205,21 @@ impl AgentTestWorld {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
+        // An agent's detached descendants may inherit output handles. Files
+        // let us collect the foreground command's output without waiting for
+        // those descendants to close a pipe after the command exits.
+        let mut stdout = tempfile::tempfile().expect("create stdout capture");
+        let mut stderr = tempfile::tempfile().expect("create stderr capture");
         command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(
+                stdout.try_clone().expect("clone stdout capture"),
+            ))
+            .stderr(Stdio::from(
+                stderr.try_clone().expect("clone stderr capture"),
+            ))
             .kill_on_drop(true);
-        let child = command.spawn().expect("spawn agent command");
-        tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())
+        let mut child = command.spawn().expect("spawn agent command");
+        let status = tokio::time::timeout(Duration::from_secs(90), child.wait())
             .await
             .unwrap_or_else(|_| {
                 panic!(
@@ -218,7 +228,22 @@ impl AgentTestWorld {
                     directory_contents(&self.data_dir)
                 )
             })
-            .expect("wait for agent command")
+            .expect("wait for agent command");
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        stdout.rewind().expect("rewind stdout capture");
+        stderr.rewind().expect("rewind stderr capture");
+        stdout
+            .read_to_end(&mut stdout_bytes)
+            .expect("read stdout capture");
+        stderr
+            .read_to_end(&mut stderr_bytes)
+            .expect("read stderr capture");
+        std::process::Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        }
     }
 
     pub async fn wait_for_trace_rows(&self) -> Vec<Value> {
