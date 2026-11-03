@@ -395,26 +395,30 @@ pub(crate) async fn flush_managed_run_in(
     timeout_ms: u64,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<wire::FlushResult> {
-    let stream = match connect(socket).await {
-        Ok(stream) => stream,
-        Err(_) => {
-            let accepted_sessions = journal::read_managed_run_keys(data_dir, managed_run_id)
-                .await
-                .len() as u64;
-            return Ok(wire::FlushResult {
-                flushed: true,
-                pending: 0,
-                accepted_sessions,
-            });
-        }
-    };
-    let mut conn = Conn::new(stream);
-    conn.initialize("managed-run-flush").await?;
-    let params = ManagedRunFlushParams {
-        managed_run_id: managed_run_id.to_string(),
-        timeout_ms,
-    };
-    conn.call(method::MANAGED_RUN_FLUSH, params).await
+    tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        let stream = match connect(socket).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                let accepted_sessions = journal::read_managed_run_keys(data_dir, managed_run_id)
+                    .await
+                    .len() as u64;
+                return Ok(wire::FlushResult {
+                    flushed: true,
+                    pending: 0,
+                    accepted_sessions,
+                });
+            }
+        };
+        let mut conn = Conn::new(stream);
+        conn.initialize("managed-run-flush").await?;
+        let params = ManagedRunFlushParams {
+            managed_run_id: managed_run_id.to_string(),
+            timeout_ms,
+        };
+        conn.call(method::MANAGED_RUN_FLUSH, params).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("managed run flush timed out after {timeout_ms}ms"))?
 }
 
 /// Query daemon status. `Ok(None)` means no daemon is running.

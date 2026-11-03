@@ -2620,6 +2620,33 @@ async fn idle_sessions_are_retired_and_can_resume_from_their_journal() {
     handle.abort();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_run_flush_times_out_when_daemon_does_not_reply() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("stalled.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (connection, _) = listener.accept().await.unwrap();
+        let (read, mut write) = connection.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let _initialize = lines.next_line().await.unwrap().unwrap();
+        write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol_version\":1,\"daemon_version\":\"test\"}}\n").await.unwrap();
+        let request = lines.next_line().await.unwrap().unwrap();
+        assert!(request.contains("managed_run.flush"));
+        std::future::pending::<()>().await;
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        flush_managed_run("test-run", &socket, 100),
+    )
+    .await
+    .expect("managed run flush must be bounded");
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    server.abort();
+}
+
 #[tokio::test]
 async fn managed_run_flush_is_scoped_to_its_accepted_sessions() {
     let (socket, handle, _flushes, tmp) = start_tracking_daemon("test").await;
