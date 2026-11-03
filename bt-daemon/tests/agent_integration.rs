@@ -558,12 +558,6 @@ async fn opencode_v2_session_emits_traces() {
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
     let workspace = world.workspace();
-    let mut version_command = support::agent_process::command(
-        std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
-    );
-    version_command.arg("--version");
-    let version = world.output(&mut version_command).await;
-    let legacy_v2 = String::from_utf8_lossy(&version.stdout).contains("v2.0.");
     let image = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==").unwrap();
     std::fs::write(workspace.join("image.png"), image).unwrap();
     let home = world.temp_path("opencode-v2-home");
@@ -793,106 +787,6 @@ async fn opencode_v2_session_emits_traces() {
         .await;
 
     std::fs::remove_file(plugins.join("interrupt.js")).unwrap();
-    // OpenCode 2.0 exposes compaction through its HTTP API rather than the
-    // in-process session API used by this fixture.
-    if !legacy_v2 {
-        std::fs::write(plugins.join("compact.js"), r#"export default { id: 'test.compact', async setup(ctx) { const c = new AbortController(); let queued = false; void (async () => { for await (const event of ctx.event.subscribe({signal:c.signal})) { if (event.type === 'session.inbox.delivered' && !queued) { queued = true; await ctx.session.compact({sessionID:event.data.sessionID,delivery:'queue'}); } } })().catch(() => {}); await ctx.session.hook('compaction', event => { event.result = {summary:'COMPACTION_SUMMARY'}; }); return () => c.abort(); } };"#).unwrap();
-        let mut compacted =
-            support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-        compacted
-            .args([
-                "run",
-                "--standalone",
-                "--auto",
-                "--model",
-                "mock/mock-model",
-                "compaction marker",
-            ])
-            .current_dir(&workspace)
-            .env("PWD", &workspace)
-            .env("HOME", &home)
-            .env("USERPROFILE", &home)
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_DATA_HOME", home.join("data"))
-            .env("XDG_CACHE_HOME", home.join("cache"));
-        world.configure(&mut compacted);
-        let output = world.output(&mut compacted).await;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let compaction_rows = world
-            .wait_for_mock_ingest_scenario(
-                &IngestScenario::new()
-                    .expect("compaction turn", |row| {
-                        row_contains(row, &["Turn 1", "compaction marker"])
-                    })
-                    .expect("compaction summary", |row| {
-                        row_contains(row, &[r#""type":"llm""#, "COMPACTION_SUMMARY"])
-                    }),
-            )
-            .await;
-        let turn = compaction_rows
-            .iter()
-            .find(|row| row_contains(row, &["Turn 1", "compaction marker"]))
-            .unwrap();
-        let root_id = &turn["root_span_id"];
-        let root = compaction_rows
-            .iter()
-            .find(|row| &row["span_id"] == root_id)
-            .unwrap();
-        let session_id = root["metadata"]["session_id"].as_str().unwrap();
-        std::fs::remove_file(plugins.join("compact.js")).unwrap();
-        let mut resumed =
-            support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-        resumed
-            .args([
-                "run",
-                "--standalone",
-                "--auto",
-                "--model",
-                "mock/mock-model",
-                "--session",
-                session_id,
-                "after compaction",
-            ])
-            .current_dir(&workspace)
-            .env("PWD", &workspace)
-            .env("HOME", &home)
-            .env("USERPROFILE", &home)
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_DATA_HOME", home.join("data"))
-            .env("XDG_CACHE_HOME", home.join("cache"));
-        world.configure(&mut resumed);
-        let output = world.output(&mut resumed).await;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let rows = world
-            .wait_for_mock_ingest_scenario(&IngestScenario::new().expect(
-                "post-compaction model input",
-                |row| {
-                    row["span_attributes"]["type"] == "llm"
-                        && row["input"].to_string().contains("COMPACTION_SUMMARY")
-                        && row["input"].to_string().contains("after compaction")
-                },
-            ))
-            .await;
-        let resumed_llm = rows
-            .iter()
-            .find(|row| {
-                row["span_attributes"]["type"] == "llm"
-                    && row["input"].to_string().contains("after compaction")
-            })
-            .unwrap();
-        assert!(!resumed_llm["input"]
-            .to_string()
-            .contains("compaction marker"));
-    }
-
     std::fs::write(plugins.join("image.js"), r#"export default { id:'test.image', async setup(ctx) { await ctx.tool.transform(editor => editor.add({name:'fixture_image',description:'Return an image',input:{type:'object',properties:{},additionalProperties:false},options:{codemode:false},async execute() { return {content:[{type:'file',mime:'image/png',uri:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg=='}]}; }})); } };"#).unwrap();
     let mut image_run =
         support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
@@ -1035,14 +929,8 @@ async fn opencode_v2_subagent_is_nested() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires OpenCode 2 and a built OpenCode package"]
-async fn opencode_v2_legacy_compaction_after_idle() {
+async fn opencode_v2_compaction_after_idle() {
     let binary = std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN");
-    let mut version = support::agent_process::command(&binary);
-    version.arg("--version");
-    let version = version.output().await.unwrap();
-    if !String::from_utf8_lossy(&version.stdout).contains("v2.0.") {
-        return;
-    }
     let inference = OpenAiMock::new(|_, _| MockReply::response(OpenAiTurn::text("LEGACY_TEXT")));
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
@@ -1100,7 +988,7 @@ async fn opencode_v2_legacy_compaction_after_idle() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(ready, "OpenCode 2.0 server did not start");
+    assert!(ready, "OpenCode 2 server did not start");
     let mut run = support::agent_process::command(&binary);
     run.args([
         "run",
@@ -1133,11 +1021,16 @@ async fn opencode_v2_legacy_compaction_after_idle() {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find_map(|event| event["sessionID"].as_str().map(str::to_owned))
         .expect("session ID");
-    world
+    let initial_rows = world
         .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("initial turn", |row| {
             row_contains(row, &["Turn 1", "legacy compaction"])
         }))
         .await;
+    let root_id = initial_rows
+        .iter()
+        .find(|row| row_contains(row, &["Turn 1", "legacy compaction"]))
+        .unwrap()["root_span_id"]
+        .clone();
     client
         .post(format!("{url}/api/session/{session_id}/compact"))
         .basic_auth("opencode", Some("integration-test-password"))
@@ -1147,11 +1040,15 @@ async fn opencode_v2_legacy_compaction_after_idle() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    world
+    let compacted_rows = world
         .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("idle compaction", |row| {
             row_contains(row, &[r#""type":"llm""#, "LEGACY_COMPACTION_SUMMARY"])
         }))
         .await;
+    assert!(compacted_rows.iter().any(|row| row_contains(
+        row,
+        &[r#""type":"llm""#, "LEGACY_COMPACTION_SUMMARY"]
+    ) && row["root_span_id"] == root_id));
     let mut resume = support::agent_process::command(&binary);
     resume
         .args([
@@ -1179,7 +1076,7 @@ async fn opencode_v2_legacy_compaction_after_idle() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    world
+    let resumed_rows = world
         .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("resumed context", |row| {
             row_contains(
                 row,
@@ -1191,6 +1088,23 @@ async fn opencode_v2_legacy_compaction_after_idle() {
             )
         }))
         .await;
+    let resumed_llm = resumed_rows
+        .iter()
+        .find(|row| {
+            row_contains(
+                row,
+                &[
+                    r#""type":"llm""#,
+                    "LEGACY_COMPACTION_SUMMARY",
+                    "legacy after compaction",
+                ],
+            )
+        })
+        .unwrap();
+    assert_eq!(resumed_llm["root_span_id"], root_id);
+    assert!(!resumed_llm["input"]
+        .to_string()
+        .contains("legacy compaction"));
     server.kill().await.unwrap();
     server.wait().await.unwrap();
 }
