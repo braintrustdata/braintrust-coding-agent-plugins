@@ -17,33 +17,32 @@ const PREFIXES: usize = 128;
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_RECORDS: usize = 64;
 
-pub(super) fn parse(bytes: &[u8]) -> anyhow::Result<Value> {
-    match serde_json::from_slice(bytes) {
-        Ok(value) => Ok(value),
-        Err(original) => {
-            // The storage wrapper must not reduce the native event's JSON
-            // depth allowance. Parse its raw envelope independently on this
-            // uncommon path, keeping the normal parser's recursion protection.
-            #[derive(Deserialize)]
-            struct Raw<'a> {
-                _bt_record_type: String,
-                #[serde(borrow)]
-                envelope: &'a serde_json::value::RawValue,
-                #[serde(default)]
-                _bt_history_refs: Vec<Reference>,
-            }
-            let raw: Raw<'_> = serde_json::from_slice(bytes).map_err(|_| original)?;
-            ensure!(
-                raw._bt_record_type == FORMAT,
-                "unsupported journal record format"
-            );
-            let envelope: Value = serde_json::from_str(raw.envelope.get())?;
-            Ok(
-                serde_json::json!({"_bt_record_type":FORMAT,"envelope":envelope,
-                "_bt_history_refs":raw._bt_history_refs}),
-            )
-        }
+pub(super) struct Record {
+    envelope: RedactedEnvelope,
+    references: Vec<Reference>,
+}
+
+pub(super) fn parse(bytes: &[u8]) -> anyhow::Result<Record> {
+    // Parse the envelope independently so the storage wrapper does not consume
+    // any of the native event's JSON depth allowance. This is the only path.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Raw<'a> {
+        _bt_record_type: super::RecordKind,
+        #[serde(borrow)]
+        envelope: &'a serde_json::value::RawValue,
+        #[serde(default)]
+        _bt_history_refs: Vec<Reference>,
     }
+    let raw: Raw<'_> = serde_json::from_slice(bytes)?;
+    ensure!(
+        matches!(raw._bt_record_type, super::RecordKind::History),
+        "not a history record"
+    );
+    Ok(Record {
+        envelope: serde_json::from_str(raw.envelope.get())?,
+        references: raw._bt_history_refs,
+    })
 }
 
 #[derive(Clone)]
@@ -275,7 +274,9 @@ impl Encoder {
 }
 
 struct Cached {
-    value: Value,
+    source: String,
+    session_id: String,
+    payload: Value,
     bytes: usize,
     hash: [u8; 32],
 }
@@ -285,10 +286,14 @@ pub(super) struct Decoder {
     bytes: usize,
 }
 impl Decoder {
-    fn remember(&mut self, offset: u64, value: &Value, bytes: usize, hash: [u8; 32]) {
+    fn remember(&mut self, offset: u64, value: &RedactedEnvelope, hash: [u8; 32]) {
         if self.records.iter().any(|(key, _)| *key == offset) {
             return;
         }
+        let bytes = crate::wire::retained_json_bytes(&value.payload) as usize
+            + value.source.len()
+            + value.session_id.len()
+            + std::mem::size_of::<Cached>();
         // One oversized event travels alone, as on the live SpanOp feed.
         while !self.records.is_empty()
             && (self.bytes.saturating_add(bytes) > CACHE_BYTES
@@ -301,7 +306,9 @@ impl Decoder {
         self.records.push_back((
             offset,
             Cached {
-                value: value.clone(),
+                source: value.source.clone(),
+                session_id: value.session_id.clone(),
+                payload: value.payload.clone(),
                 bytes,
                 hash,
             },
@@ -312,7 +319,7 @@ impl Decoder {
         file: &mut std::fs::File,
         offset: u64,
         limit: u64,
-    ) -> anyhow::Result<(Value, [u8; 32])> {
+    ) -> anyhow::Result<(Record, [u8; 32])> {
         ensure!(offset < limit, "history reference is not backward");
         if offset > 0 {
             file.seek(std::io::SeekFrom::Start(offset - 1))?;
@@ -332,31 +339,26 @@ impl Decoder {
     }
     pub(super) fn expand(
         &mut self,
-        mut value: Value,
+        record: Record,
         file_path: &Path,
         offset: u64,
         hash: [u8; 32],
-    ) -> anyhow::Result<Value> {
-        let references: Vec<Reference> = value
-            .get("_bt_history_refs")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default();
+    ) -> anyhow::Result<RedactedEnvelope> {
+        let Record {
+            envelope: mut value,
+            references,
+        } = record;
         let mut stored_paths = Vec::new();
-        paths(&value["envelope"]["payload"], "/payload", &mut stored_paths);
+        paths(&value.payload, "", &mut stored_paths);
         // Empty suffixes cannot become new writer bases. Keep their actual
         // referenced heads hot instead of caching duplicate complete histories.
         let cacheable = stored_paths.iter().any(|path| {
-            value["envelope"]
+            value
+                .payload
                 .pointer(path)
                 .and_then(Value::as_array)
                 .is_some_and(|a| !a.is_empty())
         });
-        let mut value = value
-            .as_object_mut()
-            .and_then(|object| object.remove("envelope"))
-            .context("missing history envelope")?;
         let mut file = None;
         let mut seen = Vec::<String>::new();
         for reference in references {
@@ -371,6 +373,10 @@ impl Decoder {
                 "overlapping history references"
             );
             seen.push(reference.path.clone());
+            let pointer = reference
+                .path
+                .strip_prefix("/payload")
+                .context("history reference outside payload")?;
             ensure!(
                 reference.base < offset && reference.keep > 0,
                 "invalid history reference range"
@@ -384,13 +390,12 @@ impl Decoder {
                 if let Some(index) = self.records.iter().position(|(key, _)| *key == base) {
                     let record = &mut self.records[index].1;
                     ensure!(
-                        record.value["source"] == value["source"]
-                            && record.value["session_id"] == value["session_id"],
+                        record.source == value.source && record.session_id == value.session_id,
                         "history reference crossed its cached stream"
                     );
                     let messages = record
-                        .value
-                        .pointer(&reference.path)
+                        .payload
+                        .pointer(pointer)
                         .and_then(Value::as_array)
                         .context("cached history is not an array")?;
                     ensure!(count <= messages.len(), "history prefix exceeds cache");
@@ -416,22 +421,17 @@ impl Decoder {
                     "history record checksum mismatch"
                 );
                 ensure!(
-                    record["_bt_record_type"] == FORMAT
-                        && record["envelope"]["source"] == value["source"]
-                        && record["envelope"]["session_id"] == value["session_id"],
+                    record.envelope.source == value.source
+                        && record.envelope.session_id == value.session_id,
                     "history reference crossed its stream"
                 );
-                let messages = record["envelope"]
-                    .pointer(&reference.path)
+                let messages = record
+                    .envelope
+                    .payload
+                    .pointer(pointer)
                     .and_then(Value::as_array)
                     .context("history reference target is not an array")?;
-                let refs: Vec<Reference> = record
-                    .get("_bt_history_refs")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()?
-                    .unwrap_or_default();
-                if let Some(parent) = refs.iter().find(|r| r.path == reference.path) {
+                if let Some(parent) = record.references.iter().find(|r| r.path == reference.path) {
                     ensure!(
                         parent.base < base && parent.keep > 0,
                         "invalid history dependency"
@@ -452,7 +452,8 @@ impl Decoder {
                 }
             }
             let suffix = value
-                .pointer_mut(&reference.path)
+                .payload
+                .pointer_mut(pointer)
                 .and_then(Value::as_array_mut)
                 .context("history suffix is not an array")?;
             let mut prefix: Vec<_> = parts.into_iter().rev().flatten().collect();
@@ -460,8 +461,7 @@ impl Decoder {
             *suffix = prefix;
         }
         if cacheable {
-            let bytes = crate::wire::retained_json_bytes(&value) as usize;
-            self.remember(offset, &value, bytes, hash);
+            self.remember(offset, &value, hash);
         }
         Ok(value)
     }
@@ -487,6 +487,40 @@ mod tests {
         json!({"role":"user","content":format!("{index} {}", "unicode 📚\n".repeat(128))})
     }
 
+    #[test]
+    fn record_structure_is_validated_before_recovery() {
+        let valid = json!({"_bt_record_type":FORMAT,"envelope":event(vec![]).redacted(),
+            "_bt_history_refs":[{"path":"/payload/messages","base":0,"keep":1,"hash":"abc"}]});
+        assert!(parse(&serde_json::to_vec(&valid).unwrap()).is_ok());
+        for (pointer, wrong) in [
+            ("/_bt_record_type", json!(null)),
+            ("/_bt_record_type", json!("event_history_v1")),
+            ("/envelope", json!({})),
+            ("/envelope", json!(null)),
+            ("/envelope/source", json!(42)),
+            ("/envelope/session_id", json!(null)),
+            ("/envelope/ts_ms", json!("now")),
+            ("/_bt_history_refs", json!({})),
+            ("/_bt_history_refs/0/base", json!(-1)),
+            ("/_bt_history_refs/0/keep", json!("1")),
+        ] {
+            let mut bad = valid.clone();
+            *bad.pointer_mut(pointer).unwrap() = wrong;
+            assert!(
+                parse(&serde_json::to_vec(&bad).unwrap()).is_err(),
+                "{pointer}"
+            );
+        }
+        for field in ["source", "session_id", "event", "ts_ms", "payload"] {
+            let mut bad = valid.clone();
+            bad["envelope"].as_object_mut().unwrap().remove(field);
+            assert!(
+                parse(&serde_json::to_vec(&bad).unwrap()).is_err(),
+                "{field}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn storage_wrapping_preserves_the_native_json_depth_allowance() {
         let dir = tempfile::tempdir().unwrap();
@@ -496,7 +530,7 @@ mod tests {
         let mut deepest = env.clone();
         loop {
             env.payload["nested"] = json!([env.payload.get("nested").cloned()]);
-            if serde_json::from_slice::<Value>(&serde_json::to_vec(&env).unwrap()).is_err() {
+            if serde_json::from_slice::<Envelope>(&serde_json::to_vec(&env).unwrap()).is_err() {
                 break;
             }
             deepest = env.clone();
@@ -504,7 +538,6 @@ mod tests {
         let first = writer.append(&deepest).await.unwrap();
         writer.append(&deepest).await.unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert!(serde_json::from_slice::<Value>(&bytes[..first as usize]).is_err());
         let mut reader = JournalReader::open(&path, writer.position())
             .await
             .unwrap()
@@ -520,7 +553,7 @@ mod tests {
         let recovered = Decoder::default()
             .expand(record, &path, first, record_hash(&bytes[first as usize..]))
             .unwrap();
-        assert_eq!(recovered["payload"], deepest.payload);
+        assert_eq!(recovered.payload, deepest.payload);
     }
 
     #[test]
@@ -551,8 +584,8 @@ mod tests {
             r#"{{"_bt_record_type":"{FORMAT}","envelope":{{"source":"muse","session_id":"test","event":"native","ts_ms":1,"payload":{{"messages":[{{"z":1e+00,"a":"text"}}]}}}}}}"#
         );
         let value = parse(base.as_bytes()).unwrap();
-        let expected = value["envelope"]["payload"].clone();
-        let mut next = value.clone();
+        let expected = value.envelope.payload.clone();
+        let mut next: Value = serde_json::from_str(&base).unwrap();
         next["envelope"]["payload"]["messages"] = json!([]);
         next["_bt_history_refs"] = json!([{"path":"/payload/messages","base":0,
             "keep":1,"hash":hex(record_hash(base.as_bytes()))}]);
@@ -568,8 +601,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             Decoder::default()
-                .expand(next.clone(), &path, offset, record_hash(&next_bytes))
-                .unwrap()["payload"],
+                .expand(
+                    parse(&next_bytes).unwrap(),
+                    &path,
+                    offset,
+                    record_hash(&next_bytes)
+                )
+                .unwrap()
+                .payload,
             expected
         );
         let mut reader = JournalReader::open(&path, std::fs::metadata(&path).unwrap().len())
@@ -585,7 +624,12 @@ mod tests {
         // A valid JSON edit must still invalidate the reference's checksum.
         std::fs::write(&path, format!("{}\n", base.replace("text", "edit"))).unwrap();
         assert!(Decoder::default()
-            .expand(next, &path, offset, record_hash(&next_bytes))
+            .expand(
+                parse(&next_bytes).unwrap(),
+                &path,
+                offset,
+                record_hash(&next_bytes)
+            )
             .is_err());
     }
 
@@ -644,13 +688,13 @@ mod tests {
             // No warmed decoder state: every reference must work from disk.
             let value = Decoder::default()
                 .expand(
-                    serde_json::from_str(line).unwrap(),
+                    parse(line.as_bytes()).unwrap(),
                     &path,
                     offset,
                     record_hash(line.as_bytes()),
                 )
                 .unwrap();
-            assert_eq!(&value["payload"], expected);
+            assert_eq!(&value.payload, expected);
             offset += line.len() as u64;
         }
         let mut reader = JournalReader::open(&path, writer.position())
@@ -780,12 +824,22 @@ mod tests {
             warm.next_entry().await.unwrap().unwrap();
         }
         for value in bad {
-            assert!(Decoder::default()
-                .expand(value.clone(), &path, offset, record_hash(b"test"))
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert!(parse(&bytes)
+                .and_then(|record| Decoder::default().expand(
+                    record,
+                    &path,
+                    offset,
+                    record_hash(&bytes)
+                ))
                 .is_err());
-            assert!(warm
-                .histories
-                .expand(value, &path, offset, record_hash(b"test"))
+            assert!(parse(&bytes)
+                .and_then(|record| warm.histories.expand(
+                    record,
+                    &path,
+                    offset,
+                    record_hash(&bytes)
+                ))
                 .is_err());
         }
     }

@@ -524,6 +524,19 @@ impl JournalReader {
     }
 }
 
+#[derive(Default, Deserialize)]
+enum RecordKind {
+    #[default]
+    #[serde(skip_deserializing)]
+    Legacy,
+    #[serde(rename = "delivery_checkpoint")]
+    DeliveryCheckpoint,
+    #[serde(rename = "pipeline_control")]
+    Control,
+    #[serde(rename = "event_history_v2")]
+    History,
+}
+
 fn decode_record(
     bytes: &[u8],
     path: &Path,
@@ -538,53 +551,42 @@ fn decode_record(
     if line.is_empty() {
         return Ok(None);
     }
-    let value: serde_json::Value = history::parse(line.as_bytes())
+    #[derive(Deserialize)]
+    struct Header {
+        #[serde(rename = "_bt_record_type", default)]
+        kind: RecordKind,
+    }
+    let header: Header = serde_json::from_str(line)
         .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-    let record = if value
-        .get("_bt_record_type")
-        .and_then(serde_json::Value::as_str)
-        == Some("delivery_checkpoint")
-    {
-        let checkpoint: DeliveryCheckpointRecord = serde_json::from_value(value)
-            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-        JournalRecord::DeliveryCheckpoint {
-            route: checkpoint.route,
-            through: checkpoint.through,
+    let record = match header.kind {
+        RecordKind::DeliveryCheckpoint => {
+            let checkpoint: DeliveryCheckpointRecord = serde_json::from_str(line)?;
+            JournalRecord::DeliveryCheckpoint {
+                route: checkpoint.route,
+                through: checkpoint.through,
+            }
         }
-    } else if value
-        .get("_bt_record_type")
-        .and_then(serde_json::Value::as_str)
-        == Some("pipeline_control")
-    {
-        JournalRecord::Control(serde_json::from_value(value)?)
-    } else if value
-        .get("_bt_record_type")
-        .and_then(serde_json::Value::as_str)
-        == Some(history::FORMAT)
-    {
-        let expanded = histories.expand(
-            value,
-            path,
-            position - bytes.len() as u64,
-            history::record_hash(bytes),
-        )?;
-        let event: RedactedEnvelope = serde_json::from_value(expanded)?;
-        if event.source == "pi" && event.event == "context" {
-            // New contexts reconstruct independently; don't pin the last
-            // pre-upgrade history throughout the rest of a long recovery.
-            *pi_context = Vec::new();
+        RecordKind::Control => JournalRecord::Control(serde_json::from_str(line)?),
+        RecordKind::History => {
+            let event = histories.expand(
+                history::parse(line.as_bytes())?,
+                path,
+                position - bytes.len() as u64,
+                history::record_hash(bytes),
+            )?;
+            if event.source == "pi" && event.event == "context" {
+                // Release the last pre-upgrade context once recovery enters the new format.
+                *pi_context = Vec::new();
+            }
+            JournalRecord::Event(event)
         }
-        JournalRecord::Event(event)
-    } else {
-        anyhow::ensure!(
-            value.get("_bt_record_type").is_none(),
-            "unsupported journal record format"
-        );
-        let mut event = serde_json::from_value(value)
-            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-        expand_pi_payload(&mut event, pi_context)
-            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-        JournalRecord::Event(event)
+        RecordKind::Legacy => {
+            let mut event: RedactedEnvelope = serde_json::from_str(line)?;
+            expand_pi_payload(&mut event, pi_context).map_err(|error| {
+                anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no)
+            })?;
+            JournalRecord::Event(event)
+        }
     };
     Ok(Some(JournalRecordEntry {
         record,
@@ -655,21 +657,18 @@ fn expand_pi_payload(
         }
         return Ok(());
     };
-    let common_prefix = delta
-        .get("common_prefix")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or_else(|| anyhow::anyhow!("invalid Pi context common prefix"))?;
+    #[derive(Deserialize)]
+    struct MessagesDelta {
+        common_prefix: usize,
+        suffix: Vec<serde_json::Value>,
+    }
+    let delta: MessagesDelta = serde_json::from_value(delta)?;
     anyhow::ensure!(
-        common_prefix <= previous.len(),
+        delta.common_prefix <= previous.len(),
         "Pi context common prefix exceeds prior context"
     );
-    let suffix = delta
-        .get("suffix")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("invalid Pi context suffix"))?;
-    previous.truncate(common_prefix);
-    previous.extend(suffix.iter().cloned());
+    previous.truncate(delta.common_prefix);
+    previous.extend(delta.suffix);
     native.insert(
         "messages".into(),
         serde_json::Value::Array(previous.clone()),
@@ -797,6 +796,34 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_record_discriminators_cannot_fall_through_to_legacy_events() {
+        let event = serde_json::json!({"source":"muse","session_id":"test",
+            "event":"native","ts_ms":1,"payload":{}});
+        let decode = |value: &serde_json::Value| {
+            let bytes = serde_json::to_vec(value).unwrap();
+            decode_record(
+                &bytes,
+                Path::new("unused.ndjson"),
+                1,
+                bytes.len() as u64,
+                &mut Vec::new(),
+                &mut history::Decoder::default(),
+            )
+        };
+        assert!(decode(&event).is_ok());
+        for kind in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!("Legacy"),
+            serde_json::json!("unknown"),
+        ] {
+            let mut invalid = event.clone();
+            invalid["_bt_record_type"] = kind;
+            assert!(decode(&invalid).is_err());
+        }
+    }
 
     fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
         Envelope {
