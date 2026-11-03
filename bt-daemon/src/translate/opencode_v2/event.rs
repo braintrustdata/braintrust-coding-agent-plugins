@@ -116,6 +116,12 @@ pub(super) struct Prompt {
     pub text: String,
     #[serde(default)]
     pub files: Vec<PromptFile>,
+    #[serde(default)]
+    pub skills: Vec<PromptSkill>,
+}
+#[derive(Deserialize)]
+pub(super) struct PromptSkill {
+    pub name: String,
 }
 #[derive(Deserialize)]
 pub(super) struct PromptFile {
@@ -127,6 +133,7 @@ pub(super) struct Model {
     pub id: Option<String>,
     #[serde(rename = "providerID")]
     pub provider_id: Option<String>,
+    pub variant: Option<String>,
 }
 #[derive(Deserialize)]
 pub(super) struct StepStarted {

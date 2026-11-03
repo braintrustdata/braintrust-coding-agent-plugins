@@ -985,7 +985,7 @@ fn opencode_v2_reduces_native_text_session_without_session_created() {
         (
             "session.inbox.enqueued",
             1,
-            json!({"sessionID":"native", "inboxID":"user-1", "item":{"type":"user", "payload":{"text":"hello", "files":[]}, "delivery":"steer"}}),
+            json!({"sessionID":"native", "inboxID":"user-1", "item":{"type":"user", "payload":{"text":"hello", "files":[],"skills":[{"id":"s1","name":"review"}]}, "delivery":"steer"}}),
         ),
         (
             "session.inbox.delivered",
@@ -995,7 +995,7 @@ fn opencode_v2_reduces_native_text_session_without_session_created() {
         (
             "session.step.started",
             3,
-            json!({"sessionID":"native", "assistantMessageID":"assistant-1", "model":{"id":"mock-model", "providerID":"mock"}, "started":2}),
+            json!({"sessionID":"native", "assistantMessageID":"assistant-1", "model":{"id":"mock-model", "providerID":"mock","variant":"high"}, "started":2}),
         ),
         (
             "session.text.ended",
@@ -1032,11 +1032,16 @@ fn opencode_v2_reduces_native_text_session_without_session_created() {
     let rows = reduce(ops);
     let turn = rows.values().find(|r| r.name == "Turn 1").unwrap();
     assert_eq!(turn.input, Some(json!("hello")));
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["loaded_skill_names"],
+        json!(["review"])
+    );
     let llm = rows
         .values()
         .find(|r| r.span_type == SpanType::Llm)
         .unwrap();
     assert_eq!(llm.name, "mock/mock-model");
+    assert_eq!(llm.metadata.as_ref().unwrap()["variant"], "high");
     assert_eq!(
         llm.output,
         Some(json!([{"role":"assistant","content":"world!"}]))
@@ -1287,5 +1292,234 @@ fn opencode_v2_compaction_preserves_native_model_context_after_resume() {
         Some(
             json!([{"role":"system","content":"system"},{"role":"user","content":"summary"},{"role":"user","content":"next"}])
         )
+    );
+}
+
+#[test]
+fn opencode_v2_distinguishes_denied_and_failed_tools() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"native","inboxID":"u","item":{"type":"user","payload":{"text":"run"}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"native","inboxID":"u"}),
+        ),
+        (
+            "session.tool.input.started",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"denied","name":"read"}),
+        ),
+        (
+            "session.tool.called",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"denied","input":{"path":"secret"}}),
+        ),
+        (
+            "permission.asked",
+            json!({"sessionID":"native","id":"p1","action":"read","source":{"id":"denied"}}),
+        ),
+        (
+            "permission.replied",
+            json!({"sessionID":"native","requestID":"p1","reply":"reject"}),
+        ),
+        (
+            "session.tool.failed",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"denied","error":{"type":"permission.rejected","message":"denied"}}),
+        ),
+        (
+            "session.tool.input.started",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"failed","name":"read"}),
+        ),
+        (
+            "session.tool.called",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"failed","input":{"path":"missing"}}),
+        ),
+        (
+            "session.tool.failed",
+            json!({"sessionID":"native","assistantMessageID":"m","id":"failed","error":{"type":"error","message":"not found"}}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        let mut e = event(
+            name,
+            i as i64 + 1,
+            json!({"id":format!("v2-{i}"),"data":data}),
+        );
+        e.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let tools: Vec<_> = rows
+        .values()
+        .filter(|row| row.span_type == SpanType::Tool)
+        .collect();
+    assert_eq!(tools.len(), 2);
+    let denied = tools
+        .iter()
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .is_some_and(|m| m["call_id"] == "denied")
+        })
+        .unwrap();
+    assert_eq!(denied.metadata.as_ref().unwrap()["tool_approval"], "denied");
+    let failed = tools
+        .iter()
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .is_some_and(|m| m["call_id"] == "failed")
+        })
+        .unwrap();
+    assert_eq!(failed.error.as_deref(), Some("not found"));
+    assert_eq!(
+        failed.metadata.as_ref().unwrap()["tool_approval"],
+        "approved"
+    );
+}
+
+#[test]
+fn opencode_v2_compaction_keeps_native_tail_without_context_hook() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"s","inboxID":"old","item":{"type":"user","payload":{"text":"old"}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"s","inboxID":"old"}),
+        ),
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"s","inboxID":"keep","item":{"type":"user","payload":{"text":"keep"}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"s","inboxID":"keep"}),
+        ),
+        (
+            "session.compaction.started",
+            json!({"sessionID":"s","inputID":"compact"}),
+        ),
+        (
+            "session.compaction.ended",
+            json!({"sessionID":"s","text":"summary"}),
+        ),
+        (
+            "session.step.started",
+            json!({"sessionID":"s","assistantMessageID":"m","model":{"id":"model","providerID":"test"}}),
+        ),
+        (
+            "session.text.ended",
+            json!({"sessionID":"s","assistantMessageID":"m","ordinal":0,"text":"answer"}),
+        ),
+        (
+            "session.step.ended",
+            json!({"sessionID":"s","assistantMessageID":"m"}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        let mut envelope = event(
+            name,
+            i as i64 + 1,
+            json!({"id":format!("tail-{i}"),"metadata":{"keepID":"keep"},"data":data}),
+        );
+        envelope.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let llm = rows
+        .values()
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .is_some_and(|m| m["message_id"] == "m")
+        })
+        .unwrap();
+    assert_eq!(
+        llm.input,
+        Some(
+            json!([{"role":"assistant","content":"summary","message_type":"compaction_summary"},{"role":"user","content":"keep"}])
+        )
+    );
+    let compact = rows
+        .values()
+        .find(|row| {
+            row.tags
+                .as_ref()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "compaction"))
+        })
+        .unwrap();
+    assert_eq!(
+        compact.input,
+        Some(json!([{"role":"user","content":"old"}]))
+    );
+}
+
+#[test]
+fn opencode_v2_permission_denied_before_tool_call_creates_one_tool_span() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"s","inboxID":"u","item":{"type":"user","payload":{"text":"read"}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"s","inboxID":"u"}),
+        ),
+        (
+            "session.tool.input.started",
+            json!({"sessionID":"s","assistantMessageID":"m","id":"call","name":"read"}),
+        ),
+        (
+            "permission.asked",
+            json!({"sessionID":"s","id":"p","action":"read","source":{"id":"call"}}),
+        ),
+        (
+            "permission.replied",
+            json!({"sessionID":"s","requestID":"p","reply":"reject"}),
+        ),
+        (
+            "session.tool.failed",
+            json!({"sessionID":"s","assistantMessageID":"m","id":"call","error":{"type":"permission.rejected","message":"denied"}}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        let mut e = event(
+            name,
+            i as i64 + 1,
+            json!({"id":format!("permission-{i}"),"data":data}),
+        );
+        e.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let tools: Vec<_> = rows
+        .values()
+        .filter(|row| row.span_type == SpanType::Tool)
+        .collect();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "read");
+    assert_eq!(
+        tools[0].metadata.as_ref().unwrap()["tool_approval"],
+        "denied"
     );
 }
