@@ -938,14 +938,17 @@ pub(crate) mod tests {
             for event in &mut events {
                 event.payload["padding"] = serde_json::json!("é📚history".repeat(1024));
             }
-            let mut cases = vec![("live", 0), ("overflow", 2)];
+            let mut cases = vec![("journal", 0), ("live", 0), ("overflow", 2)];
+            cases.extend((1..events.len()).map(|split| ("gap", split)));
             cases.extend((1..=events.len()).map(|split| ("cold", split)));
             let mut expected = None;
             for (mode, split) in cases {
                 let mut f = SourceFixture::new(&agent).await;
                 let mut positions = vec![0];
-                for event in &events {
-                    positions.push(f.write(event, mode == "live" || mode == "overflow").await);
+                for (index, event) in events.iter().enumerate() {
+                    let live =
+                        mode == "live" || mode == "overflow" || (mode == "gap" && index != split);
+                    positions.push(f.write(event, live).await);
                 }
                 let tail = *positions.last().unwrap();
                 match mode {
@@ -964,6 +967,11 @@ pub(crate) mod tests {
                         assert!(f.options.input.take(positions[1], positions[2]).is_some());
                         f.poison(positions[2]..tail).await;
                     }
+                    "gap" => {
+                        // Rebuild decoder context after live input, then return
+                        // to live input without rereading its retained tail.
+                        f.poison(positions[split + 1]..tail).await;
+                    }
                     _ => {
                         f.process(positions[split]).await;
                         f.source.shutdown().await;
@@ -976,7 +984,9 @@ pub(crate) mod tests {
                 // StoredOp already includes the private correlation fields;
                 // compare its complete encoding rather than duplicate its codec.
                 let db = f.db();
-                let mut query = db.prepare("SELECT value FROM ops ORDER BY value").unwrap();
+                let mut query = db
+                    .prepare("SELECT value FROM ops ORDER BY position")
+                    .unwrap();
                 let rows: Vec<Vec<u8>> = query
                     .query_map([], |row| row.get(0))
                     .unwrap()

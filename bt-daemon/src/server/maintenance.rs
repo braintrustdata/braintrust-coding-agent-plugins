@@ -522,6 +522,10 @@ mod tests {
             .unwrap()
             .contains("next"));
         assert!(daemon.translations.lock().is_empty());
+        assert!(
+            daemon.source_inputs.lock().is_empty(),
+            "capture must retain live payloads only in the bounded ingress queue"
+        );
         let recovered = discover_unprocessed_journals(&daemon).await;
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].journal_through, old_end);
@@ -593,6 +597,15 @@ mod tests {
         ready.send(()).unwrap();
         daemon.settle_ingress().await;
         for (slot, env) in envs.iter().enumerate() {
+            // These sources may have no authenticated delivery actor. Wait for
+            // translation itself before inspecting its durable head.
+            daemon
+                .translation_for(env)
+                .await
+                .unwrap()
+                .barrier()
+                .await
+                .unwrap();
             let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
             let storage = tmp.path().join("pipeline").join(format!(
                 "{}.sqlite",

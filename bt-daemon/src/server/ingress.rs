@@ -63,7 +63,18 @@ pub(super) async fn drain_capture_buffer(daemon: &Arc<Daemon>) -> anyhow::Result
     loop {
         match daemon.next_capture_work() {
             CaptureWork::Evicted(bounds) => replay_evicted(daemon, &bounds).await?,
-            CaptureWork::Event(event) => dispatch_ingress_event(daemon, *event).await,
+            CaptureWork::Event(event) => {
+                daemon
+                    .source_input_for(&event.env.source, &event.env.session_id)
+                    .push_event(
+                        event.env.clone(),
+                        crate::pipeline::input::SourcePosition {
+                            before: event.replay_through,
+                            through: event.journal_through,
+                        },
+                    );
+                dispatch_ingress_event(daemon, *event).await;
+            }
             CaptureWork::Finished => return Ok(()),
         }
     }
@@ -349,19 +360,13 @@ impl Daemon {
             .journal_writer_for(&env.source, &env.session_id)
             .await
             .map_err(|error| format!("journal failed: {error}"))?;
-        let input = self.source_input_for(&env.source, &env.session_id);
         let (replay_through, journal_through) = {
             let mut writer = writer.lock().await;
-            // Storage is a side branch: it receives a copy and returns only
-            // durable position/context metadata. The stage receives the
-            // original complete event directly from capture.
             let position = self
                 .append_to_journal(&env, &mut writer)
                 .await
                 .map_err(|error| format!("journal failed: {error}"))?;
-            let bounds = (position.before, position.through);
-            input.push_event(env.clone(), position);
-            bounds
+            (position.before, position.through)
         };
         let event = PendingEvent {
             env,

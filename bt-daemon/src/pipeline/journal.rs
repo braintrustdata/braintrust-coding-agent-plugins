@@ -184,7 +184,20 @@ impl SpanJournal {
             std::fs::create_dir_all(parent)?;
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
-            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
+            // Concurrent WAL transitions can return BUSY without invoking
+            // SQLite's busy handler. Retry initialization within the same
+            // bound, before any schema transaction has started.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;") {
+                    Ok(()) => break,
+                    Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                        && std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             // Read the version under the same write transaction as every
             // upgrade, so another opener cannot run a stale migration plan.
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
