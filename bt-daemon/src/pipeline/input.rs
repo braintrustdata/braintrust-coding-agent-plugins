@@ -28,7 +28,25 @@ pub(crate) struct SourceRecord {
 
 impl SourceRecord {
     fn bytes(&self) -> u64 {
-        self.position.through.saturating_sub(self.position.before)
+        // Journal references can be tiny while the live payload is huge.
+        // Charge retained values, without serializing/copying their strings.
+        fn payload_bytes(value: &serde_json::Value) -> u64 {
+            std::mem::size_of::<serde_json::Value>() as u64
+                + match value {
+                    serde_json::Value::String(text) => text.len() as u64,
+                    serde_json::Value::Array(array) => array.iter().map(payload_bytes).sum(),
+                    serde_json::Value::Object(object) => object
+                        .iter()
+                        .map(|(key, value)| key.len() as u64 + 64 + payload_bytes(value))
+                        .sum(),
+                    _ => 0,
+                }
+        }
+        let stored = self.position.through.saturating_sub(self.position.before);
+        match &self.event {
+            SourceEvent::Event(event) => stored.max(payload_bytes(&event.payload)),
+            _ => stored,
+        }
     }
 }
 
@@ -98,7 +116,8 @@ mod tests {
     fn oversized_events_flow_alone_and_eviction_exposes_a_recovery_gap() {
         let input = SourceInput::default();
         let event: Envelope = serde_json::from_value(json!({"source":"debug","session_id":"direct","event":"native","ts_ms":1,"payload":{"history":"x".repeat(9 * 1024 * 1024)}})).unwrap();
-        let stride = 9 * 1024 * 1024;
+        // References have a small disk footprint but retain full live data.
+        let stride = 128;
         let position = |before| SourcePosition {
             before,
             through: before + stride,
