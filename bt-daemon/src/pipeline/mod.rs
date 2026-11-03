@@ -1,6 +1,7 @@
 //! Typed stage contracts and completion-preserving channel messages.
 
 pub(crate) mod delivery;
+pub(crate) mod input;
 pub(crate) mod live;
 pub(crate) mod plugins;
 pub(crate) mod prepare;

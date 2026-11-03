@@ -37,6 +37,16 @@ impl Daemon {
         &self,
         env: &Envelope,
     ) -> anyhow::Result<Arc<crate::pipeline::translation::Translation>> {
+        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
+        if let Some(source) = self.translations.lock().get(&storage_key).cloned() {
+            return Ok(source);
+        }
+        // Initialization owns one reducer per source. This lock covers only
+        // opening its SQLite head and spawning the actor, never capture/replay.
+        let _init = self.translation_init.lock().await;
+        if let Some(source) = self.translations.lock().get(&storage_key).cloned() {
+            return Ok(source);
+        }
         let event_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
         let namespace =
@@ -45,37 +55,29 @@ impl Daemon {
             {
                 env.session_id.clone()
             } else {
-                crate::ids::session_namespace(&env.source, &env.session_id)
+                storage_key.clone()
             };
-        let journal = self
+        let events = self
             .journal_writer_for(&env.source, &env.session_id)
             .await?;
-        let storage_key = crate::ids::session_namespace(&env.source, &env.session_id);
-        let existing = self.translations.lock().get(&storage_key).cloned();
-        Ok(match existing {
-            Some(translation) => translation,
-            None => {
-                let translation = crate::pipeline::translation::Translation::spawn(
-                    crate::pipeline::translation::TranslationOptions {
-                        source: env.source.clone(),
-                        session_id: env.session_id.clone(),
-                        namespace: namespace.clone(),
-                        version: self.version.clone(),
-                        data_dir: self.data_dir.clone(),
-                        events: journal.clone(),
-                        event_path: event_path.clone(),
-                        registry: self.translators.clone(),
-                        correlation: self.correlation.clone(),
-                        correlation_changed: self.correlation_changed.clone(),
-                    },
-                )
-                .await?;
-                self.translations
-                    .lock()
-                    .insert(storage_key, translation.clone());
-                translation
-            }
-        })
+        let source = crate::pipeline::translation::Translation::spawn(
+            crate::pipeline::translation::TranslationOptions {
+                source: env.source.clone(),
+                session_id: env.session_id.clone(),
+                namespace,
+                version: self.version.clone(),
+                data_dir: self.data_dir.clone(),
+                events,
+                event_path,
+                input: self.source_input_for(&env.source, &env.session_id),
+                registry: self.translators.clone(),
+                correlation: self.correlation.clone(),
+                correlation_changed: self.correlation_changed.clone(),
+            },
+        )
+        .await?;
+        self.translations.lock().insert(storage_key, source.clone());
+        Ok(source)
     }
 
     pub(super) async fn session_for(
@@ -182,6 +184,7 @@ impl Daemon {
     /// journal file for the rest of the daemon's life; deterministic span ids
     /// mean a late event simply rebuilds it from the journal.
     pub(super) async fn retire_session(&self, key: &DeliveryKey) {
+        self.ingress_barrier().await;
         self.observe_claude_transcripts(Some(key), false).await;
         self.ingress_barrier().await;
         let lock = self.dispatch_lock(&key.source, &key.session_id);
@@ -220,7 +223,19 @@ impl Daemon {
             self.claude_transcripts.lock().retain(|candidate, _| {
                 candidate.source != key.source || candidate.session_id != key.session_id
             });
-            self.journals.lock().remove(&storage_key);
+            self.journals.lock().remove(&journal::source_journal_path(
+                &self.data_dir,
+                &key.source,
+                &key.session_id,
+            ));
+            let mut inputs = self.source_inputs.lock();
+            if inputs
+                .get(&storage_key)
+                .is_some_and(|input| input.is_empty())
+            {
+                inputs.remove(&storage_key);
+            }
+            drop(inputs);
             self.translations.lock().remove(&storage_key);
             {
                 let mut locks = self.session_locks.lock();
@@ -231,9 +246,6 @@ impl Daemon {
                 }
             }
             self.dispatch_locks.lock().remove(&storage_key);
-            self.ingress_dispatched.lock().retain(|candidate, _| {
-                candidate.source != key.source || candidate.session_id != key.session_id
-            });
         }
         tracing::info!(session_id = %key.session_id, "session retired");
     }
@@ -255,30 +267,66 @@ impl Daemon {
         source: &str,
         session_id: &str,
     ) -> anyhow::Result<Arc<tokio::sync::Mutex<JournalWriter>>> {
-        let storage_key = crate::ids::session_namespace(source, session_id);
-        if let Some(writer) = self.journals.lock().get(&storage_key).cloned() {
-            return Ok(writer);
-        }
-        let path = journal::ensure_source_journal(&self.data_dir, source, session_id).await?;
-        let writer = Arc::new(tokio::sync::Mutex::new(
-            JournalWriter::open_path(&path).await?,
-        ));
-        Ok(self
+        let path = journal::source_journal_path(&self.data_dir, source, session_id);
+        let slot = self
             .journals
             .lock()
-            .entry(storage_key)
-            .or_insert_with(|| writer.clone())
-            .clone())
+            .entry(path.clone())
+            .or_default()
+            .clone();
+        // A recovery actor and capture may open the same source concurrently.
+        // Tail repair must finish exactly once before either can append.
+        let writer = slot
+            .get_or_try_init(|| async {
+                let path =
+                    journal::ensure_source_journal(&self.data_dir, source, session_id).await?;
+                let writer = JournalWriter::open_path(&path).await?;
+                Ok::<_, anyhow::Error>(Arc::new(tokio::sync::Mutex::new(writer)))
+            })
+            .await?;
+        Ok(writer.clone())
     }
 
-    pub(super) async fn append_to_journal(&self, env: &mut Envelope) -> anyhow::Result<(u64, u64)> {
-        let writer = self
-            .journal_writer_for(&env.source, &env.session_id)
-            .await?;
-        let mut writer = writer.lock().await;
+    /// Take only the durable append position, never hold the writer while
+    /// reading/replaying records. Recheck after metadata I/O if it opened meanwhile.
+    pub(super) async fn journal_snapshot(&self, path: &std::path::Path) -> u64 {
+        let slot = self.journals.lock().get(path).cloned();
+        if let Some(writer) = slot.and_then(|slot| slot.get().cloned()) {
+            return writer.lock().await.position();
+        }
+        let recorded = journal::JournalReader::recorded_len(path).await;
+        let slot = self.journals.lock().get(path).cloned();
+        if let Some(writer) = slot.and_then(|slot| slot.get().cloned()) {
+            recorded.min(writer.lock().await.position())
+        } else {
+            recorded
+        }
+    }
+
+    pub(super) fn source_input_for(
+        &self,
+        source: &str,
+        session_id: &str,
+    ) -> crate::pipeline::input::SourceInput {
+        self.source_inputs
+            .lock()
+            .entry(crate::ids::session_namespace(source, session_id))
+            .or_default()
+            .clone()
+    }
+
+    pub(super) async fn append_to_journal(
+        &self,
+        env: &Envelope,
+        writer: &mut JournalWriter,
+    ) -> anyhow::Result<crate::pipeline::input::SourcePosition> {
         let before = writer.position();
+        if let Some(cutoffs) = self.startup_cutoffs.lock().as_mut() {
+            let path = journal::source_journal_path(&self.data_dir, &env.source, &env.session_id);
+            cutoffs.entry(path).or_insert(before);
+        }
         let through = writer.append(env).await?;
-        Ok((before, through))
+        Ok(crate::pipeline::input::SourcePosition { before, through })
     }
 
     pub(super) fn session_lock(

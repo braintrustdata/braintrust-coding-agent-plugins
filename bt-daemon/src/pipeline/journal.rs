@@ -1,4 +1,8 @@
 //! Concrete durable channel: one ordered SpanOp log and a head per route.
+//!
+//! Tracking mutations acquire SQLite write access before reading. Deferred
+//! read-to-write upgrades can fail without waiting when another connection
+//! writes concurrently, even with a busy timeout.
 use super::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
 use super::{
     delivery::InputPort,
@@ -180,13 +184,27 @@ impl SpanJournal {
             std::fs::create_dir_all(parent)?;
             let db = Connection::open(path)?;
             db.busy_timeout(std::time::Duration::from_secs(5))?;
+            // Concurrent WAL transitions can return BUSY without invoking
+            // SQLite's busy handler. Retry initialization within the same
+            // bound, before any schema transaction has started.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;") {
+                    Ok(()) => break,
+                    Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                        && std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            // Read the version under the same write transaction as every
+            // upgrade, so another opener cannot run a stale migration plan.
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
             anyhow::ensure!(version <= 6, "unsupported SpanOp journal schema {version}");
-            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
             if version < 3 {
                 db.execute_batch(
-                    "BEGIN IMMEDIATE;
-                    CREATE TABLE IF NOT EXISTS batches (
+                    "CREATE TABLE IF NOT EXISTS batches (
                         input INTEGER PRIMARY KEY, committed INTEGER NOT NULL DEFAULT 0,
                         observation INTEGER NOT NULL DEFAULT 1);
                     CREATE TABLE IF NOT EXISTS ops (
@@ -205,16 +223,16 @@ impl SpanJournal {
                     )?;
                 }
                 db.execute_batch("ALTER TABLE heads ADD COLUMN binding TEXT")?;
-                db.execute_batch("PRAGMA user_version=3; COMMIT")?;
+                db.execute_batch("PRAGMA user_version=3")?;
             }
             if version < 4 {
-                db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE root_candidates (span_id TEXT PRIMARY KEY, value BLOB NOT NULL); PRAGMA user_version=4; COMMIT")?;
+                db.execute_batch("CREATE TABLE root_candidates (span_id TEXT PRIMARY KEY, value BLOB NOT NULL); PRAGMA user_version=4")?;
             }
             if version < 5 {
-                db.execute_batch("BEGIN IMMEDIATE; ALTER TABLE heads ADD COLUMN settings TEXT; ALTER TABLE heads ADD COLUMN settings_through INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=5; COMMIT")?;
+                db.execute_batch("ALTER TABLE heads ADD COLUMN settings TEXT; ALTER TABLE heads ADD COLUMN settings_through INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=5")?;
             }
             if version < 6 {
-                db.execute_batch("BEGIN IMMEDIATE;
+                db.execute_batch("
                     DELETE FROM ops WHERE input IN (SELECT input FROM batches WHERE committed=0);
                     CREATE TABLE receipts (input INTEGER NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(input,ordinal));
                     CREATE TABLE publication (id INTEGER PRIMARY KEY CHECK(id=1), tail INTEGER NOT NULL, floor INTEGER NOT NULL);
@@ -231,9 +249,10 @@ impl SpanJournal {
                     after = position;
                 }
                 prune(&db)?;
-                db.execute_batch("PRAGMA user_version=6; COMMIT")?;
+                db.execute_batch("PRAGMA user_version=6")?;
             }
             let tail = db.query_row("SELECT tail FROM publication WHERE id=1", [], |row| row.get(0))?;
+            db.execute_batch("COMMIT")?;
             Ok((db, tail))
         })
         .await??;
@@ -294,10 +313,9 @@ impl SpanJournal {
         .await
     }
 
-    /// Restart abandons only invisible receipts; a committed identity is never rewritten.
     pub async fn begin(&self, input: u64, observation: bool) -> anyhow::Result<bool> {
         self.with_db(move |db| {
-            let tx = db.transaction()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let done: Option<bool> = tx
                 .query_row(
                     "SELECT committed FROM batches WHERE input=?",
@@ -359,7 +377,8 @@ impl SpanJournal {
             let first = *ordinal;
             let positions = self
                 .with_db(move |db| {
-                    let tx = db.transaction()?;
+                    let tx =
+                        db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let mut positions = Vec::new();
                     let (committed, observation): (bool, bool) = tx.query_row(
                         "SELECT committed,observation FROM batches WHERE input=?",
@@ -472,7 +491,7 @@ impl SpanJournal {
             .map(StoredOp::encode)
             .collect::<anyhow::Result<Vec<_>>>()?;
         self.with_db(move |db| {
-            let tx = db.transaction()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let done: bool = tx.query_row(
                 "SELECT committed FROM batches WHERE input=?",
                 [input],
@@ -545,7 +564,7 @@ impl SpanJournal {
     ) -> anyhow::Result<u64> {
         let tail = self
             .with_db(move |db| {
-                let tx = db.transaction()?;
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let previous: u64 = tx.query_row(
                     "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
                     [],
@@ -602,7 +621,7 @@ impl SpanJournal {
         let key = route.clone();
         let position = self
             .with_db(move |db| {
-                let tx = db.transaction()?;
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // Auth can register a named-profile obligation before learning
                 // its stable ID. Move that unresolved placeholder to the resolved
                 // identity instead of leaving a second head that can never run.
@@ -819,7 +838,7 @@ impl SpanJournal {
     ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
         let route = route.clone();
         self.with_db(move |db| {
-            let tx = db.transaction()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let updates = {
                 let mut query = tx.prepare(
                     "SELECT route,failure,settings FROM heads WHERE failure IS NOT NULL AND settings_through<?",
@@ -1358,7 +1377,7 @@ impl Completion for HeadCompletion {
         let (route, expected, through) = (self.route.clone(), self.expected, self.through);
         self.journal
             .with_db(move |db| {
-                let tx = db.transaction()?;
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let head: u64 =
                     tx.query_row("SELECT position FROM heads WHERE route=?", [&route], |r| {
                         r.get(0)
@@ -1539,6 +1558,58 @@ mod tests {
             second.value()[0].as_ref()
         ));
         assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_opens_upgrade_one_schema_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("concurrent-upgrade.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0); PRAGMA user_version=1;").unwrap();
+        drop(db);
+        let ready = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let path = path.clone();
+            let ready = ready.clone();
+            tasks.push(tokio::spawn(async move {
+                ready.wait().await;
+                SpanJournal::open(&path).await
+            }));
+        }
+        let mut opened = Vec::new();
+        for task in tasks {
+            opened.push(task.await.unwrap().unwrap());
+        }
+        for journal in opened {
+            assert_eq!(journal.tail().await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn translation_begin_waits_for_a_concurrent_writer_before_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("concurrent.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let mut peer = Connection::open(&path).unwrap();
+        let transaction = peer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute("INSERT INTO batches(input,committed) VALUES(10,1)", [])
+            .unwrap();
+        let begin = tokio::spawn(async move { journal.begin(10, true).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let failed_early = begin.is_finished();
+        transaction.commit().unwrap();
+        assert!(
+            !begin.await.unwrap().unwrap(),
+            "a committed input must remain committed after waiting for its writer"
+        );
+        assert!(
+            !failed_early,
+            "a read-before-write transaction must wait rather than fail to upgrade its snapshot"
+        );
     }
 
     #[tokio::test]

@@ -70,10 +70,21 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         if tokio::fs::try_exists(&wal).await.unwrap_or(true) && !old(&wal, age).await {
             continue;
         }
+        // Scanning a large journal must not hold the capture lock. The length
+        // and route set are revalidated under that lock before deletion.
+        let Ok(partition) = crate::pipeline::journal::SpanJournal::open(&storage).await else {
+            continue;
+        };
+        let Ok(routes) = partition.routes().await else {
+            continue;
+        };
+        if !captured_routes_registered(&daemon.data_dir, &path, recorded, &routes).await {
+            continue;
+        }
         let lock = daemon.session_lock(&first.source, &first.session_id);
         let _guard = lock.lock().await;
         let namespace = crate::ids::session_namespace(&first.source, &first.session_id);
-        if daemon.journals.lock().contains_key(&namespace)
+        if daemon.journals.lock().contains_key(&path)
             || daemon.translations.lock().contains_key(&namespace)
         {
             continue;
@@ -81,19 +92,24 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         if journal::JournalReader::recorded_len(&path).await != recorded {
             continue;
         }
-        let Ok(partition) = crate::pipeline::journal::SpanJournal::open(&storage).await else {
+        let Ok(current_routes) = partition.routes().await else {
             continue;
         };
-        let Ok(routes) = partition.routes().await else {
+        let (Ok(current_routes), Ok(scanned_routes)) = (
+            serde_json::to_value(&current_routes),
+            serde_json::to_value(&routes),
+        ) else {
             continue;
         };
+        if current_routes != scanned_routes {
+            continue;
+        }
         let pending = daemon.pending_sessions.lock().values().any(|state| {
             state.events.iter().any(|event| {
                 event.env.source == first.source && event.env.session_id == first.session_id
             })
         });
-        if pending || !captured_routes_registered(&daemon.data_dir, &path, recorded, &routes).await
-        {
+        if pending {
             continue;
         }
 
@@ -269,6 +285,9 @@ pub(super) fn spawn_session_reaper(daemon: Arc<Daemon>, idle_timeout: Duration) 
 
 pub(super) fn spawn_gc(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
+        // Retention may scan old transcripts. Start it after recovery releases
+        // live ingress, so it cannot delay resuming an active source session.
+        collect_garbage(&daemon).await;
         loop {
             tokio::select! {
                 _ = daemon.shutdown.notified() => return,
@@ -313,6 +332,9 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     }
     daemon.begin_quiesce();
     let _capture_guard = daemon.capture_gate.write().await;
+    // Captures already acknowledged may still be waiting to register their
+    // transcript paths in ingress. Observe only after those have dispatched.
+    daemon.settle_ingress().await;
     daemon.observe_claude_transcripts(None, true).await;
     daemon.settle_ingress().await;
     if let Err(error) = resolve_pending_sessions(daemon, |_| true).await {
@@ -357,6 +379,7 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     daemon.sessions.lock().clear();
     daemon.translations.lock().clear();
     daemon.journals.lock().clear();
+    daemon.source_inputs.lock().clear();
     let (reply, done) = oneshot::channel();
     if daemon
         .ingress_tx
@@ -406,6 +429,17 @@ mod tests {
         wire::Envelope,
     };
 
+    #[allow(dead_code)]
+    mod distributed_fixture {
+        use crate as bt_daemon;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/distributed.rs"
+        ));
+    }
+
+    use super::super::recovery::tests::TestAuth;
+
     fn event(session: &str, route: SessionRoute) -> Envelope {
         Envelope {
             source: "debug".into(),
@@ -421,6 +455,295 @@ mod tests {
             source_version: None,
         }
     }
+
+    fn paused_ingress(root: &std::path::Path) -> (Arc<Daemon>, oneshot::Sender<()>) {
+        let (ready, startup) = oneshot::channel();
+        (
+            Daemon::new_with_startup(
+                debug_serve_options("test", root),
+                root.into(),
+                Some(startup),
+            ),
+            ready,
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_and_dispatch_share_one_source_producer() {
+        let f = crate::pipeline::translation::tests::SourceFixture::new("debug").await;
+        f.source.shutdown().await;
+        let (daemon, ready) = paused_ingress(&f.options.data_dir);
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+        let mut opening = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let daemon = daemon.clone();
+            let start = start.clone();
+            opening.spawn(async move {
+                start.wait().await;
+                daemon
+                    .translation_for(&event("checkpoint", SessionRoute::default()))
+                    .await
+                    .unwrap()
+            });
+        }
+        let first = opening.join_next().await.unwrap().unwrap();
+        while let Some(source) = opening.join_next().await {
+            assert!(
+                Arc::ptr_eq(&first, &source.unwrap()),
+                "source initialization must have one owner"
+            );
+        }
+        ready.send(()).unwrap();
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn capture_is_durable_during_startup_and_recovery_stops_before_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = event("resuming", SessionRoute::default());
+        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
+        let old_end = JournalWriter::open_path(&path)
+            .await
+            .unwrap()
+            .append(&env)
+            .await
+            .unwrap();
+        let (daemon, ready) = paused_ingress(tmp.path());
+        env.ts_ms = 2;
+        env.event = "next".into();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), daemon.capture_event(env))
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(tokio::fs::read_to_string(&path)
+            .await
+            .unwrap()
+            .contains("next"));
+        assert!(daemon.translations.lock().is_empty());
+        assert!(
+            daemon.source_inputs.lock().is_empty(),
+            "capture must retain live payloads only in the bounded ingress queue"
+        );
+        let recovered = discover_unprocessed_journals(&daemon).await;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].journal_through, old_end);
+        for event in recovered {
+            dispatch_ingress_event(&daemon, event).await;
+        }
+        drain_capture_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        daemon.settle_ingress().await;
+        let source = daemon.translations.lock().values().next().unwrap().clone();
+        assert!(source.barrier().await.unwrap() > 0);
+        let storage = tmp.path().join("pipeline").join(format!(
+            "{}.sqlite",
+            crate::ids::session_storage_id("debug", "resuming")
+        ));
+        let partition = crate::pipeline::journal::SpanJournal::open(&storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            partition.translated_through().await.unwrap(),
+            journal::JournalReader::recorded_len(&path).await
+        );
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_overflow_preserves_each_session_and_event_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (daemon, ready) = paused_ingress(tmp.path());
+        // Four journals interleave through two eviction ranges and a live tail.
+        let mut envs = Vec::new();
+        for source in ["debug", "pi"] {
+            for session in ["first", "second"] {
+                let mut env = event(session, SessionRoute::default());
+                env.source = source.into();
+                env.event = "context".into();
+                envs.push(env);
+            }
+        }
+        let mut first = None;
+        let total = 2 * INGRESS_QUEUE_CAPACITY + 12;
+        for index in 0..total {
+            let mut env = envs[index % envs.len()].clone();
+            env.ts_ms = index as i64;
+            env.payload = serde_json::json!({"index":index,"event":{"messages":[{"role":"user","content":"history".repeat(1024)},{"role":"assistant","content":index}]}});
+            daemon.capture_event(env).await.unwrap();
+            if index + 1 == 2 * INGRESS_QUEUE_CAPACITY {
+                let CaptureWork::Evicted(bounds) = daemon.next_capture_work() else {
+                    panic!("missing first eviction");
+                };
+                assert_eq!(bounds.len(), envs.len());
+                first = Some(bounds);
+            }
+        }
+        {
+            let buffer = daemon.capture_buffer.lock();
+            assert_eq!(buffer.events.len(), INGRESS_QUEUE_CAPACITY);
+            assert_eq!(
+                buffer.events.front().unwrap().env.payload["index"],
+                total - INGRESS_QUEUE_CAPACITY
+            );
+        }
+        replay_evicted(&daemon, &first.unwrap()).await.unwrap();
+        let CaptureWork::Evicted(second) = daemon.next_capture_work() else {
+            panic!("new captures must extend recovery");
+        };
+        replay_evicted(&daemon, &second).await.unwrap();
+        drain_capture_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        daemon.settle_ingress().await;
+        for (slot, env) in envs.iter().enumerate() {
+            // These sources may have no authenticated delivery actor. Wait for
+            // translation itself before inspecting its durable head.
+            daemon
+                .translation_for(env)
+                .await
+                .unwrap()
+                .barrier()
+                .await
+                .unwrap();
+            let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
+            let storage = tmp.path().join("pipeline").join(format!(
+                "{}.sqlite",
+                crate::ids::session_storage_id(&env.source, &env.session_id)
+            ));
+            let partition = crate::pipeline::journal::SpanJournal::open(&storage)
+                .await
+                .unwrap();
+            assert_eq!(
+                partition.translated_through().await.unwrap(),
+                journal::JournalReader::recorded_len(&path).await
+            );
+            let db = rusqlite::Connection::open(storage).unwrap();
+            let count: usize = db
+                .query_row(
+                    "SELECT count(*) FROM batches WHERE committed=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let expected: Vec<_> = (slot..total).step_by(envs.len()).collect();
+            assert_eq!(count, expected.len());
+            if env.source == "debug" {
+                let actual: Vec<_> = partition
+                    .read_after(0, total)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|(_, op)| {
+                        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                        row.input?.get("index")?.as_u64()
+                    })
+                    .collect();
+                assert_eq!(
+                    actual,
+                    expected.into_iter().map(|i| i as u64).collect::<Vec<_>>()
+                );
+            }
+        }
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_observes_transcript_registered_by_queued_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        tokio::fs::write(&transcript, b"{}\n").await.unwrap();
+        let (daemon, ready) = paused_ingress(tmp.path());
+        let mut env = event("late-transcript", SessionRoute::default());
+        env.source = "claude-code".into();
+        env.event = "Stop".into();
+        env.payload = serde_json::json!({"transcript_path": transcript});
+        daemon.capture_event(env.clone()).await.unwrap();
+        tokio::fs::write(&transcript, b"{}\n{}\n").await.unwrap();
+
+        let shutdown_daemon = daemon.clone();
+        let shutdown = tokio::spawn(async move { drain_all(&shutdown_daemon).await });
+        while !daemon.quiescing.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        drain_capture_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
+        let content = tokio::fs::read_to_string(path).await.unwrap();
+        assert!(
+            content.contains("TranscriptUpdate"),
+            "late transcript must be journaled before shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_overflow_preserves_parent_child_tool_order() {
+        use distributed_fixture::{AgentKind, DistributedFixtures, ProcessTree};
+        let tmp = tempfile::tempdir().unwrap();
+        let (ready, startup) = oneshot::channel();
+        let mut opts = debug_serve_options("test", tmp.path());
+        opts.auth_provider = Some(Arc::new(TestAuth));
+        let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup));
+        let mut fixtures = DistributedFixtures::new();
+        let parent = ProcessTree::root(1000);
+        let child = ProcessTree::child(1002, 1001, &parent);
+        let mut events =
+            fixtures.start_turn(AgentKind::OpenCode, "parent", &parent, "delegate", 100);
+        events.push(fixtures.open_tool(
+            AgentKind::OpenCode,
+            "parent",
+            &parent,
+            "tool",
+            "do work",
+            102,
+        ));
+        let child_events =
+            fixtures.start_turn(AgentKind::OpenCode, "child", &child, "do work", 103);
+        let child_key = automatic_link_key(&child_events[0]);
+        events.extend(child_events);
+        events.push(fixtures.close_tool(
+            AgentKind::OpenCode,
+            "parent",
+            &parent,
+            "tool",
+            "do work",
+            "done",
+            105,
+        ));
+        for env in events {
+            daemon.capture_event(env).await.unwrap();
+        }
+        for i in 0..INGRESS_QUEUE_CAPACITY {
+            let mut filler = event("filler", SessionRoute::default());
+            filler.ts_ms = i as i64;
+            daemon.capture_event(filler).await.unwrap();
+        }
+        drain_capture_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        daemon.settle_ingress().await;
+        let route = daemon
+            .automatic_links
+            .lock()
+            .get(&child_key)
+            .cloned()
+            .expect("child must be linked");
+        let Some(crate::wire::TraceDestination::ParentSpan { components }) = route.destination
+        else {
+            panic!("child was not attached to the parent tool");
+        };
+        let tool_id = crate::ids::span_id(
+            &crate::ids::session_namespace("opencode", "parent"),
+            "tool:parent:tool",
+        );
+        assert_eq!(components.span_id.as_deref(), Some(tool_id.as_str()));
+        drain_all(&daemon).await;
+    }
+
     #[tokio::test]
     async fn retention_requires_complete_inactive_partitions_and_nonempty_heads() {
         for scenario in [

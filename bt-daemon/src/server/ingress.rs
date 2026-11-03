@@ -3,9 +3,148 @@
 //! the journals as overflow when the queue is full.
 
 use super::*;
+use std::collections::VecDeque;
+/// Captures remain ordered and bounded. Evicted entries are
+/// already durable; their source journal's high-water mark is replayed first.
+#[derive(Default)]
+pub(super) struct CaptureBuffer {
+    pub(super) events: VecDeque<PendingEvent>,
+    pub(super) evicted: HashMap<PathBuf, EvictedRange>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EvictedRange {
+    pub(super) from: u64,
+    pub(super) through: u64,
+}
+
+impl CaptureBuffer {
+    fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) {
+        if self.events.len() == INGRESS_QUEUE_CAPACITY {
+            if let Some(oldest) = self.events.pop_front() {
+                let path = journal::source_journal_path(
+                    data_dir,
+                    &oldest.env.source,
+                    &oldest.env.session_id,
+                );
+                self.evicted
+                    .entry(path)
+                    .and_modify(|range| range.through = range.through.max(oldest.journal_through))
+                    .or_insert(EvictedRange {
+                        from: oldest.replay_through,
+                        through: oldest.journal_through,
+                    });
+            }
+        }
+        self.events.push_back(event);
+    }
+}
+
+pub(super) enum CaptureWork {
+    Evicted(HashMap<PathBuf, EvictedRange>),
+    Event(Box<PendingEvent>),
+    Finished,
+}
+
+impl Daemon {
+    pub(super) fn next_capture_work(&self) -> CaptureWork {
+        let mut buffer = self.capture_buffer.lock();
+        if !buffer.evicted.is_empty() {
+            return CaptureWork::Evicted(std::mem::take(&mut buffer.evicted));
+        }
+        if let Some(event) = buffer.events.pop_front() {
+            return CaptureWork::Event(Box::new(event));
+        }
+        CaptureWork::Finished
+    }
+}
+
+pub(super) async fn drain_capture_buffer(daemon: &Arc<Daemon>) -> anyhow::Result<()> {
+    loop {
+        match daemon.next_capture_work() {
+            CaptureWork::Evicted(bounds) => replay_evicted(daemon, &bounds).await?,
+            CaptureWork::Event(event) => {
+                daemon
+                    .source_input_for(&event.env.source, &event.env.session_id)
+                    .push_event(
+                        event.env.clone(),
+                        crate::pipeline::input::SourcePosition {
+                            before: event.replay_through,
+                            through: event.journal_through,
+                        },
+                    );
+                dispatch_ingress_event(daemon, *event).await;
+            }
+            CaptureWork::Finished => return Ok(()),
+        }
+    }
+}
+
+/// Read frozen evicted ranges in source order, merging by event timestamp as
+/// startup recovery does. Rebuild decoder context before each range.
+pub(super) async fn replay_evicted(
+    daemon: &Arc<Daemon>,
+    bounds: &HashMap<PathBuf, EvictedRange>,
+) -> anyhow::Result<()> {
+    let mut ready = Vec::new();
+    for (path, range) in bounds {
+        let mut reader = journal::JournalReader::resume(path, range.from, range.through).await?;
+        if let Some((timestamp, event)) =
+            next_evicted_event(daemon, &mut reader, range.through).await?
+        {
+            ready.push((timestamp, event, reader, range.through));
+        }
+    }
+    while let Some(index) = ready
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, item)| item.0)
+        .map(|(index, _)| index)
+    {
+        let (_, event, mut reader, through) = ready.swap_remove(index);
+        dispatch_ingress_event(daemon, event).await;
+        if let Some((timestamp, event)) = next_evicted_event(daemon, &mut reader, through).await? {
+            ready.push((timestamp, event, reader, through));
+        }
+    }
+    Ok(())
+}
+
+async fn next_evicted_event(
+    daemon: &Daemon,
+    reader: &mut journal::JournalReader,
+    through: u64,
+) -> anyhow::Result<Option<(i64, PendingEvent)>> {
+    while reader.position() < through {
+        let before = reader.position();
+        let entry = reader
+            .next_record()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("replay range ends inside a record"))?;
+        anyhow::ensure!(entry.through <= through, "invalid replay end boundary");
+        if let journal::JournalRecord::Event(redacted) = entry.record {
+            let mut env = journal::envelope_from_redacted(redacted);
+            let Some(source) = daemon.translators.canonical_source(&env.source) else {
+                continue;
+            };
+            env.source = source.to_owned();
+            return Ok(Some((
+                env.ts_ms,
+                PendingEvent {
+                    env,
+                    replay_through: before,
+                    journal_through: entry.through,
+                    settings_through: None,
+                },
+            )));
+        }
+    }
+    anyhow::ensure!(reader.position() == through, "invalid replay end boundary");
+    Ok(None)
+}
 
 pub(super) enum IngressMsg {
-    Event(Box<PendingEvent>),
+    Wake,
     Barrier(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
 }
@@ -14,34 +153,37 @@ pub(super) enum IngressMsg {
 /// journals become the overflow queue and the worker catches them up in place.
 pub(super) const INGRESS_QUEUE_CAPACITY: usize = 64;
 
-pub(super) fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::Receiver<IngressMsg>) {
+pub(super) fn spawn_ingress_worker(
+    daemon: Arc<Daemon>,
+    mut rx: mpsc::Receiver<IngressMsg>,
+    startup: Option<oneshot::Receiver<()>>,
+) {
     tokio::spawn(async move {
-        loop {
-            if daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
-                recover_ingress_overflow(&daemon).await;
-                continue;
+        if let Some(startup) = startup {
+            if startup.await.is_err() {
+                tracing::error!("startup recovery failed; stopping ingress");
+                daemon.trigger_shutdown();
+                return;
             }
-            let Some(msg) = rx.recv().await else {
-                break;
-            };
+        }
+        while let Some(msg) = rx.recv().await {
+            // The same queue drains before barriers and after ordinary wakes.
+            // Capture never waits for its reader, actors, or destinations.
+            if let Err(error) = drain_capture_buffer(&daemon).await {
+                tracing::error!(%error, "capture recovery failed; stopping ingress");
+                daemon.trigger_shutdown();
+                return;
+            }
             match msg {
+                IngressMsg::Wake => {}
+                IngressMsg::Barrier(reply) => {
+                    daemon.settle_session_actors().await;
+                    let _ = retry_pending_sessions(&daemon).await;
+                    let _ = reply.send(());
+                }
                 IngressMsg::Stop(reply) => {
                     let _ = reply.send(());
                     break;
-                }
-                IngressMsg::Event(event) => {
-                    dispatch_ingress_event(&daemon, *event).await;
-                }
-                IngressMsg::Barrier(reply) => {
-                    loop {
-                        daemon.settle_session_actors().await;
-                        let _ = retry_pending_sessions(&daemon).await;
-                        if !daemon.ingress_overflow.swap(false, Ordering::AcqRel) {
-                            break;
-                        }
-                        recover_ingress_overflow(&daemon).await;
-                    }
-                    let _ = reply.send(());
                 }
             }
         }
@@ -49,19 +191,9 @@ pub(super) fn spawn_ingress_worker(daemon: Arc<Daemon>, mut rx: mpsc::Receiver<I
 }
 
 pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingEvent) {
-    let ingress_key =
-        event.env.route.as_ref().and_then(|route| {
-            DeliveryKey::new(&event.env.source, &event.env.session_id, route).ok()
-        });
-    if ingress_key.as_ref().is_some_and(|key| {
-        daemon
-            .ingress_dispatched
-            .lock()
-            .get(key)
-            .is_some_and(|through| *through >= event.journal_through)
-    }) {
-        return;
-    }
+    // Startup discovery rebuilds these observations before this worker is
+    // released, so a historical event cannot overwrite a newer capture.
+    daemon.remember_claude_transcripts(&event.env);
 
     let journal_through = event.journal_through;
     // A child may arrive immediately after a parent's tool hook. Catch prior
@@ -74,17 +206,8 @@ pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingE
         daemon.settle_session_actors().await;
     }
     let source_env = event.env.clone();
-    match accept_event(daemon, event).await {
-        Ok(()) => {
-            if let Some(key) = ingress_key {
-                let mut dispatched = daemon.ingress_dispatched.lock();
-                let through = dispatched.entry(key).or_default();
-                *through = (*through).max(journal_through);
-            }
-        }
-        Err(error) => {
-            tracing::warn!(%error, "journaled ingress event could not be dispatched");
-        }
+    if let Err(error) = accept_event(daemon, event).await {
+        tracing::warn!(%error, "journaled ingress event could not be dispatched");
     }
     // Authentication and route discovery do not prevent canonical persistence.
     match daemon.translation_for(&source_env).await {
@@ -96,92 +219,6 @@ pub(super) async fn dispatch_ingress_event(daemon: &Arc<Daemon>, event: PendingE
         Err(error) => {
             tracing::warn!(%error,"source journal could not be opened; captured events retained")
         }
-    }
-}
-
-/// Drain events omitted from the bounded in-memory queue. The queue contains
-/// only a latency fast path; journals remain the complete source of ingress.
-pub(super) async fn recover_ingress_overflow(daemon: &Arc<Daemon>) {
-    let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
-        return;
-    };
-    let mut recovered = 0usize;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
-            continue;
-        }
-        let recorded_len = journal::JournalReader::recorded_len(&path).await;
-        let Ok(Some(mut checkpoints)) = journal::JournalReader::open(&path, recorded_len).await
-        else {
-            continue;
-        };
-        let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
-        while let Ok(Some(entry)) = checkpoints.next_record().await {
-            if let journal::JournalRecord::DeliveryCheckpoint { route, through } = entry.record {
-                let key = serde_json::to_string(&route).unwrap_or_default();
-                let acknowledged = acknowledged_by_route.entry(key).or_default();
-                *acknowledged = (*acknowledged).max(through);
-            }
-        }
-
-        let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded_len).await else {
-            continue;
-        };
-        let mut before = 0u64;
-        while let Ok(Some(entry)) = reader.next_record().await {
-            let through = entry.through;
-            let journal::JournalRecord::Event(redacted) = entry.record else {
-                before = through;
-                continue;
-            };
-            let mut env = journal::envelope_from_redacted(redacted);
-            let Some(source) = daemon.translators.canonical_source(&env.source) else {
-                before = through;
-                continue;
-            };
-            env.source = source.to_string();
-            let Some(route) = env.route.as_ref() else {
-                before = through;
-                continue;
-            };
-            let route_json = recovered_delivery_route(daemon, &env)
-                .await
-                .as_ref()
-                .and_then(|route| serde_json::to_string(route).ok())
-                .unwrap_or_else(|| serde_json::to_string(route).unwrap_or_default());
-            let key = match DeliveryKey::new(&env.source, &env.session_id, route) {
-                Ok(key) => key,
-                Err(_) => {
-                    before = through;
-                    continue;
-                }
-            };
-            let dispatched = daemon
-                .ingress_dispatched
-                .lock()
-                .get(&key)
-                .copied()
-                .unwrap_or(0);
-            let acknowledged = acknowledged_by_route.get(&route_json).copied().unwrap_or(0);
-            if through > dispatched.max(acknowledged) {
-                dispatch_ingress_event(
-                    daemon,
-                    PendingEvent {
-                        env,
-                        replay_through: before,
-                        journal_through: through,
-                        settings_through: None,
-                    },
-                )
-                .await;
-                recovered += 1;
-            }
-            before = through;
-        }
-    }
-    if recovered > 0 {
-        tracing::info!(recovered, "drained journal-backed ingress overflow");
     }
 }
 
@@ -318,25 +355,28 @@ impl Daemon {
 
     /// Caller holds the source-session capture lock; frozen observations enter
     /// the same durable queue as hooks without reacquiring that lock.
-    pub(super) async fn journal_and_enqueue(&self, mut env: Envelope) -> Result<bool, String> {
-        let (replay_through, journal_through) = self
-            .append_to_journal(&mut env)
+    pub(super) async fn journal_and_enqueue(&self, env: Envelope) -> Result<bool, String> {
+        let writer = self
+            .journal_writer_for(&env.source, &env.session_id)
             .await
             .map_err(|error| format!("journal failed: {error}"))?;
-        self.remember_claude_transcripts(&env);
-        match self
-            .ingress_tx
-            .try_send(IngressMsg::Event(Box::new(PendingEvent {
-                env,
-                replay_through,
-                journal_through,
-                settings_through: None,
-            }))) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.ingress_overflow.store(true, Ordering::Release);
-                tracing::debug!("ingress queue full; journal will be drained by daemon worker");
-            }
+        let (replay_through, journal_through) = {
+            let mut writer = writer.lock().await;
+            let position = self
+                .append_to_journal(&env, &mut writer)
+                .await
+                .map_err(|error| format!("journal failed: {error}"))?;
+            (position.before, position.through)
+        };
+        let event = PendingEvent {
+            env,
+            replay_through,
+            journal_through,
+            settings_through: None,
+        };
+        self.capture_buffer.lock().push(&self.data_dir, event);
+        match self.ingress_tx.try_send(IngressMsg::Wake) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!("journaled event will be recovered after daemon restart");
             }
