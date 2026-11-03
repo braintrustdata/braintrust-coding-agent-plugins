@@ -788,12 +788,14 @@ async fn opencode_v2_session_emits_traces() {
 
     std::fs::remove_file(plugins.join("interrupt.js")).unwrap();
     std::fs::write(plugins.join("image.js"), r#"export default { id:'test.image', async setup(ctx) { await ctx.tool.transform(editor => editor.add({name:'fixture_image',description:'Return an image',input:{type:'object',properties:{},additionalProperties:false},options:{codemode:false},async execute() { return {content:[{type:'file',mime:'image/png',uri:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg=='}]}; }})); } };"#).unwrap();
-    let mut image_run =
-        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    let mut image_run = support::agent_process::daemon_command();
     image_run
         .args([
             "run",
-            "--standalone",
+            "--project",
+            "agent-e2e",
+            "opencode",
+            "run",
             "--auto",
             "--model",
             "mock/mock-model",
@@ -805,7 +807,12 @@ async fn opencode_v2_session_emits_traces() {
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("OPENCODE_BIN", std::env::var_os("OPENCODE_V2_BIN").unwrap())
+        .env(
+            "BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC",
+            std::env::var_os("OPENCODE_V2_PLUGIN_DIR").unwrap(),
+        );
     world.configure(&mut image_run);
     let output = world.output(&mut image_run).await;
     assert!(
