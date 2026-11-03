@@ -71,6 +71,10 @@ impl AgentTestWorld {
         let project = std::env::var(PROJECT_ENV).unwrap_or_else(|_| "agent-e2e".into());
         std::fs::create_dir_all(&wrapper_dir).expect("create wrapper directory");
         std::fs::create_dir_all(&data_dir).expect("create daemon data directory");
+        // Keep daemon diagnostics available without an unread pipe that can
+        // fill and block the daemon during longer integration scenarios.
+        let daemon_stderr = std::fs::File::create(data_dir.join("daemon-stderr.log"))
+            .expect("create daemon stderr capture");
         std::fs::write(
             &config_path,
             serde_json::to_vec_pretty(&json!({
@@ -114,7 +118,7 @@ impl AgentTestWorld {
             .arg("0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(daemon_stderr))
             .kill_on_drop(true);
         if ingest_mode == TestBackendMode::Mock {
             command
