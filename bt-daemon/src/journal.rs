@@ -538,7 +538,7 @@ fn decode_record(
     if line.is_empty() {
         return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_str(line)
+    let value: serde_json::Value = history::parse(line.as_bytes())
         .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
     let record = if value
         .get("_bt_record_type")

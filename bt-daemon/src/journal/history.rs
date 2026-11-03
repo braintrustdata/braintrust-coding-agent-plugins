@@ -18,6 +18,35 @@ const PREFIXES: usize = 128;
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_RECORDS: usize = 64;
 
+pub(super) fn parse(bytes: &[u8]) -> anyhow::Result<Value> {
+    match serde_json::from_slice(bytes) {
+        Ok(value) => Ok(value),
+        Err(original) => {
+            // The storage wrapper must not reduce the native event's JSON
+            // depth allowance. Parse its raw envelope independently on this
+            // uncommon path, keeping the normal parser's recursion protection.
+            #[derive(Deserialize)]
+            struct Raw<'a> {
+                _bt_record_type: String,
+                #[serde(borrow)]
+                envelope: &'a serde_json::value::RawValue,
+                #[serde(default)]
+                _bt_history_refs: Vec<Reference>,
+            }
+            let raw: Raw<'_> = serde_json::from_slice(bytes).map_err(|_| original)?;
+            ensure!(
+                raw._bt_record_type == FORMAT,
+                "unsupported journal record format"
+            );
+            let envelope: Value = serde_json::from_str(raw.envelope.get())?;
+            Ok(
+                serde_json::json!({"_bt_record_type":FORMAT,"envelope":envelope,
+                "_bt_history_refs":raw._bt_history_refs}),
+            )
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Prefix {
     hash: [u8; 32],
@@ -388,7 +417,7 @@ impl Decoder {
         std::io::BufReader::new(std::io::Read::take(&mut *file, limit - offset))
             .read_until(b'\n', &mut line)?;
         ensure!(line.last() == Some(&b'\n'), "incomplete history reference");
-        Ok(serde_json::from_slice(&line)?)
+        parse(&line)
     }
     pub(super) fn expand(
         &mut self,
@@ -581,6 +610,42 @@ mod tests {
     }
     fn message(index: usize) -> Value {
         json!({"role":"user","content":format!("{index} {}", "unicode 📚\n".repeat(128))})
+    }
+
+    #[tokio::test]
+    async fn storage_wrapping_preserves_the_native_json_depth_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("depth.ndjson");
+        let mut writer = JournalWriter::open_path(&path).await.unwrap();
+        let mut env = event(vec![message(0)]);
+        let mut deepest = env.clone();
+        loop {
+            env.payload["nested"] = json!([env.payload.get("nested").cloned()]);
+            if serde_json::from_slice::<Value>(&serde_json::to_vec(&env).unwrap()).is_err() {
+                break;
+            }
+            deepest = env.clone();
+        }
+        let first = writer.append(&deepest).await.unwrap();
+        writer.append(&deepest).await.unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<Value>(&bytes[..first as usize]).is_err());
+        let mut reader = JournalReader::open(&path, writer.position())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                reader.next_entry().await.unwrap().unwrap().payload,
+                deepest.payload
+            );
+        }
+        // The backward-seek path must use the same depth allowance too.
+        let record = parse(&bytes[first as usize..]).unwrap();
+        let recovered = Decoder::default()
+            .expand(record, &path, first, bytes.len() - first as usize)
+            .unwrap();
+        assert_eq!(recovered["payload"], deepest.payload);
     }
 
     #[test]
