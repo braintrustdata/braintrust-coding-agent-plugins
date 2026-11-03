@@ -219,16 +219,37 @@ impl AgentTestWorld {
             ))
             .kill_on_drop(true);
         let mut child = command.spawn().expect("spawn agent command");
-        let status = tokio::time::timeout(Duration::from_secs(90), child.wait())
-            .await
-            .unwrap_or_else(|_| {
+        let status = match tokio::time::timeout(Duration::from_secs(90), child.wait()).await {
+            Ok(status) => status.expect("wait for agent command"),
+            Err(_) => {
+                let mut out = String::new();
+                let mut err = String::new();
+                let _ = stdout.rewind();
+                let _ = stderr.rewind();
+                let _ = stdout.read_to_string(&mut out);
+                let _ = stderr.read_to_string(&mut err);
+                #[cfg(unix)]
+                let processes = match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    self::command("ps")
+                        .args(["-eo", "pid,ppid,stat,comm"])
+                        .output(),
+                )
+                .await
+                {
+                    Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).into_owned(),
+                    _ => String::from("process listing unavailable"),
+                };
+                #[cfg(not(unix))]
+                let processes = String::from("process listing unavailable");
                 panic!(
-                    "agent command timed out: {program} {args:?}; {}; daemon files:\n{}",
+                    "agent command timed out: {program} {args:?} pid {:?}; stdout:\n{out}\nstderr:\n{err}\nprocesses:\n{processes}\n{}; daemon files:\n{}",
+                    child.id(),
                     self.collector.diagnostics(),
                     directory_contents(&self.data_dir)
-                )
-            })
-            .expect("wait for agent command");
+                );
+            }
+        };
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         stdout.rewind().expect("rewind stdout capture");
