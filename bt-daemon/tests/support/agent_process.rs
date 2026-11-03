@@ -194,6 +194,16 @@ impl AgentTestWorld {
     }
 
     pub async fn output(&self, command: &mut Command) -> std::process::Output {
+        let program = command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -201,7 +211,13 @@ impl AgentTestWorld {
         let child = command.spawn().expect("spawn agent command");
         tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())
             .await
-            .expect("agent command timed out")
+            .unwrap_or_else(|_| {
+                panic!(
+                    "agent command timed out: {program} {args:?}; {}; daemon files:\n{}",
+                    self.collector.diagnostics(),
+                    directory_contents(&self.data_dir)
+                )
+            })
             .expect("wait for agent command")
     }
 
