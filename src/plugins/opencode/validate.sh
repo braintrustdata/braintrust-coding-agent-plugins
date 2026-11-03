@@ -21,7 +21,7 @@ node -e '
   const parsed = JSON.parse(process.argv[1])
   const result = Array.isArray(parsed) ? parsed[0] : parsed
   const files = new Set(result.files.map((file) => file.path))
-  for (const required of ["dist/index.mjs", "dist/index.d.mts", "README.md", "LICENSE"]) {
+  for (const required of ["dist/index.mjs", "dist/index.d.mts", "dist/server.mjs", "dist/server.d.mts", "server.js", "README.md", "LICENSE"]) {
     if (!files.has(required)) throw new Error(`package omits ${required}`)
   }
   for (const file of files) {

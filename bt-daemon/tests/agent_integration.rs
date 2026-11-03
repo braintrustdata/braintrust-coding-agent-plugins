@@ -523,16 +523,33 @@ fn request_helpers_recognize_tool_results_and_advertised_tools() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires OpenCode 2 and a built OpenCode package"]
 async fn opencode_v2_session_emits_traces() {
+    use base64::Engine;
     let inference = OpenAiMock::new(|_, request| {
         let tools = request.body["tools"].as_array();
         let has_tool_result = request.body["messages"]
             .as_array()
             .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
         if tools.is_some() && !has_tool_result {
+            if request.contains_text("image tool marker") {
+                return MockReply::response(OpenAiTurn::tool_call(
+                    "call_image",
+                    "fixture_image",
+                    json!({}),
+                ));
+            }
+            let command = if request.contains_text("interrupt marker") {
+                if cfg!(windows) {
+                    "Start-Sleep -Seconds 30".to_string()
+                } else {
+                    "sleep 30".to_string()
+                }
+            } else {
+                tool_command("OPENCODE_V2_TOOL_OK")
+            };
             MockReply::response(OpenAiTurn::tool_call(
                 "call_v2",
                 "shell",
-                json!({"command":tool_command("OPENCODE_V2_TOOL_OK"),"description":"Print a marker"}),
+                json!({"command":command,"description":"Run a test command"}),
             ))
         } else {
             MockReply::response(OpenAiTurn::text("OPENCODE_V2_OK"))
@@ -541,6 +558,14 @@ async fn opencode_v2_session_emits_traces() {
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
     let workspace = world.workspace();
+    let mut version_command = support::agent_process::command(
+        std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
+    );
+    version_command.arg("--version");
+    let version = world.output(&mut version_command).await;
+    let legacy_v2 = String::from_utf8_lossy(&version.stdout).contains("v2.0.");
+    let image = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==").unwrap();
+    std::fs::write(workspace.join("image.png"), image).unwrap();
     let home = world.temp_path("opencode-v2-home");
     std::fs::create_dir_all(&home).unwrap();
     let config = json!({
@@ -563,6 +588,8 @@ async fn opencode_v2_session_emits_traces() {
             "--auto",
             "--model",
             "mock/mock-model",
+            "--file",
+            "image.png",
             "say hello",
         ])
         .current_dir(&workspace)
@@ -587,9 +614,16 @@ async fn opencode_v2_session_emits_traces() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        inference
+            .requests()
+            .iter()
+            .any(|request| request.contains_text("braintrust_list_projects")),
+        "Braintrust tools were not exposed to the managed OpenCode 2 run"
+    );
     let scenario = IngestScenario::new()
         .expect("v2 input", |row| {
-            row_contains(row, &["Turn 1", "say hello"])
+            row_contains(row, &["Turn 1", "say hello", "data:image/png;base64,"])
         })
         .expect("v2 tool", |row| {
             row_contains(row, &[r#""type":"tool""#, "OPENCODE_V2_TOOL_OK"])
@@ -597,7 +631,27 @@ async fn opencode_v2_session_emits_traces() {
         .expect("v2 LLM", |row| {
             row_contains(row, &[r#""type":"llm""#, "OPENCODE_V2_OK"])
         });
-    world.wait_for_mock_ingest_scenario(&scenario).await;
+    let rows = world.wait_for_mock_ingest_scenario(&scenario).await;
+    let final_llm = rows
+        .iter()
+        .find(|row| {
+            row["span_attributes"]["type"] == "llm"
+                && row["output"].to_string().contains("OPENCODE_V2_OK")
+        })
+        .unwrap();
+    assert!(
+        final_llm["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["tool_call_id"] == "call_v2"
+                && message["content"]
+                    .to_string()
+                    .contains("OPENCODE_V2_TOOL_OK")),
+        "unexpected model input: {}",
+        final_llm["input"]
+    );
 
     // Exercise the persistent plugin configuration separately from managed runs.
     let mut persistent_config = config.clone();
@@ -622,8 +676,8 @@ async fn opencode_v2_session_emits_traces() {
         support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
     persistent
         .args([
-            "--standalone",
             "run",
+            "--standalone",
             "--auto",
             "--model",
             "mock/mock-model",
@@ -655,4 +709,488 @@ async fn opencode_v2_session_emits_traces() {
             row_contains(row, &["Turn 1", "persistent marker"])
         }))
         .await;
+
+    persistent_config["permissions"] = json!([{"action":"shell","resource":"*","effect":"ask"}]);
+    std::fs::write(
+        workspace.join("opencode.json"),
+        serde_json::to_vec(&persistent_config).unwrap(),
+    )
+    .unwrap();
+    let plugins = workspace.join(".opencode/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(plugins.join("reject.js"), r#"export default { id: 'test.reject', setup(ctx) { const c = new AbortController(); void (async () => { for await (const event of ctx.event.subscribe({signal:c.signal})) { if (event.type === 'permission.asked') await ctx.permission.reply({sessionID:event.data.sessionID,requestID:event.data.id,decision:'reject',message:'test denied'}); } })().catch(() => {}); return () => c.abort(); } };"#).unwrap();
+    let mut rejected =
+        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    rejected
+        .args([
+            "run",
+            "--standalone",
+            "--model",
+            "mock/mock-model",
+            "permission marker",
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"));
+    world.configure(&mut rejected);
+    // OpenCode 2.0 exits nonzero after a rejection; later releases continue.
+    let _output = world.output(&mut rejected).await;
+    world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new()
+                .expect("permission turn", |row| {
+                    row_contains(row, &["Turn 1", "permission marker"])
+                })
+                .expect("denied shell", |row| {
+                    row["span_attributes"]["type"] == "tool"
+                        && row["metadata"]["tool_approval"] == "denied"
+                }),
+        )
+        .await;
+
+    std::fs::remove_file(plugins.join("reject.js")).unwrap();
+    std::fs::write(plugins.join("interrupt.js"), r#"export default { id: 'test.interrupt', setup(ctx) { const c = new AbortController(); void (async () => { for await (const event of ctx.event.subscribe({signal:c.signal})) { if (event.type === 'session.tool.called') await ctx.session.interrupt({sessionID:event.data.sessionID}); } })().catch(() => {}); return () => c.abort(); } };"#).unwrap();
+    persistent_config
+        .as_object_mut()
+        .unwrap()
+        .remove("permissions");
+    std::fs::write(
+        workspace.join("opencode.json"),
+        serde_json::to_vec(&persistent_config).unwrap(),
+    )
+    .unwrap();
+    let mut interrupted =
+        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    interrupted
+        .args([
+            "run",
+            "--standalone",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "interrupt marker",
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"));
+    world.configure(&mut interrupted);
+    let _output = world.output(&mut interrupted).await;
+    world
+        .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("interrupted turn", |row| {
+            row_contains(
+                row,
+                &["Turn 1", "interrupt marker", "OpenCode session interrupted"],
+            )
+        }))
+        .await;
+
+    std::fs::remove_file(plugins.join("interrupt.js")).unwrap();
+    // OpenCode 2.0 exposes compaction through its HTTP API rather than the
+    // in-process session API used by this fixture.
+    if !legacy_v2 {
+        std::fs::write(plugins.join("compact.js"), r#"export default { id: 'test.compact', async setup(ctx) { const c = new AbortController(); let queued = false; void (async () => { for await (const event of ctx.event.subscribe({signal:c.signal})) { if (event.type === 'session.inbox.delivered' && !queued) { queued = true; await ctx.session.compact({sessionID:event.data.sessionID,delivery:'queue'}); } } })().catch(() => {}); await ctx.session.hook('compaction', event => { event.result = {summary:'COMPACTION_SUMMARY'}; }); return () => c.abort(); } };"#).unwrap();
+        let mut compacted =
+            support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+        compacted
+            .args([
+                "run",
+                "--standalone",
+                "--auto",
+                "--model",
+                "mock/mock-model",
+                "compaction marker",
+            ])
+            .current_dir(&workspace)
+            .env("PWD", &workspace)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_CACHE_HOME", home.join("cache"));
+        world.configure(&mut compacted);
+        let output = world.output(&mut compacted).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let compaction_rows = world
+            .wait_for_mock_ingest_scenario(
+                &IngestScenario::new()
+                    .expect("compaction turn", |row| {
+                        row_contains(row, &["Turn 1", "compaction marker"])
+                    })
+                    .expect("compaction summary", |row| {
+                        row_contains(row, &[r#""type":"llm""#, "COMPACTION_SUMMARY"])
+                    }),
+            )
+            .await;
+        let turn = compaction_rows
+            .iter()
+            .find(|row| row_contains(row, &["Turn 1", "compaction marker"]))
+            .unwrap();
+        let root_id = &turn["root_span_id"];
+        let root = compaction_rows
+            .iter()
+            .find(|row| &row["span_id"] == root_id)
+            .unwrap();
+        let session_id = root["metadata"]["session_id"].as_str().unwrap();
+        std::fs::remove_file(plugins.join("compact.js")).unwrap();
+        let mut resumed =
+            support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+        resumed
+            .args([
+                "run",
+                "--standalone",
+                "--auto",
+                "--model",
+                "mock/mock-model",
+                "--session",
+                session_id,
+                "after compaction",
+            ])
+            .current_dir(&workspace)
+            .env("PWD", &workspace)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_CACHE_HOME", home.join("cache"));
+        world.configure(&mut resumed);
+        let output = world.output(&mut resumed).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows = world
+            .wait_for_mock_ingest_scenario(&IngestScenario::new().expect(
+                "post-compaction model input",
+                |row| {
+                    row["span_attributes"]["type"] == "llm"
+                        && row["input"].to_string().contains("COMPACTION_SUMMARY")
+                        && row["input"].to_string().contains("after compaction")
+                },
+            ))
+            .await;
+        let resumed_llm = rows
+            .iter()
+            .find(|row| {
+                row["span_attributes"]["type"] == "llm"
+                    && row["input"].to_string().contains("after compaction")
+            })
+            .unwrap();
+        assert!(!resumed_llm["input"]
+            .to_string()
+            .contains("compaction marker"));
+    }
+
+    std::fs::write(plugins.join("image.js"), r#"export default { id:'test.image', async setup(ctx) { await ctx.tool.transform(editor => editor.add({name:'fixture_image',description:'Return an image',input:{type:'object',properties:{},additionalProperties:false},options:{codemode:false},async execute() { return {content:[{type:'file',mime:'image/png',uri:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg=='}]}; }})); } };"#).unwrap();
+    let mut image_run =
+        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    image_run
+        .args([
+            "run",
+            "--standalone",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "image tool marker",
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"));
+    world.configure(&mut image_run);
+    let output = world.output(&mut image_run).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let image_rows = world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new()
+                .expect("image tool turn", |row| {
+                    row_contains(row, &["Turn 1", "image tool marker"])
+                })
+                .expect("image tool result", |row| {
+                    row["span_attributes"]["type"] == "tool"
+                        && row["output"].to_string().contains("image_url")
+                        && row["output"].to_string().contains("image/png")
+                })
+                .expect("model input with tool image", |row| {
+                    row["span_attributes"]["type"] == "llm"
+                        && row["input"].to_string().contains("image tool marker")
+                        && row["input"].to_string().contains("image/png")
+                        && row["input"].to_string().contains("image_url")
+                }),
+        )
+        .await;
+    assert!(
+        image_rows
+            .iter()
+            .any(|row| row["span_attributes"]["type"] == "llm"
+                && row["input"].to_string().contains("image tool marker")
+                && row["input"].to_string().contains("image/png")
+                && row["input"].to_string().contains("image_url")),
+        "model input lost tool image: {image_rows:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires OpenCode 2 and a built OpenCode package"]
+async fn opencode_v2_subagent_is_nested() {
+    let inference = OpenAiMock::new(|_, request| {
+        let messages = request.body["messages"].as_array();
+        let user = messages
+            .and_then(|ms| ms.iter().rev().find(|m| m["role"] == "user"))
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let tool_result = messages.is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
+        if user.contains("CHILD_MARKER") {
+            MockReply::response(OpenAiTurn::text("CHILD_DONE"))
+        } else if request.body["tools"].is_array() && !tool_result {
+            MockReply::response(OpenAiTurn::tool_call(
+                "subagent_call",
+                "subagent",
+                json!({"agent":"general","description":"Test child","prompt":"CHILD_MARKER"}),
+            ))
+        } else {
+            MockReply::response(OpenAiTurn::text("PARENT_DONE"))
+        }
+    });
+    let server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let workspace = world.workspace();
+    let home = world.temp_path("v2-subagent-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(workspace.join("opencode.json"), serde_json::to_vec(&json!({
+        "model":"mock/mock-model", "providers":{"mock":{"package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":format!("{}/v1",server.uri()),"apiKey":"test"},"models":{"mock-model":{"name":"Mock"}}}}
+    })).unwrap()).unwrap();
+    let mut command = support::agent_process::daemon_command();
+    command
+        .args([
+            "run",
+            "--project",
+            "agent-e2e",
+            "opencode",
+            "run",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "spawn subagent",
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env(
+            "OPENCODE_BIN",
+            std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
+        )
+        .env(
+            "BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC",
+            std::env::var_os("OPENCODE_V2_PLUGIN_DIR").expect("set OPENCODE_V2_PLUGIN_DIR"),
+        );
+    world.configure(&mut command);
+    let output = world.output(&mut command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows = world.wait_for_trace_delivery().await;
+    let root = rows
+        .iter()
+        .find(|r| r["span_attributes"]["name"] == "OpenCode")
+        .expect("root span");
+    let child = rows
+        .iter()
+        .find(|r| r["metadata"]["is_subagent"] == true)
+        .expect("child session span");
+    assert_eq!(child["root_span_id"], root["root_span_id"]);
+    assert!(child["span_parents"]
+        .as_array()
+        .is_some_and(|parents| !parents.is_empty()));
+    assert!(
+        rows.iter().any(|row| row_contains(row, &["CHILD_DONE"])),
+        "child result missing: {rows:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires OpenCode 2 and a built OpenCode package"]
+async fn opencode_v2_legacy_compaction_after_idle() {
+    let binary = std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN");
+    let mut version = support::agent_process::command(&binary);
+    version.arg("--version");
+    let version = version.output().await.unwrap();
+    if !String::from_utf8_lossy(&version.stdout).contains("v2.0.") {
+        return;
+    }
+    let inference = OpenAiMock::new(|_, _| MockReply::response(OpenAiTurn::text("LEGACY_TEXT")));
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let workspace = world.workspace();
+    let home = world.temp_path("v2-legacy-compact-home");
+    let config_dir = home.join("config/opencode");
+    let plugins = workspace.join(".opencode/plugins");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(config_dir.join("braintrust.json"), serde_json::to_vec(&json!({"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"agent-e2e"}}})).unwrap()).unwrap();
+    std::fs::write(workspace.join("opencode.json"), serde_json::to_vec(&json!({
+        "plugin":[std::env::var("OPENCODE_V2_PLUGIN_DIR").unwrap()], "model":"mock/mock-model", "providers":{"mock":{"package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":format!("{}/v1",inference_server.uri()),"apiKey":"test"},"models":{"mock-model":{"name":"Mock"}}}}
+    })).unwrap()).unwrap();
+    std::fs::write(plugins.join("compact.js"), "export default {id:'test.compact',async setup(ctx){await ctx.session.hook('compaction',e=>{e.result={summary:'LEGACY_COMPACTION_SUMMARY'}})}};").unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("http://127.0.0.1:{port}");
+    let mut server = support::agent_process::command(&binary);
+    server
+        .args([
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("OPENCODE_PASSWORD", "integration-test-password")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    world.configure(&mut server);
+    let mut server = server.spawn().unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        if client
+            .get(format!("{url}/api/session"))
+            .basic_auth("opencode", Some("integration-test-password"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "OpenCode 2.0 server did not start");
+    let mut run = support::agent_process::command(&binary);
+    run.args([
+        "run",
+        "--server",
+        &url,
+        "--auto",
+        "--model",
+        "mock/mock-model",
+        "--format",
+        "json",
+        "legacy compaction",
+    ])
+    .current_dir(&workspace)
+    .env("PWD", &workspace)
+    .env("HOME", &home)
+    .env("USERPROFILE", &home)
+    .env("XDG_CONFIG_HOME", home.join("config"))
+    .env("XDG_DATA_HOME", home.join("data"))
+    .env("XDG_CACHE_HOME", home.join("cache"))
+    .env("OPENCODE_PASSWORD", "integration-test-password");
+    let output = world.output(&mut run).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let session_id = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|event| event["sessionID"].as_str().map(str::to_owned))
+        .expect("session ID");
+    world
+        .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("initial turn", |row| {
+            row_contains(row, &["Turn 1", "legacy compaction"])
+        }))
+        .await;
+    client
+        .post(format!("{url}/api/session/{session_id}/compact"))
+        .basic_auth("opencode", Some("integration-test-password"))
+        .json(&json!({"delivery":"queue"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    world
+        .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("idle compaction", |row| {
+            row_contains(row, &[r#""type":"llm""#, "LEGACY_COMPACTION_SUMMARY"])
+        }))
+        .await;
+    let mut resume = support::agent_process::command(&binary);
+    resume
+        .args([
+            "run",
+            "--server",
+            &url,
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "--session",
+            &session_id,
+            "legacy after compaction",
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("OPENCODE_PASSWORD", "integration-test-password");
+    let output = world.output(&mut resume).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    world
+        .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("resumed context", |row| {
+            row_contains(
+                row,
+                &[
+                    r#""type":"llm""#,
+                    "LEGACY_COMPACTION_SUMMARY",
+                    "legacy after compaction",
+                ],
+            )
+        }))
+        .await;
+    server.kill().await.unwrap();
+    server.wait().await.unwrap();
 }

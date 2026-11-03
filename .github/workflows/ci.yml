@@ -155,6 +155,36 @@ jobs:
           node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
             "$PWD/install-test/node_modules/@braintrust/trace-opencode/dist/index.mjs"
 
+  opencode-v2-minimum:
+    name: OpenCode 2 minimum compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          cache-dependency-path: src/plugins/opencode/content/pnpm-lock.yaml
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: bt-daemon -> target
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install OpenCode 2.0 and packed plugin
+        run: |
+          set -euo pipefail
+          make build-opencode
+          mkdir -p "$RUNNER_TEMP/opencode-v2-package"
+          (cd dist/opencode && pnpm pack --pack-destination "$RUNNER_TEMP/opencode-v2-package" >/dev/null)
+          tarball="$(find "$RUNNER_TEMP/opencode-v2-package" -name 'braintrust-trace-opencode-*.tgz' -print -quit)"
+          npm install --prefix "$RUNNER_TEMP/opencode-v2-min" --no-audit --no-fund @opencode/cli@2.0.0 "$tarball"
+      - name: Trace OpenCode 2.0 sessions
+        env:
+          OPENCODE_V2_BIN: ${{ runner.temp }}/opencode-v2-min/node_modules/.bin/opencode
+          OPENCODE_V2_PLUGIN_DIR: ${{ runner.temp }}/opencode-v2-min/node_modules/@braintrust/trace-opencode
+          BT_AGENT_INFERENCE_MODE: mock
+          BT_AGENT_INGEST_MODE: mock
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration opencode_v2_ -- --ignored --nocapture --test-threads=1
+
   resolve-pi-compatibility:
     name: Resolve Pi compatibility window
     runs-on: ubuntu-24.04
@@ -433,6 +463,7 @@ jobs:
       - plugins
       - js-packages
       - opencode-compatibility
+      - opencode-v2-minimum
       - resolve-pi-compatibility
       - pi-compatibility
       - resolve-coding-agent-versions

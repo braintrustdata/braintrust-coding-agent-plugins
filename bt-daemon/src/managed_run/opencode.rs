@@ -55,13 +55,36 @@ impl ManagedRun for OpenCode {
 
     fn check(&self, args: &[OsString], _terminal: super::Terminal) -> anyhow::Result<()> {
         if is_v2()
-            && args
-                .iter()
-                .any(|arg| arg == "--server" || arg.to_string_lossy().starts_with("--server="))
+            && args.iter().any(|arg| {
+                arg == "--server"
+                    || arg.to_string_lossy().starts_with("--server=")
+                    || arg == "--service"
+            })
         {
             anyhow::bail!("OpenCode 2 managed tracing requires a private server; remove --server");
         }
         Ok(())
+    }
+
+    fn invocation_args(&self, injection: Vec<OsString>, mut args: Vec<OsString>) -> Vec<OsString> {
+        if injection.first().is_some_and(|arg| arg == "--standalone")
+            && args.first().is_some_and(|arg| arg == "serve")
+        {
+            // `serve` already starts its own server and does not accept --standalone.
+            return args;
+        }
+        if injection.first().is_some_and(|arg| arg == "--standalone")
+            && args
+                .first()
+                .is_some_and(|arg| arg == "run" || arg == "mini")
+        {
+            let command = args.remove(0);
+            return std::iter::once(command)
+                .chain(injection)
+                .chain(args)
+                .collect();
+        }
+        injection.into_iter().chain(args).collect()
     }
 
     fn inject(
@@ -122,6 +145,22 @@ mod tests {
         assert_eq!(
             config["plugin"],
             serde_json::json!(["other", "@braintrust/trace-opencode"])
+        );
+    }
+
+    #[test]
+    fn opencode_v2_private_flag_follows_subcommand() {
+        let private = vec![OsString::from("--standalone")];
+        assert_eq!(
+            OpenCode.invocation_args(private.clone(), vec!["run".into(), "hello".into()]),
+            vec!["run", "--standalone", "hello"]
+        );
+        assert_eq!(
+            OpenCode.invocation_args(
+                private,
+                vec!["serve".into(), "--port".into(), "1234".into()]
+            ),
+            vec!["serve", "--port", "1234"]
         );
     }
 }

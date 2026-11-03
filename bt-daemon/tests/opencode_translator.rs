@@ -1003,13 +1003,18 @@ fn opencode_v2_reduces_native_text_session_without_session_created() {
             json!({"sessionID":"native", "assistantMessageID":"assistant-1", "ordinal":0, "text":"world"}),
         ),
         (
-            "session.step.ended",
+            "session.text.ended",
             5,
+            json!({"sessionID":"native", "assistantMessageID":"assistant-1", "ordinal":1, "text":"!"}),
+        ),
+        (
+            "session.step.ended",
+            6,
             json!({"sessionID":"native", "assistantMessageID":"assistant-1", "finish":"stop", "tokens":{"input":3,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}),
         ),
         (
             "session.execution.succeeded",
-            6,
+            7,
             json!({"sessionID":"native"}),
         ),
     ];
@@ -1034,7 +1039,7 @@ fn opencode_v2_reduces_native_text_session_without_session_created() {
     assert_eq!(llm.name, "mock/mock-model");
     assert_eq!(
         llm.output,
-        Some(json!([{"role":"assistant","content":"world"}]))
+        Some(json!([{"role":"assistant","content":"world!"}]))
     );
     assert_eq!(llm.metrics.as_ref().unwrap()["prompt_tokens"], 3);
     assert_eq!(llm.parent_span_ids, vec![turn.span_id.clone()]);
@@ -1091,4 +1096,196 @@ fn opencode_v2_emits_tool_span_from_native_events() {
         Some(json!([{"type":"text","text":"contents"}]))
     );
     assert!(tool.end_ms.is_some());
+}
+
+#[test]
+fn opencode_v2_preserves_attached_images_in_turn_and_model_input() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"native","inboxID":"u","item":{"type":"user","payload":{"text":"describe","files":[{"mime":"image/png","data":"YWJj","source":{"type":"inline"}}]}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"native","inboxID":"u"}),
+        ),
+        (
+            "session.step.started",
+            json!({"sessionID":"native","assistantMessageID":"m","model":{"id":"model","providerID":"mock"},"started":3}),
+        ),
+        (
+            "session.text.ended",
+            json!({"sessionID":"native","assistantMessageID":"m","ordinal":0,"text":"red"}),
+        ),
+        (
+            "session.step.ended",
+            json!({"sessionID":"native","assistantMessageID":"m","tokens":{"input":1,"output":1}}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        let mut e = event(
+            name,
+            i as i64 + 1,
+            json!({"id":format!("event-{i}"),"type":name,"data":data}),
+        );
+        e.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let turn = rows.values().find(|r| r.name == "Turn 1").unwrap();
+    let expected = json!([{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}}]);
+    assert_eq!(turn.input, Some(expected.clone()));
+    let llm = rows
+        .values()
+        .find(|r| r.span_type == SpanType::Llm)
+        .unwrap();
+    assert_eq!(llm.input.as_ref().unwrap()[0]["content"], expected);
+}
+
+#[test]
+fn opencode_v2_resume_keeps_the_first_native_event_after_synthetic_start() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for (i, name, data) in [
+        (
+            1,
+            "session.inbox.enqueued",
+            json!({"sessionID":"native","inboxID":"u1","item":{"type":"user","payload":{"text":"first"}}}),
+        ),
+        (
+            2,
+            "session.inbox.delivered",
+            json!({"sessionID":"native","inboxID":"u1"}),
+        ),
+        (
+            3,
+            "session.execution.succeeded",
+            json!({"sessionID":"native"}),
+        ),
+        (
+            4,
+            "session_start",
+            json!({"sessionID":"native","inboxID":"u2","item":{"type":"user","payload":{"text":"second"}}}),
+        ),
+        (
+            4,
+            "session.inbox.enqueued",
+            json!({"sessionID":"native","inboxID":"u2","item":{"type":"user","payload":{"text":"second"}}}),
+        ),
+        (
+            5,
+            "session.inbox.delivered",
+            json!({"sessionID":"native","inboxID":"u2"}),
+        ),
+    ] {
+        let mut e = event(name, i, json!({"id":format!("event-{i}"),"data":data}));
+        e.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    assert!(rows
+        .values()
+        .any(|row| row.name == "Turn 2" && row.input == Some(json!("second"))));
+}
+
+#[test]
+fn opencode_v2_compaction_preserves_native_model_context_after_resume() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        (
+            1,
+            "session.inbox.enqueued",
+            json!({"sessionID":"native","inboxID":"u1","item":{"type":"user","payload":{"text":"old"}}}),
+        ),
+        (
+            2,
+            "session.inbox.delivered",
+            json!({"sessionID":"native","inboxID":"u1"}),
+        ),
+        (
+            3,
+            "session.compaction.started",
+            json!({"sessionID":"native","reason":"manual","inputID":"c1","recent":""}),
+        ),
+        (
+            4,
+            "session.compaction.ended",
+            json!({"sessionID":"native","reason":"manual","model":{"providerID":"mock","id":"model"},"text":"summary","recent":""}),
+        ),
+        (
+            5,
+            "session.execution.succeeded",
+            json!({"sessionID":"native"}),
+        ),
+        (
+            6,
+            "session_start",
+            json!({"sessionID":"native","inboxID":"u2","item":{"type":"user","payload":{"text":"next"}}}),
+        ),
+        (
+            6,
+            "session.inbox.enqueued",
+            json!({"sessionID":"native","inboxID":"u2","item":{"type":"user","payload":{"text":"next"}}}),
+        ),
+        (
+            7,
+            "session.inbox.delivered",
+            json!({"sessionID":"native","inboxID":"u2"}),
+        ),
+        (
+            8,
+            "model.context",
+            json!({"sessionID":"native","system":["system"],"messages":[{"role":"user","content":[{"type":"text","text":"summary"}]},{"role":"user","content":[{"type":"text","text":"next"}]}]}),
+        ),
+        (
+            9,
+            "session.step.started",
+            json!({"sessionID":"native","assistantMessageID":"m2","model":{"providerID":"mock","id":"model"},"started":9}),
+        ),
+        (
+            10,
+            "session.text.ended",
+            json!({"sessionID":"native","assistantMessageID":"m2","ordinal":0,"text":"answer"}),
+        ),
+        (
+            11,
+            "session.step.ended",
+            json!({"sessionID":"native","assistantMessageID":"m2","tokens":{"input":2,"output":1}}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (i, name, data) in events {
+        let mut e = event(name, i, json!({"id":format!("event-{i}"),"data":data}));
+        e.source_version = Some("2.0.0".into());
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let llm = rows
+        .values()
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata["message_id"] == "m2")
+        })
+        .unwrap();
+    assert_eq!(
+        llm.input,
+        Some(
+            json!([{"role":"system","content":"system"},{"role":"user","content":"summary"},{"role":"user","content":"next"}])
+        )
+    );
 }

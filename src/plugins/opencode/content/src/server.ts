@@ -18,6 +18,16 @@ interface Context {
   app: { version: string };
   location: { directory: string };
   event: { subscribe(options: { signal: AbortSignal }): AsyncIterable<NativeEvent> };
+  session: {
+    hook(
+      name: "context",
+      callback: (event: {
+        sessionID: string;
+        system: Array<{ text: string }>;
+        messages: unknown[];
+      }) => void,
+    ): Promise<unknown>;
+  };
   tool: {
     transform(
       callback: (editor: {
@@ -50,6 +60,11 @@ const forwarded = new Set([
   "session.tool.called",
   "session.tool.success",
   "session.tool.failed",
+  "permission.asked",
+  "permission.replied",
+  "session.compaction.started",
+  "session.compaction.ended",
+  "session.compaction.failed",
   "session.deleted",
 ]);
 
@@ -57,7 +72,7 @@ export default {
   id: "braintrust.trace",
   async setup(ctx: Context) {
     const config = loadConfig(await readPluginConfig(ctx.location));
-    if (config.enableTools && !process.env.BT_TRACE_MANAGED_RUN_ID) {
+    if (config.enableTools) {
       const definitions = createBraintrustTools(new BtCliToolsClient(config));
       await ctx.tool.transform((editor) => {
         for (const [name, definition] of Object.entries(definitions)) {
@@ -81,7 +96,27 @@ export default {
     const abort = new AbortController();
     const roots = new Map<string, string>();
     const started = new Set<string>();
+    const contexts = new Map<string, Array<{ ts_ms: number; payload: unknown }>>();
     let pending = Promise.resolve();
+    await ctx.session.hook("context", (event) => {
+      try {
+        const queue = contexts.get(event.sessionID) ?? [];
+        const payload = JSON.parse(
+          JSON.stringify({
+            data: {
+              sessionID: event.sessionID,
+              system: event.system.map((part) => part.text),
+              messages: event.messages,
+            },
+            location: ctx.location,
+          }),
+        ) as unknown;
+        queue.push({ ts_ms: Date.now(), payload });
+        contexts.set(event.sessionID, queue);
+      } catch {
+        // A malformed capture must not interrupt the agent's model request.
+      }
+    });
     const task = (async () => {
       for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
         if (!forwarded.has(event.type)) continue;
@@ -105,10 +140,21 @@ export default {
         if (first) {
           started.add(root);
         }
+        const context =
+          event.type === "session.step.started" ? contexts.get(session)?.shift() : undefined;
+        if (contexts.get(session)?.length === 0) contexts.delete(session);
+        if (
+          event.type === "session.execution.succeeded" ||
+          event.type === "session.execution.failed" ||
+          event.type === "session.execution.interrupted" ||
+          event.type === "session.deleted"
+        )
+          contexts.delete(session);
         pending = pending.then(async () => {
           if (first && event.type !== "session.created") {
             await daemon.log({ ...envelope, event: "session_start" });
           }
+          if (context) await daemon.log({ ...envelope, event: "model.context", ...context });
           await daemon.log(envelope);
         });
       }

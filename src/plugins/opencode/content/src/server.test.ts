@@ -27,34 +27,40 @@ vi.mock("./tools/bt-cli", () => ({
 import plugin from "./server";
 
 describe("OpenCode 2 capture", () => {
-  it("registers executable Braintrust tools", async () => {
-    const definitions: Array<{
-      name: string;
-      input: object;
-      execute(input: unknown): Promise<{ content: string }>;
-    }> = [];
-    const cleanup = await plugin.setup({
-      app: { version: "2.2.5" },
-      location: { directory: "/test" },
-      event: { async *subscribe() {} },
-      tool: {
-        async transform(callback) {
-          callback({
-            add(definition) {
-              definitions.push(definition);
-            },
-          });
+  it.each([undefined, "managed-run"])(
+    "registers executable Braintrust tools (managed: %s)",
+    async (managedRun) => {
+      vi.stubEnv("BT_TRACE_MANAGED_RUN_ID", managedRun);
+      const definitions: Array<{
+        name: string;
+        input: object;
+        execute(input: unknown): Promise<{ content: string }>;
+      }> = [];
+      const cleanup = await plugin.setup({
+        app: { version: "2.2.5" },
+        session: { async hook() {} },
+        location: { directory: "/test" },
+        event: { async *subscribe() {} },
+        tool: {
+          async transform(callback) {
+            callback({
+              add(definition) {
+                definitions.push(definition);
+              },
+            });
+          },
         },
-      },
-    });
-    const projects = definitions.find(
-      (definition) => definition.name === "braintrust_list_projects",
-    );
-    expect(projects).toBeDefined();
-    expect(projects?.input).toMatchObject({ type: "object" });
-    expect(await projects?.execute({})).toEqual({ content: "- Example (p1)" });
-    await cleanup?.();
-  });
+      });
+      const projects = definitions.find(
+        (definition) => definition.name === "braintrust_list_projects",
+      );
+      expect(projects).toBeDefined();
+      expect(projects?.input).toMatchObject({ type: "object" });
+      expect(await projects?.execute({})).toEqual({ content: "- Example (p1)" });
+      await cleanup?.();
+      vi.unstubAllEnvs();
+    },
+  );
   it("forwards native events in order and closes the daemon", async () => {
     state.logs.length = 0;
     state.closed = false;
@@ -64,6 +70,7 @@ describe("OpenCode 2 capture", () => {
     ];
     const cleanup = await plugin.setup({
       app: { version: "2.2.5" },
+      session: { async hook() {} },
       location: { directory: "/test" },
       tool: {
         async transform(callback) {
@@ -89,5 +96,49 @@ describe("OpenCode 2 capture", () => {
       payload: events[0],
     });
     expect(state.closed).toBe(true);
+  });
+
+  it("routes an early child model context through its parent session", async () => {
+    state.logs.length = 0;
+    let capture: (event: {
+      sessionID: string;
+      system: Array<{ text: string }>;
+      messages: unknown[];
+    }) => void = () => {};
+    const cleanup = await plugin.setup({
+      app: { version: "2.2.5" },
+      location: { directory: "/test" },
+      session: {
+        async hook(_name, callback) {
+          capture = callback;
+        },
+      },
+      tool: {
+        async transform(callback) {
+          callback({ add() {} });
+        },
+      },
+      event: {
+        async *subscribe() {
+          capture({
+            sessionID: "child",
+            system: [{ text: "system" }],
+            messages: [{ role: "user", content: "hello" }],
+          });
+          yield { type: "session.created", data: { sessionID: "child", parentID: "parent" } };
+          yield { type: "session.step.started", data: { sessionID: "child" } };
+        },
+      },
+    });
+    await cleanup?.();
+    expect(state.logs.map((entry) => entry.event)).toEqual([
+      "session.created",
+      "model.context",
+      "session.step.started",
+    ]);
+    expect(state.logs[1]).toMatchObject({
+      session_id: "parent",
+      payload: { data: { sessionID: "child" } },
+    });
   });
 });
