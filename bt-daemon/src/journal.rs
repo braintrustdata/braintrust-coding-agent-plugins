@@ -562,7 +562,12 @@ fn decode_record(
         .and_then(serde_json::Value::as_str)
         == Some(history::FORMAT)
     {
-        let expanded = histories.expand(value, path, position - bytes.len() as u64, bytes.len())?;
+        let expanded = histories.expand(
+            value,
+            path,
+            position - bytes.len() as u64,
+            history::record_hash(bytes),
+        )?;
         let event: RedactedEnvelope = serde_json::from_value(expanded)?;
         if event.source == "pi" && event.event == "context" {
             // New contexts reconstruct independently; don't pin the last

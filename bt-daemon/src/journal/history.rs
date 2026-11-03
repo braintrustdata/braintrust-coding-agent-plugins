@@ -6,13 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     io::{BufRead, Seek},
     path::Path,
-    sync::Arc,
 };
 
-pub(super) const FORMAT: &str = "event_history_v1";
+pub(super) const FORMAT: &str = "event_history_v2";
 const STREAMS: usize = 16;
 const PREFIXES: usize = 128;
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -50,7 +49,6 @@ pub(super) fn parse(bytes: &[u8]) -> anyhow::Result<Value> {
 #[derive(Clone)]
 struct Prefix {
     hash: [u8; 32],
-    wire: [u8; 32],
     count: usize,
     bytes: usize,
 }
@@ -58,7 +56,7 @@ struct Prefix {
 struct History {
     key: [u8; 32],
     offset: u64,
-    anchor: u64,
+    record_hash: [u8; 32],
     delta_bytes: usize,
     prefixes: VecDeque<Prefix>,
 }
@@ -69,9 +67,10 @@ pub(super) struct Encoder(VecDeque<History>);
 struct Reference {
     path: String,
     base: u64,
-    anchor: u64,
     keep: usize,
-    hash: String,
+    // SHA-256 of the referenced record, excluding its terminating newline.
+    #[serde(rename = "hash")]
+    checksum: String,
 }
 
 // No native keys are reserved: reference metadata lives outside payload.
@@ -104,121 +103,49 @@ fn paths(value: &Value, path: &str, found: &mut Vec<String>) {
         _ => {}
     }
 }
-struct Counter(usize);
-impl std::io::Write for Counter {
+// Hash the exact serialized representation while measuring its storage cost.
+struct FingerprintWriter {
+    bytes: usize,
+    digest: Sha256,
+}
+impl std::io::Write for FingerprintWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 += bytes.len();
+        self.bytes += bytes.len();
+        self.digest.update(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
-// Stable type/length framing and sorted object keys make persisted checksums
-// independent of serde_json's preserve_order feature. The separate, memory-only
-// wire hash preserves object order and number spellings a translator may stringify.
-// Normalize equivalent decimal spellings without rounding through f64. Very
-// large exponents fall back to their exact spelling; no precision is discarded.
-fn hash_number(text: &str, hash: &mut Sha256) {
-    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
-    let digits = mantissa.trim_start_matches('-').replace('.', "");
-    let digits = digits.trim_start_matches('0');
-    let coefficient = digits.trim_end_matches('0');
-    let fraction = mantissa
-        .split_once('.')
-        .map_or(0, |(_, fraction)| fraction.len());
-    let exponent = exponent
-        .parse::<i64>()
-        .ok()
-        .and_then(|e| e.checked_sub(fraction as i64))
-        .and_then(|e| e.checked_add((digits.len() - coefficient.len()) as i64));
-    if coefficient.is_empty() {
-        hash.update(b"0");
-    } else if let Some(exponent) = exponent {
-        hash.update(if text.starts_with('-') { b"-" } else { b"+" });
-        hash.update((coefficient.len() as u64).to_be_bytes());
-        hash.update(coefficient.as_bytes());
-        hash.update(exponent.to_be_bytes());
-    } else {
-        hash.update(b"x");
-        hash.update((text.len() as u64).to_be_bytes());
-        hash.update(text.as_bytes());
-    }
-}
-fn hash_value(value: &Value, hash: &mut Sha256, wire: &mut Sha256) {
-    let sized = |hash: &mut Sha256, bytes: &[u8]| {
-        hash.update((bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
-    };
-    match value {
-        Value::Null => hash.update(b"n"),
-        Value::Bool(value) => hash.update(if *value { b"t" } else { b"f" }),
-        Value::Number(number) => {
-            let text = number.to_string();
-            hash.update(b"#");
-            hash_number(&text, hash);
-            wire.update(b"#");
-            sized(wire, text.as_bytes());
-        }
-        Value::String(text) => {
-            hash.update(b"s");
-            sized(hash, text.as_bytes());
-        }
-        Value::Array(array) => {
-            hash.update(b"[");
-            hash.update((array.len() as u64).to_be_bytes());
-            for value in array {
-                hash_value(value, hash, wire);
-            }
-        }
-        Value::Object(object) => {
-            hash.update(b"{");
-            hash.update((object.len() as u64).to_be_bytes());
-            for key in object.keys() {
-                sized(wire, key.as_bytes());
-            }
-            let mut entries: Vec<_> = object.iter().collect();
-            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            for (key, value) in entries {
-                sized(hash, key.as_bytes());
-                hash_value(value, hash, wire);
-            }
-        }
-    }
-}
 fn hex(hash: [u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-fn prefixes(messages: &[Value]) -> anyhow::Result<VecDeque<Prefix>> {
-    extend_prefixes(VecDeque::new(), messages)
+
+// Persisted checksums cover stored bytes, so JSON parser features cannot
+// change their meaning. Prefix fingerprints are only an in-memory optimization.
+pub(super) fn record_hash(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes.strip_suffix(b"\n").unwrap_or(bytes)).into()
 }
-fn extend_prefixes(
-    mut result: VecDeque<Prefix>,
-    messages: &[Value],
-) -> anyhow::Result<VecDeque<Prefix>> {
-    let mut hash = result.back().map_or([0; 32], |p| p.hash);
-    let mut wire = result.back().map_or([0; 32], |p| p.wire);
-    let mut bytes = result.back().map_or(2, |p| p.bytes);
-    let start = result.back().map_or(0, |p| p.count);
+fn prefixes(messages: &[Value]) -> anyhow::Result<VecDeque<Prefix>> {
+    let mut result = VecDeque::new();
+    let mut hash = [0; 32];
+    let mut bytes = 2;
     for (index, message) in messages.iter().enumerate() {
-        let count = start + index + 1;
-        let mut digest = Sha256::new();
-        digest.update(hash);
-        let mut wire_digest = Sha256::new();
-        wire_digest.update(wire);
-        hash_value(message, &mut digest, &mut wire_digest);
-        let mut counter = Counter(0);
-        serde_json::to_writer(&mut counter, message)?;
-        bytes += counter.0 + usize::from(count > 1);
-        hash = digest.finalize().into();
-        wire = wire_digest.finalize().into();
+        let mut encoded = FingerprintWriter {
+            bytes: 0,
+            digest: Sha256::new(),
+        };
+        encoded.digest.update(hash);
+        serde_json::to_writer(&mut encoded, message)?;
+        hash = encoded.digest.finalize().into();
+        bytes += encoded.bytes + usize::from(index > 0);
         if result.len() == PREFIXES {
             result.pop_front();
         }
         result.push_back(Prefix {
             hash,
-            wire,
-            count,
+            count: index + 1,
             bytes,
         });
     }
@@ -261,11 +188,9 @@ impl Encoder {
                     .enumerate()
                     .filter(|(_, h)| {
                         h.key == key
-                            && h.prefixes.iter().any(|old| {
-                                old.count == prefix.count
-                                    && old.hash == prefix.hash
-                                    && old.wire == prefix.wire
-                            })
+                            && h.prefixes
+                                .iter()
+                                .any(|old| old.count == prefix.count && old.hash == prefix.hash)
                     })
                     .max_by_key(|(index, h)| {
                         (
@@ -276,53 +201,47 @@ impl Encoder {
                     .map(|(index, _)| (index, prefix.clone()))
             });
             let previous = candidate
-                .as_ref()
-                .and_then(|(index, _)| self.0.remove(*index));
+                .and_then(|(index, common)| self.0.remove(index).map(|history| (history, common)));
             let full_bytes = current.back().map_or(2, |p| p.bytes);
-            let mut anchor = offset;
             let mut delta_bytes = 0;
             let mut unchanged = false;
-            if let Some(previous) = &previous {
-                if let Some((_, common)) = &candidate {
-                    let reference = Reference {
-                        path: path.clone(),
-                        base: previous.offset,
-                        anchor: previous.anchor,
-                        keep: common.count,
-                        hash: hex(common.hash),
-                    };
-                    let cost = serde_json::to_vec(&reference)?.len() + 32;
-                    let accumulated = previous
-                        .delta_bytes
-                        .saturating_add(full_bytes.saturating_sub(common.bytes))
-                        .saturating_add(cost);
-                    // Each stream pays for its own checkpoints. Charging global
-                    // journal bytes would amplify checkpoints for multiple histories.
-                    if common.bytes > cost && accumulated < full_bytes {
-                        value
-                            .payload
-                            .pointer_mut(&pointer)
-                            .and_then(Value::as_array_mut)
-                            .context("missing history")?
-                            .drain(..common.count);
-                        references.push(reference);
-                        anchor = previous.anchor;
-                        delta_bytes = accumulated;
-                        unchanged = previous.prefixes.back().map(|p| (p.count, p.hash, p.wire))
-                            == current.back().map(|p| (p.count, p.hash, p.wire));
-                    }
+            if let Some((previous, common)) = &previous {
+                let reference = Reference {
+                    path: path.clone(),
+                    base: previous.offset,
+                    keep: common.count,
+                    checksum: hex(previous.record_hash),
+                };
+                let cost = serde_json::to_vec(&reference)?.len() + 32;
+                let accumulated = previous
+                    .delta_bytes
+                    .saturating_add(full_bytes.saturating_sub(common.bytes))
+                    .saturating_add(cost);
+                // Each stream pays for its own checkpoints. Charging global
+                // journal bytes would amplify checkpoints for multiple histories.
+                if common.bytes > cost && accumulated < full_bytes {
+                    value
+                        .payload
+                        .pointer_mut(&pointer)
+                        .and_then(Value::as_array_mut)
+                        .context("missing history")?
+                        .drain(..common.count);
+                    references.push(reference);
+                    delta_bytes = accumulated;
+                    unchanged = previous.prefixes.back().map(|p| (p.count, p.hash))
+                        == current.back().map(|p| (p.count, p.hash));
                 }
             }
             let mut entry = if unchanged {
-                previous.context("missing prefix base")?
+                previous.context("missing prefix base")?.0
             } else {
-                if let Some(previous) = previous {
+                if let Some((previous, _)) = previous {
                     self.0.push_back(previous);
                 }
                 History {
                     key,
                     offset,
-                    anchor,
+                    record_hash: [0; 32],
                     delta_bytes,
                     prefixes: current,
                 }
@@ -342,36 +261,32 @@ impl Encoder {
             #[serde(skip_serializing_if = "Vec::is_empty")]
             _bt_history_refs: Vec<Reference>,
         }
-        Ok(serde_json::to_vec(&Stored {
+        let bytes = serde_json::to_vec(&Stored {
             _bt_record_type: FORMAT,
             envelope: &value,
             _bt_history_refs: references,
-        })?)
+        })?;
+        let hash = record_hash(&bytes);
+        for history in self.0.iter_mut().filter(|h| h.offset == offset) {
+            history.record_hash = hash;
+        }
+        Ok(bytes)
     }
 }
 
 struct Cached {
-    value: Arc<Value>,
+    value: Value,
     bytes: usize,
-    anchors: BTreeMap<String, u64>,
-    prefixes: BTreeMap<String, VecDeque<Prefix>>,
+    hash: [u8; 32],
 }
 #[derive(Default)]
 pub(super) struct Decoder {
-    records: BTreeMap<u64, Cached>,
-    order: VecDeque<u64>,
+    records: VecDeque<(u64, Cached)>,
     bytes: usize,
 }
 impl Decoder {
-    fn remember(
-        &mut self,
-        offset: u64,
-        value: &Value,
-        bytes: usize,
-        anchors: BTreeMap<String, u64>,
-        prefixes: BTreeMap<String, VecDeque<Prefix>>,
-    ) {
-        if self.records.contains_key(&offset) {
+    fn remember(&mut self, offset: u64, value: &Value, bytes: usize, hash: [u8; 32]) {
+        if self.records.iter().any(|(key, _)| *key == offset) {
             return;
         }
         // One oversized event travels alone, as on the live SpanOp feed.
@@ -379,29 +294,25 @@ impl Decoder {
             && (self.bytes.saturating_add(bytes) > CACHE_BYTES
                 || self.records.len() >= CACHE_RECORDS)
         {
-            if let Some(old) = self
-                .order
-                .pop_front()
-                .and_then(|key| self.records.remove(&key))
-            {
-                self.bytes -= old.bytes;
-            } else {
-                break;
+            if let Some((_, evicted)) = self.records.pop_front() {
+                self.bytes -= evicted.bytes;
             }
         }
-        self.records.insert(
+        self.records.push_back((
             offset,
             Cached {
-                value: Arc::new(value.clone()),
+                value: value.clone(),
                 bytes,
-                anchors,
-                prefixes,
+                hash,
             },
-        );
-        self.order.push_back(offset);
+        ));
         self.bytes += bytes;
     }
-    fn read(file: &mut std::fs::File, offset: u64, limit: u64) -> anyhow::Result<Value> {
+    fn read(
+        file: &mut std::fs::File,
+        offset: u64,
+        limit: u64,
+    ) -> anyhow::Result<(Value, [u8; 32])> {
         ensure!(offset < limit, "history reference is not backward");
         if offset > 0 {
             file.seek(std::io::SeekFrom::Start(offset - 1))?;
@@ -417,14 +328,14 @@ impl Decoder {
         std::io::BufReader::new(std::io::Read::take(&mut *file, limit - offset))
             .read_until(b'\n', &mut line)?;
         ensure!(line.last() == Some(&b'\n'), "incomplete history reference");
-        parse(&line)
+        Ok((parse(&line)?, record_hash(&line)))
     }
     pub(super) fn expand(
         &mut self,
         mut value: Value,
         file_path: &Path,
         offset: u64,
-        bytes: usize,
+        hash: [u8; 32],
     ) -> anyhow::Result<Value> {
         let references: Vec<Reference> = value
             .get("_bt_history_refs")
@@ -442,9 +353,6 @@ impl Decoder {
                 .and_then(Value::as_array)
                 .is_some_and(|a| !a.is_empty())
         });
-        let mut expanded_bytes = bytes;
-        let mut anchors = BTreeMap::new();
-        let mut validated = BTreeMap::new();
         let mut value = value
             .as_object_mut()
             .and_then(|object| object.remove("envelope"))
@@ -464,20 +372,19 @@ impl Decoder {
             );
             seen.push(reference.path.clone());
             ensure!(
-                reference.anchor <= reference.base && reference.base < offset && reference.keep > 0,
+                reference.base < offset && reference.keep > 0,
                 "invalid history reference range"
             );
             let mut base = reference.base;
             let mut limit = offset;
             let mut count = reference.keep;
             let mut parts = Vec::new();
-            let mut cached_prefix = None;
+            let mut expected_hash = reference.checksum;
             loop {
-                if let Some(record) = self.records.get_mut(&base) {
+                if let Some(index) = self.records.iter().position(|(key, _)| *key == base) {
+                    let record = &mut self.records[index].1;
                     ensure!(
-                        record.anchors.get(&reference.path).copied().unwrap_or(base)
-                            == reference.anchor
-                            && record.value["source"] == value["source"]
+                        record.value["source"] == value["source"]
                             && record.value["session_id"] == value["session_id"],
                         "history reference crossed its cached stream"
                     );
@@ -487,32 +394,27 @@ impl Decoder {
                         .and_then(Value::as_array)
                         .context("cached history is not an array")?;
                     ensure!(count <= messages.len(), "history prefix exceeds cache");
-                    if !record.prefixes.contains_key(&reference.path) {
-                        record
-                            .prefixes
-                            .insert(reference.path.clone(), prefixes(messages)?);
-                    }
-                    let points = &record.prefixes[&reference.path];
-                    let points = if points.iter().any(|p| p.count == count) {
-                        points
-                            .iter()
-                            .filter(|p| p.count <= count)
-                            .cloned()
-                            .collect()
-                    } else {
-                        prefixes(&messages[..count])?
-                    };
-                    cached_prefix = Some(points);
+                    ensure!(
+                        hex(record.hash) == expected_hash,
+                        "history record checksum mismatch"
+                    );
                     parts.push(messages[..count].to_vec());
-                    self.order.retain(|key| *key != base);
-                    self.order.push_back(base);
+                    let cached = self
+                        .records
+                        .remove(index)
+                        .context("missing cached record")?;
+                    self.records.push_back(cached);
                     break;
                 }
                 let file = match &mut file {
                     Some(file) => file,
                     slot @ None => slot.insert(std::fs::File::open(file_path)?),
                 };
-                let record = Self::read(file, base, limit)?;
+                let (record, hash) = Self::read(file, base, limit)?;
+                ensure!(
+                    hex(hash) == expected_hash,
+                    "history record checksum mismatch"
+                );
                 ensure!(
                     record["_bt_record_type"] == FORMAT
                         && record["envelope"]["source"] == value["source"]
@@ -531,10 +433,7 @@ impl Decoder {
                     .unwrap_or_default();
                 if let Some(parent) = refs.iter().find(|r| r.path == reference.path) {
                     ensure!(
-                        parent.anchor == reference.anchor
-                            && parent.anchor <= parent.base
-                            && parent.base < base
-                            && parent.keep > 0,
+                        parent.base < base && parent.keep > 0,
                         "invalid history dependency"
                     );
                     ensure!(
@@ -545,48 +444,24 @@ impl Decoder {
                     count = count.min(parent.keep);
                     limit = base;
                     base = parent.base;
+                    expected_hash = parent.checksum.clone();
                 } else {
-                    ensure!(
-                        base == reference.anchor && count <= messages.len(),
-                        "invalid history anchor"
-                    );
+                    ensure!(count <= messages.len(), "history prefix exceeds literal");
                     parts.push(messages[..count].to_vec());
                     break;
                 }
             }
-            let points = if let Some(mut points) = cached_prefix {
-                // The final part came from a validated cached prefix. Only
-                // uncached suffixes need hashing when unwinding dependencies.
-                for suffix in parts.iter().rev().skip(1) {
-                    points = extend_prefixes(points, suffix)?;
-                }
-                points
-            } else {
-                let mut points = VecDeque::new();
-                for part in parts.iter().rev() {
-                    points = extend_prefixes(points, part)?;
-                }
-                points
-            };
-            let prefix = points.back().context("empty referenced prefix")?;
-            ensure!(
-                hex(prefix.hash) == reference.hash,
-                "history prefix checksum mismatch"
-            );
-            expanded_bytes = expanded_bytes.saturating_add(prefix.bytes);
             let suffix = value
                 .pointer_mut(&reference.path)
                 .and_then(Value::as_array_mut)
                 .context("history suffix is not an array")?;
-            let points = extend_prefixes(points, suffix)?;
             let mut prefix: Vec<_> = parts.into_iter().rev().flatten().collect();
             prefix.append(suffix);
             *suffix = prefix;
-            anchors.insert(reference.path.clone(), reference.anchor);
-            validated.insert(reference.path, points);
         }
         if cacheable {
-            self.remember(offset, &value, expanded_bytes, anchors, validated);
+            let bytes = crate::wire::retained_json_bytes(&value) as usize;
+            self.remember(offset, &value, bytes, hash);
         }
         Ok(value)
     }
@@ -643,43 +518,75 @@ mod tests {
         // The backward-seek path must use the same depth allowance too.
         let record = parse(&bytes[first as usize..]).unwrap();
         let recovered = Decoder::default()
-            .expand(record, &path, first, bytes.len() - first as usize)
+            .expand(record, &path, first, record_hash(&bytes[first as usize..]))
             .unwrap();
         assert_eq!(recovered["payload"], deepest.payload);
     }
 
     #[test]
-    fn fingerprints_are_stable_without_coalescing_wire_order_or_number_types() {
+    fn prefix_matching_preserves_serialized_order_and_number_types() {
+        let fingerprint = |value: &Value| {
+            prefixes(std::slice::from_ref(value))
+                .unwrap()
+                .pop_back()
+                .unwrap()
+                .hash
+        };
         let left: Value = serde_json::from_str(r#"{"z":1,"a":[true,"é"]}"#).unwrap();
         let right: Value = serde_json::from_str(r#"{"a":[true,"é"],"z":1}"#).unwrap();
-        let a = prefixes(std::slice::from_ref(&left))
-            .unwrap()
-            .pop_back()
-            .unwrap();
-        let b = prefixes(std::slice::from_ref(&right))
-            .unwrap()
-            .pop_back()
-            .unwrap();
-        // This is part of the on-disk v1 format, including cross-build key order.
         assert_eq!(
-            hex(a.hash),
-            "77274ba03369e2db77acaabb7dc2d895be5b9106f7b9278ec521e259f1781138"
+            fingerprint(&left) == fingerprint(&right),
+            serde_json::to_vec(&left).unwrap() == serde_json::to_vec(&right).unwrap()
         );
-        assert_eq!(a.hash, b.hash);
-        if serde_json::to_string(&left).unwrap() != serde_json::to_string(&right).unwrap() {
-            assert_ne!(a.wire, b.wire);
+        assert_ne!(fingerprint(&json!(1)), fingerprint(&json!(1.0)));
+    }
+
+    #[tokio::test]
+    async fn references_verify_stored_bytes_independently_of_json_features() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bytes.ndjson");
+        // Deliberately noncanonical key order and numeric spelling. Re-encoding
+        // this Value may differ, depending on the embedding CLI's JSON features.
+        let base = format!(
+            r#"{{"_bt_record_type":"{FORMAT}","envelope":{{"source":"muse","session_id":"test","event":"native","ts_ms":1,"payload":{{"messages":[{{"z":1e+00,"a":"text"}}]}}}}}}"#
+        );
+        let value = parse(base.as_bytes()).unwrap();
+        let expected = value["envelope"]["payload"].clone();
+        let mut next = value.clone();
+        next["envelope"]["payload"]["messages"] = json!([]);
+        next["_bt_history_refs"] = json!([{"path":"/payload/messages","base":0,
+            "keep":1,"hash":hex(record_hash(base.as_bytes()))}]);
+        let next_bytes = serde_json::to_vec(&next).unwrap();
+        let offset = base.len() as u64 + 1;
+        std::fs::write(
+            &path,
+            format!(
+                "{base}\n{}\n",
+                String::from_utf8(next_bytes.clone()).unwrap()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            Decoder::default()
+                .expand(next.clone(), &path, offset, record_hash(&next_bytes))
+                .unwrap()["payload"],
+            expected
+        );
+        let mut reader = JournalReader::open(&path, std::fs::metadata(&path).unwrap().len())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                reader.next_entry().await.unwrap().unwrap().payload,
+                expected
+            );
         }
-        let integer = prefixes(&[json!(1)]).unwrap().pop_back().unwrap();
-        let decimal = prefixes(&[json!(1.0)]).unwrap().pop_back().unwrap();
-        assert_eq!(integer.hash, decimal.hash);
-        assert_ne!(integer.wire, decimal.wire);
-        let digest = |number: &str| {
-            let mut h = Sha256::new();
-            hash_number(number, &mut h);
-            hex(h.finalize().into())
-        };
-        assert_eq!(digest("0.00100"), digest("1e-3"));
-        assert_ne!(digest("1.0000000000000000001"), digest("1.0"));
+        // A valid JSON edit must still invalidate the reference's checksum.
+        std::fs::write(&path, format!("{}\n", base.replace("text", "edit"))).unwrap();
+        assert!(Decoder::default()
+            .expand(next, &path, offset, record_hash(&next_bytes))
+            .is_err());
     }
 
     #[tokio::test]
@@ -740,7 +647,7 @@ mod tests {
                     serde_json::from_str(line).unwrap(),
                     &path,
                     offset,
-                    line.len(),
+                    record_hash(line.as_bytes()),
                 )
                 .unwrap();
             assert_eq!(&value["payload"], expected);
@@ -848,7 +755,7 @@ mod tests {
         for (key, val) in [
             ("base", json!(offset)),
             ("base", json!(1)),
-            ("anchor", json!(offset + 1)),
+            ("unknown", json!(offset + 1)),
             ("keep", json!(100)),
             ("keep", json!(0)),
             ("hash", json!("wrong")),
@@ -859,9 +766,6 @@ mod tests {
             copy["_bt_history_refs"][0][key] = val;
             bad.push(copy);
         }
-        let mut copy = value.clone();
-        copy["_bt_history_refs"][0]["anchor"] = value["_bt_history_refs"][0]["base"].clone();
-        bad.push(copy);
         let mut copy = value.clone();
         copy["envelope"]["session_id"] = "other".into();
         bad.push(copy);
@@ -877,9 +781,12 @@ mod tests {
         }
         for value in bad {
             assert!(Decoder::default()
-                .expand(value.clone(), &path, offset, 1)
+                .expand(value.clone(), &path, offset, record_hash(b"test"))
                 .is_err());
-            assert!(warm.histories.expand(value, &path, offset, 1).is_err());
+            assert!(warm
+                .histories
+                .expand(value, &path, offset, record_hash(b"test"))
+                .is_err());
         }
     }
 
