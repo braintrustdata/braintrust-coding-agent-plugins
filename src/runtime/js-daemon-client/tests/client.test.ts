@@ -282,6 +282,9 @@ test("pipelined events do not report success when daemon initialization is incom
   const temp = mkdtempSync(join(tmpdir(), "bt-js-version-"))
   const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\bt-js-version-${process.pid}-${Date.now()}` : join(temp, "daemon.sock")
   const server = createServer((socket) => {
+    // The client intentionally closes this connection after rejecting the
+    // incompatible handshake; a pending server write may then fail on Windows.
+    socket.on("error", () => {})
     socket.setEncoding("utf8")
     let input = ""
     socket.on("data", (chunk: string) => {
