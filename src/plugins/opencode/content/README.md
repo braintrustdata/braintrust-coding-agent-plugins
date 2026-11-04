@@ -38,7 +38,7 @@ through its `@opencode/cli` distribution. Installed-package tests exercise
 text and tool sessions, subagents, attachments, denied permissions, interrupted
 sessions, compaction, and resumed sessions using a mock model and trace backend.
 Managed runs start a private OpenCode 2 server to keep routing scoped to the run.
-Standalone delivery is tested with delayed daemon acknowledgements. As with
+Standalone delivery is tested with delayed event acknowledgements. As with
 other fail-open integrations, abrupt termination or an unavailable daemon can
 prevent trace events from being delivered.
 

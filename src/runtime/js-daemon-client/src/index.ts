@@ -173,19 +173,6 @@ export class DaemonClient {
     }
   }
 
-  /** Start the connection early without delaying the host indefinitely. */
-  async prepare(timeoutMs = 5_000): Promise<boolean> {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      return await Promise.race([
-        this.ensureConnected().then(() => true, () => false),
-        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs) }),
-      ])
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
-  }
-
   async log(envelope: DaemonEnvelope): Promise<boolean> {
     return this.serial(() => this.sendEvent(envelope))
   }

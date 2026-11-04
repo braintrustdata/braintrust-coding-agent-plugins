@@ -310,22 +310,3 @@ test("pipelined events do not report success when daemon initialization is incom
   await new Promise<void>((resolve) => server.close(() => resolve()))
   rmSync(temp, { recursive: true, force: true })
 })
-
-test("connection preparation is bounded when the daemon is slow", async () => {
-  const temp = mkdtempSync(join(tmpdir(), "bt-js-prepare-"))
-  const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\bt-js-prepare-${process.pid}-${Date.now()}` : join(temp, "daemon.sock")
-  const server = createServer((socket) => {
-    socket.on("error", () => {})
-    socket.once("data", (data) => {
-      const request = JSON.parse(data.toString().trim())
-      setTimeout(() => socket.write(`${JSON.stringify({jsonrpc:"2.0",id:request.id,result:{protocol_version:1,capabilities:{sources:["opencode"]}}})}\n`), 80)
-    })
-  })
-  await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
-  const client = new DaemonClient({ source:"opencode", socketPath:endpoint, requestTimeoutMs:500 })
-  assert.equal(await client.prepare(10), false)
-  assert.equal(await client.prepare(1_000), true)
-  await client.close()
-  await new Promise<void>((resolve) => server.close(() => resolve()))
-  rmSync(temp, { recursive:true, force:true })
-})

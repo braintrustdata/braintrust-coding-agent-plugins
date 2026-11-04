@@ -1232,11 +1232,14 @@ async fn run_v2_compaction_after_idle(native: bool) {
         .find(|row| row_contains(row, &["Turn 1", "legacy compaction"]))
         .unwrap()["root_span_id"]
         .clone();
-    client
+    let compact_request = client
         .post(format!("{url}/api/session/{session_id}/compact"))
         .basic_auth("opencode", Some("integration-test-password"))
         .json(&json!({"delivery":"queue"}))
-        .send()
+        .build()
+        .unwrap();
+    client
+        .execute(compact_request.try_clone().unwrap())
         .await
         .unwrap()
         .error_for_status()
@@ -1300,10 +1303,7 @@ async fn run_v2_compaction_after_idle(native: bool) {
         .contains("legacy compaction"));
     if native {
         client
-            .post(format!("{url}/api/session/{session_id}/compact"))
-            .basic_auth("opencode", Some("integration-test-password"))
-            .json(&json!({"delivery":"queue"}))
-            .send()
+            .execute(compact_request)
             .await
             .unwrap()
             .error_for_status()
@@ -1341,7 +1341,7 @@ async fn run_v2_compaction_after_idle(native: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires OpenCode 2 and a built OpenCode package"]
 async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are_slow() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
 
     let inference =
@@ -1367,19 +1367,27 @@ async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are
                     return;
                 };
                 let (mut client_read, mut client_write) = incoming.into_split();
-                let (mut daemon_read, mut daemon_write) = outgoing.into_split();
+                let (daemon_read, mut daemon_write) = outgoing.into_split();
                 let request = async {
                     let _ = tokio::io::copy(&mut client_read, &mut daemon_write).await;
                 };
                 let response = async {
-                    let mut buffer = [0u8; 8192];
+                    let mut daemon_read = BufReader::new(daemon_read);
+                    let mut buffer = Vec::new();
                     let mut client_closed = false;
-                    while let Ok(n) = daemon_read.read(&mut buffer).await {
-                        if n == 0 {
-                            break;
+                    let mut initializing = true;
+                    loop {
+                        buffer.clear();
+                        match daemon_read.read_until(b'\n', &mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
-                        if !client_closed && client_write.write_all(&buffer[..n]).await.is_err() {
+                        if initializing {
+                            initializing = false;
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+                        }
+                        if !client_closed && client_write.write_all(&buffer).await.is_err() {
                             client_closed = true;
                         }
                     }

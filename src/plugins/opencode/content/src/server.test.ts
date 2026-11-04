@@ -10,6 +10,7 @@ vi.mock("./runtime/daemon-client", () => ({
   resolveDaemonTraceSettings: (settings: unknown) => settings,
   DaemonClient: class {
     async prepare() {
+      await state.gate;
       return true;
     }
     async log(event: Record<string, unknown>) {
@@ -153,7 +154,7 @@ describe("OpenCode 2 capture", () => {
       payload: { data: { sessionID: "child" } },
     });
   });
-  it("sends later events without waiting for acknowledgements and drains them on cleanup", async () => {
+  it("starts and forwards events without waiting for the daemon, then drains on cleanup", async () => {
     state.logs.length = 0;
     state.closed = false;
     let release = () => {};

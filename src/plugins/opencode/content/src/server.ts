@@ -93,7 +93,6 @@ export default {
     }
     if (!config.tracingEnabled || !claimManagedTracingInstance("opencode")) return;
     const daemon = new DaemonClient({ source: "opencode", pluginVersion: PLUGIN_VERSION });
-    await daemon.prepare();
     const abort = new AbortController();
     const roots = new Map<string, string>();
     const started = new Set<string>();
