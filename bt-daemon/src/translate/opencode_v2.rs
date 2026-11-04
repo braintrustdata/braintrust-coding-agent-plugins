@@ -1,20 +1,32 @@
 //! OpenCode 2 native event translation.
 mod event;
+mod span;
 
 use self::event::*;
+use self::span::*;
 use super::{
-    git::GitMetadataCache,
-    local_username,
-    recent::RecentSet,
-    tool::{with_tool_approval, ToolApproval},
-    AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
+    git::GitMetadataCache, local_username, recent::RecentSet, tool::ToolApproval, AgentTranslator,
+    SessionCtx, SpanOp, SpanRow, SpanType,
 };
 use crate::{ids, wire::Envelope};
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
+
+// SpanRow exposes JSON at the sink boundary; all data before this conversion
+// uses the concrete types in `span` (apart from native, open-ended values).
+fn span_value(value: impl Serialize) -> Value {
+    match serde_json::to_value(value) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "could not serialize OpenCode span data");
+            Value::Null
+        }
+    }
+}
 
 #[derive(Default)]
 struct SessionState {
@@ -29,8 +41,8 @@ struct SessionState {
     idle: bool,
     output: Option<String>,
     history: Vec<HistoryEntry>,
-    calls: HashMap<String, Vec<Value>>,
-    results: HashMap<String, Vec<Value>>,
+    calls: HashMap<String, Vec<ToolCall>>,
+    results: HashMap<String, Vec<Message>>,
     tools: HashMap<String, ToolState>,
     denied_tools: HashSet<String>,
     completed_messages: RecentSet<String>,
@@ -55,7 +67,7 @@ struct Permission {
 }
 struct HistoryEntry {
     id: String,
-    messages: Vec<Value>,
+    messages: Vec<Message>,
 }
 struct Compaction {
     started: i64,
@@ -138,11 +150,14 @@ impl OpenCodeV2Translator {
         } else {
             "OpenCode".into()
         };
-        let mut metadata = json!({"session_id":sid,"source":"opencode","_bt_defer_root":true,"username":local_username()});
-        if let Some(parent_id) = parent_id {
-            metadata["parent_session_id"] = json!(parent_id);
-            metadata["is_subagent"] = json!(true);
-        }
+        let metadata = RootMetadata {
+            session_id: sid,
+            source: "opencode",
+            defer_root: true,
+            username: local_username(),
+            parent_session_id: parent_id,
+            is_subagent: parent_id.map(|_| true),
+        };
         self.sessions.insert(
             sid.into(),
             SessionState {
@@ -162,7 +177,7 @@ impl OpenCodeV2Translator {
             name,
             span_type: SpanType::Task,
             start_ms: Some(ts),
-            metadata: Some(metadata),
+            metadata: Some(span_value(metadata)),
             ..Default::default()
         })]
     }
@@ -192,22 +207,25 @@ impl OpenCodeV2Translator {
         }
         s.turn_number += 1;
         let turn = ids::span_id(&self.daemon_session_id, &format!("turn:{sid}:{id}"));
-        let mut content = vec![json!({"type":"text","text":prompt.text})];
+        let mut content = vec![ContentPart::text(prompt.text.clone())];
         for file in prompt.files {
             if file.mime.starts_with("image/") {
-                content.push(json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}",file.mime,file.data)}}));
+                content.push(ContentPart::image(format!(
+                    "data:{};base64,{}",
+                    file.mime, file.data
+                )));
             }
         }
         let input = if content.len() == 1 {
-            json!(prompt.text)
+            Content::Text(prompt.text.clone())
         } else {
-            json!(content)
+            Content::Parts(content)
         };
-        let has_input = !prompt.text.is_empty() || input.is_array();
+        let has_input = !prompt.text.is_empty() || matches!(input, Content::Parts(_));
         s.history.push(HistoryEntry {
             id: id.into(),
             messages: has_input
-                .then(|| json!({"role":"user","content":input}))
+                .then(|| Message::new("user", input.clone()))
                 .into_iter()
                 .collect(),
         });
@@ -236,10 +254,12 @@ impl OpenCodeV2Translator {
             span_type: SpanType::Task,
             is_turn: true,
             start_ms: Some(ts),
-            input: has_input.then_some(input),
-            metadata: Some(
-                json!({"turn_number":s.turn_number,"model":null,"loaded_skill_names":skills}),
-            ),
+            input: has_input.then(|| span_value(input)),
+            metadata: Some(span_value(TurnMetadata {
+                turn_number: s.turn_number,
+                model: None,
+                loaded_skill_names: skills,
+            })),
             ..Default::default()
         }));
         ops
@@ -283,7 +303,10 @@ impl OpenCodeV2Translator {
             root_span_id: s.trace_root.clone(),
             parent_span_ids: s.parents.clone(),
             end_ms: Some(ts),
-            metadata: Some(json!({"total_turns":s.turn_number,"total_tool_calls":s.tool_count})),
+            metadata: Some(span_value(RootTotals {
+                total_turns: s.turn_number,
+                total_tool_calls: s.tool_count,
+            })),
             error,
             ..Default::default()
         }));
@@ -403,7 +426,10 @@ impl AgentTranslator for OpenCodeV2Translator {
                             .map(str::to_owned)
                     })
                     .flatten();
-                s.calls.entry(data.message_id.clone()).or_default().push(json!({"id":data.id,"type":"function","function":{"name":name,"arguments":data.input.to_string()}}));
+                s.calls
+                    .entry(data.message_id.clone())
+                    .or_default()
+                    .push(ToolCall::new(data.id.clone(), name.clone(), &data.input));
                 s.tools.insert(
                     data.id.clone(),
                     ToolState {
@@ -424,7 +450,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     span_type: SpanType::Tool,
                     start_ms: Some(ts),
                     input: Some(data.input),
-                    metadata: Some(json!({"tool_name":name,"call_id":data.id})),
+                    metadata: Some(span_value(ToolMetadata::new(&name, &data.id))),
                     ..Default::default()
                 })]
             }
@@ -434,7 +460,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     &data.session_id,
                     &data.message_id,
                     &data.id,
-                    output,
+                    Some(output),
                     None,
                     ts,
                 )
@@ -445,7 +471,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     &data.session_id,
                     &data.message_id,
                     &data.id,
-                    Value::Null,
+                    None,
                     Some(error),
                     ts,
                 )
@@ -500,6 +526,10 @@ impl AgentTranslator for OpenCodeV2Translator {
                     )
                 };
                 s.denied_tools.insert(call.clone());
+                let mut metadata = ToolMetadata::new(&tool_name, &call);
+                metadata.tool_approval = Some(ToolApproval::Denied);
+                metadata.permission_id = Some(&data.request_id);
+                metadata.permission_type = Some(&p.action);
                 let row = SpanRow {
                     span_id,
                     root_span_id: s.trace_root.clone(),
@@ -515,10 +545,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     span_type: SpanType::Tool,
                     start_ms: (!had_start).then_some(ts),
                     end_ms: Some(ts),
-                    metadata: Some(with_tool_approval(
-                        json!({"tool_name":tool_name,"call_id":call,"permission_id":data.request_id,"permission_type":p.action}),
-                        Some(ToolApproval::Denied),
-                    )),
+                    metadata: Some(span_value(metadata)),
                     ..Default::default()
                 };
                 vec![if had_start {
@@ -632,7 +659,7 @@ impl OpenCodeV2Translator {
         sid: &str,
         message_id: &str,
         call: &str,
-        output: Value,
+        output: Option<Vec<ContentPart>>,
         error: Option<String>,
         ts: i64,
     ) -> Vec<SpanOp> {
@@ -659,30 +686,28 @@ impl OpenCodeV2Translator {
         }
         s.tool_count += 1;
         let result = if let Some(error) = &error {
-            json!(error)
+            Content::Text(error.clone())
         } else {
-            output.clone()
+            Content::Parts(output.clone().unwrap_or_default())
         };
         s.results
             .entry(tool.message_id)
             .or_default()
-            .push(json!({"role":"tool","tool_call_id":call,"content":result}));
-        let mut metadata = with_tool_approval(
-            json!({"tool_name":tool.name,"call_id":call}),
-            Some(ToolApproval::Approved),
-        );
+            .push(Message::tool(call.into(), result));
+        let mut metadata = ToolMetadata::new(&tool.name, call);
+        metadata.tool_approval = Some(ToolApproval::Approved);
         if tool.name == "skill" {
-            metadata["tool_kind"] = json!("skill");
-            metadata["skill_name"] = json!(tool.skill_name);
+            metadata.tool_kind = Some("skill");
+            metadata.skill_name = Some(tool.skill_name.as_deref());
         }
         vec![SpanOp::Merge(SpanRow {
             span_id: tool.span_id,
             root_span_id: s.trace_root.clone(),
             parent_span_ids: vec![tool.parent],
             end_ms: Some(ts),
-            output: Some(output),
+            output: Some(span_value(output)),
             error,
-            metadata: Some(metadata),
+            metadata: Some(span_value(metadata)),
             ..Default::default()
         })]
     }
@@ -711,13 +736,16 @@ impl OpenCodeV2Translator {
         let Some(parent) = s.turn.clone() else {
             return vec![];
         };
-        let mut assistant = json!({"role":"assistant","content":text});
+        let mut assistant = Message::new("assistant", Content::Text(text.clone()));
         let calls = s.calls.remove(&data.message_id).unwrap_or_default();
         if !calls.is_empty() {
-            assistant["tool_calls"] = json!(calls);
+            assistant.tool_calls = calls.clone();
         }
         if let Some(reasoning) = reasoning {
-            assistant["reasoning"] = json!([{"id":"reasoning","content":reasoning}]);
+            assistant.reasoning = Some(vec![Reasoning {
+                id: "reasoning",
+                content: reasoning,
+            }]);
         }
         let input = step.context.map(normalize_context).unwrap_or_else(|| {
             s.history
@@ -737,8 +765,7 @@ impl OpenCodeV2Translator {
             id: data.message_id.clone(),
             messages,
         });
-        let tokens = data.tokens.unwrap_or_default();
-        let prompt = tokens.input + tokens.cache.read + tokens.cache.write;
+        let metrics = Metrics::from_tokens(data.tokens.unwrap_or_default());
         let provider = step
             .model
             .as_ref()
@@ -749,10 +776,12 @@ impl OpenCodeV2Translator {
             .as_ref()
             .and_then(|m| m.id.as_deref())
             .unwrap_or("unknown");
-        let mut metadata = json!({"provider":provider,"model":model,"message_id":data.message_id});
-        if let Some(variant) = step.model.as_ref().and_then(|m| m.variant.as_deref()) {
-            metadata["variant"] = json!(variant);
-        }
+        let metadata = LlmMetadata {
+            provider,
+            model,
+            message_id: &data.message_id,
+            variant: step.model.as_ref().and_then(|m| m.variant.as_deref()),
+        };
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(
                 &self.daemon_session_id,
@@ -765,12 +794,10 @@ impl OpenCodeV2Translator {
             span_type: SpanType::Llm,
             start_ms: Some(step.started),
             end_ms: Some(ts),
-            input: Some(json!(input)),
-            output: Some(json!([assistant])),
-            metadata: Some(metadata),
-            metrics: Some(
-                json!({"prompt_tokens":prompt,"completion_tokens":tokens.output,"tokens":prompt+tokens.output+tokens.reasoning,"prompt_cached_tokens":tokens.cache.read,"prompt_cache_creation_tokens":tokens.cache.write,"reasoning_tokens":tokens.reasoning}),
-            ),
+            input: Some(span_value(input)),
+            output: Some(span_value([assistant])),
+            metadata: Some(span_value(metadata)),
+            metrics: Some(span_value(metrics)),
             error: data.error.map(|e| e.message),
             ..Default::default()
         })]
@@ -808,9 +835,7 @@ impl OpenCodeV2Translator {
             s.history.clear();
             s.history.push(HistoryEntry {
                 id: id.into(),
-                messages: vec![
-                    json!({"role":"assistant","content":text,"message_type":"compaction_summary"}),
-                ],
+                messages: vec![Message::summary(text.clone())],
             });
             s.history.extend(kept);
         }
@@ -822,8 +847,7 @@ impl OpenCodeV2Translator {
             .as_ref()
             .and_then(|m| m.id.as_deref())
             .unwrap_or("unknown");
-        let tokens = tokens.unwrap_or_default();
-        let prompt = tokens.input + tokens.cache.read + tokens.cache.write;
+        let metrics = Metrics::from_tokens(tokens.unwrap_or_default());
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("llm:{sid}:{id}")),
             root_span_id: s.trace_root.clone(),
@@ -833,31 +857,34 @@ impl OpenCodeV2Translator {
             span_type: SpanType::Llm,
             start_ms: Some(started),
             end_ms: Some(ts),
-            input: Some(json!(input)),
-            output: Some(json!([{"role":"assistant","content":text}])),
-            metadata: Some(json!({"provider":provider,"model":model,"message_id":id})),
-            metrics: Some(
-                json!({"prompt_tokens":prompt,"completion_tokens":tokens.output,"tokens":prompt+tokens.output+tokens.reasoning,"prompt_cached_tokens":tokens.cache.read,"prompt_cache_creation_tokens":tokens.cache.write,"reasoning_tokens":tokens.reasoning}),
-            ),
+            input: Some(span_value(input)),
+            output: Some(span_value([Message::new("assistant", Content::Text(text))])),
+            metadata: Some(span_value(LlmMetadata {
+                provider,
+                model,
+                message_id: id,
+                variant: None,
+            })),
+            metrics: Some(span_value(metrics)),
             error,
             tags: Some(vec!["compaction".into()]),
             ..Default::default()
         })]
     }
 }
-fn normalize_context(context: Context) -> Vec<Value> {
+fn normalize_context(context: Context) -> Vec<Message> {
     let mut messages = Vec::new();
     let system = context.system.join("\n\n");
     if !system.is_empty() {
-        messages.push(json!({"role":"system","content":system}));
+        messages.push(Message::new("system", Content::Text(system)));
     }
     for message in context.messages {
         match message.content {
             MessageContent::Text(text) => {
-                messages.push(json!({"role":message.role,"content":text}))
+                messages.push(Message::new(message.role, Content::Text(text)))
             }
             MessageContent::Other(content) => {
-                messages.push(json!({"role":message.role,"content":content}))
+                messages.push(Message::new(message.role, Content::Dynamic(content)))
             }
             MessageContent::Parts(parts) => {
                 let mut content = Vec::new();
@@ -865,54 +892,83 @@ fn normalize_context(context: Context) -> Vec<Value> {
                 let mut single_text = None;
                 for part in parts {
                     match part {
-                        ContextPart::Known(KnownContextPart::Text { text }) => { single_text = Some(text.clone()); content.push(json!({"type":"text","text":text})); },
-                        ContextPart::Known(KnownContextPart::Media { media_type, data, media, extra }) => {
+                        ContextPart::Known(KnownContextPart::Text { text }) => {
+                            single_text = Some(text.clone());
+                            content.push(ContentPart::text(text));
+                        }
+                        ContextPart::Known(KnownContextPart::Media {
+                            media_type,
+                            data,
+                            media,
+                            extra,
+                        }) => {
                             let source = media.as_ref().and_then(|media| media.source.as_ref());
-                            let mime = source.as_ref().and_then(|source| source.media_type.as_deref()).or(media_type.as_deref());
-                            let bytes = source.as_ref().and_then(|source| source.data.as_deref()).or(data.as_deref());
-                            let image = mime.zip(bytes).filter(|(mime, _)| mime.starts_with("image/"));
-                            if let Some((mime, bytes)) = image { content.push(json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{bytes}")}})); }
-                            else if let Ok(value) = serde_json::to_value(KnownContextPart::Media { media_type, data, media, extra }) { content.push(value); }
+                            let mime = source
+                                .and_then(|source| source.media_type.as_deref())
+                                .or(media_type.as_deref());
+                            let bytes = source
+                                .and_then(|source| source.data.as_deref())
+                                .or(data.as_deref());
+                            if let Some((mime, bytes)) = mime
+                                .zip(bytes)
+                                .filter(|(mime, _)| mime.starts_with("image/"))
+                            {
+                                content.push(ContentPart::image(format!(
+                                    "data:{mime};base64,{bytes}"
+                                )));
+                            } else {
+                                content.push(ContentPart::Native(KnownContextPart::Media {
+                                    media_type,
+                                    data,
+                                    media,
+                                    extra,
+                                }));
+                            }
                         }
-                        ContextPart::Known(KnownContextPart::ToolCall { id, name, input }) => calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}})),
+                        ContextPart::Known(KnownContextPart::ToolCall { id, name, input }) => {
+                            calls.push(ToolCall::new(id, name, &input))
+                        }
                         ContextPart::Known(KnownContextPart::ToolResult { id, result }) => {
-                            let value = match serde_json::from_value::<Vec<ToolContent>>(result.value.clone()) { Ok(parts) => normalize_tool_content(parts), Err(_) => result.value };
-                            messages.push(json!({"role":"tool","tool_call_id":id,"content":value}));
+                            let value = match serde_json::from_value::<Vec<ToolContent>>(
+                                result.value.clone(),
+                            ) {
+                                Ok(parts) => Content::Parts(normalize_tool_content(parts)),
+                                Err(_) => Content::Dynamic(result.value),
+                            };
+                            messages.push(Message::tool(id, value));
                         }
-                        ContextPart::Other(value) => content.push(value),
+                        ContextPart::Other(value) => content.push(ContentPart::Dynamic(value)),
                     }
                 }
                 if message.role == "tool" {
                     continue;
                 }
-                let value = match content.as_slice() {
-                    [] => json!(""),
-                    [_] if single_text.is_some() => json!(single_text),
-                    _ => Value::Array(content),
-                };
-                if calls.is_empty() {
-                    messages.push(json!({"role":message.role,"content":value}));
+                let value = if content.is_empty() {
+                    Content::Text(String::new())
+                } else if content.len() == 1 && single_text.is_some() {
+                    Content::Text(single_text.unwrap_or_default())
                 } else {
-                    messages.push(json!({"role":message.role,"content":value,"tool_calls":calls}));
-                }
+                    Content::Parts(content)
+                };
+                let mut normalized = Message::new(message.role, value);
+                normalized.tool_calls = calls;
+                messages.push(normalized);
             }
         }
     }
     messages
 }
 
-fn normalize_tool_content(parts: Vec<ToolContent>) -> Value {
-    Value::Array(
-        parts
-            .into_iter()
-            .map(|part| match part {
-                ToolContent::Known(KnownToolContent::File { mime, uri, .. })
-                    if mime.starts_with("image/") =>
-                {
-                    json!({"type":"image_url","image_url":{"url":uri}})
-                }
-                other => serde_json::to_value(other).unwrap_or(Value::Null),
-            })
-            .collect(),
-    )
+fn normalize_tool_content(parts: Vec<ToolContent>) -> Vec<ContentPart> {
+    parts
+        .into_iter()
+        .map(|part| match part {
+            ToolContent::Known(KnownToolContent::File { mime, uri, .. })
+                if mime.starts_with("image/") =>
+            {
+                ContentPart::image(uri)
+            }
+            other => ContentPart::Tool(other),
+        })
+        .collect()
 }

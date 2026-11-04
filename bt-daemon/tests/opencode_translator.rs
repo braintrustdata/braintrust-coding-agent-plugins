@@ -1523,3 +1523,74 @@ fn opencode_v2_permission_denied_before_tool_call_creates_one_tool_span() {
         "denied"
     );
 }
+
+#[test]
+fn opencode_v2_preserves_provider_defined_context_and_tool_content() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"s","inboxID":"u","item":{"type":"user","payload":{"text":"inspect"}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"s","inboxID":"u"}),
+        ),
+        (
+            "model.context",
+            json!({"sessionID":"s","system":[],"messages":[{"role":"user","content":[{"type":"provider-specific","payload":{"key":"value"}}]}]}),
+        ),
+        (
+            "session.step.started",
+            json!({"sessionID":"s","assistantMessageID":"m","model":{"id":"model","providerID":"test"}}),
+        ),
+        (
+            "session.tool.input.started",
+            json!({"sessionID":"s","assistantMessageID":"m","id":"call","name":"custom"}),
+        ),
+        (
+            "session.tool.called",
+            json!({"sessionID":"s","assistantMessageID":"m","id":"call","input":{"nested":{"key":42}}}),
+        ),
+        (
+            "session.tool.success",
+            json!({"sessionID":"s","assistantMessageID":"m","id":"call","content":[{"type":"vendor-content","payload":{"value":7}}]}),
+        ),
+        (
+            "session.step.ended",
+            json!({"sessionID":"s","assistantMessageID":"m"}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        let mut envelope = event(
+            name,
+            i as i64 + 1,
+            json!({"id":format!("provider-{i}"),"data":data}),
+        );
+        envelope.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let llm = rows
+        .values()
+        .find(|row| row.span_type == SpanType::Llm)
+        .unwrap();
+    assert_eq!(
+        llm.input.as_ref().unwrap()[0]["content"],
+        json!([{"type":"provider-specific","payload":{"key":"value"}}])
+    );
+    let tool = rows
+        .values()
+        .find(|row| row.span_type == SpanType::Tool)
+        .unwrap();
+    assert_eq!(tool.input, Some(json!({"nested":{"key":42}})));
+    assert_eq!(
+        tool.output,
+        Some(json!([{"type":"vendor-content","payload":{"value":7}}]))
+    );
+}

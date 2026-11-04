@@ -228,13 +228,13 @@ pub(super) struct NativeError {
 pub(super) struct ErrorResponse {
     pub body: String,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub(super) enum ToolContent {
     Known(KnownToolContent),
     Other(Value),
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub(super) enum KnownToolContent {
     #[serde(rename = "text")]
@@ -334,7 +334,7 @@ pub(super) enum ContextPart {
     Known(KnownContextPart),
     Other(Value),
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub(super) enum KnownContextPart {
     #[serde(rename = "text")]
@@ -357,13 +357,13 @@ pub(super) enum KnownContextPart {
     #[serde(rename = "tool-result")]
     ToolResult { id: String, result: ToolResult },
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Media {
     pub source: Option<MediaSource>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct MediaSource {
     #[serde(rename = "mediaType")]
     pub media_type: Option<String>,
@@ -371,7 +371,7 @@ pub(super) struct MediaSource {
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct ToolResult {
     pub value: Value,
 }
