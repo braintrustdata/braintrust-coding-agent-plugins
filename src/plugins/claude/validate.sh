@@ -3,7 +3,8 @@
 # validate.sh — Sanity-check a built Claude Code dist tree in $1 before publishing.
 #
 # Fails (non-zero) on the mistakes that would ship a broken marketplace:
-#   - missing marketplace manifest / tracing plugin manifest / hooks
+#   - missing marketplace manifest / plugin manifests / hooks
+#   - an MCP plugin that ships anything beyond its hosted server connection
 #   - malformed JSON in any manifest
 #   - marketplace entries whose `source` path does not exist in the tree
 #
@@ -30,6 +31,8 @@ check_json "$MARKETPLACE"
 
 # Required files for each shipped plugin.
 required=(
+  "plugins/braintrust/.claude-plugin/plugin.json"
+  "plugins/braintrust/.mcp.json"
   "plugins/trace-claude-code/.claude-plugin/plugin.json"
   "plugins/trace-claude-code/.cursor-plugin/plugin.json"
   "plugins/trace-claude-code/hooks/hooks.json"
@@ -40,7 +43,7 @@ for rel in "${required[@]}"; do
 done
 
 python3 - "$MARKETPLACE" "$TARGET_DIR/plugins" <<'PY' \
-  || fail "Claude marketplace must contain only the tracing plugin"
+  || fail "Claude marketplace must contain exactly the MCP and tracing plugins"
 import json
 import sys
 from pathlib import Path
@@ -48,14 +51,60 @@ from pathlib import Path
 with open(sys.argv[1]) as f:
     plugins = json.load(f)["plugins"]
 
-assert [plugin["name"] for plugin in plugins] == ["trace-claude-code"]
+assert [plugin["name"] for plugin in plugins] == ["braintrust", "trace-claude-code"]
+for plugin in plugins:
+    assert plugin["source"] == f"./plugins/{plugin['name']}"
 assert sorted(path.name for path in Path(sys.argv[2]).iterdir() if path.is_dir()) == [
-    "trace-claude-code"
+    "braintrust", "trace-claude-code"
 ]
 PY
 
-if find "$TARGET_DIR" -name '.mcp.json' -print -quit | grep -q .; then
-  fail "Claude dist still contains an MCP proxy configuration"
+# The braintrust plugin is the Anthropic directory listing: a hosted MCP
+# connection only, with no hooks, skills, commands, or local processes.
+python3 - "$TARGET_DIR/plugins" <<'PY' || fail "Claude braintrust plugin breaks its MCP-only contract"
+import json
+import struct
+import sys
+from pathlib import Path
+
+plugins = Path(sys.argv[1])
+root = plugins / "braintrust"
+assert not any(p.is_symlink() for p in root.rglob("*"))
+files = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
+assert files == {
+    ".claude-plugin/plugin.json", ".claude-plugin/icon.png", ".mcp.json", "README.md", "LICENSE",
+}, files
+
+manifest = json.loads((root / ".claude-plugin/plugin.json").read_text())
+assert manifest["name"] == "braintrust" and manifest["displayName"] == "Braintrust"
+assert manifest["author"]["name"] == "Braintrust"
+assert manifest["license"] == "MIT"
+assert manifest["icon"] == "./.claude-plugin/icon.png"
+for field in ["homepage", "repository", "documentationUrl", "supportUrl", "privacyPolicyUrl", "termsOfServiceUrl"]:
+    assert manifest[field].startswith("https://"), field
+assert not ({"hooks", "commands", "agents", "skills", "lspServers", "mcpServers"} & set(manifest))
+
+tracing = json.loads((plugins / "trace-claude-code/.claude-plugin/plugin.json").read_text())
+assert manifest["version"] == tracing["version"], "Claude plugins must share a release version"
+marketplace = json.loads((plugins.parent / ".claude-plugin/marketplace.json").read_text())
+assert marketplace["version"] == manifest["version"], "Claude catalog version must match its plugins"
+assert not any("version" in entry for entry in marketplace["plugins"])
+
+# No headers or credentials: Claude Code discovers OAuth from the server.
+# Plugin-root .mcp.json is the server map itself, with no mcpServers wrapper.
+assert json.loads((root / ".mcp.json").read_text()) == {
+    "braintrust": {"type": "http", "url": "https://api.braintrust.dev/mcp"},
+}
+
+# Anthropic directory listing icon: square PNG, 512..2048px, under 2 MB.
+data = (root / ".claude-plugin/icon.png").read_bytes()
+assert data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR" and len(data) < 2 * 1024 * 1024
+width, height = struct.unpack(">II", data[16:24])
+assert width == height and 512 <= width <= 2048, (width, height)
+PY
+
+if find "$TARGET_DIR" -name '.mcp.json' ! -path "$TARGET_DIR/plugins/braintrust/.mcp.json" -print -quit | grep -q .; then
+  fail "Claude dist contains an MCP configuration outside plugins/braintrust"
 fi
 
 python3 - "$TARGET_DIR/plugins/trace-claude-code/hooks/hooks.json" <<'PY' \
