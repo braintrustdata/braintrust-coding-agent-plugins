@@ -193,3 +193,114 @@ test("fails open when the daemon and bt executable are absent", async () => {
   assert.ok(warnings.length > 0)
   await client.close()
 })
+
+test("pipelines ordered events before receiving daemon acknowledgements", async () => {
+  const temp = mkdtempSync(join(tmpdir(), "bt-js-pipeline-"))
+  const endpoint = process.platform === "win32"
+    ? `\\\\.\\pipe\\bt-js-pipeline-${process.pid}-${Date.now()}`
+    : join(temp, "daemon.sock")
+  const received: string[] = []
+  const pending: Array<{ id: number; socket: import("node:net").Socket }> = []
+  const server = createServer((socket) => {
+    socket.setEncoding("utf8")
+    let input = ""
+    socket.on("data", (chunk: string) => {
+      input += chunk
+      while (input.includes("\n")) {
+        const newline = input.indexOf("\n")
+        const request = JSON.parse(input.slice(0, newline))
+        input = input.slice(newline + 1)
+        if (request.method === "initialize") {
+          setTimeout(() => socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { protocol_version: 1, capabilities: { sources: ["opencode"] } } })}\n`), 100)
+        } else if (request.method === "session.flush") {
+          received.push("flush")
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { flushed: true } })}\n`)
+        } else {
+          received.push(request.params.event)
+          pending.push({ id: request.id, socket })
+          if (pending.length === 3) {
+            for (const item of pending) item.socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: item.id, result: { accepted: true } })}\n`)
+          }
+        }
+      }
+    })
+  })
+  await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
+  const client = new DaemonClient({ source: "opencode", socketPath: endpoint, requestTimeoutMs: 2000 })
+  const event = (name: string) => ({ source: "opencode", session_id: "session", event: name, ts_ms: 1, payload: {} })
+  const first = client.logPipelined(event("one"))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const second = client.logPipelined(event("two"))
+  const third = client.logPipelined(event("three"))
+  const flush = client.flush("session")
+  assert.deepEqual(await Promise.all([first, second, third]), [true, true, true])
+  assert.equal(await flush, true)
+  assert.deepEqual(received, ["one", "two", "three", "flush"])
+  await client.close()
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  rmSync(temp, { recursive: true, force: true })
+})
+
+test("retries pipelined events in order after a lost connection", async () => {
+  const temp = mkdtempSync(join(tmpdir(), "bt-js-retry-"))
+  const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\bt-js-retry-${process.pid}-${Date.now()}` : join(temp, "daemon.sock")
+  const received: string[] = []
+  let connections = 0
+  const server = createServer((socket) => {
+    const connection = ++connections
+    socket.setEncoding("utf8")
+    let input = ""
+    socket.on("data", (chunk: string) => {
+      input += chunk
+      while (input.includes("\n")) {
+        const newline = input.indexOf("\n")
+        const request = JSON.parse(input.slice(0, newline))
+        input = input.slice(newline + 1)
+        if (request.method === "initialize") {
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { protocol_version: 1, capabilities: { sources: ["opencode"] } } })}\n`)
+        } else if (connection === 1) {
+          socket.destroy()
+          return
+        } else {
+          received.push(request.params.event)
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { accepted: true } })}\n`)
+        }
+      }
+    })
+  })
+  await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
+  const client = new DaemonClient({ source: "opencode", socketPath: endpoint, requestTimeoutMs: 2000 })
+  const event = (name: string) => ({ source: "opencode", session_id: "session", event: name, ts_ms: 1, payload: {} })
+  assert.deepEqual(await Promise.all([client.logPipelined(event("one")), client.logPipelined(event("two")), client.logPipelined(event("three"))]), [true, true, true])
+  assert.deepEqual(received, ["one", "two", "three"])
+  await client.close()
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  rmSync(temp, { recursive: true, force: true })
+})
+
+test("pipelined events do not report success when daemon initialization is incompatible", async () => {
+  const temp = mkdtempSync(join(tmpdir(), "bt-js-version-"))
+  const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\bt-js-version-${process.pid}-${Date.now()}` : join(temp, "daemon.sock")
+  const server = createServer((socket) => {
+    socket.setEncoding("utf8")
+    let input = ""
+    socket.on("data", (chunk: string) => {
+      input += chunk
+      while (input.includes("\n")) {
+        const newline = input.indexOf("\n")
+        const request = JSON.parse(input.slice(0, newline))
+        input = input.slice(newline + 1)
+        const result = request.method === "initialize" ? { protocol_version: 99, capabilities: { sources: ["opencode"] } } : { accepted: true }
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`)
+      }
+    })
+  })
+  await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
+  const warnings: string[] = []
+  const client = new DaemonClient({ source: "opencode", socketPath: endpoint, connectAttempts: 1, connectDelayMs: 1, requestTimeoutMs: 500, warn: (warning) => warnings.push(warning) })
+  assert.equal(await client.logPipelined({ source: "opencode", session_id: "s", event: "test", ts_ms: 1, payload: {} }), false)
+  assert.ok(warnings.length > 0)
+  await client.close()
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  rmSync(temp, { recursive: true, force: true })
+})

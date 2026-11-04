@@ -158,7 +158,9 @@ export class DaemonClient {
   private nextId = 1
   private pending = new Map<number, PendingRequest>()
   private connecting?: Promise<void>
+  private writable?: { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void }
   private queue: Promise<unknown> = Promise.resolve()
+  private inFlightEvents = new Set<Promise<boolean>>()
   private warned = new Set<string>()
 
   constructor(options: DaemonClientOptions) {
@@ -173,30 +175,43 @@ export class DaemonClient {
   }
 
   async log(envelope: DaemonEnvelope): Promise<boolean> {
-    return this.serial(async () => {
-      const event = {
-        ...envelope,
-        ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
-        ...(this.options.managedRunId ? { managed_run_id: this.options.managedRunId } : {}),
-      }
+    return this.serial(() => this.sendEvent(envelope))
+  }
+
+  /** Submit events in call order without waiting for earlier acknowledgements. */
+  logPipelined(envelope: DaemonEnvelope): Promise<boolean> {
+    const request = this.sendEvent(envelope, true)
+    this.inFlightEvents.add(request)
+    void request.finally(() => this.inFlightEvents.delete(request))
+    return request
+  }
+
+  private async sendEvent(envelope: DaemonEnvelope, pipelined = false): Promise<boolean> {
+    const event = {
+      ...envelope,
+      ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
+      ...(this.options.managedRunId ? { managed_run_id: this.options.managedRunId } : {}),
+    }
+    try {
+      const result = (await this.request("event.log", event, pipelined)) as { accepted?: boolean }
+      if (pipelined) await this.ensureConnected()
+      return result.accepted === true
+    } catch (error) {
+      if (this.socket) this.disconnect(error)
       try {
-        const result = (await this.request("event.log", event)) as { accepted?: boolean }
+        const result = (await this.request("event.log", event, pipelined)) as { accepted?: boolean }
+        if (pipelined) await this.ensureConnected()
         return result.accepted === true
-      } catch (error) {
-        this.disconnect(error)
-        try {
-          const result = (await this.request("event.log", event)) as { accepted?: boolean }
-          return result.accepted === true
-        } catch (retryError) {
-          this.warnOnce(`event:${String(retryError)}`)
-          return false
-        }
+      } catch (retryError) {
+        this.warnOnce(`event:${String(retryError)}`)
+        return false
       }
-    })
+    }
   }
 
   async flush(sessionId: string, timeoutMs = 10_000): Promise<boolean> {
     return this.serial(async () => {
+      await Promise.all(this.inFlightEvents)
       try {
         const result = (await this.request("session.flush", {
           session_id: sessionId,
@@ -226,6 +241,7 @@ export class DaemonClient {
 
   async close(): Promise<void> {
     await this.queue
+    await Promise.all(this.inFlightEvents)
     this.disconnect(new Error("daemon client closed"))
   }
 
@@ -238,8 +254,9 @@ export class DaemonClient {
     return next
   }
 
-  private async request(method: string, params: unknown): Promise<unknown> {
-    await this.ensureConnected()
+  private async request(method: string, params: unknown, pipelined = false): Promise<unknown> {
+    if (pipelined) await this.ensureWritable()
+    else await this.ensureConnected()
     const socket = this.socket
     if (!socket || socket.destroyed) throw new Error("daemon socket is unavailable")
 
@@ -255,13 +272,27 @@ export class DaemonClient {
     return response
   }
 
-  private async ensureConnected(): Promise<void> {
+  // The daemon reads requests in socket order. Write initialize first, then
+  // permit queued events to follow without waiting for its response.
+  private async ensureWritable(): Promise<void> {
     if (this.socket && !this.socket.destroyed) return
-    if (!this.connecting) {
-      this.connecting = this.connectWithStartup().finally(() => {
-        this.connecting = undefined
-      })
+    if (!this.writable) {
+      let resolve = () => {}
+      let reject = (_error: unknown) => {}
+      const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej })
+      this.writable = { promise, resolve, reject }
     }
+    const writable = this.writable
+    void this.ensureConnected().catch((error) => writable.reject(error))
+    return writable.promise
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.connecting) return this.connecting
+    if (this.socket && !this.socket.destroyed) return
+    this.connecting = this.connectWithStartup().finally(() => {
+      this.connecting = undefined
+    })
     return this.connecting
   }
 
@@ -296,14 +327,16 @@ export class DaemonClient {
         socket.off("error", onError)
         this.attach(socket)
         try {
-          const result = (await this.requestOnConnectedSocket("initialize", {
+          const initialization = this.requestOnConnectedSocket("initialize", {
             protocol_version: DAEMON_PROTOCOL_VERSION,
             client: {
               source: this.options.source,
               plugin_version: this.options.pluginVersion,
               pid: process.pid,
             },
-          })) as {
+          })
+          this.writable?.resolve()
+          const result = (await initialization) as {
             protocol_version: number
             capabilities?: { sources?: string[] }
           }
@@ -315,7 +348,7 @@ export class DaemonClient {
           }
           resolve()
         } catch (error) {
-          this.disconnect(error)
+          if (this.socket === socket) this.disconnect(error)
           reject(error)
         }
       })
@@ -342,8 +375,12 @@ export class DaemonClient {
     this.input = ""
     socket.setEncoding("utf8")
     socket.on("data", (chunk: string) => this.onData(chunk))
-    socket.on("error", (error) => this.disconnect(error))
-    socket.on("close", () => this.disconnect(new Error("daemon connection closed")))
+    socket.on("error", (error) => {
+      if (this.socket === socket) this.disconnect(error)
+    })
+    socket.on("close", () => {
+      if (this.socket === socket) this.disconnect(new Error("daemon connection closed"))
+    })
   }
 
   private onData(chunk: string): void {
@@ -384,6 +421,8 @@ export class DaemonClient {
   }
 
   private disconnect(reason: unknown): void {
+    this.writable?.reject(reason)
+    this.writable = undefined
     const socket = this.socket
     this.socket = undefined
     if (socket && !socket.destroyed) socket.destroy()

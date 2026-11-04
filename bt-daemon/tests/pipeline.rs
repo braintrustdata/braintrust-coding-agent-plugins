@@ -1614,6 +1614,66 @@ async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
 }
 
 #[tokio::test]
+async fn opencode_v2_terminal_events_flush_without_an_explicit_client_flush() {
+    let (socket, handle, flushes, _tmp) = start_tracking_daemon("test").await;
+    let host = dummy_host();
+    for event in [
+        "session.execution.succeeded",
+        "session.execution.failed",
+        "session.execution.interrupted",
+        "session.deleted",
+    ] {
+        let session_id = format!("opencode-v2-{event}");
+        let mut enqueued = envelope(&session_id, "session.inbox.enqueued", 1);
+        enqueued.source = "opencode".into();
+        enqueued.source_version = Some("2.0.0".into());
+        enqueued.payload = serde_json::json!({"id":"enqueue", "data":{"sessionID":"native","inboxID":"i","item":{"type":"user","payload":{"text":"hello"}}}});
+        forward_envelope(&enqueued, &socket, &host, false)
+            .await
+            .unwrap();
+        let mut delivered = enqueued.clone();
+        delivered.event = "session.inbox.delivered".into();
+        delivered.payload =
+            serde_json::json!({"id":"delivered","data":{"sessionID":"native","inboxID":"i"}});
+        forward_envelope(&delivered, &socket, &host, false)
+            .await
+            .unwrap();
+        assert!(
+            flush_session(&session_id, &socket, 5_000)
+                .await
+                .unwrap()
+                .flushed
+        );
+        flushes.lock().unwrap().insert(session_id.clone(), 0);
+        let mut terminal = enqueued.clone();
+        terminal.event = event.into();
+        terminal.payload = serde_json::json!({"id":"terminal","data":{"sessionID":"native","reason":"test","error":{"type":"test","message":"test failure"}}});
+        forward_envelope(&terminal, &socket, &host, false)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if flushes
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("OpenCode v2 {event} was not flushed by the daemon"));
+    }
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn hook_capture_stops_at_the_durable_journal_boundary() {
     let (socket, handle, tmp) = start_slow_daemon().await;
     let host = dummy_host();

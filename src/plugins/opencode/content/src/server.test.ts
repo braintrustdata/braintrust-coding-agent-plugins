@@ -1,12 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
 
-const state = vi.hoisted(() => ({ logs: [] as Array<Record<string, unknown>>, closed: false }));
+const state = vi.hoisted(() => ({
+  logs: [] as Array<Record<string, unknown>>,
+  closed: false,
+  gate: undefined as Promise<void> | undefined,
+}));
 vi.mock("./runtime/daemon-client", () => ({
   claimManagedTracingInstance: () => true,
   resolveDaemonTraceSettings: (settings: unknown) => settings,
   DaemonClient: class {
     async log(event: Record<string, unknown>) {
       state.logs.push(event);
+      return true;
+    }
+    async logPipelined(event: Record<string, unknown>) {
+      state.logs.push(event);
+      await state.gate;
       return true;
     }
     async close() {
@@ -140,5 +149,43 @@ describe("OpenCode 2 capture", () => {
       session_id: "parent",
       payload: { data: { sessionID: "child" } },
     });
+  });
+  it("sends later events without waiting for acknowledgements and drains them on cleanup", async () => {
+    state.logs.length = 0;
+    state.closed = false;
+    let release = () => {};
+    state.gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const cleanup = await plugin.setup({
+      app: { version: "2.0.0" },
+      location: { directory: "/test" },
+      session: { async hook() {} },
+      tool: {
+        async transform(callback) {
+          callback({ add() {} });
+        },
+      },
+      event: {
+        async *subscribe() {
+          yield { type: "session.created", data: { sessionID: "s" } };
+          yield { type: "session.execution.succeeded", data: { sessionID: "s" } };
+        },
+      },
+    });
+    let finished = false;
+    const closing = cleanup?.().then(() => {
+      finished = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(state.logs.map((entry) => entry.event)).toEqual([
+      "session.created",
+      "session.execution.succeeded",
+    ]);
+    expect(finished).toBe(false);
+    release();
+    await closing;
+    expect(state.closed).toBe(true);
+    state.gate = undefined;
   });
 });

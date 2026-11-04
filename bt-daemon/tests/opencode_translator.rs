@@ -1713,3 +1713,313 @@ fn opencode_v2_preserves_opaque_provider_compaction_output() {
         .unwrap();
     assert_eq!(compact.output, Some(native));
 }
+
+fn v2_event(name: &str, ts: i64, data: serde_json::Value) -> Envelope {
+    let mut envelope = event(name, ts, json!({"id":format!("parity-{ts}"),"data":data}));
+    envelope.source_version = Some("2.0.0".into());
+    envelope
+}
+
+#[test]
+fn opencode_v2_checkpoint_resume_and_finalize_preserve_session_and_close_missing_tool() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for e in [
+        v2_event(
+            "session.inbox.enqueued",
+            1,
+            json!({"sessionID":"s","inboxID":"first","item":{"type":"user","payload":{"text":"first"}}}),
+        ),
+        v2_event(
+            "session.inbox.delivered",
+            2,
+            json!({"sessionID":"s","inboxID":"first"}),
+        ),
+        v2_event("session.execution.succeeded", 3, json!({"sessionID":"s"})),
+        v2_event(
+            "session.inbox.enqueued",
+            4,
+            json!({"sessionID":"s","inboxID":"second","item":{"type":"user","payload":{"text":"second"}}}),
+        ),
+    ] {
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    assert!(translator.checkpoint(&ctx).unwrap().is_empty());
+    for e in [
+        v2_event(
+            "session.inbox.delivered",
+            5,
+            json!({"sessionID":"s","inboxID":"second"}),
+        ),
+        v2_event(
+            "session.tool.input.started",
+            6,
+            json!({"sessionID":"s","id":"call","name":"read"}),
+        ),
+        v2_event(
+            "session.tool.called",
+            7,
+            json!({"sessionID":"s","assistantMessageID":"m","id":"call","input":{"path":"x"}}),
+        ),
+    ] {
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    ops.extend(translator.finalize(&ctx).unwrap());
+    let rows = reduce(ops);
+    assert_eq!(rows.values().filter(|r| r.name == "OpenCode").count(), 1);
+    assert_eq!(
+        rows.values()
+            .filter(|r| r.name.starts_with("Turn "))
+            .count(),
+        2
+    );
+    let root = rows.values().find(|r| r.name == "OpenCode").unwrap();
+    assert_eq!(root.metadata.as_ref().unwrap()["total_turns"], 2);
+    assert_eq!(root.end_ms, Some(7));
+    let tool = rows
+        .values()
+        .find(|r| r.span_type == SpanType::Tool)
+        .unwrap();
+    assert_eq!(tool.end_ms, Some(7));
+    assert_eq!(
+        tool.error.as_deref(),
+        Some("Interrupted before tool completion")
+    );
+}
+
+#[test]
+fn opencode_v2_records_reasoning_usage_timing_and_error() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let events = [
+        v2_event(
+            "session.inbox.enqueued",
+            1,
+            json!({"sessionID":"s","inboxID":"i","item":{"type":"user","payload":{"text":"think"}}}),
+        ),
+        v2_event(
+            "session.inbox.delivered",
+            2,
+            json!({"sessionID":"s","inboxID":"i"}),
+        ),
+        v2_event(
+            "session.step.started",
+            3,
+            json!({"sessionID":"s","assistantMessageID":"m","started":2,"model":{"id":"model","providerID":"test","variant":"high"}}),
+        ),
+        v2_event(
+            "session.reasoning.ended",
+            4,
+            json!({"sessionID":"s","assistantMessageID":"m","ordinal":1,"text":"second"}),
+        ),
+        v2_event(
+            "session.reasoning.ended",
+            5,
+            json!({"sessionID":"s","assistantMessageID":"m","ordinal":0,"text":"first "}),
+        ),
+        v2_event(
+            "session.text.ended",
+            6,
+            json!({"sessionID":"s","assistantMessageID":"m","text":"answer"}),
+        ),
+        v2_event(
+            "session.step.failed",
+            7,
+            json!({"sessionID":"s","assistantMessageID":"m","tokens":{"input":10,"output":3,"reasoning":2,"cache":{"read":5,"write":4}},"error":{"type":"provider","message":"provider failure"}}),
+        ),
+        v2_event(
+            "session.execution.failed",
+            8,
+            json!({"sessionID":"s","error":{"type":"provider","message":"provider failure"}}),
+        ),
+    ];
+    let ops = events
+        .iter()
+        .flat_map(|e| translator.handle(e, &ctx).unwrap())
+        .collect();
+    let rows = reduce(ops);
+    let llm = rows
+        .values()
+        .find(|r| r.span_type == SpanType::Llm)
+        .unwrap();
+    assert_eq!((llm.start_ms, llm.end_ms), (Some(2), Some(7)));
+    assert_eq!(llm.error.as_deref(), Some("provider failure"));
+    assert_eq!(
+        llm.output.as_ref().unwrap()[0]["reasoning"][0]["content"],
+        "first second"
+    );
+    assert_eq!(
+        llm.metrics,
+        Some(
+            json!({"prompt_tokens":19,"completion_tokens":3,"tokens":24,"prompt_cached_tokens":5,"prompt_cache_creation_tokens":4,"reasoning_tokens":2})
+        )
+    );
+    let root = rows.values().find(|r| r.name == "OpenCode").unwrap();
+    assert_eq!(root.error.as_deref(), Some("provider failure"));
+}
+
+#[test]
+fn opencode_v2_ignores_malformed_unknown_cancelled_and_replayed_events() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    for e in [
+        v2_event(
+            "session.inbox.enqueued",
+            1,
+            json!({"sessionID":"s","inboxID":"cancelled","item":{"type":"user","payload":{"text":"not delivered"}}}),
+        ),
+        v2_event(
+            "session.inbox.cancelled",
+            2,
+            json!({"sessionID":"s","inboxID":"cancelled"}),
+        ),
+        v2_event(
+            "session.inbox.delivered",
+            3,
+            json!({"sessionID":"s","inboxID":"cancelled"}),
+        ),
+        v2_event("session.step.ended", 4, json!({"sessionID":42})),
+        v2_event(
+            "session.future.event",
+            5,
+            json!({"sessionID":"s","new":"shape"}),
+        ),
+    ] {
+        assert!(translator.handle(&e, &ctx).unwrap().is_empty());
+    }
+    let enqueued = v2_event(
+        "session.inbox.enqueued",
+        6,
+        json!({"sessionID":"s","inboxID":"real","item":{"type":"user","payload":{"text":"delivered"}}}),
+    );
+    let delivered = v2_event(
+        "session.inbox.delivered",
+        7,
+        json!({"sessionID":"s","inboxID":"real"}),
+    );
+    assert!(translator.handle(&enqueued, &ctx).unwrap().is_empty());
+    assert!(translator.handle(&enqueued, &ctx).unwrap().is_empty());
+    let ops = translator.handle(&delivered, &ctx).unwrap();
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(op, SpanOp::Insert(row) if row.name == "Turn 1"))
+            .count(),
+        1
+    );
+    assert!(translator.handle(&delivered, &ctx).unwrap().is_empty());
+}
+
+#[test]
+fn opencode_v2_routes_resumed_nested_sessions_under_external_parent() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
+    components.span_id = Some("external-parent".into());
+    components.root_span_id = Some("external-root".into());
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: Some(
+            SessionRoute {
+                destination: Some(TraceDestination::ParentSpan { components }),
+                additional_metadata: Some(
+                    json!({"team":"pipeline","source":"override","_bt_private":true}),
+                ),
+                tags: vec!["nested".into()],
+                ..SessionRoute::default()
+            }
+            .with_auth(BackendAuth {
+                token: "test".into(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            }),
+        ),
+    };
+    let events = [
+        v2_event("session.created", 1, json!({"sessionID":"parent"})),
+        v2_event(
+            "session.inbox.enqueued",
+            2,
+            json!({"sessionID":"parent","inboxID":"i","item":{"type":"user","payload":{"text":"delegate"}}}),
+        ),
+        v2_event(
+            "session.inbox.delivered",
+            3,
+            json!({"sessionID":"parent","inboxID":"i"}),
+        ),
+        v2_event(
+            "session.created",
+            4,
+            json!({"sessionID":"child","parentID":"parent","title":"find docs (@research subagent)"}),
+        ),
+        v2_event(
+            "session.execution.succeeded",
+            5,
+            json!({"sessionID":"child"}),
+        ),
+        v2_event(
+            "session.execution.succeeded",
+            6,
+            json!({"sessionID":"parent"}),
+        ),
+        v2_event(
+            "session.inbox.enqueued",
+            7,
+            json!({"sessionID":"parent","inboxID":"j","item":{"type":"user","payload":{"text":"resume"}}}),
+        ),
+        v2_event(
+            "session.inbox.delivered",
+            8,
+            json!({"sessionID":"parent","inboxID":"j"}),
+        ),
+    ];
+    let ops = events
+        .iter()
+        .flat_map(|e| translator.handle(e, &ctx).unwrap())
+        .collect::<Vec<_>>();
+    assert_merges_preserve_insert_identity(&ops);
+    let root_insert = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "OpenCode" => Some(row),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(root_insert.parent_span_ids, ["external-parent"]);
+    let reopen = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Merge(row) if row.span_id == root_insert.span_id && row.end_ms.is_none() => {
+                Some(row)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(reopen.parent_span_ids, ["external-parent"]);
+    let child_insert = ops
+        .iter()
+        .find_map(|op| match op {
+            SpanOp::Insert(row) if row.name == "research: find docs" => Some(row),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(root_insert.root_span_id, "external-root");
+    assert_eq!(child_insert.root_span_id, "external-root");
+    assert_ne!(child_insert.parent_span_ids, ["external-parent"]);
+    for row in [root_insert, child_insert] {
+        assert_eq!(row.metadata.as_ref().unwrap()["team"], "pipeline");
+        assert_eq!(row.metadata.as_ref().unwrap()["source"], "opencode");
+        assert!(row.metadata.as_ref().unwrap().get("_bt_private").is_none());
+        assert_eq!(row.tags, Some(vec!["nested".into()]));
+    }
+}

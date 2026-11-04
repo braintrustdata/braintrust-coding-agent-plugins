@@ -166,6 +166,11 @@ impl AgentTestWorld {
         self.root.path().join(name)
     }
 
+    #[cfg(unix)]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
     pub fn configure(&self, command: &mut Command) {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut entries = vec![self.wrapper_dir.clone()];

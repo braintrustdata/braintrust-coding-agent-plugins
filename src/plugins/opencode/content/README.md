@@ -38,8 +38,9 @@ through its `@opencode/cli` distribution. Installed-package tests exercise
 text and tool sessions, subagents, attachments, denied permissions, interrupted
 sessions, compaction, and resumed sessions using a mock model and trace backend.
 Managed runs start a private OpenCode 2 server to keep routing scoped to the run.
-Short-lived standalone OpenCode 2 processes may exit before the final trace event
-is delivered; use a managed run when completion of the trace is required.
+Standalone delivery is tested with delayed daemon acknowledgements. As with
+other fail-open integrations, abrupt termination or an unavailable daemon can
+prevent trace events from being delivered.
 
 The package declares `@opencode-ai/plugin` and `@opencode-ai/sdk` peers at
 `>=1.2.25`. CI checks package installation at that minimum and at the latest

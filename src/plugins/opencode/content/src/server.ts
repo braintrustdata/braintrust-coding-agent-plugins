@@ -150,13 +150,14 @@ export default {
           event.type === "session.deleted"
         )
           contexts.delete(session);
-        pending = pending.then(async () => {
-          if (first && event.type !== "session.created") {
-            await daemon.log({ ...envelope, event: "session_start" });
-          }
-          if (context) await daemon.log({ ...envelope, event: "model.context", ...context });
-          await daemon.log(envelope);
-        });
+        const writes = [];
+        if (first && event.type !== "session.created") {
+          writes.push(daemon.logPipelined({ ...envelope, event: "session_start" }));
+        }
+        if (context)
+          writes.push(daemon.logPipelined({ ...envelope, event: "model.context", ...context }));
+        writes.push(daemon.logPipelined(envelope));
+        pending = Promise.all([pending, ...writes]).then(() => {});
       }
     })().catch(() => {});
     return async () => {

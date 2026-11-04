@@ -541,6 +541,12 @@ fn request_helpers_recognize_tool_results_and_advertised_tools() {
 async fn opencode_v2_session_emits_traces() {
     use base64::Engine;
     let inference = OpenAiMock::new(|_, request| {
+        if request.contains_text("model failure marker") {
+            return MockReply::http_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                json!({"error":{"message":"MODEL_FAILURE_FIXTURE","type":"invalid_request_error"}}),
+            );
+        }
         let tools = request.body["tools"].as_array();
         let has_tool_result = request.body["messages"]
             .as_array()
@@ -649,6 +655,14 @@ async fn opencode_v2_session_emits_traces() {
                 && row["output"].to_string().contains("OPENCODE_V2_OK")
         })
         .unwrap();
+    assert_eq!(final_llm["metadata"]["provider"], "mock");
+    assert_eq!(final_llm["metadata"]["model"], "mock-model");
+    assert_eq!(final_llm["metrics"]["prompt_tokens"].as_f64(), Some(10.0));
+    assert_eq!(
+        final_llm["metrics"]["completion_tokens"].as_f64(),
+        Some(5.0)
+    );
+    assert_eq!(final_llm["metrics"]["tokens"].as_f64(), Some(15.0));
     assert!(
         final_llm["input"]
             .as_array()
@@ -662,6 +676,21 @@ async fn opencode_v2_session_emits_traces() {
         "unexpected model input: {}",
         final_llm["input"]
     );
+
+    let managed_turn_id = rows
+        .iter()
+        .find(|row| row_contains(row, &["Turn 1", "say hello", "data:image/png;base64,"]))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new().expect("managed v2 completed turn", move |row| {
+                row["id"] == managed_turn_id && row["output"] == "OPENCODE_V2_OK"
+            }),
+        )
+        .await;
 
     // Exercise the persistent plugin configuration separately from managed runs.
     let mut persistent_config = config.clone();
@@ -803,6 +832,40 @@ async fn opencode_v2_session_emits_traces() {
         .await;
 
     std::fs::remove_file(plugins.join("interrupt.js")).unwrap();
+    let mut failed = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    failed
+        .args([
+            "run",
+            "--standalone",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "model failure marker",
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"));
+    world.configure(&mut failed);
+    let _output = world.output(&mut failed).await;
+    let failure_rows = world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new()
+                .expect("failed model turn", |row| {
+                    row_contains(row, &["Turn 1", "model failure marker"])
+                })
+                .expect("model error", |row| {
+                    row["error"].to_string().contains("MODEL_FAILURE_FIXTURE")
+                }),
+        )
+        .await;
+    assert!(failure_rows
+        .iter()
+        .any(|row| row["error"].to_string().contains("MODEL_FAILURE_FIXTURE")));
+
     std::fs::write(plugins.join("image.js"), r#"export default { id:'test.image', async setup(ctx) { await ctx.tool.transform(editor => editor.add({name:'fixture_image',description:'Return an image',input:{type:'object',properties:{},additionalProperties:false},options:{codemode:false},async execute() { return {content:[{type:'file',mime:'image/png',uri:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg=='}]}; }})); } };"#).unwrap();
     let mut image_run = support::agent_process::daemon_command();
     image_run
@@ -1152,4 +1215,101 @@ async fn run_v2_compaction_after_idle(native: bool) {
         .contains("legacy compaction"));
     server.kill().await.unwrap();
     server.wait().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires OpenCode 2 and a built OpenCode package"]
+async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are_slow() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
+
+    let inference =
+        OpenAiMock::new(|_, _| MockReply::response(OpenAiTurn::text("SLOW_ACK_RESPONSE")));
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let workspace = world.workspace();
+    let home = world.temp_path("slow-ack-home");
+    let config_dir = home.join("config/opencode");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("braintrust.json"), serde_json::to_vec(&json!({"trace_to_braintrust":true,"enable_tools":false,"route":{"destination":{"type":"project_logs","project_name":"agent-e2e"}}})).unwrap()).unwrap();
+    std::fs::write(workspace.join("opencode.json"), serde_json::to_vec(&json!({
+        "plugin":[std::env::var("OPENCODE_V2_PLUGIN_DIR").unwrap()], "model":"mock/mock-model", "providers":{"mock":{"package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":format!("{}/v1",inference_server.uri()),"apiKey":"test"},"models":{"mock-model":{"name":"Mock"}}}}
+    })).unwrap()).unwrap();
+    let proxy_path = world.temp_path("slow.sock");
+    let listener = UnixListener::bind(&proxy_path).unwrap();
+    let target = world.socket().to_owned();
+    let proxy = tokio::spawn(async move {
+        while let Ok((incoming, _)) = listener.accept().await {
+            let target = target.clone();
+            tokio::spawn(async move {
+                let Ok(outgoing) = UnixStream::connect(target).await else {
+                    return;
+                };
+                let (mut client_read, mut client_write) = incoming.into_split();
+                let (mut daemon_read, mut daemon_write) = outgoing.into_split();
+                let request = async {
+                    let _ = tokio::io::copy(&mut client_read, &mut daemon_write).await;
+                };
+                let response = async {
+                    let mut buffer = [0u8; 8192];
+                    let mut client_closed = false;
+                    while let Ok(n) = daemon_read.read(&mut buffer).await {
+                        if n == 0 {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+                        if !client_closed && client_write.write_all(&buffer[..n]).await.is_err() {
+                            client_closed = true;
+                        }
+                    }
+                };
+                tokio::join!(request, response);
+            });
+        }
+    });
+    let mut run = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    run.args([
+        "run",
+        "--standalone",
+        "--auto",
+        "--model",
+        "mock/mock-model",
+        "slow ack marker",
+    ])
+    .current_dir(&workspace)
+    .env("PWD", &workspace)
+    .env("HOME", &home)
+    .env("USERPROFILE", &home)
+    .env("XDG_CONFIG_HOME", home.join("config"))
+    .env("XDG_DATA_HOME", home.join("data"))
+    .env("XDG_CACHE_HOME", home.join("cache"));
+    world.configure(&mut run);
+    run.env("BRAINTRUST_DAEMON_SOCKET", &proxy_path);
+    let output = world.output(&mut run).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows = world
+        .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("standalone turn", |row| {
+            row_contains(row, &["Turn 1", "slow ack marker"])
+        }))
+        .await;
+    let turn_id = rows
+        .iter()
+        .find(|row| row_contains(row, &["Turn 1", "slow ack marker"]))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new().expect("standalone completed turn", move |row| {
+                row["id"] == turn_id && row["output"] == "SLOW_ACK_RESPONSE"
+            }),
+        )
+        .await;
+    proxy.abort();
 }
