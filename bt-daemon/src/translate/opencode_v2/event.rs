@@ -282,10 +282,24 @@ pub(super) struct CompactionEnded {
     pub model: Option<Model>,
     pub tokens: Option<Tokens>,
     pub native: Option<NativeCompaction>,
+    #[serde(rename = "providerContext")]
+    pub provider_context: Option<NativeCompaction>,
 }
 #[derive(Deserialize)]
 pub(super) struct NativeCompaction {
-    pub messages: Option<Value>,
+    pub messages: Option<NativeMessages>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum NativeMessages {
+    Messages(Vec<NativeContextMessage>),
+    Opaque(Value),
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NativeContextMessage {
+    pub role: String,
+    pub content: MessageContent,
 }
 #[derive(Deserialize)]
 pub(super) struct CompactionFailed {

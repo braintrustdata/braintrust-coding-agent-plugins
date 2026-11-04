@@ -41,6 +41,7 @@ struct SessionState {
     idle: bool,
     output: Option<String>,
     history: Vec<HistoryEntry>,
+    native_window: Option<NativeWindow>,
     calls: HashMap<String, Vec<ToolCall>>,
     results: HashMap<String, Vec<Message>>,
     tools: HashMap<String, ToolState>,
@@ -69,6 +70,11 @@ struct HistoryEntry {
     id: String,
     messages: Vec<Message>,
 }
+struct NativeWindow {
+    model: Option<Model>,
+    messages: Vec<Message>,
+    history_boundary: usize,
+}
 struct Compaction {
     started: i64,
     input_id: Option<String>,
@@ -84,6 +90,7 @@ struct CompactionResult<'a> {
     error: Option<String>,
     keep_id: Option<String>,
     input_id: Option<String>,
+    native_messages: Option<NativeMessages>,
 }
 
 pub(super) struct OpenCodeV2Translator {
@@ -583,27 +590,22 @@ impl AgentTranslator for OpenCodeV2Translator {
                         started: ts,
                         input_id: None,
                     });
-                if data
-                    .native
-                    .as_ref()
-                    .and_then(|n| n.messages.as_ref())
-                    .is_some()
-                {
-                    vec![]
-                } else {
-                    self.compact(CompactionResult {
-                        session_id: &data.session_id,
-                        id: native.id.as_deref().unwrap_or("compaction-summary"),
-                        text: data.text,
-                        model: data.model,
-                        tokens: data.tokens,
-                        started: start.started,
-                        ended: ts,
-                        error: None,
-                        keep_id: native.metadata.and_then(|m| m.keep_id),
-                        input_id: start.input_id,
-                    })
-                }
+                self.compact(CompactionResult {
+                    session_id: &data.session_id,
+                    id: native.id.as_deref().unwrap_or("compaction-summary"),
+                    text: data.text,
+                    model: data.model,
+                    tokens: data.tokens,
+                    started: start.started,
+                    ended: ts,
+                    error: None,
+                    keep_id: native.metadata.and_then(|m| m.keep_id),
+                    input_id: start.input_id,
+                    native_messages: data
+                        .native
+                        .and_then(|n| n.messages)
+                        .or_else(|| data.provider_context.and_then(|n| n.messages)),
+                })
             }
             NativeEvent::CompactionFailed(data) => {
                 let start = self
@@ -624,6 +626,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     error: Some(data.error.message),
                     keep_id: None,
                     input_id: start.input_id,
+                    native_messages: None,
                 })
             }
             NativeEvent::Succeeded(data) => self.finish(&data.session_id, ts, false, None),
@@ -748,10 +751,27 @@ impl OpenCodeV2Translator {
             }]);
         }
         let input = step.context.map(normalize_context).unwrap_or_else(|| {
-            s.history
-                .iter()
-                .flat_map(|entry| entry.messages.iter().cloned())
-                .collect()
+            let window = s.native_window.as_ref().filter(|window| {
+                match (window.model.as_ref(), step.model.as_ref()) {
+                    (Some(a), Some(b)) => {
+                        a.id.is_some()
+                            && a.provider_id.is_some()
+                            && a.id == b.id
+                            && a.provider_id == b.provider_id
+                    }
+                    _ => false,
+                }
+            });
+            let (mut input, start) = window.map_or_else(
+                || (Vec::new(), 0),
+                |window| (window.messages.clone(), window.history_boundary),
+            );
+            input.extend(
+                s.history[start..]
+                    .iter()
+                    .flat_map(|entry| entry.messages.iter().cloned()),
+            );
+            input
         });
         if !text.is_empty() {
             s.output = Some(text.clone());
@@ -814,12 +834,20 @@ impl OpenCodeV2Translator {
             error,
             keep_id,
             input_id,
+            native_messages,
         } = result;
         let Some(s) = self.sessions.get_mut(sid) else {
             return vec![];
         };
         let parent = s.turn.clone().unwrap_or_else(|| s.root.clone());
         if let Some(input_id) = input_id {
+            if let Some(window) = &mut s.native_window {
+                let removed = s.history[..window.history_boundary]
+                    .iter()
+                    .filter(|entry| entry.id == input_id)
+                    .count();
+                window.history_boundary -= removed;
+            }
             s.history.retain(|entry| entry.id != input_id);
         }
         let tail = keep_id
@@ -830,15 +858,49 @@ impl OpenCodeV2Translator {
             .iter()
             .flat_map(|entry| entry.messages.iter().cloned())
             .collect();
-        if error.is_none() {
-            let kept = s.history.drain(tail..).collect::<Vec<_>>();
-            s.history.clear();
-            s.history.push(HistoryEntry {
-                id: id.into(),
-                messages: vec![Message::summary(text.clone())],
-            });
-            s.history.extend(kept);
-        }
+        let output = match native_messages {
+            Some(NativeMessages::Messages(messages)) => {
+                let messages = normalize_context(Context {
+                    session_id: sid.to_owned(),
+                    system: Vec::new(),
+                    messages: messages
+                        .into_iter()
+                        .map(|message| ContextMessage {
+                            role: message.role,
+                            content: message.content,
+                        })
+                        .collect(),
+                });
+                if error.is_none() {
+                    s.native_window = Some(NativeWindow {
+                        model: model.clone(),
+                        messages: messages.clone(),
+                        history_boundary: s.history.len(),
+                    });
+                }
+                span_value(messages)
+            }
+            Some(NativeMessages::Opaque(messages)) => {
+                if error.is_none() {
+                    s.native_window = None;
+                }
+                messages
+            }
+            None => {
+                if error.is_none() {
+                    let kept = s.history.drain(tail..).collect::<Vec<_>>();
+                    s.history.clear();
+                    s.history.push(HistoryEntry {
+                        id: id.into(),
+                        messages: vec![Message::summary(text.clone())],
+                    });
+                    s.history.extend(kept);
+                    s.native_window = None;
+                }
+                span_value([Message::new("assistant", Content::Text(text))])
+            }
+        };
+        let variant = model.as_ref().and_then(|m| m.variant.as_deref());
         let provider = model
             .as_ref()
             .and_then(|m| m.provider_id.as_deref())
@@ -858,12 +920,12 @@ impl OpenCodeV2Translator {
             start_ms: Some(started),
             end_ms: Some(ts),
             input: Some(span_value(input)),
-            output: Some(span_value([Message::new("assistant", Content::Text(text))])),
+            output: Some(output),
             metadata: Some(span_value(LlmMetadata {
                 provider,
                 model,
                 message_id: id,
-                variant: None,
+                variant,
             })),
             metrics: Some(span_value(metrics)),
             error,

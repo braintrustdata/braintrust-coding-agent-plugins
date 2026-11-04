@@ -1594,3 +1594,122 @@ fn opencode_v2_preserves_provider_defined_context_and_tool_content() {
         Some(json!([{"type":"vendor-content","payload":{"value":7}}]))
     );
 }
+
+#[test]
+fn opencode_v2_native_compaction_window_is_scoped_to_its_model() {
+    for (field, model, expected) in [
+        ("native", "same", "replacement"),
+        ("native", "different", "original"),
+        ("providerContext", "same", "replacement"),
+    ] {
+        let mut translator = Registry::default_agents().create("opencode", "root-session");
+        let ctx = SessionCtx {
+            session_id: "root-session".into(),
+            config: None,
+        };
+        let mut compact =
+            json!({"sessionID":"s","text":"","model":{"id":"same","providerID":"test"}});
+        compact[field] = json!({"messages":[{"role":"user","content":"replacement"}]});
+        let events = [
+            (
+                "session.inbox.enqueued",
+                json!({"sessionID":"s","inboxID":"old","item":{"type":"user","payload":{"text":"original"}}}),
+            ),
+            (
+                "session.inbox.delivered",
+                json!({"sessionID":"s","inboxID":"old"}),
+            ),
+            ("session.compaction.started", json!({"sessionID":"s"})),
+            ("session.compaction.ended", compact),
+            (
+                "session.step.started",
+                json!({"sessionID":"s","assistantMessageID":"m","model":{"id":model,"providerID":"test"}}),
+            ),
+            (
+                "session.text.ended",
+                json!({"sessionID":"s","assistantMessageID":"m","ordinal":0,"text":"answer"}),
+            ),
+            (
+                "session.step.ended",
+                json!({"sessionID":"s","assistantMessageID":"m"}),
+            ),
+        ];
+        let mut ops = Vec::new();
+        for (i, (name, data)) in events.into_iter().enumerate() {
+            let mut envelope = event(
+                name,
+                i as i64 + 1,
+                json!({"id":format!("native-{i}"),"data":data}),
+            );
+            envelope.source_version = Some("2.2.5".into());
+            ops.extend(translator.handle(&envelope, &ctx).unwrap());
+        }
+        let rows = reduce(ops);
+        let llm = rows
+            .values()
+            .find(|row| {
+                row.metadata
+                    .as_ref()
+                    .is_some_and(|m| m["message_id"] == "m")
+            })
+            .unwrap();
+        assert_eq!(llm.input, Some(json!([{"role":"user","content":expected}])));
+        let compact = rows
+            .values()
+            .find(|row| {
+                row.tags
+                    .as_ref()
+                    .is_some_and(|tags| tags.iter().any(|tag| tag == "compaction"))
+            })
+            .unwrap();
+        assert_eq!(
+            compact.output,
+            Some(json!([{"role":"user","content":"replacement"}]))
+        );
+    }
+}
+
+#[test]
+fn opencode_v2_preserves_opaque_provider_compaction_output() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let native =
+        json!([{"role":"assistant","content":null,"provider_specific":{"continuation":"opaque"}}]);
+    let events = [
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"s","inboxID":"i","item":{"type":"user","payload":{"text":"hello"}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"s","inboxID":"i"}),
+        ),
+        (
+            "session.compaction.ended",
+            json!({"sessionID":"s","text":"","native":{"messages":native}}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        let mut envelope = event(
+            name,
+            i as i64 + 1,
+            json!({"id":format!("opaque-{i}"),"data":data}),
+        );
+        envelope.source_version = Some("2.2.5".into());
+        ops.extend(translator.handle(&envelope, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let compact = rows
+        .values()
+        .find(|row| {
+            row.tags
+                .as_ref()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == "compaction"))
+        })
+        .unwrap();
+    assert_eq!(compact.output, Some(native));
+}

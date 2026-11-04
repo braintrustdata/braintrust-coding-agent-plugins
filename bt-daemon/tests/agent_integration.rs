@@ -953,7 +953,32 @@ async fn opencode_v2_subagent_is_nested() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires OpenCode 2 and a built OpenCode package"]
 async fn opencode_v2_compaction_after_idle() {
+    run_v2_compaction_after_idle(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires OpenCode 2.1+ and a built OpenCode package"]
+async fn opencode_v2_native_compaction_after_idle() {
+    run_v2_compaction_after_idle(true).await;
+}
+
+async fn run_v2_compaction_after_idle(native: bool) {
     let binary = std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN");
+    if native {
+        let version = support::agent_process::command(&binary)
+            .arg("--version")
+            .output()
+            .await
+            .unwrap();
+        if String::from_utf8_lossy(&version.stdout).contains("v2.0.") {
+            return;
+        }
+    }
+    let summary = if native {
+        "NATIVE_COMPACTION_WINDOW"
+    } else {
+        "LEGACY_COMPACTION_SUMMARY"
+    };
     let inference = OpenAiMock::new(|_, _| MockReply::response(OpenAiTurn::text("LEGACY_TEXT")));
     let inference_server = TestServer::start(inference.router()).await;
     let world = AgentTestWorld::start().await;
@@ -967,7 +992,12 @@ async fn opencode_v2_compaction_after_idle() {
     std::fs::write(workspace.join("opencode.json"), serde_json::to_vec(&json!({
         "plugin":[std::env::var("OPENCODE_V2_PLUGIN_DIR").unwrap()], "model":"mock/mock-model", "providers":{"mock":{"package":"@opencode/ai/providers/openai-compatible","settings":{"baseURL":format!("{}/v1",inference_server.uri()),"apiKey":"test"},"models":{"mock-model":{"name":"Mock"}}}}
     })).unwrap()).unwrap();
-    std::fs::write(plugins.join("compact.js"), "export default {id:'test.compact',async setup(ctx){await ctx.session.hook('compaction',e=>{e.result={summary:'LEGACY_COMPACTION_SUMMARY'}})}};").unwrap();
+    let hook = if native {
+        "export default {id:'test.compact',async setup(ctx){await ctx.session.hook('compaction',e=>{e.result={summary:'',native:{messages:[{role:'user',content:[{type:'text',text:'NATIVE_COMPACTION_WINDOW'}]}]}}})}};"
+    } else {
+        "export default {id:'test.compact',async setup(ctx){await ctx.session.hook('compaction',e=>{e.result={summary:'LEGACY_COMPACTION_SUMMARY'}})}};"
+    };
+    std::fs::write(plugins.join("compact.js"), hook).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -1065,13 +1095,13 @@ async fn opencode_v2_compaction_after_idle() {
         .unwrap();
     let compacted_rows = world
         .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("idle compaction", |row| {
-            row_contains(row, &[r#""type":"llm""#, "LEGACY_COMPACTION_SUMMARY"])
+            row_contains(row, &[r#""type":"llm""#, summary])
         }))
         .await;
-    assert!(compacted_rows.iter().any(|row| row_contains(
-        row,
-        &[r#""type":"llm""#, "LEGACY_COMPACTION_SUMMARY"]
-    ) && row["root_span_id"] == root_id));
+    assert!(compacted_rows
+        .iter()
+        .any(|row| row_contains(row, &[r#""type":"llm""#, summary])
+            && row["root_span_id"] == root_id));
     let mut resume = support::agent_process::command(&binary);
     resume
         .args([
@@ -1103,11 +1133,7 @@ async fn opencode_v2_compaction_after_idle() {
         .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("resumed context", |row| {
             row_contains(
                 row,
-                &[
-                    r#""type":"llm""#,
-                    "LEGACY_COMPACTION_SUMMARY",
-                    "legacy after compaction",
-                ],
+                &[r#""type":"llm""#, summary, "legacy after compaction"],
             )
         }))
         .await;
@@ -1116,11 +1142,7 @@ async fn opencode_v2_compaction_after_idle() {
         .find(|row| {
             row_contains(
                 row,
-                &[
-                    r#""type":"llm""#,
-                    "LEGACY_COMPACTION_SUMMARY",
-                    "legacy after compaction",
-                ],
+                &[r#""type":"llm""#, summary, "legacy after compaction"],
             )
         })
         .unwrap();
