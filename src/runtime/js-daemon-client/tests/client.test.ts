@@ -281,6 +281,7 @@ test("retries pipelined events in order after a lost connection", async () => {
 test("pipelined events do not report success when daemon initialization is incompatible", async () => {
   const temp = mkdtempSync(join(tmpdir(), "bt-js-version-"))
   const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\bt-js-version-${process.pid}-${Date.now()}` : join(temp, "daemon.sock")
+  let eventsReceived = 0
   const server = createServer((socket) => {
     // The client intentionally closes this connection after rejecting the
     // incompatible handshake; a pending server write may then fail on Windows.
@@ -293,6 +294,7 @@ test("pipelined events do not report success when daemon initialization is incom
         const newline = input.indexOf("\n")
         const request = JSON.parse(input.slice(0, newline))
         input = input.slice(newline + 1)
+        if (request.method === "event.log") eventsReceived++
         const result = request.method === "initialize" ? { protocol_version: 99, capabilities: { sources: ["opencode"] } } : { accepted: true }
         socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`)
       }
@@ -303,7 +305,27 @@ test("pipelined events do not report success when daemon initialization is incom
   const client = new DaemonClient({ source: "opencode", socketPath: endpoint, connectAttempts: 1, connectDelayMs: 1, requestTimeoutMs: 500, warn: (warning) => warnings.push(warning) })
   assert.equal(await client.logPipelined({ source: "opencode", session_id: "s", event: "test", ts_ms: 1, payload: {} }), false)
   assert.ok(warnings.length > 0)
+  assert.equal(eventsReceived, 0)
   await client.close()
   await new Promise<void>((resolve) => server.close(() => resolve()))
   rmSync(temp, { recursive: true, force: true })
+})
+
+test("connection preparation is bounded when the daemon is slow", async () => {
+  const temp = mkdtempSync(join(tmpdir(), "bt-js-prepare-"))
+  const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\bt-js-prepare-${process.pid}-${Date.now()}` : join(temp, "daemon.sock")
+  const server = createServer((socket) => {
+    socket.on("error", () => {})
+    socket.once("data", (data) => {
+      const request = JSON.parse(data.toString().trim())
+      setTimeout(() => socket.write(`${JSON.stringify({jsonrpc:"2.0",id:request.id,result:{protocol_version:1,capabilities:{sources:["opencode"]}}})}\n`), 80)
+    })
+  })
+  await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
+  const client = new DaemonClient({ source:"opencode", socketPath:endpoint, requestTimeoutMs:500 })
+  assert.equal(await client.prepare(10), false)
+  assert.equal(await client.prepare(1_000), true)
+  await client.close()
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  rmSync(temp, { recursive:true, force:true })
 })

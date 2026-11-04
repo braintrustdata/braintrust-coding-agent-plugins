@@ -33,10 +33,10 @@ struct SessionState {
     root: String,
     trace_root: String,
     parents: Vec<String>,
-    parent_session: Option<String>,
     owner_turn: Option<String>,
     turn: Option<String>,
     turn_number: u32,
+    turn_skills: Vec<String>,
     tool_count: u32,
     idle: bool,
     output: Option<String>,
@@ -44,8 +44,8 @@ struct SessionState {
     native_window: Option<NativeWindow>,
     calls: HashMap<String, Vec<ToolCall>>,
     results: HashMap<String, Vec<Message>>,
-    tools: HashMap<String, ToolState>,
-    denied_tools: HashSet<String>,
+    tools: HashMap<(String, String), ToolState>,
+    denied_tools: HashSet<(String, String)>,
     completed_messages: RecentSet<String>,
 }
 struct ToolState {
@@ -64,6 +64,7 @@ struct Step {
 struct Permission {
     session_id: String,
     call_id: Option<String>,
+    message_id: Option<String>,
     action: String,
 }
 struct HistoryEntry {
@@ -97,7 +98,7 @@ pub(super) struct OpenCodeV2Translator {
     daemon_session_id: String,
     sessions: HashMap<String, SessionState>,
     pending_inputs: HashMap<(String, String), Prompt>,
-    tool_names: HashMap<(String, String), String>,
+    tool_names: HashMap<(String, String, String), String>,
     steps: HashMap<(String, String), Step>,
     pending_context: HashMap<String, Context>,
     text_parts: HashMap<(String, String, bool), BTreeMap<u64, String>>,
@@ -171,7 +172,6 @@ impl OpenCodeV2Translator {
                 root: root.clone(),
                 trace_root: trace_root.clone(),
                 parents: parents.clone(),
-                parent_session: parent_id.map(str::to_owned),
                 owner_turn: owner.clone(),
                 ..Default::default()
             },
@@ -252,6 +252,7 @@ impl OpenCodeV2Translator {
             }
         }
         s.turn = Some(turn.clone());
+        s.turn_skills = skills.clone();
         ops.push(SpanOp::Insert(SpanRow {
             span_id: turn.clone(),
             root_span_id: s.trace_root.clone(),
@@ -317,7 +318,7 @@ impl OpenCodeV2Translator {
             error,
             ..Default::default()
         }));
-        if !permanent && s.parent_session.is_none() {
+        if !permanent {
             s.idle = true;
             self.sessions.insert(sid.into(), s);
         }
@@ -379,6 +380,21 @@ impl AgentTranslator for OpenCodeV2Translator {
             }
             NativeEvent::StepStarted(data) => {
                 let context = self.pending_context.remove(&data.session_id);
+                let turn_update = self.sessions.get(&data.session_id).and_then(|s| {
+                    let turn = s.turn.as_ref()?;
+                    let model = data.model.as_ref()?.id.as_ref()?;
+                    Some(SpanOp::Merge(SpanRow {
+                        span_id: turn.clone(),
+                        root_span_id: s.trace_root.clone(),
+                        parent_span_ids: vec![s.root.clone()],
+                        metadata: Some(span_value(TurnMetadata {
+                            turn_number: s.turn_number,
+                            model: Some(model.clone()),
+                            loaded_skill_names: s.turn_skills.clone(),
+                        })),
+                        ..Default::default()
+                    }))
+                });
                 self.steps.insert(
                     (data.session_id, data.message_id),
                     Step {
@@ -387,17 +403,34 @@ impl AgentTranslator for OpenCodeV2Translator {
                         context,
                     },
                 );
-                vec![]
+                turn_update.into_iter().collect()
             }
             NativeEvent::ToolInputStarted(data) => {
-                self.tool_names
-                    .insert((data.session_id, data.id), data.name);
+                self.tool_names.insert(
+                    (
+                        data.session_id,
+                        data.message_id.unwrap_or_default(),
+                        data.id,
+                    ),
+                    data.name,
+                );
                 vec![]
             }
             NativeEvent::ToolCalled(data) => {
                 let name = self
                     .tool_names
-                    .get(&(data.session_id.clone(), data.id.clone()))
+                    .get(&(
+                        data.session_id.clone(),
+                        data.message_id.clone(),
+                        data.id.clone(),
+                    ))
+                    .or_else(|| {
+                        self.tool_names.get(&(
+                            data.session_id.clone(),
+                            String::new(),
+                            data.id.clone(),
+                        ))
+                    })
                     .cloned()
                     .unwrap_or_else(|| "tool".into());
                 let Some(s) = self.sessions.get_mut(&data.session_id) else {
@@ -406,15 +439,16 @@ impl AgentTranslator for OpenCodeV2Translator {
                 let Some(parent) = s.turn.clone() else {
                     return Ok(vec![]);
                 };
-                if s.tools.contains_key(&data.id) {
+                let tool_key = (data.message_id.clone(), data.id.clone());
+                if s.tools.contains_key(&tool_key) {
                     return Ok(vec![]);
                 }
-                if s.denied_tools.contains(&data.id) {
+                if s.denied_tools.contains(&tool_key) {
                     return Ok(vec![]);
                 }
                 let span_id = ids::span_id(
                     &self.daemon_session_id,
-                    &format!("tool:{}:{}", data.session_id, data.id),
+                    &format!("tool:{}:{}:{}", data.session_id, data.message_id, data.id),
                 );
                 let span_name = if name == "skill" {
                     data.input
@@ -438,7 +472,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     .or_default()
                     .push(ToolCall::new(data.id.clone(), name.clone(), &data.input));
                 s.tools.insert(
-                    data.id.clone(),
+                    tool_key,
                     ToolState {
                         name: name.clone(),
                         skill_name,
@@ -488,7 +522,8 @@ impl AgentTranslator for OpenCodeV2Translator {
                     data.id,
                     Permission {
                         session_id: data.session_id,
-                        call_id: data.source.map(|source| source.id),
+                        call_id: data.source.as_ref().map(|source| source.id.clone()),
+                        message_id: data.source.and_then(|source| source.message_id),
                         action: data.action,
                     },
                 );
@@ -510,12 +545,36 @@ impl AgentTranslator for OpenCodeV2Translator {
                 let Some(s) = self.sessions.get_mut(&p.session_id) else {
                     return Ok(vec![]);
                 };
+                let message_id = p
+                    .message_id
+                    .or_else(|| {
+                        let mut matches = self
+                            .tool_names
+                            .keys()
+                            .filter(|(sid, _, id)| sid == &p.session_id && id == &call)
+                            .map(|(_, message_id, _)| message_id.clone());
+                        let first = matches.next()?;
+                        matches.next().is_none().then_some(first)
+                    })
+                    .or_else(|| {
+                        let mut matches = s
+                            .tools
+                            .keys()
+                            .filter(|(_, id)| id == &call)
+                            .map(|(message_id, _)| message_id.clone());
+                        let first = matches.next()?;
+                        matches.next().is_none().then_some(first)
+                    });
+                let Some(message_id) = message_id else {
+                    return Ok(vec![]);
+                };
+                let key = (message_id.clone(), call.clone());
                 let tool_name = self
                     .tool_names
-                    .get(&(p.session_id.clone(), call.clone()))
+                    .get(&(p.session_id.clone(), message_id.clone(), call.clone()))
                     .cloned()
                     .unwrap_or_else(|| p.action.clone());
-                let existing = s.tools.get_mut(&call);
+                let existing = s.tools.get_mut(&key);
                 let (span_id, parent, had_start) = if let Some(tool) = existing {
                     tool.denied = true;
                     (tool.span_id.clone(), tool.parent.clone(), true)
@@ -526,13 +585,13 @@ impl AgentTranslator for OpenCodeV2Translator {
                     (
                         ids::span_id(
                             &self.daemon_session_id,
-                            &format!("tool:{}:{call}", p.session_id),
+                            &format!("tool:{}:{message_id}:{call}", p.session_id),
                         ),
                         parent,
                         false,
                     )
                 };
-                s.denied_tools.insert(call.clone());
+                s.denied_tools.insert(key);
                 let mut metadata = ToolMetadata::new(&tool_name, &call);
                 metadata.tool_approval = Some(ToolApproval::Denied);
                 metadata.permission_id = Some(&data.request_id);
@@ -631,12 +690,12 @@ impl AgentTranslator for OpenCodeV2Translator {
             }
             NativeEvent::Succeeded(data) => self.finish(&data.session_id, ts, false, None),
             NativeEvent::Failed(data) => {
-                self.finish(&data.session_id, ts, true, Some(data.error.message))
+                self.finish(&data.session_id, ts, false, Some(data.error.message))
             }
             NativeEvent::Interrupted(data) => self.finish(
                 &data.session_id,
                 ts,
-                true,
+                false,
                 Some(format!(
                     "OpenCode session interrupted ({})",
                     data.reason.as_deref().unwrap_or("unknown")
@@ -666,22 +725,26 @@ impl OpenCodeV2Translator {
         error: Option<String>,
         ts: i64,
     ) -> Vec<SpanOp> {
-        self.tool_names.remove(&(sid.into(), call.into()));
+        self.tool_names
+            .remove(&(sid.into(), message_id.into(), call.into()));
+        self.tool_names
+            .remove(&(sid.into(), String::new(), call.into()));
+        let key = (message_id.to_owned(), call.to_owned());
         let Some(s) = self.sessions.get_mut(sid) else {
             return vec![];
         };
-        if s.denied_tools.remove(call) {
-            s.tools.remove(call);
+        if s.denied_tools.remove(&key) {
+            s.tools.remove(&key);
             return vec![];
         }
         if !s
             .tools
-            .get(call)
+            .get(&key)
             .is_some_and(|tool| tool.message_id == message_id)
         {
             return vec![];
         }
-        let Some(tool) = s.tools.remove(call) else {
+        let Some(tool) = s.tools.remove(&key) else {
             return vec![];
         };
         if tool.denied {
@@ -854,10 +917,23 @@ impl OpenCodeV2Translator {
             .as_deref()
             .and_then(|id| s.history.iter().position(|entry| entry.id == id))
             .unwrap_or(s.history.len());
-        let input: Vec<_> = s.history[..tail]
-            .iter()
-            .flat_map(|entry| entry.messages.iter().cloned())
-            .collect();
+        let window = s.native_window.as_ref().filter(|window| {
+            window.history_boundary <= tail
+                && matches!(
+                    (window.model.as_ref(), model.as_ref()),
+                    (Some(a), Some(b)) if a.id.is_some() && a.provider_id.is_some()
+                        && a.id == b.id && a.provider_id == b.provider_id
+                )
+        });
+        let (mut input, start) = window.map_or_else(
+            || (Vec::new(), 0),
+            |window| (window.messages.clone(), window.history_boundary),
+        );
+        input.extend(
+            s.history[start..tail]
+                .iter()
+                .flat_map(|entry| entry.messages.iter().cloned()),
+        );
         let output = match native_messages {
             Some(NativeMessages::Messages(messages)) => {
                 let messages = normalize_context(Context {
@@ -1002,7 +1078,7 @@ fn normalize_context(context: Context) -> Vec<Message> {
                         ContextPart::Other(value) => content.push(ContentPart::Dynamic(value)),
                     }
                 }
-                if message.role == "tool" {
+                if message.role == "tool" && content.is_empty() && calls.is_empty() {
                     continue;
                 }
                 let value = if content.is_empty() {

@@ -541,7 +541,16 @@ fn request_helpers_recognize_tool_results_and_advertised_tools() {
 async fn opencode_v2_session_emits_traces() {
     use base64::Engine;
     let inference = OpenAiMock::new(|_, request| {
-        if request.contains_text("model failure marker") {
+        if request.body["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "user")
+            })
+            .is_some_and(|message| message.to_string().contains("model failure marker"))
+        {
             return MockReply::http_error(
                 axum::http::StatusCode::BAD_REQUEST,
                 json!({"error":{"message":"MODEL_FAILURE_FIXTURE","type":"invalid_request_error"}}),
@@ -866,6 +875,55 @@ async fn opencode_v2_session_emits_traces() {
         .iter()
         .any(|row| row["error"].to_string().contains("MODEL_FAILURE_FIXTURE")));
 
+    let failed_turn = failure_rows
+        .iter()
+        .find(|row| row_contains(row, &["Turn 1", "model failure marker"]))
+        .unwrap();
+    let failed_root = failed_turn["root_span_id"].clone();
+    let native_session = failure_rows
+        .iter()
+        .find(|row| row["span_id"] == failed_root && row["metadata"]["session_id"].is_string())
+        .expect("failed native session root")["metadata"]["session_id"]
+        .as_str()
+        .unwrap();
+    let mut resumed = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    resumed
+        .args([
+            "run",
+            "--standalone",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "--session",
+            native_session,
+            "model recovery marker",
+        ])
+        .current_dir(&workspace)
+        .env("PWD", &workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"));
+    world.configure(&mut resumed);
+    let output = world.output(&mut resumed).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recovered_rows = world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new().expect("resumed failed session", |row| {
+                row_contains(row, &["Turn 2", "model recovery marker"])
+            }),
+        )
+        .await;
+    assert!(recovered_rows
+        .iter()
+        .any(|row| row["root_span_id"] == failed_root
+            && row_contains(row, &["Turn 2", "model recovery marker"])));
+
     std::fs::write(plugins.join("image.js"), r#"export default { id:'test.image', async setup(ctx) { await ctx.tool.transform(editor => editor.add({name:'fixture_image',description:'Return an image',input:{type:'object',properties:{},additionalProperties:false},options:{codemode:false},async execute() { return {content:[{type:'file',mime:'image/png',uri:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg=='}]}; }})); } };"#).unwrap();
     let mut image_run = support::agent_process::daemon_command();
     image_run
@@ -938,14 +996,32 @@ async fn opencode_v2_subagent_is_nested() {
             .and_then(|ms| ms.iter().rev().find(|m| m["role"] == "user"))
             .map(Value::to_string)
             .unwrap_or_default();
-        let tool_result = messages.is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
+        let results = messages
+            .into_iter()
+            .flatten()
+            .filter(|m| m["role"] == "tool")
+            .collect::<Vec<_>>();
         if user.contains("CHILD_MARKER") {
             MockReply::response(OpenAiTurn::text("CHILD_DONE"))
-        } else if request.body["tools"].is_array() && !tool_result {
+        } else if request.body["tools"].is_array() && results.is_empty() {
             MockReply::response(OpenAiTurn::tool_call(
                 "subagent_call",
                 "subagent",
                 json!({"agent":"general","description":"Test child","prompt":"CHILD_MARKER"}),
+            ))
+        } else if results.len() == 1 {
+            let content = results[0]["content"]
+                .as_str()
+                .expect("subagent result text");
+            let session = content
+                .split("sessionID=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .expect("subagent session ID");
+            MockReply::response(OpenAiTurn::tool_call(
+                "subagent_resume",
+                "subagent",
+                json!({"agent":"general","description":"Continue child","sessionID":session,"prompt":"CHILD_MARKER_SECOND"}),
             ))
         } else {
             MockReply::response(OpenAiTurn::text("PARENT_DONE"))
@@ -1010,6 +1086,15 @@ async fn opencode_v2_subagent_is_nested() {
     assert!(
         rows.iter().any(|row| row_contains(row, &["CHILD_DONE"])),
         "child result missing: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["span_attributes"]["name"] == "Turn 2"
+                && row["span_parents"]
+                    .as_array()
+                    .is_some_and(|parents| parents.contains(&child["span_id"]))
+                && row.to_string().contains("CHILD_MARKER_SECOND")),
+        "continued child turn missing: {rows:?}"
     );
 }
 
@@ -1213,6 +1298,41 @@ async fn run_v2_compaction_after_idle(native: bool) {
     assert!(!resumed_llm["input"]
         .to_string()
         .contains("legacy compaction"));
+    if native {
+        client
+            .post(format!("{url}/api/session/{session_id}/compact"))
+            .basic_auth("opencode", Some("integration-test-password"))
+            .json(&json!({"delivery":"queue"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let second = world
+            .wait_for_mock_ingest_scenario(&IngestScenario::new().expect(
+                "second native compaction",
+                |row| {
+                    row["tags"]
+                        .as_array()
+                        .is_some_and(|tags| tags.iter().any(|tag| tag == "compaction"))
+                        && row["input"].to_string().contains("legacy after compaction")
+                },
+            ))
+            .await;
+        let compact = second
+            .iter()
+            .find(|row| {
+                row["tags"]
+                    .as_array()
+                    .is_some_and(|tags| tags.iter().any(|tag| tag == "compaction"))
+                    && row["input"].to_string().contains("legacy after compaction")
+            })
+            .unwrap();
+        assert!(compact["input"]
+            .to_string()
+            .contains("NATIVE_COMPACTION_WINDOW"));
+        assert!(!compact["input"].to_string().contains("legacy compaction"));
+    }
     server.kill().await.unwrap();
     server.wait().await.unwrap();
 }

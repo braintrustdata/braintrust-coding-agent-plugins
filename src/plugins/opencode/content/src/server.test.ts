@@ -9,6 +9,9 @@ vi.mock("./runtime/daemon-client", () => ({
   claimManagedTracingInstance: () => true,
   resolveDaemonTraceSettings: (settings: unknown) => settings,
   DaemonClient: class {
+    async prepare() {
+      return true;
+    }
     async log(event: Record<string, unknown>) {
       state.logs.push(event);
       return true;

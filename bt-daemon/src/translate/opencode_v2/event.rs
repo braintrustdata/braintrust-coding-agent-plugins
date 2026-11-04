@@ -184,6 +184,8 @@ pub(super) struct TextEnded {
 pub(super) struct ToolInputStarted {
     #[serde(rename = "sessionID")]
     pub session_id: String,
+    #[serde(rename = "assistantMessageID")]
+    pub message_id: Option<String>,
     pub id: String,
     pub name: String,
 }
@@ -258,6 +260,8 @@ pub(super) struct PermissionAsked {
 #[derive(Deserialize)]
 pub(super) struct PermissionSource {
     pub id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: Option<String>,
 }
 #[derive(Deserialize)]
 pub(super) struct PermissionReplied {

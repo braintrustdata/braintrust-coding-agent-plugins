@@ -158,7 +158,6 @@ export class DaemonClient {
   private nextId = 1
   private pending = new Map<number, PendingRequest>()
   private connecting?: Promise<void>
-  private writable?: { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void }
   private queue: Promise<unknown> = Promise.resolve()
   private inFlightEvents = new Set<Promise<boolean>>()
   private warned = new Set<string>()
@@ -174,33 +173,44 @@ export class DaemonClient {
     }
   }
 
+  /** Start the connection early without delaying the host indefinitely. */
+  async prepare(timeoutMs = 5_000): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        this.ensureConnected().then(() => true, () => false),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs) }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
   async log(envelope: DaemonEnvelope): Promise<boolean> {
     return this.serial(() => this.sendEvent(envelope))
   }
 
   /** Submit events in call order without waiting for earlier acknowledgements. */
   logPipelined(envelope: DaemonEnvelope): Promise<boolean> {
-    const request = this.sendEvent(envelope, true)
+    const request = this.sendEvent(envelope)
     this.inFlightEvents.add(request)
     void request.finally(() => this.inFlightEvents.delete(request))
     return request
   }
 
-  private async sendEvent(envelope: DaemonEnvelope, pipelined = false): Promise<boolean> {
+  private async sendEvent(envelope: DaemonEnvelope): Promise<boolean> {
     const event = {
       ...envelope,
       ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
       ...(this.options.managedRunId ? { managed_run_id: this.options.managedRunId } : {}),
     }
     try {
-      const result = (await this.request("event.log", event, pipelined)) as { accepted?: boolean }
-      if (pipelined) await this.ensureConnected()
+      const result = (await this.request("event.log", event)) as { accepted?: boolean }
       return result.accepted === true
     } catch (error) {
       if (this.socket) this.disconnect(error)
       try {
-        const result = (await this.request("event.log", event, pipelined)) as { accepted?: boolean }
-        if (pipelined) await this.ensureConnected()
+        const result = (await this.request("event.log", event)) as { accepted?: boolean }
         return result.accepted === true
       } catch (retryError) {
         this.warnOnce(`event:${String(retryError)}`)
@@ -254,9 +264,8 @@ export class DaemonClient {
     return next
   }
 
-  private async request(method: string, params: unknown, pipelined = false): Promise<unknown> {
-    if (pipelined) await this.ensureWritable()
-    else await this.ensureConnected()
+  private async request(method: string, params: unknown): Promise<unknown> {
+    await this.ensureConnected()
     const socket = this.socket
     if (!socket || socket.destroyed) throw new Error("daemon socket is unavailable")
 
@@ -270,21 +279,6 @@ export class DaemonClient {
     })
     socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`)
     return response
-  }
-
-  // The daemon reads requests in socket order. Write initialize first, then
-  // permit queued events to follow without waiting for its response.
-  private async ensureWritable(): Promise<void> {
-    if (this.socket && !this.socket.destroyed) return
-    if (!this.writable) {
-      let resolve = () => {}
-      let reject = (_error: unknown) => {}
-      const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej })
-      this.writable = { promise, resolve, reject }
-    }
-    const writable = this.writable
-    void this.ensureConnected().catch((error) => writable.reject(error))
-    return writable.promise
   }
 
   private async ensureConnected(): Promise<void> {
@@ -327,16 +321,14 @@ export class DaemonClient {
         socket.off("error", onError)
         this.attach(socket)
         try {
-          const initialization = this.requestOnConnectedSocket("initialize", {
+          const result = (await this.requestOnConnectedSocket("initialize", {
             protocol_version: DAEMON_PROTOCOL_VERSION,
             client: {
               source: this.options.source,
               plugin_version: this.options.pluginVersion,
               pid: process.pid,
             },
-          })
-          this.writable?.resolve()
-          const result = (await initialization) as {
+          })) as {
             protocol_version: number
             capabilities?: { sources?: string[] }
           }
@@ -421,8 +413,6 @@ export class DaemonClient {
   }
 
   private disconnect(reason: unknown): void {
-    this.writable?.reject(reason)
-    this.writable = undefined
     const socket = this.socket
     this.socket = undefined
     if (socket && !socket.destroyed) socket.destroy()
