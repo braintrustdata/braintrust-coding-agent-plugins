@@ -4,9 +4,11 @@
 //! This module only encodes the common Braintrust representation once that
 //! source-specific interpretation has been made.
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ToolApproval {
     Approved,
     Denied,

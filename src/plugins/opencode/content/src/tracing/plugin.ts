@@ -3,7 +3,9 @@ import { loadConfig, type PluginConfig } from "../config";
 import { claimManagedTracingInstance } from "../runtime/daemon-client";
 import { createDaemonTracingHooks } from "./daemon";
 
-export async function readPluginConfig(input: PluginInput): Promise<PluginConfig | undefined> {
+export async function readPluginConfig(input: {
+  directory: string;
+}): Promise<PluginConfig | undefined> {
   let pluginConfig: PluginConfig | undefined;
   try {
     const fs = await import("node:fs");

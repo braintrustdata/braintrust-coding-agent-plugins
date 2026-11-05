@@ -53,6 +53,7 @@ pub(super) async fn serve_connection(
             continue;
         }
         let mut shutdown_after_response = false;
+        let mut stop_after_response = false;
         let response = match Message::from_line(&line) {
             Ok(Message::Request(req)) => {
                 let request_id = req.id.clone();
@@ -63,6 +64,14 @@ pub(super) async fn serve_connection(
                     "request received"
                 );
                 let response = handle_request(&daemon, req, &mut client).await;
+                stop_after_response = method == method::EVENT_LOG
+                    && (response.error.is_some()
+                        || response
+                            .result
+                            .as_ref()
+                            .and_then(|v| v.get("accepted"))
+                            .and_then(Value::as_bool)
+                            == Some(false));
                 shutdown_after_response = method == method::DAEMON_SHUTDOWN
                     && response.error.is_none()
                     && response
@@ -139,6 +148,9 @@ pub(super) async fn serve_connection(
                 daemon.trigger_shutdown();
             }
             write_result?;
+            if stop_after_response {
+                break;
+            }
         }
     }
     Ok(())
@@ -211,6 +223,7 @@ pub(super) async fn handle_request(
                 daemon_version: daemon.version.clone(),
                 capabilities: Capabilities {
                     sources: daemon.translators.sources(),
+                    ordered_event_pipeline: true,
                 },
             };
             Response::serialized(id, result)

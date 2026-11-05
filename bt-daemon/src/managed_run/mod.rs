@@ -151,8 +151,12 @@ async fn run_traced_inner(
         .as_ref()
         .map(|runtime| runtime.socket.clone())
         .unwrap_or_else(|| paths::socket_path(None));
-    let mut injection =
-        agent.inject_with_context(&hook_command, &managed_run_id, &route, &socket)?;
+    let mut injection = if args.source == RunSource::OpenCode {
+        let v2 = opencode::is_v2(&executable).await?;
+        opencode::inject_for_version(v2, &args.agent_args)?
+    } else {
+        agent.inject_with_context(&hook_command, &managed_run_id, &route, &socket)?
+    };
     if args.source == RunSource::Codex {
         let executable_for_trust =
             std::env::var_os("CODEX_BIN").unwrap_or_else(|| OsString::from("codex"));

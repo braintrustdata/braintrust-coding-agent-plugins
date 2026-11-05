@@ -20,6 +20,7 @@ mod git;
 mod grok;
 mod muse;
 mod opencode;
+mod opencode_v2;
 mod pi;
 pub(crate) use claude::successful_subagent_handback_message;
 pub(crate) use pi::request_config as pi_request_config;
