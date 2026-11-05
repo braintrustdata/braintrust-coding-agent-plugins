@@ -4578,3 +4578,29 @@ async fn storage_failure_after_retirement_is_reported_and_recovers_without_nativ
     shutdown(&socket).await;
     handle.await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn event_pipeline_stops_after_a_rejected_request() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (socket, handle, _flushes, _tmp) = start_tracking_daemon("test").await;
+    let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    write
+        .write_all(
+            concat!(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"event.log\",\"params\":{}}\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"status.get\",\"params\":{}}\n",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(response["id"], 1);
+    assert!(response.get("error").is_some());
+    assert!(lines.next_line().await.unwrap().is_none());
+    handle.abort();
+}

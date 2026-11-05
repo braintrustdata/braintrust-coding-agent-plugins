@@ -76,6 +76,15 @@ struct NativeWindow {
     messages: Vec<Message>,
     history_boundary: usize,
 }
+impl NativeWindow {
+    fn matches_model(&self, model: Option<&Model>) -> bool {
+        matches!(
+            (self.model.as_ref(), model),
+            (Some(a), Some(b)) if a.id.is_some() && a.provider_id.is_some()
+                && a.id == b.id && a.provider_id == b.provider_id
+        )
+    }
+}
 struct Compaction {
     started: i64,
     input_id: Option<String>,
@@ -814,17 +823,10 @@ impl OpenCodeV2Translator {
             }]);
         }
         let input = step.context.map(normalize_context).unwrap_or_else(|| {
-            let window = s.native_window.as_ref().filter(|window| {
-                match (window.model.as_ref(), step.model.as_ref()) {
-                    (Some(a), Some(b)) => {
-                        a.id.is_some()
-                            && a.provider_id.is_some()
-                            && a.id == b.id
-                            && a.provider_id == b.provider_id
-                    }
-                    _ => false,
-                }
-            });
+            let window = s
+                .native_window
+                .as_ref()
+                .filter(|window| window.matches_model(step.model.as_ref()));
             let (mut input, start) = window.map_or_else(
                 || (Vec::new(), 0),
                 |window| (window.messages.clone(), window.history_boundary),
@@ -918,12 +920,7 @@ impl OpenCodeV2Translator {
             .and_then(|id| s.history.iter().position(|entry| entry.id == id))
             .unwrap_or(s.history.len());
         let window = s.native_window.as_ref().filter(|window| {
-            window.history_boundary <= tail
-                && matches!(
-                    (window.model.as_ref(), model.as_ref()),
-                    (Some(a), Some(b)) if a.id.is_some() && a.provider_id.is_some()
-                        && a.id == b.id && a.provider_id == b.provider_id
-                )
+            window.history_boundary <= tail && window.matches_model(model.as_ref())
         });
         let (mut input, start) = window.map_or_else(
             || (Vec::new(), 0),

@@ -51,7 +51,12 @@ describe("OpenCode 2 capture", () => {
       }> = [];
       const cleanup = await plugin.setup({
         app: { version: "2.2.5" },
-        session: { async hook() {} },
+        session: {
+          async hook() {},
+          async get() {
+            return {};
+          },
+        },
         location: { directory: "/test" },
         event: { async *subscribe() {} },
         tool: {
@@ -83,7 +88,12 @@ describe("OpenCode 2 capture", () => {
     ];
     const cleanup = await plugin.setup({
       app: { version: "2.2.5" },
-      session: { async hook() {} },
+      session: {
+        async hook() {},
+        async get() {
+          return {};
+        },
+      },
       location: { directory: "/test" },
       tool: {
         async transform(callback) {
@@ -96,7 +106,9 @@ describe("OpenCode 2 capture", () => {
         },
       },
     });
+    await vi.waitFor(() => expect(state.logs.length).toBeGreaterThan(0));
     await cleanup?.();
+    await vi.waitFor(() => expect(state.closed).toBe(true));
     expect(state.logs.map((event) => event.event)).toEqual([
       "session_start",
       ...events.map((e) => e.type),
@@ -122,6 +134,9 @@ describe("OpenCode 2 capture", () => {
       app: { version: "2.2.5" },
       location: { directory: "/test" },
       session: {
+        async get() {
+          return {};
+        },
         async hook(_name, callback) {
           capture = callback;
         },
@@ -143,7 +158,9 @@ describe("OpenCode 2 capture", () => {
         },
       },
     });
+    await vi.waitFor(() => expect(state.logs.length).toBeGreaterThan(0));
     await cleanup?.();
+    await vi.waitFor(() => expect(state.closed).toBe(true));
     expect(state.logs.map((entry) => entry.event)).toEqual([
       "session.created",
       "model.context",
@@ -154,7 +171,7 @@ describe("OpenCode 2 capture", () => {
       payload: { data: { sessionID: "child" } },
     });
   });
-  it("starts and forwards events without waiting for the daemon, then drains on cleanup", async () => {
+  it("starts and forwards without waiting for daemon acknowledgements", async () => {
     state.logs.length = 0;
     state.closed = false;
     let release = () => {};
@@ -164,7 +181,12 @@ describe("OpenCode 2 capture", () => {
     const cleanup = await plugin.setup({
       app: { version: "2.0.0" },
       location: { directory: "/test" },
-      session: { async hook() {} },
+      session: {
+        async hook() {},
+        async get() {
+          return {};
+        },
+      },
       tool: {
         async transform(callback) {
           callback({ add() {} });
@@ -177,19 +199,44 @@ describe("OpenCode 2 capture", () => {
         },
       },
     });
-    let finished = false;
-    const closing = cleanup?.().then(() => {
-      finished = true;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(state.logs).toHaveLength(2));
+    const closing = cleanup?.();
     expect(state.logs.map((entry) => entry.event)).toEqual([
       "session.created",
       "session.execution.succeeded",
     ]);
-    expect(finished).toBe(false);
     release();
     await closing;
-    expect(state.closed).toBe(true);
+    await vi.waitFor(() => expect(state.closed).toBe(true));
     state.gate = undefined;
+  });
+  it("resolves a resumed nested session to its original root", async () => {
+    state.logs.length = 0;
+    state.closed = false;
+    const parents: Record<string, string | undefined> = { child: "parent", parent: "root" };
+    const cleanup = await plugin.setup({
+      app: { version: "2.2.5" },
+      location: { directory: "/test" },
+      session: {
+        async hook() {},
+        async get({ sessionID }) {
+          return { parentID: parents[sessionID] };
+        },
+      },
+      tool: {
+        async transform(callback) {
+          callback({ add() {} });
+        },
+      },
+      event: {
+        async *subscribe() {
+          yield { type: "session.step.started", data: { sessionID: "child" } };
+        },
+      },
+    });
+    await vi.waitFor(() => expect(state.logs).toHaveLength(2));
+    expect(state.logs.map((entry) => entry.session_id)).toEqual(["root", "root"]);
+    await cleanup?.();
+    await vi.waitFor(() => expect(state.closed).toBe(true));
   });
 });

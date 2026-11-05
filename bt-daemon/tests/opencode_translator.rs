@@ -1081,12 +1081,7 @@ fn opencode_v2_emits_tool_span_from_native_events() {
     ];
     let mut ops = Vec::new();
     for (i, (name, data)) in events.into_iter().enumerate() {
-        let mut e = event(
-            name,
-            i as i64 + 1,
-            json!({"id":format!("event-{i}"),"type":name,"data":data}),
-        );
-        e.source_version = Some("2.2.5".into());
+        let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
     }
     let rows = reduce(ops);
@@ -1134,12 +1129,7 @@ fn opencode_v2_preserves_attached_images_in_turn_and_model_input() {
     ];
     let mut ops = Vec::new();
     for (i, (name, data)) in events.into_iter().enumerate() {
-        let mut e = event(
-            name,
-            i as i64 + 1,
-            json!({"id":format!("event-{i}"),"type":name,"data":data}),
-        );
-        e.source_version = Some("2.2.5".into());
+        let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
     }
     let rows = reduce(ops);
@@ -1346,12 +1336,7 @@ fn opencode_v2_distinguishes_denied_and_failed_tools() {
     ];
     let mut ops = Vec::new();
     for (i, (name, data)) in events.into_iter().enumerate() {
-        let mut e = event(
-            name,
-            i as i64 + 1,
-            json!({"id":format!("v2-{i}"),"data":data}),
-        );
-        e.source_version = Some("2.2.5".into());
+        let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
     }
     let rows = reduce(ops);
@@ -1503,12 +1488,7 @@ fn opencode_v2_permission_denied_before_tool_call_creates_one_tool_span() {
     ];
     let mut ops = Vec::new();
     for (i, (name, data)) in events.into_iter().enumerate() {
-        let mut e = event(
-            name,
-            i as i64 + 1,
-            json!({"id":format!("permission-{i}"),"data":data}),
-        );
-        e.source_version = Some("2.2.5".into());
+        let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
     }
     let rows = reduce(ops);
@@ -1567,12 +1547,7 @@ fn opencode_v2_preserves_provider_defined_context_and_tool_content() {
     ];
     let mut ops = Vec::new();
     for (i, (name, data)) in events.into_iter().enumerate() {
-        let mut envelope = event(
-            name,
-            i as i64 + 1,
-            json!({"id":format!("provider-{i}"),"data":data}),
-        );
-        envelope.source_version = Some("2.2.5".into());
+        let envelope = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&envelope, &ctx).unwrap());
     }
     let rows = reduce(ops);
@@ -1636,12 +1611,7 @@ fn opencode_v2_native_compaction_window_is_scoped_to_its_model() {
         ];
         let mut ops = Vec::new();
         for (i, (name, data)) in events.into_iter().enumerate() {
-            let mut envelope = event(
-                name,
-                i as i64 + 1,
-                json!({"id":format!("native-{i}"),"data":data}),
-            );
-            envelope.source_version = Some("2.2.5".into());
+            let envelope = v2_event(name, i as i64 + 1, data);
             ops.extend(translator.handle(&envelope, &ctx).unwrap());
         }
         let rows = reduce(ops);
@@ -1694,12 +1664,7 @@ fn opencode_v2_preserves_opaque_provider_compaction_output() {
     ];
     let mut ops = Vec::new();
     for (i, (name, data)) in events.into_iter().enumerate() {
-        let mut envelope = event(
-            name,
-            i as i64 + 1,
-            json!({"id":format!("opaque-{i}"),"data":data}),
-        );
-        envelope.source_version = Some("2.2.5".into());
+        let envelope = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&envelope, &ctx).unwrap());
     }
     let rows = reduce(ops);

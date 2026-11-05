@@ -19,6 +19,7 @@ interface Context {
   location: { directory: string };
   event: { subscribe(options: { signal: AbortSignal }): AsyncIterable<NativeEvent> };
   session: {
+    get(input: { sessionID: string }): Promise<{ parentID?: string | null }>;
     hook(
       name: "context",
       callback: (event: {
@@ -96,8 +97,26 @@ export default {
     const abort = new AbortController();
     const roots = new Map<string, string>();
     const started = new Set<string>();
+    const rootFor = async (session: string): Promise<string> => {
+      const path: string[] = [];
+      const seen = new Set<string>();
+      let current = session;
+      while (!roots.has(current) && !seen.has(current)) {
+        seen.add(current);
+        path.push(current);
+        try {
+          const info = await ctx.session.get({ sessionID: current });
+          if (!info.parentID) break;
+          current = info.parentID;
+        } catch {
+          break;
+        }
+      }
+      const root = roots.get(current) ?? current;
+      for (const id of path) roots.set(id, root);
+      return root;
+    };
     const contexts = new Map<string, Array<{ ts_ms: number; payload: unknown }>>();
-    let pending = Promise.resolve();
     await ctx.session.hook("context", (event) => {
       try {
         const queue = contexts.get(event.sessionID) ?? [];
@@ -124,9 +143,9 @@ export default {
         if (!session) continue;
         if (event.type === "session.created") {
           const parent = event.data?.parentID;
-          roots.set(session, parent ? (roots.get(parent) ?? parent) : session);
+          roots.set(session, parent ? await rootFor(parent) : session);
         }
-        const root = roots.get(session) ?? session;
+        const root = roots.get(session) ?? (await rootFor(session));
         const envelope = {
           source: "opencode",
           source_version: ctx.app.version,
@@ -150,20 +169,16 @@ export default {
           event.type === "session.deleted"
         )
           contexts.delete(session);
-        const writes = [];
         if (first && event.type !== "session.created") {
-          writes.push(daemon.logPipelined({ ...envelope, event: "session_start" }));
+          void daemon.logPipelined({ ...envelope, event: "session_start" });
         }
-        if (context)
-          writes.push(daemon.logPipelined({ ...envelope, event: "model.context", ...context }));
-        writes.push(daemon.logPipelined(envelope));
-        pending = Promise.all([pending, ...writes]).then(() => {});
+        if (context) void daemon.logPipelined({ ...envelope, event: "model.context", ...context });
+        void daemon.logPipelined(envelope);
       }
     })().catch(() => {});
     return async () => {
       abort.abort();
       await task;
-      await pending;
       await daemon.close();
     };
   },

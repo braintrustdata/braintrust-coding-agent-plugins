@@ -125,10 +125,6 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 export function daemonSocketPath(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
@@ -158,7 +154,9 @@ export class DaemonClient {
   private nextId = 1
   private pending = new Map<number, PendingRequest>()
   private connecting?: Promise<void>
+  private orderedEventPipeline = false
   private queue: Promise<unknown> = Promise.resolve()
+  private fallbackQueue: Promise<unknown> = Promise.resolve()
   private inFlightEvents = new Set<Promise<boolean>>()
   private warned = new Set<string>()
 
@@ -179,7 +177,10 @@ export class DaemonClient {
 
   /** Submit events in call order without waiting for earlier acknowledgements. */
   logPipelined(envelope: DaemonEnvelope): Promise<boolean> {
-    const request = this.sendEvent(envelope)
+    const request = this.ensureConnected().then(
+      () => this.orderedEventPipeline ? this.sendEvent(envelope) : this.serialFallback(envelope),
+      () => this.serialFallback(envelope),
+    )
     this.inFlightEvents.add(request)
     void request.finally(() => this.inFlightEvents.delete(request))
     return request
@@ -242,6 +243,12 @@ export class DaemonClient {
     this.disconnect(new Error("daemon client closed"))
   }
 
+  private serialFallback(envelope: DaemonEnvelope): Promise<boolean> {
+    const next = this.fallbackQueue.then(() => this.sendEvent(envelope))
+    this.fallbackQueue = next.then(() => undefined, () => undefined)
+    return next
+  }
+
   private serial<T>(operation: () => Promise<T>): Promise<T> {
     const next = this.queue.then(operation, operation)
     this.queue = next.then(
@@ -284,7 +291,7 @@ export class DaemonClient {
       this.startDaemon()
       let lastError: unknown
       for (let attempt = 0; attempt < this.options.connectAttempts; attempt++) {
-        await sleep(this.options.connectDelayMs)
+        await new Promise((resolve) => setTimeout(resolve, this.options.connectDelayMs))
         try {
           await this.connectOnce()
           return
@@ -317,7 +324,7 @@ export class DaemonClient {
             },
           })) as {
             protocol_version: number
-            capabilities?: { sources?: string[] }
+            capabilities?: { sources?: string[]; ordered_event_pipeline?: boolean }
           }
           if (result.protocol_version !== DAEMON_PROTOCOL_VERSION) {
             throw new Error(`unsupported daemon protocol ${result.protocol_version}`)
@@ -325,6 +332,7 @@ export class DaemonClient {
           if (!result.capabilities?.sources?.includes(this.options.source)) {
             throw new Error(`daemon does not support ${this.options.source}; update bt`)
           }
+          this.orderedEventPipeline = result.capabilities?.ordered_event_pipeline === true
           resolve()
         } catch (error) {
           if (this.socket === socket) this.disconnect(error)

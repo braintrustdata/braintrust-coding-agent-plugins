@@ -5,19 +5,49 @@ use crate::agents::OpenCode;
 use crate::args::RunHookCommand;
 use std::ffi::OsString;
 
-fn is_v2() -> bool {
-    let executable = crate::env::var_os("OPENCODE_BIN").unwrap_or_else(|| "opencode".into());
-    crate::subprocess::background_command(executable)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .split_whitespace()
-                .last()
-                .is_some_and(|v| v.trim_start_matches('v').starts_with("2."))
+pub(super) async fn is_v2(executable: &std::ffi::OsStr) -> anyhow::Result<bool> {
+    let mut command: tokio::process::Command =
+        crate::subprocess::background_command(executable).into();
+    command.arg("--version").kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(15), command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out detecting OpenCode version"))?
+        .map_err(|error| anyhow::anyhow!("failed to detect OpenCode version: {error}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to detect OpenCode version: --version exited with {}",
+            output.status
+        );
+    }
+    let output = String::from_utf8_lossy(&output.stdout);
+    let version = output
+        .split_whitespace()
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("OpenCode returned an empty version"))?;
+    Ok(version.trim_start_matches('v').starts_with("2."))
+}
+
+pub(super) fn inject_for_version(v2: bool, args: &[OsString]) -> anyhow::Result<Injection> {
+    if v2
+        && args.iter().any(|arg| {
+            arg == "--server"
+                || arg.to_string_lossy().starts_with("--server=")
+                || arg == "--service"
         })
+    {
+        anyhow::bail!("OpenCode 2 managed tracing requires a private server; remove --server");
+    }
+    let config =
+        opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(), v2)?;
+    Ok(Injection {
+        env: vec![("OPENCODE_CONFIG_CONTENT", config)],
+        args: if v2 {
+            vec!["--standalone".into()]
+        } else {
+            Vec::new()
+        },
+        ..Injection::default()
+    })
 }
 
 fn opencode_managed_config(existing: Option<&str>, v2: bool) -> anyhow::Result<String> {
@@ -53,19 +83,6 @@ impl ManagedRun for OpenCode {
         ("OPENCODE_BIN", "opencode")
     }
 
-    fn check(&self, args: &[OsString], _terminal: super::Terminal) -> anyhow::Result<()> {
-        if is_v2()
-            && args.iter().any(|arg| {
-                arg == "--server"
-                    || arg.to_string_lossy().starts_with("--server=")
-                    || arg == "--service"
-            })
-        {
-            anyhow::bail!("OpenCode 2 managed tracing requires a private server; remove --server");
-        }
-        Ok(())
-    }
-
     fn invocation_args(&self, injection: Vec<OsString>, mut args: Vec<OsString>) -> Vec<OsString> {
         if injection.first().is_some_and(|arg| arg == "--standalone")
             && args.first().is_some_and(|arg| arg == "serve")
@@ -92,18 +109,7 @@ impl ManagedRun for OpenCode {
         _hook_command: &RunHookCommand,
         _managed_run_id: &str,
     ) -> anyhow::Result<Injection> {
-        let v2 = is_v2();
-        let config =
-            opencode_managed_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(), v2)?;
-        Ok(Injection {
-            env: vec![("OPENCODE_CONFIG_CONTENT", config)],
-            args: if v2 {
-                vec!["--standalone".into()]
-            } else {
-                Vec::new()
-            },
-            ..Injection::default()
-        })
+        inject_for_version(false, &[])
     }
 }
 
@@ -146,6 +152,25 @@ mod tests {
             config["plugin"],
             serde_json::json!(["other", "@braintrust/trace-opencode"])
         );
+    }
+
+    #[test]
+    fn opencode_v2_rejects_external_server_arguments() {
+        assert!(inject_for_version(true, &["--server=http://localhost".into()]).is_err());
+        assert!(inject_for_version(false, &["--server=http://localhost".into()]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_detection_executes_the_selected_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("opencode");
+        std::fs::write(&executable, "#!/bin/sh\nprintf '2.2.5\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_v2(executable.as_os_str()).await.unwrap());
+        std::fs::write(&executable, "#!/bin/sh\nprintf '1.18.0\\n'\n").unwrap();
+        assert!(!is_v2(executable.as_os_str()).await.unwrap());
     }
 
     #[test]

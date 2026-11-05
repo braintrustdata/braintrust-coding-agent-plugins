@@ -54,6 +54,20 @@ fn row_contains(row: &Value, fragments: &[&str]) -> bool {
 }
 
 #[cfg(unix)]
+fn opencode_test_env(
+    workspace: &std::path::Path,
+    home: &std::path::Path,
+) -> [(std::ffi::OsString, std::ffi::OsString); 6] {
+    [
+        ("PWD".into(), workspace.into()),
+        ("HOME".into(), home.into()),
+        ("USERPROFILE".into(), home.into()),
+        ("XDG_CONFIG_HOME".into(), home.join("config").into()),
+        ("XDG_DATA_HOME".into(), home.join("data").into()),
+        ("XDG_CACHE_HOME".into(), home.join("cache").into()),
+    ]
+}
+
 #[tokio::test]
 async fn agent_output_does_not_wait_for_inherited_descendant_handles() {
     let world = AgentTestWorld::start().await;
@@ -618,12 +632,7 @@ async fn opencode_v2_session_emits_traces() {
             "say hello",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"))
+        .envs(opencode_test_env(&workspace, &home))
         .env(
             "OPENCODE_BIN",
             std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
@@ -732,12 +741,7 @@ async fn opencode_v2_session_emits_traces() {
             "persistent marker",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut persistent);
     let output = world.output(&mut persistent).await;
     assert!(
@@ -778,12 +782,7 @@ async fn opencode_v2_session_emits_traces() {
             "permission marker",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut rejected);
     // OpenCode 2.0 exits nonzero after a rejection; later releases continue.
     let _output = world.output(&mut rejected).await;
@@ -823,12 +822,7 @@ async fn opencode_v2_session_emits_traces() {
             "interrupt marker",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut interrupted);
     let _output = world.output(&mut interrupted).await;
     world
@@ -852,12 +846,7 @@ async fn opencode_v2_session_emits_traces() {
             "model failure marker",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut failed);
     let _output = world.output(&mut failed).await;
     let failure_rows = world
@@ -899,12 +888,7 @@ async fn opencode_v2_session_emits_traces() {
             "model recovery marker",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut resumed);
     let output = world.output(&mut resumed).await;
     assert!(
@@ -939,12 +923,7 @@ async fn opencode_v2_session_emits_traces() {
             "image tool marker",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"))
+        .envs(opencode_test_env(&workspace, &home))
         .env("OPENCODE_BIN", std::env::var_os("OPENCODE_V2_BIN").unwrap())
         .env(
             "BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC",
@@ -1049,12 +1028,7 @@ async fn opencode_v2_subagent_is_nested() {
             "spawn subagent",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"))
+        .envs(opencode_test_env(&workspace, &home))
         .env(
             "OPENCODE_BIN",
             std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
@@ -1162,12 +1136,7 @@ async fn run_v2_compaction_after_idle(native: bool) {
             &port.to_string(),
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"))
+        .envs(opencode_test_env(&workspace, &home))
         .env("OPENCODE_PASSWORD", "integration-test-password")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1203,12 +1172,7 @@ async fn run_v2_compaction_after_idle(native: bool) {
         "legacy compaction",
     ])
     .current_dir(&workspace)
-    .env("PWD", &workspace)
-    .env("HOME", &home)
-    .env("USERPROFILE", &home)
-    .env("XDG_CONFIG_HOME", home.join("config"))
-    .env("XDG_DATA_HOME", home.join("data"))
-    .env("XDG_CACHE_HOME", home.join("cache"))
+    .envs(opencode_test_env(&workspace, &home))
     .env("OPENCODE_PASSWORD", "integration-test-password");
     let output = world.output(&mut run).await;
     assert!(
@@ -1267,12 +1231,7 @@ async fn run_v2_compaction_after_idle(native: bool) {
             "legacy after compaction",
         ])
         .current_dir(&workspace)
-        .env("PWD", &workspace)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CACHE_HOME", home.join("cache"))
+        .envs(opencode_test_env(&workspace, &home))
         .env("OPENCODE_PASSWORD", "integration-test-password");
     let output = world.output(&mut resume).await;
     assert!(
@@ -1406,12 +1365,7 @@ async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are
         "slow ack marker",
     ])
     .current_dir(&workspace)
-    .env("PWD", &workspace)
-    .env("HOME", &home)
-    .env("USERPROFILE", &home)
-    .env("XDG_CONFIG_HOME", home.join("config"))
-    .env("XDG_DATA_HOME", home.join("data"))
-    .env("XDG_CACHE_HOME", home.join("cache"));
+    .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut run);
     run.env("BRAINTRUST_DAEMON_SOCKET", &proxy_path);
     let output = world.output(&mut run).await;
