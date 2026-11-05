@@ -53,7 +53,6 @@ fn row_contains(row: &Value, fragments: &[&str]) -> bool {
         .all(|fragment| serialized.contains(fragment))
 }
 
-#[cfg(unix)]
 fn opencode_test_env(
     workspace: &std::path::Path,
     home: &std::path::Path,
@@ -68,6 +67,7 @@ fn opencode_test_env(
     ]
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn agent_output_does_not_wait_for_inherited_descendant_handles() {
     let world = AgentTestWorld::start().await;
