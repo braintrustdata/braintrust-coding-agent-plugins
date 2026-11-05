@@ -335,6 +335,10 @@ for (const orderedPipeline of [false, true]) test(`does not deliver later events
           failed = true
           response = { error: { code: -32603, message: "temporary" } }
           if (orderedPipeline) {
+            // The daemon stops reading as soon as an event fails. socket.end()
+            // only closes the writable side; later data callbacks can still
+            // fire for pipelined requests, especially on Windows named pipes.
+            socket.pause()
             socket.end(`${JSON.stringify({jsonrpc:"2.0",id:request.id,...response})}\n`)
             return
           }
