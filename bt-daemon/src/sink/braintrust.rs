@@ -1,6 +1,6 @@
 //! The Braintrust sink: maps sink-neutral [`SpanOp`]s onto `braintrust-sdk-rust`.
 //!
-//! Each routing branch owns its checked SDK queue. Clients are built lazily
+//! Each routing branch owns its SDK queue and write completions. Clients are built lazily
 //! using its configured backend URLs; flush results cannot include another
 //! branch's rejected operations. Within a client, each
 //! session's token/org travel per span (`span_builder_with_credentials`) and
@@ -12,8 +12,8 @@ use super::{Sink, SinkFactory};
 use crate::translate::{SpanOp, SpanRow, SpanType};
 use crate::wire::{SessionConfig, TraceDestination};
 use braintrust_sdk_rust::{
-    BraintrustClient, ParentSpanInfo, SpanComponents, SpanHandle, SpanLog, SpanObjectType,
-    SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
+    BraintrustClient, Completion, DeliveryReceipt, ParentSpanInfo, SpanComponents, SpanHandle,
+    SpanLog, SpanObjectType, SpanType as SdkSpanType, WriteError, DEFAULT_API_URL, DEFAULT_APP_URL,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
@@ -37,6 +37,7 @@ struct ClientCache {
 
 const CLIENT_CACHE_CAPACITY: usize = 16;
 const QUEUE_FLUSH_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+const MAX_PENDING_COMPLETIONS: usize = 1024;
 
 #[derive(Default)]
 struct ClientCacheState {
@@ -50,15 +51,10 @@ struct CachedClient {
 }
 
 impl CachedClient {
-    async fn account_and_flush(&self, bytes: usize) -> anyhow::Result<()> {
+    async fn account(&self, bytes: usize) -> bool {
         let mut queued_bytes = self.queued_bytes.lock().await;
         *queued_bytes = queued_bytes.saturating_add(bytes);
-        if *queued_bytes < QUEUE_FLUSH_BYTE_BUDGET {
-            return Ok(());
-        }
-        self.client.flush().await.map_err(anyhow::Error::new)?;
-        *queued_bytes = 0;
-        Ok(())
+        *queued_bytes >= QUEUE_FLUSH_BYTE_BUDGET
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
@@ -115,7 +111,6 @@ impl ClientCache {
         }
         let client = BraintrustClient::builder()
             .skip_login(true)
-            .checked_delivery(true)
             .api_url(api_url.to_string())
             .app_url(app_url.to_string())
             .build()
@@ -161,6 +156,7 @@ impl SinkFactory for BraintrustSinkFactory {
             client: None,
             open: HashMap::new(),
             pending_roots: HashMap::new(),
+            pending_completions: Vec::new(),
             delivered_root: None,
         }))
     }
@@ -200,6 +196,8 @@ struct BraintrustSink {
     /// Roots marked by translators as provisional, keyed by their local span
     /// id. Each is exported only once direct descendant work arrives.
     pending_roots: HashMap<String, Vec<SpanOp>>,
+    /// Retain acknowledgements even when automatic delivery finishes before flush.
+    pending_completions: Vec<Completion<DeliveryReceipt, WriteError>>,
     /// Root span id of the trace that most recently received a row, which
     /// is also that root's deterministic row id in Braintrust.
     delivered_root: Option<String>,
@@ -285,9 +283,13 @@ impl BraintrustSink {
         let handle = self.open.get(&row.span_id).ok_or_else(|| {
             anyhow::anyhow!("span handle was not initialized for {}", row.span_id)
         })?;
-        handle.log(build_log(row, &self.source, false)?);
-        if let Some(end) = row.end_ms {
-            handle.end_with_time(ms_to_secs(end));
+        let completion = handle.log(build_log(row, &self.source, false)?);
+        if let Err(error) = completion.submission() {
+            return Err(anyhow::anyhow!("braintrust span admission failed: {error}"));
+        }
+        self.pending_completions.push(completion);
+        if row.end_ms.is_some() {
+            // build_log includes the end metric in this tracked write.
             // SpanHandle retains the complete accumulated input/output. Once a
             // span is terminal, use stateless SDK merges for any unusually late
             // update instead of pinning that payload for the session lifetime.
@@ -296,7 +298,7 @@ impl BraintrustSink {
         Ok(())
     }
 
-    fn merge_closed(&self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
+    fn merge_closed(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
         let creds = self
             .creds
             .as_ref()
@@ -315,14 +317,16 @@ impl BraintrustSink {
                 context.remove("span_origin");
             }
         }
-        client
-            .update_span_with_credentials(
+        let completion = client
+            .update_span_with_credentials_tracked(
                 creds.token.clone(),
                 creds.org_id.clone(),
                 &components.to_str(),
                 build_log(row, &self.source, true)?,
             )
-            .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))
+            .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))?;
+        self.pending_completions.push(completion);
+        Ok(())
     }
 
     fn span_components(&self, row: &SpanRow, creds: &Creds, project: &str) -> SpanComponents {
@@ -361,9 +365,11 @@ impl BraintrustSink {
             }
             SpanOp::Merge(row) => self.merge_closed(&client.client, row)?,
         }
-        client
-            .account_and_flush(serialized_len(op).unwrap_or(0))
-            .await
+        let over_budget = client.account(serialized_len(op).unwrap_or(0)).await;
+        if over_budget || self.pending_completions.len() >= MAX_PENDING_COMPLETIONS {
+            self.flush().await?;
+        }
+        Ok(())
     }
 }
 
@@ -451,10 +457,18 @@ impl Sink for BraintrustSink {
     }
 
     async fn flush(&mut self) -> anyhow::Result<()> {
-        match &self.client {
-            Some(client) => client.flush().await,
-            None => Ok(()),
+        let mut failure = match &self.client {
+            Some(client) => client.flush().await.err(),
+            None => None,
+        };
+        for completion in self.pending_completions.drain(..) {
+            if let Err(error) = completion.await {
+                if failure.is_none() {
+                    failure = Some(anyhow::Error::new(error));
+                }
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
 
     fn has_pending_delivery(&self) -> bool {
@@ -772,6 +786,53 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
+    async fn sink_flush_observes_failure_already_retired_by_sdk() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .api_url(server.uri())
+            .app_url(server.uri())
+            .build()
+            .await
+            .unwrap();
+        let handle = client
+            .span_builder_with_credentials("token", "org")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "project".into(),
+            })
+            .build();
+        let completion = handle.log(SpanLog::builder().input(json!("value")).build().unwrap());
+        // Complete and retire the failed batch before the sink issues its flush.
+        // Depending on scheduling, the automatic worker may already have
+        // retired the failure, in which case this barrier succeeds.
+        let _ = client.flush().await;
+        let cached = Arc::new(CachedClient {
+            client,
+            queued_bytes: AsyncMutex::new(0),
+        });
+        let mut sink = BraintrustSink {
+            cache: Arc::new(ClientCache::new()),
+            default_api_url: None,
+            default_app_url: None,
+            source: "codex".into(),
+            creds: None,
+            urls: None,
+            client: Some(cached),
+            open: HashMap::new(),
+            pending_roots: HashMap::new(),
+            pending_completions: vec![completion],
+            delivered_root: None,
+        };
+        assert!(sink.flush().await.is_err());
+        assert!(sink.flush().await.is_ok());
+    }
+
+    #[tokio::test]
     async fn root_context_retains_sdk_environment_on_insert_and_stateless_merge() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -786,7 +847,6 @@ mod tests {
             .await;
         let client = BraintrustClient::builder()
             .skip_login(true)
-            .checked_delivery(true)
             .api_url(server.uri())
             .app_url(server.uri())
             .environment("test", Some("sink-test"))
