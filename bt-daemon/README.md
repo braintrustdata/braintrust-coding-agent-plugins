@@ -293,6 +293,16 @@ transcript are not invented.
 Muse Code 1.3+ supports live tracing, managed runs, session import, and attach
 on macOS and Linux. Use `import muse --all` to import completed sessions.
 
+Muse image attachments appear in the Turn input when the local session log and
+its `input-assets/v1/sha256` files are retained (verified with Muse 1.4.14).
+Capture reads the last 8 MiB of the session log and includes up to 8 MiB of image
+bytes per turn, verifying each asset's size and SHA-256 digest. Images use the
+same data URL format as the other agent translators, allowing Braintrust's
+backend attachment conversion to produce previews. Missing, corrupt, oversized,
+or unavailable assets leave the text prompt intact. Export JSON alone does not
+include asset bytes; import and attach need the original local Muse session
+store. Muse's LLM hook summaries still contain image placeholders.
+
 Add `--attach` to keep following an active Codex, Claude, Antigravity, or Muse
 session until Ctrl-C. Detaching from Muse leaves the session running; attach
 again or import it later to collect its completion.
