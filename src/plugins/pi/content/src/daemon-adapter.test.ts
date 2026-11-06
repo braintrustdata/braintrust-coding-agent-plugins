@@ -1,3 +1,4 @@
+import { hyperlink } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockState = vi.hoisted(() => ({
@@ -5,12 +6,18 @@ const mockState = vi.hoisted(() => ({
   flushes: [] as string[],
   closed: 0,
   claim: true,
+  hyperlinks: true,
   legacyContinuation: undefined as Record<string, unknown> | undefined,
   legacyContinuationFor: vi.fn(),
   logGate: undefined as Promise<void> | undefined,
   statusGate: undefined as Promise<void> | undefined,
   statusCalls: 0,
   permalink: "https://www.braintrust.dev/trace/1" as string | undefined,
+}));
+
+vi.mock("@earendil-works/pi-tui", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@earendil-works/pi-tui")>()),
+  getCapabilities: () => ({ hyperlinks: mockState.hyperlinks }),
 }));
 
 vi.mock("./runtime/daemon-client.ts", () => ({
@@ -113,6 +120,7 @@ describe("Pi daemon adapter", () => {
     mockState.flushes.length = 0;
     mockState.closed = 0;
     mockState.claim = true;
+    mockState.hyperlinks = true;
     mockState.legacyContinuation = undefined;
     mockState.legacyContinuationFor.mockClear();
     mockState.logGate = undefined;
@@ -173,14 +181,14 @@ describe("Pi daemon adapter", () => {
     await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 
     expect(statuses.at(-1)).toEqual(["braintrust-tracing", undefined]);
-    expect(widgets.at(-1)).toEqual(["braintrust-trace-link", undefined]);
+    expect(widgets).toEqual([]);
 
     releaseStatus();
     await Promise.resolve();
     await Promise.resolve();
 
     expect(statuses).toEqual([["braintrust-tracing", undefined]]);
-    expect(widgets).toEqual([["braintrust-trace-link", undefined]]);
+    expect(widgets).toEqual([]);
   });
 
   it("forwards native events and keeps the trace-link UI", async () => {
@@ -286,22 +294,45 @@ describe("Pi daemon adapter", () => {
       ),
     ).toEqual(["text_delta", "thinking_delta"]);
     expect(mockState.flushes).toHaveLength(0);
-    expect(widgets).toContainEqual([
-      "braintrust-trace-link",
-      ["Braintrust trace", "https://www.braintrust.dev/trace/1"],
-      { placement: "belowEditor" },
+    expect(statuses).toContainEqual([
+      "braintrust-tracing",
+      hyperlink("Braintrust trace ↗", "https://www.braintrust.dev/trace/1"),
     ]);
+    expect(widgets).toEqual([]);
     expect(statuses.length).toBeGreaterThan(0);
     expect(mockState.closed).toBe(2);
   });
 
+  it.each([true, false])(
+    "respects hyperlink capability %s without displaying the URL",
+    async (supported) => {
+      mockState.hyperlinks = supported;
+      const setStatus = vi.fn();
+      const setWidget = vi.fn();
+      const ctx = fakeContext({ setStatus, setWidget });
+      const handlers = await loadExtension();
+      await handlers.get("session_start")?.({ reason: "new" }, ctx);
+      const expectedLabel = supported
+        ? hyperlink("Braintrust trace ↗", mockState.permalink!)
+        : "Braintrust: connected";
+      await vi.waitFor(() =>
+        expect(setStatus).toHaveBeenCalledWith("braintrust-tracing", expectedLabel),
+      );
+      expect(setWidget).not.toHaveBeenCalled();
+      if (!supported) {
+        expect(setStatus.mock.calls.flat().join(" ")).not.toContain("https://");
+      }
+      await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+    },
+  );
+
   it("polls for the trace link until the daemon delivers the first turn", async () => {
     vi.useFakeTimers();
     try {
-      const widgets: unknown[] = [];
+      const statuses: unknown[] = [];
       const ctx = fakeContext({
-        setStatus: vi.fn(),
-        setWidget: (...args: unknown[]) => widgets.push(args),
+        setStatus: (...args: unknown[]) => statuses.push(args),
+        setWidget: vi.fn(),
       });
       const handlers = await loadExtension();
 
@@ -310,18 +341,13 @@ describe("Pi daemon adapter", () => {
       await handlers.get("session_start")?.({ reason: "new" }, ctx);
       await handlers.get("agent_end")?.({ messages: [] }, ctx);
       await vi.advanceTimersByTimeAsync(10_000);
-      expect(widgets.at(-1)).toEqual([
-        "braintrust-trace-link",
-        undefined,
-        { placement: "belowEditor" },
-      ]);
+      expect(statuses.at(-1)).toEqual(["braintrust-tracing", "Braintrust: connected"]);
 
       mockState.permalink = "https://www.braintrust.dev/trace/1";
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(widgets.at(-1)).toEqual([
-        "braintrust-trace-link",
-        ["Braintrust trace", "https://www.braintrust.dev/trace/1"],
-        { placement: "belowEditor" },
+      expect(statuses.at(-1)).toEqual([
+        "braintrust-tracing",
+        hyperlink("Braintrust trace ↗", "https://www.braintrust.dev/trace/1"),
       ]);
 
       // Once the link is shown, neither the timer nor later turns query again.
