@@ -5,6 +5,7 @@ pub(crate) mod export_v1;
 pub(crate) mod field;
 pub(crate) mod hooks;
 pub(crate) mod ids;
+pub(crate) mod images;
 pub(crate) mod messages;
 pub(crate) mod metadata;
 pub(crate) mod msp;

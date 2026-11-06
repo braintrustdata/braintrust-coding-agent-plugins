@@ -387,7 +387,7 @@ impl AgentTranslator for MuseTranslator {
                             name: "Turn".into(),
                             span_type: SpanType::Task,
                             start_ms: Some(e.ts_ms),
-                            input: hook.body.prompt.map(serde_json::to_value).transpose()?,
+                            input: hook.body.image_content.map(|content| serde_json::json!([{ "role": "user", "content": content }])).or_else(|| hook.body.prompt.map(Value::String)),
                             is_turn: true,
                             turn_span_id: Some(turn_span_id),
                             ..Default::default()
@@ -495,6 +495,33 @@ mod tests {
             session_id: "muse-fixture-session".into(),
             config: None,
         }
+    }
+
+    #[test]
+    fn turn_input_preserves_image_messages() {
+        let mut translator = MuseTranslator::new(
+            "muse-fixture-session",
+            Arc::new(GitMetadataCache::default()),
+        );
+        let content = json!([{"type":"text","text":"Describe this image"}, {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]);
+        let rows = translator
+            .handle(
+                &event(
+                    "UserPromptSubmit",
+                    json!({"turn_id":"t1","prompt":"Describe this image","image_content":content}),
+                    1,
+                ),
+                &context(),
+            )
+            .unwrap();
+        let row = rows
+            .iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.name == "Turn" => Some(row),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(row.input.as_ref().unwrap()[0]["content"], content);
     }
 
     fn fixture() -> Vec<Envelope> {
