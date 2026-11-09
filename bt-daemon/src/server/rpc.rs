@@ -128,6 +128,14 @@ pub(super) async fn serve_connection(
                 {
                     if let Some(envelope) = observation.as_ref() {
                         observations.observe(envelope);
+                        if let (Some(completed), Some(config)) = (
+                            observations.completed(envelope),
+                            client
+                                .as_ref()
+                                .and_then(|info| info.opencode_recovery.clone()),
+                        ) {
+                            completed.recover(&daemon, config, false).await;
+                        }
                     }
                 }
                 if method == method::INITIALIZE
@@ -308,6 +316,12 @@ pub(super) async fn handle_request(
                     ),
                 );
             }
+            tracing::info!(
+                source = %p.client.source,
+                opencode_recovery = p.client.opencode_recovery.is_some(),
+                managed_run = p.client.managed_run_id.is_some(),
+                "client initialized"
+            );
             *client = Some(p.client);
             let result = InitializeResult {
                 protocol_version: PROTOCOL_VERSION,

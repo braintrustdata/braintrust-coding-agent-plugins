@@ -4641,20 +4641,25 @@ async fn disconnected_client_does_not_discard_already_sent_events() {
 
 #[tokio::test]
 async fn opencode_projection_is_recovered_after_capture_connection_closes() {
-    opencode_projection_recovery(true, false).await;
+    opencode_projection_recovery(true, false, false).await;
 }
 
 #[tokio::test]
 async fn opencode_projection_is_recovered_when_shutdown_marker_is_lost() {
-    opencode_projection_recovery(false, false).await;
+    opencode_projection_recovery(false, false, false).await;
 }
 
 #[tokio::test]
 async fn opencode_active_session_is_not_recovered_on_unexpected_disconnect() {
-    opencode_projection_recovery(false, true).await;
+    opencode_projection_recovery(false, true, false).await;
 }
 
-async fn opencode_projection_recovery(include_close_marker: bool, active: bool) {
+#[tokio::test]
+async fn opencode_projection_is_recovered_on_execution_end_while_connection_remains_open() {
+    opencode_projection_recovery(false, false, true).await;
+}
+
+async fn opencode_projection_recovery(include_close_marker: bool, active: bool, terminal: bool) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let (data_dir, socket, handle, tmp) = start_daemon().await;
     let database = tmp.path().join("opencode.db");
@@ -4715,8 +4720,15 @@ async fn opencode_projection_recovery(include_close_marker: bool, active: bool) 
             "session.capture.closed",
             serde_json::json!({"sessionID":"native"}),
         ),
+        (
+            "session.execution.succeeded",
+            serde_json::json!({"sessionID":"native"}),
+        ),
     ];
     for (id, (name, data)) in events.into_iter().enumerate() {
+        if name == "session.execution.succeeded" && !terminal {
+            continue;
+        }
         if name == "session.capture.closed" && !include_close_marker {
             continue;
         }
@@ -4740,9 +4752,23 @@ async fn opencode_projection_recovery(include_close_marker: bool, active: bool) 
             .await
             .unwrap();
     }
+    let journal = source_journal_path(&data_dir, "opencode", "root");
+    if terminal {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if std::fs::read_to_string(&journal).is_ok_and(|data| {
+                    data.contains("session.snapshot") && data.contains("child recovered")
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion should recover before the connection closes");
+    }
     drop(write);
     drop(lines);
-    let journal = source_journal_path(&data_dir, "opencode", "root");
     if active {
         flush_managed_run("recovery-run", &socket, 5000)
             .await

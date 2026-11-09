@@ -24,6 +24,7 @@ struct NativeSession {
     input_id: Option<String>,
 }
 
+#[derive(Clone)]
 struct Observation {
     template: Envelope,
     last_message_id: Option<String>,
@@ -36,6 +37,24 @@ pub(super) struct OpenCodeObservations {
     sessions: HashMap<(String, String), Observation>,
 }
 impl OpenCodeObservations {
+    pub(super) fn completed(&self, env: &Envelope) -> Option<Self> {
+        if !matches!(
+            env.event.as_str(),
+            "session.execution.succeeded"
+                | "session.execution.failed"
+                | "session.execution.interrupted"
+        ) {
+            return None;
+        }
+        let payload = serde_json::from_value::<NativePayload>(env.payload.clone()).ok()?;
+        let key = (env.session_id.clone(), payload.data.session_id);
+        let mut observation = self.sessions.get(&key)?.clone();
+        observation.closed_at_ms = Some(now_ms());
+        observation.inferred_close = false;
+        Some(Self {
+            sessions: HashMap::from([(key, observation)]),
+        })
+    }
     pub(super) fn observe(&mut self, env: &Envelope) {
         if env.source != "opencode"
             || !env
