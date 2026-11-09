@@ -35,6 +35,7 @@ struct SessionState {
     parents: Vec<String>,
     owner_turn: Option<String>,
     turn: Option<String>,
+    last_turn: Option<String>,
     turn_number: u32,
     turn_skills: Vec<String>,
     tool_count: u32,
@@ -209,6 +210,9 @@ impl OpenCodeV2Translator {
         })]
     }
     fn turn(&mut self, sid: &str, id: &str, prompt: Prompt, ts: i64) -> Vec<SpanOp> {
+        if self.sessions.get(sid).is_some_and(|session| session.idle) {
+            self.pending_context.remove(sid);
+        }
         let mut ops = self.open(sid, None, None, ts);
         let Some(s) = self.sessions.get_mut(sid) else {
             return ops;
@@ -300,7 +304,6 @@ impl OpenCodeV2Translator {
         permanent: bool,
         error: Option<String>,
     ) -> Vec<SpanOp> {
-        self.pending_context.remove(sid);
         let Some(mut s) = self.sessions.remove(sid) else {
             return vec![];
         };
@@ -318,6 +321,7 @@ impl OpenCodeV2Translator {
             }
         }
         if let Some(turn) = s.turn.take() {
+            s.last_turn = Some(turn.clone());
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn,
                 root_span_id: s.trace_root.clone(),
@@ -790,8 +794,7 @@ impl OpenCodeV2Translator {
         _ts: i64,
     ) -> Vec<SpanOp> {
         use crate::wire::opencode_snapshot::{
-            SnapshotCompactionStatus, SnapshotKnownToolContent, SnapshotMessageKind, SnapshotPart,
-            SnapshotToolContent, SnapshotToolState,
+            SnapshotCompactionStatus, SnapshotMessageKind, SnapshotPart, SnapshotToolState,
         };
         let sid = snapshot.session_id;
         let mut ops = Vec::new();
@@ -803,6 +806,17 @@ impl OpenCodeV2Translator {
                 _ts,
             ));
         }
+        // Completion can precede the snapshot in the journal. Temporarily
+        // restore the finished turn so missing model/tool spans retain their
+        // original parent and can update the already closed turn.
+        let recovering_closed_turn = self.sessions.get_mut(&sid).is_some_and(|session| {
+            if session.turn.is_none() && session.idle {
+                session.turn.clone_from(&session.last_turn);
+                session.turn.is_some()
+            } else {
+                false
+            }
+        });
         let last_error = snapshot
             .messages
             .iter()
@@ -967,24 +981,6 @@ impl OpenCodeV2Translator {
                     SnapshotPart::Tool { id, name, state } => {
                         let (input, result) = match state {
                             SnapshotToolState::Completed { input, content } => {
-                                let content = content
-                                    .into_iter()
-                                    .map(|part| match part {
-                                        SnapshotToolContent::Known(
-                                            SnapshotKnownToolContent::Text { text },
-                                        ) => ToolContent::Known(KnownToolContent::Text { text }),
-                                        SnapshotToolContent::Known(
-                                            SnapshotKnownToolContent::File { mime, uri, name },
-                                        ) => ToolContent::Known(KnownToolContent::File {
-                                            mime,
-                                            uri,
-                                            name,
-                                        }),
-                                        SnapshotToolContent::Other(value) => {
-                                            ToolContent::Other(value)
-                                        }
-                                    })
-                                    .collect();
                                 (input, Some(Ok(normalize_tool_content(content))))
                             }
                             SnapshotToolState::Error { input, error } => {
@@ -1062,15 +1058,7 @@ impl OpenCodeV2Translator {
                     write: t.cache.write,
                 },
             });
-            let error = data.error.map(|e| NativeError {
-                kind: e.kind,
-                message: e.message,
-                status: e.status,
-                response: e.response.map(|response| ErrorResponse {
-                    body: response.body,
-                }),
-                retry_after_ms: e.retry_after_ms,
-            });
+            let error = data.error;
             ops.extend(self.finish_step(
                 StepEnded {
                     session_id: sid.clone(),
@@ -1080,6 +1068,22 @@ impl OpenCodeV2Translator {
                 },
                 ended,
             ));
+        }
+        if recovering_closed_turn {
+            self.pending_context.remove(&sid);
+            if let Some(session) = self.sessions.get_mut(&sid) {
+                if let Some(turn) = session.turn.take() {
+                    if let Some(output) = session.output.take() {
+                        ops.push(SpanOp::Merge(SpanRow {
+                            span_id: turn,
+                            root_span_id: session.trace_root.clone(),
+                            parent_span_ids: vec![session.root.clone()],
+                            output: Some(Value::String(output)),
+                            ..Default::default()
+                        }));
+                    }
+                }
+            }
         }
         if let Some(ended) = snapshot.idle_ms.filter(|_| {
             self.sessions
@@ -1184,12 +1188,12 @@ impl OpenCodeV2Translator {
         let Some(s) = self.sessions.get_mut(&data.session_id) else {
             return vec![];
         };
-        if !s.completed_messages.insert(data.message_id.clone()) {
-            return vec![];
-        }
         let Some(parent) = s.turn.clone() else {
             return vec![];
         };
+        if !s.completed_messages.insert(data.message_id.clone()) {
+            return vec![];
+        }
         let mut assistant = Message::new("assistant", Content::Text(text.clone()));
         let calls = s.calls.remove(&data.message_id).unwrap_or_default();
         if !calls.is_empty() {

@@ -2405,6 +2405,14 @@ fn opencode_v2_snapshot_recovers_unseen_step_and_replays_without_duplicates() {
     for event in events {
         ops.extend(translator.handle(&event, &ctx).unwrap());
     }
+    ops.extend(
+        translator
+            .handle(
+                &v2_event("session.execution.succeeded", 5, json!({"sessionID":"s"})),
+                &ctx,
+            )
+            .unwrap(),
+    );
     let snapshot = v2_event(
         "session.snapshot",
         6,

@@ -4795,7 +4795,7 @@ async fn opencode_projection_recovery(include_close_marker: bool, active: bool, 
     assert!(flush_session("root", &socket, 5000).await.unwrap().flushed);
     let spans = std::fs::read_to_string(data_dir.join("spans/root.ndjson")).unwrap();
     assert!(
-        spans.contains("recovered"),
+        spans.contains("\"content\":\"recovered\""),
         "missing recovered model output: {spans}"
     );
     assert!(
@@ -4859,5 +4859,41 @@ async fn managed_run_flush_waits_for_capture_connection_to_drain() {
         .unwrap();
     assert_eq!(result.accepted_sessions, 1);
     assert!(result.flushed);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn managed_run_flush_returns_when_capture_connection_stays_open() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (socket, handle, _flushes, _tmp) = start_tracking_daemon("test").await;
+    #[cfg(unix)]
+    let capture = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    #[cfg(windows)]
+    let capture = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&socket)
+        .unwrap();
+    let (capture_read, mut capture_write) = tokio::io::split(capture);
+    let mut capture_lines = BufReader::new(capture_read).lines();
+    capture_write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocol_version\":1,\"client\":{\"source\":\"debug\",\"managed_run_id\":\"stalled-run\"}}}\n").await.unwrap();
+    assert!(capture_lines.next_line().await.unwrap().is_some());
+    #[cfg(unix)]
+    let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    #[cfg(windows)]
+    let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&socket)
+        .unwrap();
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocol_version\":1,\"client\":{\"source\":\"test\"}}}\n").await.unwrap();
+    assert!(lines.next_line().await.unwrap().is_some());
+    write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"managed_run.flush\",\"params\":{\"managed_run_id\":\"stalled-run\",\"timeout_ms\":50}}\n").await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["result"]["flushed"], false);
+    assert_eq!(response["result"]["pending"], 1);
     handle.abort();
 }

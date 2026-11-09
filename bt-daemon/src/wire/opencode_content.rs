@@ -77,3 +77,37 @@ pub(crate) struct MediaSource {
 pub(crate) struct ToolResult {
     pub value: Value,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct NativeError {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub message: String,
+    pub status: Option<u16>,
+    pub response: Option<ErrorResponse>,
+    #[serde(rename = "retryAfterMs")]
+    pub retry_after_ms: Option<u64>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ErrorResponse {
+    pub body: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ToolContent {
+    Known(KnownToolContent),
+    Other(Value),
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum KnownToolContent {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "file")]
+    File {
+        mime: String,
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+}

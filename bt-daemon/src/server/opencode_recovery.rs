@@ -163,7 +163,7 @@ impl OpenCodeObservations {
             (envelope.session_id.clone(), depth(&snapshot.session_id))
         });
         let mut terminals = Vec::new();
-        for (mut envelope, mut snapshot) in items {
+        for (envelope, snapshot) in &mut items {
             if let Some(idle_ms) = snapshot.idle_ms.take() {
                 terminals.push((
                     envelope.clone(),
@@ -178,6 +178,8 @@ impl OpenCodeObservations {
                     },
                 ));
             }
+        }
+        for (mut envelope, snapshot) in items.into_iter().chain(terminals.into_iter().rev()) {
             let Ok(payload) = serde_json::to_value(snapshot) else {
                 continue;
             };
@@ -186,17 +188,6 @@ impl OpenCodeObservations {
             envelope.payload = serde_json::json!({"type":"session.snapshot", "data":payload});
             if let Err(error) = daemon.capture_event(envelope).await {
                 tracing::warn!(%error, "could not capture OpenCode session recovery");
-            }
-        }
-        for (mut envelope, snapshot) in terminals.into_iter().rev() {
-            let Ok(payload) = serde_json::to_value(snapshot) else {
-                continue;
-            };
-            envelope.event = "session.snapshot".into();
-            envelope.ts_ms = now_ms();
-            envelope.payload = serde_json::json!({"type":"session.snapshot", "data":payload});
-            if let Err(error) = daemon.capture_event(envelope).await {
-                tracing::warn!(%error, "could not capture OpenCode terminal recovery");
             }
         }
     }

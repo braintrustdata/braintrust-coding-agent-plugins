@@ -67,6 +67,22 @@ fn opencode_test_env(
     ]
 }
 
+fn opencode_v2_standalone(
+    workspace: &std::path::Path,
+    home: &std::path::Path,
+    args: &[&str],
+) -> tokio::process::Command {
+    let mut command = support::agent_process::command(
+        std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
+    );
+    command
+        .args(["run", "--standalone", "--model", "mock/mock-model"])
+        .args(args)
+        .current_dir(workspace)
+        .envs(opencode_test_env(workspace, home));
+    command
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn agent_output_does_not_wait_for_inherited_descendant_handles() {
@@ -730,18 +746,7 @@ async fn opencode_v2_session_emits_traces() {
     )
     .unwrap();
     let mut persistent =
-        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    persistent
-        .args([
-            "run",
-            "--standalone",
-            "--auto",
-            "--model",
-            "mock/mock-model",
-            "persistent marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
+        opencode_v2_standalone(&workspace, &home, &["--auto", "persistent marker"]);
     world.configure(&mut persistent);
     let output = world.output(&mut persistent).await;
     assert!(
@@ -771,18 +776,7 @@ async fn opencode_v2_session_emits_traces() {
     let plugins = workspace.join(".opencode/plugins");
     std::fs::create_dir_all(&plugins).unwrap();
     std::fs::write(plugins.join("reject.js"), r#"export default { id: 'test.reject', setup(ctx) { const c = new AbortController(); void (async () => { for await (const event of ctx.event.subscribe({signal:c.signal})) { if (event.type === 'permission.asked') await ctx.permission.reply({sessionID:event.data.sessionID,requestID:event.data.id,decision:'reject',message:'test denied'}); } })().catch(() => {}); return () => c.abort(); } };"#).unwrap();
-    let mut rejected =
-        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    rejected
-        .args([
-            "run",
-            "--standalone",
-            "--model",
-            "mock/mock-model",
-            "permission marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
+    let mut rejected = opencode_v2_standalone(&workspace, &home, &["permission marker"]);
     world.configure(&mut rejected);
     // OpenCode 2.0 exits nonzero after a rejection; later releases continue.
     let _output = world.output(&mut rejected).await;
@@ -811,18 +805,7 @@ async fn opencode_v2_session_emits_traces() {
     )
     .unwrap();
     let mut interrupted =
-        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    interrupted
-        .args([
-            "run",
-            "--standalone",
-            "--auto",
-            "--model",
-            "mock/mock-model",
-            "interrupt marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
+        opencode_v2_standalone(&workspace, &home, &["--auto", "interrupt marker"]);
     world.configure(&mut interrupted);
     let _output = world.output(&mut interrupted).await;
     world
@@ -835,18 +818,7 @@ async fn opencode_v2_session_emits_traces() {
         .await;
 
     std::fs::remove_file(plugins.join("interrupt.js")).unwrap();
-    let mut failed = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    failed
-        .args([
-            "run",
-            "--standalone",
-            "--auto",
-            "--model",
-            "mock/mock-model",
-            "model failure marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
+    let mut failed = opencode_v2_standalone(&workspace, &home, &["--auto", "model failure marker"]);
     world.configure(&mut failed);
     let _output = world.output(&mut failed).await;
     let failure_rows = world
@@ -875,20 +847,16 @@ async fn opencode_v2_session_emits_traces() {
         .expect("failed native session root")["metadata"]["session_id"]
         .as_str()
         .unwrap();
-    let mut resumed = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    resumed
-        .args([
-            "run",
-            "--standalone",
+    let mut resumed = opencode_v2_standalone(
+        &workspace,
+        &home,
+        &[
             "--auto",
-            "--model",
-            "mock/mock-model",
             "--session",
             native_session,
             "model recovery marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
+        ],
+    );
     world.configure(&mut resumed);
     let output = world.output(&mut resumed).await;
     assert!(

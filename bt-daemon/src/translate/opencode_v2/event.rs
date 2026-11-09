@@ -224,39 +224,6 @@ pub(super) struct ToolFailed {
     pub id: String,
     pub error: NativeError,
 }
-#[derive(Deserialize, Serialize)]
-pub(super) struct NativeError {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub message: String,
-    pub status: Option<u16>,
-    pub response: Option<ErrorResponse>,
-    #[serde(rename = "retryAfterMs")]
-    pub retry_after_ms: Option<u64>,
-}
-#[derive(Deserialize, Serialize)]
-pub(super) struct ErrorResponse {
-    pub body: String,
-}
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub(super) enum ToolContent {
-    Known(KnownToolContent),
-    Other(Value),
-}
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub(super) enum KnownToolContent {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "file")]
-    File {
-        mime: String,
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-    },
-}
 #[derive(Deserialize)]
 pub(super) struct PermissionAsked {
     #[serde(rename = "sessionID")]

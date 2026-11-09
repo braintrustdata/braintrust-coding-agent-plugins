@@ -389,7 +389,7 @@ pub(super) async fn handle_request(
             )
         }
         method::MANAGED_RUN_FLUSH => {
-            let params = parse!(ManagedRunFlushParams);
+            let mut params = parse!(ManagedRunFlushParams);
             let mut changed = daemon.managed_connections_changed.subscribe();
             let own = usize::from(
                 client
@@ -397,18 +397,39 @@ pub(super) async fn handle_request(
                     .and_then(|info| info.managed_run_id.as_deref())
                     == Some(params.managed_run_id.as_str()),
             );
-            while daemon
-                .managed_connections
-                .lock()
-                .get(&params.managed_run_id)
-                .copied()
-                .unwrap_or(0)
-                > own
-            {
-                if changed.changed().await.is_err() {
-                    break;
+            let started = tokio::time::Instant::now();
+            let drained = tokio::time::timeout(Duration::from_millis(params.timeout_ms), async {
+                while daemon
+                    .managed_connections
+                    .lock()
+                    .get(&params.managed_run_id)
+                    .copied()
+                    .unwrap_or(0)
+                    > own
+                {
+                    if changed.changed().await.is_err() {
+                        break;
+                    }
                 }
+            })
+            .await;
+            if drained.is_err() {
+                let accepted_sessions =
+                    journal::read_managed_run_keys(&daemon.data_dir, &params.managed_run_id)
+                        .await
+                        .len() as u64;
+                return Response::serialized(
+                    id,
+                    FlushResult {
+                        flushed: false,
+                        pending: 1,
+                        accepted_sessions,
+                    },
+                );
             }
+            params.timeout_ms = params
+                .timeout_ms
+                .saturating_sub(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
             daemon.settle_ingress().await;
             if let Err(error) = resolve_pending_sessions(daemon, |env| {
                 env.managed_run_id.as_deref() == Some(params.managed_run_id.as_str())
