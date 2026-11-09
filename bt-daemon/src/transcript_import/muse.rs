@@ -176,7 +176,10 @@ impl<F: FnMut(Envelope) -> Result<()>> Reader<'_, F> {
             ts,
             MuseEvent::UserPromptSubmit(Hook {
                 context: self.context(Some(run_id), None),
-                body: PromptSubmitted { prompt: None },
+                body: PromptSubmitted {
+                    prompt: None,
+                    ..Default::default()
+                },
             }),
         )
     }
@@ -334,7 +337,15 @@ impl<F: FnMut(Envelope) -> Result<()>> Reader<'_, F> {
                     ts,
                     MuseEvent::UserPromptSubmit(Hook {
                         context: self.context(Some(&run_id), None),
-                        body: PromptSubmitted { prompt },
+                        body: PromptSubmitted {
+                            prompt: prompt.clone(),
+                            image_content: prompt
+                                .as_deref()
+                                .filter(|text| text.contains("[Image #"))
+                                .and_then(|_| {
+                                    crate::muse::images::content(&self.session_id, &run_id)
+                                }),
+                        },
                     }),
                 )?;
             }
