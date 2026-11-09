@@ -30,16 +30,6 @@ pub struct ClientInfo {
     pub plugin_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opencode_recovery: Option<OpenCodeRecovery>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenCodeRecovery {
-    pub database: std::path::PathBuf,
-    pub since_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

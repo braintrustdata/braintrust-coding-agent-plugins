@@ -1,7 +1,6 @@
 //! Partial OpenCode 2 wire types. Unknown fields are accepted; arbitrary tool
 //! inputs, outputs and provider-specific content remain JSON values.
-pub(super) use crate::wire::opencode_content::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Deserialize)]
@@ -9,13 +8,8 @@ pub(super) struct NativeEnvelope {
     pub id: Option<String>,
     pub location: Option<Location>,
     pub metadata: Option<EventMetadata>,
-    pub durable: Option<DurableEvent>,
     #[serde(flatten)]
     pub event: NativeEvent,
-}
-#[derive(Deserialize)]
-pub(super) struct DurableEvent {
-    pub seq: u64,
 }
 #[derive(Deserialize)]
 pub(super) struct Location {
@@ -30,8 +24,6 @@ pub(super) struct EventMetadata {
 #[derive(Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub(super) enum NativeEvent {
-    #[serde(rename = "session.snapshot")]
-    Snapshot(crate::wire::opencode_snapshot::Snapshot),
     #[serde(rename = "session.created")]
     Created(Created),
     #[serde(rename = "session.inbox.enqueued")]
@@ -119,6 +111,31 @@ pub(super) enum InboxItem {
     Other,
 }
 #[derive(Deserialize)]
+pub(super) struct Prompt {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub files: Vec<PromptFile>,
+    #[serde(default)]
+    pub skills: Vec<PromptSkill>,
+}
+#[derive(Deserialize)]
+pub(super) struct PromptSkill {
+    pub name: String,
+}
+#[derive(Deserialize)]
+pub(super) struct PromptFile {
+    pub mime: String,
+    pub data: String,
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub(super) struct Model {
+    pub id: Option<String>,
+    #[serde(rename = "providerID")]
+    pub provider_id: Option<String>,
+    pub variant: Option<String>,
+}
+#[derive(Deserialize)]
 pub(super) struct StepStarted {
     #[serde(rename = "sessionID")]
     pub session_id: String,
@@ -135,6 +152,24 @@ pub(super) struct StepEnded {
     pub message_id: String,
     pub tokens: Option<Tokens>,
     pub error: Option<NativeError>,
+}
+#[derive(Default, Deserialize, Serialize)]
+pub(super) struct Tokens {
+    #[serde(default)]
+    pub input: i64,
+    #[serde(default)]
+    pub output: i64,
+    #[serde(default)]
+    pub reasoning: i64,
+    #[serde(default)]
+    pub cache: CacheTokens,
+}
+#[derive(Default, Deserialize, Serialize)]
+pub(super) struct CacheTokens {
+    #[serde(default)]
+    pub read: i64,
+    #[serde(default)]
+    pub write: i64,
 }
 #[derive(Deserialize)]
 pub(super) struct TextEnded {
@@ -181,6 +216,39 @@ pub(super) struct ToolFailed {
     pub id: String,
     pub error: NativeError,
 }
+#[derive(Deserialize, Serialize)]
+pub(super) struct NativeError {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub message: String,
+    pub status: Option<u16>,
+    pub response: Option<ErrorResponse>,
+    #[serde(rename = "retryAfterMs")]
+    pub retry_after_ms: Option<u64>,
+}
+#[derive(Deserialize, Serialize)]
+pub(super) struct ErrorResponse {
+    pub body: String,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(super) enum ToolContent {
+    Known(KnownToolContent),
+    Other(Value),
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub(super) enum KnownToolContent {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "file")]
+    File {
+        mime: String,
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+}
 #[derive(Deserialize)]
 pub(super) struct PermissionAsked {
     #[serde(rename = "sessionID")]
@@ -222,6 +290,22 @@ pub(super) struct CompactionEnded {
     pub provider_context: Option<NativeCompaction>,
 }
 #[derive(Deserialize)]
+pub(super) struct NativeCompaction {
+    pub messages: Option<NativeMessages>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum NativeMessages {
+    Messages(Vec<NativeContextMessage>),
+    Opaque(Value),
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NativeContextMessage {
+    pub role: String,
+    pub content: MessageContent,
+}
+#[derive(Deserialize)]
 pub(super) struct CompactionFailed {
     #[serde(rename = "sessionID")]
     pub session_id: String,
@@ -249,4 +333,63 @@ pub(super) struct Context {
     pub system: Vec<String>,
     #[serde(default)]
     pub messages: Vec<ContextMessage>,
+}
+#[derive(Deserialize)]
+pub(super) struct ContextMessage {
+    pub role: String,
+    pub content: MessageContent,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum MessageContent {
+    Text(String),
+    Parts(Vec<ContextPart>),
+    Other(Value),
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum ContextPart {
+    Known(KnownContextPart),
+    Other(Value),
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub(super) enum KnownContextPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "media")]
+    Media {
+        #[serde(rename = "mediaType")]
+        media_type: Option<String>,
+        data: Option<String>,
+        media: Option<Media>,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, Value>,
+    },
+    #[serde(rename = "tool-call")]
+    ToolCall {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    #[serde(rename = "tool-result")]
+    ToolResult { id: String, result: ToolResult },
+}
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct Media {
+    pub source: Option<MediaSource>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct MediaSource {
+    #[serde(rename = "mediaType")]
+    pub media_type: Option<String>,
+    pub data: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct ToolResult {
+    pub value: Value,
 }

@@ -973,19 +973,13 @@ fn opencode_idle_root_merge_keeps_external_parent() {
     assert_merges_preserve_insert_identity(&ops);
 }
 
-fn v2_translator() -> (Box<dyn bt_daemon::AgentTranslator>, SessionCtx) {
-    (
-        Registry::default_agents().create("opencode", "root-session"),
-        SessionCtx {
-            session_id: "root-session".into(),
-            config: None,
-        },
-    )
-}
-
 #[test]
 fn opencode_v2_reduces_native_text_session_without_session_created() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     // Shapes observed from OpenCode 2.2.5 with a local mock model.
     let events = [
         (
@@ -1058,7 +1052,11 @@ fn opencode_v2_reduces_native_text_session_without_session_created() {
 
 #[test]
 fn opencode_v2_emits_tool_span_from_native_events() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let events = [
         (
             "session.inbox.enqueued",
@@ -1102,7 +1100,11 @@ fn opencode_v2_emits_tool_span_from_native_events() {
 
 #[test]
 fn opencode_v2_preserves_attached_images_in_turn_and_model_input() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let events = [
         (
             "session.inbox.enqueued",
@@ -1143,7 +1145,11 @@ fn opencode_v2_preserves_attached_images_in_turn_and_model_input() {
 
 #[test]
 fn opencode_v2_resume_keeps_the_first_native_event_after_synthetic_start() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let mut ops = Vec::new();
     for (i, name, data) in [
         (
@@ -1189,7 +1195,11 @@ fn opencode_v2_resume_keeps_the_first_native_event_after_synthetic_start() {
 
 #[test]
 fn opencode_v2_compaction_preserves_native_model_context_after_resume() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let events = [
         (
             1,
@@ -1277,7 +1287,11 @@ fn opencode_v2_compaction_preserves_native_model_context_after_resume() {
 
 #[test]
 fn opencode_v2_distinguishes_denied_and_failed_tools() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let events = [
         (
             "session.inbox.enqueued",
@@ -1357,7 +1371,11 @@ fn opencode_v2_distinguishes_denied_and_failed_tools() {
 
 #[test]
 fn opencode_v2_compaction_keeps_native_tail_without_context_hook() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let events = [
         (
             "session.inbox.enqueued",
@@ -1437,7 +1455,11 @@ fn opencode_v2_compaction_keeps_native_tail_without_context_hook() {
 
 #[test]
 fn opencode_v2_permission_denied_before_tool_call_creates_one_tool_span() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let events = [
         (
             "session.inbox.enqueued",
@@ -1484,7 +1506,11 @@ fn opencode_v2_permission_denied_before_tool_call_creates_one_tool_span() {
 
 #[test]
 fn opencode_v2_preserves_provider_defined_context_and_tool_content() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let events = [
         (
             "session.inbox.enqueued",
@@ -1615,7 +1641,11 @@ fn opencode_v2_native_compaction_window_is_scoped_to_its_model() {
 
 #[test]
 fn opencode_v2_preserves_opaque_provider_compaction_output() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let native =
         json!([{"role":"assistant","content":null,"provider_specific":{"continuation":"opaque"}}]);
     let events = [
@@ -1657,7 +1687,11 @@ fn v2_event(name: &str, ts: i64, data: serde_json::Value) -> Envelope {
 
 #[test]
 fn opencode_v2_checkpoint_resume_and_finalize_preserve_session_and_close_missing_tool() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let mut ops = Vec::new();
     for e in [
         v2_event(
@@ -1724,7 +1758,11 @@ fn opencode_v2_checkpoint_resume_and_finalize_preserve_session_and_close_missing
 
 #[test]
 fn opencode_v2_records_reasoning_usage_timing_and_error() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     let events = [
         v2_event(
             "session.inbox.enqueued",
@@ -1794,7 +1832,11 @@ fn opencode_v2_records_reasoning_usage_timing_and_error() {
 
 #[test]
 fn opencode_v2_ignores_malformed_unknown_cancelled_and_replayed_events() {
-    let (mut translator, ctx) = v2_translator();
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
     for e in [
         v2_event(
             "session.inbox.enqueued",
@@ -2333,262 +2375,4 @@ fn opencode_v2_top_level_resume_after_interruption_keeps_turn_numbers() {
     assert!(ops
         .iter()
         .any(|op| matches!(op, SpanOp::Insert(row) if row.name == "Turn 2")));
-}
-
-#[test]
-fn opencode_v2_snapshot_recovers_unseen_step_and_replays_without_duplicates() {
-    let (mut translator, ctx) = v2_translator();
-    let events = [
-        v2_event(
-            "session.inbox.enqueued",
-            1,
-            json!({"sessionID":"s","inboxID":"u","item":{"type":"user","payload":{"text":"hello"}}}),
-        ),
-        v2_event(
-            "session.inbox.delivered",
-            2,
-            json!({"sessionID":"s","inboxID":"u"}),
-        ),
-        v2_event(
-            "model.context",
-            3,
-            json!({"sessionID":"s","system":["system"],"messages":[{"role":"user","content":"hello"}]}),
-        ),
-    ];
-    let mut ops = Vec::new();
-    for event in events {
-        ops.extend(translator.handle(&event, &ctx).unwrap());
-    }
-    ops.extend(
-        translator
-            .handle(
-                &v2_event("session.execution.succeeded", 5, json!({"sessionID":"s"})),
-                &ctx,
-            )
-            .unwrap(),
-    );
-    let snapshot = v2_event(
-        "session.snapshot",
-        6,
-        json!({"sessionID":"s","idle_ms":6,"outcome":"succeeded","messages":[{
-            "id":"m", "kind":{"type":"assistant","data":{"time":{"created":4,"completed":5}, "model":{"id":"mock","providerID":"test"},
-            "content":[{"type":"text","text":"answer"}],"tokens":{"input":2,"output":1}}}
-        }]}),
-    );
-    ops.extend(translator.handle(&snapshot, &ctx).unwrap());
-    let replay = v2_event("session.snapshot", 7, snapshot.payload["data"].clone());
-    assert!(translator.handle(&replay, &ctx).unwrap().is_empty());
-    let rows = reduce(ops);
-    let llm = rows
-        .values()
-        .find(|row| row.span_type == SpanType::Llm)
-        .unwrap();
-    assert_eq!(
-        llm.output,
-        Some(json!([{"role":"assistant","content":"answer"}]))
-    );
-    assert_eq!(llm.metrics.as_ref().unwrap()["prompt_tokens"], 2);
-    assert!(llm.input.as_ref().unwrap().to_string().contains("hello"));
-    assert_eq!(
-        rows.values()
-            .find(|row| row.name == "Turn 1")
-            .unwrap()
-            .output,
-        Some(json!("answer"))
-    );
-}
-
-#[test]
-fn opencode_v2_snapshot_recovers_tool_output_without_inventing_approval() {
-    let (mut translator, ctx) = v2_translator();
-    let mut ops = Vec::new();
-    for event in [
-        v2_event(
-            "session.inbox.enqueued",
-            1,
-            json!({"sessionID":"s","inboxID":"u","item":{"type":"user","payload":{"text":"hello"}}}),
-        ),
-        v2_event(
-            "session.inbox.delivered",
-            2,
-            json!({"sessionID":"s","inboxID":"u"}),
-        ),
-        v2_event(
-            "session.snapshot",
-            7,
-            json!({"sessionID":"s","idle_ms":6,"outcome":"interrupted","messages":[{
-                "id":"m", "kind":{"type":"assistant","data":{"time":{"created":3,"completed":5}, "model":{"id":"mock","providerID":"test"},
-                "content":[{"type":"tool","id":"call","name":"shell","state":{"status":"error","input":{"command":"false"},"error":{"type":"aborted","message":"stopped"}}}]}}
-            }]}),
-        ),
-    ] {
-        ops.extend(translator.handle(&event, &ctx).unwrap());
-    }
-    let rows = reduce(ops);
-    let tool = rows
-        .values()
-        .find(|row| row.span_type == SpanType::Tool)
-        .unwrap();
-    assert_eq!(tool.name, "shell");
-    assert_eq!(tool.error.as_deref(), Some("stopped"));
-    assert!(tool
-        .metadata
-        .as_ref()
-        .unwrap()
-        .get("tool_approval")
-        .is_none());
-}
-
-#[test]
-fn opencode_v2_snapshot_recovers_a_turn_without_live_events() {
-    let (mut translator, ctx) = v2_translator();
-    let snapshot = v2_event(
-        "session.snapshot",
-        6,
-        json!({"sessionID":"s","idle_ms":6,"outcome":"succeeded","messages":[
-            {"id":"u","kind":{"type":"user","data":{"time":{"created":1},"text":"hello","files":[]}}},
-            {"id":"m","kind":{"type":"assistant","data":{"time":{"created":4,"completed":5},"model":{"id":"mock","providerID":"test"},"content":[{"type":"text","text":"answer"}]}}}
-        ]}),
-    );
-    let rows = reduce(translator.handle(&snapshot, &ctx).unwrap());
-    let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
-    assert_eq!(turn.input, Some(json!("hello")));
-    assert_eq!(turn.output, Some(json!("answer")));
-    assert_eq!(
-        rows.values()
-            .filter(|row| row.span_type == SpanType::Llm)
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn opencode_v2_snapshot_recovers_compaction_and_its_following_context() {
-    let (mut translator, ctx) = v2_translator();
-    let events = [
-        v2_event(
-            "session.inbox.enqueued",
-            1,
-            json!({"sessionID":"s","inboxID":"u","item":{"type":"user","payload":{"text":"hello"}}}),
-        ),
-        v2_event(
-            "session.inbox.delivered",
-            2,
-            json!({"sessionID":"s","inboxID":"u"}),
-        ),
-        v2_event(
-            "session.snapshot",
-            8,
-            json!({"sessionID":"s","idle_ms":8,"outcome":"succeeded","messages":[
-                {"id":"c","seq":3,"updated_ms":5,"kind":{"type":"compaction","data":{"time":{"created":3},"status":"completed","summary":"summary","model":{"id":"mock","providerID":"test"},"providerContext":{"messages":[{"role":"user","content":"native compacted context"}]}}}},
-                {"id":"m","seq":6,"kind":{"type":"assistant","data":{"time":{"created":6,"completed":7},"model":{"id":"mock","providerID":"test"},"content":[{"type":"text","text":"answer"}]}}}
-            ]}),
-        ),
-    ];
-    let mut ops = Vec::new();
-    for event in events {
-        ops.extend(translator.handle(&event, &ctx).unwrap());
-    }
-    let rows = reduce(ops);
-    assert_eq!(
-        rows.values()
-            .filter(|row| row
-                .tags
-                .as_ref()
-                .is_some_and(|tags| tags.iter().any(|tag| tag == "compaction")))
-            .count(),
-        1
-    );
-    let llm = rows
-        .values()
-        .find(|row| row.span_type == SpanType::Llm && row.tags.is_none())
-        .unwrap();
-    assert!(llm
-        .input
-        .as_ref()
-        .unwrap()
-        .to_string()
-        .contains("native compacted context"));
-    assert_eq!(
-        llm.output,
-        Some(json!([{"role":"assistant","content":"answer"}]))
-    );
-}
-
-#[test]
-fn opencode_v2_snapshot_does_not_duplicate_live_compaction() {
-    let (mut translator, ctx) = v2_translator();
-    for name in ["session.compaction.started", "session.compaction.ended"] {
-        let mut e = event(
-            name,
-            3,
-            json!({"id":if name.ends_with("started") {"evt_c"} else {"evt_done"},"type":name,"durable":{"seq":if name.ends_with("started") {3} else {5}},"data":{"sessionID":"s","text":"summary"}}),
-        );
-        e.source_version = Some("2.0.0".into());
-        if name.ends_with("started") {
-            let _ = translator
-                .handle(
-                    &v2_event("session.created", 1, json!({"sessionID":"s"})),
-                    &ctx,
-                )
-                .unwrap();
-        }
-        let _ = translator.handle(&e, &ctx).unwrap();
-    }
-    let snapshot = v2_event(
-        "session.snapshot",
-        7,
-        json!({"sessionID":"s","messages":[{"id":"msg_c","seq":3,"updated_ms":5,"kind":{"type":"compaction","data":{"time":{"created":3},"status":"completed","summary":"summary"}}}]}),
-    );
-    assert!(translator.handle(&snapshot, &ctx).unwrap().is_empty());
-}
-
-#[test]
-fn opencode_v2_snapshot_preserves_parent_child_turn_lineage() {
-    let (mut translator, ctx) = v2_translator();
-    let mut ops = Vec::new();
-    for event in [
-        v2_event(
-            "session.snapshot",
-            1,
-            json!({"sessionID":"parent","messages":[{"id":"u1","kind":{"type":"user","data":{"time":{"created":1},"text":"parent"}}}]}),
-        ),
-        v2_event(
-            "session.snapshot",
-            2,
-            json!({"sessionID":"child","parent_id":"parent","title":"Child","messages":[{"id":"u2","kind":{"type":"user","data":{"time":{"created":2},"text":"child"}}},{"id":"m","kind":{"type":"assistant","data":{"time":{"created":3,"completed":4},"model":{"id":"mock","providerID":"test"},"content":[{"type":"text","text":"child answer"}]}}}]}),
-        ),
-        v2_event(
-            "session.snapshot",
-            5,
-            json!({"sessionID":"child","messages":[],"outcome":"succeeded","idle_ms":5}),
-        ),
-        v2_event(
-            "session.snapshot",
-            6,
-            json!({"sessionID":"parent","messages":[],"outcome":"succeeded","idle_ms":6}),
-        ),
-    ] {
-        ops.extend(translator.handle(&event, &ctx).unwrap());
-    }
-    let rows = reduce(ops);
-    let parent = rows.values().find(|row| row.name == "OpenCode").unwrap();
-    let parent_turn = rows
-        .values()
-        .find(|row| row.input == Some(json!("parent")))
-        .unwrap();
-    let child = rows.values().find(|row| row.name == "Child").unwrap();
-    let child_turn = rows
-        .values()
-        .find(|row| row.input == Some(json!("child")))
-        .unwrap();
-    assert_eq!(child.root_span_id, parent.root_span_id);
-    assert_eq!(
-        child.parent_span_ids,
-        std::slice::from_ref(&parent_turn.span_id)
-    );
-    assert_eq!(
-        child_turn.parent_span_ids,
-        std::slice::from_ref(&child.span_id)
-    );
 }

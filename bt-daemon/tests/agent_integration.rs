@@ -67,22 +67,6 @@ fn opencode_test_env(
     ]
 }
 
-fn opencode_v2_standalone(
-    workspace: &std::path::Path,
-    home: &std::path::Path,
-    args: &[&str],
-) -> tokio::process::Command {
-    let mut command = support::agent_process::command(
-        std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN"),
-    );
-    command
-        .args(["run", "--standalone", "--model", "mock/mock-model"])
-        .args(args)
-        .current_dir(workspace)
-        .envs(opencode_test_env(workspace, home));
-    command
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn agent_output_does_not_wait_for_inherited_descendant_handles() {
@@ -746,7 +730,18 @@ async fn opencode_v2_session_emits_traces() {
     )
     .unwrap();
     let mut persistent =
-        opencode_v2_standalone(&workspace, &home, &["--auto", "persistent marker"]);
+        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    persistent
+        .args([
+            "run",
+            "--standalone",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "persistent marker",
+        ])
+        .current_dir(&workspace)
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut persistent);
     let output = world.output(&mut persistent).await;
     assert!(
@@ -776,7 +771,18 @@ async fn opencode_v2_session_emits_traces() {
     let plugins = workspace.join(".opencode/plugins");
     std::fs::create_dir_all(&plugins).unwrap();
     std::fs::write(plugins.join("reject.js"), r#"export default { id: 'test.reject', setup(ctx) { const c = new AbortController(); void (async () => { for await (const event of ctx.event.subscribe({signal:c.signal})) { if (event.type === 'permission.asked') await ctx.permission.reply({sessionID:event.data.sessionID,requestID:event.data.id,decision:'reject',message:'test denied'}); } })().catch(() => {}); return () => c.abort(); } };"#).unwrap();
-    let mut rejected = opencode_v2_standalone(&workspace, &home, &["permission marker"]);
+    let mut rejected =
+        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    rejected
+        .args([
+            "run",
+            "--standalone",
+            "--model",
+            "mock/mock-model",
+            "permission marker",
+        ])
+        .current_dir(&workspace)
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut rejected);
     // OpenCode 2.0 exits nonzero after a rejection; later releases continue.
     let _output = world.output(&mut rejected).await;
@@ -805,7 +811,18 @@ async fn opencode_v2_session_emits_traces() {
     )
     .unwrap();
     let mut interrupted =
-        opencode_v2_standalone(&workspace, &home, &["--auto", "interrupt marker"]);
+        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    interrupted
+        .args([
+            "run",
+            "--standalone",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "interrupt marker",
+        ])
+        .current_dir(&workspace)
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut interrupted);
     let _output = world.output(&mut interrupted).await;
     world
@@ -818,7 +835,18 @@ async fn opencode_v2_session_emits_traces() {
         .await;
 
     std::fs::remove_file(plugins.join("interrupt.js")).unwrap();
-    let mut failed = opencode_v2_standalone(&workspace, &home, &["--auto", "model failure marker"]);
+    let mut failed = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    failed
+        .args([
+            "run",
+            "--standalone",
+            "--auto",
+            "--model",
+            "mock/mock-model",
+            "model failure marker",
+        ])
+        .current_dir(&workspace)
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut failed);
     let _output = world.output(&mut failed).await;
     let failure_rows = world
@@ -847,16 +875,20 @@ async fn opencode_v2_session_emits_traces() {
         .expect("failed native session root")["metadata"]["session_id"]
         .as_str()
         .unwrap();
-    let mut resumed = opencode_v2_standalone(
-        &workspace,
-        &home,
-        &[
+    let mut resumed = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
+    resumed
+        .args([
+            "run",
+            "--standalone",
             "--auto",
+            "--model",
+            "mock/mock-model",
             "--session",
             native_session,
             "model recovery marker",
-        ],
-    );
+        ])
+        .current_dir(&workspace)
+        .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut resumed);
     let output = world.output(&mut resumed).await;
     assert!(
@@ -931,20 +963,6 @@ async fn opencode_v2_session_emits_traces() {
                 && row["input"].to_string().contains("image/png")
                 && row["input"].to_string().contains("image_url")),
         "model input lost tool image: {image_rows:?}"
-    );
-    let database = rusqlite::Connection::open(home.join("data/opencode/opencode.db")).unwrap();
-    let native_session: String = database.query_row(
-        "SELECT session_id FROM session_message WHERE type='user' AND data LIKE '%image tool marker%' LIMIT 1",
-        [], |row| row.get(0),
-    ).unwrap();
-    let recovery_journal =
-        bt_daemon::source_journal_path(&world.temp_path("daemon"), "opencode", &native_session);
-    let recovery = std::fs::read_to_string(recovery_journal).unwrap();
-    assert!(
-        recovery.contains("session.snapshot"),
-        "native projection recovery was not journaled; journal: {recovery}; daemon stderr: {}; run stderr: {}",
-        std::fs::read_to_string(world.temp_path("daemon/daemon-stderr.log")).unwrap_or_default(),
-        String::from_utf8_lossy(&output.stderr),
     );
 }
 
@@ -1357,10 +1375,30 @@ async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are
     .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut run);
     run.env("BRAINTRUST_DAEMON_SOCKET", &proxy_path);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(20), world.output(&mut run))
-        .await
-        .expect("OpenCode waited for daemon acknowledgements during cleanup");
-    release_acknowledgements.send_replace(true);
+    // Verify the journal boundary directly while acknowledgements are held.
+    // The timeout bounds the test; it is not part of hook dispatch.
+    let journal_dir = world.temp_path("daemon/journal");
+    let journaled = async {
+        loop {
+            if let Ok(entries) = std::fs::read_dir(&journal_dir) {
+                if entries.flatten().any(|entry| {
+                    std::fs::read_to_string(entry.path()).is_ok_and(|contents| {
+                        contents.contains("session.execution.succeeded")
+                            && contents.contains("opencode")
+                    })
+                }) {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let (output, ()) = tokio::join!(world.output(&mut run), async {
+        tokio::time::timeout(std::time::Duration::from_secs(20), journaled)
+            .await
+            .expect("completion event was not journaled");
+        release_acknowledgements.send_replace(true);
+    });
     assert!(
         output.status.success(),
         "{}",

@@ -40,59 +40,15 @@ pub(super) async fn accept_loop(daemon: Arc<Daemon>, mut listener: Listener) -> 
     }
 }
 
-struct ManagedConnection {
-    daemon: Arc<Daemon>,
-    id: String,
-}
-impl ManagedConnection {
-    fn new(daemon: Arc<Daemon>, id: String) -> Self {
-        *daemon
-            .managed_connections
-            .lock()
-            .entry(id.clone())
-            .or_default() += 1;
-        daemon
-            .managed_connections_changed
-            .send_modify(|v| *v = v.wrapping_add(1));
-        Self { daemon, id }
-    }
-}
-impl Drop for ManagedConnection {
-    fn drop(&mut self) {
-        let mut connections = self.daemon.managed_connections.lock();
-        if let Some(count) = connections.get_mut(&self.id) {
-            *count -= 1;
-            if *count == 0 {
-                connections.remove(&self.id);
-            }
-        }
-        drop(connections);
-        self.daemon
-            .managed_connections_changed
-            .send_modify(|v| *v = v.wrapping_add(1));
-    }
-}
 pub(super) async fn serve_connection(
     daemon: Arc<Daemon>,
     stream: ServerStream,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
-    let mut client: Option<ClientInfo> = None;
-    let mut response_channel_open = true;
-    let mut managed_connection: Option<ManagedConnection> = None;
-    let mut observations = super::opencode_recovery::OpenCodeObservations::default();
-    let mut rejected_event = false;
+    let mut client = None;
 
-    loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(error) => {
-                tracing::debug!(%error, "client stopped sending requests");
-                break;
-            }
-        };
+    while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -107,45 +63,7 @@ pub(super) async fn serve_connection(
                     method,
                     "request received"
                 );
-                let observation = (method == method::EVENT_LOG
-                    && client
-                        .as_ref()
-                        .is_some_and(|info| info.opencode_recovery.is_some()))
-                .then(|| {
-                    req.params
-                        .as_ref()
-                        .and_then(|params| serde_json::from_value::<Envelope>(params.clone()).ok())
-                })
-                .flatten();
                 let response = handle_request(&daemon, req, &mut client).await;
-                if response.error.is_none()
-                    && response
-                        .result
-                        .as_ref()
-                        .and_then(|value| value.get("accepted"))
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                {
-                    if let Some(envelope) = observation.as_ref() {
-                        observations.observe(envelope);
-                        if let (Some(completed), Some(config)) = (
-                            observations.completed(envelope),
-                            client
-                                .as_ref()
-                                .and_then(|info| info.opencode_recovery.clone()),
-                        ) {
-                            completed.recover(&daemon, config, false).await;
-                        }
-                    }
-                }
-                if method == method::INITIALIZE
-                    && response.error.is_none()
-                    && managed_connection.is_none()
-                {
-                    if let Some(id) = client.as_ref().and_then(|info| info.managed_run_id.clone()) {
-                        managed_connection = Some(ManagedConnection::new(daemon.clone(), id));
-                    }
-                }
                 stop_after_response = method == method::EVENT_LOG
                     && (response.error.is_some()
                         || response
@@ -219,36 +137,19 @@ pub(super) async fn serve_connection(
         };
 
         if let Some(resp) = response {
-            if response_channel_open {
-                let mut buf = Message::Response(resp).to_line()?;
-                buf.push('\n');
-                let result = async {
-                    write_half.write_all(buf.as_bytes()).await?;
-                    write_half.flush().await
-                }
-                .await;
-                if let Err(error) = result {
-                    // The peer may close after sending a pipeline without waiting
-                    // for replies. Drain received requests before honoring EOF.
-                    tracing::debug!(%error, "client stopped reading responses");
-                    response_channel_open = false;
-                }
+            let mut buf = Message::Response(resp).to_line()?;
+            buf.push('\n');
+            let write_result = async {
+                write_half.write_all(buf.as_bytes()).await?;
+                write_half.flush().await
             }
+            .await;
             if shutdown_after_response {
                 daemon.trigger_shutdown();
             }
+            write_result?;
             if stop_after_response {
-                rejected_event = true;
                 break;
-            }
-        }
-    }
-    if !rejected_event {
-        if let Some(info) = client {
-            if let Some(config) = info.opencode_recovery {
-                observations
-                    .recover(&daemon, config, info.managed_run_id.is_some())
-                    .await;
             }
         }
     }
@@ -316,12 +217,6 @@ pub(super) async fn handle_request(
                     ),
                 );
             }
-            tracing::info!(
-                source = %p.client.source,
-                opencode_recovery = p.client.opencode_recovery.is_some(),
-                managed_run = p.client.managed_run_id.is_some(),
-                "client initialized"
-            );
             *client = Some(p.client);
             let result = InitializeResult {
                 protocol_version: PROTOCOL_VERSION,
@@ -389,47 +284,7 @@ pub(super) async fn handle_request(
             )
         }
         method::MANAGED_RUN_FLUSH => {
-            let mut params = parse!(ManagedRunFlushParams);
-            let mut changed = daemon.managed_connections_changed.subscribe();
-            let own = usize::from(
-                client
-                    .as_ref()
-                    .and_then(|info| info.managed_run_id.as_deref())
-                    == Some(params.managed_run_id.as_str()),
-            );
-            let started = tokio::time::Instant::now();
-            let drained = tokio::time::timeout(Duration::from_millis(params.timeout_ms), async {
-                while daemon
-                    .managed_connections
-                    .lock()
-                    .get(&params.managed_run_id)
-                    .copied()
-                    .unwrap_or(0)
-                    > own
-                {
-                    if changed.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-            .await;
-            if drained.is_err() {
-                let accepted_sessions =
-                    journal::read_managed_run_keys(&daemon.data_dir, &params.managed_run_id)
-                        .await
-                        .len() as u64;
-                return Response::serialized(
-                    id,
-                    FlushResult {
-                        flushed: false,
-                        pending: 1,
-                        accepted_sessions,
-                    },
-                );
-            }
-            params.timeout_ms = params
-                .timeout_ms
-                .saturating_sub(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+            let params = parse!(ManagedRunFlushParams);
             daemon.settle_ingress().await;
             if let Err(error) = resolve_pending_sessions(daemon, |env| {
                 env.managed_run_id.as_deref() == Some(params.managed_run_id.as_str())

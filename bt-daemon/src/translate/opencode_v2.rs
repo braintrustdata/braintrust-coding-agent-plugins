@@ -12,7 +12,7 @@ use crate::{ids, wire::Envelope};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -35,7 +35,6 @@ struct SessionState {
     parents: Vec<String>,
     owner_turn: Option<String>,
     turn: Option<String>,
-    last_turn: Option<String>,
     turn_number: u32,
     turn_skills: Vec<String>,
     tool_count: u32,
@@ -48,7 +47,6 @@ struct SessionState {
     tools: HashMap<(String, String), ToolState>,
     denied_tools: HashSet<(String, String)>,
     completed_messages: RecentSet<String>,
-    seen_users: RecentSet<String>,
 }
 struct ToolState {
     name: String,
@@ -62,11 +60,6 @@ struct Step {
     started: i64,
     model: Option<Model>,
     context: Option<Context>,
-}
-struct ToolCompletion {
-    output: Option<Vec<ContentPart>>,
-    error: Option<String>,
-    approval: Option<ToolApproval>,
 }
 struct Permission {
     session_id: String,
@@ -95,7 +88,6 @@ impl NativeWindow {
 struct Compaction {
     started: i64,
     input_id: Option<String>,
-    projection_id: Option<String>,
 }
 struct CompactionResult<'a> {
     session_id: &'a str,
@@ -117,12 +109,10 @@ pub(super) struct OpenCodeV2Translator {
     pending_inputs: HashMap<(String, String), Prompt>,
     tool_names: HashMap<(String, String, String), String>,
     steps: HashMap<(String, String), Step>,
-    pending_context: HashMap<String, VecDeque<Context>>,
+    pending_context: HashMap<String, Context>,
     text_parts: HashMap<(String, String, bool), BTreeMap<u64, String>>,
     permissions: HashMap<String, Permission>,
     compactions: HashMap<String, Compaction>,
-    completed_compactions: RecentSet<(String, String)>,
-    completed_compaction_seq: HashMap<String, u64>,
     seen: RecentSet<String>,
     last_ts_ms: i64,
     git: Arc<GitMetadataCache>,
@@ -139,8 +129,6 @@ impl OpenCodeV2Translator {
             text_parts: HashMap::new(),
             permissions: HashMap::new(),
             compactions: HashMap::new(),
-            completed_compactions: RecentSet::default(),
-            completed_compaction_seq: HashMap::new(),
             seen: RecentSet::default(),
             last_ts_ms: 0,
             git: GitMetadataCache::shared(),
@@ -210,14 +198,10 @@ impl OpenCodeV2Translator {
         })]
     }
     fn turn(&mut self, sid: &str, id: &str, prompt: Prompt, ts: i64) -> Vec<SpanOp> {
-        if self.sessions.get(sid).is_some_and(|session| session.idle) {
-            self.pending_context.remove(sid);
-        }
         let mut ops = self.open(sid, None, None, ts);
         let Some(s) = self.sessions.get_mut(sid) else {
             return ops;
         };
-        s.seen_users.insert(id.to_owned());
         if s.idle {
             s.idle = false;
             ops.push(SpanOp::Merge(SpanRow {
@@ -321,7 +305,6 @@ impl OpenCodeV2Translator {
             }
         }
         if let Some(turn) = s.turn.take() {
-            s.last_turn = Some(turn.clone());
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn,
                 root_span_id: s.trace_root.clone(),
@@ -373,7 +356,6 @@ impl AgentTranslator for OpenCodeV2Translator {
             .and_then(|location| location.directory.as_deref());
         let ts = event.ts_ms;
         let mut ops = match native.event {
-            NativeEvent::Snapshot(data) => self.recover_snapshot(data, ts),
             NativeEvent::Created(data) => self.open(
                 &data.session_id,
                 data.parent_id.as_deref(),
@@ -402,13 +384,36 @@ impl AgentTranslator for OpenCodeV2Translator {
                 vec![]
             }
             NativeEvent::Context(data) => {
-                self.pending_context
-                    .entry(data.session_id.clone())
-                    .or_default()
-                    .push_back(data);
+                self.pending_context.insert(data.session_id.clone(), data);
                 vec![]
             }
-            NativeEvent::StepStarted(data) => self.start_step(data, ts),
+            NativeEvent::StepStarted(data) => {
+                let context = self.pending_context.remove(&data.session_id);
+                let turn_update = self.sessions.get(&data.session_id).and_then(|s| {
+                    let turn = s.turn.as_ref()?;
+                    let model = data.model.as_ref()?.id.as_ref()?;
+                    Some(SpanOp::Merge(SpanRow {
+                        span_id: turn.clone(),
+                        root_span_id: s.trace_root.clone(),
+                        parent_span_ids: vec![s.root.clone()],
+                        metadata: Some(span_value(TurnMetadata {
+                            turn_number: s.turn_number,
+                            model: Some(model.clone()),
+                            loaded_skill_names: s.turn_skills.clone(),
+                        })),
+                        ..Default::default()
+                    }))
+                });
+                self.steps.insert(
+                    (data.session_id, data.message_id),
+                    Step {
+                        started: data.started.unwrap_or(ts),
+                        model: data.model,
+                        context,
+                    },
+                );
+                turn_update.into_iter().collect()
+            }
             NativeEvent::ToolInputStarted(data) => {
                 self.tool_names.insert(
                     (
@@ -420,18 +425,93 @@ impl AgentTranslator for OpenCodeV2Translator {
                 );
                 vec![]
             }
-            NativeEvent::ToolCalled(data) => self.start_tool(data, ts),
+            NativeEvent::ToolCalled(data) => {
+                let name = self
+                    .tool_names
+                    .get(&(
+                        data.session_id.clone(),
+                        data.message_id.clone(),
+                        data.id.clone(),
+                    ))
+                    .or_else(|| {
+                        self.tool_names.get(&(
+                            data.session_id.clone(),
+                            String::new(),
+                            data.id.clone(),
+                        ))
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| "tool".into());
+                let Some(s) = self.sessions.get_mut(&data.session_id) else {
+                    return Ok(vec![]);
+                };
+                let Some(parent) = s.turn.clone() else {
+                    return Ok(vec![]);
+                };
+                let tool_key = (data.message_id.clone(), data.id.clone());
+                if s.tools.contains_key(&tool_key) {
+                    return Ok(vec![]);
+                }
+                if s.denied_tools.contains(&tool_key) {
+                    return Ok(vec![]);
+                }
+                let span_id = ids::span_id(
+                    &self.daemon_session_id,
+                    &format!("tool:{}:{}:{}", data.session_id, data.message_id, data.id),
+                );
+                let span_name = if name == "skill" {
+                    data.input
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|skill| format!("skill: {skill}"))
+                        .unwrap_or_else(|| name.clone())
+                } else {
+                    name.clone()
+                };
+                let skill_name = (name == "skill")
+                    .then(|| {
+                        data.input
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .flatten();
+                s.calls
+                    .entry(data.message_id.clone())
+                    .or_default()
+                    .push(ToolCall::new(data.id.clone(), name.clone(), &data.input));
+                s.tools.insert(
+                    tool_key,
+                    ToolState {
+                        name: name.clone(),
+                        skill_name,
+                        message_id: data.message_id,
+                        span_id: span_id.clone(),
+                        parent: parent.clone(),
+                        denied: false,
+                    },
+                );
+                vec![SpanOp::Insert(SpanRow {
+                    span_id,
+                    root_span_id: s.trace_root.clone(),
+                    parent_span_ids: vec![parent],
+                    turn_span_id: s.owner_turn.clone().or_else(|| s.turn.clone()),
+                    name: span_name,
+                    span_type: SpanType::Tool,
+                    start_ms: Some(ts),
+                    input: Some(data.input),
+                    metadata: Some(span_value(ToolMetadata::new(&name, &data.id))),
+                    ..Default::default()
+                })]
+            }
             NativeEvent::ToolSuccess(data) => {
                 let output = normalize_tool_content(data.content.unwrap_or_default());
                 self.finish_tool(
                     &data.session_id,
                     &data.message_id,
                     &data.id,
-                    ToolCompletion {
-                        output: Some(output),
-                        error: None,
-                        approval: Some(ToolApproval::Approved),
-                    },
+                    Some(output),
+                    None,
                     ts,
                 )
             }
@@ -441,11 +521,8 @@ impl AgentTranslator for OpenCodeV2Translator {
                     &data.session_id,
                     &data.message_id,
                     &data.id,
-                    ToolCompletion {
-                        output: None,
-                        error: Some(error),
-                        approval: Some(ToolApproval::Approved),
-                    },
+                    None,
+                    Some(error),
                     ts,
                 )
             }
@@ -568,11 +645,6 @@ impl AgentTranslator for OpenCodeV2Translator {
                     data.session_id,
                     Compaction {
                         started: ts,
-                        projection_id: data.input_id.clone().or_else(|| {
-                            native.id.as_deref().and_then(|id| {
-                                id.strip_prefix("evt_").map(|id| format!("msg_{id}"))
-                            })
-                        }),
                         input_id: data.input_id,
                     },
                 );
@@ -585,13 +657,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     .unwrap_or(Compaction {
                         started: ts,
                         input_id: None,
-                        projection_id: None,
                     });
-                self.record_compaction(
-                    &data.session_id,
-                    start.projection_id.as_deref(),
-                    native.durable.as_ref().map(|event| event.seq),
-                );
                 self.compact(CompactionResult {
                     session_id: &data.session_id,
                     id: native.id.as_deref().unwrap_or("compaction-summary"),
@@ -616,13 +682,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     .unwrap_or(Compaction {
                         started: ts,
                         input_id: None,
-                        projection_id: None,
                     });
-                self.record_compaction(
-                    &data.session_id,
-                    start.projection_id.as_deref(),
-                    native.durable.as_ref().map(|event| event.seq),
-                );
                 self.compact(CompactionResult {
                     session_id: &data.session_id,
                     id: native.id.as_deref().unwrap_or("compaction-failed"),
@@ -665,412 +725,15 @@ impl AgentTranslator for OpenCodeV2Translator {
     }
 }
 impl OpenCodeV2Translator {
-    fn start_step(&mut self, data: StepStarted, ts: i64) -> Vec<SpanOp> {
-        let context = self
-            .pending_context
-            .get_mut(&data.session_id)
-            .and_then(VecDeque::pop_front);
-        let turn_update = self.sessions.get(&data.session_id).and_then(|s| {
-            let turn = s.turn.as_ref()?;
-            let model = data.model.as_ref()?.id.as_ref()?;
-            Some(SpanOp::Merge(SpanRow {
-                span_id: turn.clone(),
-                root_span_id: s.trace_root.clone(),
-                parent_span_ids: vec![s.root.clone()],
-                metadata: Some(span_value(TurnMetadata {
-                    turn_number: s.turn_number,
-                    model: Some(model.clone()),
-                    loaded_skill_names: s.turn_skills.clone(),
-                })),
-                ..Default::default()
-            }))
-        });
-        self.steps.insert(
-            (data.session_id, data.message_id),
-            Step {
-                started: data.started.unwrap_or(ts),
-                model: data.model,
-                context,
-            },
-        );
-        turn_update.into_iter().collect()
-    }
-    fn start_tool(&mut self, data: ToolCalled, ts: i64) -> Vec<SpanOp> {
-        let name = self
-            .tool_names
-            .get(&(
-                data.session_id.clone(),
-                data.message_id.clone(),
-                data.id.clone(),
-            ))
-            .or_else(|| {
-                self.tool_names
-                    .get(&(data.session_id.clone(), String::new(), data.id.clone()))
-            })
-            .cloned()
-            .unwrap_or_else(|| "tool".into());
-        let Some(s) = self.sessions.get_mut(&data.session_id) else {
-            return vec![];
-        };
-        let Some(parent) = s.turn.clone() else {
-            return vec![];
-        };
-        let tool_key = (data.message_id.clone(), data.id.clone());
-        if s.tools.contains_key(&tool_key) {
-            return vec![];
-        }
-        if s.denied_tools.contains(&tool_key) {
-            return vec![];
-        }
-        let span_id = ids::span_id(
-            &self.daemon_session_id,
-            &format!("tool:{}:{}:{}", data.session_id, data.message_id, data.id),
-        );
-        let span_name = if name == "skill" {
-            data.input
-                .get("name")
-                .and_then(Value::as_str)
-                .map(|skill| format!("skill: {skill}"))
-                .unwrap_or_else(|| name.clone())
-        } else {
-            name.clone()
-        };
-        let skill_name = (name == "skill")
-            .then(|| {
-                data.input
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .flatten();
-        s.calls
-            .entry(data.message_id.clone())
-            .or_default()
-            .push(ToolCall::new(data.id.clone(), name.clone(), &data.input));
-        s.tools.insert(
-            tool_key,
-            ToolState {
-                name: name.clone(),
-                skill_name,
-                message_id: data.message_id,
-                span_id: span_id.clone(),
-                parent: parent.clone(),
-                denied: false,
-            },
-        );
-        vec![SpanOp::Insert(SpanRow {
-            span_id,
-            root_span_id: s.trace_root.clone(),
-            parent_span_ids: vec![parent],
-            turn_span_id: s.owner_turn.clone().or_else(|| s.turn.clone()),
-            name: span_name,
-            span_type: SpanType::Tool,
-            start_ms: Some(ts),
-            input: Some(data.input),
-            metadata: Some(span_value(ToolMetadata::new(&name, &data.id))),
-            ..Default::default()
-        })]
-    }
-    fn record_compaction(
-        &mut self,
-        session: &str,
-        projection_id: Option<&str>,
-        sequence: Option<u64>,
-    ) {
-        if let Some(id) = projection_id {
-            self.completed_compactions
-                .insert((session.to_owned(), id.to_owned()));
-        }
-        if let Some(sequence) = sequence {
-            self.completed_compaction_seq
-                .entry(session.to_owned())
-                .and_modify(|old| *old = (*old).max(sequence))
-                .or_insert(sequence);
-        }
-    }
-    fn recover_snapshot(
-        &mut self,
-        snapshot: crate::wire::opencode_snapshot::Snapshot,
-        _ts: i64,
-    ) -> Vec<SpanOp> {
-        use crate::wire::opencode_snapshot::{
-            SnapshotCompactionStatus, SnapshotMessageKind, SnapshotPart, SnapshotToolState,
-        };
-        let sid = snapshot.session_id;
-        let mut ops = Vec::new();
-        if !snapshot.messages.is_empty() && !self.sessions.contains_key(&sid) {
-            ops.extend(self.open(
-                &sid,
-                snapshot.parent_id.as_deref(),
-                snapshot.title.as_deref(),
-                _ts,
-            ));
-        }
-        // Completion can precede the snapshot in the journal. Temporarily
-        // restore the finished turn so missing model/tool spans retain their
-        // original parent and can update the already closed turn.
-        let recovering_closed_turn = self.sessions.get_mut(&sid).is_some_and(|session| {
-            if session.turn.is_none() && session.idle {
-                session.turn.clone_from(&session.last_turn);
-                session.turn.is_some()
-            } else {
-                false
-            }
-        });
-        let last_error = snapshot
-            .messages
-            .iter()
-            .rev()
-            .find_map(|message| match &message.kind {
-                SnapshotMessageKind::Assistant(data) => {
-                    data.error.as_ref().map(|error| error.message.clone())
-                }
-                SnapshotMessageKind::Compaction(data) => {
-                    data.error.as_ref().map(|error| error.message.clone())
-                }
-                SnapshotMessageKind::User(_) => None,
-            });
-        for message in snapshot.messages {
-            let data = match message.kind {
-                SnapshotMessageKind::User(user) => {
-                    let seen = self
-                        .sessions
-                        .get(&sid)
-                        .is_some_and(|session| session.seen_users.contains(&message.id));
-                    if !seen {
-                        ops.extend(self.turn(&sid, &message.id, user.prompt, user.time.created));
-                    }
-                    continue;
-                }
-                SnapshotMessageKind::Compaction(data) => {
-                    if matches!(
-                        data.status,
-                        SnapshotCompactionStatus::Running | SnapshotCompactionStatus::Other
-                    ) {
-                        continue;
-                    }
-                    if self
-                        .completed_compactions
-                        .contains(&(sid.clone(), message.id.clone()))
-                        || (message.seq > 0
-                            && self
-                                .completed_compaction_seq
-                                .get(&sid)
-                                .is_some_and(|seq| *seq >= message.seq))
-                    {
-                        continue;
-                    }
-                    let start = if self.compactions.get(&sid).is_some_and(|entry| {
-                        entry
-                            .projection_id
-                            .as_deref()
-                            .is_none_or(|id| id == message.id)
-                    }) {
-                        self.compactions.remove(&sid)
-                    } else {
-                        None
-                    };
-                    let started = start
-                        .as_ref()
-                        .map_or(data.time.created, |start| start.started);
-                    let input_id = start
-                        .and_then(|start| start.input_id)
-                        .or_else(|| Some(message.id.clone()));
-                    self.record_compaction(&sid, Some(&message.id), Some(message.seq));
-                    let failed = matches!(data.status, SnapshotCompactionStatus::Failed);
-                    let error = data
-                        .error
-                        .map(|error| error.message)
-                        .or_else(|| failed.then(|| "OpenCode compaction failed".to_owned()));
-                    ops.extend(self.compact(CompactionResult {
-                        session_id: &sid,
-                        id: &message.id,
-                        text: data.summary,
-                        model: data.model,
-                        tokens: data.tokens,
-                        started,
-                        ended: message.updated_ms.max(data.time.created),
-                        error,
-                        keep_id: data.metadata.and_then(|metadata| metadata.keep_id),
-                        input_id,
-                        native_messages: data.provider_context.and_then(|context| context.messages),
-                    }));
-                    continue;
-                }
-                SnapshotMessageKind::Assistant(data) => data,
-            };
-            let Some(ended) = data.time.completed else {
-                continue;
-            };
-            let Some(session) = self.sessions.get(&sid) else {
-                continue;
-            };
-            if session.turn.is_none() || session.completed_messages.contains(&message.id) {
-                continue;
-            }
-            let key = (sid.clone(), message.id.clone());
-            if !self.steps.contains_key(&key) {
-                ops.extend(self.start_step(
-                    StepStarted {
-                        session_id: sid.clone(),
-                        message_id: message.id.clone(),
-                        started: Some(data.time.created),
-                        model: Some(data.model),
-                    },
-                    data.time.created,
-                ));
-            }
-            let mut text_ordinal = 0;
-            let mut reasoning_ordinal = 0;
-            for part in data.content {
-                match part {
-                    SnapshotPart::Text { text } => {
-                        self.text_parts
-                            .entry((sid.clone(), message.id.clone(), false))
-                            .or_default()
-                            .entry(text_ordinal)
-                            .or_insert(text);
-                        text_ordinal += 1;
-                    }
-                    SnapshotPart::Reasoning { text } => {
-                        self.text_parts
-                            .entry((sid.clone(), message.id.clone(), true))
-                            .or_default()
-                            .entry(reasoning_ordinal)
-                            .or_insert(text);
-                        reasoning_ordinal += 1;
-                    }
-                    SnapshotPart::Tool { id, name, state } => {
-                        let (input, result) = match state {
-                            SnapshotToolState::Completed { input, content } => {
-                                (input, Some(Ok(normalize_tool_content(content))))
-                            }
-                            SnapshotToolState::Error { input, error } => {
-                                (input, Some(Err(error.message)))
-                            }
-                            SnapshotToolState::Running { input } => (input, None),
-                            SnapshotToolState::Streaming | SnapshotToolState::Other => continue,
-                        };
-                        let tool_key = (message.id.clone(), id.clone());
-                        let already_finished = self
-                            .sessions
-                            .get(&sid)
-                            .and_then(|s| s.results.get(&message.id))
-                            .is_some_and(|items| {
-                                items
-                                    .iter()
-                                    .any(|item| item.tool_call_id.as_deref() == Some(id.as_str()))
-                            });
-                        if already_finished {
-                            continue;
-                        }
-                        if !self
-                            .sessions
-                            .get(&sid)
-                            .is_some_and(|s| s.tools.contains_key(&tool_key))
-                        {
-                            self.tool_names
-                                .insert((sid.clone(), message.id.clone(), id.clone()), name);
-                            ops.extend(self.start_tool(
-                                ToolCalled {
-                                    session_id: sid.clone(),
-                                    message_id: message.id.clone(),
-                                    id: id.clone(),
-                                    input,
-                                },
-                                data.time.created,
-                            ));
-                        }
-                        if let Some(result) = result {
-                            match result {
-                                Ok(output) => ops.extend(self.finish_tool(
-                                    &sid,
-                                    &message.id,
-                                    &id,
-                                    ToolCompletion {
-                                        output: Some(output),
-                                        error: None,
-                                        approval: Some(ToolApproval::Approved),
-                                    },
-                                    ended,
-                                )),
-                                Err(error) => ops.extend(self.finish_tool(
-                                    &sid,
-                                    &message.id,
-                                    &id,
-                                    ToolCompletion {
-                                        output: None,
-                                        error: Some(error),
-                                        approval: None,
-                                    },
-                                    ended,
-                                )),
-                            }
-                        }
-                    }
-                    SnapshotPart::Other => {}
-                }
-            }
-            let tokens = data.tokens;
-            let error = data.error;
-            ops.extend(self.finish_step(
-                StepEnded {
-                    session_id: sid.clone(),
-                    message_id: message.id,
-                    tokens,
-                    error,
-                },
-                ended,
-            ));
-        }
-        if recovering_closed_turn {
-            self.pending_context.remove(&sid);
-            if let Some(session) = self.sessions.get_mut(&sid) {
-                if let Some(turn) = session.turn.take() {
-                    if let Some(output) = session.output.take() {
-                        ops.push(SpanOp::Merge(SpanRow {
-                            span_id: turn,
-                            root_span_id: session.trace_root.clone(),
-                            parent_span_ids: vec![session.root.clone()],
-                            output: Some(Value::String(output)),
-                            ..Default::default()
-                        }));
-                    }
-                }
-            }
-        }
-        if let Some(ended) = snapshot.idle_ms.filter(|_| {
-            self.sessions
-                .get(&sid)
-                .is_some_and(|session| !session.idle && session.turn.is_some())
-        }) {
-            match snapshot.outcome.as_deref() {
-                Some("succeeded") => ops.extend(self.finish(&sid, ended, false, None)),
-                Some("failed") => ops.extend(self.finish(&sid, ended, false, last_error)),
-                Some("interrupted") => ops.extend(self.finish(
-                    &sid,
-                    ended,
-                    false,
-                    Some("OpenCode session interrupted (unknown)".into()),
-                )),
-                _ => {}
-            }
-        }
-        ops
-    }
     fn finish_tool(
         &mut self,
         sid: &str,
         message_id: &str,
         call: &str,
-        completion: ToolCompletion,
+        output: Option<Vec<ContentPart>>,
+        error: Option<String>,
         ts: i64,
     ) -> Vec<SpanOp> {
-        let ToolCompletion {
-            output,
-            error,
-            approval,
-        } = completion;
         self.tool_names
             .remove(&(sid.into(), message_id.into(), call.into()));
         self.tool_names
@@ -1107,7 +770,7 @@ impl OpenCodeV2Translator {
             .or_default()
             .push(Message::tool(call.into(), result));
         let mut metadata = ToolMetadata::new(&tool.name, call);
-        metadata.tool_approval = approval;
+        metadata.tool_approval = Some(ToolApproval::Approved);
         if tool.name == "skill" {
             metadata.tool_kind = Some("skill");
             metadata.skill_name = Some(tool.skill_name.as_deref());
@@ -1142,12 +805,12 @@ impl OpenCodeV2Translator {
         let Some(s) = self.sessions.get_mut(&data.session_id) else {
             return vec![];
         };
-        let Some(parent) = s.turn.clone() else {
-            return vec![];
-        };
         if !s.completed_messages.insert(data.message_id.clone()) {
             return vec![];
         }
+        let Some(parent) = s.turn.clone() else {
+            return vec![];
+        };
         let mut assistant = Message::new("assistant", Content::Text(text.clone()));
         let calls = s.calls.remove(&data.message_id).unwrap_or_default();
         if !calls.is_empty() {

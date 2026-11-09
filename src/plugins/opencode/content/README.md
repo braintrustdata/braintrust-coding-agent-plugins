@@ -42,6 +42,10 @@ Standalone delivery is tested with delayed event acknowledgements. As with
 other fail-open integrations, abrupt termination or an unavailable daemon can
 prevent trace events from being delivered.
 
+Runtime hooks enqueue events without waiting for translation or upload. During
+plugin teardown, pending dispatches wait only for the daemon's journal
+acknowledgements; the daemon processes and uploads those events independently.
+
 The package declares `@opencode-ai/plugin` and `@opencode-ai/sdk` peers at
 `>=1.2.25`. CI checks package installation at that minimum and at the latest
 1.x peers, and runs real-agent integration tests with both distributions.

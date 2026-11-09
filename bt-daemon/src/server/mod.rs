@@ -8,7 +8,6 @@ mod correlation_store;
 mod ingress;
 mod maintenance;
 mod managed_run;
-mod opencode_recovery;
 mod recovery;
 mod rpc;
 mod sessions;
@@ -119,8 +118,6 @@ pub struct Daemon {
     journals: Mutex<HashMap<String, Arc<tokio::sync::Mutex<JournalWriter>>>>,
     claude_transcripts: Mutex<HashMap<DeliveryKey, ClaudeTranscriptObservation>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
-    managed_connections: Mutex<HashMap<String, usize>>,
-    managed_connections_changed: tokio::sync::watch::Sender<u64>,
     auth_errors: Mutex<HashMap<DeliveryKey, (String, String)>>,
     sessions: Mutex<HashMap<DeliveryKey, Arc<Session>>>,
     translations: Mutex<HashMap<String, Arc<crate::pipeline::translation::Translation>>>,
@@ -161,8 +158,6 @@ impl Daemon {
             journals: Mutex::new(HashMap::new()),
             claude_transcripts: Mutex::new(HashMap::new()),
             managed_run_sessions: Mutex::new(HashMap::new()),
-            managed_connections: Mutex::new(HashMap::new()),
-            managed_connections_changed: tokio::sync::watch::channel(0).0,
             auth_errors: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             translations: Mutex::new(HashMap::new()),
@@ -321,8 +316,6 @@ mod tests {
             daemon_version: version.map(str::to_string),
             plugin_version: None,
             pid: None,
-            managed_run_id: None,
-            opencode_recovery: None,
         }
     }
 

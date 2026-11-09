@@ -7,8 +7,6 @@
 
 mod envelope;
 mod methods;
-pub(crate) mod opencode_content;
-pub(crate) mod opencode_snapshot;
 mod rpc;
 
 pub use envelope::{
@@ -18,7 +16,7 @@ pub use envelope::{
 pub use methods::{
     method, AuthDiagnoseParams, AuthDiagnoseResult, Capabilities, ClientInfo, EventLogResult,
     FlushParams, FlushResult, InitializeParams, InitializeResult, ManagedRunFlushParams,
-    OpenCodeRecovery, RecoveryInfo, SessionStatus, ShutdownResult, StatusParams, StatusResult,
+    RecoveryInfo, SessionStatus, ShutdownResult, StatusParams, StatusResult,
 };
 pub use rpc::{error_code, Message, Request, RequestId, Response, RpcError};
 
