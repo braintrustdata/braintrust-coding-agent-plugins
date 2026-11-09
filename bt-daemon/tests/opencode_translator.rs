@@ -409,7 +409,7 @@ fn opencode_child_sessions_share_the_parent_trace_root() {
         session_id: "root-session".into(),
         config: Some(
             SessionRoute {
-                tags: vec!["nested".into()],
+                tags: ["nested".into()].into_iter().collect(),
                 additional_metadata: Some(
                     json!({"team":"pipeline", "source":"override", "_bt_private":true}),
                 ),
@@ -489,7 +489,7 @@ fn opencode_additional_metadata_reaches_roots_without_overriding_session_fields(
             SessionRoute {
                 destination: Some(TraceDestination::ParentSpan { components }),
                 additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
-                tags: vec!["ci".into(), "docs".into()],
+                tags: ["ci".into(), "docs".into()].into_iter().collect(),
                 ..SessionRoute::default()
             }
             .with_auth(BackendAuth {

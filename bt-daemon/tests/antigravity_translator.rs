@@ -206,7 +206,7 @@ fn hooks_and_full_transcript_build_model_and_tool_spans() {
         session_id: "conversation-1".into(),
         config: Some(
             SessionRoute {
-                tags: vec!["ci".into(), "docs".into()],
+                tags: ["ci".into(), "docs".into()].into_iter().collect(),
                 ..SessionRoute::default()
             }
             .with_auth(BackendAuth {

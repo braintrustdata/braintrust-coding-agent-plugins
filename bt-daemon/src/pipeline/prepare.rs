@@ -100,7 +100,7 @@ impl Prepare {
                 }
             }
             if insert && (is_root || is_subagent) && !config.tags.is_empty() {
-                row.tags = Some(config.tags.clone());
+                row.tags = Some(config.tags.iter().cloned().collect());
             }
         }
     }
@@ -183,7 +183,7 @@ mod tests {
             config: None,
         };
         let config = SessionRoute {
-            tags: vec!["route-tag".into()],
+            tags: ["route-tag".into()].into_iter().collect(),
             additional_metadata: Some(
                 serde_json::json!({"custom": true, "source": "wrong", "_bt_private": true}),
             ),

@@ -1463,7 +1463,7 @@ mod tests {
 
     fn route(name: &str) -> SessionRoute {
         SessionRoute {
-            tags: vec![name.into()],
+            tags: [name.into()].into_iter().collect(),
             ..SessionRoute::default()
         }
     }
@@ -2107,7 +2107,7 @@ mod tests {
         let mut other_profile = canonical.clone();
         other_profile.auth.profile_id = Some("different-id".into());
         assert!(!journal.route_complete(&other_profile, 10).await.unwrap());
-        legacy.tags.push("different route".into());
+        legacy.tags.insert("different route".into());
         assert!(!journal.route_complete(&legacy, 10).await.unwrap());
     }
 
@@ -2182,7 +2182,7 @@ mod tests {
             .await
             .unwrap();
         let mut corrected = original.clone();
-        corrected.tags.push("corrected".into());
+        corrected.tags.insert("corrected".into());
         for unrelated in [
             SessionRoute {
                 destination: Some(crate::wire::TraceDestination::ProjectLogs {
@@ -2231,7 +2231,7 @@ mod tests {
         assert_eq!(restored.subscribe(&original, 0).await.unwrap().completed, 0);
         restored.set_failure(&cursor.route, None).await.unwrap();
         let mut newer = corrected.clone();
-        newer.tags.push("independent".into());
+        newer.tags.insert("independent".into());
         assert!(
             restored
                 .reconfigure_held(&newer, 30)

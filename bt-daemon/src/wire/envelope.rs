@@ -3,7 +3,7 @@
 
 use braintrust_sdk_rust::SpanComponents;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 /// One operating-system process observed while capturing an event.
 ///
@@ -151,8 +151,8 @@ pub struct SessionRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
     /// Tags applied to each root span for this session.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub tags: BTreeSet<String>,
     /// Ordered JavaScript span transforms. Paths are resolved by explicit
     /// setup, run, and import commands before entering a session route.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -226,8 +226,8 @@ pub struct SessionConfig {
     pub flush_mode: FlushMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_metadata: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub tags: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub span_plugins: Vec<PathBuf>,
 }
@@ -414,7 +414,7 @@ mod tests {
                 },
                 destination: None,
                 flush_mode: FlushMode::FireAndForget,
-                tags: Vec::new(),
+                tags: Default::default(),
                 additional_metadata: None,
                 span_plugins: Vec::new(),
             }),

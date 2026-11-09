@@ -3981,7 +3981,7 @@ async fn startup_restores_a_durable_head_absent_from_captured_routes() {
     let (data_dir, socket, handle, _tmp) = start_routed_daemon(provider.clone()).await;
     let env = envelope("durable-subscription", "SessionStart", 1);
     let mut dormant = env.route.clone().unwrap();
-    dormant.tags = vec!["dormant".into()];
+    dormant.tags = ["dormant".into()].into_iter().collect();
     seed_dormant_route(&data_dir, &env.source, &env.session_id, &dormant);
     forward_envelope(&env, &socket, &dummy_host(), false)
         .await
@@ -4061,7 +4061,7 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
     #[async_trait]
     impl Sink for RouteSink {
         fn configure(&mut self, config: &SessionConfig) {
-            self.tag = config.tags[0].clone();
+            self.tag = config.tags.first().unwrap().clone();
         }
         async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
             if ops.iter().any(|op| match op {
@@ -4110,7 +4110,7 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
         let mut env = envelope("retirement-routes", "UserPromptSubmit", 1);
         env.source = "claude-code".into();
         env.payload = serde_json::json!({"session_id":env.session_id,"hook_event_name":"UserPromptSubmit","prompt":"work"});
-        env.route.as_mut().unwrap().tags = vec![tag.into()];
+        env.route.as_mut().unwrap().tags = [tag.into()].into_iter().collect();
         forward_envelope(&env, &socket, &dummy_host(), false)
             .await
             .unwrap();
@@ -4324,7 +4324,12 @@ async fn changed_settings_resume_the_original_rejected_route_through_ingress() {
         .await;
     event.event = "Stop".into();
     event.ts_ms = 2;
-    event.route.as_mut().unwrap().tags.push("corrected".into());
+    event
+        .route
+        .as_mut()
+        .unwrap()
+        .tags
+        .insert("corrected".into());
     forward_envelope(&event, &socket, &dummy_host(), false)
         .await
         .unwrap();

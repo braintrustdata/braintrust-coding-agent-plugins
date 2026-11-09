@@ -288,7 +288,7 @@ pub(super) mod tests {
         spans.commit(through).await.unwrap();
         spans.subscribe(&route, 0).await.unwrap();
         let mut dormant = route.clone();
-        dormant.tags.push("dormant".into());
+        dormant.tags.insert("dormant".into());
         spans.subscribe(&dormant, 0).await.unwrap();
 
         let mut options = debug_serve_options("test", tmp.path());
@@ -337,7 +337,7 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut corrected = original.clone();
-        corrected.tags.push("corrected".into());
+        corrected.tags.insert("corrected".into());
         let mut env: Envelope = serde_json::from_value(serde_json::json!({
             "source":"debug", "session_id":"restart-correction", "event":"SessionStart", "ts_ms":1,
             "payload":{}, "route":original

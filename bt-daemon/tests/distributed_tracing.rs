@@ -2715,7 +2715,7 @@ async fn explicit_parent_and_child_route_settings_win_over_ancestry() {
         );
         for event in &mut events {
             let route = event.route.as_mut().unwrap();
-            route.tags = vec!["child-tag".into()];
+            route.tags = ["child-tag".into()].into_iter().collect();
             route.additional_metadata = Some(serde_json::json!({"child_metadata": "retained"}));
             route.span_plugins = vec![plugin.clone()];
             if explicit {
@@ -2834,7 +2834,7 @@ async fn one_native_parent_session_selects_the_childs_delivery_route() {
     );
     for event in &mut duplicate {
         let mut route = parents[0].0.clone();
-        route.tags.push("duplicate-route".into());
+        route.tags.insert("duplicate-route".into());
         event.route = Some(route);
     }
     forward_all(&mut duplicate, &socket, &host).await;

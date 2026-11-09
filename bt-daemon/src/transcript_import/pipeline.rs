@@ -68,7 +68,7 @@ fn apply_import_span_plugins(
             destination: None,
             flush_mode: wire::FlushMode::FireAndForget,
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             span_plugins: plugins,
         });
     }
@@ -1037,7 +1037,7 @@ mod tests {
             destination: None,
             flush_mode: wire::FlushMode::FireAndForget,
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             span_plugins: vec![PathBuf::from("persisted.mjs")],
         });
 
@@ -1098,7 +1098,7 @@ mod tests {
             parent_project: None,
             attach: true,
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             plugin: Vec::new(),
         };
         assert!(validate_import_selection(&args)
@@ -1137,7 +1137,7 @@ mod tests {
             }),
             flush_mode: wire::FlushMode::FireAndForget,
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             span_plugins: Vec::new(),
         }
     }

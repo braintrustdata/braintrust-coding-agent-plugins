@@ -992,7 +992,7 @@ mod tests {
             source: RunSource::Codex,
             parent: None,
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             plugin: Vec::new(),
             agent_args: Vec::new(),
         };
@@ -1008,7 +1008,7 @@ mod tests {
                 TraceCommand::Setup(SetupArgs {
                     agent: SetupAgent::OpenCode,
                     additional_metadata: None,
-                    tags: Vec::new(),
+                    tags: Default::default(),
                     plugin: Vec::new(),
                 }),
                 true,
@@ -1050,7 +1050,7 @@ mod tests {
             source: RunSource::Claude,
             parent: Some(parent),
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             plugin: Vec::new(),
             agent_args: Vec::new(),
         };
@@ -1136,7 +1136,7 @@ mod tests {
                 parent_project: None,
                 attach: false,
                 additional_metadata: None,
-                tags: Vec::new(),
+                tags: Default::default(),
                 plugin: Vec::new(),
             };
             let error = run_trace(

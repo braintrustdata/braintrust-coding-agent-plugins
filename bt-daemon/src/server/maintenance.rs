@@ -770,7 +770,7 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .tags
-                    .push("not registered".into());
+                    .insert("not registered".into());
                 through = writer.append(&other).await.unwrap();
             }
             drop(writer);

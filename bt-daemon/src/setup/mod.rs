@@ -284,7 +284,7 @@ mod tests {
 
         let route = SessionRoute {
             additional_metadata: Some(serde_json::json!({"run_id": "new"})),
-            tags: vec!["replacement".to_string()],
+            tags: ["replacement".to_string()].into_iter().collect(),
             ..SessionRoute::default()
         };
         enable_tracing_at(&path, route).unwrap();

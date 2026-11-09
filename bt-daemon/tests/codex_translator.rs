@@ -895,7 +895,7 @@ fn configured_ctx(session_id: &str, additional_metadata: Value) -> SessionCtx {
             }),
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: Some(additional_metadata),
-            tags: vec!["ci".into(), "docs".into()],
+            tags: ["ci".into(), "docs".into()].into_iter().collect(),
             span_plugins: Vec::new(),
         }),
     }
@@ -2235,7 +2235,7 @@ fn codex_root_source_merge_after_stop_keeps_external_parent() {
             destination: Some(TraceDestination::ParentSpan { components }),
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             span_plugins: Vec::new(),
         }),
     };

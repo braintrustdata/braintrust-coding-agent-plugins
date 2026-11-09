@@ -852,7 +852,7 @@ mod tests {
         consumer.configure(config.clone());
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(progress.completed(), 0);
-        config.tags.push("corrected".into());
+        config.tags.insert("corrected".into());
         consumer.configure(config);
         wait_for(|| progress.completed() == 1).await;
         assert!(error.lock().is_none());
