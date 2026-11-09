@@ -572,11 +572,7 @@ impl Sink for LedgerSink {
         }
         for op in &mut filtered {
             let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
-            let has_duplicates = row.tags.as_ref().is_some_and(|tags| {
-                let mut seen = HashSet::with_capacity(tags.len());
-                tags.iter().any(|tag| !seen.insert(tag))
-            });
-            if has_duplicates {
+            if row.tags.as_ref().is_some_and(|tags| tags.len() > 1) {
                 let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.make_mut();
                 if let Some(tags) = &mut row.tags {
                     let mut seen = HashSet::with_capacity(tags.len());
