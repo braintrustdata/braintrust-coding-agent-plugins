@@ -26,8 +26,8 @@ pub(crate) fn apply_additional_metadata(
     Ok(())
 }
 
-/// Apply invocation-local root-span tags to a route. Tags are normalized once
-/// at the CLI boundary so hook shims and translators only receive valid values.
+/// Apply invocation-local root-span tags to a route. Trim whitespace and reject
+/// empty tags here; the sink deduplicates the final span tags before logging.
 pub(crate) fn apply_tags(route: &mut SessionRoute, tags: &[String]) -> anyhow::Result<()> {
     if tags.is_empty() {
         return Ok(());
@@ -38,9 +38,7 @@ pub(crate) fn apply_tags(route: &mut SessionRoute, tags: &[String]) -> anyhow::R
         if tag.is_empty() {
             anyhow::bail!("--tag must not be empty");
         }
-        if !normalized.iter().any(|existing| existing == tag) {
-            normalized.push(tag.to_string());
-        }
+        normalized.push(tag.to_string());
     }
     route.tags = normalized;
     Ok(())
@@ -100,13 +98,13 @@ mod tests {
     }
 
     #[test]
-    fn tags_override_a_route_and_are_normalized() {
+    fn tags_override_a_route_and_preserve_duplicates_after_trimming() {
         let mut route = SessionRoute {
             tags: vec!["saved".into()],
             ..SessionRoute::default()
         };
         apply_tags(&mut route, &[" ci ".into(), "ci".into(), "docs".into()]).unwrap();
-        assert_eq!(route.tags, ["ci", "docs"]);
+        assert_eq!(route.tags, ["ci", "ci", "docs"]);
 
         let error = apply_tags(&mut route, &[" ".into()]).unwrap_err();
         assert!(error.to_string().contains("must not be empty"));
