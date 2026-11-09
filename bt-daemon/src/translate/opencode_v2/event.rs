@@ -1,5 +1,6 @@
 //! Partial OpenCode 2 wire types. Unknown fields are accepted; arbitrary tool
 //! inputs, outputs and provider-specific content remain JSON values.
+pub(super) use crate::wire::opencode_content::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -8,8 +9,13 @@ pub(super) struct NativeEnvelope {
     pub id: Option<String>,
     pub location: Option<Location>,
     pub metadata: Option<EventMetadata>,
+    pub durable: Option<DurableEvent>,
     #[serde(flatten)]
     pub event: NativeEvent,
+}
+#[derive(Deserialize)]
+pub(super) struct DurableEvent {
+    pub seq: u64,
 }
 #[derive(Deserialize)]
 pub(super) struct Location {
@@ -24,6 +30,8 @@ pub(super) struct EventMetadata {
 #[derive(Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub(super) enum NativeEvent {
+    #[serde(rename = "session.snapshot")]
+    Snapshot(crate::wire::opencode_snapshot::Snapshot),
     #[serde(rename = "session.created")]
     Created(Created),
     #[serde(rename = "session.inbox.enqueued")]
@@ -290,22 +298,6 @@ pub(super) struct CompactionEnded {
     pub provider_context: Option<NativeCompaction>,
 }
 #[derive(Deserialize)]
-pub(super) struct NativeCompaction {
-    pub messages: Option<NativeMessages>,
-}
-#[derive(Deserialize)]
-#[serde(untagged)]
-pub(super) enum NativeMessages {
-    Messages(Vec<NativeContextMessage>),
-    Opaque(Value),
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct NativeContextMessage {
-    pub role: String,
-    pub content: MessageContent,
-}
-#[derive(Deserialize)]
 pub(super) struct CompactionFailed {
     #[serde(rename = "sessionID")]
     pub session_id: String,
@@ -333,63 +325,4 @@ pub(super) struct Context {
     pub system: Vec<String>,
     #[serde(default)]
     pub messages: Vec<ContextMessage>,
-}
-#[derive(Deserialize)]
-pub(super) struct ContextMessage {
-    pub role: String,
-    pub content: MessageContent,
-}
-#[derive(Deserialize)]
-#[serde(untagged)]
-pub(super) enum MessageContent {
-    Text(String),
-    Parts(Vec<ContextPart>),
-    Other(Value),
-}
-#[derive(Deserialize)]
-#[serde(untagged)]
-pub(super) enum ContextPart {
-    Known(KnownContextPart),
-    Other(Value),
-}
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub(super) enum KnownContextPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "media")]
-    Media {
-        #[serde(rename = "mediaType")]
-        media_type: Option<String>,
-        data: Option<String>,
-        media: Option<Media>,
-        #[serde(flatten)]
-        extra: serde_json::Map<String, Value>,
-    },
-    #[serde(rename = "tool-call")]
-    ToolCall {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    #[serde(rename = "tool-result")]
-    ToolResult { id: String, result: ToolResult },
-}
-#[derive(Clone, Deserialize, Serialize)]
-pub(super) struct Media {
-    pub source: Option<MediaSource>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, Value>,
-}
-#[derive(Clone, Deserialize, Serialize)]
-pub(super) struct MediaSource {
-    #[serde(rename = "mediaType")]
-    pub media_type: Option<String>,
-    pub data: Option<String>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, Value>,
-}
-#[derive(Clone, Deserialize, Serialize)]
-pub(super) struct ToolResult {
-    pub value: Value,
 }

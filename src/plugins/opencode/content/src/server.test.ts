@@ -22,7 +22,9 @@ vi.mock("./runtime/daemon-client", () => ({
       await state.gate;
       return true;
     }
+    async detach() {}
     async close() {
+      await state.gate;
       state.closed = true;
     }
   },
@@ -40,6 +42,31 @@ vi.mock("./tools/bt-cli", () => ({
 import plugin from "./server";
 
 describe("OpenCode 2 capture", () => {
+  it("stops even when the native event stream ignores cancellation", async () => {
+    const cleanup = await plugin.setup({
+      app: { version: "2.2.5" },
+      session: {
+        async hook() {},
+        async get() {
+          return {};
+        },
+      },
+      location: { directory: "/test" },
+      tool: { async transform() {} },
+      event: {
+        async *subscribe() {
+          await new Promise(() => {});
+          yield { type: "session.created", data: { sessionID: "unused" } };
+        },
+      },
+    });
+    await expect(
+      Promise.race([
+        cleanup?.(),
+        new Promise((resolve) => setTimeout(() => resolve("stalled"), 1000)),
+      ]),
+    ).resolves.not.toBe("stalled");
+  });
   it.each([undefined, "managed-run"])(
     "registers executable Braintrust tools (managed: %s)",
     async (managedRun) => {
@@ -112,6 +139,7 @@ describe("OpenCode 2 capture", () => {
     expect(state.logs.map((event) => event.event)).toEqual([
       "session_start",
       ...events.map((e) => e.type),
+      "session.capture.closed",
     ]);
     expect(state.logs[1]).toMatchObject({
       source: "opencode",
@@ -165,6 +193,7 @@ describe("OpenCode 2 capture", () => {
       "session.created",
       "model.context",
       "session.step.started",
+      "session.capture.closed",
     ]);
     expect(state.logs[1]).toMatchObject({
       session_id: "parent",
@@ -205,10 +234,79 @@ describe("OpenCode 2 capture", () => {
       "session.created",
       "session.execution.succeeded",
     ]);
-    release();
     await closing;
+    expect(state.closed).toBe(false);
+    release();
     await vi.waitFor(() => expect(state.closed).toBe(true));
     state.gate = undefined;
+  });
+  it("hands off an unpaired model context during cleanup", async () => {
+    state.logs.length = 0;
+    let capture: (event: {
+      sessionID: string;
+      system: Array<{ text: string }>;
+      messages: unknown[];
+    }) => void = () => {};
+    const cleanup = await plugin.setup({
+      app: { version: "2.0.0" },
+      location: { directory: "/test" },
+      session: {
+        async get() {
+          return {};
+        },
+        async hook(_name, callback) {
+          capture = callback;
+        },
+      },
+      tool: {
+        async transform(callback) {
+          callback({ add() {} });
+        },
+      },
+      event: {
+        async *subscribe() {
+          yield { type: "session.created", data: { sessionID: "s" } };
+          capture({
+            sessionID: "s",
+            system: [{ text: "system" }],
+            messages: [{ role: "user", content: "prompt" }],
+          });
+        },
+      },
+    });
+    await vi.waitFor(() => expect(state.logs).toHaveLength(1));
+    await cleanup?.();
+    expect(state.logs.map((event) => event.event)).toEqual([
+      "session.created",
+      "model.context",
+      "session.capture.closed",
+    ]);
+  });
+  it("does not block cleanup on an unresponsive native session lookup", async () => {
+    let lookupStarted = false;
+    const cleanup = await plugin.setup({
+      app: { version: "2.0.0" },
+      location: { directory: "/test" },
+      session: {
+        async hook() {},
+        async get() {
+          lookupStarted = true;
+          return await new Promise<{}>(() => {});
+        },
+      },
+      tool: {
+        async transform(callback) {
+          callback({ add() {} });
+        },
+      },
+      event: {
+        async *subscribe() {
+          yield { type: "session.step.started", data: { sessionID: "s" } };
+        },
+      },
+    });
+    await vi.waitFor(() => expect(lookupStarted).toBe(true));
+    await cleanup?.();
   });
   it("resolves a resumed nested session to its original root", async () => {
     state.logs.length = 0;

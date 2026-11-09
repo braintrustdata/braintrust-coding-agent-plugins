@@ -363,3 +363,52 @@ for (const orderedPipeline of [false, true]) test(`does not deliver later events
     rmSync(temp, {recursive:true,force:true})
   }
 })
+
+for (const stalled of ["initialize", "event"]) test(`detached client exits when ${stalled} receives no response`, async () => {
+  const { spawn } = await import("node:child_process")
+  const temp = mkdtempSync(join(tmpdir(), "bt-js-detach-"))
+  const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\bt-js-detach-${process.pid}-${Date.now()}` : join(temp, "daemon.sock")
+  const sockets = new Set<import("node:net").Socket>()
+  const server = createServer((socket) => {
+    sockets.add(socket)
+    socket.on("close", () => sockets.delete(socket))
+    socket.on("error", () => {})
+    let input = ""
+    socket.on("data", (chunk) => {
+      input += chunk.toString()
+      while (input.includes("\n")) {
+        const end = input.indexOf("\n")
+        const request = JSON.parse(input.slice(0, end))
+        input = input.slice(end + 1)
+        if (request.method === "event.log" || (stalled === "initialize" && request.method === "initialize")) continue
+        const result = request.method === "initialize"
+          ? { protocol_version: 1, capabilities: { sources: ["opencode"], ordered_event_pipeline: true } }
+          : { daemon_version: "test", uptime_ms: 0, sessions: [] }
+        socket.write(`${JSON.stringify({jsonrpc:"2.0", id:request.id, result})}\n`)
+      }
+    })
+  })
+  await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
+  const source = `
+    import { DaemonClient } from ${JSON.stringify(new URL("../src/index.ts", import.meta.url).href)};
+    const client = new DaemonClient({source:"opencode",socketPath:${JSON.stringify(endpoint)}});
+    ${stalled === "initialize" ? "void client.status(); await new Promise((resolve) => setImmediate(resolve));" : "await client.status();"}
+    void client.logPipelined({source:"opencode",session_id:"s",event:"test",ts_ms:1,payload:{}});
+    await client.detach();
+    void client.close();
+  `
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", source], { stdio: "ignore", windowsHide: true })
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    const status = await Promise.race([
+      new Promise<number | null>((resolve, reject) => child.once("error", reject).once("exit", resolve)),
+      new Promise<never>((_, reject) => { timeout = setTimeout(() => { child.kill(); reject(new Error("detached client kept process alive")) }, 3000) }),
+    ])
+    assert.equal(status, 0)
+  } finally {
+    if (timeout) clearTimeout(timeout)
+    for (const socket of sockets) socket.destroy()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    rmSync(temp, { recursive: true, force: true })
+  }
+})

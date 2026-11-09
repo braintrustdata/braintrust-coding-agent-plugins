@@ -109,6 +109,7 @@ export interface DaemonClientOptions {
   connectDelayMs?: number
   requestTimeoutMs?: number
   managedRunId?: string
+  opencodeRecovery?: { database: string; since_ms: number }
   warn?: (message: string) => void
 }
 
@@ -150,6 +151,9 @@ export class DaemonClient {
   > &
     DaemonClientOptions
   private socket?: Socket
+  private connectingSocket?: Socket
+  private detached = false
+  private retryTimers = new Set<ReturnType<typeof setTimeout>>()
   private input = ""
   private nextId = 1
   private pending = new Map<number, PendingRequest>()
@@ -158,6 +162,7 @@ export class DaemonClient {
   private queue: Promise<unknown> = Promise.resolve()
   private fallbackQueue: Promise<unknown> = Promise.resolve()
   private inFlightEvents = new Set<Promise<boolean>>()
+  private pendingWrites = new Set<Promise<void>>()
   private warned = new Set<string>()
 
   constructor(options: DaemonClientOptions) {
@@ -171,29 +176,47 @@ export class DaemonClient {
     }
   }
 
+  /** Start connecting without blocking the host's startup. */
+  async prepare(): Promise<boolean> {
+    try {
+      await this.ensureConnected()
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async log(envelope: DaemonEnvelope): Promise<boolean> {
     return this.serial(() => this.sendEvent(envelope))
   }
 
   /** Submit events in call order without waiting for earlier acknowledgements. */
   logPipelined(envelope: DaemonEnvelope): Promise<boolean> {
+    let written!: () => void
+    const write = new Promise<void>((resolve) => {
+      written = resolve
+    })
+    this.pendingWrites.add(write)
+    void write.then(() => this.pendingWrites.delete(write))
     const request = this.ensureConnected().then(
-      () => this.orderedEventPipeline ? this.sendEvent(envelope) : this.serialFallback(envelope),
-      () => this.serialFallback(envelope),
-    )
+      () => this.orderedEventPipeline
+        ? this.sendEvent(envelope, written)
+        : this.serialFallback(envelope, written),
+      () => this.serialFallback(envelope, written),
+    ).finally(written)
     this.inFlightEvents.add(request)
     void request.finally(() => this.inFlightEvents.delete(request))
     return request
   }
 
-  private async sendEvent(envelope: DaemonEnvelope): Promise<boolean> {
+  private async sendEvent(envelope: DaemonEnvelope, written?: () => void): Promise<boolean> {
     const event = {
       ...envelope,
       ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
       ...(this.options.managedRunId ? { managed_run_id: this.options.managedRunId } : {}),
     }
     try {
-      const result = (await this.request("event.log", event)) as { accepted?: boolean }
+      const result = (await this.request("event.log", event, written)) as { accepted?: boolean }
       return result.accepted === true
     } catch (error) {
       if (this.socket) this.disconnect(error)
@@ -237,14 +260,36 @@ export class DaemonClient {
     })
   }
 
+  /** Hand off connected writes without waiting for daemon acknowledgements. */
+  async detach(): Promise<void> {
+    if (this.pendingWrites.size && this.socket && !this.socket.destroyed && this.orderedEventPipeline && !this.connecting) {
+      // Give already scheduled writes one event-loop turn. A reconnect or a
+      // stalled daemon must not hold the host open during shutdown.
+      let immediate: ReturnType<typeof setImmediate> | undefined
+      try {
+        await Promise.race([
+          Promise.all(this.pendingWrites),
+          new Promise<void>((resolve) => { immediate = setImmediate(resolve) }),
+        ])
+      } finally {
+        if (immediate) clearImmediate(immediate)
+      }
+    }
+    this.detached = true
+    this.socket?.unref()
+    this.connectingSocket?.unref()
+    for (const pending of this.pending.values()) pending.timer.unref()
+    for (const timer of this.retryTimers) timer.unref()
+  }
+
   async close(): Promise<void> {
     await this.queue
     await Promise.all(this.inFlightEvents)
     this.disconnect(new Error("daemon client closed"))
   }
 
-  private serialFallback(envelope: DaemonEnvelope): Promise<boolean> {
-    const next = this.fallbackQueue.then(() => this.sendEvent(envelope))
+  private serialFallback(envelope: DaemonEnvelope, written?: () => void): Promise<boolean> {
+    const next = this.fallbackQueue.then(() => this.sendEvent(envelope, written))
     this.fallbackQueue = next.then(() => undefined, () => undefined)
     return next
   }
@@ -258,10 +303,18 @@ export class DaemonClient {
     return next
   }
 
-  private async request(method: string, params: unknown): Promise<unknown> {
-    await this.ensureConnected()
+  private async request(method: string, params: unknown, written?: () => void): Promise<unknown> {
+    try {
+      await this.ensureConnected()
+    } catch (error) {
+      written?.()
+      throw error
+    }
     const socket = this.socket
-    if (!socket || socket.destroyed) throw new Error("daemon socket is unavailable")
+    if (!socket || socket.destroyed) {
+      written?.()
+      throw new Error("daemon socket is unavailable")
+    }
 
     const id = this.nextId++
     const response = new Promise<unknown>((resolve, reject) => {
@@ -269,9 +322,11 @@ export class DaemonClient {
         this.pending.delete(id)
         reject(new Error(`daemon request timed out: ${method}`))
       }, this.options.requestTimeoutMs)
+      if (this.detached) timer.unref()
       this.pending.set(id, { resolve, reject, timer })
     })
     socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`)
+    written?.()
     return response
   }
 
@@ -291,7 +346,14 @@ export class DaemonClient {
       this.startDaemon()
       let lastError: unknown
       for (let attempt = 0; attempt < this.options.connectAttempts; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, this.options.connectDelayMs))
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            this.retryTimers.delete(timer)
+            resolve()
+          }, this.options.connectDelayMs)
+          if (this.detached) timer.unref()
+          this.retryTimers.add(timer)
+        })
         try {
           await this.connectOnce()
           return
@@ -306,12 +368,16 @@ export class DaemonClient {
   private connectOnce(): Promise<void> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.options.socketPath ?? daemonSocketPath())
+      this.connectingSocket = socket
+      if (this.detached) socket.unref()
       const onError = (error: Error) => {
+        if (this.connectingSocket === socket) this.connectingSocket = undefined
         socket.destroy()
         reject(error)
       }
       socket.once("error", onError)
       socket.once("connect", async () => {
+        if (this.connectingSocket === socket) this.connectingSocket = undefined
         socket.off("error", onError)
         this.attach(socket)
         try {
@@ -320,6 +386,8 @@ export class DaemonClient {
             client: {
               source: this.options.source,
               plugin_version: this.options.pluginVersion,
+              managed_run_id: this.options.managedRunId,
+              opencode_recovery: this.options.opencodeRecovery,
               pid: process.pid,
             },
           })) as {
@@ -351,6 +419,7 @@ export class DaemonClient {
         this.pending.delete(id)
         reject(new Error(`daemon request timed out: ${method}`))
       }, this.options.requestTimeoutMs)
+      if (this.detached) timer.unref()
       this.pending.set(id, { resolve, reject, timer })
     })
     socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`)

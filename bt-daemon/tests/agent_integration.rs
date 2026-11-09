@@ -964,6 +964,18 @@ async fn opencode_v2_session_emits_traces() {
                 && row["input"].to_string().contains("image_url")),
         "model input lost tool image: {image_rows:?}"
     );
+    let database = rusqlite::Connection::open(home.join("data/opencode/opencode.db")).unwrap();
+    let native_session: String = database.query_row(
+        "SELECT session_id FROM session_message WHERE type='user' AND data LIKE '%image tool marker%' LIMIT 1",
+        [], |row| row.get(0),
+    ).unwrap();
+    let recovery_journal =
+        bt_daemon::source_journal_path(&world.temp_path("daemon"), "opencode", &native_session);
+    let recovery = std::fs::read_to_string(recovery_journal).unwrap();
+    assert!(
+        recovery.contains("session.snapshot"),
+        "native projection recovery was not journaled"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1318,17 +1330,20 @@ async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are
     let proxy_path = world.temp_path("slow.sock");
     let listener = UnixListener::bind(&proxy_path).unwrap();
     let target = world.socket().to_owned();
+    let (release_acknowledgements, acknowledgements) = tokio::sync::watch::channel(false);
     let proxy = tokio::spawn(async move {
         while let Ok((incoming, _)) = listener.accept().await {
             let target = target.clone();
+            let mut acknowledgements = acknowledgements.clone();
             tokio::spawn(async move {
                 let Ok(outgoing) = UnixStream::connect(target).await else {
                     return;
                 };
                 let (mut client_read, mut client_write) = incoming.into_split();
                 let (daemon_read, mut daemon_write) = outgoing.into_split();
-                let request = async {
+                let request = async move {
                     let _ = tokio::io::copy(&mut client_read, &mut daemon_write).await;
+                    drop(daemon_write);
                 };
                 let response = async {
                     let mut daemon_read = BufReader::new(daemon_read);
@@ -1344,7 +1359,11 @@ async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are
                         if initializing {
                             initializing = false;
                         } else {
-                            tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+                            while !*acknowledgements.borrow_and_update() {
+                                if acknowledgements.changed().await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                         if !client_closed && client_write.write_all(&buffer).await.is_err() {
                             client_closed = true;
@@ -1368,7 +1387,10 @@ async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are
     .envs(opencode_test_env(&workspace, &home));
     world.configure(&mut run);
     run.env("BRAINTRUST_DAEMON_SOCKET", &proxy_path);
-    let output = world.output(&mut run).await;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20), world.output(&mut run))
+        .await
+        .expect("OpenCode waited for daemon acknowledgements during cleanup");
+    release_acknowledgements.send_replace(true);
     assert!(
         output.status.success(),
         "{}",

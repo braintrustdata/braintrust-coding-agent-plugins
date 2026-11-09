@@ -1,0 +1,184 @@
+//! Typed OpenCode session projection used to recover events lost at shutdown.
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct Snapshot {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub messages: Vec<SnapshotMessage>,
+    pub parent_id: Option<String>,
+    pub title: Option<String>,
+    pub outcome: Option<String>,
+    pub idle_ms: Option<i64>,
+    pub terminal_error: Option<SnapshotError>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotMessage {
+    pub id: String,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub updated_ms: i64,
+    pub kind: SnapshotMessageKind,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "data")]
+pub(crate) enum SnapshotMessageKind {
+    #[serde(rename = "user")]
+    User(SnapshotUser),
+    #[serde(rename = "assistant")]
+    Assistant(SnapshotAssistant),
+    #[serde(rename = "compaction")]
+    Compaction(SnapshotCompaction),
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotUser {
+    pub time: SnapshotTime,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub files: Vec<SnapshotFile>,
+    #[serde(default)]
+    pub skills: Vec<SnapshotSkill>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotFile {
+    pub mime: String,
+    pub data: String,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotSkill {
+    pub name: String,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotCompaction {
+    pub time: SnapshotTime,
+    pub status: SnapshotCompactionStatus,
+    #[serde(default)]
+    pub summary: String,
+    pub model: Option<SnapshotModel>,
+    pub tokens: Option<SnapshotTokens>,
+    pub error: Option<SnapshotError>,
+    #[serde(rename = "providerContext")]
+    pub provider_context: Option<crate::wire::opencode_content::NativeCompaction>,
+    pub metadata: Option<SnapshotCompactionMetadata>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SnapshotCompactionStatus {
+    Running,
+    Completed,
+    Failed,
+    #[serde(other)]
+    Other,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotCompactionMetadata {
+    #[serde(rename = "keepID")]
+    pub keep_id: Option<String>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotAssistant {
+    pub time: SnapshotTime,
+    pub model: SnapshotModel,
+    #[serde(default)]
+    pub content: Vec<SnapshotPart>,
+    pub tokens: Option<SnapshotTokens>,
+    pub error: Option<SnapshotError>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotTime {
+    pub created: i64,
+    pub completed: Option<i64>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotModel {
+    pub id: Option<String>,
+    #[serde(rename = "providerID")]
+    pub provider_id: Option<String>,
+    pub variant: Option<String>,
+}
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub(crate) struct SnapshotTokens {
+    #[serde(default)]
+    pub input: i64,
+    #[serde(default)]
+    pub output: i64,
+    #[serde(default)]
+    pub reasoning: i64,
+    #[serde(default)]
+    pub cache: SnapshotCache,
+}
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub(crate) struct SnapshotCache {
+    #[serde(default)]
+    pub read: i64,
+    #[serde(default)]
+    pub write: i64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotError {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub message: String,
+    pub status: Option<u16>,
+    pub response: Option<SnapshotErrorResponse>,
+    #[serde(rename = "retryAfterMs")]
+    pub retry_after_ms: Option<u64>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SnapshotErrorResponse {
+    pub body: String,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum SnapshotPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "reasoning")]
+    Reasoning { text: String },
+    #[serde(rename = "tool")]
+    Tool {
+        id: String,
+        name: String,
+        state: SnapshotToolState,
+    },
+    #[serde(other)]
+    Other,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "status")]
+pub(crate) enum SnapshotToolState {
+    #[serde(rename = "streaming")]
+    Streaming,
+    #[serde(rename = "running")]
+    Running { input: Value },
+    #[serde(rename = "completed")]
+    Completed {
+        input: Value,
+        content: Vec<SnapshotToolContent>,
+    },
+    #[serde(rename = "error")]
+    Error { input: Value, error: SnapshotError },
+    #[serde(other)]
+    Other,
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(crate) enum SnapshotToolContent {
+    Known(SnapshotKnownToolContent),
+    Other(Value),
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum SnapshotKnownToolContent {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "file")]
+    File {
+        mime: String,
+        uri: String,
+        name: Option<String>,
+    },
+}

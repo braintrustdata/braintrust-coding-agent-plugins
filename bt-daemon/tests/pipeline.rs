@@ -4638,3 +4638,162 @@ async fn disconnected_client_does_not_discard_already_sent_events() {
     );
     handle.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn opencode_projection_is_recovered_after_capture_connection_closes() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (data_dir, socket, handle, tmp) = start_daemon().await;
+    let database = tmp.path().join("opencode.db");
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT, time_updated INTEGER); CREATE TABLE session_v2 (id TEXT, idle_outcome TEXT, time_idle INTEGER, time_suspended INTEGER, parent_id TEXT, title TEXT);").unwrap();
+    db.execute(
+        "INSERT INTO session_v2 (id, idle_outcome, time_idle) VALUES (?1, ?2, ?3)",
+        rusqlite::params!["native", "succeeded", 10],
+    )
+    .unwrap();
+    let data = serde_json::json!({"time":{"created":3,"completed":5},"model":{"id":"mock","providerID":"test"},"content":[{"type":"text","text":"recovered"}],"tokens":{"input":1,"output":1}}).to_string();
+    db.execute(
+        "INSERT INTO session_message (id, session_id, type, seq, time_created, data, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 5)",
+        rusqlite::params!["m", "native", "assistant", 1, 3, data],
+    )
+    .unwrap();
+    db.execute("INSERT INTO session_v2 (id, idle_outcome, time_idle, parent_id, title) VALUES (?1, ?2, ?3, ?4, ?5)", rusqlite::params!["child", "succeeded", 10, "native", "Child"]).unwrap();
+    let child_user = serde_json::json!({"time":{"created":3},"text":"child prompt"}).to_string();
+    let child_response = serde_json::json!({"time":{"created":4,"completed":6},"model":{"id":"mock","providerID":"test"},"content":[{"type":"text","text":"child recovered"}]}).to_string();
+    db.execute("INSERT INTO session_message (id, session_id, type, seq, time_created, data, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", rusqlite::params!["child-user", "child", "user", 1, 3, child_user, 3]).unwrap();
+    db.execute("INSERT INTO session_message (id, session_id, type, seq, time_created, data, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", rusqlite::params!["child-answer", "child", "assistant", 2, 4, child_response, 6]).unwrap();
+    drop(db);
+    let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let initialize = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":1,"client":{"source":"opencode","opencode_recovery":{"database":database,"since_ms":1}}}});
+    write
+        .write_all((initialize.to_string() + "\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(lines.next_line().await.unwrap().is_some());
+    let events = [
+        (
+            "session.inbox.enqueued",
+            serde_json::json!({"sessionID":"native","inboxID":"user","item":{"type":"user","payload":{"text":"hello"}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            serde_json::json!({"sessionID":"native","inboxID":"user"}),
+        ),
+        (
+            "model.context",
+            serde_json::json!({"sessionID":"native","system":["system"],"messages":[{"role":"user","content":"hello"}]}),
+        ),
+        (
+            "session.capture.closed",
+            serde_json::json!({"sessionID":"native"}),
+        ),
+    ];
+    for (id, (name, data)) in events.into_iter().enumerate() {
+        let mut event = envelope(
+            "root",
+            name,
+            if name == "session.capture.closed" {
+                10
+            } else {
+                id as i64 + 1
+            },
+        );
+        event.source = "opencode".into();
+        event.source_version = Some("2.0.0".into());
+        event.payload = serde_json::json!({"type":name,"data":data});
+        let request =
+            serde_json::json!({"jsonrpc":"2.0","id":id+2,"method":"event.log","params":event});
+        write
+            .write_all((request.to_string() + "\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    drop(write);
+    drop(lines);
+    let journal = source_journal_path(&data_dir, "opencode", "root");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if std::fs::read_to_string(&journal).is_ok_and(|data| {
+                data.contains("session.snapshot")
+                    && data.contains("recovered")
+                    && data.contains("child recovered")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(flush_session("root", &socket, 5000).await.unwrap().flushed);
+    let spans = std::fs::read_to_string(data_dir.join("spans/root.ndjson")).unwrap();
+    assert!(
+        spans.contains("recovered"),
+        "missing recovered model output: {spans}"
+    );
+    assert!(
+        spans.contains("child recovered"),
+        "missing recovered child output: {spans}"
+    );
+    assert!(
+        spans.contains("hello"),
+        "missing original model input: {spans}"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn managed_run_flush_waits_for_capture_connection_to_drain() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (socket, handle, _flushes, _tmp) = start_tracking_daemon("test").await;
+    #[cfg(unix)]
+    let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    #[cfg(windows)]
+    let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&socket)
+        .unwrap();
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocol_version\":1,\"client\":{\"source\":\"debug\",\"managed_run_id\":\"run-drain\"}}}\n").await.unwrap();
+    assert!(lines.next_line().await.unwrap().is_some());
+    let mut event = envelope("drain", "first", 1);
+    event.managed_run_id = Some("run-drain".into());
+    let request =
+        serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"event.log", "params":event});
+    write
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    let flush_socket = socket.clone();
+    let mut flush = tokio::spawn(async move {
+        flush_managed_run("run-drain", &flush_socket, 5000)
+            .await
+            .unwrap()
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut flush)
+        .await
+        .is_err());
+    // A flush on the capture connection must not wait for itself.
+    assert!(lines.next_line().await.unwrap().is_some());
+    write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"managed_run.flush\",\"params\":{\"managed_run_id\":\"run-drain\",\"timeout_ms\":5000}}\n").await.unwrap();
+    let own_response = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let own_response: serde_json::Value = serde_json::from_str(&own_response).unwrap();
+    assert_eq!(own_response["id"], 3);
+    assert_eq!(own_response["result"]["flushed"], true);
+    drop(write);
+    drop(lines);
+    let result = tokio::time::timeout(Duration::from_secs(3), flush)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.accepted_sessions, 1);
+    assert!(result.flushed);
+    handle.abort();
+}

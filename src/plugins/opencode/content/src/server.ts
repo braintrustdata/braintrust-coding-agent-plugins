@@ -4,6 +4,8 @@ import { claimManagedTracingInstance, DaemonClient } from "./runtime/daemon-clie
 import { readPluginConfig } from "./tracing/plugin";
 import { PLUGIN_VERSION } from "./version";
 import { tool, type ToolContext } from "@opencode-ai/plugin";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createBraintrustTools } from "./tools";
 import { BtCliToolsClient } from "./tools/bt-cli";
 
@@ -93,32 +95,64 @@ export default {
       });
     }
     if (!config.tracingEnabled || !claimManagedTracingInstance("opencode")) return;
-    const daemon = new DaemonClient({ source: "opencode", pluginVersion: PLUGIN_VERSION });
+    const daemon = new DaemonClient({
+      source: "opencode",
+      pluginVersion: PLUGIN_VERSION,
+      opencodeRecovery: {
+        database: join(
+          process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"),
+          "opencode",
+          "opencode.db",
+        ),
+        since_ms: Date.now(),
+      },
+    });
+    void daemon.prepare();
     const abort = new AbortController();
     const roots = new Map<string, string>();
     const started = new Set<string>();
-    const rootFor = async (session: string): Promise<string> => {
-      const path: string[] = [];
-      const seen = new Set<string>();
-      let current = session;
-      while (!roots.has(current) && !seen.has(current)) {
-        seen.add(current);
-        path.push(current);
-        try {
-          const info = await ctx.session.get({ sessionID: current });
-          if (!info.parentID) break;
-          current = info.parentID;
-        } catch {
-          break;
+    const nativeSessions = new Set<string>();
+    const lookups = new Map<string, Promise<string>>();
+    let cancelLookups: () => void = () => {};
+    const cancelled = new Promise<undefined>((resolve) => {
+      cancelLookups = () => resolve(undefined);
+    });
+    const rootFor = (session: string): Promise<string> => {
+      const cached = roots.get(session);
+      if (cached) return Promise.resolve(cached);
+      const pending = lookups.get(session);
+      if (pending) return pending;
+      const lookup = (async () => {
+        const path: string[] = [];
+        const seen = new Set<string>();
+        let current = session;
+        while (!roots.has(current) && !seen.has(current)) {
+          seen.add(current);
+          path.push(current);
+          try {
+            const info = await Promise.race([ctx.session.get({ sessionID: current }), cancelled]);
+            if (!info?.parentID) break;
+            current = info.parentID;
+          } catch {
+            break;
+          }
         }
-      }
-      const root = roots.get(current) ?? current;
-      for (const id of path) roots.set(id, root);
-      return root;
+        const root = roots.get(current) ?? current;
+        for (const id of path) roots.set(id, root);
+        return root;
+      })();
+      lookups.set(session, lookup);
+      void lookup.then(
+        () => lookups.delete(session),
+        () => lookups.delete(session),
+      );
+      return lookup;
     };
     const contexts = new Map<string, Array<{ ts_ms: number; payload: unknown }>>();
     await ctx.session.hook("context", (event) => {
       try {
+        nativeSessions.add(event.sessionID);
+        void rootFor(event.sessionID);
         const queue = contexts.get(event.sessionID) ?? [];
         const payload = JSON.parse(
           JSON.stringify({
@@ -136,11 +170,22 @@ export default {
         // A malformed capture must not interrupt the agent's model request.
       }
     });
+    let stopping = false;
+    let wakePump: (() => void) | undefined;
     const task = (async () => {
-      for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+      const iterator = ctx.event.subscribe({ signal: abort.signal })[Symbol.asyncIterator]();
+      while (!stopping) {
+        const stopped = new Promise<undefined>((resolve) => {
+          wakePump = () => resolve(undefined);
+        });
+        const next = await Promise.race([iterator.next(), stopped]);
+        wakePump = undefined;
+        if (!next || next.done) break;
+        const event = next.value;
         if (!forwarded.has(event.type)) continue;
         const session = event.data?.sessionID;
         if (!session) continue;
+        nativeSessions.add(session);
         if (event.type === "session.created") {
           const parent = event.data?.parentID;
           roots.set(session, parent ? await rootFor(parent) : session);
@@ -177,9 +222,38 @@ export default {
       }
     })().catch(() => {});
     return async () => {
+      stopping = true;
+      cancelLookups();
+      wakePump?.();
       abort.abort();
       await task;
-      await daemon.close();
+      for (const [session, pending] of contexts) {
+        const root = roots.get(session) ?? session;
+        for (const context of pending) {
+          void daemon.logPipelined({
+            source: "opencode",
+            source_version: ctx.app.version,
+            session_id: root,
+            event: "model.context",
+            route: config.route,
+            ...context,
+          });
+        }
+      }
+      for (const session of nativeSessions) {
+        const root = roots.get(session) ?? session;
+        void daemon.logPipelined({
+          source: "opencode",
+          source_version: ctx.app.version,
+          session_id: root,
+          event: "session.capture.closed",
+          ts_ms: Date.now(),
+          payload: { type: "session.capture.closed", data: { sessionID: session } },
+          route: config.route,
+        });
+      }
+      await daemon.detach();
+      void daemon.close();
     };
   },
 };
