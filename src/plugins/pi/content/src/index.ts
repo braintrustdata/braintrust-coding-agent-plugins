@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getCapabilities, hyperlink } from "@earendil-works/pi-tui";
 import { loadConfig } from "./config.ts";
 import { legacyContinuationFor, type LegacyContinuation } from "./legacy-session.ts";
 import { runningPiPackage } from "./pi-package.ts";
@@ -8,7 +9,6 @@ import { claimManagedTracingInstance, DaemonClient } from "./runtime/daemon-clie
 import { EXTENSION_VERSION } from "./version.ts";
 
 const STATUS_KEY = "braintrust-tracing";
-const WIDGET_KEY = "braintrust-trace-link";
 const UI_STATUS_TIMEOUT_MS = 250;
 // The daemon uploads a turn after Pi reports agent_end: about a second later
 // with flush_on_turn_end, and when its 30 s batch window closes with
@@ -133,15 +133,18 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     const daemonSession = status?.sessions.find(
       (session) => session.session_id === refreshSessionId,
     );
+    const permalink = config.showTraceLink ? daemonSession?.permalink : undefined;
+    const traceLabel = "Braintrust trace ↗";
     if (daemonSession?.last_error) {
       ctx.ui.setStatus(STATUS_KEY, `Braintrust: ${daemonSession.last_error}`);
     } else {
-      ctx.ui.setStatus(STATUS_KEY, "Braintrust: tracing");
+      ctx.ui.setStatus(
+        STATUS_KEY,
+        permalink && getCapabilities().hyperlinks
+          ? hyperlink(traceLabel, permalink)
+          : "Braintrust: connected",
+      );
     }
-    const permalink = config.showTraceLink ? daemonSession?.permalink : undefined;
-    ctx.ui.setWidget(WIDGET_KEY, permalink ? ["Braintrust trace", permalink] : undefined, {
-      placement: "belowEditor",
-    });
     traceLinkShown = Boolean(permalink);
   };
 
@@ -285,7 +288,6 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     lastContext = undefined;
     if (ctx.hasUI) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
-      ctx.ui.setWidget(WIDGET_KEY, undefined);
     }
     await client.close();
     await statusClient.close();
