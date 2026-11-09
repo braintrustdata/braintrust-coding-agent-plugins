@@ -28,6 +28,7 @@ struct Observation {
     template: Envelope,
     last_message_id: Option<String>,
     closed_at_ms: Option<i64>,
+    inferred_close: bool,
 }
 
 #[derive(Default)]
@@ -57,6 +58,7 @@ impl OpenCodeObservations {
                 template: template.clone(),
                 last_message_id: None,
                 closed_at_ms: None,
+                inferred_close: false,
             });
         observation.template = template;
         if env.event == "session.capture.closed" {
@@ -81,9 +83,26 @@ impl OpenCodeObservations {
         }
     }
 
-    pub(super) async fn recover(self, daemon: &Arc<Daemon>, config: OpenCodeRecovery) {
+    pub(super) async fn recover(
+        mut self,
+        daemon: &Arc<Daemon>,
+        config: OpenCodeRecovery,
+        managed: bool,
+    ) {
         if self.sessions.is_empty() {
             return;
+        }
+        if managed {
+            // A host can exit before its last socket write reaches the daemon.
+            // Only recover an inferred close when the native database confirms
+            // the session had already reached an idle state at disconnection.
+            let disconnected_at = now_ms();
+            for observation in self.sessions.values_mut() {
+                if observation.closed_at_ms.is_none() {
+                    observation.closed_at_ms = Some(disconnected_at);
+                    observation.inferred_close = true;
+                }
+            }
         }
         let result =
             tokio::task::spawn_blocking(move || read_snapshots(config, self.sessions)).await;
@@ -187,10 +206,14 @@ fn read_snapshots(
                 session.clone(),
                 observation.template.clone(),
                 observation.closed_at_ms.unwrap_or_default(),
+                observation.inferred_close,
             )
         })
         .collect();
-    for (root, session, template, closed_at_ms) in roots {
+    for (root, session, template, closed_at_ms, inferred_close) in roots {
+        if inferred_close && !session_was_idle(&db, &session, config.since_ms, closed_at_ms) {
+            continue;
+        }
         let mut statement = db.prepare("WITH RECURSIVE descendants(id) AS (SELECT id FROM session_v2 WHERE parent_id = ?1 UNION SELECT child.id FROM session_v2 child JOIN descendants parent ON child.parent_id = parent.id) SELECT descendants.id FROM descendants JOIN session_v2 s ON s.id = descendants.id WHERE s.time_idle >= ?2 OR EXISTS (SELECT 1 FROM session_message m WHERE m.session_id = descendants.id AND m.time_created >= ?2)")?;
         let children = statement.query_map(rusqlite::params![session, config.since_ms], |row| {
             row.get::<_, String>(0)
@@ -205,6 +228,7 @@ fn read_snapshots(
                     template: template.clone(),
                     last_message_id: None,
                     closed_at_ms: Some(closed_at_ms),
+                    inferred_close,
                 });
         }
     }
@@ -213,6 +237,11 @@ fn read_snapshots(
         let Some(closed_at_ms) = observation.closed_at_ms else {
             continue;
         };
+        if observation.inferred_close
+            && !session_was_idle(&db, &session_id, config.since_ms, closed_at_ms)
+        {
+            continue;
+        }
         let mut statement = db.prepare("SELECT id, type, data, seq, time_updated FROM session_message WHERE session_id = ?1 AND type IN ('user', 'assistant', 'compaction') AND (time_created >= ?2 OR id = ?3) AND time_created <= ?4 AND time_updated <= ?4 AND seq >= COALESCE((SELECT seq FROM session_message WHERE id = ?3 AND session_id = ?1), 0) ORDER BY seq")?;
         let rows = statement.query_map(
             rusqlite::params![
@@ -298,4 +327,13 @@ fn read_snapshots(
         ));
     }
     Ok(result)
+}
+
+fn session_was_idle(db: &Connection, session: &str, since: i64, until: i64) -> bool {
+    let state = db.query_row(
+        "SELECT time_idle, time_suspended FROM session_v2 WHERE id = ?1",
+        [session],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    );
+    matches!(state, Ok((Some(time), None)) if time >= since && time <= until)
 }

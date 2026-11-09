@@ -4639,9 +4639,22 @@ async fn disconnected_client_does_not_discard_already_sent_events() {
     handle.abort();
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn opencode_projection_is_recovered_after_capture_connection_closes() {
+    opencode_projection_recovery(true, false).await;
+}
+
+#[tokio::test]
+async fn opencode_projection_is_recovered_when_shutdown_marker_is_lost() {
+    opencode_projection_recovery(false, false).await;
+}
+
+#[tokio::test]
+async fn opencode_active_session_is_not_recovered_on_unexpected_disconnect() {
+    opencode_projection_recovery(false, true).await;
+}
+
+async fn opencode_projection_recovery(include_close_marker: bool, active: bool) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let (data_dir, socket, handle, tmp) = start_daemon().await;
     let database = tmp.path().join("opencode.db");
@@ -4652,6 +4665,13 @@ async fn opencode_projection_is_recovered_after_capture_connection_closes() {
         rusqlite::params!["native", "succeeded", 10],
     )
     .unwrap();
+    if active {
+        db.execute(
+            "UPDATE session_v2 SET time_suspended = 9 WHERE id = 'native'",
+            [],
+        )
+        .unwrap();
+    }
     let data = serde_json::json!({"time":{"created":3,"completed":5},"model":{"id":"mock","providerID":"test"},"content":[{"type":"text","text":"recovered"}],"tokens":{"input":1,"output":1}}).to_string();
     db.execute(
         "INSERT INTO session_message (id, session_id, type, seq, time_created, data, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 5)",
@@ -4664,10 +4684,15 @@ async fn opencode_projection_is_recovered_after_capture_connection_closes() {
     db.execute("INSERT INTO session_message (id, session_id, type, seq, time_created, data, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", rusqlite::params!["child-user", "child", "user", 1, 3, child_user, 3]).unwrap();
     db.execute("INSERT INTO session_message (id, session_id, type, seq, time_created, data, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", rusqlite::params!["child-answer", "child", "assistant", 2, 4, child_response, 6]).unwrap();
     drop(db);
+    #[cfg(unix)]
     let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
-    let (read, mut write) = stream.into_split();
+    #[cfg(windows)]
+    let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&socket)
+        .unwrap();
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
-    let initialize = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":1,"client":{"source":"opencode","opencode_recovery":{"database":database,"since_ms":1}}}});
+    let initialize = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":1,"client":{"source":"opencode","managed_run_id":"recovery-run","opencode_recovery":{"database":database,"since_ms":1}}}});
     write
         .write_all((initialize.to_string() + "\n").as_bytes())
         .await
@@ -4692,6 +4717,9 @@ async fn opencode_projection_is_recovered_after_capture_connection_closes() {
         ),
     ];
     for (id, (name, data)) in events.into_iter().enumerate() {
+        if name == "session.capture.closed" && !include_close_marker {
+            continue;
+        }
         let mut event = envelope(
             "root",
             name,
@@ -4703,6 +4731,7 @@ async fn opencode_projection_is_recovered_after_capture_connection_closes() {
         );
         event.source = "opencode".into();
         event.source_version = Some("2.0.0".into());
+        event.managed_run_id = Some("recovery-run".into());
         event.payload = serde_json::json!({"type":name,"data":data});
         let request =
             serde_json::json!({"jsonrpc":"2.0","id":id+2,"method":"event.log","params":event});
@@ -4714,6 +4743,15 @@ async fn opencode_projection_is_recovered_after_capture_connection_closes() {
     drop(write);
     drop(lines);
     let journal = source_journal_path(&data_dir, "opencode", "root");
+    if active {
+        flush_managed_run("recovery-run", &socket, 5000)
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(journal).unwrap();
+        assert!(!contents.contains("session.snapshot"), "{contents}");
+        handle.abort();
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if std::fs::read_to_string(&journal).is_ok_and(|data| {

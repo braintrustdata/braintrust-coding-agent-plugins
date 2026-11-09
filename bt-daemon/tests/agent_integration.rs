@@ -974,7 +974,9 @@ async fn opencode_v2_session_emits_traces() {
     let recovery = std::fs::read_to_string(recovery_journal).unwrap();
     assert!(
         recovery.contains("session.snapshot"),
-        "native projection recovery was not journaled"
+        "native projection recovery was not journaled; journal: {recovery}; daemon stderr: {}; run stderr: {}",
+        std::fs::read_to_string(world.temp_path("daemon/daemon-stderr.log")).unwrap_or_default(),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 

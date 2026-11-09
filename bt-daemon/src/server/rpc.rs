@@ -236,8 +236,12 @@ pub(super) async fn serve_connection(
         }
     }
     if !rejected_event {
-        if let Some(config) = client.and_then(|info| info.opencode_recovery) {
-            observations.recover(&daemon, config).await;
+        if let Some(info) = client {
+            if let Some(config) = info.opencode_recovery {
+                observations
+                    .recover(&daemon, config, info.managed_run_id.is_some())
+                    .await;
+            }
         }
     }
     Ok(())
