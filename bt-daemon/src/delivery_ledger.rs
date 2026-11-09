@@ -570,6 +570,20 @@ impl Sink for LedgerSink {
                 self.span_origins.insert(row.span_id.clone(), origin);
             }
         }
+        for op in &mut filtered {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+            let has_duplicates = row.tags.as_ref().is_some_and(|tags| {
+                let mut seen = HashSet::with_capacity(tags.len());
+                tags.iter().any(|tag| !seen.insert(tag))
+            });
+            if has_duplicates {
+                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.make_mut();
+                if let Some(tags) = &mut row.tags {
+                    let mut seen = HashSet::with_capacity(tags.len());
+                    tags.retain(|tag| seen.insert(tag.clone()));
+                }
+            }
+        }
         let emitted = self.inner.emit_shared(&filtered).await?;
         // A deferred lifecycle root has not reached the backend yet. Do not
         // record it as delivered: a subsequent cold-worker replay needs to
@@ -662,6 +676,44 @@ mod tests {
             tags: Vec::new(),
             span_plugins: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn deduplicates_tags_before_forwarding_to_any_sink() {
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = LedgerSink::new(
+            Box::new(RecordingSink {
+                emitted: emitted.clone(),
+            }),
+            None,
+            "codex",
+            "tags",
+            None,
+            "test",
+        )
+        .await
+        .unwrap();
+        let row = SpanRow {
+            span_id: "span".into(),
+            tags: Some(vec!["a".into(), "b".into(), "a".into()]),
+            ..Default::default()
+        };
+        let original = crate::translate::CowSpanOp::new(SpanOp::Insert(row));
+        sink.emit_shared(std::slice::from_ref(&original))
+            .await
+            .unwrap();
+        let rows = emitted.lock();
+        let SpanOp::Insert(row) = &rows[0] else {
+            panic!("expected insert")
+        };
+        assert_eq!(
+            row.tags.as_deref(),
+            Some(["a".into(), "b".into()].as_slice())
+        );
+        let SpanOp::Insert(row) = original.as_ref() else {
+            panic!("expected insert")
+        };
+        assert_eq!(row.tags.as_ref().unwrap().len(), 3);
     }
 
     #[tokio::test]

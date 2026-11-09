@@ -16,7 +16,7 @@ use braintrust_sdk_rust::{
     SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
 };
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -736,13 +736,7 @@ fn build_log(row: &SpanRow, source: &str, is_merge: bool) -> anyhow::Result<Span
     }
     if let Some(tags) = &row.tags {
         if !tags.is_empty() {
-            let mut seen = HashSet::with_capacity(tags.len());
-            let unique_tags = tags
-                .iter()
-                .filter(|tag| seen.insert(tag.as_str()))
-                .cloned()
-                .collect();
-            builder = builder.tags(unique_tags);
+            builder = builder.tags(tags.clone());
         }
     }
     builder
