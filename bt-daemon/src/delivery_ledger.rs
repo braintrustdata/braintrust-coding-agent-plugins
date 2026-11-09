@@ -669,7 +669,7 @@ mod tests {
             }),
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             span_plugins: Vec::new(),
         }
     }
