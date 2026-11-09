@@ -435,7 +435,7 @@ fn synthetic_attached_session_preserves_external_identity_across_all_merges() {
     h.ctx.config = Some(
         SessionRoute {
             destination: Some(TraceDestination::ParentSpan { components }),
-            tags: vec!["custom-tag".into()],
+            tags: ["custom-tag".into()].into_iter().collect(),
             additional_metadata: Some(json!({"team":"audit","_bt_secret":"hidden"})),
             ..Default::default()
         }
