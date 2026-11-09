@@ -47,6 +47,7 @@ pub(super) async fn serve_connection(
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
     let mut client = None;
+    let mut response_channel_open = true;
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -137,17 +138,24 @@ pub(super) async fn serve_connection(
         };
 
         if let Some(resp) = response {
-            let mut buf = Message::Response(resp).to_line()?;
-            buf.push('\n');
-            let write_result = async {
-                write_half.write_all(buf.as_bytes()).await?;
-                write_half.flush().await
+            if response_channel_open {
+                let mut buf = Message::Response(resp).to_line()?;
+                buf.push('\n');
+                let result = async {
+                    write_half.write_all(buf.as_bytes()).await?;
+                    write_half.flush().await
+                }
+                .await;
+                if let Err(error) = result {
+                    // The peer may close after sending a pipeline without waiting
+                    // for replies. Drain received requests before honoring EOF.
+                    tracing::debug!(%error, "client stopped reading responses");
+                    response_channel_open = false;
+                }
             }
-            .await;
             if shutdown_after_response {
                 daemon.trigger_shutdown();
             }
-            write_result?;
             if stop_after_response {
                 break;
             }

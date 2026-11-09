@@ -4604,3 +4604,37 @@ async fn event_pipeline_stops_after_a_rejected_request() {
     assert!(lines.next_line().await.unwrap().is_none());
     handle.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn disconnected_client_does_not_discard_already_sent_events() {
+    use tokio::io::AsyncWriteExt;
+    let (socket, handle, _flushes, tmp) = start_tracking_daemon("test").await;
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let requests = (0..5).map(|id| {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"event.log","params":{
+            "source":"debug","session_id":"closed-client", "event":format!("event-{id}"),"ts_ms":id,"payload":{}
+        }}).to_string() + "\n"
+    }).collect::<String>();
+    stream.write_all(requests.as_bytes()).await.unwrap();
+    drop(stream);
+    let journal = source_journal_path(&tmp.path().join("data"), "debug", "closed-client");
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&journal) {
+                if contents.lines().count() == 5 {
+                    break contents;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let contents = std::fs::read_to_string(&journal).unwrap_or_default();
+    assert!(
+        result.is_ok(),
+        "only received {} events: {contents}",
+        contents.lines().count()
+    );
+    handle.abort();
+}
