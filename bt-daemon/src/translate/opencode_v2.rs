@@ -838,29 +838,7 @@ impl OpenCodeV2Translator {
                         .get(&sid)
                         .is_some_and(|session| session.seen_users.contains(&message.id));
                     if !seen {
-                        ops.extend(
-                            self.turn(
-                                &sid,
-                                &message.id,
-                                Prompt {
-                                    text: user.text,
-                                    files: user
-                                        .files
-                                        .into_iter()
-                                        .map(|file| PromptFile {
-                                            mime: file.mime,
-                                            data: file.data,
-                                        })
-                                        .collect(),
-                                    skills: user
-                                        .skills
-                                        .into_iter()
-                                        .map(|skill| PromptSkill { name: skill.name })
-                                        .collect(),
-                                },
-                                user.time.created,
-                            ),
-                        );
+                        ops.extend(self.turn(&sid, &message.id, user.prompt, user.time.created));
                     }
                     continue;
                 }
@@ -908,20 +886,8 @@ impl OpenCodeV2Translator {
                         session_id: &sid,
                         id: &message.id,
                         text: data.summary,
-                        model: data.model.map(|model| Model {
-                            id: model.id,
-                            provider_id: model.provider_id,
-                            variant: model.variant,
-                        }),
-                        tokens: data.tokens.map(|tokens| Tokens {
-                            input: tokens.input,
-                            output: tokens.output,
-                            reasoning: tokens.reasoning,
-                            cache: CacheTokens {
-                                read: tokens.cache.read,
-                                write: tokens.cache.write,
-                            },
-                        }),
+                        model: data.model,
+                        tokens: data.tokens,
                         started,
                         ended: message.updated_ms.max(data.time.created),
                         error,
@@ -949,11 +915,7 @@ impl OpenCodeV2Translator {
                         session_id: sid.clone(),
                         message_id: message.id.clone(),
                         started: Some(data.time.created),
-                        model: Some(Model {
-                            id: data.model.id,
-                            provider_id: data.model.provider_id,
-                            variant: data.model.variant,
-                        }),
+                        model: Some(data.model),
                     },
                     data.time.created,
                 ));
@@ -1049,15 +1011,7 @@ impl OpenCodeV2Translator {
                     SnapshotPart::Other => {}
                 }
             }
-            let tokens = data.tokens.map(|t| Tokens {
-                input: t.input,
-                output: t.output,
-                reasoning: t.reasoning,
-                cache: CacheTokens {
-                    read: t.cache.read,
-                    write: t.cache.write,
-                },
-            });
+            let tokens = data.tokens;
             let error = data.error;
             ops.extend(self.finish_step(
                 StepEnded {

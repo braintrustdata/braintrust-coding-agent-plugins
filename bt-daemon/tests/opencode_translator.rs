@@ -973,13 +973,19 @@ fn opencode_idle_root_merge_keeps_external_parent() {
     assert_merges_preserve_insert_identity(&ops);
 }
 
+fn v2_translator() -> (Box<dyn bt_daemon::AgentTranslator>, SessionCtx) {
+    (
+        Registry::default_agents().create("opencode", "root-session"),
+        SessionCtx {
+            session_id: "root-session".into(),
+            config: None,
+        },
+    )
+}
+
 #[test]
 fn opencode_v2_reduces_native_text_session_without_session_created() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     // Shapes observed from OpenCode 2.2.5 with a local mock model.
     let events = [
         (
@@ -1052,11 +1058,7 @@ fn opencode_v2_reduces_native_text_session_without_session_created() {
 
 #[test]
 fn opencode_v2_emits_tool_span_from_native_events() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         (
             "session.inbox.enqueued",
@@ -1100,11 +1102,7 @@ fn opencode_v2_emits_tool_span_from_native_events() {
 
 #[test]
 fn opencode_v2_preserves_attached_images_in_turn_and_model_input() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         (
             "session.inbox.enqueued",
@@ -1145,11 +1143,7 @@ fn opencode_v2_preserves_attached_images_in_turn_and_model_input() {
 
 #[test]
 fn opencode_v2_resume_keeps_the_first_native_event_after_synthetic_start() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let mut ops = Vec::new();
     for (i, name, data) in [
         (
@@ -1195,11 +1189,7 @@ fn opencode_v2_resume_keeps_the_first_native_event_after_synthetic_start() {
 
 #[test]
 fn opencode_v2_compaction_preserves_native_model_context_after_resume() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         (
             1,
@@ -1287,11 +1277,7 @@ fn opencode_v2_compaction_preserves_native_model_context_after_resume() {
 
 #[test]
 fn opencode_v2_distinguishes_denied_and_failed_tools() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         (
             "session.inbox.enqueued",
@@ -1371,11 +1357,7 @@ fn opencode_v2_distinguishes_denied_and_failed_tools() {
 
 #[test]
 fn opencode_v2_compaction_keeps_native_tail_without_context_hook() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         (
             "session.inbox.enqueued",
@@ -1455,11 +1437,7 @@ fn opencode_v2_compaction_keeps_native_tail_without_context_hook() {
 
 #[test]
 fn opencode_v2_permission_denied_before_tool_call_creates_one_tool_span() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         (
             "session.inbox.enqueued",
@@ -1506,11 +1484,7 @@ fn opencode_v2_permission_denied_before_tool_call_creates_one_tool_span() {
 
 #[test]
 fn opencode_v2_preserves_provider_defined_context_and_tool_content() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         (
             "session.inbox.enqueued",
@@ -1641,11 +1615,7 @@ fn opencode_v2_native_compaction_window_is_scoped_to_its_model() {
 
 #[test]
 fn opencode_v2_preserves_opaque_provider_compaction_output() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let native =
         json!([{"role":"assistant","content":null,"provider_specific":{"continuation":"opaque"}}]);
     let events = [
@@ -1687,11 +1657,7 @@ fn v2_event(name: &str, ts: i64, data: serde_json::Value) -> Envelope {
 
 #[test]
 fn opencode_v2_checkpoint_resume_and_finalize_preserve_session_and_close_missing_tool() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let mut ops = Vec::new();
     for e in [
         v2_event(
@@ -1758,11 +1724,7 @@ fn opencode_v2_checkpoint_resume_and_finalize_preserve_session_and_close_missing
 
 #[test]
 fn opencode_v2_records_reasoning_usage_timing_and_error() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         v2_event(
             "session.inbox.enqueued",
@@ -1832,11 +1794,7 @@ fn opencode_v2_records_reasoning_usage_timing_and_error() {
 
 #[test]
 fn opencode_v2_ignores_malformed_unknown_cancelled_and_replayed_events() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     for e in [
         v2_event(
             "session.inbox.enqueued",
@@ -2379,11 +2337,7 @@ fn opencode_v2_top_level_resume_after_interruption_keeps_turn_numbers() {
 
 #[test]
 fn opencode_v2_snapshot_recovers_unseen_step_and_replays_without_duplicates() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         v2_event(
             "session.inbox.enqueued",
@@ -2446,11 +2400,7 @@ fn opencode_v2_snapshot_recovers_unseen_step_and_replays_without_duplicates() {
 
 #[test]
 fn opencode_v2_snapshot_recovers_tool_output_without_inventing_approval() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let mut ops = Vec::new();
     for event in [
         v2_event(
@@ -2491,11 +2441,7 @@ fn opencode_v2_snapshot_recovers_tool_output_without_inventing_approval() {
 
 #[test]
 fn opencode_v2_snapshot_recovers_a_turn_without_live_events() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let snapshot = v2_event(
         "session.snapshot",
         6,
@@ -2518,11 +2464,7 @@ fn opencode_v2_snapshot_recovers_a_turn_without_live_events() {
 
 #[test]
 fn opencode_v2_snapshot_recovers_compaction_and_its_following_context() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let events = [
         v2_event(
             "session.inbox.enqueued",
@@ -2575,11 +2517,7 @@ fn opencode_v2_snapshot_recovers_compaction_and_its_following_context() {
 
 #[test]
 fn opencode_v2_snapshot_does_not_duplicate_live_compaction() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     for name in ["session.compaction.started", "session.compaction.ended"] {
         let mut e = event(
             name,
@@ -2607,11 +2545,7 @@ fn opencode_v2_snapshot_does_not_duplicate_live_compaction() {
 
 #[test]
 fn opencode_v2_snapshot_preserves_parent_child_turn_lineage() {
-    let mut translator = Registry::default_agents().create("opencode", "root-session");
-    let ctx = SessionCtx {
-        session_id: "root-session".into(),
-        config: None,
-    };
+    let (mut translator, ctx) = v2_translator();
     let mut ops = Vec::new();
     for event in [
         v2_event(

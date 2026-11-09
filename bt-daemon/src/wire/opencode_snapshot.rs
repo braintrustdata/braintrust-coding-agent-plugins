@@ -1,5 +1,5 @@
 //! Typed OpenCode session projection used to recover events lost at shutdown.
-use super::opencode_content::{NativeError, ToolContent};
+use super::opencode_content::{Model, NativeError, Prompt, Tokens, ToolContent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -36,21 +36,8 @@ pub(crate) enum SnapshotMessageKind {
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct SnapshotUser {
     pub time: SnapshotTime,
-    #[serde(default)]
-    pub text: String,
-    #[serde(default)]
-    pub files: Vec<SnapshotFile>,
-    #[serde(default)]
-    pub skills: Vec<SnapshotSkill>,
-}
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct SnapshotFile {
-    pub mime: String,
-    pub data: String,
-}
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct SnapshotSkill {
-    pub name: String,
+    #[serde(flatten)]
+    pub prompt: Prompt,
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct SnapshotCompaction {
@@ -58,8 +45,8 @@ pub(crate) struct SnapshotCompaction {
     pub status: SnapshotCompactionStatus,
     #[serde(default)]
     pub summary: String,
-    pub model: Option<SnapshotModel>,
-    pub tokens: Option<SnapshotTokens>,
+    pub model: Option<Model>,
+    pub tokens: Option<Tokens>,
     pub error: Option<NativeError>,
     #[serde(rename = "providerContext")]
     pub provider_context: Option<crate::wire::opencode_content::NativeCompaction>,
@@ -82,41 +69,16 @@ pub(crate) struct SnapshotCompactionMetadata {
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct SnapshotAssistant {
     pub time: SnapshotTime,
-    pub model: SnapshotModel,
+    pub model: Model,
     #[serde(default)]
     pub content: Vec<SnapshotPart>,
-    pub tokens: Option<SnapshotTokens>,
+    pub tokens: Option<Tokens>,
     pub error: Option<NativeError>,
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct SnapshotTime {
     pub created: i64,
     pub completed: Option<i64>,
-}
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct SnapshotModel {
-    pub id: Option<String>,
-    #[serde(rename = "providerID")]
-    pub provider_id: Option<String>,
-    pub variant: Option<String>,
-}
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub(crate) struct SnapshotTokens {
-    #[serde(default)]
-    pub input: i64,
-    #[serde(default)]
-    pub output: i64,
-    #[serde(default)]
-    pub reasoning: i64,
-    #[serde(default)]
-    pub cache: SnapshotCache,
-}
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub(crate) struct SnapshotCache {
-    #[serde(default)]
-    pub read: i64,
-    #[serde(default)]
-    pub write: i64,
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]

@@ -41,25 +41,38 @@ vi.mock("./tools/bt-cli", () => ({
 }));
 import plugin from "./server";
 
+function testContext(overrides: Partial<Parameters<typeof plugin.setup>[0]>) {
+  return {
+    app: { version: "2.2.5" },
+    location: { directory: "/test" },
+    session: {
+      async hook() {},
+      async get() {
+        return {};
+      },
+    },
+    tool: {
+      async transform(callback) {
+        callback({ add() {} });
+      },
+    },
+    event: { async *subscribe() {} },
+    ...overrides,
+  } satisfies Parameters<typeof plugin.setup>[0];
+}
+
 describe("OpenCode 2 capture", () => {
   it("stops even when the native event stream ignores cancellation", async () => {
-    const cleanup = await plugin.setup({
-      app: { version: "2.2.5" },
-      session: {
-        async hook() {},
-        async get() {
-          return {};
+    const cleanup = await plugin.setup(
+      testContext({
+        event: {
+          async *subscribe() {
+            await new Promise(() => {});
+            yield { type: "session.created", data: { sessionID: "unused" } };
+          },
         },
-      },
-      location: { directory: "/test" },
-      tool: { async transform() {} },
-      event: {
-        async *subscribe() {
-          await new Promise(() => {});
-          yield { type: "session.created", data: { sessionID: "unused" } };
-        },
-      },
-    });
+      }),
+    );
     await expect(
       Promise.race([
         cleanup?.(),
@@ -76,26 +89,20 @@ describe("OpenCode 2 capture", () => {
         input: object;
         execute(input: unknown): Promise<{ content: string }>;
       }> = [];
-      const cleanup = await plugin.setup({
-        app: { version: "2.2.5" },
-        session: {
-          async hook() {},
-          async get() {
-            return {};
+      const cleanup = await plugin.setup(
+        testContext({
+          event: { async *subscribe() {} },
+          tool: {
+            async transform(callback) {
+              callback({
+                add(definition) {
+                  definitions.push(definition);
+                },
+              });
+            },
           },
-        },
-        location: { directory: "/test" },
-        event: { async *subscribe() {} },
-        tool: {
-          async transform(callback) {
-            callback({
-              add(definition) {
-                definitions.push(definition);
-              },
-            });
-          },
-        },
-      });
+        }),
+      );
       const projects = definitions.find(
         (definition) => definition.name === "braintrust_list_projects",
       );
@@ -113,26 +120,15 @@ describe("OpenCode 2 capture", () => {
       { type: "session.inbox.enqueued", created: 1, data: { sessionID: "s", inboxID: "i" } },
       { type: "session.step.started", created: 2, data: { sessionID: "s" } },
     ];
-    const cleanup = await plugin.setup({
-      app: { version: "2.2.5" },
-      session: {
-        async hook() {},
-        async get() {
-          return {};
+    const cleanup = await plugin.setup(
+      testContext({
+        event: {
+          async *subscribe() {
+            yield* events;
+          },
         },
-      },
-      location: { directory: "/test" },
-      tool: {
-        async transform(callback) {
-          callback({ add() {} });
-        },
-      },
-      event: {
-        async *subscribe() {
-          yield* events;
-        },
-      },
-    });
+      }),
+    );
     await vi.waitFor(() => expect(state.logs.length).toBeGreaterThan(0));
     await cleanup?.();
     await vi.waitFor(() => expect(state.closed).toBe(true));
@@ -158,34 +154,29 @@ describe("OpenCode 2 capture", () => {
       system: Array<{ text: string }>;
       messages: unknown[];
     }) => void = () => {};
-    const cleanup = await plugin.setup({
-      app: { version: "2.2.5" },
-      location: { directory: "/test" },
-      session: {
-        async get() {
-          return {};
+    const cleanup = await plugin.setup(
+      testContext({
+        session: {
+          async get() {
+            return {};
+          },
+          async hook(_name, callback) {
+            capture = callback;
+          },
         },
-        async hook(_name, callback) {
-          capture = callback;
+        event: {
+          async *subscribe() {
+            capture({
+              sessionID: "child",
+              system: [{ text: "system" }],
+              messages: [{ role: "user", content: "hello" }],
+            });
+            yield { type: "session.created", data: { sessionID: "child", parentID: "parent" } };
+            yield { type: "session.step.started", data: { sessionID: "child" } };
+          },
         },
-      },
-      tool: {
-        async transform(callback) {
-          callback({ add() {} });
-        },
-      },
-      event: {
-        async *subscribe() {
-          capture({
-            sessionID: "child",
-            system: [{ text: "system" }],
-            messages: [{ role: "user", content: "hello" }],
-          });
-          yield { type: "session.created", data: { sessionID: "child", parentID: "parent" } };
-          yield { type: "session.step.started", data: { sessionID: "child" } };
-        },
-      },
-    });
+      }),
+    );
     await vi.waitFor(() => expect(state.logs.length).toBeGreaterThan(0));
     await cleanup?.();
     await vi.waitFor(() => expect(state.closed).toBe(true));
@@ -207,27 +198,17 @@ describe("OpenCode 2 capture", () => {
     state.gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const cleanup = await plugin.setup({
-      app: { version: "2.0.0" },
-      location: { directory: "/test" },
-      session: {
-        async hook() {},
-        async get() {
-          return {};
+    const cleanup = await plugin.setup(
+      testContext({
+        app: { version: "2.0.0" },
+        event: {
+          async *subscribe() {
+            yield { type: "session.created", data: { sessionID: "s" } };
+            yield { type: "session.execution.succeeded", data: { sessionID: "s" } };
+          },
         },
-      },
-      tool: {
-        async transform(callback) {
-          callback({ add() {} });
-        },
-      },
-      event: {
-        async *subscribe() {
-          yield { type: "session.created", data: { sessionID: "s" } };
-          yield { type: "session.execution.succeeded", data: { sessionID: "s" } };
-        },
-      },
-    });
+      }),
+    );
     await vi.waitFor(() => expect(state.logs).toHaveLength(2));
     const closing = cleanup?.();
     expect(state.logs.map((entry) => entry.event)).toEqual([
@@ -247,33 +228,29 @@ describe("OpenCode 2 capture", () => {
       system: Array<{ text: string }>;
       messages: unknown[];
     }) => void = () => {};
-    const cleanup = await plugin.setup({
-      app: { version: "2.0.0" },
-      location: { directory: "/test" },
-      session: {
-        async get() {
-          return {};
+    const cleanup = await plugin.setup(
+      testContext({
+        app: { version: "2.0.0" },
+        session: {
+          async get() {
+            return {};
+          },
+          async hook(_name, callback) {
+            capture = callback;
+          },
         },
-        async hook(_name, callback) {
-          capture = callback;
+        event: {
+          async *subscribe() {
+            yield { type: "session.created", data: { sessionID: "s" } };
+            capture({
+              sessionID: "s",
+              system: [{ text: "system" }],
+              messages: [{ role: "user", content: "prompt" }],
+            });
+          },
         },
-      },
-      tool: {
-        async transform(callback) {
-          callback({ add() {} });
-        },
-      },
-      event: {
-        async *subscribe() {
-          yield { type: "session.created", data: { sessionID: "s" } };
-          capture({
-            sessionID: "s",
-            system: [{ text: "system" }],
-            messages: [{ role: "user", content: "prompt" }],
-          });
-        },
-      },
-    });
+      }),
+    );
     await vi.waitFor(() => expect(state.logs).toHaveLength(1));
     await cleanup?.();
     expect(state.logs.map((event) => event.event)).toEqual([
@@ -284,27 +261,23 @@ describe("OpenCode 2 capture", () => {
   });
   it("does not block cleanup on an unresponsive native session lookup", async () => {
     let lookupStarted = false;
-    const cleanup = await plugin.setup({
-      app: { version: "2.0.0" },
-      location: { directory: "/test" },
-      session: {
-        async hook() {},
-        async get() {
-          lookupStarted = true;
-          return await new Promise<{}>(() => {});
+    const cleanup = await plugin.setup(
+      testContext({
+        app: { version: "2.0.0" },
+        session: {
+          async hook() {},
+          async get() {
+            lookupStarted = true;
+            return await new Promise<{}>(() => {});
+          },
         },
-      },
-      tool: {
-        async transform(callback) {
-          callback({ add() {} });
+        event: {
+          async *subscribe() {
+            yield { type: "session.step.started", data: { sessionID: "s" } };
+          },
         },
-      },
-      event: {
-        async *subscribe() {
-          yield { type: "session.step.started", data: { sessionID: "s" } };
-        },
-      },
-    });
+      }),
+    );
     await vi.waitFor(() => expect(lookupStarted).toBe(true));
     await cleanup?.();
   });
@@ -312,26 +285,21 @@ describe("OpenCode 2 capture", () => {
     state.logs.length = 0;
     state.closed = false;
     const parents: Record<string, string | undefined> = { child: "parent", parent: "root" };
-    const cleanup = await plugin.setup({
-      app: { version: "2.2.5" },
-      location: { directory: "/test" },
-      session: {
-        async hook() {},
-        async get({ sessionID }) {
-          return { parentID: parents[sessionID] };
+    const cleanup = await plugin.setup(
+      testContext({
+        session: {
+          async hook() {},
+          async get({ sessionID }) {
+            return { parentID: parents[sessionID] };
+          },
         },
-      },
-      tool: {
-        async transform(callback) {
-          callback({ add() {} });
+        event: {
+          async *subscribe() {
+            yield { type: "session.step.started", data: { sessionID: "child" } };
+          },
         },
-      },
-      event: {
-        async *subscribe() {
-          yield { type: "session.step.started", data: { sessionID: "child" } };
-        },
-      },
-    });
+      }),
+    );
     await vi.waitFor(() => expect(state.logs).toHaveLength(2));
     expect(state.logs.map((entry) => entry.session_id)).toEqual(["root", "root"]);
     await cleanup?.();

@@ -1,7 +1,7 @@
 //! Partial OpenCode 2 wire types. Unknown fields are accepted; arbitrary tool
 //! inputs, outputs and provider-specific content remain JSON values.
 pub(super) use crate::wire::opencode_content::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Deserialize)]
@@ -119,31 +119,6 @@ pub(super) enum InboxItem {
     Other,
 }
 #[derive(Deserialize)]
-pub(super) struct Prompt {
-    #[serde(default)]
-    pub text: String,
-    #[serde(default)]
-    pub files: Vec<PromptFile>,
-    #[serde(default)]
-    pub skills: Vec<PromptSkill>,
-}
-#[derive(Deserialize)]
-pub(super) struct PromptSkill {
-    pub name: String,
-}
-#[derive(Deserialize)]
-pub(super) struct PromptFile {
-    pub mime: String,
-    pub data: String,
-}
-#[derive(Clone, Default, Deserialize, Serialize)]
-pub(super) struct Model {
-    pub id: Option<String>,
-    #[serde(rename = "providerID")]
-    pub provider_id: Option<String>,
-    pub variant: Option<String>,
-}
-#[derive(Deserialize)]
 pub(super) struct StepStarted {
     #[serde(rename = "sessionID")]
     pub session_id: String,
@@ -160,24 +135,6 @@ pub(super) struct StepEnded {
     pub message_id: String,
     pub tokens: Option<Tokens>,
     pub error: Option<NativeError>,
-}
-#[derive(Default, Deserialize, Serialize)]
-pub(super) struct Tokens {
-    #[serde(default)]
-    pub input: i64,
-    #[serde(default)]
-    pub output: i64,
-    #[serde(default)]
-    pub reasoning: i64,
-    #[serde(default)]
-    pub cache: CacheTokens,
-}
-#[derive(Default, Deserialize, Serialize)]
-pub(super) struct CacheTokens {
-    #[serde(default)]
-    pub read: i64,
-    #[serde(default)]
-    pub write: i64,
 }
 #[derive(Deserialize)]
 pub(super) struct TextEnded {

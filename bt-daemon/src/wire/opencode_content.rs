@@ -111,3 +111,48 @@ pub(crate) enum KnownToolContent {
         name: Option<String>,
     },
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct Prompt {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub files: Vec<PromptFile>,
+    #[serde(default)]
+    pub skills: Vec<PromptSkill>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct PromptSkill {
+    pub name: String,
+}
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct PromptFile {
+    pub mime: String,
+    pub data: String,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct Model {
+    pub id: Option<String>,
+    #[serde(rename = "providerID")]
+    pub provider_id: Option<String>,
+    pub variant: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub(crate) struct Tokens {
+    #[serde(default)]
+    pub input: i64,
+    #[serde(default)]
+    pub output: i64,
+    #[serde(default)]
+    pub reasoning: i64,
+    #[serde(default)]
+    pub cache: CacheTokens,
+}
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub(crate) struct CacheTokens {
+    #[serde(default)]
+    pub read: i64,
+    #[serde(default)]
+    pub write: i64,
+}
