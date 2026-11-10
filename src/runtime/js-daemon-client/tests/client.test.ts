@@ -363,3 +363,139 @@ for (const orderedPipeline of [false, true]) test(`does not deliver later events
     rmSync(temp, {recursive:true,force:true})
   }
 })
+
+/** Serve a scripted event.log responder; the daemon closes after any failure. */
+async function withPipelineDaemon(
+  respond: (event: string) => "accept" | "reject" | "error",
+  run: (client: DaemonClient, accepted: string[]) => Promise<void>,
+): Promise<void> {
+  const temp = mkdtempSync(join(tmpdir(), "bt-js-outbox-"))
+  const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\bt-js-outbox-${process.pid}-${Date.now()}` : join(temp, "daemon.sock")
+  const accepted: string[] = []
+  const sockets = new Set<import("node:net").Socket>()
+  const server = createServer((socket) => {
+    sockets.add(socket)
+    socket.on("error", () => {})
+    socket.on("close", () => sockets.delete(socket))
+    let input = ""
+    let closed = false
+    socket.on("data", (chunk) => {
+      input += chunk.toString()
+      while (!closed && input.includes("\n")) {
+        const end = input.indexOf("\n")
+        const request = JSON.parse(input.slice(0, end))
+        input = input.slice(end + 1)
+        if (request.method === "initialize") {
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { protocol_version: 1, capabilities: { sources: ["opencode"], ordered_event_pipeline: true } } })}\n`)
+          continue
+        }
+        const outcome = respond(request.params.event)
+        if (outcome === "accept") {
+          accepted.push(request.params.event)
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { accepted: true } })}\n`)
+          continue
+        }
+        // Mirror rpc.rs: answer the failed event, then stop serving the connection.
+        const response = outcome === "reject" ? { result: { accepted: false } } : { error: { code: -32603, message: "invalid" } }
+        closed = true
+        socket.pause()
+        socket.end(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, ...response })}\n`)
+      }
+    })
+  })
+  await new Promise<void>((resolve, reject) => server.listen(endpoint, resolve).once("error", reject))
+  const client = new DaemonClient({ source: "opencode", socketPath: endpoint, requestTimeoutMs: 1000, connectAttempts: 1, connectDelayMs: 1 })
+  try {
+    await run(client, accepted)
+  } finally {
+    await client.close()
+    for (const socket of sockets) socket.destroy()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    rmSync(temp, { recursive: true, force: true })
+  }
+}
+
+const pipelineEvent = (name: string) => ({ source: "opencode", session_id: "s", event: name, ts_ms: 1, payload: {} })
+
+test("resends a rejected pipelined event ahead of later events", async () => {
+  let rejected = false
+  await withPipelineDaemon(
+    (event) => {
+      if (event === "a" && !rejected) {
+        rejected = true
+        return "reject"
+      }
+      return "accept"
+    },
+    async (client, accepted) => {
+      const results = await Promise.all(["a", "b", "c"].map((name) => client.logPipelined(pipelineEvent(name))))
+      assert.deepEqual(results, [true, true, true])
+      assert.deepEqual(accepted, ["a", "b", "c"])
+    },
+  )
+})
+
+test("a persistently failing event does not exhaust later events' retries", async () => {
+  await withPipelineDaemon(
+    (event) => (event === "a" ? "error" : "accept"),
+    async (client, accepted) => {
+      const results = await Promise.all(["a", "b", "c"].map((name) => client.logPipelined(pipelineEvent(name))))
+      assert.deepEqual(results, [false, true, true])
+      assert.deepEqual(accepted, ["b", "c"])
+    },
+  )
+})
+
+test("a follower keeps its retry after the failed head is dropped", async () => {
+  let rejected = false
+  await withPipelineDaemon(
+    (event) => {
+      if (event === "a") return "error"
+      if (event === "b" && !rejected) {
+        rejected = true
+        return "reject"
+      }
+      return "accept"
+    },
+    async (client, accepted) => {
+      const results = await Promise.all(["a", "b", "c"].map((name) => client.logPipelined(pipelineEvent(name))))
+      assert.deepEqual(results, [false, true, true])
+      assert.deepEqual(accepted, ["b", "c"])
+    },
+  )
+})
+
+for (const connected of [false, true]) {
+  for (const kind of ["bigint", "circular"]) {
+    test(`drops ${kind} payloads without blocking delivery or close (connected: ${connected})`, { timeout: 5000 }, async () => {
+      const payload: Record<string, unknown> = {}
+      payload.value = kind === "bigint" ? 1n : payload
+      await withPipelineDaemon(
+        () => "accept",
+        async (client, accepted) => {
+          if (connected) assert.equal(await client.logPipelined(pipelineEvent("warmup")), true)
+          const results = await Promise.all([
+            client.logPipelined(pipelineEvent("before")),
+            client.logPipelined({ ...pipelineEvent("invalid"), payload }),
+            client.logPipelined(pipelineEvent("after")),
+          ])
+          assert.deepEqual(results, [true, false, true])
+          assert.deepEqual(accepted, connected ? ["warmup", "before", "after"] : ["before", "after"])
+        },
+      )
+    })
+  }
+}
+
+test("events queued behind a cold start keep call order", async () => {
+  await withPipelineDaemon(
+    () => "accept",
+    async (client, accepted) => {
+      const first = ["a", "b"].map((name) => client.logPipelined(pipelineEvent(name)))
+      await new Promise((resolve) => setImmediate(resolve))
+      const later = client.logPipelined(pipelineEvent("c"))
+      assert.deepEqual(await Promise.all([...first, later]), [true, true, true])
+      assert.deepEqual(accepted, ["a", "b", "c"])
+    },
+  )
+})
