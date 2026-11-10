@@ -7,6 +7,8 @@ const mockState = vi.hoisted(() => ({
   closed: 0,
   claim: true,
   hyperlinks: true,
+  // Oh My Pi's pi-tui exports neither getCapabilities() nor hyperlink().
+  ompTui: false,
   legacyContinuation: undefined as Record<string, unknown> | undefined,
   legacyContinuationFor: vi.fn(),
   logGate: undefined as Promise<void> | undefined,
@@ -15,10 +17,18 @@ const mockState = vi.hoisted(() => ({
   permalink: "https://www.braintrust.dev/trace/1" as string | undefined,
 }));
 
-vi.mock("@earendil-works/pi-tui", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@earendil-works/pi-tui")>()),
-  getCapabilities: () => ({ hyperlinks: mockState.hyperlinks }),
-}));
+vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@earendil-works/pi-tui")>();
+  return {
+    ...original,
+    get getCapabilities() {
+      return mockState.ompTui ? undefined : () => ({ hyperlinks: mockState.hyperlinks });
+    },
+    get hyperlink() {
+      return mockState.ompTui ? undefined : original.hyperlink;
+    },
+  };
+});
 
 vi.mock("./runtime/daemon-client.ts", () => ({
   claimManagedTracingInstance: () => mockState.claim,
@@ -121,6 +131,7 @@ describe("Pi daemon adapter", () => {
     mockState.closed = 0;
     mockState.claim = true;
     mockState.hyperlinks = true;
+    mockState.ompTui = false;
     mockState.legacyContinuation = undefined;
     mockState.legacyContinuationFor.mockClear();
     mockState.logGate = undefined;
@@ -325,6 +336,19 @@ describe("Pi daemon adapter", () => {
       await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
     },
   );
+
+  it("falls back to plain status text when pi-tui lacks link helpers", async () => {
+    mockState.ompTui = true;
+    const setStatus = vi.fn();
+    const ctx = fakeContext({ setStatus, setWidget: vi.fn() });
+    const handlers = await loadExtension();
+    await handlers.get("session_start")?.({ reason: "new" }, ctx);
+    await vi.waitFor(() =>
+      expect(setStatus).toHaveBeenCalledWith("braintrust-tracing", "Braintrust: connected"),
+    );
+    expect(setStatus.mock.calls.flat().join(" ")).not.toContain("https://");
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+  });
 
   it("polls for the trace link until the daemon delivers the first turn", async () => {
     vi.useFakeTimers();

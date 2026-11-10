@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getCapabilities, hyperlink } from "@earendil-works/pi-tui";
+import * as piTui from "@earendil-works/pi-tui";
 import { loadConfig } from "./config.ts";
 import { legacyContinuationFor, type LegacyContinuation } from "./legacy-session.ts";
 import { runningPiPackage } from "./pi-package.ts";
@@ -17,6 +17,17 @@ const TRACE_LINK_POLL_INTERVAL_MS = 2_000;
 const TRACE_LINK_POLL_TIMEOUT_MS = 40_000;
 const PI_VERSION = runningPiPackage().version;
 const PI_HOST_NAME = runningPiPackage().name;
+
+/**
+ * Oh My Pi resolves this package to its own pi-tui, which exports neither
+ * helper. A named import would fail to link and OMP would silently drop the
+ * extension, so read them from the namespace and fall back to plain text.
+ */
+function terminalHyperlink(text: string, url: string): string | undefined {
+  const { getCapabilities, hyperlink } = piTui as Partial<typeof piTui>;
+  if (typeof getCapabilities !== "function" || typeof hyperlink !== "function") return undefined;
+  return getCapabilities().hyperlinks ? hyperlink(text, url) : undefined;
+}
 
 function sessionKeyFor(
   sessionFile: string | undefined,
@@ -140,9 +151,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     } else {
       ctx.ui.setStatus(
         STATUS_KEY,
-        permalink && getCapabilities().hyperlinks
-          ? hyperlink(traceLabel, permalink)
-          : "Braintrust: connected",
+        (permalink && terminalHyperlink(traceLabel, permalink)) || "Braintrust: connected",
       );
     }
     traceLinkShown = Boolean(permalink);
