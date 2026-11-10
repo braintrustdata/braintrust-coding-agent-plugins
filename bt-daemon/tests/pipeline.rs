@@ -1614,6 +1614,66 @@ async fn opencode_lifecycle_flushes_without_an_explicit_client_flush() {
 }
 
 #[tokio::test]
+async fn opencode_v2_terminal_events_flush_without_an_explicit_client_flush() {
+    let (socket, handle, flushes, _tmp) = start_tracking_daemon("test").await;
+    let host = dummy_host();
+    for event in [
+        "session.execution.succeeded",
+        "session.execution.failed",
+        "session.execution.interrupted",
+        "session.deleted",
+    ] {
+        let session_id = format!("opencode-v2-{event}");
+        let mut enqueued = envelope(&session_id, "session.inbox.enqueued", 1);
+        enqueued.source = "opencode".into();
+        enqueued.source_version = Some("2.0.0".into());
+        enqueued.payload = serde_json::json!({"id":"enqueue", "data":{"sessionID":"native","inboxID":"i","item":{"type":"user","payload":{"text":"hello"}}}});
+        forward_envelope(&enqueued, &socket, &host, false)
+            .await
+            .unwrap();
+        let mut delivered = enqueued.clone();
+        delivered.event = "session.inbox.delivered".into();
+        delivered.payload =
+            serde_json::json!({"id":"delivered","data":{"sessionID":"native","inboxID":"i"}});
+        forward_envelope(&delivered, &socket, &host, false)
+            .await
+            .unwrap();
+        assert!(
+            flush_session(&session_id, &socket, 5_000)
+                .await
+                .unwrap()
+                .flushed
+        );
+        flushes.lock().unwrap().insert(session_id.clone(), 0);
+        let mut terminal = enqueued.clone();
+        terminal.event = event.into();
+        terminal.payload = serde_json::json!({"id":"terminal","data":{"sessionID":"native","reason":"test","error":{"type":"test","message":"test failure"}}});
+        forward_envelope(&terminal, &socket, &host, false)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if flushes
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("OpenCode v2 {event} was not flushed by the daemon"));
+    }
+    shutdown(&socket).await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn hook_capture_stops_at_the_durable_journal_boundary() {
     let (socket, handle, tmp) = start_slow_daemon().await;
     let host = dummy_host();
@@ -2618,6 +2678,33 @@ async fn idle_sessions_are_retired_and_can_resume_from_their_journal() {
         "the resumed event adds one new span without duplicating acknowledged history"
     );
     handle.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_run_flush_times_out_when_daemon_does_not_reply() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("stalled.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (connection, _) = listener.accept().await.unwrap();
+        let (read, mut write) = connection.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let _initialize = lines.next_line().await.unwrap().unwrap();
+        write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocol_version\":1,\"daemon_version\":\"test\"}}\n").await.unwrap();
+        let request = lines.next_line().await.unwrap().unwrap();
+        assert!(request.contains("managed_run.flush"));
+        std::future::pending::<()>().await;
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        flush_managed_run("test-run", &socket, 100),
+    )
+    .await
+    .expect("managed run flush must be bounded");
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    server.abort();
 }
 
 #[tokio::test]
@@ -4588,4 +4675,106 @@ async fn storage_failure_after_retirement_is_reported_and_recovers_without_nativ
         .all(|session| session.recovery.is_none() && session.last_error.is_none()));
     shutdown(&socket).await;
     handle.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn event_pipeline_stops_after_a_rejected_request() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (socket, handle, _flushes, _tmp) = start_tracking_daemon("test").await;
+    let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    write
+        .write_all(
+            concat!(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"event.log\",\"params\":{}}\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"status.get\",\"params\":{}}\n",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(response["id"], 1);
+    assert!(response.get("error").is_some());
+    assert!(lines.next_line().await.unwrap().is_none());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn managed_run_flush_shares_one_budget_and_returns_pending_counts() {
+    struct BlockedFlush;
+    #[async_trait]
+    impl Sink for BlockedFlush {
+        fn configure(&mut self, _: &SessionConfig) {}
+        async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+            Ok(ops.len() as u64)
+        }
+        async fn flush(&mut self) -> anyhow::Result<()> {
+            std::future::pending().await
+        }
+    }
+    struct Factory;
+    impl SinkFactory for Factory {
+        fn create(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Sink>> {
+            Ok(Box::new(BlockedFlush))
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let mut options = debug_serve_options("test", &data_dir);
+    options.sink_factory = Arc::new(Factory);
+    options.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
+    let endpoint = socket.clone();
+    let handle = tokio::spawn(async move {
+        run_serve(
+            ServeArgs {
+                socket: Some(endpoint),
+                data_dir: Some(data_dir),
+                idle_timeout_secs: 0,
+                session_idle_timeout_secs: 0,
+            },
+            options,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for(&socket).await;
+    for session in ["budget-a", "budget-b", "budget-c"] {
+        let mut event = envelope(session, "SessionStart", 1);
+        event.managed_run_id = Some("shared-budget".into());
+        forward_envelope(&event, &socket, &dummy_host(), false)
+            .await
+            .unwrap();
+    }
+    // Journal acknowledgement precedes actor creation. Observe the ingress
+    // barrier before measuring finalize's budget, so initialization is excluded.
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status.sessions.len(), 3);
+    // All three sinks remain blocked. The server must answer with diagnostics
+    // within its shared budget, before the client's outer deadline expires.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        flush_managed_run("shared-budget", &socket, 1000),
+    )
+    .await
+    .unwrap()
+    .expect("daemon must return its pending-count response");
+    assert!(!result.flushed);
+    assert_eq!(result.accepted_sessions, 3);
+    assert!(result.pending > 0);
+    handle.abort();
 }

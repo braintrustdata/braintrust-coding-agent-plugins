@@ -360,6 +360,7 @@ async fn chat_completions(
         Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error": error})),
     };
     let request = OpenAiRequest { body };
+    let streaming = request.body["stream"] == true;
     state
         .requests
         .lock()
@@ -408,6 +409,18 @@ async fn chat_completions(
             arguments,
             ..
         }) => {
+            if streaming {
+                let chunks = [
+                    json!({"id":format!("chatcmpl_mock_{index}"),"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":call_id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}}]}}]}),
+                    json!({"id":format!("chatcmpl_mock_{index}"),"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+                ];
+                let mut body = chunks
+                    .iter()
+                    .map(|chunk| format!("data: {chunk}\n\n"))
+                    .collect::<String>();
+                body.push_str("data: [DONE]\n\n");
+                return raw_response(StatusCode::OK, "text/event-stream", body.into_bytes());
+            }
             let body = json!({
                 "id": format!("chatcmpl_mock_{index}"),
                 "object": "chat.completion",

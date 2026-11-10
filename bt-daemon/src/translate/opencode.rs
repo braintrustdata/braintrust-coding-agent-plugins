@@ -17,13 +17,69 @@ use std::sync::Arc;
 
 impl TranslatorFactory for crate::agents::OpenCode {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
-        Box::new(OpenCodeTranslator {
-            daemon_session_id: session_id.to_string(),
-            sessions: HashMap::new(),
-            permission_requests: HashMap::new(),
-            git: GitMetadataCache::shared(),
-            last_ts_ms: 0,
+        Box::new(OpenCodeVersionedTranslator {
+            v1: new_translator(session_id),
+            v2: super::opencode_v2::OpenCodeV2Translator::new(session_id),
+            version: None,
         })
+    }
+}
+
+pub(super) fn new_translator(session_id: &str) -> Box<dyn AgentTranslator> {
+    Box::new(OpenCodeTranslator {
+        daemon_session_id: session_id.to_string(),
+        sessions: HashMap::new(),
+        permission_requests: HashMap::new(),
+        git: GitMetadataCache::shared(),
+        last_ts_ms: 0,
+    })
+}
+
+struct OpenCodeVersionedTranslator {
+    v1: Box<dyn AgentTranslator>,
+    v2: super::opencode_v2::OpenCodeV2Translator,
+    version: Option<bool>,
+}
+
+impl AgentTranslator for OpenCodeVersionedTranslator {
+    fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        if event.event == "session_start" {
+            return Ok(Vec::new());
+        }
+        let v2 = *self
+            .version
+            .get_or_insert_with(|| match event.source_version.as_deref() {
+                Some(version) => version.trim_start_matches('v').split('.').next() == Some("2"),
+                None => {
+                    event.payload.get("type").and_then(Value::as_str) == Some(event.event.as_str())
+                        && event
+                            .payload
+                            .pointer("/data/sessionID")
+                            .and_then(Value::as_str)
+                            .is_some()
+                }
+            });
+        if v2 {
+            self.v2.handle(event, ctx)
+        } else {
+            self.v1.handle(event, ctx)
+        }
+    }
+
+    fn checkpoint(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        if self.version == Some(true) {
+            self.v2.checkpoint(ctx)
+        } else {
+            self.v1.checkpoint(ctx)
+        }
+    }
+
+    fn finalize(&mut self, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        if self.version == Some(true) {
+            self.v2.finalize(ctx)
+        } else {
+            self.v1.finalize(ctx)
+        }
     }
 }
 
@@ -296,6 +352,8 @@ struct MessageInfo {
     tokens: Option<MessageTokens>,
     #[serde(default)]
     summary: bool,
+    #[serde(default)]
+    compaction: bool,
     #[serde(default)]
     error: Option<Value>,
 }
@@ -702,10 +760,13 @@ impl OpenCodeTranslator {
         state.tool_message_ids.clear();
         state.completed_messages.clear();
         state.turn_number += 1;
-        let turn_id = ids::span_id(
-            &self.daemon_session_id,
-            &format!("turn:{sid}:{}", state.turn_number),
-        );
+        let turn_key = event
+            .payload
+            .pointer("/input/turnID")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| state.turn_number.to_string());
+        let turn_id = ids::span_id(&self.daemon_session_id, &format!("turn:{sid}:{turn_key}"));
         let output = event.payload.get("output").unwrap_or(&event.payload);
         let input = output
             .get("parts")
@@ -719,6 +780,24 @@ impl OpenCodeTranslator {
                     .join("\n")
             })
             .unwrap_or_default();
+        let images = output
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let input_value = if images.is_empty() {
+            Value::String(input.clone())
+        } else {
+            let mut content = Vec::new();
+            if !input.is_empty() {
+                content.push(json!({"type":"text","text":input}));
+            }
+            content.extend(images);
+            Value::Array(content)
+        };
         let message_id = output
             .get("message")
             .and_then(|message| message.get("id"))
@@ -749,8 +828,8 @@ impl OpenCodeTranslator {
             );
             state.history.upsert(
                 &message_id,
-                (!input.is_empty())
-                    .then(|| json!({"role":"user","content":input}))
+                (!input.is_empty() || input_value.is_array())
+                    .then(|| json!({"role":"user","content":input_value}))
                     .into_iter()
                     .collect(),
             );
@@ -771,7 +850,7 @@ impl OpenCodeTranslator {
             span_type: SpanType::Task,
             is_turn: true,
             start_ms: Some(event.ts_ms),
-            input: (!input.is_empty()).then_some(Value::String(input)),
+            input: (!input.is_empty() || input_value.is_array()).then_some(input_value),
             metadata: Some(
                 json!({"turn_number":state.turn_number,"model":model,"loaded_skill_names":skills}),
             ),
@@ -984,8 +1063,10 @@ impl OpenCodeTranslator {
             input.extend(state.history.active());
             state.history.upsert(mid, history_values);
         }
-        let Some(turn) = turn else {
-            return Vec::new();
+        let parent = match &turn {
+            Some(turn) => turn.clone(),
+            None if info.summary || info.compaction => state.root_span_id.clone(),
+            None => return Vec::new(),
         };
         let provider = info.provider_id.as_deref().unwrap_or("unknown");
         let model = info.model_id.as_deref().unwrap_or("unknown");
@@ -997,13 +1078,8 @@ impl OpenCodeTranslator {
         vec![SpanOp::Insert(SpanRow {
             span_id: ids::span_id(&self.daemon_session_id, &format!("llm:{sid}:{mid}")),
             root_span_id: state.effective_root_span_id.clone(),
-            turn_span_id: Some(
-                state
-                    .owner_turn_span_id
-                    .clone()
-                    .unwrap_or_else(|| turn.clone()),
-            ),
-            parent_span_ids: vec![turn],
+            turn_span_id: state.owner_turn_span_id.clone().or(turn),
+            parent_span_ids: vec![parent],
             name: format!("{provider}/{model}"),
             span_type: SpanType::Llm,
             start_ms: info
@@ -1023,6 +1099,7 @@ impl OpenCodeTranslator {
                 json!({"prompt_tokens":prompt,"completion_tokens":completion,"tokens":prompt+completion+reasoning,"prompt_cached_tokens":cache_read,"prompt_cache_creation_tokens":cache_write,"reasoning_tokens":reasoning}),
             ),
             error: info.error.as_ref().map(|error| format_error(Some(error))),
+            tags: (info.summary || info.compaction).then(|| vec!["compaction".into()]),
             ..Default::default()
         })]
     }

@@ -125,9 +125,18 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+/** A pipelined event that has not been acknowledged yet. */
+interface OutboxEntry {
+  params: Record<string, unknown>
+  /** Delivery failures attributed to this event; it is dropped at the limit. */
+  failures: number
+  /** Connection the event was last written to; any other socket needs a resend. */
+  socket?: Socket
+  settle: (accepted: boolean) => void
 }
+
+/** Initial attempt plus one retry, matching `log()`. */
+const MAX_EVENT_FAILURES = 2
 
 export function daemonSocketPath(
   env: NodeJS.ProcessEnv = process.env,
@@ -158,7 +167,11 @@ export class DaemonClient {
   private nextId = 1
   private pending = new Map<number, PendingRequest>()
   private connecting?: Promise<void>
+  private orderedEventPipeline = false
   private queue: Promise<unknown> = Promise.resolve()
+  private outbox: OutboxEntry[] = []
+  private outboxConnecting = false
+  private inFlightEvents = new Set<Promise<boolean>>()
   private warned = new Set<string>()
 
   constructor(options: DaemonClientOptions) {
@@ -173,30 +186,139 @@ export class DaemonClient {
   }
 
   async log(envelope: DaemonEnvelope): Promise<boolean> {
-    return this.serial(async () => {
-      const event = {
-        ...envelope,
-        ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
-        ...(this.options.managedRunId ? { managed_run_id: this.options.managedRunId } : {}),
+    return this.serial(() => this.sendEvent(envelope))
+  }
+
+  /**
+   * Submit events in call order without waiting for earlier acknowledgements.
+   *
+   * All pipelined events share one ordered outbox. When a delivery fails, the
+   * failed event and everything written after it are resent in call order on
+   * the next connection, so the daemon never journals a later event ahead of
+   * an earlier one. Against daemons without `ordered_event_pipeline`, the
+   * outbox keeps one event in flight at a time.
+   */
+  logPipelined(envelope: DaemonEnvelope): Promise<boolean> {
+    const request = new Promise<boolean>((settle) => {
+      this.outbox.push({ params: this.eventParams(envelope), failures: 0, settle })
+    })
+    this.inFlightEvents.add(request)
+    void request.finally(() => this.inFlightEvents.delete(request))
+    this.pumpOutbox()
+    return request
+  }
+
+  private eventParams(envelope: DaemonEnvelope): Record<string, unknown> {
+    return {
+      ...envelope,
+      ...(this.options.pluginVersion ? { plugin_version: this.options.pluginVersion } : {}),
+      ...(this.options.managedRunId ? { managed_run_id: this.options.managedRunId } : {}),
+    }
+  }
+
+  private pumpOutbox(): void {
+    if (this.outboxConnecting || this.outbox.length === 0) return
+    const socket = this.socket
+    if (!socket || socket.destroyed || this.connecting) {
+      this.outboxConnecting = true
+      this.ensureConnected().then(
+        () => {
+          this.outboxConnecting = false
+          this.pumpOutbox()
+        },
+        (error: unknown) => {
+          this.outboxConnecting = false
+          // Nothing reached a daemon; every queued event used one attempt. Iterate
+          // a copy because exhausted entries leave the outbox.
+          for (const entry of this.outbox.slice()) this.recordFailure(entry, error)
+          this.pumpOutbox()
+        },
+      )
+      return
+    }
+    for (let index = 0; index < this.outbox.length; index++) {
+      const entry = this.outbox[index]!
+      if (entry.socket === socket) {
+        if (!this.orderedEventPipeline) return
+        continue
       }
+      if (!this.orderedEventPipeline && entry !== this.outbox[0]) return
+      entry.socket = socket
+      let request: Promise<unknown>
+      try {
+        request = this.requestOnConnectedSocket("event.log", entry.params)
+      } catch (error) {
+        // An unsendable event must not disconnect or block the rest of the outbox.
+        this.removeEntry(entry)
+        entry.settle(false)
+        this.warnOnce(`event:${String(error)}`)
+        index--
+        continue
+      }
+      request.then(
+        (result) => {
+          if ((result as { accepted?: boolean } | undefined)?.accepted === true) {
+            this.removeEntry(entry)
+            entry.settle(true)
+            this.pumpOutbox()
+          } else {
+            // The daemon rejects while quiescing and then closes the connection.
+            this.onOutboxFailure(entry, socket, new Error("daemon did not accept event"))
+          }
+        },
+        (error: unknown) => this.onOutboxFailure(entry, socket, error),
+      )
+    }
+  }
+
+  private onOutboxFailure(entry: OutboxEntry, socket: Socket, error: unknown): void {
+    if (entry.socket !== socket || !this.outbox.includes(entry)) return
+    // Invalidate every write on this connection before removing its failed head.
+    // Followers' rejection callbacks must not charge the newly promoted head.
+    for (const queued of this.outbox) {
+      if (queued.socket === socket) queued.socket = undefined
+    }
+    if (this.outbox[0] === entry) this.recordFailure(entry, error)
+    // Drop the connection so nothing written after the failure is processed
+    // ahead of the resend.
+    if (this.socket === socket) this.disconnect(error)
+    this.pumpOutbox()
+  }
+
+  private recordFailure(entry: OutboxEntry, error: unknown): void {
+    entry.failures++
+    entry.socket = undefined
+    if (entry.failures < MAX_EVENT_FAILURES) return
+    this.removeEntry(entry)
+    this.warnOnce(`event:${String(error)}`)
+    entry.settle(false)
+  }
+
+  private removeEntry(entry: OutboxEntry): void {
+    const index = this.outbox.indexOf(entry)
+    if (index >= 0) this.outbox.splice(index, 1)
+  }
+
+  private async sendEvent(envelope: DaemonEnvelope): Promise<boolean> {
+    const event = this.eventParams(envelope)
+    try {
+      const result = (await this.request("event.log", event)) as { accepted?: boolean }
+      return result.accepted === true
+    } catch (error) {
+      if (this.socket) this.disconnect(error)
       try {
         const result = (await this.request("event.log", event)) as { accepted?: boolean }
         return result.accepted === true
-      } catch (error) {
-        this.disconnect(error)
-        try {
-          const result = (await this.request("event.log", event)) as { accepted?: boolean }
-          return result.accepted === true
-        } catch (retryError) {
-          this.warnOnce(`event:${String(retryError)}`)
-          return false
-        }
+      } catch (retryError) {
+        this.warnOnce(`event:${String(retryError)}`)
+        return false
       }
-    })
+    }
   }
 
   async flush(sessionId: string, timeoutMs = 10_000): Promise<boolean> {
     return this.serial(async () => {
+      await Promise.all(this.inFlightEvents)
       try {
         const result = (await this.request("session.flush", {
           session_id: sessionId,
@@ -226,6 +348,7 @@ export class DaemonClient {
 
   async close(): Promise<void> {
     await this.queue
+    await Promise.all(this.inFlightEvents)
     this.disconnect(new Error("daemon client closed"))
   }
 
@@ -256,12 +379,11 @@ export class DaemonClient {
   }
 
   private async ensureConnected(): Promise<void> {
+    if (this.connecting) return this.connecting
     if (this.socket && !this.socket.destroyed) return
-    if (!this.connecting) {
-      this.connecting = this.connectWithStartup().finally(() => {
-        this.connecting = undefined
-      })
-    }
+    this.connecting = this.connectWithStartup().finally(() => {
+      this.connecting = undefined
+    })
     return this.connecting
   }
 
@@ -272,7 +394,7 @@ export class DaemonClient {
       this.startDaemon()
       let lastError: unknown
       for (let attempt = 0; attempt < this.options.connectAttempts; attempt++) {
-        await sleep(this.options.connectDelayMs)
+        await new Promise((resolve) => setTimeout(resolve, this.options.connectDelayMs))
         try {
           await this.connectOnce()
           return
@@ -305,7 +427,7 @@ export class DaemonClient {
             },
           })) as {
             protocol_version: number
-            capabilities?: { sources?: string[] }
+            capabilities?: { sources?: string[]; ordered_event_pipeline?: boolean }
           }
           if (result.protocol_version !== DAEMON_PROTOCOL_VERSION) {
             throw new Error(`unsupported daemon protocol ${result.protocol_version}`)
@@ -313,9 +435,10 @@ export class DaemonClient {
           if (!result.capabilities?.sources?.includes(this.options.source)) {
             throw new Error(`daemon does not support ${this.options.source}; update bt`)
           }
+          this.orderedEventPipeline = result.capabilities?.ordered_event_pipeline === true
           resolve()
         } catch (error) {
-          this.disconnect(error)
+          if (this.socket === socket) this.disconnect(error)
           reject(error)
         }
       })
@@ -326,6 +449,8 @@ export class DaemonClient {
     const socket = this.socket
     if (!socket) return Promise.reject(new Error("daemon socket is unavailable"))
     const id = this.nextId++
+    // Serialize before registering a request, so a throw cannot orphan its timer.
+    const message = JSON.stringify({ jsonrpc: "2.0", id, method, params })
     const response = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)
@@ -333,7 +458,7 @@ export class DaemonClient {
       }, this.options.requestTimeoutMs)
       this.pending.set(id, { resolve, reject, timer })
     })
-    socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`)
+    socket.write(`${message}\n`)
     return response
   }
 
@@ -342,8 +467,12 @@ export class DaemonClient {
     this.input = ""
     socket.setEncoding("utf8")
     socket.on("data", (chunk: string) => this.onData(chunk))
-    socket.on("error", (error) => this.disconnect(error))
-    socket.on("close", () => this.disconnect(new Error("daemon connection closed")))
+    socket.on("error", (error) => {
+      if (this.socket === socket) this.disconnect(error)
+    })
+    socket.on("close", () => {
+      if (this.socket === socket) this.disconnect(new Error("daemon connection closed"))
+    })
   }
 
   private onData(chunk: string): void {

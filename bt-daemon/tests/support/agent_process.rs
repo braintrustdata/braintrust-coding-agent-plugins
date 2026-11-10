@@ -47,6 +47,14 @@ pub struct AgentTestWorld {
     config_path: PathBuf,
 }
 
+pub fn daemon_command() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_bt-daemon"))
+}
+
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::new(program)
+}
+
 impl AgentTestWorld {
     pub async fn start() -> Self {
         let inference_mode = TestBackendMode::from_env(INFERENCE_MODE_ENV);
@@ -63,6 +71,10 @@ impl AgentTestWorld {
         let project = std::env::var(PROJECT_ENV).unwrap_or_else(|_| "agent-e2e".into());
         std::fs::create_dir_all(&wrapper_dir).expect("create wrapper directory");
         std::fs::create_dir_all(&data_dir).expect("create daemon data directory");
+        // Keep daemon diagnostics available without an unread pipe that can
+        // fill and block the daemon during longer integration scenarios.
+        let daemon_stderr = std::fs::File::create(data_dir.join("daemon-stderr.log"))
+            .expect("create daemon stderr capture");
         std::fs::write(
             &config_path,
             serde_json::to_vec_pretty(&json!({
@@ -106,7 +118,7 @@ impl AgentTestWorld {
             .arg("0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(daemon_stderr))
             .kill_on_drop(true);
         if ingest_mode == TestBackendMode::Mock {
             command
@@ -154,6 +166,11 @@ impl AgentTestWorld {
         self.root.path().join(name)
     }
 
+    #[cfg(unix)]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
     pub fn configure(&self, command: &mut Command) {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut entries = vec![self.wrapper_dir.clone()];
@@ -186,15 +203,77 @@ impl AgentTestWorld {
     }
 
     pub async fn output(&self, command: &mut Command) -> std::process::Output {
+        use std::io::{Read, Seek};
+        let program = command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        // An agent's detached descendants may inherit output handles. Files
+        // let us collect the foreground command's output without waiting for
+        // those descendants to close a pipe after the command exits.
+        let mut stdout = tempfile::tempfile().expect("create stdout capture");
+        let mut stderr = tempfile::tempfile().expect("create stderr capture");
         command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(
+                stdout.try_clone().expect("clone stdout capture"),
+            ))
+            .stderr(Stdio::from(
+                stderr.try_clone().expect("clone stderr capture"),
+            ))
             .kill_on_drop(true);
-        let child = command.spawn().expect("spawn agent command");
-        tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())
-            .await
-            .expect("agent command timed out")
-            .expect("wait for agent command")
+        let mut child = command.spawn().expect("spawn agent command");
+        let status = match tokio::time::timeout(Duration::from_secs(90), child.wait()).await {
+            Ok(status) => status.expect("wait for agent command"),
+            Err(_) => {
+                let mut out = String::new();
+                let mut err = String::new();
+                let _ = stdout.rewind();
+                let _ = stderr.rewind();
+                let _ = stdout.read_to_string(&mut out);
+                let _ = stderr.read_to_string(&mut err);
+                #[cfg(unix)]
+                let processes = match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    self::command("ps")
+                        .args(["-eo", "pid,ppid,stat,comm"])
+                        .output(),
+                )
+                .await
+                {
+                    Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).into_owned(),
+                    _ => String::from("process listing unavailable"),
+                };
+                #[cfg(not(unix))]
+                let processes = String::from("process listing unavailable");
+                panic!(
+                    "agent command timed out: {program} {args:?} pid {:?}; stdout:\n{out}\nstderr:\n{err}\nprocesses:\n{processes}\n{}; daemon files:\n{}",
+                    child.id(),
+                    self.collector.diagnostics(),
+                    directory_contents(&self.data_dir)
+                );
+            }
+        };
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        stdout.rewind().expect("rewind stdout capture");
+        stderr.rewind().expect("rewind stderr capture");
+        stdout
+            .read_to_end(&mut stdout_bytes)
+            .expect("read stdout capture");
+        stderr
+            .read_to_end(&mut stderr_bytes)
+            .expect("read stderr capture");
+        std::process::Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        }
     }
 
     pub async fn wait_for_trace_rows(&self) -> Vec<Value> {

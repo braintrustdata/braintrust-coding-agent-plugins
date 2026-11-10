@@ -19,6 +19,7 @@
   },
   "files": [
     "dist",
+    "server.js",
     "README.md",
     "LICENSE"
   ],
@@ -29,6 +30,10 @@
     ".": {
       "types": "./dist/index.d.mts",
       "import": "./dist/index.mjs"
+    },
+    "./server": {
+      "types": "./dist/server.d.mts",
+      "import": "./dist/server.mjs"
     },
     "./tracing": {
       "types": "./dist/tracing.d.mts",
@@ -46,7 +51,7 @@
     "fmt": "vp fmt",
     "lint": "vp lint",
     "publish:dry-run": "pnpm run build && pnpm publish --dry-run --no-git-checks",
-    "smoke": "node -e \"Promise.all([import('./dist/index.mjs'), import('./dist/tracing.mjs')])\"",
+    "smoke": "node -e \"Promise.all([import('./dist/index.mjs'), import('./dist/tracing.mjs'), import('./dist/server.mjs')])\"",
     "test": "pnpm run prepare:daemon-client && vp test run",
     "test:watch": "pnpm run prepare:daemon-client && vp test watch",
     "typecheck": "pnpm run check"

@@ -155,6 +155,36 @@ jobs:
           node -e 'import(process.argv[1]).then((m) => { if (typeof m.default !== "function") process.exit(1) })' \
             "$PWD/install-test/node_modules/@braintrust/trace-opencode/dist/index.mjs"
 
+  opencode-v2-minimum:
+    name: OpenCode 2 minimum compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          cache-dependency-path: src/plugins/opencode/content/pnpm-lock.yaml
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: bt-daemon -> target
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install OpenCode 2.0 and packed plugin
+        run: |
+          set -euo pipefail
+          make build-opencode
+          mkdir -p "$RUNNER_TEMP/opencode-v2-package"
+          (cd dist/opencode && pnpm pack --pack-destination "$RUNNER_TEMP/opencode-v2-package" >/dev/null)
+          tarball="$(find "$RUNNER_TEMP/opencode-v2-package" -name 'braintrust-trace-opencode-*.tgz' -print -quit)"
+          npm install --prefix "$RUNNER_TEMP/opencode-v2-min" --no-audit --no-fund @opencode/cli@2.0.0 "$tarball"
+      - name: Trace OpenCode 2.0 sessions
+        env:
+          OPENCODE_V2_BIN: ${{ runner.temp }}/opencode-v2-min/node_modules/.bin/opencode
+          OPENCODE_V2_PLUGIN_DIR: ${{ runner.temp }}/opencode-v2-min/node_modules/@braintrust/trace-opencode
+          BT_AGENT_INFERENCE_MODE: mock
+          BT_AGENT_INGEST_MODE: mock
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration opencode_v2_ -- --ignored --nocapture --test-threads=1
+
   resolve-pi-compatibility:
     name: Resolve Pi compatibility window
     runs-on: ubuntu-24.04
@@ -237,6 +267,7 @@ jobs:
       codex: ${{ steps.versions.outputs.codex }}
       claude: ${{ steps.versions.outputs.claude }}
       opencode: ${{ steps.versions.outputs.opencode }}
+      opencode_v2: ${{ steps.versions.outputs.opencode_v2 }}
       pi: ${{ steps.versions.outputs.pi }}
     steps:
       - id: versions
@@ -246,6 +277,7 @@ jobs:
           echo "codex=$(npm view @openai/codex version)" >> "$GITHUB_OUTPUT"
           echo "claude=$(npm view @anthropic-ai/claude-code version)" >> "$GITHUB_OUTPUT"
           echo "opencode=$(npm view opencode-ai version)" >> "$GITHUB_OUTPUT"
+          echo "opencode_v2=$(npm view @opencode/cli version)" >> "$GITHUB_OUTPUT"
           echo "pi=$(npm view @earendil-works/pi-coding-agent version)" >> "$GITHUB_OUTPUT"
 
   daemon:
@@ -329,6 +361,9 @@ jobs:
             fi
             sleep 10
           done
+      - name: Install OpenCode 2
+        shell: bash
+        run: npm install --prefix "${{ runner.temp }}/opencode-v2" --no-audit --no-fund "@opencode/cli@${{ needs.resolve-coding-agent-versions.outputs.opencode_v2 }}"
       - name: Set up Node and pnpm
         uses: ./.github/actions/setup-node-pnpm
         with:
@@ -349,6 +384,7 @@ jobs:
             "$tarball" @opencode-ai/plugin@latest @opencode-ai/sdk@latest
           echo "OPENCODE_PLUGIN=$install_dir/node_modules/@braintrust/trace-opencode/dist/index.mjs" \
             >> "$GITHUB_ENV"
+          echo "OPENCODE_V2_PLUGIN_DIR=$install_dir/node_modules/@braintrust/trace-opencode" >> "$GITHUB_ENV"
       - name: Build and install Pi extension for integration harness
         shell: bash
         run: |
@@ -386,6 +422,7 @@ jobs:
           CODEX_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/codex${{ matrix.agent_suffix }}
           CLAUDE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/claude${{ matrix.agent_suffix }}
           OPENCODE_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/opencode${{ matrix.agent_suffix }}
+          OPENCODE_V2_BIN: ${{ runner.temp }}/opencode-v2/node_modules/.bin/opencode${{ matrix.agent_suffix }}
           PI_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/pi${{ matrix.agent_suffix }}
           PI_EXTENSION_PATH: ${{ runner.temp }}/pi-extension/node_modules/@braintrust/pi-extension/dist/index.mjs
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
@@ -436,6 +473,7 @@ jobs:
       - plugins
       - js-packages
       - opencode-compatibility
+      - opencode-v2-minimum
       - resolve-pi-compatibility
       - pi-compatibility
       - resolve-coding-agent-versions

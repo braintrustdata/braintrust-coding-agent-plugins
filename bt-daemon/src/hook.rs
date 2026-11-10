@@ -78,7 +78,13 @@ pub(crate) fn should_flush_ingress_event(env: &wire::Envelope) -> bool {
             },
             "opencode" => matches!(
                 env.event.as_str(),
-                "session.idle" | "session.deleted" | "session.error" | "server.instance.disposed"
+                "session.idle"
+                    | "session.deleted"
+                    | "session.error"
+                    | "server.instance.disposed"
+                    | "session.execution.succeeded"
+                    | "session.execution.failed"
+                    | "session.execution.interrupted"
             ),
             _ => false,
         }
