@@ -413,7 +413,6 @@ struct NativeSession {
     current_input: Option<String>,
     current_output: Option<String>,
     system_prompt: Option<String>,
-    model_input: Option<Vec<Value>>,
     output_parts: HashMap<String, String>,
     reasoning_parts: HashMap<String, String>,
     tool_calls: HashMap<String, Vec<Value>>,
@@ -578,18 +577,6 @@ impl AgentTranslator for OpenCodeTranslator {
             "session.created" => self.session_created(event, ctx),
             "chat.message" => self.chat_message(event, ctx),
             "experimental.chat.system.transform" => self.system_prompt(event),
-            "model.context" => {
-                if let Some(sid) = native_session_id(&event.payload) {
-                    if let Some(state) = self.sessions.get_mut(&sid) {
-                        state.model_input = event
-                            .payload
-                            .get("messages")
-                            .and_then(Value::as_array)
-                            .cloned();
-                    }
-                }
-                Vec::new()
-            }
             "message.part.updated" => properties::<PartEvent>(&event.payload, "part")
                 .map(|part| self.part_updated(part, event.ts_ms))
                 .unwrap_or_default(),
@@ -1058,7 +1045,6 @@ impl OpenCodeTranslator {
                 }));
             }
         }
-        let captured_input = state.model_input.take();
         let mut input = Vec::new();
         if let Some(system) = &state.system_prompt {
             input.push(json!({"role":"system","content":system}))
@@ -1076,9 +1062,6 @@ impl OpenCodeTranslator {
         } else {
             input.extend(state.history.active());
             state.history.upsert(mid, history_values);
-        }
-        if let Some(captured) = captured_input {
-            input = captured;
         }
         let parent = match &turn {
             Some(turn) => turn.clone(),

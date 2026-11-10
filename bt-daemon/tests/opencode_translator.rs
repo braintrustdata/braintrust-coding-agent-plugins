@@ -2376,3 +2376,59 @@ fn opencode_v2_top_level_resume_after_interruption_keeps_turn_numbers() {
         .iter()
         .any(|op| matches!(op, SpanOp::Insert(row) if row.name == "Turn 2")));
 }
+
+#[test]
+fn opencode_v2_interrupted_denial_does_not_suppress_later_tool_calls() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let turn = |inbox: &str| {
+        [
+            (
+                "session.inbox.enqueued",
+                json!({"sessionID":"native","inboxID":inbox,"item":{"type":"user","payload":{"text":"run"}}}),
+            ),
+            (
+                "session.inbox.delivered",
+                json!({"sessionID":"native","inboxID":inbox}),
+            ),
+        ]
+    };
+    let mut events = Vec::new();
+    events.extend(turn("u1"));
+    // Denied before the call is recorded; the execution is interrupted before
+    // the tool ever reports failure.
+    events.push((
+        "permission.asked",
+        json!({"sessionID":"native","id":"p1","action":"read","source":{"id":"call","messageID":"m"}}),
+    ));
+    events.push((
+        "permission.replied",
+        json!({"sessionID":"native","requestID":"p1","reply":"reject"}),
+    ));
+    events.push((
+        "session.execution.interrupted",
+        json!({"sessionID":"native","reason":"user"}),
+    ));
+    events.extend(turn("u2"));
+    events.push((
+        "session.tool.called",
+        json!({"sessionID":"native","assistantMessageID":"m","id":"call","name":"read","input":{"path":"ok"}}),
+    ));
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        let e = v2_event(name, i as i64 + 1, data);
+        ops.extend(translator.handle(&e, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    assert!(
+        rows.values().any(|row| row.span_type == SpanType::Tool
+            && row
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_approval"] != "denied")),
+        "the second execution's tool call must produce an approved tool span"
+    );
+}

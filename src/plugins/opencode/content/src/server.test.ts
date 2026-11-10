@@ -80,6 +80,31 @@ describe("OpenCode 2 capture", () => {
       vi.unstubAllEnvs();
     },
   );
+  it("loads and keeps tracing when host registration APIs fail", async () => {
+    state.logs = [];
+    const cleanup = await plugin.setup({
+      app: { version: "2.2.5" },
+      session: {
+        async hook() {
+          throw new Error("context hook unavailable");
+        },
+        async get() {
+          return {};
+        },
+      },
+      location: { directory: "/test" },
+      event: {
+        async *subscribe() {
+          yield { type: "session.created", data: { sessionID: "root" } };
+        },
+      },
+      tool: {} as never,
+    });
+    expect(cleanup).toBeTypeOf("function");
+    await cleanup?.();
+    expect(state.logs.map((log) => log.event)).toEqual(["session.created"]);
+  });
+
   it("forwards native events in order and closes the daemon", async () => {
     state.logs.length = 0;
     state.closed = false;

@@ -389,13 +389,23 @@ pub async fn flush_managed_run(
     flush_managed_run_in(managed_run_id, socket, timeout_ms, &paths::data_dir(None)).await
 }
 
+/// The daemon spends at most `timeout_ms` finalizing a managed run and then
+/// answers `flushed: false` with a pending count. The client waits an extra
+/// half of that budget (covering connect, initialize, and the ingress
+/// barrier) so the daemon's answer normally arrives before the client gives
+/// up on a hung daemon.
+fn managed_run_flush_client_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.saturating_add(timeout_ms / 2))
+}
+
 pub(crate) async fn flush_managed_run_in(
     managed_run_id: &str,
     socket: &std::path::Path,
     timeout_ms: u64,
     data_dir: &std::path::Path,
 ) -> anyhow::Result<wire::FlushResult> {
-    tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+    let client_timeout = managed_run_flush_client_timeout(timeout_ms);
+    tokio::time::timeout(client_timeout, async {
         let stream = match connect(socket).await {
             Ok(stream) => stream,
             Err(_) => {
@@ -418,7 +428,12 @@ pub(crate) async fn flush_managed_run_in(
         conn.call(method::MANAGED_RUN_FLUSH, params).await
     })
     .await
-    .map_err(|_| anyhow::anyhow!("managed run flush timed out after {timeout_ms}ms"))?
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "managed run flush timed out after {}ms",
+            client_timeout.as_millis()
+        )
+    })?
 }
 
 /// Query daemon status. `Ok(None)` means no daemon is running.

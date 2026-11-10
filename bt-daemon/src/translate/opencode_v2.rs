@@ -291,6 +291,7 @@ impl OpenCodeV2Translator {
         let Some(mut s) = self.sessions.remove(sid) else {
             return vec![];
         };
+        self.discard_execution_state(sid, &mut s, permanent);
         let mut ops = Vec::new();
         for (_, tool) in s.tools.drain() {
             if !tool.denied {
@@ -332,6 +333,28 @@ impl OpenCodeV2Translator {
             self.sessions.insert(sid.into(), s);
         }
         ops
+    }
+
+    /// Drop correlation state that cannot outlive an execution. Interrupted
+    /// steps, tools, and permission prompts never see their closing event, so
+    /// without this a long-lived daemon session would keep their entries
+    /// (including full model contexts) forever, and a stale denial could
+    /// suppress a later tool call that reuses the key. Queued inbox items and
+    /// compactions may legitimately span executions, so they are dropped only
+    /// when the session is deleted.
+    fn discard_execution_state(&mut self, sid: &str, s: &mut SessionState, permanent: bool) {
+        self.steps.retain(|(session, _), _| session != sid);
+        self.text_parts.retain(|(session, _, _), _| session != sid);
+        self.tool_names.retain(|(session, _, _), _| session != sid);
+        self.permissions.retain(|_, p| p.session_id != sid);
+        self.pending_context.remove(sid);
+        s.calls.clear();
+        s.results.clear();
+        s.denied_tools.clear();
+        if permanent {
+            self.pending_inputs.retain(|(session, _), _| session != sid);
+            self.compactions.remove(sid);
+        }
     }
 }
 impl AgentTranslator for OpenCodeV2Translator {

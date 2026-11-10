@@ -5,34 +5,54 @@ use crate::agents::OpenCode;
 use crate::args::RunHookCommand;
 use std::ffi::OsString;
 
-pub(super) async fn is_v2(executable: &std::ffi::OsStr) -> anyhow::Result<bool> {
+/// Detect OpenCode 2 from `--version`. Detection is best-effort: any failure
+/// falls back to the 1.x integration (the pre-2.0 behavior) with a warning
+/// rather than refusing to launch the agent.
+pub(super) async fn is_v2(executable: &std::ffi::OsStr) -> bool {
+    match detect_major_version(executable).await {
+        Ok(major) => major == 2,
+        Err(error) => {
+            tracing::warn!(%error, "could not detect OpenCode version; assuming OpenCode 1.x");
+            false
+        }
+    }
+}
+
+async fn detect_major_version(executable: &std::ffi::OsStr) -> anyhow::Result<u64> {
     let mut command: tokio::process::Command =
         crate::subprocess::background_command(executable).into();
     command.arg("--version").kill_on_drop(true);
     let output = tokio::time::timeout(std::time::Duration::from_secs(15), command.output())
         .await
-        .map_err(|_| anyhow::anyhow!("timed out detecting OpenCode version"))?
-        .map_err(|error| anyhow::anyhow!("failed to detect OpenCode version: {error}"))?;
+        .map_err(|_| anyhow::anyhow!("timed out running --version"))?
+        .map_err(|error| anyhow::anyhow!("failed to run --version: {error}"))?;
     if !output.status.success() {
-        anyhow::bail!(
-            "failed to detect OpenCode version: --version exited with {}",
-            output.status
-        );
+        anyhow::bail!("--version exited with {}", output.status);
     }
-    let output = String::from_utf8_lossy(&output.stdout);
-    let version = output
-        .split_whitespace()
-        .last()
-        .ok_or_else(|| anyhow::anyhow!("OpenCode returned an empty version"))?;
-    Ok(version.trim_start_matches('v').starts_with("2."))
+    parse_major_version(&String::from_utf8_lossy(&output.stdout))
+        .or_else(|| parse_major_version(&String::from_utf8_lossy(&output.stderr)))
+        .ok_or_else(|| anyhow::anyhow!("--version printed no recognizable version"))
+}
+
+/// The first `MAJOR.MINOR...` token, so banners or trailing notes such as
+/// `2.2.6 (update available 3.0.0)` do not change the result.
+fn parse_major_version(output: &str) -> Option<u64> {
+    output.split_whitespace().find_map(|token| {
+        let token = token.trim_start_matches('v');
+        let (major, rest) = token.split_once('.')?;
+        rest.starts_with(|c: char| c.is_ascii_digit())
+            .then(|| major.parse().ok())
+            .flatten()
+    })
 }
 
 pub(super) fn inject_for_version(v2: bool, args: &[OsString]) -> anyhow::Result<Injection> {
     if v2
         && args.iter().any(|arg| {
             arg == "--server"
-                || arg.to_string_lossy().starts_with("--server=")
                 || arg == "--service"
+                || arg.to_string_lossy().starts_with("--server=")
+                || arg.to_string_lossy().starts_with("--service=")
         })
     {
         anyhow::bail!("OpenCode 2 managed tracing requires a private server; remove --server");
@@ -168,9 +188,32 @@ mod tests {
         let executable = temp.path().join("opencode");
         std::fs::write(&executable, "#!/bin/sh\nprintf '2.2.5\\n'\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(is_v2(executable.as_os_str()).await.unwrap());
+        assert!(is_v2(executable.as_os_str()).await);
         std::fs::write(&executable, "#!/bin/sh\nprintf '1.18.0\\n'\n").unwrap();
-        assert!(!is_v2(executable.as_os_str()).await.unwrap());
+        assert!(!is_v2(executable.as_os_str()).await);
+        // A broken or unrecognizable --version falls back to 1.x instead of failing the run.
+        std::fs::write(&executable, "#!/bin/sh\nexit 3\n").unwrap();
+        assert!(!is_v2(executable.as_os_str()).await);
+        std::fs::write(&executable, "#!/bin/sh\nprintf '2.0.1\\n' >&2\n").unwrap();
+        assert!(is_v2(executable.as_os_str()).await);
+    }
+
+    #[test]
+    fn version_parsing_uses_the_first_version_token() {
+        assert_eq!(parse_major_version("2.2.6\n"), Some(2));
+        assert_eq!(parse_major_version("v2.0.0"), Some(2));
+        assert_eq!(
+            parse_major_version("2.2.6 (update available 3.0.0)"),
+            Some(2)
+        );
+        assert_eq!(parse_major_version("opencode 1.18.4"), Some(1));
+        assert_eq!(parse_major_version("opencode"), None);
+        assert_eq!(parse_major_version(""), None);
+    }
+
+    #[test]
+    fn opencode_v2_rejects_service_equals_argument() {
+        assert!(inject_for_version(true, &["--service=remote".into()]).is_err());
     }
 
     #[test]

@@ -69,28 +69,40 @@ const forwarded = new Set([
   "session.deleted",
 ]);
 
+/** Await an optional host registration without letting it reject setup. */
+async function failOpen(registration: () => Promise<unknown>): Promise<void> {
+  try {
+    await registration();
+  } catch {
+    // Tracing and tools degrade independently; neither may fail plugin load.
+  }
+}
+
 export default {
   id: "braintrust.trace",
   async setup(ctx: Context) {
     const config = loadConfig(await readPluginConfig(ctx.location));
     if (config.enableTools) {
       const definitions = createBraintrustTools(new BtCliToolsClient(config));
-      await ctx.tool.transform((editor) => {
-        for (const [name, definition] of Object.entries(definitions)) {
-          editor.add({
-            name,
-            description: definition.description,
-            input: tool.schema.toJSONSchema(tool.schema.object(definition.args)),
-            async execute(input) {
-              const result = await definition.execute(
-                input as Record<string, unknown>,
-                {} as ToolContext,
-              );
-              return { content: typeof result === "string" ? result : result.output };
-            },
-          });
-        }
-      });
+      // Fail open: a host without this API must not prevent tracing setup.
+      await failOpen(() =>
+        ctx.tool.transform((editor) => {
+          for (const [name, definition] of Object.entries(definitions)) {
+            editor.add({
+              name,
+              description: definition.description,
+              input: tool.schema.toJSONSchema(tool.schema.object(definition.args)),
+              async execute(input) {
+                const result = await definition.execute(
+                  input as Record<string, unknown>,
+                  {} as ToolContext,
+                );
+                return { content: typeof result === "string" ? result : result.output };
+              },
+            });
+          }
+        }),
+      );
     }
     if (!config.tracingEnabled || !claimManagedTracingInstance("opencode")) return;
     const daemon = new DaemonClient({ source: "opencode", pluginVersion: PLUGIN_VERSION });
@@ -117,25 +129,28 @@ export default {
       return root;
     };
     const contexts = new Map<string, Array<{ ts_ms: number; payload: unknown }>>();
-    await ctx.session.hook("context", (event) => {
-      try {
-        const queue = contexts.get(event.sessionID) ?? [];
-        const payload = JSON.parse(
-          JSON.stringify({
-            data: {
-              sessionID: event.sessionID,
-              system: event.system.map((part) => part.text),
-              messages: event.messages,
-            },
-            location: ctx.location,
-          }),
-        ) as unknown;
-        queue.push({ ts_ms: Date.now(), payload });
-        contexts.set(event.sessionID, queue);
-      } catch {
-        // A malformed capture must not interrupt the agent's model request.
-      }
-    });
+    // Without the context hook, LLM spans simply lack captured input.
+    await failOpen(() =>
+      ctx.session.hook("context", (event) => {
+        try {
+          const queue = contexts.get(event.sessionID) ?? [];
+          const payload = JSON.parse(
+            JSON.stringify({
+              data: {
+                sessionID: event.sessionID,
+                system: event.system.map((part) => part.text),
+                messages: event.messages,
+              },
+              location: ctx.location,
+            }),
+          ) as unknown;
+          queue.push({ ts_ms: Date.now(), payload });
+          contexts.set(event.sessionID, queue);
+        } catch {
+          // A malformed capture must not interrupt the agent's model request.
+        }
+      }),
+    );
     const task = (async () => {
       for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
         if (!forwarded.has(event.type)) continue;

@@ -43,6 +43,9 @@ impl Daemon {
     }
 
     pub(super) async fn flush_managed_run(&self, params: ManagedRunFlushParams) -> FlushResult {
+        // `timeout_ms` bounds the whole flush, not each session, so the caller
+        // can budget one client-side deadline (see `client::flush_managed_run_in`).
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(params.timeout_ms);
         let mut delivery_keys: HashSet<DeliveryKey> = self
             .managed_run_sessions
             .lock()
@@ -131,9 +134,8 @@ impl Daemon {
             }
             let session = { self.sessions.lock().get(&key).cloned() };
             if let Some(session) = session {
-                let (flushed, pending) = session
-                    .finalize(Duration::from_millis(params.timeout_ms))
-                    .await;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let (flushed, pending) = session.finalize(remaining).await;
                 result.flushed &= flushed;
                 result.pending = result.pending.saturating_add(pending);
             }
