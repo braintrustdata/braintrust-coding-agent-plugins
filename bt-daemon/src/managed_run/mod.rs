@@ -111,6 +111,10 @@ async fn run_traced_inner(
     mut route: SessionRoute,
     host: Option<crate::HostInfo>,
 ) -> anyhow::Result<std::process::ExitStatus> {
+    args.validate_parent()?;
+    if let Some(components) = args.parent {
+        route.destination = Some(wire::TraceDestination::ParentSpan { components });
+    }
     apply_run_span_plugins(&mut route, &args.plugin)?;
     let name = args.source.identity().id;
     let agent = registrar()
@@ -389,8 +393,9 @@ mod tests {
         let error = run_traced(
             RunArgs {
                 source: RunSource::Codex,
+                parent: None,
                 additional_metadata: None,
-                tags: Vec::new(),
+                tags: Default::default(),
                 plugin: Vec::new(),
                 agent_args: Vec::new(),
             },
@@ -408,8 +413,9 @@ mod tests {
         let error = run_traced(
             RunArgs {
                 source: RunSource::Codex,
+                parent: None,
                 additional_metadata: None,
-                tags: Vec::new(),
+                tags: Default::default(),
                 plugin: Vec::new(),
                 agent_args: vec![OsString::from("--dangerously-bypass-hook-trust")],
             },

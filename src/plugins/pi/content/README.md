@@ -65,9 +65,9 @@ new daemon session instead.
 ## Compatibility
 
 CI runs a traced Pi session with the packed extension against the latest patch
-from each of the last five stable Pi release lines. The compatibility job
-resolves these versions on each run, including releases from Pi's former npm
-package name when needed.
+from each of the last five stable Pi release lines and the last three stable
+Oh My Pi release lines. The compatibility job resolves these versions on each
+run, including releases from Pi's former npm package name when needed.
 
 Package detection prefers the running CLI to an extension-local peer dependency.
 Pi-compatible hosts are recognized by a `piConfig` field or a known package name,

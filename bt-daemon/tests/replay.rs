@@ -370,7 +370,7 @@ async fn attached_import_summary_reports_the_effective_parent_root() {
         }),
         flush_mode: FlushMode::FireAndForget,
         additional_metadata: None,
-        tags: Vec::new(),
+        tags: Default::default(),
         span_plugins: Vec::new(),
     };
 
@@ -422,7 +422,7 @@ async fn import_uses_the_same_span_plugin_stage() {
             destination: None,
             flush_mode: FlushMode::FireAndForget,
             additional_metadata: None,
-            tags: Vec::new(),
+            tags: Default::default(),
             span_plugins: vec![plugin],
         }),
         false,

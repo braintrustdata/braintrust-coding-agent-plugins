@@ -228,6 +228,12 @@ async fn capture_hook(
         .or_else(|| json_str_field(&payload, &args.event_field))
         .unwrap_or_default();
 
+    if crate::translate::canonical_source_name(&args.source) == "muse"
+        && event == "UserPromptSubmit"
+    {
+        crate::muse::images::enrich(&mut payload);
+    }
+
     if args.flush_on_turn_end {
         route.flush_mode = wire::FlushMode::FlushOnTurnEnd;
     }

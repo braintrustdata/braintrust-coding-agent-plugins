@@ -1,6 +1,6 @@
 {
   "name": "@braintrust/pi-extension",
-  "version": "2.2.2",
+  "version": "2.2.3",
   "description": "Braintrust extension for pi. Includes automatic tracing for pi sessions, turns, LLM calls, and tool executions to Braintrust.",
   "keywords": [
     "braintrust",
@@ -39,19 +39,20 @@
     "publish:dry-run": "pnpm run build && pnpm publish --dry-run --no-git-checks",
     "smoke": "node -e \"import('./dist/index.mjs')\"",
     "sync:version": "node scripts/sync-version.mjs",
-    "test": "pnpm run prepare:daemon-client && vitest run",
-    "test:watch": "pnpm run prepare:daemon-client && vitest",
+    "test": "pnpm run prepare:daemon-client && vp test run",
+    "test:watch": "pnpm run prepare:daemon-client && vp test watch",
     "typecheck": "pnpm run check"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "@earendil-works/pi-tui": "^1.5.2",
     "@types/node": "^26.6.4",
     "typescript": "^6.0.3",
-    "vite-plus": "^1.4.0",
-    "vitest": "5.0.5"
+    "vite-plus": "^1.4.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "packageManager": "pnpm@11.21.0",
   "pi": {

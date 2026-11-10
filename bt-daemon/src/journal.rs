@@ -333,6 +333,26 @@ pub struct JournalReader {
 }
 
 impl JournalReader {
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Rebuild decoder context before continuing at a saved record boundary.
+    pub(crate) async fn resume(path: &Path, position: u64, through: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(position <= through, "invalid recovery range");
+        let mut reader = Self::open(path, through)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("recovery journal is missing"))?;
+        while reader.position < position {
+            anyhow::ensure!(
+                reader.next_record().await?.is_some(),
+                "recovery journal ended before its boundary"
+            );
+        }
+        anyhow::ensure!(reader.position == position, "invalid recovery boundary");
+        Ok(reader)
+    }
+
     /// Open a journal for streaming, reading at most `through` bytes.
     ///
     /// That bound is what keeps replay from consuming the very event that
@@ -385,49 +405,19 @@ impl JournalReader {
             }
             self.position += read as u64;
             self.line_no += 1;
-            let line = std::str::from_utf8(&bytes)
-                .map_err(|error| {
-                    anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-                })?
-                .trim();
-            if line.is_empty() {
-                continue;
+            let path = self.path.clone();
+            let line_no = self.line_no;
+            let position = self.position;
+            let mut pi_context = std::mem::take(&mut self.pi_context);
+            let (pi_context, record) = tokio::task::spawn_blocking(move || {
+                let record = decode_record(&bytes, &path, line_no, position, &mut pi_context);
+                (pi_context, record)
+            })
+            .await?;
+            self.pi_context = pi_context;
+            if let Some(record) = record? {
+                return Ok(Some(record));
             }
-            let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
-                anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-            })?;
-            let record = if value
-                .get("_bt_record_type")
-                .and_then(serde_json::Value::as_str)
-                == Some("delivery_checkpoint")
-            {
-                let checkpoint: DeliveryCheckpointRecord =
-                    serde_json::from_value(value).map_err(|error| {
-                        anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-                    })?;
-                JournalRecord::DeliveryCheckpoint {
-                    route: checkpoint.route,
-                    through: checkpoint.through,
-                }
-            } else if value
-                .get("_bt_record_type")
-                .and_then(serde_json::Value::as_str)
-                == Some("pipeline_control")
-            {
-                JournalRecord::Control(serde_json::from_value(value)?)
-            } else {
-                let mut event = serde_json::from_value(value).map_err(|error| {
-                    anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-                })?;
-                expand_pi_payload(&mut event, &mut self.pi_context).map_err(|error| {
-                    anyhow::anyhow!("journal {}:{}: {error}", self.path.display(), self.line_no)
-                })?;
-                JournalRecord::Event(event)
-            };
-            return Ok(Some(JournalRecordEntry {
-                record,
-                through: self.position,
-            }));
         }
     }
 
@@ -459,6 +449,51 @@ impl JournalReader {
         }
         acknowledged
     }
+}
+
+fn decode_record(
+    bytes: &[u8],
+    path: &Path,
+    line_no: usize,
+    position: u64,
+    pi_context: &mut Vec<serde_json::Value>,
+) -> anyhow::Result<Option<JournalRecordEntry>> {
+    let line = std::str::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?
+        .trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
+    let record = if value
+        .get("_bt_record_type")
+        .and_then(serde_json::Value::as_str)
+        == Some("delivery_checkpoint")
+    {
+        let checkpoint: DeliveryCheckpointRecord = serde_json::from_value(value)
+            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
+        JournalRecord::DeliveryCheckpoint {
+            route: checkpoint.route,
+            through: checkpoint.through,
+        }
+    } else if value
+        .get("_bt_record_type")
+        .and_then(serde_json::Value::as_str)
+        == Some("pipeline_control")
+    {
+        JournalRecord::Control(serde_json::from_value(value)?)
+    } else {
+        let mut event = serde_json::from_value(value)
+            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
+        expand_pi_payload(&mut event, pi_context)
+            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
+        JournalRecord::Event(event)
+    };
+    Ok(Some(JournalRecordEntry {
+        record,
+        through: position,
+    }))
 }
 
 const PI_MESSAGES_DELTA: &str = "_bt_messages_delta";

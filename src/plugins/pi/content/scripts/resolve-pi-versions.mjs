@@ -5,17 +5,37 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
-const packageFamily = {
-  alias: "@earendil-works/pi-coding-agent",
-  sources: ["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"],
-};
-const count = Number(process.env.PI_VERSION_COUNT ?? "5");
+const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const stableVersionPattern = /^\d+\.\d+\.\d+$/;
 
-if (!Number.isInteger(count) || count <= 0) {
-  throw new Error(
-    `PI_VERSION_COUNT must be a positive integer, got: ${process.env.PI_VERSION_COUNT ?? "undefined"}`,
-  );
+// Each host is tested against the latest patch of its newest release lines.
+// `sources` lists npm names the host has published under; older names are
+// installed under the first (current) name with an npm alias.
+const hosts = [
+  {
+    host: "pi",
+    label: "Pi",
+    bin: "pi",
+    sources: [PI_PACKAGE, "@mariozechner/pi-coding-agent"],
+    count: positiveInteger("PI_VERSION_COUNT", "5"),
+  },
+  {
+    // Oh My Pi is a Bun-based Pi fork that loads Pi extensions through its own
+    // compatibility shim, so it needs a separate install and binary.
+    host: "omp",
+    label: "Oh My Pi",
+    bin: "omp",
+    sources: ["@oh-my-pi/pi-coding-agent"],
+    count: positiveInteger("OMP_VERSION_COUNT", "3"),
+  },
+];
+
+function positiveInteger(name, fallback) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer, got: ${process.env[name]}`);
+  }
+  return value;
 }
 
 const npmQueryDirectory = mkdtempSync(join(tmpdir(), "pi-version-query-"));
@@ -46,58 +66,67 @@ function compareVersions(a, b) {
   return 0;
 }
 
-const versionsBySource = packageFamily.sources.map((packageName) => ({
-  packageName,
-  versions: npmViewVersions(packageName),
-}));
-const availableVersions = [...new Set(versionsBySource.flatMap(({ versions }) => versions))].sort(
-  compareVersions,
-);
-
-const releaseLines = [];
-
-for (const version of availableVersions) {
-  const [major, minor] = version.split(".");
-  const line = `${major}.${minor}`;
-  const previousReleaseLine = releaseLines.at(-1);
-
-  if (previousReleaseLine?.line === line) {
-    previousReleaseLine.version = version;
-    continue;
-  }
-
-  releaseLines.push({ line, version });
-}
-
-const selectedVersions = releaseLines.map(({ version }) => version).slice(-count);
-
-if (selectedVersions.length < count) {
-  throw new Error(
-    `Expected at least ${count} stable pi release lines across ${packageFamily.sources.join(
-      "/",
-    )}, found ${selectedVersions.length}`,
+function resolveHost({ host, label, bin, sources, count }) {
+  const versionsBySource = sources.map((packageName) => ({
+    packageName,
+    versions: npmViewVersions(packageName),
+  }));
+  const availableVersions = [...new Set(versionsBySource.flatMap(({ versions }) => versions))].sort(
+    compareVersions,
   );
-}
 
-function installSpecFor(version) {
-  const source = versionsBySource.find(({ versions }) => versions.includes(version))?.packageName;
-  if (!source) {
-    throw new Error(`No source package found for pi-coding-agent@${version}`);
+  const releaseLines = [];
+  for (const version of availableVersions) {
+    const [major, minor] = version.split(".");
+    const line = `${major}.${minor}`;
+    const previousReleaseLine = releaseLines.at(-1);
+
+    if (previousReleaseLine?.line === line) {
+      previousReleaseLine.version = version;
+      continue;
+    }
+
+    releaseLines.push({ line, version });
   }
-  return source === packageFamily.alias
-    ? `${packageFamily.alias}@${version}`
-    : `${packageFamily.alias}@npm:${source}@${version}`;
+
+  const selectedVersions = releaseLines.map(({ version }) => version).slice(-count);
+  if (selectedVersions.length < count) {
+    throw new Error(
+      `Expected at least ${count} stable ${label} release lines across ${sources.join(
+        "/",
+      )}, found ${selectedVersions.length}`,
+    );
+  }
+
+  const [alias] = sources;
+  const installSpecFor = (version) => {
+    const source = versionsBySource.find(({ versions }) => versions.includes(version))?.packageName;
+    if (!source) {
+      throw new Error(`No source package found for ${label} ${version}`);
+    }
+    return source === alias ? `${alias}@${version}` : `${alias}@npm:${source}@${version}`;
+  };
+
+  return selectedVersions.map((version) => ({
+    host,
+    label,
+    bin,
+    version,
+    piCodingAgentSpec: installSpecFor(version),
+  }));
 }
 
-const selectedTargets = selectedVersions.map((version) => ({
-  version,
-  piCodingAgentSpec: installSpecFor(version),
-}));
+const targetsByHost = hosts.map((host) => ({ ...host, targets: resolveHost(host) }));
+const selectedTargets = targetsByHost.flatMap(({ targets }) => targets);
+const piVersions = targetsByHost
+  .find(({ host }) => host === "pi")
+  .targets.map(({ version }) => version);
 
 const outputs = {
   versions: JSON.stringify(selectedTargets),
-  latest: selectedVersions[selectedVersions.length - 1],
-  oldest: selectedVersions[0],
+  // `latest` and `oldest` describe upstream Pi only.
+  latest: piVersions[piVersions.length - 1],
+  oldest: piVersions[0],
 };
 
 if (process.env.GITHUB_OUTPUT) {
@@ -106,16 +135,18 @@ if (process.env.GITHUB_OUTPUT) {
   }
 }
 
+const summaryLines = targetsByHost.map(
+  ({ label, count, targets }) =>
+    `- ${label}: latest ${count} stable release line${count === 1 ? "" : "s"}: ${targets
+      .map(({ version }) => version)
+      .join(", ")}`,
+);
+
 if (process.env.GITHUB_STEP_SUMMARY) {
   appendFileSync(
     process.env.GITHUB_STEP_SUMMARY,
-    [
-      "## Supported pi compatibility versions",
-      "",
-      `Testing the latest ${count} stable pi release lines: ${selectedVersions.join(", ")}`,
-      "",
-    ].join("\n"),
+    ["## Supported Pi compatibility versions", "", ...summaryLines, ""].join("\n"),
   );
 }
 
-console.log(`Resolved pi compatibility versions: ${selectedVersions.join(", ")}`);
+console.log(`Resolved Pi compatibility versions:\n${summaryLines.join("\n")}`);

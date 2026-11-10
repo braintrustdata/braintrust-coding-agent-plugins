@@ -4,22 +4,13 @@ allowBuilds:
   koffi: true
   protobufjs: true
 overrides:
-  "@vitest/mocker": 5.0.5
   esbuild: 0.28.2
-  postcss: 8.5.23
-  source-map-js: 1.2.2
-  tinypool: 2.1.2
-  undici: 8.12.2
-  vite: npm:@voidzero-dev/vite-plus-core@1.4.0
-  vitest: 5.0.5
-  nanoid: ^3.3.18
-  zod: ^4.6.6
 minimumReleaseAgeExclude:
-  - "@earendil-works/chord@1.0.0"
-  - "@earendil-works/pi-agent-core@1.0.0"
-  - "@earendil-works/pi-ai@1.0.0"
-  - "@earendil-works/pi-codemode@1.0.0"
-  - "@earendil-works/pi-coding-agent@1.0.0"
-  - "@earendil-works/pi-mcp@1.0.0"
-  - "@earendil-works/pi-telemetry@1.0.0"
-  - "@earendil-works/pi-tui@1.0.0"
+  - "@earendil-works/pi-agent-core@1.5.2"
+  - "@earendil-works/pi-ai@1.5.2"
+  - "@earendil-works/pi-codemode@1.5.2"
+  - "@earendil-works/pi-coding-agent@1.5.2"
+  - "@earendil-works/pi-mcp@1.5.2"
+  - "@earendil-works/pi-schema@1.5.2"
+  - "@earendil-works/pi-telemetry@1.5.2"
+  - "@earendil-works/pi-tui@1.5.2"

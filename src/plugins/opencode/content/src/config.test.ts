@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { loadConfig, type PluginConfig, parseBooleanEnv } from "./config";
 
 describe("parseBooleanEnv", () => {

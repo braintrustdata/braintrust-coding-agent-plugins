@@ -330,7 +330,7 @@ fn claude_additional_metadata_reaches_roots_without_overriding_session_fields() 
             SessionRoute {
                 destination: Some(TraceDestination::ParentSpan { components }),
                 additional_metadata: Some(json!({"team": "platform", "source": "custom"})),
-                tags: vec!["ci".into(), "docs".into()],
+                tags: ["ci".into(), "docs".into()].into_iter().collect(),
                 ..SessionRoute::default()
             }
             .with_auth(BackendAuth {

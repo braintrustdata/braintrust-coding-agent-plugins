@@ -296,20 +296,31 @@ mod tests {
     }
 
     #[test]
-    fn run_accepts_cursor_and_forwards_agent_arguments() {
+    fn run_accepts_cursor_with_parent_and_forwards_agent_arguments() {
+        let parent: braintrust_sdk_rust::SpanComponents =
+            serde_json::from_value(serde_json::json!({
+                "object_type": 2,
+                "object_id": "project-id",
+                "span_id": "parent-span",
+                "root_span_id": "trace-root"
+            }))
+            .unwrap();
+        let exported = parent.to_str();
         let parsed = Cli::try_parse_from([
-            "bt", "run", "cursor", "--tag", "ci", "--", "--print", "hello",
+            "bt", "run", "cursor", "--parent", &exported, "--tag", "ci", "--", "--print", "hello",
         ])
         .unwrap();
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Run(RunArgs {
                 source: crate::RunSource::Cursor,
+                parent: Some(ref parent),
                 ref agent_args,
                 ref tags,
                 ..
-            }) if agent_args == &["--print", "hello"] && tags == &["ci"]
+            }) if parent.to_str() == exported && agent_args == &["--print", "hello"] && tags == &["ci"]
         ));
+        assert!(Cli::try_parse_from(["bt", "run", "--parent", "invalid", "cursor"]).is_err());
     }
 
     #[test]
