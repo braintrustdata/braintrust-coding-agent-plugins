@@ -1,5 +1,5 @@
 import { hyperlink } from "@earendil-works/pi-tui";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const mockState = vi.hoisted(() => ({
   logs: [] as Array<Record<string, unknown>>,
