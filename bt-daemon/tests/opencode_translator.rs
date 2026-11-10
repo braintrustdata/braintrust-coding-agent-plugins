@@ -1898,7 +1898,7 @@ fn opencode_v2_routes_resumed_nested_sessions_under_external_parent() {
                 additional_metadata: Some(
                     json!({"team":"pipeline","source":"override","_bt_private":true}),
                 ),
-                tags: vec!["nested".into()],
+                tags: ["nested".into()].into_iter().collect(),
                 ..SessionRoute::default()
             }
             .with_auth(BackendAuth {
