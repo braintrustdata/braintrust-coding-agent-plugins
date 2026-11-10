@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vite-plus/test";
 import { legacyContinuationFor } from "./legacy-session.ts";
 
 const previousStateDir = process.env.BRAINTRUST_STATE_DIR;

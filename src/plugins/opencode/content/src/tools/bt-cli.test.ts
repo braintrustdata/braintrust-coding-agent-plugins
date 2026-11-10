@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "vite-plus/test";
 import { existsSync, readFileSync } from "node:fs";
 import type { BraintrustConfig } from "../config";
 import { BtCliToolsClient } from "./bt-cli";
