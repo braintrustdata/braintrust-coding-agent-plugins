@@ -11,6 +11,7 @@ pub(super) const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub(super) async fn collect_garbage(daemon: &Daemon) {
     collect_partitions(daemon, RETENTION).await;
+    crate::delivery_ledger::collect_orphans(&daemon.data_dir).await;
     journal::gc_old_journals(&daemon.data_dir, RETENTION).await;
     journal::gc_old_managed_runs(&daemon.data_dir, RETENTION).await;
     // Protect references from every retained input log, including completed
@@ -38,20 +39,21 @@ async fn old(path: &std::path::Path, age: Duration) -> bool {
 }
 
 async fn collect_partitions(daemon: &Daemon, age: Duration) {
-    let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
+    let Ok(paths) = journal::paths(&daemon.data_dir).await else {
         return;
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("ndjson") || !old(&path, age).await {
-            continue;
-        }
+    for path in paths {
         let recorded = journal::JournalReader::recorded_len(&path).await;
         let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded).await else {
             continue;
         };
-        let Ok(Some(first)) = reader.next_entry().await else {
-            continue;
+        let first = match reader.next_entry().await {
+            Ok(Some(first)) => first,
+            Ok(None) => match journal::identity(&path).await {
+                Ok(Some(identity)) => identity,
+                _ => continue,
+            },
+            Err(_) => continue,
         };
         let id = crate::ids::session_storage_id(&first.source, &first.session_id);
         // Legacy mixed-source logs are handled by their own conservative reader.
@@ -119,6 +121,11 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         }) {
             continue;
         }
+        let Ok(Some(ledger_lease)) =
+            crate::delivery_ledger::try_collect_session(&daemon.data_dir, &id).await
+        else {
+            continue;
+        };
         if !partition.collectible(recorded).await.unwrap_or(false)
             || partition.close_storage().await.is_err()
         {
@@ -131,12 +138,21 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
         if tokio::fs::remove_file(&storage).await.is_err() {
             continue;
         }
-        for sidecar in [wal, storage.with_extension("sqlite-shm"), path] {
+        for sidecar in [wal, storage.with_extension("sqlite-shm")] {
             if let Err(error) = tokio::fs::remove_file(&sidecar).await {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(%error,path=%sidecar.display(),"expired partition cleanup failed");
                 }
             }
+        }
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%error,path=%path.display(),"completed input cleanup failed; retaining delivery ledger");
+                continue;
+            }
+        }
+        if let Err(error) = ledger_lease.remove_files().await {
+            tracing::warn!(%error,"completed delivery ledger cleanup failed");
         }
     }
 }
@@ -198,6 +214,55 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
     }
     let mut protected = HashSet::new();
     let mut sources = HashSet::new();
+    // Consumed event rows no longer own transcript or correlation references.
+    // Their durable continuation and source identity take over that ownership.
+    fn checkpoint_paths(value: &Value, root: &std::path::Path, protected: &mut HashSet<PathBuf>) {
+        match value {
+            Value::String(value) if std::path::Path::new(value).starts_with(root) => {
+                protected.insert(value.into());
+            }
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    if std::path::Path::new(key).starts_with(root) {
+                        protected.insert(key.into());
+                    }
+                    checkpoint_paths(value, root, protected);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    checkpoint_paths(value, root, protected);
+                }
+            }
+            _ => {}
+        }
+    }
+    for path in journal::paths(data_dir).await? {
+        if let Some(identity) = journal::identity(&path).await? {
+            mirrors(&identity.payload, &mut protected);
+            let env = journal::envelope_from_redacted(identity);
+            let key = automatic_link_key(&env);
+            protected.insert(correlation_state_path(data_dir, &key));
+            protected.insert(active_parent_snapshot_path(data_dir, &key));
+            let partition = crate::pipeline::journal::SpanJournal::open(
+                &crate::collections::database_path(&path),
+            )
+            .await?;
+            if let Some((_, bytes)) = partition.checkpoint().await? {
+                checkpoint_paths(
+                    &serde_json::from_slice(&bytes)?,
+                    &data_dir.join("transcripts"),
+                    &mut protected,
+                );
+            }
+            for route in partition.routes().await? {
+                let key = DeliveryKey::new(&env.source, &env.session_id, &route)?.correlation_key();
+                protected.insert(correlation_state_path(data_dir, &key));
+                protected.insert(active_parent_snapshot_path(data_dir, &key));
+            }
+        }
+    }
+
     let mut entries = match tokio::fs::read_dir(journal::journal_dir(data_dir)).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(protected),
@@ -517,10 +582,16 @@ mod tests {
                 .unwrap()
                 .unwrap()
         );
-        assert!(tokio::fs::read_to_string(&path)
-            .await
-            .unwrap()
-            .contains("next"));
+        let mut reader =
+            journal::JournalReader::open(&path, journal::JournalReader::recorded_len(&path).await)
+                .await
+                .unwrap()
+                .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = reader.next_entry().await.unwrap() {
+            events.push(event.event);
+        }
+        assert!(events.iter().any(|event| event == "next"));
         assert!(daemon.translations.lock().is_empty());
         assert!(
             daemon.source_inputs.lock().is_empty(),
@@ -627,8 +698,14 @@ mod tests {
                 )
                 .unwrap();
             let expected: Vec<_> = (slot..total).step_by(envs.len()).collect();
-            assert_eq!(count, expected.len());
+            assert!(
+                count <= expected.len(),
+                "completed batches can be reclaimed"
+            );
+            let (_, state) = partition.checkpoint().await.unwrap().unwrap();
+            let state: Value = serde_json::from_slice(&state).unwrap();
             if env.source == "debug" {
+                assert_eq!(state["native"]["event_seq"], expected.len() as u64);
                 let actual: Vec<_> = partition
                     .read_after(0, total)
                     .await
@@ -674,9 +751,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-        let content = tokio::fs::read_to_string(path).await.unwrap();
+        let identity = journal::identity(&path).await.unwrap().unwrap();
         assert!(
-            content.contains("TranscriptUpdate"),
+            identity.event == "TranscriptUpdate",
             "late transcript must be journaled before shutdown"
         );
     }
@@ -749,6 +826,7 @@ mod tests {
         for scenario in [
             "no_heads",
             "unresolved",
+            "second_unresolved",
             "unregistered",
             "held",
             "source_held",
@@ -803,6 +881,11 @@ mod tests {
                     .subscribe(env.route.as_ref().unwrap(), 0)
                     .await
                     .unwrap();
+                if scenario == "second_unresolved" {
+                    let mut second = env.route.clone().unwrap();
+                    second.tags.insert("second".into());
+                    partition.subscribe(&second, 0).await.unwrap();
+                }
                 if scenario != "unresolved" {
                     head.next_batch(8)
                         .await
@@ -845,9 +928,22 @@ mod tests {
             } else {
                 Duration::ZERO
             };
+            let id = crate::ids::session_storage_id(&env.source, &env.session_id);
+            let ledger_dir = tmp.path().join("delivery-ledger");
+            std::fs::create_dir_all(&ledger_dir).unwrap();
+            let ledger = ledger_dir.join(format!("{id}--destination.ndjson"));
+            std::fs::write(&ledger, "completed receipt").unwrap();
             collect_partitions(&daemon, age).await;
+            assert_eq!(
+                ledger.exists(),
+                scenario != "complete",
+                "ledger: {scenario}"
+            );
             assert_eq!(storage.exists(), scenario != "complete", "{scenario}");
-            assert_eq!(raw.exists(), scenario != "complete", "{scenario}");
+            assert!(
+                !raw.exists(),
+                "SQLite cutover removed the legacy file: {scenario}"
+            );
             drain_all(&daemon).await;
         }
     }

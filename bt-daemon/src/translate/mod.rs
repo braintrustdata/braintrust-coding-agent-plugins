@@ -26,6 +26,7 @@ pub(crate) use claude::successful_subagent_handback_message;
 pub(crate) use pi::request_config as pi_request_config;
 mod origins;
 mod recent;
+mod state;
 pub(crate) use origins::WeakOrigins;
 mod tool;
 mod turn_lineage;
@@ -35,7 +36,7 @@ use debug::DebugTranslatorFactory;
 
 use crate::agents::{registrar, Agent};
 use crate::wire::{Envelope, SessionConfig};
-use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -49,7 +50,7 @@ pub(crate) fn local_username() -> String {
 }
 
 /// Braintrust span kinds we emit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpanType {
     #[default]
@@ -61,7 +62,7 @@ pub enum SpanType {
 }
 
 /// Immutable versions captured when a coding-agent span is first created.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OriginSnapshot {
     pub plugin_version: Option<String>,
     pub bt_version: String,
@@ -70,7 +71,7 @@ pub struct OriginSnapshot {
 
 /// Causal watermark for an aggregate updated by independently replayed snapshots.
 /// The same native operation may enrich a live preview despite capture clock lag.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct LateMergeVersion {
     pub ts_ms: i64,
     pub native_id: Option<String>,
@@ -78,7 +79,7 @@ pub struct LateMergeVersion {
 
 /// A resolved span row, ready for a sink to insert or merge. Field set is the
 /// subset every current plugin uses; extend as translators need more.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SpanRow {
     pub span_id: String,
     pub root_span_id: String,
@@ -131,7 +132,7 @@ pub struct SpanRow {
 /// existing row by id (maps to `_is_merge` at the sink). Re-emitting an
 /// `Insert` after journal replay merges server-side thanks to deterministic
 /// ids, so replay is idempotent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SpanOp {
     Insert(SpanRow),
     Merge(SpanRow),
@@ -149,6 +150,14 @@ pub struct SessionCtx {
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
 pub trait AgentTranslator: Send {
+    /// Versioned continuation state, after all output for an input has drained.
+    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("translator does not support durable continuation")
+    }
+    fn restore_state(&mut self, _bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::bail!("translator does not support durable continuation")
+    }
+
     /// Handle one event, returning span ops to emit.
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>>;
 

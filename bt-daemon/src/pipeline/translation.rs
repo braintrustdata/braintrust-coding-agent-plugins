@@ -193,6 +193,16 @@ enum State {
     Processing,
     Recovering(Failure),
 }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Continuation {
+    source: String,
+    native: Box<serde_json::value::RawValue>,
+    #[serde(default)]
+    last_control: Option<PipelineControl>,
+    bounds: HashMap<String, u64>,
+    capture: Option<OriginSnapshot>,
+}
+
 struct Publication {
     input: u64,
     ordinal: u64,
@@ -202,6 +212,7 @@ struct Publication {
     begun: bool,
     prepared: bool,
     complete: bool,
+    continuation: Option<Vec<u8>>,
 }
 
 struct Producer {
@@ -218,6 +229,7 @@ struct Producer {
     capture: Option<OriginSnapshot>,
     pending_snapshots: HashSet<String>,
     bounds: HashMap<String, u64>,
+    last_control: Option<PipelineControl>,
     position: u64,
     committed: u64,
     state: State,
@@ -259,6 +271,7 @@ impl Producer {
             capture: None,
             pending_snapshots: HashSet::new(),
             bounds: HashMap::new(),
+            last_control: None,
             position: 0,
             committed,
             state,
@@ -484,6 +497,9 @@ impl Producer {
             bounds.insert(path.clone(), through);
         }
         let control = PipelineControl { kind, bounds };
+        if matches!(kind, ControlKind::Retire) && self.last_control.as_ref() == Some(&control) {
+            return Ok(None);
+        }
         let through = {
             let mut writer = self.options.events.lock().await;
             // A checkpoint observes dispatched work. If capture is ahead,
@@ -511,6 +527,11 @@ impl Producer {
         if self.translator.is_some() {
             return Ok(());
         }
+        let checkpoint = self.journal.checkpoint().await?;
+        anyhow::ensure!(
+            checkpoint.is_some() || !tokio::fs::try_exists(&self.options.event_path).await?,
+            "legacy input migration is incomplete"
+        );
         self.committed = self.journal.translated_through().await?;
         self.roots = Roots::restore(self.journal.root_candidates().await?);
         for ops in self.roots.pending().values() {
@@ -530,6 +551,24 @@ impl Producer {
             })
             .await??,
         );
+        if let Some((through, bytes)) = checkpoint {
+            let source = self.options.source.clone();
+            let saved = self
+                .translate(move |translator, _| {
+                    let saved: Continuation = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(saved.source == source, "checkpoint source mismatch");
+                    translator.restore_state(saved.native.get().as_bytes())?;
+                    Ok(saved)
+                })
+                .await?;
+            self.bounds = saved.bounds;
+            self.last_control = saved.last_control;
+            self.capture = saved.capture;
+            self.position = through;
+            self.committed = through;
+            self.reader = None;
+            return Ok(());
+        }
         self.position = 0;
         self.reader = if self.committed > 0 {
             JournalReader::open(&self.options.event_path, self.committed).await?
@@ -567,7 +606,12 @@ impl Producer {
                 SourceEvent::Event(Box::new(crate::journal::envelope_from_redacted(event)))
             }
             JournalRecord::Control(control) => SourceEvent::Control(control),
-            JournalRecord::DeliveryCheckpoint { .. } => SourceEvent::LegacyDeliveryCheckpoint,
+            JournalRecord::DeliveryCheckpoint { route, through } => {
+                SourceEvent::LegacyDeliveryCheckpoint {
+                    route: Box::new(route),
+                    through,
+                }
+            }
         };
         Ok(Some(SourceRecord {
             event,
@@ -596,8 +640,10 @@ impl Producer {
         while let Some(entry) = self.next_input(through).await? {
             let input = entry.position.through;
             let observation = !matches!(&entry.event,SourceEvent::Control(control) if matches!(control.kind,ControlKind::Retire));
+            let mut continuation = None;
             let (first, capture) = match entry.event {
                 SourceEvent::Event(mut env) => {
+                    self.last_control = None;
                     if let Some(route) = &env.route {
                         self.journal.register(route).await?;
                     }
@@ -637,6 +683,7 @@ impl Producer {
                     )
                 }
                 SourceEvent::Control(control) => {
+                    self.last_control = Some(control.clone());
                     // Retirement exports defensive terminal updates but does not
                     // close native state when rebuilding for later captured work.
                     if input <= self.committed && matches!(control.kind, ControlKind::Retire) {
@@ -644,6 +691,9 @@ impl Producer {
                         continue;
                     }
                     self.phase = Boundary::Translation;
+                    if matches!(control.kind, ControlKind::Retire) {
+                        continuation = Some(self.continuation().await?);
+                    }
                     let ops = self
                         .translate(move |translator, ctx| {
                             if !matches!(control.kind, ControlKind::Checkpoint) {
@@ -655,10 +705,19 @@ impl Producer {
                         .await?;
                     (ops, self.capture.clone())
                 }
-                SourceEvent::LegacyDeliveryCheckpoint => {
+                SourceEvent::LegacyDeliveryCheckpoint { route, through } => {
+                    self.journal.acknowledge_legacy(&route, through).await?;
                     if input > self.committed {
                         self.journal.begin(input, observation).await?;
-                        self.journal.commit(input).await?;
+                        let state = self.continuation().await?;
+                        self.journal
+                            .transaction(|tx| {
+                                tx.roots.replace(self.roots.pending())?;
+                                tx.checkpoints.insert(input, state)?;
+                                tx.events.drain(..=input)?;
+                                Ok(())
+                            })
+                            .await?;
                         self.committed = input;
                         self.progress.committed.store(input, Ordering::Relaxed);
                     }
@@ -675,12 +734,33 @@ impl Producer {
                 begun: false,
                 prepared: false,
                 complete: false,
+                continuation,
             });
             self.publish().await?;
             self.phase = Boundary::Journal;
             self.position = input;
         }
         Ok(())
+    }
+
+    async fn continuation(&mut self) -> anyhow::Result<Vec<u8>> {
+        let source = self.options.source.clone();
+        let last_control = self.last_control.clone();
+        let bounds = self.bounds.clone();
+        let capture = self.capture.clone();
+        self.translate(move |translator, _| {
+            let native = serde_json::value::RawValue::from_string(String::from_utf8(
+                translator.save_state()?,
+            )?)?;
+            Ok(serde_json::to_vec(&Continuation {
+                source,
+                native,
+                last_control,
+                bounds,
+                capture,
+            })?)
+        })
+        .await
     }
 
     /// Each chunk stays owned until its local write succeeds. A commit retry
@@ -769,8 +849,17 @@ impl Producer {
             }
             if publish {
                 self.phase = Boundary::Journal;
+                let state = match &pending.continuation {
+                    Some(state) => state.clone(),
+                    None => self.continuation().await?,
+                };
                 self.journal
-                    .commit_with_roots(pending.input, self.roots.pending())
+                    .transaction(|tx| {
+                        tx.roots.replace(self.roots.pending())?;
+                        tx.checkpoints.insert(pending.input, state)?;
+                        tx.events.drain(..=pending.input)?;
+                        Ok(())
+                    })
                     .await?;
                 self.committed = pending.input;
                 self.progress
@@ -917,15 +1006,7 @@ pub(crate) mod tests {
             .unwrap()
         }
         pub(crate) async fn poison(&self, range: std::ops::Range<u64>) {
-            let mut bytes = tokio::fs::read(&self.options.event_path).await.unwrap();
-            for byte in &mut bytes[range.start as usize..range.end as usize] {
-                if *byte != b'\n' {
-                    *byte = b'x';
-                }
-            }
-            tokio::fs::write(&self.options.event_path, bytes)
-                .await
-                .unwrap();
+            self.db().execute("UPDATE collection_records SET value=x'78' WHERE name='events' AND id>? AND id<=?",rusqlite::params![range.start,range.end]).unwrap();
         }
     }
 
@@ -1002,7 +1083,123 @@ pub(crate) mod tests {
             }
         }
         covered.sort();
+        covered.dedup();
         assert_eq!(covered, Registry::default_agents().sources());
+    }
+
+    #[tokio::test]
+    async fn accepted_partial_output_survives_failed_checkpoint_without_input_loss_or_redelivery() {
+        let mut f = SourceFixture::new("debug").await;
+        let db = f.db();
+        db.execute_batch("CREATE TABLE IF NOT EXISTS source_checkpoint(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,through INTEGER NOT NULL,value BLOB NOT NULL); CREATE TRIGGER reject_checkpoint BEFORE INSERT ON source_checkpoint BEGIN SELECT RAISE(FAIL,'injected checkpoint failure'); END;").unwrap();
+        let event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
+            "source":"debug", "session_id":"checkpoint", "event":"tool", "ts_ms":1,
+            "payload":{"value":1}, "route":{}
+        }))
+        .unwrap();
+        let through = f.write(&event, true).await;
+        f.source.advance(through).await.unwrap();
+        assert!(f.source.barrier().await.is_err());
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM collection_records WHERE name='events'",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let mut route = f
+            .source
+            .journal
+            .subscribe(event.route.as_ref().unwrap(), 0)
+            .await
+            .unwrap();
+        route
+            .next_batch(8)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_completed()
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM ops", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM receipts", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            2
+        );
+        f.source.shutdown().await;
+        db.execute_batch("DROP TRIGGER reject_checkpoint").unwrap();
+        f.reopen().await;
+        f.source.advance(through).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while f.source.barrier().await.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(f.source.journal.tail().await.unwrap(), 2);
+        assert!(f.source.journal.read_after(0, 8).await.unwrap().is_empty());
+        let (_, bytes) = f.source.journal.checkpoint().await.unwrap().unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(state["native"]["event_seq"], 1);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM collection_records WHERE name='events'",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM receipts", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        f.source.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unchanged_restarts_do_not_append_retirement_records() {
+        let mut f = SourceFixture::new("debug").await;
+        let event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
+            "source":"debug", "session_id":"checkpoint", "event":"tool", "ts_ms":1,
+            "payload":{}, "route":{}
+        }))
+        .unwrap();
+        let through = f.write(&event, true).await;
+        f.process(through).await;
+        f.source.control(ControlKind::Retire).await.unwrap();
+        let through = crate::journal::JournalReader::recorded_len(&f.options.event_path).await;
+        let tail = f.source.journal.tail().await.unwrap();
+        for _ in 0..3 {
+            f.reopen().await;
+            f.source.control(ControlKind::Retire).await.unwrap();
+            assert_eq!(
+                crate::journal::JournalReader::recorded_len(&f.options.event_path).await,
+                through
+            );
+            assert_eq!(f.source.journal.tail().await.unwrap(), tail);
+            assert_eq!(
+                f.db()
+                    .query_row(
+                        "SELECT count(*) FROM collection_records WHERE name='events'",
+                        [],
+                        |r| r.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        f.source.shutdown().await;
     }
 
     struct BlockedTranslator {
@@ -1018,6 +1215,10 @@ pub(crate) mod tests {
         }
     }
     impl AgentTranslator for BlockedTranslator {
+        fn save_state(&self) -> anyhow::Result<Vec<u8>> {
+            Ok(b"null".to_vec())
+        }
+
         fn handle(
             &mut self,
             _: &crate::wire::Envelope,
@@ -1199,6 +1400,9 @@ pub(crate) mod tests {
     }
     struct CountedTranslation(Arc<AtomicU64>);
     impl AgentTranslator for CountedTranslation {
+        fn save_state(&self) -> anyhow::Result<Vec<u8>> {
+            Ok(b"null".to_vec())
+        }
         fn handle(
             &mut self,
             _: &crate::wire::Envelope,
@@ -1243,6 +1447,7 @@ pub(crate) mod tests {
             begun: false,
             prepared: false,
             complete: false,
+            continuation: None,
         });
         db.execute_batch("CREATE TRIGGER fail_append BEFORE INSERT ON ops BEGIN SELECT RAISE(FAIL,'append'); END;").unwrap();
         assert!(producer.publish().await.is_err());

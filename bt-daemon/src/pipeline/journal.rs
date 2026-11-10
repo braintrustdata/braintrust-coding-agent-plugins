@@ -3,6 +3,8 @@
 //! Tracking mutations acquire SQLite write access before reading. Deferred
 //! read-to-write upgrades can fail without waiting when another connection
 //! writes concurrently, even with a busy timeout.
+mod mutation;
+
 use super::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
 use super::{
     delivery::InputPort,
@@ -189,7 +191,7 @@ impl SpanJournal {
             // bound, before any schema transaction has started.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                match db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;") {
+                match db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=1048576; BEGIN IMMEDIATE;") {
                     Ok(()) => break,
                     Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
                         && std::time::Instant::now() < deadline => {
@@ -295,6 +297,11 @@ impl SpanJournal {
                 .map_err(|_| anyhow::anyhow!("SpanOp storage lock poisoned"))?
                 .take();
             if let Some(database) = database {
+                // Reclaim a bounded number of free pages on idle close. Existing
+                // databases reuse free pages even if created without auto-vacuum.
+                database.execute_batch(
+                    "PRAGMA incremental_vacuum(256); PRAGMA wal_checkpoint(TRUNCATE)",
+                )?;
                 database.close().map_err(|(_, error)| error)?;
             }
             Ok(())
@@ -511,11 +518,65 @@ impl SpanJournal {
         .await
     }
 
+    #[cfg(test)]
     pub async fn commit(&self, input: u64) -> anyhow::Result<u64> {
         self.commit_output(input, None).await
     }
 
     /// Root candidates and translated output share the consumed-input boundary.
+    pub async fn checkpoint(&self) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+        self.with_db(|db| {
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='source_checkpoint')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Ok(None);
+            }
+            let saved: Option<(u32, u64, Vec<u8>)> = db
+                .query_row(
+                    "SELECT version,through,value FROM source_checkpoint WHERE id=1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            saved
+                .map(|(version, through, value)| {
+                    anyhow::ensure!(
+                        version == 1,
+                        "unsupported translator checkpoint version {version}"
+                    );
+                    Ok((through, value))
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    pub async fn transaction(
+        &self,
+        build: impl FnOnce(&mut mutation::Mutations) -> anyhow::Result<()> + Send,
+    ) -> anyhow::Result<u64> {
+        let mut mutations = mutation::Mutations::default();
+        build(&mut mutations)?;
+        let input = mutations
+            .events
+            .through
+            .ok_or_else(|| anyhow::anyhow!("transaction is missing its consumed input range"))?;
+        let (checkpoint, state) = mutations
+            .checkpoints
+            .value
+            .ok_or_else(|| anyhow::anyhow!("event removal requires a continuation checkpoint"))?;
+        anyhow::ensure!(
+            input == checkpoint,
+            "checkpoint and consumed input boundaries differ"
+        );
+        self.commit_output_with_state(input, mutations.roots.values, Some(state))
+            .await
+    }
+
+    #[cfg(test)]
     pub async fn commit_with_roots(
         &self,
         input: u64,
@@ -557,10 +618,20 @@ impl SpanJournal {
         .await
     }
 
+    #[cfg(test)]
     async fn commit_output(
         &self,
         input: u64,
         roots: Option<Vec<(String, Vec<u8>)>>,
+    ) -> anyhow::Result<u64> {
+        self.commit_output_with_state(input, roots, None).await
+    }
+
+    async fn commit_output_with_state(
+        &self,
+        input: u64,
+        roots: Option<Vec<(String, Vec<u8>)>>,
+        state: Option<Vec<u8>>,
     ) -> anyhow::Result<u64> {
         let tail = self
             .with_db(move |db| {
@@ -594,7 +665,7 @@ impl SpanJournal {
                     }
                 }
                 let tail = tx.query_row(
-                    "SELECT coalesce(max(position),0) FROM ops WHERE input<=?",
+                    "SELECT max((SELECT floor FROM publication WHERE id=1),coalesce(max(position),0)) FROM ops WHERE input<=?",
                     [input],
                     |r| r.get(0),
                 )?;
@@ -603,6 +674,15 @@ impl SpanJournal {
                 let tail =
                     tx.query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))?;
                 prune(&tx)?;
+                if let Some(state) = state {
+                    tx.execute_batch("CREATE TABLE IF NOT EXISTS source_checkpoint(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,through INTEGER NOT NULL,value BLOB NOT NULL)")?;
+                    tx.execute("INSERT OR REPLACE INTO source_checkpoint VALUES(1,1,?,?)",params![input,state])?;
+                    // The same transaction transfers recovery ownership from input to
+                    // native continuation + output. Failed commits retain the input.
+                    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='collection_records')",[],|r|r.get(0))?;
+                    if exists { tx.execute("DELETE FROM collection_records WHERE name='events' AND id<=?",[input])?; }
+                    tx.execute("DELETE FROM batches WHERE input<? AND committed=1 AND NOT EXISTS(SELECT 1 FROM ops WHERE ops.input=batches.input) AND NOT EXISTS(SELECT 1 FROM receipts WHERE receipts.input=batches.input)",[input])?;
+                }
                 tx.commit()?;
                 Ok(tail)
             })
@@ -758,6 +838,18 @@ impl SpanJournal {
         .await
     }
 
+    pub async fn acknowledge_legacy(&self, route: &SessionRoute, input: u64) -> anyhow::Result<()> {
+        let route = serde_json::to_string(route)?;
+        self.with_db(move |db| {
+            let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let position:u64=tx.query_row("SELECT coalesce(max(position),0) FROM ops WHERE input<=?",[input],|r|r.get(0))?;
+            tx.execute("INSERT INTO heads(route,position) VALUES(?,?) ON CONFLICT(route) DO UPDATE SET position=max(position,excluded.position)",params![route,position])?;
+            prune(&tx)?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
     pub async fn register(&self, route: &SessionRoute) -> anyhow::Result<()> {
         let route = serde_json::to_string(route)?;
         self.with_db(move |db| {
@@ -769,7 +861,7 @@ impl SpanJournal {
                 for row in rows { if serde_json::from_str::<SessionRoute>(&row?)?.same_route(&candidate) { existing = true; break; } }
                 existing
             };
-            if !existing { db.execute("INSERT OR IGNORE INTO heads(route,position) VALUES (?,(SELECT floor FROM publication WHERE id=1))",[route])?; }
+            if !existing { db.execute("INSERT OR IGNORE INTO heads(route,position) VALUES (?,(SELECT tail FROM publication WHERE id=1))",[route])?; }
             Ok(())
         }).await
     }
@@ -931,6 +1023,7 @@ impl SpanJournal {
             AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position < (SELECT tail FROM publication WHERE id=1))
             AND NOT EXISTS(SELECT 1 FROM recovery WHERE failure IS NOT NULL)
             AND NOT EXISTS(SELECT 1 FROM batches WHERE committed=0)
+            AND NOT EXISTS(SELECT 1 FROM root_candidates)
             AND (SELECT coalesce(max(input),0) FROM batches WHERE committed=1)>=?",[input],|r|r.get(0))?)).await
     }
     pub async fn close_storage(&self) -> anyhow::Result<()> {
@@ -1373,6 +1466,9 @@ impl Drop for HeadCompletion {
 }
 #[async_trait::async_trait]
 impl Completion for HeadCompletion {
+    fn record_id(&self) -> Option<u64> {
+        Some(self.through)
+    }
     async fn complete(&mut self) -> anyhow::Result<()> {
         let (route, expected, through) = (self.route.clone(), self.expected, self.through);
         self.journal
@@ -1708,6 +1804,35 @@ mod tests {
         .await
         .expect("explicit flush must bypass the 30-second window");
         assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn newly_registered_route_starts_after_an_existing_routes_pending_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanJournal::open(&tmp.path().join("routes.sqlite"))
+            .await
+            .unwrap();
+        journal.register(&route("first")).await.unwrap();
+        journal.begin(10, true).await.unwrap();
+        journal.append(10, &[op("old")]).await.unwrap();
+        journal.commit(10).await.unwrap();
+        journal.register(&route("new")).await.unwrap();
+        journal.begin(20, true).await.unwrap();
+        journal.append(20, &[op("new")]).await.unwrap();
+        journal.commit(20).await.unwrap();
+        let mut new = journal.subscribe(&route("new"), 0).await.unwrap();
+        let batch = new.next_batch(8).await.unwrap().unwrap();
+        assert_eq!(batch.value().len(), 1);
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &batch.value()[0];
+        assert_eq!(row.span_id, "new");
+        batch.into_completed().await.ok().unwrap();
+        let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
+        let batch = first.next_batch(8).await.unwrap().unwrap();
+        assert_eq!(
+            batch.value().len(),
+            2,
+            "the original destination still owns its backlog"
+        );
     }
 
     #[tokio::test]

@@ -1490,19 +1490,17 @@ mod tests {
         for corrupt in [false, true] {
             let daemon = TestDaemon::start(Arc::new(OtherProfileDaemonAuth)).await;
             let data = daemon._dir.path().join("data");
-            let storage = data.join("pipeline");
+            let path = crate::collections::database_path(&crate::journal::source_journal_path(
+                &data,
+                "codex",
+                "storage-failure",
+            ));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let db = rusqlite::Connection::open(path).unwrap();
             if corrupt {
-                std::fs::create_dir_all(&storage).unwrap();
-                std::fs::write(
-                    storage.join(format!(
-                        "{}.sqlite",
-                        crate::ids::session_storage_id("codex", "storage-failure")
-                    )),
-                    "not a database",
-                )
-                .unwrap();
+                db.execute_batch("CREATE TABLE source_checkpoint(id INTEGER PRIMARY KEY,version INTEGER NOT NULL,through INTEGER NOT NULL,value BLOB NOT NULL); INSERT INTO source_checkpoint VALUES(1,1,0,x'78');").unwrap();
             } else {
-                std::fs::write(&storage, "blocked storage directory").unwrap();
+                db.execute_batch("CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0,observation INTEGER NOT NULL DEFAULT 1); CREATE TRIGGER block_translation BEFORE INSERT ON batches BEGIN SELECT RAISE(FAIL,'injected translation storage failure'); END;").unwrap();
             }
             daemon
                 .forward_event("codex", "storage-failure", SessionRoute::default())

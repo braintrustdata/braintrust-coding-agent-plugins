@@ -3,7 +3,11 @@ use super::{
     delivery::InputPort,
     recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
     routing::RoutingSink,
-    Delivery, Stage,
+    Stage,
+};
+use crate::collections::{
+    async_iter::{AsyncIteratorExt, IntoAsyncIterator},
+    view::{RemovalView, RouteCollection},
 };
 use crate::{
     delivery_ledger::{CommitFailure, LedgerSink},
@@ -69,9 +73,14 @@ impl ConsumerOptions {
         sink.configure(config);
         Ok(sink)
     }
-    async fn hold(&self, pending: &mut VecDeque<Delivery<()>>, failure: &mut Failure) -> bool {
+    async fn hold(
+        &self,
+        view: &RemovalView,
+        pending: &mut VecDeque<u64>,
+        failure: &mut Failure,
+    ) -> bool {
         let result = match pending.front_mut() {
-            Some(delivery) => delivery.failed(failure).await,
+            Some(id) => view.report_failure(*id, failure).await,
             None => Ok(()), // Input errors are reported by the source itself.
         };
         *self.error.lock() = Some(failure.message());
@@ -140,7 +149,8 @@ impl ConsumerOptions {
     // resolved every deferred row. Completion failures retry only acknowledgement.
     async fn finish(
         &self,
-        pending: &mut VecDeque<Delivery<()>>,
+        view: &RemovalView,
+        pending: &mut VecDeque<u64>,
         sink: &mut Option<RoutingSink>,
         config: &SessionConfig,
         attempt: u32,
@@ -154,6 +164,7 @@ impl ConsumerOptions {
                     previous.shutdown().await;
                 }
                 pending.clear();
+                view.retry();
                 return Ok(false);
             }
             Work::Flush => {
@@ -178,10 +189,10 @@ impl ConsumerOptions {
             }
             Work::Complete => {}
         }
-        while let Some(delivery) = pending.pop_front() {
-            if let Err(unfinished) = delivery.into_completed().await {
-                pending.push_front(unfinished.delivery);
-                return Err(self.storage(&unfinished.error, attempt, Work::Complete));
+        while let Some(id) = pending.pop_front() {
+            if let Err(error) = view.remove(id).await {
+                pending.push_front(id);
+                return Err(self.storage(&error, attempt, Work::Complete));
             }
         }
         Ok(true)
@@ -190,9 +201,12 @@ impl ConsumerOptions {
 
 impl Consumer {
     pub fn spawn(
-        mut input: Box<dyn InputPort<Item = Vec<super::live::SharedOp>>>,
+        input: Box<dyn InputPort<Item = Vec<super::live::SharedOp>>>,
         options: ConsumerOptions,
     ) -> Arc<Self> {
+        let collection = RouteCollection::new(input);
+        let view = collection.view();
+        let mut input = collection.into_async_iter();
         let config = options.config.clone();
         let mut settings = config.subscribe();
         let stop = Arc::new(Notify::new());
@@ -215,7 +229,7 @@ impl Consumer {
                     if recorded.as_ref() != Some(&reported)
                         && super::recovery::now_ms() >= record_retry
                     {
-                        if options.hold(&mut pending, &mut failure).await {
+                        if options.hold(&view, &mut pending, &mut failure).await {
                             reported = failure.clone();
                             recorded = Some(reported.clone());
                         } else {
@@ -255,7 +269,7 @@ impl Consumer {
                         config.send_replace(current.clone());
                     }
                     match options
-                        .finish(&mut pending, &mut sink, &current, attempts, work)
+                        .finish(&view, &mut pending, &mut sink, &current, attempts, work)
                         .await
                     {
                         Ok(completed) => {
@@ -271,7 +285,7 @@ impl Consumer {
                 }
                 let attempt = async {
                     let received = tokio::select! {
-                        result=input.receive()=>result,
+                        result=input.next()=>result.transpose(),
                         result=settings.changed()=> {
                             return if result.is_err() { Ok(None) } else { Ok(Some(false)) };
                         },
@@ -284,7 +298,7 @@ impl Consumer {
                         return Ok(None);
                     };
                     let current = settings.borrow_and_update().clone();
-                    let ops = delivery.value().as_slice();
+                    let ops = delivery.value.as_slice();
                     let result = async {
                         if sink.is_none() {
                             sink = Some(options.sink(&current).await.map_err(|error| {
@@ -314,14 +328,21 @@ impl Consumer {
                             .map_err(|error| options.routing(&error, &current, attempts))
                     }
                     .await;
-                    pending.push_back(delivery.map(|_| ()));
+                    pending.push_back(delivery.id);
                     let count = result?;
                     options
                         .counters
                         .spans_emitted
                         .fetch_add(count, Ordering::Relaxed);
                     options
-                        .finish(&mut pending, &mut sink, &current, attempts, Work::Flush)
+                        .finish(
+                            &view,
+                            &mut pending,
+                            &mut sink,
+                            &current,
+                            attempts,
+                            Work::Flush,
+                        )
                         .await
                         .map(Some)
                 };
@@ -369,6 +390,7 @@ impl Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::Delivery;
     use crate::{
         pipeline::journal::SpanJournal,
         translate::{SpanOp, SpanRow},

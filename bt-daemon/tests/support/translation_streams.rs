@@ -32,6 +32,19 @@ pub fn native_streams() -> Vec<NativeStream> {
         events.extend(fixtures.start_turn(kind, id, &tree, "second", t + 40));
         cases.push((events[0].source.clone(), events, Some(fixtures)));
     }
+    let v2 = [
+        ("session.inbox.enqueued", json!({"sessionID":"native", "inboxID":"inbox", "item":{"type":"user","payload":{"text":"hello","files":[],"skills":[]},"delivery":"steer"}})),
+        ("session.inbox.delivered", json!({"sessionID":"native","inboxID":"inbox"})),
+        ("session.step.started", json!({"sessionID":"native","assistantMessageID":"step","started":2,"model":{"id":"mock","providerID":"mock"}})),
+        ("session.text.ended", json!({"sessionID":"native","assistantMessageID":"step","ordinal":0,"text":"answer"})),
+        ("session.step.ended", json!({"sessionID":"native","assistantMessageID":"step","finish":"stop"})),
+        ("session.execution.succeeded", json!({"sessionID":"native"})),
+    ].into_iter().enumerate().map(|(i,(name,data))| {
+        let mut envelope = event("opencode", name, i as i64 + 1, json!({"id":format!("v2-{i}"),"type":name,"data":data}));
+        envelope.source_version = Some("2.2.5".into());
+        envelope
+    }).collect();
+    cases.push(("opencode".into(), v2, None));
     let events = include_str!("../fixtures/muse-hooks-1.1.1.jsonl")
         .lines()
         .enumerate()

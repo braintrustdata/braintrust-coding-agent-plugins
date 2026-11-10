@@ -16,6 +16,7 @@ mod agents;
 mod args;
 mod client;
 mod codex_hooks;
+mod collections;
 mod command_output;
 mod correlation;
 mod delivery_ledger;

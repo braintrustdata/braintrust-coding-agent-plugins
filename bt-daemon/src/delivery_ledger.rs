@@ -43,6 +43,200 @@ struct LedgerLock {
     _file: std::fs::File,
 }
 
+// A stable coordination inode must survive collection: unlinking a lock while
+// another process waits on it would allow two independent lock owners.
+async fn session_lease(
+    data_dir: &Path,
+    id: &str,
+    exclusive: bool,
+) -> anyhow::Result<Option<LedgerLock>> {
+    // Use a bounded set of coordination files instead of leaving one inode per
+    // collected session. Unrelated sessions in the same bucket can defer GC.
+    let bucket = uuid::Uuid::parse_str(id)?.as_bytes()[0];
+    let dir = data_dir.join("delivery-ledger/leases");
+    let path = dir.join(format!("{bucket:02x}.lock"));
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        if exclusive {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            fs2::FileExt::lock_shared(&file)?;
+        }
+        Ok(Some(LedgerLock { _file: file }))
+    })
+    .await?
+}
+
+pub(crate) struct CollectedLedger {
+    _lease: LedgerLock,
+    dir: PathBuf,
+    prefix: String,
+}
+
+pub(crate) async fn try_collect_session(
+    data_dir: &Path,
+    id: &str,
+) -> anyhow::Result<Option<CollectedLedger>> {
+    Ok(session_lease(data_dir, id, true)
+        .await?
+        .map(|lease| CollectedLedger {
+            _lease: lease,
+            dir: data_dir.join("delivery-ledger"),
+            prefix: format!("{id}--"),
+        }))
+}
+
+// Imports may leave only a ledger, with no daemon input/output partition.
+// Keep a ledger while either recovery file exists or any ingress owns its lease.
+pub(crate) async fn collect_orphans(data_dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(data_dir.join("delivery-ledger")).await else {
+        return;
+    };
+    let mut ids = HashSet::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = name.get(..36) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(id).is_ok() {
+            ids.insert(id.to_owned());
+        }
+    }
+    let mut inputs = HashSet::new();
+    match tokio::fs::read_dir(crate::journal::journal_dir(data_dir)).await {
+        Ok(mut journals) => loop {
+            match journals.next_entry().await {
+                Ok(Some(entry)) => {
+                    let name = entry.file_name();
+                    if let Some(id) = name
+                        .to_str()
+                        .and_then(|name| name.strip_suffix(".ndjson"))
+                        .and_then(|name| name.rsplit("--").next())
+                    {
+                        inputs.insert(id.to_owned());
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return,
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+    for id in ids {
+        let Ok(Some(lease)) = try_collect_session(data_dir, &id).await else {
+            continue;
+        };
+        if tokio::fs::try_exists(data_dir.join("pipeline").join(format!("{id}.sqlite")))
+            .await
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let retained = inputs.contains(&id);
+        if !retained {
+            if let Err(error) = lease.remove_files().await {
+                tracing::warn!(%error, "orphan delivery ledger cleanup failed");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collection_waits_for_all_live_ingresses_and_keeps_recovery_ledgers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = crate::ids::session_storage_id("debug", "collect");
+        let first = session_lease(tmp.path(), &id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = session_lease(tmp.path(), &id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let dir = tmp.path().join("delivery-ledger");
+        let paths: Vec<_> = [
+            "ndjson",
+            "json",
+            "lock",
+            "origins.sqlite",
+            "origins.sqlite-wal",
+            "origins.sqlite-shm",
+        ]
+        .into_iter()
+        .map(|ext| dir.join(format!("{id}--destination.{ext}")))
+        .collect();
+        for path in &paths {
+            tokio::fs::write(path, b"receipt").await.unwrap();
+        }
+        collect_orphans(tmp.path()).await;
+        assert!(paths.iter().all(|p| p.exists()));
+        drop(first);
+        assert!(try_collect_session(tmp.path(), &id)
+            .await
+            .unwrap()
+            .is_none());
+        drop(second);
+        let raw = crate::journal::source_journal_path(tmp.path(), "debug", "collect");
+        tokio::fs::create_dir_all(raw.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&raw, b"input awaiting translation")
+            .await
+            .unwrap();
+        collect_orphans(tmp.path()).await;
+        assert!(paths.iter().all(|p| p.exists()));
+        tokio::fs::remove_file(raw).await.unwrap();
+        collect_orphans(tmp.path()).await;
+        assert!(paths.iter().all(|p| !p.exists()));
+        // The coordination inode remains stable, with no event or receipt data.
+        assert_eq!(
+            tokio::fs::metadata(dir.join("leases").join(format!(
+                "{:02x}.lock",
+                uuid::Uuid::parse_str(&id).unwrap().as_bytes()[0]
+            )))
+            .await
+            .unwrap()
+            .len(),
+            0
+        );
+    }
+}
+
+impl CollectedLedger {
+    pub(crate) async fn remove_files(&self) -> anyhow::Result<()> {
+        let mut entries = tokio::fs::read_dir(&self.dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&self.prefix))
+                && entry.file_type().await?.is_file()
+            {
+                tokio::fs::remove_file(entry.path()).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 struct DeliveryLedger {
     origins: OriginIndex,
     path: PathBuf,
@@ -52,6 +246,8 @@ struct DeliveryLedger {
     pending_late_merges: HashSet<String>,
     known_versions: HashMap<String, LateMergeVersion>,
     pending_versions: HashMap<String, LateMergeVersion>,
+    // Release only after all database and journal handles have been dropped.
+    _lease: LedgerLock,
 }
 
 impl DeliveryLedger {
@@ -61,6 +257,10 @@ impl DeliveryLedger {
         session_id: &str,
         config: &SessionConfig,
     ) -> anyhow::Result<(Self, HashMap<String, Arc<OriginSnapshot>>)> {
+        let id = crate::ids::session_storage_id(source, session_id);
+        let lease = session_lease(data_dir, &id, false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("shared ledger lease was not acquired"))?;
         let fingerprint = serde_json::json!({
             "api_url": config.auth.api_url,
             "org_id": config.auth.org_id,
@@ -83,6 +283,7 @@ impl DeliveryLedger {
         let origin_path = path.with_extension("origins.sqlite");
         tokio::fs::create_dir_all(data_dir.join("delivery-ledger")).await?;
         let mut ledger = Self {
+            _lease: lease,
             origins: OriginIndex::open(origin_path).await?,
             path: path.with_extension("ndjson"),
             journal_len: 0,

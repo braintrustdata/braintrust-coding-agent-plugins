@@ -490,12 +490,12 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
     let journal = source_journal_path(&data_dir, "claude-code", session);
     // Model a released pre-SpanOp-journal daemon: accepted native history and
     // a legacy delivery checkpoint, with no newer durable partition.
-    let raw = std::fs::read_to_string(&journal).unwrap();
-    let mut history = raw
-        .lines()
-        .filter(|line| !line.contains("_bt_record_type"))
-        .map(|line| format!("{line}\n"))
-        .collect::<String>();
+    let mut history = format!(
+        "{}\n",
+        serde_json::to_string(&capture("UserPromptSubmit", "v1", "native1", 1_000).redacted())
+            .unwrap()
+    );
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
     let through = history.len() as u64;
     history.push_str(&format!("{}\n",json!({"_bt_record_type":"delivery_checkpoint", "route":capture("UserPromptSubmit","v1","native1",1_000).route, "through":through})));
     std::fs::write(&journal, &history).unwrap();

@@ -73,7 +73,7 @@ impl TranslatorFactory for crate::agents::Cursor {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct History {
     messages: VecDeque<Value>,
     bytes: usize,
@@ -100,7 +100,7 @@ impl History {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Turn {
     ordinal: u64,
     id: String,
@@ -113,7 +113,9 @@ struct Turn {
     emitted_text: String,
     usage: serde_json::Map<String, Value>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ModelStep {
+    #[serde(with = "super::state::row")]
     row: SpanRow,
     content: Vec<Value>,
     text: String,
@@ -153,14 +155,15 @@ impl ModelStep {
         self.content.push(value);
     }
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Tool {
+    #[serde(with = "super::state::row")]
     row: SpanRow,
     turn: String,
     call_id: String,
     ended: bool,
 }
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct TranscriptCursor {
     path: String,
     offset: u64,
@@ -207,7 +210,7 @@ impl TranscriptCursor {
         Ok((records, truncated, self.offset >= through))
     }
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CursorTranslator {
     namespace: String,
     root: String,
@@ -218,6 +221,7 @@ struct CursorTranslator {
     cwd: Option<String>,
     model: Option<String>,
     model_params: Option<Value>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
     turn_seq: u64,
     turn: Option<Turn>,
@@ -233,6 +237,7 @@ struct CursorTranslator {
     transcript_owner: Option<String>,
     transcript_unattributed: bool,
     pending: Option<Envelope>,
+    #[serde(with = "super::state::rows")]
     subagents: BTreeMap<String, SpanRow>,
     compact_seq: u64,
 }
@@ -1535,6 +1540,14 @@ impl CursorTranslator {
     }
 }
 impl AgentTranslator for CursorTranslator {
+    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        *self = serde_json::from_slice(bytes)?;
+        Ok(())
+    }
+
     fn handle(&mut self, e: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),

@@ -2,14 +2,14 @@
 use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub(super) enum Content {
     Text(String),
     Parts(Vec<ContentPart>),
     Dynamic(Value),
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub(super) enum ContentPart {
     Text(TextPart),
@@ -18,41 +18,44 @@ pub(super) enum ContentPart {
     Tool(super::event::ToolContent),
     Dynamic(Value),
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct TextPart {
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub text: String,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct ImagePart {
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub image_url: ImageUrl,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct ImageUrl {
     pub url: String,
 }
 impl ContentPart {
     pub fn text(text: String) -> Self {
-        Self::Text(TextPart { kind: "text", text })
+        Self::Text(TextPart {
+            kind: "text".into(),
+            text,
+        })
     }
     pub fn image(url: String) -> Self {
         Self::Image(ImagePart {
-            kind: "image_url",
+            kind: "image_url".into(),
             image_url: ImageUrl { url },
         })
     }
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub function: FunctionCall,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct FunctionCall {
     pub name: String,
     pub arguments: String,
@@ -61,7 +64,7 @@ impl ToolCall {
     pub fn new(id: String, name: String, input: &Value) -> Self {
         Self {
             id,
-            kind: "function",
+            kind: "function".into(),
             function: FunctionCall {
                 name,
                 arguments: input.to_string(),
@@ -69,23 +72,23 @@ impl ToolCall {
         }
     }
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct Reasoning {
-    pub id: &'static str,
+    pub id: String,
     pub content: String,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct Message {
     pub role: String,
     pub content: Content,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Vec<Reasoning>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_type: Option<&'static str>,
+    pub message_type: Option<String>,
 }
 impl Message {
     pub fn new(role: impl Into<String>, content: Content) -> Self {
@@ -105,7 +108,7 @@ impl Message {
     }
     pub fn summary(text: String) -> Self {
         let mut message = Self::new("assistant", Content::Text(text));
-        message.message_type = Some("compaction_summary");
+        message.message_type = Some("compaction_summary".into());
         message
     }
 }

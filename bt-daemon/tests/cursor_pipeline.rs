@@ -7,14 +7,17 @@
 //! Cursor hooks freeze native transcript observations before journal ingress.
 //! Recovery must use those mirrors even after native files change or disappear.
 
+#[path = "support/journal_store.rs"]
+mod journal_store;
+
 use async_trait::async_trait;
 use bt_daemon::wire::{
     AuthSelection, BackendAuth, Envelope, FlushMode, SessionRoute, TraceDestination,
 };
 use bt_daemon::{
     debug_serve_options, flush_session, forward_envelope, run_serve, run_status, shutdown_daemon,
-    source_journal_path, AuthLease, AuthProvider, AuthResolveReason, HostInfo, ServeArgs, Sink,
-    SinkFactory, SpanOp, StatusArgs,
+    AuthLease, AuthProvider, AuthResolveReason, HostInfo, ServeArgs, Sink, SinkFactory, SpanOp,
+    StatusArgs,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -454,7 +457,6 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
     ] {
         send_with_flush_mode(&socket, event, ts_ms, payload, FlushMode::FlushOnTurnEnd).await;
     }
-    let journal = source_journal_path(&data, "cursor", "cursor-recovery");
     // Ingress acknowledges capture before the out-of-band sink flush finishes.
     // Wait for delivery and its checkpoint without requesting an explicit flush.
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
@@ -462,22 +464,7 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
             let delivered = buffered.lock().unwrap().delivered.iter().any(|op| {
                 matches!(op, SpanOp::Merge(row) if row.output == Some(json!("late final answer")))
             });
-            let text = std::fs::read_to_string(&journal).unwrap_or_default();
-            let mut position = 0;
-            let mut response_through = None;
-
-            for line in text.split_inclusive('\n') {
-                position += line.len() as u64;
-                let Ok(row) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                if row["event"] == "afterAgentResponse" {
-                    response_through = Some(position);
-                }
-            }
-            let completed = delivered && response_through.is_some_and(|offset| {
-                span_journal(&data).query_row("SELECT min(position)>=(SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input) WHERE committed=1) AND (SELECT coalesce(max(input),0) FROM batches WHERE committed=1)>=? FROM heads", [offset], |row|row.get::<_,bool>(0)).unwrap_or(false)
-            });
+            let completed=delivered && span_journal(&data).query_row("SELECT EXISTS(SELECT 1 FROM source_checkpoint WHERE through>=(SELECT tail FROM collection_state WHERE name='events')) AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position<(SELECT tail FROM publication WHERE id=1))",[],|row|row.get::<_,bool>(0)).unwrap_or(false);
             if delivered && completed {
                 break;
             }
@@ -694,23 +681,23 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
     assert!(llms
         .iter()
         .all(|row| row["parent_span_ids"].as_array().unwrap().len() == 1));
-    let journal = source_journal_path(&data, "cursor", "cursor-recovery");
-    let persisted = rows(&journal);
-    let observations = persisted
-        .iter()
-        .filter(|row| row["event"] == "stop")
-        .map(|row| &row["payload"]["_bt_transcript_mirror"])
-        .collect::<Vec<_>>();
-    assert_eq!(observations.len(), 2);
-    assert_ne!(observations[0]["mirror"], observations[1]["mirror"]);
-    for observation in &observations {
-        assert_eq!(observation["through"], first.len());
-        assert!(Path::new(observation["mirror"].as_str().unwrap())
-            .starts_with(data.join("transcripts")));
+    let checkpoint = journal_store::checkpoint(&data, "cursor", "cursor-recovery").unwrap();
+    let bounds = checkpoint["bounds"].as_object().unwrap();
+    assert_eq!(
+        bounds.len(),
+        2,
+        "continuation owns both captured mirror generations"
+    );
+    for (path, through) in bounds {
+        assert!(through.as_u64().unwrap() <= first.len() as u64);
+        assert!(Path::new(path).starts_with(data.join("transcripts")));
     }
-    assert!(!std::fs::read_to_string(&journal)
-        .unwrap()
-        .contains("cursor-test-secret"));
+    assert_eq!(
+        checkpoint["native"]["transcript"]["offset"],
+        first.len() as u64
+    );
+    assert!(journal_store::pending(&data, "cursor", "cursor-recovery").is_empty());
+    assert!(!checkpoint.to_string().contains("cursor-test-secret"));
 
     // Recover the dormant route as well as the primary route from the retained payloads.
     span_journal(&data)

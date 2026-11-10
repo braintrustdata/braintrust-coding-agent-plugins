@@ -45,6 +45,13 @@ fn publish_turn(row: &mut SpanRow) {
 }
 
 impl AgentTranslator for TurnLineage {
+    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
+        self.inner.save_state()
+    }
+    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.inner.restore_state(bytes)
+    }
+
     fn handle(
         &mut self,
         event: &crate::wire::Envelope,

@@ -28,7 +28,7 @@ fn span_value(value: impl Serialize) -> Value {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct SessionState {
     root: String,
     trace_root: String,
@@ -44,10 +44,12 @@ struct SessionState {
     native_window: Option<NativeWindow>,
     calls: HashMap<String, Vec<ToolCall>>,
     results: HashMap<String, Vec<Message>>,
+    #[serde(with = "super::state::pairs")]
     tools: HashMap<(String, String), ToolState>,
     denied_tools: HashSet<(String, String)>,
     completed_messages: RecentSet<String>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ToolState {
     name: String,
     skill_name: Option<String>,
@@ -56,21 +58,25 @@ struct ToolState {
     parent: String,
     denied: bool,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Step {
     started: i64,
     model: Option<Model>,
     context: Option<Context>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Permission {
     session_id: String,
     call_id: Option<String>,
     message_id: Option<String>,
     action: String,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct HistoryEntry {
     id: String,
     messages: Vec<Message>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct NativeWindow {
     model: Option<Model>,
     messages: Vec<Message>,
@@ -85,6 +91,7 @@ impl NativeWindow {
         )
     }
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Compaction {
     started: i64,
     input_id: Option<String>,
@@ -103,18 +110,24 @@ struct CompactionResult<'a> {
     native_messages: Option<NativeMessages>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct OpenCodeV2Translator {
     daemon_session_id: String,
     sessions: HashMap<String, SessionState>,
+    #[serde(with = "super::state::pairs")]
     pending_inputs: HashMap<(String, String), Prompt>,
+    #[serde(with = "super::state::pairs")]
     tool_names: HashMap<(String, String, String), String>,
+    #[serde(with = "super::state::pairs")]
     steps: HashMap<(String, String), Step>,
     pending_context: HashMap<String, Context>,
+    #[serde(with = "super::state::pairs")]
     text_parts: HashMap<(String, String, bool), BTreeMap<u64, String>>,
     permissions: HashMap<String, Permission>,
     compactions: HashMap<String, Compaction>,
     seen: RecentSet<String>,
     last_ts_ms: i64,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 impl OpenCodeV2Translator {
@@ -358,6 +371,14 @@ impl OpenCodeV2Translator {
     }
 }
 impl AgentTranslator for OpenCodeV2Translator {
+    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        *self = serde_json::from_slice(bytes)?;
+        Ok(())
+    }
+
     fn handle(&mut self, event: &Envelope, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut payload = event.payload.clone();
@@ -841,7 +862,7 @@ impl OpenCodeV2Translator {
         }
         if let Some(reasoning) = reasoning {
             assistant.reasoning = Some(vec![Reasoning {
-                id: "reasoning",
+                id: "reasoning".into(),
                 content: reasoning,
             }]);
         }

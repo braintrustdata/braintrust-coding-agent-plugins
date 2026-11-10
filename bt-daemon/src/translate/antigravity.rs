@@ -26,27 +26,27 @@ impl TranslatorFactory for crate::agents::Antigravity {
         ))
     }
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Turn {
     span_id: String,
     number: u32,
     start_ms: i64,
     last_output: Option<Value>,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Invocation {
     span_id: String,
     parent_span_id: String,
     history_start: usize,
     record_start: usize,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingTool {
     span_id: String,
     parent_span_id: String,
     name: String,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct AntigravityTranslator {
     session_id: String,
     session_span_id: String,
@@ -63,6 +63,7 @@ struct AntigravityTranslator {
     invocations: HashMap<i64, Invocation>,
     tools: HashMap<i64, PendingTool>,
     last_ts_ms: i64,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 
@@ -494,6 +495,14 @@ impl AntigravityTranslator {
 }
 
 impl AgentTranslator for AntigravityTranslator {
+    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        *self = serde_json::from_slice(bytes)?;
+        Ok(())
+    }
+
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut ops = Vec::new();
@@ -699,7 +708,7 @@ fn clean_user_input(content: Value) -> Value {
     )
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct ToolDetails {
     name: Option<String>,
     input: Option<Value>,

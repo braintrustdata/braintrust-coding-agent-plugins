@@ -9,12 +9,18 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         .values()
         .flat_map(|state| state.events.iter().cloned())
         .collect();
-    let Ok(mut entries) = tokio::fs::read_dir(journal::journal_dir(&daemon.data_dir)).await else {
+    let Ok(paths) = journal::paths(&daemon.data_dir).await else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
+    for path in paths {
+        // Complete interrupted legacy migration before interpreting its prefix.
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            if let Err(error) = JournalWriter::open_path(&path).await {
+                tracing::warn!(%error,path=%path.display(),"journal migration is held");
+                continue;
+            }
+        }
         if path.extension().and_then(|ext| ext.to_str()) != Some("ndjson") {
             continue;
         }
@@ -34,6 +40,21 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         let mut before = 0u64;
         let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
         let mut latest_by_route: HashMap<String, PendingEvent> = HashMap::new();
+        if let Ok(Some(template)) = journal::identity(&path).await {
+            let env = journal::envelope_from_redacted(template);
+            daemon.remember_claude_transcripts(&env);
+            if let Some(route) = &env.route {
+                latest_by_route.insert(
+                    serde_json::to_string(route).unwrap_or_default(),
+                    PendingEvent {
+                        env,
+                        replay_through: recorded_len,
+                        journal_through: recorded_len,
+                        settings_through: Some(0),
+                    },
+                );
+            }
+        }
         while let Ok(Some(entry)) = reader.next_record().await {
             let through = entry.through;
             match entry.record {
@@ -155,10 +176,26 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
                     crate::pipeline::journal::SpanJournal::open(&span_path).await,
                     recovered_route.as_ref(),
                 ) {
-                    (Ok(journal), Some(route)) => journal
-                        .route_complete(route, recorded_len)
-                        .await
-                        .unwrap_or(false),
+                    (Ok(journal), Some(route)) => {
+                        let registered = journal
+                            .routes()
+                            .await
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|head| head.same_route(route));
+                        if registered {
+                            journal
+                                .route_complete(route, recorded_len)
+                                .await
+                                .unwrap_or(false)
+                        } else {
+                            acknowledged_by_route
+                                .get(&serde_json::to_string(route).unwrap_or_default())
+                                .copied()
+                                .unwrap_or(0)
+                                >= event.journal_through
+                        }
+                    }
                     _ => false,
                 }
             } else {
@@ -450,8 +487,11 @@ pub(super) mod tests {
             .automatic_links
             .lock()
             .insert(key.clone(), linked.clone());
-        let storage = tmp.path().join("pipeline");
-        std::fs::write(&storage, "blocked storage path").unwrap();
+        let storage = crate::collections::database_path(&raw);
+        rusqlite::Connection::open(&storage)
+            .unwrap()
+            .execute_batch("PRAGMA user_version=999")
+            .unwrap();
         assert!(accept_event(
             &daemon,
             PendingEvent {
@@ -467,7 +507,10 @@ pub(super) mod tests {
         assert!(saved.linked_route.as_ref().unwrap().same_route(&linked));
         assert_eq!(saved.recovery.unwrap().info(false).stage, "journal");
         assert_eq!(daemon.pending_sessions.lock()[&key].events.len(), 1);
-        std::fs::remove_file(storage).unwrap();
+        rusqlite::Connection::open(&storage)
+            .unwrap()
+            .execute_batch("PRAGMA user_version=0")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let _ = retry_pending_sessions(&daemon).await;
