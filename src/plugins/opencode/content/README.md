@@ -1,7 +1,6 @@
 # @braintrust/trace-opencode
 
-Trace [OpenCode](https://opencode.ai) sessions in Braintrust. The plugin sends
-events to the local `bt` daemon, which builds and uploads traces. OpenCode keeps
+Trace [OpenCode](https://opencode.ai) sessions in Braintrust. OpenCode keeps
 running if tracing fails.
 
 - **Session spans**: Root span for each OpenCode session with metadata (workspace, hostname, etc.)
@@ -33,20 +32,8 @@ Historical import and live attach are not supported for OpenCode.
 
 ## Compatibility
 
-The plugin supports OpenCode 1.x and provides experimental tracing for
-OpenCode 2 (`@opencode/cli`). Both versions capture conversations, model calls,
-tools, and subagent sessions.
-
-Use `bt trace run --project <project> opencode run <prompt>` to trace one run.
-For OpenCode 2, this starts a private server so the run uses its selected
-Braintrust destination. Persistent plugin setup is also supported.
-
-Events are journaled by the local daemon before being processed and uploaded.
-Tracing fails open if the daemon is unavailable; abrupt process termination can
-lose events that have not yet reached the journal.
-
-The package requires `@opencode-ai/plugin` and `@opencode-ai/sdk` version
-1.2.25 or later for OpenCode 1.
+Supports OpenCode 1.x and experimental OpenCode 2
+(`@opencode/cli`) tracing. Both versions use the setup commands above.
 
 ## Configuration
 
@@ -136,7 +123,7 @@ The value must be a JSON object. Built-in session metadata wins if keys conflict
 
 ## Trace structure
 
-The daemon reconstructs sessions, turns, model messages, and tool executions:
+Traces contain sessions, turns, model responses, and tool executions:
 
 ```text
 Session (task)
@@ -149,7 +136,7 @@ Session (task)
 
 Model usage and metadata are included when OpenCode provides them. Child
 sessions are attached to their parent's active turn when that relationship is
-available to the translator.
+available.
 
 ## Manage tracing
 
@@ -160,15 +147,8 @@ bt trace update opencode
 bt trace disable opencode
 ```
 
-## Runtime architecture
-
-Tracing sends events to the local daemon over JSON-RPC. The four optional
-Braintrust tools call `bt` commands. Both use `bt` for credentials and API access.
-
 ## Development
 
-From the monorepo root, run `make validate-opencode` to build, check, and test
-the package. See the
+See the
 [contribution guide](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/src/plugins/opencode/content/CONTRIBUTING.md)
-for development instructions. The npm package contains compiled entrypoints;
-source changes belong in the monorepo.
+for development instructions.
