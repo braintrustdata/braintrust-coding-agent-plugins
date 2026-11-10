@@ -33,22 +33,20 @@ Historical import and live attach are not supported for OpenCode.
 
 ## Compatibility
 
-The plugin supports OpenCode 1.x and has experimental support for OpenCode 2
-through its `@opencode/cli` distribution. Installed-package tests exercise
-text and tool sessions, subagents, attachments, denied permissions, interrupted
-sessions, compaction, and resumed sessions using a mock model and trace backend.
-Managed runs start a private OpenCode 2 server to keep routing scoped to the run.
-Standalone delivery is tested with delayed event acknowledgements. As with
-other fail-open integrations, abrupt termination or an unavailable daemon can
-prevent trace events from being delivered.
+The plugin supports OpenCode 1.x and provides experimental tracing for
+OpenCode 2 (`@opencode/cli`). Both versions capture conversations, model calls,
+tools, and subagent sessions.
 
-Runtime hooks enqueue events without waiting for translation or upload. During
-plugin teardown, pending dispatches wait only for the daemon's journal
-acknowledgements; the daemon processes and uploads those events independently.
+Use `bt trace run --project <project> opencode run <prompt>` to trace one run.
+For OpenCode 2, this starts a private server so the run uses its selected
+Braintrust destination. Persistent plugin setup is also supported.
 
-The package declares `@opencode-ai/plugin` and `@opencode-ai/sdk` peers at
-`>=1.2.25`. CI checks package installation at that minimum and at the latest
-1.x peers, and runs real-agent integration tests with both distributions.
+Events are journaled by the local daemon before being processed and uploaded.
+Tracing fails open if the daemon is unavailable; abrupt process termination can
+lose events that have not yet reached the journal.
+
+The package requires `@opencode-ai/plugin` and `@opencode-ai/sdk` version
+1.2.25 or later for OpenCode 1.
 
 ## Configuration
 

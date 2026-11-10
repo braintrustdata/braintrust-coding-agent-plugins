@@ -5,16 +5,13 @@ use crate::agents::OpenCode;
 use crate::args::RunHookCommand;
 use std::ffi::OsString;
 
-/// Detect OpenCode 2 from `--version`. Detection is best-effort: any failure
-/// falls back to the 1.x integration (the pre-2.0 behavior) with a warning
-/// rather than refusing to launch the agent.
-pub(super) async fn is_v2(executable: &std::ffi::OsStr) -> bool {
-    match detect_major_version(executable).await {
-        Ok(major) => major == 2,
-        Err(error) => {
-            tracing::warn!(%error, "could not detect OpenCode version; assuming OpenCode 1.x");
-            false
-        }
+/// Select only a recognized protocol; an unknown version must not silently
+/// choose v1 and bypass v2's private-server safeguards.
+pub(super) async fn is_v2(executable: &std::ffi::OsStr) -> anyhow::Result<bool> {
+    match detect_major_version(executable).await? {
+        1 => Ok(false),
+        2 => Ok(true),
+        major => anyhow::bail!("unsupported OpenCode major version {major}"),
     }
 }
 
@@ -188,14 +185,18 @@ mod tests {
         let executable = temp.path().join("opencode");
         std::fs::write(&executable, "#!/bin/sh\nprintf '2.2.5\\n'\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(is_v2(executable.as_os_str()).await);
+        assert!(is_v2(executable.as_os_str()).await.unwrap());
         std::fs::write(&executable, "#!/bin/sh\nprintf '1.18.0\\n'\n").unwrap();
-        assert!(!is_v2(executable.as_os_str()).await);
-        // A broken or unrecognizable --version falls back to 1.x instead of failing the run.
+        assert!(!is_v2(executable.as_os_str()).await.unwrap());
+        // Detection failures must not silently select v1.
         std::fs::write(&executable, "#!/bin/sh\nexit 3\n").unwrap();
-        assert!(!is_v2(executable.as_os_str()).await);
+        assert!(is_v2(executable.as_os_str()).await.is_err());
+        std::fs::write(&executable, "#!/bin/sh\nprintf unknown\n").unwrap();
+        assert!(is_v2(executable.as_os_str()).await.is_err());
+        std::fs::write(&executable, "#!/bin/sh\nprintf 3.0.0\n").unwrap();
+        assert!(is_v2(executable.as_os_str()).await.is_err());
         std::fs::write(&executable, "#!/bin/sh\nprintf '2.0.1\\n' >&2\n").unwrap();
-        assert!(is_v2(executable.as_os_str()).await);
+        assert!(is_v2(executable.as_os_str()).await.unwrap());
     }
 
     #[test]

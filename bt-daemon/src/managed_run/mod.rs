@@ -148,7 +148,7 @@ async fn run_traced_inner(
         .map(|runtime| runtime.socket.clone())
         .unwrap_or_else(|| paths::socket_path(None));
     let mut injection = if args.source == RunSource::OpenCode {
-        let v2 = opencode::is_v2(&executable).await;
+        let v2 = opencode::is_v2(&executable).await?;
         opencode::inject_for_version(v2, &args.agent_args)?
     } else {
         agent.inject_with_context(&hook_command, &managed_run_id, &route, &socket)?

@@ -4604,3 +4604,79 @@ async fn event_pipeline_stops_after_a_rejected_request() {
     assert!(lines.next_line().await.unwrap().is_none());
     handle.abort();
 }
+
+#[tokio::test]
+async fn managed_run_flush_shares_one_budget_and_returns_pending_counts() {
+    struct BlockedFlush;
+    #[async_trait]
+    impl Sink for BlockedFlush {
+        fn configure(&mut self, _: &SessionConfig) {}
+        async fn emit(&mut self, ops: &[SpanOp]) -> anyhow::Result<u64> {
+            Ok(ops.len() as u64)
+        }
+        async fn flush(&mut self) -> anyhow::Result<()> {
+            std::future::pending().await
+        }
+    }
+    struct Factory;
+    impl SinkFactory for Factory {
+        fn create(&self, _: &str, _: &str) -> anyhow::Result<Box<dyn Sink>> {
+            Ok(Box::new(BlockedFlush))
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let mut options = debug_serve_options("test", &data_dir);
+    options.sink_factory = Arc::new(Factory);
+    options.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
+    let endpoint = socket.clone();
+    let handle = tokio::spawn(async move {
+        run_serve(
+            ServeArgs {
+                socket: Some(endpoint),
+                data_dir: Some(data_dir),
+                idle_timeout_secs: 0,
+                session_idle_timeout_secs: 0,
+            },
+            options,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for(&socket).await;
+    for session in ["budget-a", "budget-b", "budget-c"] {
+        let mut event = envelope(session, "SessionStart", 1);
+        event.managed_run_id = Some("shared-budget".into());
+        forward_envelope(&event, &socket, &dummy_host(), false)
+            .await
+            .unwrap();
+    }
+    // Journal acknowledgement precedes actor creation. Observe the ingress
+    // barrier before measuring finalize's budget, so initialization is excluded.
+    let status = run_status(StatusArgs {
+        socket: Some(socket.clone()),
+        session_id: None,
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status.sessions.len(), 3);
+    // All three sinks remain blocked. The server must answer with diagnostics
+    // within its shared budget, before the client's outer deadline expires.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        flush_managed_run("shared-budget", &socket, 1000),
+    )
+    .await
+    .unwrap()
+    .expect("daemon must return its pending-count response");
+    assert!(!result.flushed);
+    assert_eq!(result.accepted_sessions, 3);
+    assert!(result.pending > 0);
+    handle.abort();
+}
