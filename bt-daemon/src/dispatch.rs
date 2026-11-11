@@ -130,9 +130,9 @@ impl Session {
                     }
                     SessionMsg::Flush(reply) | SessionMsg::Finalize(reply) => {
                         let kind = if finalize {
-                            crate::journal::ControlKind::Finalize
+                            crate::pipeline::input::ControlKind::Finalize
                         } else {
-                            crate::journal::ControlKind::Checkpoint
+                            crate::pipeline::input::ControlKind::Checkpoint
                         };
                         let target = producer.control(kind).await;
                         let progress = progress.clone();
@@ -163,7 +163,7 @@ impl Session {
                         let target = match target {
                             Some(tail) => Some(tail),
                             None if last => producer
-                                .control(crate::journal::ControlKind::Retire)
+                                .control(crate::pipeline::input::ControlKind::Retire)
                                 .await
                                 .ok(),
                             None => None,

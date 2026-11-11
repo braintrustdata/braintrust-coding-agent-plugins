@@ -2,7 +2,7 @@
 //! capabilities stay inside this adapter while callers use read/remove.
 use super::{
     async_iter::{AsyncIterator, IntoAsyncIterator},
-    Delivery, Entry, InputPort,
+    Delivery, InputPort,
 };
 use crate::pipeline::recovery::Failure;
 use parking_lot::Mutex;
@@ -13,6 +13,13 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+
+/// A record read through a view, removable by its ID.
+#[derive(Debug)]
+pub(crate) struct Entry<T> {
+    pub id: u64,
+    pub value: T,
+}
 
 type Input<T> = Box<dyn InputPort<Item = T>>;
 type Read<T> =

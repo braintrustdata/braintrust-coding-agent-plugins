@@ -2947,13 +2947,13 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
             .collect::<String>();
         assert!(!journal.is_empty());
         let backup = data_dir.parent().unwrap().join("pending-backup.sqlite");
-        rusqlite::Connection::open(journal_store::path(
+        bt_daemon::storage_inspect::Inspector::open(&journal_store::path(
             &data_dir,
             "claude-code",
             "bounded-child",
         ))
         .unwrap()
-        .execute("VACUUM INTO ?", [backup.to_str().unwrap()])
+        .backup(&backup)
         .unwrap();
         let saved_database = std::fs::read(&backup).unwrap();
         shutdown_daemon(&socket).await.unwrap();

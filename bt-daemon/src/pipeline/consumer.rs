@@ -572,7 +572,7 @@ mod tests {
         consumer.shutdown().await;
         forward.abort();
         let _ = forward.await;
-        journal.close().await.unwrap();
+        drop(journal);
     }
 
     #[tokio::test]
@@ -606,7 +606,7 @@ mod tests {
             .unwrap()
             .is_none());
         consumer.shutdown().await;
-        journal.close().await.unwrap();
+        drop(journal);
     }
     struct Acknowledged(Arc<AtomicU64>);
     #[async_trait::async_trait]
@@ -708,15 +708,17 @@ mod tests {
         stored(&journal).await;
         let route = SessionRoute::default();
         let cursor = journal.subscribe(&route, 0).await.unwrap();
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TRIGGER fail_head BEFORE UPDATE OF position ON heads BEGIN SELECT RAISE(FAIL,'injected head failure'); END;").unwrap();
+        let db = crate::collections::inspect::Inspector::open(&path).unwrap();
+        db.inject(crate::collections::inspect::Fault::AdvanceHead)
+            .unwrap();
         let record = Arc::new(Recording::default());
         let (consumer, progress, error) =
             spawn(cursor, options(tmp.path(), &route, record.clone()));
         wait_for(|| error.lock().is_some()).await;
         assert_eq!(progress.completed(), 0);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
-        db.execute_batch("DROP TRIGGER fail_head").unwrap();
+        db.clear(crate::collections::inspect::Fault::AdvanceHead)
+            .unwrap();
         wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.submitted.load(Ordering::SeqCst), 1);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
@@ -774,7 +776,7 @@ mod tests {
         consumer.shutdown().await;
         forward.abort();
         let _ = forward.await;
-        journal.close().await.unwrap();
+        drop(journal);
     }
     struct RefreshAuth(Arc<AtomicU64>);
     #[async_trait::async_trait]

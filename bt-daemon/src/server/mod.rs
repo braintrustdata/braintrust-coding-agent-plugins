@@ -22,8 +22,9 @@ use recovery::*;
 use rpc::*;
 use sessions::*;
 
+use crate::collections::{EventCollection, EventRecord};
 use crate::dispatch::{hydrate_transcript_reference, Session, SessionOptions};
-use crate::journal::{self, JournalWriter};
+use crate::journal;
 use crate::sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, SinkFactory};
 use crate::translate::Registry;
 use crate::transport::{self, Listener, ServerStream};
@@ -102,7 +103,7 @@ struct SessionAuthState {
     lease: AuthLease,
 }
 
-type JournalSlot = Arc<tokio::sync::OnceCell<Arc<tokio::sync::Mutex<JournalWriter>>>>;
+type EventSlot = Arc<tokio::sync::OnceCell<EventCollection>>;
 
 pub struct Daemon {
     version: String,
@@ -117,7 +118,8 @@ pub struct Daemon {
     /// Serializes daemon-side routing and actor creation independently of
     /// capture, which must never inherit actor or sink backpressure.
     dispatch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    journals: Mutex<HashMap<PathBuf, JournalSlot>>,
+    /// Open input collections by source-session namespace.
+    journals: Mutex<HashMap<String, EventSlot>>,
     source_inputs: Mutex<HashMap<String, crate::pipeline::input::SourceInput>>,
     claude_transcripts: Mutex<HashMap<DeliveryKey, ClaudeTranscriptObservation>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
@@ -135,7 +137,7 @@ pub struct Daemon {
     ingress_tx: mpsc::Sender<IngressMsg>,
     /// Earliest live append during startup, keyed by source journal path.
     /// Recovery must not absorb queued live events into its historical head.
-    startup_cutoffs: Mutex<Option<HashMap<PathBuf, u64>>>,
+    startup_cutoffs: Mutex<Option<HashMap<String, u64>>>,
     capture_buffer: Mutex<CaptureBuffer>,
     started: Instant,
     last_activity: Mutex<Instant>,

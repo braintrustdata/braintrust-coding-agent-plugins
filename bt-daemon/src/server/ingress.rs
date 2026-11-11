@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 #[derive(Default)]
 pub(super) struct CaptureBuffer {
     pub(super) events: VecDeque<PendingEvent>,
-    pub(super) evicted: HashMap<PathBuf, EvictedRange>,
+    pub(super) evicted: HashMap<(String, String), EvictedRange>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -19,16 +19,11 @@ pub(super) struct EvictedRange {
 }
 
 impl CaptureBuffer {
-    fn push(&mut self, data_dir: &std::path::Path, event: PendingEvent) {
+    fn push(&mut self, event: PendingEvent) {
         if self.events.len() == INGRESS_QUEUE_CAPACITY {
             if let Some(oldest) = self.events.pop_front() {
-                let path = journal::source_journal_path(
-                    data_dir,
-                    &oldest.env.source,
-                    &oldest.env.session_id,
-                );
                 self.evicted
-                    .entry(path)
+                    .entry((oldest.env.source.clone(), oldest.env.session_id.clone()))
                     .and_modify(|range| range.through = range.through.max(oldest.journal_through))
                     .or_insert(EvictedRange {
                         from: oldest.replay_through,
@@ -41,7 +36,7 @@ impl CaptureBuffer {
 }
 
 pub(super) enum CaptureWork {
-    Evicted(HashMap<PathBuf, EvictedRange>),
+    Evicted(HashMap<(String, String), EvictedRange>),
     Event(Box<PendingEvent>),
     Finished,
 }
@@ -84,11 +79,14 @@ pub(super) async fn drain_capture_buffer(daemon: &Arc<Daemon>) -> anyhow::Result
 /// startup recovery does. Rebuild decoder context before each range.
 pub(super) async fn replay_evicted(
     daemon: &Arc<Daemon>,
-    bounds: &HashMap<PathBuf, EvictedRange>,
+    bounds: &HashMap<(String, String), EvictedRange>,
 ) -> anyhow::Result<()> {
     let mut ready = Vec::new();
-    for (path, range) in bounds {
-        let mut reader = journal::JournalReader::resume(path, range.from, range.through).await?;
+    for ((source, session_id), range) in bounds {
+        let mut reader = daemon
+            .events_for(source, session_id)
+            .await?
+            .read(range.from, range.through);
         if let Some((timestamp, event)) =
             next_evicted_event(daemon, &mut reader, range.through).await?
         {
@@ -112,17 +110,17 @@ pub(super) async fn replay_evicted(
 
 async fn next_evicted_event(
     daemon: &Daemon,
-    reader: &mut journal::JournalReader,
+    reader: &mut crate::collections::EventReader,
     through: u64,
 ) -> anyhow::Result<Option<(i64, PendingEvent)>> {
     while reader.position() < through {
         let before = reader.position();
         let entry = reader
-            .next_record()
+            .next()
             .await?
             .ok_or_else(|| anyhow::anyhow!("replay range ends inside a record"))?;
-        anyhow::ensure!(entry.through <= through, "invalid replay end boundary");
-        if let journal::JournalRecord::Event(redacted) = entry.record {
+        anyhow::ensure!(entry.id <= through, "invalid replay end boundary");
+        if let EventRecord::Event(redacted) = entry.record {
             let mut env = journal::envelope_from_redacted(redacted);
             let Some(source) = daemon.translators.canonical_source(&env.source) else {
                 continue;
@@ -133,7 +131,7 @@ async fn next_evicted_event(
                 PendingEvent {
                     env,
                     replay_through: before,
-                    journal_through: entry.through,
+                    journal_through: entry.id,
                     settings_through: None,
                 },
             )));
@@ -356,25 +354,22 @@ impl Daemon {
     /// Caller holds the source-session capture lock; frozen observations enter
     /// the same durable queue as hooks without reacquiring that lock.
     pub(super) async fn journal_and_enqueue(&self, env: Envelope) -> Result<bool, String> {
-        let writer = self
-            .journal_writer_for(&env.source, &env.session_id)
+        let events = self
+            .events_for(&env.source, &env.session_id)
             .await
-            .map_err(|error| format!("journal failed: {error}"))?;
-        let (replay_through, journal_through) = {
-            let mut writer = writer.lock().await;
-            let position = self
-                .append_to_journal(&env, &mut writer)
-                .await
-                .map_err(|error| format!("journal failed: {error}"))?;
-            (position.before, position.through)
-        };
+            .map_err(|error| format!("capture storage failed: {error}"))?;
+        let appended = self
+            .append_event(&env, &events)
+            .await
+            .map_err(|error| format!("capture storage failed: {error}"))?;
+        let (replay_through, journal_through) = (appended.before, appended.through);
         let event = PendingEvent {
             env,
             replay_through,
             journal_through,
             settings_through: None,
         };
-        self.capture_buffer.lock().push(&self.data_dir, event);
+        self.capture_buffer.lock().push(event);
         match self.ingress_tx.try_send(IngressMsg::Wake) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => {

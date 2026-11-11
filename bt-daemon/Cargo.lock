@@ -302,6 +302,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "braintrust-sdk-rust",
+ "bt-daemon",
  "bytes",
  "chrono",
  "clap",

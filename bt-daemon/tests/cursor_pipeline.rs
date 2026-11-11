@@ -28,19 +28,10 @@ use std::time::Duration;
 /// Register a dormant route before any output exists, so completed peers cannot
 /// reclaim the recovery payloads this fixture deliberately leaves unresolved.
 fn seed_dormant_route(data: &Path, source: &str, session: &str, route: &SessionRoute) {
-    let journal = bt_daemon::source_journal_path(data, source, session);
-    let stem = journal.file_stem().unwrap().to_str().unwrap();
-    let id = stem.rsplit("--").next().unwrap();
-    std::fs::create_dir_all(data.join("pipeline")).unwrap();
-    let db =
-        rusqlite::Connection::open(data.join("pipeline").join(format!("{id}.sqlite"))).unwrap();
-    // The daemon upgrades this preparatory schema on first use.
-    db.execute_batch("CREATE TABLE heads(route TEXT PRIMARY KEY,position INTEGER NOT NULL DEFAULT 0,failure TEXT)").unwrap();
-    db.execute(
-        "INSERT INTO heads(route,position) VALUES (?,0)",
-        [serde_json::to_string(route).unwrap()],
-    )
-    .unwrap();
+    bt_daemon::storage_inspect::Inspector::session(data, source, session)
+        .unwrap()
+        .add_head(route)
+        .unwrap();
 }
 
 /// Smoke-test Cursor's portable direct command through the native Windows
@@ -369,13 +360,13 @@ fn transcript(prompt: &str, response: &str) -> String {
     )
 }
 
-fn span_journal(data: &Path) -> rusqlite::Connection {
+fn span_journal(data: &Path) -> bt_daemon::storage_inspect::Inspector {
     let path = std::fs::read_dir(data.join("pipeline"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sqlite"))
         .unwrap();
-    rusqlite::Connection::open(path).unwrap()
+    bt_daemon::storage_inspect::Inspector::open(&path).unwrap()
 }
 
 fn rows(path: &Path) -> Vec<Value> {
@@ -464,7 +455,7 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
             let delivered = buffered.lock().unwrap().delivered.iter().any(|op| {
                 matches!(op, SpanOp::Merge(row) if row.output == Some(json!("late final answer")))
             });
-            let completed=delivered && span_journal(&data).query_row("SELECT EXISTS(SELECT 1 FROM source_checkpoint WHERE through>=(SELECT tail FROM collection_state WHERE name='events')) AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position<(SELECT tail FROM publication WHERE id=1))",[],|row|row.get::<_,bool>(0)).unwrap_or(false);
+            let completed = delivered && span_journal(&data).delivered();
             if delivered && completed {
                 break;
             }
@@ -700,9 +691,7 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
     assert!(!checkpoint.to_string().contains("cursor-test-secret"));
 
     // Recover the dormant route as well as the primary route from the retained payloads.
-    span_journal(&data)
-        .execute("UPDATE heads SET position=0,failure=NULL", [])
-        .unwrap();
+    span_journal(&data).rewind_heads().unwrap();
     std::fs::remove_dir_all(data.join("delivery-ledger")).unwrap();
     std::fs::remove_file(&native).unwrap();
     std::fs::remove_file(&output).unwrap();

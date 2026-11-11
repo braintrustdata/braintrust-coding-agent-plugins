@@ -55,6 +55,10 @@ pub use args::{
 pub use client::{
     flush_managed_run, flush_session, forward_envelope, run_status, shutdown_daemon, HostInfo,
 };
+/// Session storage inspection and fault injection for integration tests.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use collections::inspect as storage_inspect;
 pub use command_output::{
     AuthDiagnostic, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, ImportSummary,
     OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,

@@ -10,12 +10,11 @@ pub(super) const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub(super) const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub(super) async fn collect_garbage(daemon: &Daemon) {
-    collect_partitions(daemon, RETENTION).await;
+    collect_sessions(daemon).await;
     crate::delivery_ledger::collect_orphans(&daemon.data_dir).await;
-    journal::gc_old_journals(&daemon.data_dir, RETENTION).await;
     journal::gc_old_managed_runs(&daemon.data_dir, RETENTION).await;
-    // Protect references from every retained input log, including completed
-    // partitions still inside retention and sessions with no registered heads.
+    // Protect references held by every retained session, including sessions
+    // still inside retention and sessions with no registered heads.
     let Ok(protected) = retained_references(&daemon.data_dir).await else {
         return;
     };
@@ -38,169 +37,80 @@ async fn old(path: &std::path::Path, age: Duration) -> bool {
         .is_some_and(|elapsed| elapsed > age)
 }
 
-async fn collect_partitions(daemon: &Daemon, age: Duration) {
-    // Snapshot activity before catalog discovery or opening a reader: even a
-    // read-only SQLite open can create a fresh WAL for an otherwise closed store.
-    let mut eligible = HashSet::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(daemon.data_dir.join("pipeline")).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let storage = entry.path();
-            if storage.extension().is_none_or(|ext| ext != "sqlite") || !old(&storage, age).await {
-                continue;
-            }
-            let wal = storage.with_extension("sqlite-wal");
-            if !tokio::fs::try_exists(&wal).await.unwrap_or(true) || old(&wal, age).await {
-                eligible.insert(storage);
-            }
-        }
-    }
-    let Ok(paths) = journal::paths(&daemon.data_dir).await else {
+async fn collect_sessions(daemon: &Daemon) {
+    let Ok(sessions) = crate::collections::sessions(&daemon.data_dir).await else {
         return;
     };
-    for path in paths {
-        if !eligible.contains(&crate::collections::database_path(&path)) {
-            continue;
-        }
-        let recorded = journal::JournalReader::recorded_len(&path).await;
-        let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded).await else {
-            continue;
-        };
-        let first = match reader.next_entry().await {
-            Ok(Some(first)) => first,
-            Ok(None) => match journal::identity(&path).await {
-                Ok(Some(identity)) => identity,
-                _ => continue,
-            },
-            Err(_) => continue,
-        };
-        let id = crate::ids::session_storage_id(&first.source, &first.session_id);
-        // Legacy mixed-source logs are handled by their own conservative reader.
-        if path != journal::source_journal_path(&daemon.data_dir, &first.source, &first.session_id)
-        {
-            continue;
-        }
-        let storage = daemon
-            .data_dir
-            .join("pipeline")
-            .join(format!("{id}.sqlite"));
-        let wal = storage.with_extension("sqlite-wal");
-        // Scanning a large journal must not hold the capture lock. The length
-        // and route set are revalidated under that lock before deletion.
-        let Ok(partition) = crate::pipeline::journal::SpanJournal::open(&storage).await else {
-            continue;
-        };
-        let Ok(routes) = partition.routes().await else {
-            continue;
-        };
-        if !captured_routes_registered(&daemon.data_dir, &path, recorded, &routes).await {
-            continue;
-        }
-        let lock = daemon.session_lock(&first.source, &first.session_id);
-        let _guard = lock.lock().await;
-        let namespace = crate::ids::session_namespace(&first.source, &first.session_id);
-        if daemon.journals.lock().contains_key(&path)
-            || daemon.translations.lock().contains_key(&namespace)
-        {
-            continue;
-        }
-        if journal::JournalReader::recorded_len(&path).await != recorded {
-            continue;
-        }
-        let Ok(current_routes) = partition.routes().await else {
-            continue;
-        };
-        let (Ok(current_routes), Ok(scanned_routes)) = (
-            serde_json::to_value(&current_routes),
-            serde_json::to_value(&routes),
-        ) else {
-            continue;
-        };
-        if current_routes != scanned_routes {
-            continue;
-        }
-        let pending = daemon.pending_sessions.lock().values().any(|state| {
-            state.events.iter().any(|event| {
-                event.env.source == first.source && event.env.session_id == first.session_id
-            })
-        });
-        if pending {
-            continue;
-        }
-
-        if routes.iter().any(|route| {
-            DeliveryKey::new(&first.source, &first.session_id, route)
-                .is_ok_and(|key| daemon.correlation.has_active_tools(&key.correlation_key()))
-        }) {
-            continue;
-        }
-        let Ok(Some(ledger_lease)) =
-            crate::delivery_ledger::try_collect_session(&daemon.data_dir, &id).await
-        else {
-            continue;
-        };
-        if !partition.collectible(recorded).await.unwrap_or(false)
-            || partition.close_storage().await.is_err()
-        {
-            continue;
-        }
-        drop(partition);
-        drop(reader);
-        // Delete the output partition first. A failed input removal can only
-        // cause idempotent replay; it cannot hide new captures behind an old receipt.
-        if tokio::fs::remove_file(&storage).await.is_err() {
-            continue;
-        }
-        for sidecar in [wal, storage.with_extension("sqlite-shm")] {
-            if let Err(error) = tokio::fs::remove_file(&sidecar).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(%error,path=%sidecar.display(),"expired partition cleanup failed");
-                }
-            }
-        }
-        if let Err(error) = tokio::fs::remove_file(&path).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(%error,path=%path.display(),"completed input cleanup failed; retaining delivery ledger");
-                continue;
-            }
-        }
-        if let Err(error) = ledger_lease.remove_files().await {
-            tracing::warn!(%error,"completed delivery ledger cleanup failed");
+    for storage in sessions {
+        if let Err(error) = collect_session(daemon, &storage).await {
+            tracing::warn!(%error, path = %storage.path.display(), "session storage cleanup failed");
         }
     }
 }
 
-// Authentication/discovery may have prevented subscription registration. Such
-// captured routes are obligations too, even if all existing heads are complete.
-async fn captured_routes_registered(
-    data_dir: &std::path::Path,
-    path: &std::path::Path,
-    recorded: u64,
-    heads: &[SessionRoute],
-) -> bool {
-    let Ok(Some(mut reader)) = journal::JournalReader::open(path, recorded).await else {
-        return false;
-    };
-    loop {
-        match reader.next_record().await {
-            Ok(Some(record)) => {
-                if let journal::JournalRecord::Event(event) = record.record {
-                    let env = journal::envelope_from_redacted(event);
-                    let route = read_correlation_state(data_dir, &automatic_link_key(&env))
-                        .await
-                        .and_then(|state| state.linked_route)
-                        .or(env.route);
-                    if route
-                        .as_ref()
-                        .is_none_or(|route| !heads.iter().any(|head| head.same_route(route)))
-                    {
-                        return false;
-                    }
-                }
-            }
-            Ok(None) => return true,
-            Err(_) => return false,
-        }
+/// Remove the storage of a cold source session that owes nothing: every
+/// captured event is translated and every route has delivered every SpanOp.
+/// A session with live actors, queued captures or active tools is retained.
+pub(super) async fn collect_session(
+    daemon: &Daemon,
+    storage: &crate::collections::SessionStorage,
+) -> anyhow::Result<()> {
+    // Inspection must never create storage for a session that has none.
+    if !tokio::fs::try_exists(&storage.path).await? {
+        return Ok(());
     }
+    let events = storage.events().await?;
+    let Some((source, session_id)) = events.owner().await? else {
+        // Output storage that no captured input ever claimed has no owner to
+        // complete it. Keep it only while it may still be in use.
+        drop(events);
+        if storage
+            .modified_ago()
+            .await
+            .is_some_and(|idle| idle > RETENTION)
+        {
+            crate::collections::remove_session(&storage.path).await?;
+        }
+        return Ok(());
+    };
+    let namespace = crate::ids::session_namespace(&source, &session_id);
+    let lock = daemon.session_lock(&source, &session_id);
+    let _guard = lock.lock().await;
+    if daemon.journals.lock().contains_key(&namespace)
+        || daemon.translations.lock().contains_key(&namespace)
+    {
+        return Ok(());
+    }
+    let queued = daemon.pending_sessions.lock().values().any(|state| {
+        state
+            .events
+            .iter()
+            .any(|event| event.env.source == source && event.env.session_id == session_id)
+    });
+    if queued {
+        return Ok(());
+    }
+    let ops = storage.span_ops().await?;
+    let routes = ops.routes().await?;
+    if routes.iter().any(|route| {
+        DeliveryKey::new(&source, &session_id, route)
+            .is_ok_and(|key| daemon.correlation.has_active_tools(&key.correlation_key()))
+    }) {
+        return Ok(());
+    }
+    // Delivered payloads are already gone. What remains is the translator
+    // continuation and span metadata a resumed session needs to extend its
+    // trace instead of re-creating it, so keep it until the session goes cold.
+    // Output that no destination ever subscribed to can never be delivered.
+    let complete = routes.is_empty() || ops.complete(events.tail().await?).await?;
+    if !complete || events.idle_for().await? <= RETENTION {
+        return Ok(());
+    }
+    drop((ops, events));
+    if crate::collections::remove_session(&storage.path).await? {
+        tracing::debug!(session_id = %session_id, "completed session storage removed");
+    }
+    Ok(())
 }
 
 async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashSet<PathBuf>> {
@@ -224,9 +134,7 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
             _ => {}
         }
     }
-    let mut protected = HashSet::new();
-    let mut sources = HashSet::new();
-    // Consumed event rows no longer own transcript or correlation references.
+    // Consumed event records no longer own transcript or correlation references.
     // Their durable continuation and source identity take over that ownership.
     fn checkpoint_paths(value: &Value, root: &std::path::Path, protected: &mut HashSet<PathBuf>) {
         match value {
@@ -249,72 +157,33 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
             _ => {}
         }
     }
-    for path in journal::paths(data_dir).await? {
-        if let Some(identity) = journal::identity(&path).await? {
-            mirrors(&identity.payload, &mut protected);
-            let env = journal::envelope_from_redacted(identity);
-            let key = automatic_link_key(&env);
+    let mut protected = HashSet::new();
+    for storage in crate::collections::sessions(data_dir).await? {
+        let events = storage.events().await?;
+        let Some(identity) = events.identity().await? else {
+            continue;
+        };
+        mirrors(&identity.payload, &mut protected);
+        let mut reader = events.read(0, events.tail().await?);
+        while let Some(event) = reader.next_event().await? {
+            mirrors(&event.payload, &mut protected);
+        }
+        let env = journal::envelope_from_redacted(identity);
+        let key = automatic_link_key(&env);
+        protected.insert(correlation_state_path(data_dir, &key));
+        protected.insert(active_parent_snapshot_path(data_dir, &key));
+        let ops = storage.span_ops().await?;
+        if let Some((_, bytes)) = ops.checkpoint().await? {
+            checkpoint_paths(
+                &serde_json::from_slice(&bytes)?,
+                &data_dir.join("transcripts"),
+                &mut protected,
+            );
+        }
+        for route in ops.routes().await? {
+            let key = DeliveryKey::new(&env.source, &env.session_id, &route)?.correlation_key();
             protected.insert(correlation_state_path(data_dir, &key));
             protected.insert(active_parent_snapshot_path(data_dir, &key));
-            let partition = crate::pipeline::journal::SpanJournal::open(
-                &crate::collections::database_path(&path),
-            )
-            .await?;
-            if let Some((_, bytes)) = partition.checkpoint().await? {
-                checkpoint_paths(
-                    &serde_json::from_slice(&bytes)?,
-                    &data_dir.join("transcripts"),
-                    &mut protected,
-                );
-            }
-            for route in partition.routes().await? {
-                let key = DeliveryKey::new(&env.source, &env.session_id, &route)?.correlation_key();
-                protected.insert(correlation_state_path(data_dir, &key));
-                protected.insert(active_parent_snapshot_path(data_dir, &key));
-            }
-        }
-    }
-
-    let mut entries = match tokio::fs::read_dir(journal::journal_dir(data_dir)).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(protected),
-        Err(error) => return Err(error.into()),
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.path().extension().and_then(|v| v.to_str()) != Some("ndjson") {
-            continue;
-        }
-        let mut reader = journal::JournalReader::open(
-            &entry.path(),
-            journal::JournalReader::recorded_len(&entry.path()).await,
-        )
-        .await?;
-        while let Some(record) = match reader.as_mut() {
-            Some(reader) => reader.next_record().await?,
-            None => None,
-        } {
-            if let journal::JournalRecord::Event(event) = record.record {
-                mirrors(&event.payload, &mut protected);
-                let env = journal::envelope_from_redacted(event);
-                let key = automatic_link_key(&env);
-                protected.insert(correlation_state_path(data_dir, &key));
-                protected.insert(active_parent_snapshot_path(data_dir, &key));
-                let storage = data_dir.join("pipeline").join(format!(
-                    "{}.sqlite",
-                    crate::ids::session_storage_id(&env.source, &env.session_id)
-                ));
-                if sources.insert((env.source.clone(), env.session_id.clone()))
-                    && tokio::fs::try_exists(&storage).await?
-                {
-                    let partition = crate::pipeline::journal::SpanJournal::open(&storage).await?;
-                    for route in partition.routes().await? {
-                        let key = DeliveryKey::new(&env.source, &env.session_id, &route)?
-                            .correlation_key();
-                        protected.insert(correlation_state_path(data_dir, &key));
-                        protected.insert(active_parent_snapshot_path(data_dir, &key));
-                    }
-                }
-            }
         }
     }
     Ok(protected)
@@ -427,7 +296,10 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
         .collect();
     let mut targets = HashMap::new();
     for (key, source) in sources {
-        if let Ok(tail) = source.control(crate::journal::ControlKind::Retire).await {
+        if let Ok(tail) = source
+            .control(crate::pipeline::input::ControlKind::Retire)
+            .await
+        {
             targets.insert(key, tail);
         }
     }
@@ -578,13 +450,11 @@ mod tests {
     async fn capture_is_durable_during_startup_and_recovery_stops_before_it() {
         let tmp = tempfile::tempdir().unwrap();
         let mut env = event("resuming", SessionRoute::default());
-        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-        let old_end = JournalWriter::open_path(&path)
-            .await
-            .unwrap()
-            .append(&env)
-            .await
-            .unwrap();
+        let events =
+            crate::collections::EventCollection::open(tmp.path(), &env.source, &env.session_id)
+                .await
+                .unwrap();
+        let old_end = events.append(&env).await.unwrap().through;
         let (daemon, ready) = paused_ingress(tmp.path());
         env.ts_ms = 2;
         env.event = "next".into();
@@ -594,16 +464,12 @@ mod tests {
                 .unwrap()
                 .unwrap()
         );
-        let mut reader =
-            journal::JournalReader::open(&path, journal::JournalReader::recorded_len(&path).await)
-                .await
-                .unwrap()
-                .unwrap();
-        let mut events = Vec::new();
-        while let Some(event) = reader.next_entry().await.unwrap() {
-            events.push(event.event);
+        let mut reader = events.read(0, events.tail().await.unwrap());
+        let mut captured = Vec::new();
+        while let Some(event) = reader.next_event().await.unwrap() {
+            captured.push(event.event);
         }
-        assert!(events.iter().any(|event| event == "next"));
+        assert!(captured.iter().any(|event| event == "next"));
         assert!(daemon.translations.lock().is_empty());
         assert!(
             daemon.source_inputs.lock().is_empty(),
@@ -620,16 +486,12 @@ mod tests {
         daemon.settle_ingress().await;
         let source = daemon.translations.lock().values().next().unwrap().clone();
         assert!(source.barrier().await.unwrap() > 0);
-        let storage = tmp.path().join("pipeline").join(format!(
-            "{}.sqlite",
-            crate::ids::session_storage_id("debug", "resuming")
-        ));
-        let partition = crate::pipeline::journal::SpanJournal::open(&storage)
+        let partition = crate::collections::SpanOps::for_events(&events)
             .await
             .unwrap();
         assert_eq!(
             partition.translated_through().await.unwrap(),
-            journal::JournalReader::recorded_len(&path).await
+            events.tail().await.unwrap()
         );
         drain_all(&daemon).await;
     }
@@ -689,26 +551,24 @@ mod tests {
                 .barrier()
                 .await
                 .unwrap();
-            let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-            let storage = tmp.path().join("pipeline").join(format!(
-                "{}.sqlite",
-                crate::ids::session_storage_id(&env.source, &env.session_id)
-            ));
-            let partition = crate::pipeline::journal::SpanJournal::open(&storage)
+            let events = daemon
+                .events_for(&env.source, &env.session_id)
+                .await
+                .unwrap();
+            let partition = crate::pipeline::journal::SpanJournal::for_events(&events)
                 .await
                 .unwrap();
             assert_eq!(
                 partition.translated_through().await.unwrap(),
-                journal::JournalReader::recorded_len(&path).await
+                events.tail().await.unwrap()
             );
-            let db = rusqlite::Connection::open(storage).unwrap();
-            let count: usize = db
-                .query_row(
-                    "SELECT count(*) FROM batches WHERE committed=1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
+            let count = crate::collections::inspect::Inspector::session(
+                tmp.path(),
+                &env.source,
+                &env.session_id,
+            )
+            .unwrap()
+            .count(crate::collections::inspect::Table::Batches) as usize;
             let expected: Vec<_> = (slot..total).step_by(envs.len()).collect();
             assert!(
                 count <= expected.len(),
@@ -719,7 +579,7 @@ mod tests {
             if env.source == "debug" {
                 assert_eq!(state["native"]["event_seq"], expected.len() as u64);
                 let actual: Vec<_> = partition
-                    .read_after(0, total)
+                    .published(0, total)
                     .await
                     .unwrap()
                     .into_iter()
@@ -762,8 +622,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-        let identity = journal::identity(&path).await.unwrap().unwrap();
+        let identity = daemon
+            .events_for(&env.source, &env.session_id)
+            .await
+            .unwrap()
+            .identity()
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             identity.event == "TranscriptUpdate",
             "late transcript must be journaled before shutdown"
@@ -834,12 +700,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retention_requires_complete_inactive_partitions_and_nonempty_heads() {
+    async fn completed_inactive_sessions_are_removed_and_every_obligation_retains_one() {
         for scenario in [
             "no_heads",
             "unresolved",
             "second_unresolved",
-            "unregistered",
             "held",
             "source_held",
             "untranslated",
@@ -847,49 +712,36 @@ mod tests {
             "active",
             "within_retention",
             "complete",
-            "old_complete",
-            "recent_wal",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let env = event(scenario, SessionRoute::default());
-            let raw = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
-            let mut writer = JournalWriter::open_path(&raw).await.unwrap();
-            let mut through = writer.append(&env).await.unwrap();
-            if scenario == "unregistered" {
-                let mut other = env.clone();
-                other
-                    .route
-                    .as_mut()
-                    .unwrap()
-                    .tags
-                    .insert("not registered".into());
-                through = writer.append(&other).await.unwrap();
-            }
-            drop(writer);
-            let storage = tmp.path().join("pipeline").join(format!(
-                "{}.sqlite",
-                crate::ids::session_storage_id(&env.source, &env.session_id)
-            ));
-            let partition = crate::pipeline::journal::SpanJournal::open(&storage)
+            let events =
+                crate::collections::EventCollection::open(tmp.path(), &env.source, &env.session_id)
+                    .await
+                    .unwrap();
+            let through = events.append(&env).await.unwrap().through;
+            let partition = crate::pipeline::journal::SpanJournal::for_events(&events)
                 .await
                 .unwrap();
-            let input = if scenario == "untranslated" {
-                through - 1
-            } else {
-                through
-            };
-            partition.begin(input, true).await.unwrap();
+            partition.begin(through, true).await.unwrap();
             partition
-                .append(
-                    input,
-                    &[SpanOp::Insert(SpanRow {
+                .append_live(
+                    through,
+                    &mut 0,
+                    &mut vec![SpanOp::Insert(SpanRow {
                         span_id: "stored".into(),
                         ..Default::default()
                     })],
                 )
                 .await
                 .unwrap();
-            partition.commit(input).await.unwrap();
+            partition
+                .commit_translation(&events, through, &Default::default(), b"null".to_vec())
+                .await
+                .unwrap();
+            if scenario == "untranslated" {
+                events.append(&env).await.unwrap();
+            }
             if scenario != "no_heads" {
                 let mut head = partition
                     .subscribe(env.route.as_ref().unwrap(), 0)
@@ -926,64 +778,39 @@ mod tests {
             if scenario == "invisible" {
                 partition.begin(through + 1, true).await.unwrap();
             }
-            drop(partition);
+            drop((partition, events));
             let daemon = Daemon::new(
                 super::super::debug_serve_options("test", tmp.path()),
                 tmp.path().into(),
             );
             if scenario == "active" {
                 daemon
-                    .journal_writer_for(&env.source, &env.session_id)
+                    .events_for(&env.source, &env.session_id)
                     .await
                     .unwrap();
             }
-            let age = if scenario == "within_retention" {
-                RETENTION
-            } else {
-                Duration::ZERO
-            };
-            let id = crate::ids::session_storage_id(&env.source, &env.session_id);
-            let ledger_dir = tmp.path().join("delivery-ledger");
-            std::fs::create_dir_all(&ledger_dir).unwrap();
-            let ledger = ledger_dir.join(format!("{id}--destination.ndjson"));
-            std::fs::write(&ledger, "completed receipt").unwrap();
-            let complete = matches!(scenario, "complete" | "old_complete");
-            let recent_wal = if scenario == "recent_wal" {
-                let db = rusqlite::Connection::open(&storage).unwrap();
-                db.execute_batch("CREATE TABLE recent_activity(value INTEGER)")
+            let storage =
+                crate::collections::inspect::session_path(tmp.path(), &env.source, &env.session_id);
+            if scenario != "within_retention" {
+                crate::collections::inspect::Inspector::open(&storage)
+                    .unwrap()
+                    .age(RETENTION + Duration::from_secs(3600))
                     .unwrap();
-                Some(db)
-            } else {
-                None
-            };
-            let age =
-                if matches!(scenario, "old_complete" | "recent_wal") {
-                    if scenario == "old_complete" {
-                        assert!(!storage.with_extension("sqlite-wal").exists());
-                    }
-                    std::fs::File::options()
-                        .write(true)
-                        .open(&storage)
-                        .unwrap()
-                        .set_times(std::fs::FileTimes::new().set_modified(
-                            SystemTime::now() - RETENTION - Duration::from_secs(3600),
-                        ))
-                        .unwrap();
-                    RETENTION
-                } else {
-                    age
-                };
-            collect_partitions(&daemon, age).await;
-            assert_eq!(ledger.exists(), !complete, "ledger: {scenario}");
+            }
+            collect_sessions(&daemon).await;
+            // Output no destination subscribed to can never be delivered.
+            let complete = matches!(scenario, "complete" | "no_heads");
             assert_eq!(storage.exists(), !complete, "{scenario}");
-            drop(recent_wal);
-            assert!(
-                !raw.exists(),
-                "SQLite cutover removed the legacy file: {scenario}"
-            );
+            for sidecar in ["sqlite-wal", "sqlite-shm"] {
+                assert!(
+                    !complete || !storage.with_extension(sidecar).exists(),
+                    "{scenario}: {sidecar}"
+                );
+            }
             drain_all(&daemon).await;
         }
     }
+
     #[tokio::test]
     async fn retained_inputs_protect_only_their_reconstruction_references() {
         for routed in [true, false] {
@@ -1000,10 +827,12 @@ mod tests {
             }
             env.payload =
                 serde_json::json!({"_bt_transcript_mirror":{"mirror": retained,"through":8}});
-            let raw = journal::source_journal_path(tmp.path(), "debug", "test");
-            let mut writer = JournalWriter::open_path(&raw).await.unwrap();
-            writer.append(&env).await.unwrap();
-            drop(writer);
+            crate::collections::EventCollection::open(tmp.path(), "debug", "test")
+                .await
+                .unwrap()
+                .append(&env)
+                .await
+                .unwrap();
             let key = automatic_link_key(&env);
             let state = PendingSession {
                 events: vec![PendingEvent {
