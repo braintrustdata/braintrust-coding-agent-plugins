@@ -1,3 +1,5 @@
+// TODO: Delete this file and migrate callers to the standard async iterator
+// interfaces once AsyncIterator and IntoAsyncIterator are available in stable Rust.
 //! Stable-toolchain subset of the proposed standard async iteration traits.
 use std::{
     future::Future,
