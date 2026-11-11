@@ -15,7 +15,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use sha2::{Digest, Sha256};
+
 const READ_RECORDS: usize = 32;
+/// Payload fields the daemon adds to record what it captured alongside an event.
+const CAPTURE_REFERENCES: [&str; 3] = [
+    "_bt_claude_transcript_mirrors",
+    "_bt_transcript_mirror",
+    "_bt_transcript_replay",
+];
 const READ_BYTES: usize = 256 * 1024;
 /// Payload fields that identify on-disk state the session still references.
 const IDENTITY_PAYLOAD: [&str; 3] = [
@@ -178,7 +186,45 @@ impl EventCollection {
 
     /// Insert one redacted event. The caller may acknowledge capture once this
     /// returns: the record is durable and visible to translation.
+    #[cfg(test)]
     pub async fn append(&self, env: &Envelope) -> anyhow::Result<Appended> {
+        self.insert_event(env, None).await.map(|appended| {
+            appended.unwrap_or(Appended {
+                before: 0,
+                through: 0,
+            })
+        })
+    }
+
+    /// Capture a native event once. The same event captured again, such as a
+    /// re-import or a capture retried across a daemon handover, returns `None`
+    /// while this session's storage exists.
+    pub async fn capture(&self, env: &Envelope) -> anyhow::Result<Option<Appended>> {
+        let mut identity = env.redacted();
+        if let Some(payload) = identity.payload.as_object_mut() {
+            // Daemon-added transcript references describe this capture, not
+            // the native event.
+            for key in CAPTURE_REFERENCES {
+                payload.remove(key);
+            }
+        }
+        // Route and capture context are part of a capture: hooks may deliver
+        // one native event to several destinations, each as its own capture.
+        let digest = Sha256::digest(serde_json::to_vec(&(
+            &identity.event,
+            identity.ts_ms,
+            &identity.payload,
+            &identity.route,
+            &identity.capture,
+        ))?);
+        self.insert_event(env, Some(digest.to_vec())).await
+    }
+
+    async fn insert_event(
+        &self,
+        env: &Envelope,
+        digest: Option<Vec<u8>>,
+    ) -> anyhow::Result<Option<Appended>> {
         let mut record = env.redacted();
         compact_pi_payload(&mut record);
         let mut identity = env.redacted();
@@ -191,6 +237,13 @@ impl EventCollection {
         let value = encode(&EventRecord::Event(record))?;
         self.store
             .write(move |tx| {
+                if let Some(digest) = digest {
+                    if tx.execute("INSERT OR IGNORE INTO captured(digest) VALUES(?)", [digest])?
+                        == 0
+                    {
+                        return Ok(None);
+                    }
+                }
                 let previous: Option<Vec<u8>> =
                     tx.query_row("SELECT identity FROM event_state WHERE id=1", [], |r| {
                         r.get(0)
@@ -218,7 +271,7 @@ impl EventCollection {
                     "UPDATE event_state SET identity=? WHERE id=1",
                     [serde_json::to_vec(&identity)?],
                 )?;
-                Ok(appended)
+                Ok(Some(appended))
             })
             .await
     }

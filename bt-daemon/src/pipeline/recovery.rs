@@ -24,7 +24,7 @@ impl std::fmt::Display for Boundary {
             Self::Credentials => "credentials",
             Self::Translation => "translation",
             Self::Journal => "journal",
-            Self::Ledger => "delivery_ledger",
+            Self::Ledger => "delivery_flush",
             Self::Completion => "completion",
         })
     }

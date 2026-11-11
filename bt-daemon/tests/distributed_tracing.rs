@@ -2990,11 +2990,6 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
             .await
             .unwrap();
         }
-        // Graceful shutdown delivered the buffered spans. Roll back its local
-        // delivery acknowledgements as well as the journal to model a crash.
-        tokio::fs::remove_dir_all(data_dir.join("delivery-ledger"))
-            .await
-            .unwrap();
         let mut legacy_route = original_route.clone();
         legacy_route.destination = Some(external_parent());
         // A decided legacy link already put earlier rows in that parent's

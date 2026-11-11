@@ -198,40 +198,6 @@ async fn logs3_rows(server: &MockServer) -> Vec<Value> {
         .collect()
 }
 
-// Combine a legacy checkpoint with append-only updates for storage assertions.
-fn ledger_state(path: &Path) -> Value {
-    let mut state = json!({
-        "completed_span_ids": [], "late_merge_ids": [], "span_origins": {}
-    });
-    let mut records = Vec::new();
-    if let Ok(bytes) = std::fs::read(path.with_extension("json")) {
-        records.push(serde_json::from_slice::<Value>(&bytes).unwrap());
-    }
-    if let Ok(text) = std::fs::read_to_string(path.with_extension("ndjson")) {
-        records.extend(
-            text.lines()
-                .map(|line| serde_json::from_str::<Value>(line).unwrap()),
-        );
-    }
-    for record in records {
-        for key in ["completed_span_ids", "late_merge_ids"] {
-            if let Some(ids) = record[key].as_array() {
-                state[key]
-                    .as_array_mut()
-                    .unwrap()
-                    .extend(ids.iter().cloned());
-            }
-        }
-        if let Some(origins) = record["span_origins"].as_object() {
-            state["span_origins"]
-                .as_object_mut()
-                .unwrap()
-                .extend(origins.clone());
-        }
-    }
-    state
-}
-
 fn root_id(rows: &[Value], session: &str) -> String {
     rows.iter()
         .find(|row| row["metadata"]["session_id"] == session)
@@ -501,29 +467,6 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
     std::fs::write(&journal, &history).unwrap();
     std::fs::remove_dir_all(data_dir.join("pipeline")).unwrap();
     let acknowledged_history = history.into_bytes();
-    let ledger_paths: Vec<_> = std::fs::read_dir(data_dir.join("delivery-ledger"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "ndjson"))
-        .collect();
-    assert_eq!(ledger_paths.len(), 1);
-    let ledger_path = ledger_paths[0].with_extension("json");
-    let mut ledger = ledger_state(&ledger_path);
-    let completed = ledger["completed_span_ids"].clone();
-    for span in [&root, &old_turn] {
-        assert!(completed.as_array().unwrap().contains(&json!(span)));
-        assert!(ledger["span_origins"].get(span.as_str()).is_some());
-    }
-    // Simulate the old schema, preserving all completion/late-merge IDs and
-    // journal checkpoints. Missing provenance is not a snapshot of null versions.
-    let ledger_object = ledger.as_object_mut().unwrap();
-    ledger_object.remove("span_origins");
-    ledger_object.remove("root_origins");
-    assert_eq!(ledger["completed_span_ids"], completed);
-    assert!(ledger.get("span_origins").is_none());
-    assert!(ledger.get("root_origins").is_none());
-    std::fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
-    std::fs::remove_file(ledger_path.with_extension("ndjson")).unwrap();
     assert_eq!(std::fs::read(&journal).unwrap(), acknowledged_history);
 
     let second = Daemon::start(tmp.path(), &server, "bt2").await;
@@ -605,16 +548,6 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
             "legacy origin was invented after recovery: {row}"
         );
     }
-    let ledger = ledger_state(&ledger_path);
-    for key in ["span_origins", "root_origins"] {
-        for span in [&root, &old_turn] {
-            assert!(
-                ledger[key].get(span.as_str()).is_none(),
-                "legacy birth snapshot was invented in {key}: {ledger}"
-            );
-        }
-    }
-    assert!(ledger["span_origins"].get(fresh_turn.as_str()).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

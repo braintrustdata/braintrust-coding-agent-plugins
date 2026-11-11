@@ -283,6 +283,24 @@ pub(super) async fn handle_request(
                 },
             )
         }
+        method::IMPORT_FINISH => {
+            let p = parse!(crate::wire::ImportFinishParams);
+            match daemon.finish_import(&p).await {
+                Ok(result) => Response::serialized(id, result),
+                Err(error) => {
+                    Response::err(id, RpcError::new(error_code::INTERNAL, error.to_string()))
+                }
+            }
+        }
+        method::IMPORT_RESET => {
+            let p = parse!(crate::wire::ImportResetParams);
+            match daemon.reset_import(&p).await {
+                Ok(()) => Response::serialized(id, serde_json::json!({})),
+                Err(error) => {
+                    Response::err(id, RpcError::new(error_code::INTERNAL, error.to_string()))
+                }
+            }
+        }
         method::MANAGED_RUN_FLUSH => {
             let params = parse!(ManagedRunFlushParams);
             daemon.settle_ingress().await;
@@ -447,5 +465,115 @@ impl Daemon {
             uptime_ms: self.started.elapsed().as_millis() as u64,
             sessions,
         }
+    }
+}
+
+impl Daemon {
+    /// Imports are captured like hooks. Finishing one waits for its captured
+    /// events to reach every matching delivery route and reports what they sent.
+    async fn finish_import(
+        self: &Arc<Self>,
+        params: &crate::wire::ImportFinishParams,
+    ) -> anyhow::Result<crate::wire::ImportFinishResult> {
+        let source = self
+            .translators
+            .canonical_source(&params.source)
+            .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {:?}", params.source))?
+            .to_owned();
+        self.settle_ingress().await;
+        resolve_pending_sessions(self, |env| {
+            env.source == source && env.session_id == params.session_id
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+        let keys: Vec<_> = self
+            .sessions
+            .lock()
+            .keys()
+            .filter(|key| {
+                key.source == source
+                    && key.session_id == params.session_id
+                    && serde_json::from_str::<SessionRoute>(&key.route)
+                        .is_ok_and(|route| route.same_route(&params.route))
+            })
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            let reason = self
+                .auth_errors
+                .lock()
+                .iter()
+                .find(|(key, _)| key.source == source && key.session_id == params.session_id)
+                .map(|(_, (_, message))| message.clone());
+            anyhow::bail!(
+                "imported session {} was not accepted for delivery{}",
+                params.session_id,
+                reason
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            );
+        }
+        let timeout = Duration::from_millis(params.timeout_ms);
+        // An attached import delivers under its parent's trace root.
+        let attached_root = params
+            .route
+            .with_auth(BackendAuth {
+                token: String::new(),
+                api_url: None,
+                app_url: None,
+                org_name: None,
+                org_id: None,
+            })
+            .attached_span_ids()
+            .1;
+        let mut result = crate::wire::ImportFinishResult {
+            flushed: true,
+            pending: 0,
+            root_span_id: attached_root,
+            span_count: 0,
+        };
+        for key in keys {
+            self.refresh_session_before_flush(&key).await?;
+            let Some(session) = self.sessions.lock().get(&key).cloned() else {
+                continue;
+            };
+            let (flushed, pending) = if params.finalize {
+                session.finalize(timeout).await
+            } else {
+                session.flush(timeout).await
+            };
+            result.flushed &= flushed;
+            result.pending = result.pending.saturating_add(pending);
+            let (root, spans) = session.counters.delivered();
+            result.root_span_id = result.root_span_id.or(root);
+            result.span_count += spans;
+        }
+        Ok(result)
+    }
+
+    /// A rewritten transcript replays from its start through fresh translator
+    /// state, ordered after every event already captured for it.
+    async fn reset_import(
+        self: &Arc<Self>,
+        params: &crate::wire::ImportResetParams,
+    ) -> anyhow::Result<()> {
+        let source = self
+            .translators
+            .canonical_source(&params.source)
+            .ok_or_else(|| anyhow::anyhow!("unsupported coding-agent source {:?}", params.source))?
+            .to_owned();
+        self.settle_ingress().await;
+        let translation = self
+            .translations
+            .lock()
+            .get(&crate::ids::session_namespace(&source, &params.session_id))
+            .cloned();
+        if let Some(translation) = translation {
+            translation
+                .control(crate::pipeline::input::ControlKind::Reset)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        Ok(())
     }
 }

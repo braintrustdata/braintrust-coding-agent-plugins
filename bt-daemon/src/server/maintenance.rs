@@ -11,7 +11,13 @@ pub(super) const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub(super) async fn collect_garbage(daemon: &Daemon) {
     collect_sessions(daemon).await;
-    crate::delivery_ledger::collect_orphans(&daemon.data_dir).await;
+    // Delivery is acknowledged by SpanOp heads; ledgers from earlier daemons
+    // hold nothing a current pipeline reads.
+    match tokio::fs::remove_dir_all(daemon.data_dir.join("delivery-ledger")).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(%error, "legacy delivery ledger cleanup failed"),
+    }
     journal::gc_old_managed_runs(&daemon.data_dir, RETENTION).await;
     // Protect references held by every retained session, including sessions
     // still inside retention and sessions with no registered heads.

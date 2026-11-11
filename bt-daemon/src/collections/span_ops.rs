@@ -544,7 +544,9 @@ impl SpanOps {
             .await
     }
 
-    /// Apply a pre-collection delivery checkpoint to the route's head.
+    /// Apply a pre-collection delivery checkpoint to the route's head. An
+    /// earlier daemon delivered those spans without recording provenance, so
+    /// their rebuilt origins are discarded rather than attributed to it.
     pub async fn acknowledge_legacy(&self, route: &SessionRoute, input: u64) -> anyhow::Result<()> {
         let route = serde_json::to_string(route)?;
         self.store
@@ -554,6 +556,19 @@ impl SpanOps {
                     [input],
                     |r| r.get(0),
                 )?;
+                let spans = {
+                    let mut query = tx.prepare("SELECT value FROM ops WHERE input<=?")?;
+                    let rows = query.query_map([input], |r| r.get::<_, Vec<u8>>(0))?;
+                    let mut spans = Vec::new();
+                    for row in rows {
+                        let (SpanOp::Insert(op) | SpanOp::Merge(op)) = StoredOp::decode(&row?)?;
+                        spans.push(op.span_id);
+                    }
+                    spans
+                };
+                for span in spans {
+                    tx.execute("DELETE FROM origins WHERE span_id=?", [span])?;
+                }
                 tx.execute(
                     "INSERT INTO heads(route,position) VALUES(?,?) ON CONFLICT(route) DO UPDATE SET position=max(position,excluded.position)",
                     params![route, position],
@@ -994,7 +1009,7 @@ mod tests {
         journal.commit(10).await.unwrap();
         drop(journal);
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("UPDATE heads SET position=1; DROP TABLE receipts; DROP TABLE publication; DROP TABLE origins; DROP TABLE span_state; DROP TABLE events; DROP TABLE event_state; DROP TABLE source_checkpoint; PRAGMA user_version=5").unwrap();
+        db.execute_batch("UPDATE heads SET position=1; DROP TABLE receipts; DROP TABLE publication; DROP TABLE origins; DROP TABLE span_state; DROP TABLE events; DROP TABLE captured; DROP TABLE event_state; DROP TABLE source_checkpoint; PRAGMA user_version=5").unwrap();
         drop(db);
         let upgraded = SpanJournal::open(&path).await.unwrap();
         assert_eq!(upgraded.tail().await.unwrap(), 1);

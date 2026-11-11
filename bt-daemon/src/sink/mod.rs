@@ -7,9 +7,11 @@
 
 mod braintrust;
 mod debug;
+mod tags;
 
 pub use braintrust::{BraintrustSinkConfig, BraintrustSinkFactory};
 pub use debug::DebugSinkFactory;
+pub(crate) use tags::UniqueTags;
 
 use crate::translate::SpanOp;
 use crate::wire::SessionConfig;

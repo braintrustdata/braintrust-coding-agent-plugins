@@ -255,6 +255,7 @@ fn migrate(db: &Connection) -> anyhow::Result<()> {
             "CREATE TABLE IF NOT EXISTS source_checkpoint(id INTEGER PRIMARY KEY CHECK(id=1),
                 version INTEGER NOT NULL, through INTEGER NOT NULL, value BLOB NOT NULL);
             CREATE TABLE events (id INTEGER PRIMARY KEY, value BLOB NOT NULL);
+            CREATE TABLE captured (digest BLOB PRIMARY KEY) WITHOUT ROWID;
             CREATE TABLE event_state (id INTEGER PRIMARY KEY CHECK(id=1),
                 source TEXT, session_id TEXT, tail INTEGER NOT NULL DEFAULT 0,
                 identity BLOB, legacy_namespace INTEGER NOT NULL DEFAULT 0,

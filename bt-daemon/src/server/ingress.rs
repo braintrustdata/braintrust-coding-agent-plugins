@@ -358,10 +358,14 @@ impl Daemon {
             .events_for(&env.source, &env.session_id)
             .await
             .map_err(|error| format!("capture storage failed: {error}"))?;
-        let appended = self
+        let Some(appended) = self
             .append_event(&env, &events)
             .await
-            .map_err(|error| format!("capture storage failed: {error}"))?;
+            .map_err(|error| format!("capture storage failed: {error}"))?
+        else {
+            // Already captured: acknowledge without delivering it twice.
+            return Ok(true);
+        };
         let (replay_through, journal_through) = (appended.before, appended.through);
         let event = PendingEvent {
             env,

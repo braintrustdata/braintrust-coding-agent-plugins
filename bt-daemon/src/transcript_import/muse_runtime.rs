@@ -8,12 +8,10 @@ use std::process::Stdio;
 use std::time::Duration;
 pub(super) async fn run(
     args: ImportArgs,
-    opts: ServeOptions,
-    config: Option<SessionConfig>,
-    ledger: Option<PathBuf>,
+    target: ImportTarget,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     if args.attach {
-        return attach_muse_session(&args.session_ids[0], opts, config, ledger).await;
+        return attach_muse_session(&args.session_ids[0], target).await;
     }
     let ids = if args.all {
         muse_msp_session_ids().await?
@@ -23,7 +21,7 @@ pub(super) async fn run(
     if ids.is_empty() {
         anyhow::bail!("no durable Muse sessions found to import");
     }
-    import_muse_sessions_with_ledger(&ids, opts, config, ledger).await
+    import_muse_sessions(&ids, target).await
 }
 
 async fn export_muse_session(session_id: &str, path: &std::path::Path) -> anyhow::Result<()> {
@@ -80,13 +78,11 @@ async fn muse_msp_session_ids() -> anyhow::Result<Vec<String>> {
     Ok(sessions)
 }
 
-pub(super) async fn import_muse_sessions_with_ledger(
+pub(super) async fn import_muse_sessions(
     session_ids: &[String],
-    opts: ServeOptions,
-    config: Option<SessionConfig>,
-    ledger_dir: Option<PathBuf>,
+    target: ImportTarget,
 ) -> anyhow::Result<Vec<ImportSummary>> {
-    let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
+    let mut processor = ImportProcessor::new(target);
     let mut summaries = Vec::new();
     for session_id in session_ids {
         let directory = tempfile::Builder::new()
@@ -119,7 +115,7 @@ pub(super) async fn process_muse_export(
 }
 
 /// The file is fully parsed on every poll. Only envelopes beyond the previous
-/// snapshot are sent to the long-lived translator and sink, so open model and
+/// snapshot are captured into the daemon's long-lived session, so open model and
 /// turn state is retained without replaying old starts into it.
 pub(super) async fn process_muse_snapshot(
     processor: &mut ImportProcessor,
@@ -183,27 +179,23 @@ pub(super) async fn process_muse_snapshot(
 
 pub(super) async fn attach_muse_session(
     session_id: &str,
-    opts: ServeOptions,
-    config: Option<SessionConfig>,
-    ledger_dir: Option<PathBuf>,
+    target: ImportTarget,
 ) -> anyhow::Result<Vec<ImportSummary>> {
     transcript_import::validate_session_id(session_id)?;
     let directory = tempfile::Builder::new()
         .prefix("bt-muse-attach-")
         .tempdir()?;
     let export = directory.path().join("session.json");
-    attach_muse_export(&export, session_id, true, opts, config, ledger_dir).await
+    attach_muse_export(&export, session_id, true, target).await
 }
 
 pub(super) async fn attach_muse_export(
     export: &std::path::Path,
     session_id: &str,
     reexport: bool,
-    opts: ServeOptions,
-    config: Option<SessionConfig>,
-    ledger_dir: Option<PathBuf>,
+    target: ImportTarget,
 ) -> anyhow::Result<Vec<ImportSummary>> {
-    let mut processor = ImportProcessor::new(opts, config, ledger_dir)?;
+    let mut processor = ImportProcessor::new(target);
     let mut emitted = 0usize;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);

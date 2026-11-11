@@ -282,14 +282,16 @@ impl Daemon {
         &self,
         env: &Envelope,
         events: &EventCollection,
-    ) -> anyhow::Result<crate::collections::Appended> {
-        let appended = events.append(env).await?;
+    ) -> anyhow::Result<Option<crate::collections::Appended>> {
+        let Some(appended) = events.capture(env).await? else {
+            return Ok(None);
+        };
         if let Some(cutoffs) = self.startup_cutoffs.lock().as_mut() {
             cutoffs
                 .entry(crate::ids::session_namespace(&env.source, &env.session_id))
                 .or_insert(appended.before);
         }
-        Ok(appended)
+        Ok(Some(appended))
     }
 
     pub(super) fn session_lock(

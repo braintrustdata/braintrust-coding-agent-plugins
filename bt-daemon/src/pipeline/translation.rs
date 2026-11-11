@@ -534,15 +534,7 @@ impl Producer {
                 }
             }
         }
-        let registry = self.options.registry.clone();
-        let source = self.options.source.clone();
-        let namespace = self.options.namespace.clone();
-        self.translator = Some(
-            tokio::task::spawn_blocking(move || {
-                registry.create_checked_with_session_namespace(&source, &namespace)
-            })
-            .await??,
-        );
+        self.translator = Some(self.new_translator().await?);
         if let Some((through, bytes)) = checkpoint {
             let source = self.options.source.clone();
             let saved = self
@@ -682,15 +674,19 @@ impl Producer {
                     if matches!(control.kind, ControlKind::Retire) {
                         continuation = Some(self.continuation().await?);
                     }
-                    let ops = self
-                        .translate(move |translator, ctx| {
+                    let ops = if matches!(control.kind, ControlKind::Reset) {
+                        self.translator = Some(self.new_translator().await?);
+                        Vec::new()
+                    } else {
+                        self.translate(move |translator, ctx| {
                             if !matches!(control.kind, ControlKind::Checkpoint) {
                                 translator.finalize_at(ctx, &control.bounds)
                             } else {
                                 translator.checkpoint_at(ctx, &control.bounds)
                             }
                         })
-                        .await?;
+                        .await?
+                    };
                     (ops, self.capture.clone())
                 }
                 SourceEvent::LegacyDeliveryCheckpoint { route, through } => {
@@ -729,6 +725,21 @@ impl Producer {
             self.position = input;
         }
         Ok(())
+    }
+
+    fn new_translator(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Box<dyn AgentTranslator>>> + Send + 'static
+    {
+        let registry = self.options.registry.clone();
+        let source = self.options.source.clone();
+        let namespace = self.options.namespace.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                registry.create_checked_with_session_namespace(&source, &namespace)
+            })
+            .await?
+        }
     }
 
     async fn continuation(&mut self) -> anyhow::Result<Vec<u8>> {
