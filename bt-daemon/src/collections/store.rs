@@ -87,10 +87,6 @@ impl Store {
         OPEN.lock().get(path).and_then(Weak::upgrade).map(Self)
     }
 
-    pub fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-
     pub async fn run<R: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,

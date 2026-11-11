@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 /// A storage write that can be made to fail.
 #[derive(Clone, Copy, Debug)]
 pub enum Fault {
+    /// The handoff of translated output for an input.
     BeginTranslation,
     InsertOps,
-    CommitBatch,
     SaveCheckpoint,
     AdvanceHead,
     ReplaceRoots,
@@ -23,7 +23,6 @@ impl Fault {
         match self {
             Self::BeginTranslation => ("fault_begin", "BEFORE INSERT ON batches"),
             Self::InsertOps => ("fault_insert_ops", "BEFORE INSERT ON ops"),
-            Self::CommitBatch => ("fault_commit", "BEFORE UPDATE OF committed ON batches"),
             Self::SaveCheckpoint => ("fault_checkpoint", "BEFORE INSERT ON source_checkpoint"),
             Self::AdvanceHead => ("fault_head", "BEFORE UPDATE OF position ON heads"),
             Self::ReplaceRoots => ("fault_roots", "BEFORE INSERT ON root_candidates"),

@@ -729,20 +729,18 @@ mod tests {
             let partition = crate::pipeline::journal::SpanJournal::for_events(&events)
                 .await
                 .unwrap();
-            partition.begin(through, true).await.unwrap();
             partition
-                .append_live(
-                    through,
-                    &mut 0,
-                    &mut vec![SpanOp::Insert(SpanRow {
+                .commit_translation(crate::collections::Translated {
+                    input: through,
+                    observation: true,
+                    ops: vec![SpanOp::Insert(SpanRow {
                         span_id: "stored".into(),
                         ..Default::default()
                     })],
-                )
-                .await
-                .unwrap();
-            partition
-                .commit_translation(&events, through, &Default::default(), b"null".to_vec())
+                    roots: Default::default(),
+                    state: Some(b"null".to_vec()),
+                    acknowledged: None,
+                })
                 .await
                 .unwrap();
             if scenario == "untranslated" {
@@ -782,7 +780,11 @@ mod tests {
                     .unwrap();
             }
             if scenario == "invisible" {
-                partition.begin(through + 1, true).await.unwrap();
+                // An input an earlier daemon began but never committed.
+                partition
+                    .legacy_uncommitted(through + 1, &[], false)
+                    .await
+                    .unwrap();
             }
             drop((partition, events));
             let daemon = Daemon::new(

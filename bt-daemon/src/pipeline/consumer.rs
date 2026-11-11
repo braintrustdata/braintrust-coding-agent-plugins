@@ -489,11 +489,10 @@ mod tests {
         .unwrap();
     }
     async fn stored(journal: &SpanJournal) {
-        journal.begin(10, true).await.unwrap();
         journal
-            .append(
+            .translated(
                 10,
-                &[SpanOp::Insert(SpanRow {
+                vec![SpanOp::Insert(SpanRow {
                     span_id: "one".into(),
                     name: "one".into(),
                     root_span_id: "one".into(),
@@ -503,7 +502,6 @@ mod tests {
             )
             .await
             .unwrap();
-        journal.commit(10).await.unwrap();
     }
     #[tokio::test]
     async fn transient_rejection_resubmits_consumed_batch_before_completing() {
@@ -635,9 +633,7 @@ mod tests {
                 })
             })
             .collect();
-        journal.begin(1, true).await.unwrap();
-        journal.append(1, &ops).await.unwrap();
-        journal.commit(1).await.unwrap();
+        journal.translated(1, ops.clone()).await.unwrap();
         let route = SessionRoute::default();
         let record = Arc::new(Recording::default());
         record.defer_until.store(129, Ordering::SeqCst);

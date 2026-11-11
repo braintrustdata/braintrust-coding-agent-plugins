@@ -6,7 +6,9 @@ use super::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
 use super::recovery::{Boundary, Failure, Recovery, RecoveryOutcome};
 use super::Stage;
 pub(crate) use crate::collections::BindingChanged;
-use crate::collections::{Completion, Delivery, EventCollection, HeldRoute, InputPort, SpanOps};
+use crate::collections::{
+    Completion, Delivery, EventCollection, HeldRoute, InputPort, SpanOps, Translated,
+};
 use crate::{
     translate::{OriginSnapshot, SpanOp},
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
@@ -56,38 +58,6 @@ impl SpanJournal {
         })
     }
 
-    /// Store available operations and hand the original instances to routes.
-    /// Per-input operation ordinals survive a crash halfway through translation,
-    /// so rebuilding translator state does not publish an accepted prefix twice.
-    pub async fn append_live(
-        &self,
-        input: u64,
-        ordinal: &mut u64,
-        ops: &mut Vec<SpanOp>,
-    ) -> anyhow::Result<()> {
-        while !ops.is_empty() {
-            let positions = self
-                .ops
-                .insert(input, *ordinal, ops, BYTE_BUDGET, WINDOW)
-                .await?;
-            let count = positions.len();
-            *ordinal += count as u64;
-            for (position, op) in positions.into_iter().zip(ops.drain(..count)) {
-                if let Some((position, bytes)) = position {
-                    self.live
-                        .publish(Record {
-                            position,
-                            bytes,
-                            op: SharedOp::new(op),
-                        })
-                        .await;
-                    self.changed.send_replace(position);
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// One serialized, weakly held recovery window is shared by all routes.
     /// No decoded payload remains alive solely because of the replay cache.
     async fn recover_after(&self, after: u64) -> anyhow::Result<Vec<Record>> {
@@ -135,43 +105,50 @@ impl SpanJournal {
         Ok(records)
     }
 
-    /// Commit translated output and remove its consumed input atomically.
-    pub async fn commit_translation(
+    /// Hand one input's translation to delivery atomically, then give routes
+    /// the original op instances. Nothing is published before it is durable.
+    pub async fn commit_translation(&self, translated: Translated) -> anyhow::Result<u64> {
+        let committed = self.ops.commit_translation(&translated).await?;
+        // Every op is durable: advertise the tail first, so routes can drain
+        // the bounded live feed (or read storage) while it is being filled.
+        self.changed.send_replace(committed.tail);
+        for (position, op) in committed.positions.into_iter().zip(translated.ops) {
+            if let Some((position, bytes)) = position {
+                self.live
+                    .publish(Record {
+                        position,
+                        bytes,
+                        op: SharedOp::new(op),
+                    })
+                    .await;
+            }
+        }
+        Ok(committed.tail)
+    }
+
+    /// Commit native output for `input` with no continuation.
+    #[cfg(test)]
+    pub async fn translated(&self, input: u64, ops: Vec<SpanOp>) -> anyhow::Result<u64> {
+        self.translated_with_roots(input, ops, &BTreeMap::new())
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn translated_with_roots(
         &self,
-        events: &EventCollection,
         input: u64,
-        roots: &BTreeMap<String, Vec<SpanOp>>,
-        state: Vec<u8>,
-    ) -> anyhow::Result<u64> {
-        let tail = self
-            .ops
-            .commit_translation(events, input, roots, state)
-            .await?;
-        self.changed.send_replace(tail);
-        Ok(tail)
-    }
-
-    #[cfg(test)]
-    pub async fn append(&self, input: u64, ops: &[SpanOp]) -> anyhow::Result<()> {
-        self.ops.insert_unreceipted(input, ops).await
-    }
-
-    #[cfg(test)]
-    pub async fn commit(&self, input: u64) -> anyhow::Result<u64> {
-        let tail = self.ops.commit(input, None).await?;
-        self.changed.send_replace(tail);
-        Ok(tail)
-    }
-
-    #[cfg(test)]
-    pub async fn commit_with_roots(
-        &self,
-        input: u64,
+        ops: Vec<SpanOp>,
         roots: &BTreeMap<String, Vec<SpanOp>>,
     ) -> anyhow::Result<u64> {
-        let tail = self.ops.commit(input, Some(roots)).await?;
-        self.changed.send_replace(tail);
-        Ok(tail)
+        self.commit_translation(Translated {
+            input,
+            observation: true,
+            ops,
+            roots: roots.clone(),
+            state: None,
+            acknowledged: None,
+        })
+        .await
     }
 
     pub async fn subscribe(
@@ -204,9 +181,6 @@ impl SpanJournal {
     pub async fn translated_through(&self) -> anyhow::Result<u64> {
         self.ops.translated_through().await
     }
-    pub async fn begin(&self, input: u64, observation: bool) -> anyhow::Result<bool> {
-        self.ops.begin(input, observation).await
-    }
     pub async fn checkpoint(&self) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
         self.ops.checkpoint().await
     }
@@ -224,9 +198,6 @@ impl SpanJournal {
     }
     pub async fn observations(&self) -> anyhow::Result<Vec<SpanOp>> {
         self.ops.observations().await
-    }
-    pub async fn acknowledge_legacy(&self, route: &SessionRoute, input: u64) -> anyhow::Result<()> {
-        self.ops.acknowledge_legacy(route, input).await
     }
     pub async fn register(&self, route: &SessionRoute) -> anyhow::Result<()> {
         self.ops.register(route).await
@@ -740,12 +711,8 @@ mod tests {
         let mut named = route("profile");
         named.auth.profile = Some("work".into());
         journal.register(&named).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal
-            .append_live(10, &mut 0, &mut vec![op("one")])
-            .await
-            .unwrap();
-        journal.commit(10).await.unwrap();
+        journal.translated(10, vec![op("one")]).await.unwrap();
+        journal.translated(10, Vec::new()).await.unwrap();
         let mut resolved = named.clone();
         resolved.auth.profile_id = Some("stable-id".into());
         let mut cursor = journal.subscribe(&resolved, 0).await.unwrap();
@@ -768,9 +735,8 @@ mod tests {
         let journal = SpanJournal::open(&tmp.path().join("shared-recovery.sqlite"))
             .await
             .unwrap();
-        journal.begin(10, true).await.unwrap();
         journal
-            .append_live(10, &mut 0, &mut vec![op("one"), op("two"), op("three")])
+            .translated(10, vec![op("one"), op("two"), op("three")])
             .await
             .unwrap();
         let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
@@ -794,12 +760,8 @@ mod tests {
         let journal = SpanJournal::open(&path).await.unwrap();
         let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
         let mut b = journal.subscribe(&route("b"), 0).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal
-            .append_live(10, &mut 0, &mut vec![op("one")])
-            .await
-            .unwrap();
-        journal.commit(10).await.unwrap();
+        journal.translated(10, vec![op("one")]).await.unwrap();
+        journal.translated(10, Vec::new()).await.unwrap();
         let first = a.next_shared().await.unwrap().unwrap();
         let second = b.next_shared().await.unwrap().unwrap();
         first.into_completed().await.ok().unwrap();
@@ -814,11 +776,7 @@ mod tests {
         assert_eq!(restored.translated_through().await.unwrap(), 10);
         let mut late = restored.subscribe(&route("new"), 0).await.unwrap();
         assert!(late.next_shared().await.unwrap().is_none());
-        restored.begin(20, true).await.unwrap();
-        restored
-            .append_live(20, &mut 0, &mut vec![op("two")])
-            .await
-            .unwrap();
+        restored.translated(20, vec![op("two")]).await.unwrap();
         assert_eq!(restored.tail().await.unwrap(), 2);
         assert!(late.next_shared().await.unwrap().is_some());
     }
@@ -835,11 +793,7 @@ mod tests {
             published: cursor.changes.clone(),
             drain: cursor.drain.clone(),
         };
-        journal.begin(10, true).await.unwrap();
-        journal
-            .append_live(10, &mut 0, &mut vec![op("one")])
-            .await
-            .unwrap();
+        journal.translated(10, vec![op("one")]).await.unwrap();
         let mut receiving = Box::pin(cursor.next_shared());
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), &mut receiving)
@@ -876,13 +830,9 @@ mod tests {
             .await
             .unwrap();
         journal.register(&route("first")).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal.append(10, &[op("old")]).await.unwrap();
-        journal.commit(10).await.unwrap();
+        journal.translated(10, vec![op("old")]).await.unwrap();
         journal.register(&route("new")).await.unwrap();
-        journal.begin(20, true).await.unwrap();
-        journal.append(20, &[op("new")]).await.unwrap();
-        journal.commit(20).await.unwrap();
+        journal.translated(20, vec![op("new")]).await.unwrap();
         let mut new = journal.subscribe(&route("new"), 0).await.unwrap();
         let batch = new.next_batch(8).await.unwrap().unwrap();
         assert_eq!(batch.value().len(), 1);
@@ -912,8 +862,10 @@ mod tests {
             input: Some(serde_json::Value::String(payload)),
             ..Default::default()
         })];
-        journal.begin(10, true).await.unwrap();
-        journal.append_live(10, &mut 0, &mut ops).await.unwrap();
+        journal
+            .translated(10, std::mem::take(&mut ops))
+            .await
+            .unwrap();
         assert!(ops.is_empty());
         // Live delivery is possible before the native event has finished.
         let a = first.next_shared().await.unwrap().unwrap();
@@ -937,11 +889,7 @@ mod tests {
         let journal = SpanJournal::open(&tmp.path().join("recovery.sqlite"))
             .await
             .unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal
-            .append_live(10, &mut 0, &mut vec![op("recover")])
-            .await
-            .unwrap();
+        journal.translated(10, vec![op("recover")]).await.unwrap();
         let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
         let mut second = journal.subscribe(&route("second"), 0).await.unwrap();
         let a = first.next_shared().await.unwrap().unwrap();
@@ -955,18 +903,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_event_restart_preserves_published_operations_and_route_heads() {
+    async fn a_legacy_partially_published_input_is_completed_without_redelivery() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("partial.sqlite");
         let journal = SpanJournal::open(&path).await.unwrap();
         let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
-        journal.begin(10, true).await.unwrap();
+        // A daemon before atomic handoff published "one", then crashed while
+        // still translating its input.
         journal
-            .append_live(10, &mut 0, &mut vec![op("one")])
+            .legacy_uncommitted(10, &[op("one")], true)
             .await
             .unwrap();
-        first
-            .next_shared()
+        let mut reader = journal.subscribe(&route("first"), 0).await.unwrap();
+        reader
+            .next_batch(8)
             .await
             .unwrap()
             .unwrap()
@@ -974,18 +924,16 @@ mod tests {
             .await
             .ok()
             .unwrap();
+        drop((reader, first));
         assert_eq!(journal.translated_through().await.unwrap(), 0);
         drop(journal);
         let journal = SpanJournal::open(&path).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        let mut ordinal = 0;
         journal
-            .append_live(10, &mut ordinal, &mut vec![op("one"), op("two")])
+            .translated(10, vec![op("one"), op("two")])
             .await
             .unwrap();
-        journal.commit(10).await.unwrap();
-        let mut restored = journal.subscribe(&route("first"), 0).await.unwrap();
-        let delivery = restored.next_shared().await.unwrap().unwrap();
+        first = journal.subscribe(&route("first"), 0).await.unwrap();
+        let delivery = first.next_shared().await.unwrap().unwrap();
         assert_eq!(delivery.value().len(), 1);
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = delivery.value()[0].as_ref();
         assert_eq!(row.name, "two");
@@ -1001,14 +949,11 @@ mod tests {
         let mut fast = journal.subscribe(&route("fast"), 0).await.unwrap();
         let mut slow = journal.subscribe(&route("slow"), 0).await.unwrap();
         slow.live.control().pause();
-        journal.begin(10, true).await.unwrap();
-        let mut ordinal = 0;
         for index in 0..3 {
             journal
-                .append_live(
-                    10,
-                    &mut ordinal,
-                    &mut vec![SpanOp::Insert(SpanRow {
+                .translated(
+                    10 + index,
+                    vec![SpanOp::Insert(SpanRow {
                         name: index.to_string(),
                         input: Some(serde_json::json!("x".repeat(BYTE_BUDGET))),
                         ..Default::default()
@@ -1026,7 +971,6 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 0);
-        journal.commit(10).await.unwrap();
         for _ in 0..3 {
             let delivery = slow.next_shared().await.unwrap().unwrap();
             assert_eq!(
@@ -1051,18 +995,17 @@ mod tests {
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut root;
         row.metadata = Some(serde_json::json!({"_bt_defer_root": true}));
         assert!(roots.process(&vec![root]).await.is_empty());
-        journal.begin(10, true).await.unwrap();
         let db = Inspector::open(&path).unwrap();
         db.inject(Fault::ReplaceRoots).unwrap();
         assert!(journal
-            .commit_with_roots(10, roots.pending())
+            .translated_with_roots(10, Vec::new(), roots.pending())
             .await
             .is_err());
         assert_eq!(journal.translated_through().await.unwrap(), 0);
         assert!(journal.root_candidates().await.unwrap().is_empty());
         db.clear(Fault::ReplaceRoots).unwrap();
         journal
-            .commit_with_roots(10, roots.pending())
+            .translated_with_roots(10, Vec::new(), roots.pending())
             .await
             .unwrap();
         drop(journal);
@@ -1083,11 +1026,9 @@ mod tests {
         });
         let ready = roots.process(&vec![child]).await;
         assert_eq!(ready.len(), 2);
-        journal.begin(20, true).await.unwrap();
-        journal.append(20, &ready).await.unwrap();
         db.inject(Fault::ReleaseRoots).unwrap();
         assert!(journal
-            .commit_with_roots(20, roots.pending())
+            .translated_with_roots(20, ready.clone(), roots.pending())
             .await
             .is_err());
         assert_eq!(journal.translated_through().await.unwrap(), 10);
@@ -1095,7 +1036,7 @@ mod tests {
         assert_eq!(journal.root_candidates().await.unwrap().len(), 1);
         db.clear(Fault::ReleaseRoots).unwrap();
         journal
-            .commit_with_roots(20, roots.pending())
+            .translated_with_roots(20, ready.clone(), roots.pending())
             .await
             .unwrap();
         assert_eq!(journal.tail().await.unwrap(), 2);
@@ -1109,9 +1050,7 @@ mod tests {
         let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
-        journal.begin(1, true).await.unwrap();
-        journal.append(1, &[op("one")]).await.unwrap();
-        journal.commit(1).await.unwrap();
+        journal.translated(1, vec![op("one")]).await.unwrap();
         let mut input: Box<dyn InputPort<Item = Vec<SpanOp>>> =
             Box::new(journal.subscribe(&route("a"), 0).await.unwrap());
         let delivery = input.receive().await.unwrap().unwrap();
@@ -1141,20 +1080,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
         let journal = SpanJournal::open(&path).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal.append(10, &[op("abandoned")]).await.unwrap();
+        journal
+            .legacy_uncommitted(10, &[op("abandoned")], false)
+            .await
+            .unwrap();
         let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
         assert!(reader.next_batch(8).await.unwrap().is_none());
         drop(reader);
         drop(journal);
         let journal = SpanJournal::open(&path).await.unwrap();
         assert_eq!(journal.translated_through().await.unwrap(), 0);
-        journal.begin(10, true).await.unwrap();
-        journal.append(10, &[op("retained")]).await.unwrap();
-        journal.commit(10).await.unwrap();
-        assert!(!journal.begin(10, true).await.unwrap());
-        journal.begin(20, true).await.unwrap();
-        journal.commit(20).await.unwrap();
+        journal.translated(10, vec![op("retained")]).await.unwrap();
+        let tail = journal.tail().await.unwrap();
+        journal.translated(10, vec![op("again")]).await.unwrap();
+        assert_eq!(
+            journal.tail().await.unwrap(),
+            tail,
+            "a committed input is final"
+        );
+        journal.translated(20, Vec::new()).await.unwrap();
         assert_eq!(journal.translated_through().await.unwrap(), 20);
         let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
         let message = reader.next_batch(8).await.unwrap().unwrap();
@@ -1173,9 +1117,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
         let journal = SpanJournal::open(&path).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal.append(10, &[op("one"), op("two")]).await.unwrap();
-        journal.commit(10).await.unwrap();
+        journal
+            .translated(10, vec![op("one"), op("two")])
+            .await
+            .unwrap();
         let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
         let mut b = journal.subscribe(&route("b"), 0).await.unwrap();
         a.next_batch(2)
@@ -1208,9 +1153,7 @@ mod tests {
         let path = tmp.path().join("spans.sqlite");
         let journal = SpanJournal::open(&path).await.unwrap();
         let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal.append(10, &[op("one")]).await.unwrap();
-        journal.commit(10).await.unwrap();
+        journal.translated(10, vec![op("one")]).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), reader.changed())
             .await
             .unwrap();
@@ -1242,9 +1185,7 @@ mod tests {
         let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal.append(10, &[op("one")]).await.unwrap();
-        journal.commit(10).await.unwrap();
+        journal.translated(10, vec![op("one")]).await.unwrap();
         let mut legacy = route("work");
         legacy.auth.profile = Some("work".into());
         let mut canonical = legacy.clone();

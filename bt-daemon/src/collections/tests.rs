@@ -1,5 +1,6 @@
 //! Storage behavior shared by the concrete collections.
 use super::inspect::{Fault, Inspector, Table};
+use super::span_ops::Translated;
 use super::*;
 use crate::journal::{journal_path, source_journal_path};
 use crate::translate::{SpanOp, SpanRow};
@@ -215,27 +216,30 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
         .unwrap()
         .through;
     let ops = SpanOps::for_events(&events).await.unwrap();
-    ops.begin(input, true).await.unwrap();
-    let op = SpanOp::Insert(SpanRow {
-        span_id: "span".into(),
-        ..Default::default()
-    });
-    ops.insert(input, 0, &[op], usize::MAX, std::time::Duration::MAX)
-        .await
-        .unwrap();
+    let translated = Translated {
+        input,
+        observation: true,
+        ops: vec![SpanOp::Insert(SpanRow {
+            span_id: "span".into(),
+            ..Default::default()
+        })],
+        roots: Default::default(),
+        state: Some(b"{}".to_vec()),
+        acknowledged: None,
+    };
     let db = Inspector::session(temp.path(), "debug", "session").unwrap();
     db.inject(Fault::RemoveEvents).unwrap();
-    assert!(ops
-        .commit_translation(&events, input, &Default::default(), b"{}".to_vec())
-        .await
-        .is_err());
+    assert!(ops.commit_translation(&translated).await.is_err());
+    // Neither stage changed: the event remains and no output is visible.
     assert_eq!(ops.translated_through().await.unwrap(), 0);
     assert_eq!(db.count(Table::Events), 1);
+    assert_eq!(db.count(Table::Ops), 0);
+    assert_eq!(ops.tail().await.unwrap(), 0);
     assert!(ops.checkpoint().await.unwrap().is_none());
     db.clear(Fault::RemoveEvents).unwrap();
-    ops.commit_translation(&events, input, &Default::default(), b"{}".to_vec())
-        .await
-        .unwrap();
+    let committed = ops.commit_translation(&translated).await.unwrap();
+    assert_eq!(committed.tail, 1);
+    assert_eq!(db.count(Table::Ops), 1);
     assert_eq!(ops.translated_through().await.unwrap(), input);
     assert_eq!(db.count(Table::Events), 0);
     assert_eq!(ops.checkpoint().await.unwrap().unwrap().0, input);

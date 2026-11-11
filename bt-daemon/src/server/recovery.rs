@@ -291,11 +291,10 @@ pub(super) mod tests {
             .await
             .unwrap();
         drop(writer);
-        spans.begin(through, true).await.unwrap();
         spans
-            .append(
+            .translated(
                 through,
-                &[SpanOp::Insert(SpanRow {
+                vec![SpanOp::Insert(SpanRow {
                     span_id: "stored".into(),
                     name: "stored".into(),
                     root_span_id: "stored".into(),
@@ -305,7 +304,6 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        spans.commit(through).await.unwrap();
         spans.subscribe(&route, 0).await.unwrap();
         let mut dormant = route.clone();
         dormant.tags.insert("dormant".into());
@@ -387,11 +385,10 @@ pub(super) mod tests {
         let path = crate::collections::inspect::session_path(tmp.path(), "debug", &env.session_id);
         let spans = SpanJournal::for_events(&writer).await.unwrap();
         drop(writer);
-        spans.begin(first, true).await.unwrap();
         spans
-            .append(
+            .translated(
                 first,
-                &[SpanOp::Insert(SpanRow {
+                vec![SpanOp::Insert(SpanRow {
                     span_id: "stored".into(),
                     name: "stored".into(),
                     root_span_id: "stored".into(),
@@ -401,7 +398,6 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        spans.commit(first).await.unwrap();
         spans.subscribe(&original, 0).await.unwrap();
         let lease = TestAuth
             .resolve(&original.auth, AuthResolveReason::Initial)

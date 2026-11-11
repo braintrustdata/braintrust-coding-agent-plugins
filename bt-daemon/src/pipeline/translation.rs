@@ -10,7 +10,7 @@ use super::{
     Stage,
 };
 use crate::{
-    collections::{EventCollection, EventReader, EventRecord},
+    collections::{EventCollection, EventReader, EventRecord, Translated},
     translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, WeakOrigins},
     wire::{SessionConfig, SessionRoute},
 };
@@ -201,14 +201,16 @@ struct Continuation {
     capture: Option<OriginSnapshot>,
 }
 
+/// One input's translation in progress. Chunks are prepared into `built` and
+/// handed off together once the translator has drained, so a storage failure
+/// retries only the handoff and never translates the input again.
 struct Publication {
     input: u64,
-    ordinal: u64,
     observation: bool,
     capture: Option<OriginSnapshot>,
+    /// The next chunk the translator produced, not yet prepared.
     ops: Option<Vec<SpanOp>>,
-    begun: bool,
-    prepared: bool,
+    built: Vec<SpanOp>,
     complete: bool,
     continuation: Option<Vec<u8>>,
 }
@@ -690,17 +692,17 @@ impl Producer {
                     (ops, self.capture.clone())
                 }
                 SourceEvent::LegacyDeliveryCheckpoint { route, through } => {
-                    self.journal.acknowledge_legacy(&route, through).await?;
                     if input > self.committed {
-                        self.journal.begin(input, observation).await?;
                         let state = self.continuation().await?;
                         self.journal
-                            .commit_translation(
-                                &self.options.events,
+                            .commit_translation(Translated {
                                 input,
-                                self.roots.pending(),
-                                state,
-                            )
+                                observation,
+                                ops: Vec::new(),
+                                roots: self.roots.pending().clone(),
+                                state: Some(state),
+                                acknowledged: Some((*route, through)),
+                            })
                             .await?;
                         self.committed = input;
                         self.progress.committed.store(input, Ordering::Relaxed);
@@ -711,12 +713,10 @@ impl Producer {
             };
             self.publication = Some(Publication {
                 input,
-                ordinal: 0,
                 observation,
                 capture,
                 ops: Some(first),
-                begun: false,
-                prepared: false,
+                built: Vec::new(),
                 complete: false,
                 continuation,
             });
@@ -762,8 +762,9 @@ impl Producer {
         .await
     }
 
-    /// Each chunk stays owned until its local write succeeds. A commit retry
-    /// cannot call translation or advance to the following event.
+    /// Each chunk stays owned until it is prepared; the input's complete
+    /// output is handed to delivery in one transaction with its removal. A
+    /// commit retry cannot call translation or advance to the following event.
     async fn publish(&mut self) -> anyhow::Result<()> {
         let mut pending = self
             .publication
@@ -771,80 +772,21 @@ impl Producer {
             .ok_or_else(|| anyhow::anyhow!("pending publication is missing"))?;
         let result = async {
             let publish = pending.input > self.committed;
-            if publish && !pending.begun {
-                self.phase = Boundary::Journal;
-                self.journal
-                    .begin(pending.input, pending.observation)
-                    .await?;
-                pending.begun = true;
-            }
             while !pending.complete {
-                if let Some(ops) = pending.ops.as_mut() {
-                    if !pending.prepared {
-                        let missing = ops
-                            .iter()
-                            .filter_map(|op| {
-                                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                                self.origins
-                                    .get(&row.span_id)
-                                    .is_none()
-                                    .then(|| row.span_id.clone())
-                            })
-                            .collect();
-                        let mut saved = self.journal.origins_for(missing).await?;
-                        for op in ops.iter_mut() {
-                            let insert = matches!(op, SpanOp::Insert(_));
-                            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                            let origin = self
-                                .origins
-                                .get(&row.span_id)
-                                .or_else(|| saved.remove(&row.span_id))
-                                .or_else(|| {
-                                    insert.then(|| {
-                                        Arc::new(pending.capture.clone().unwrap_or_else(|| {
-                                            OriginSnapshot {
-                                                plugin_version: None,
-                                                source_version: None,
-                                                bt_version: self.options.version.clone(),
-                                            }
-                                        }))
-                                    })
-                                });
-                            if let Some(origin) = &origin {
-                                self.origins.insert(row.span_id.clone(), origin);
-                            }
-                            row.origin = origin;
-                        }
-                        self.phase = Boundary::Journal;
-                        if pending.observation {
-                            for observer in &self.observers {
-                                Self::observe(
-                                    &self.options,
-                                    &mut self.pending_snapshots,
-                                    ops,
-                                    observer,
-                                )
-                                .await?;
-                            }
-                        }
-                        if publish {
-                            *ops = self.roots.process_owned(std::mem::take(ops));
-                        }
-                        pending.prepared = true;
+                if let Some(mut ops) = pending.ops.take() {
+                    if let Err(error) = self.prepare(&pending, &mut ops).await {
+                        pending.ops = Some(ops);
+                        return Err(error);
                     }
                     if publish {
-                        self.journal
-                            .append_live(pending.input, &mut pending.ordinal, ops)
-                            .await?;
+                        pending.built.extend(self.roots.process_owned(ops));
                     }
-                    pending.ops = None;
                 }
                 self.phase = Boundary::Translation;
                 pending.ops = self
                     .translate(|translator, ctx| translator.drain_pending(ctx))
                     .await?;
                 pending.complete = pending.ops.is_none();
-                pending.prepared = false;
             }
             if publish {
                 self.phase = Boundary::Journal;
@@ -852,13 +794,16 @@ impl Producer {
                     Some(state) => state.clone(),
                     None => self.continuation().await?,
                 };
+                pending.continuation = Some(state.clone());
                 self.journal
-                    .commit_translation(
-                        &self.options.events,
-                        pending.input,
-                        self.roots.pending(),
-                        state,
-                    )
+                    .commit_translation(Translated {
+                        input: pending.input,
+                        observation: pending.observation,
+                        ops: pending.built.clone(),
+                        roots: self.roots.pending().clone(),
+                        state: Some(state),
+                        acknowledged: None,
+                    })
                     .await?;
                 self.committed = pending.input;
                 self.progress
@@ -873,6 +818,49 @@ impl Producer {
             self.publication = Some(pending);
         }
         result
+    }
+
+    /// Stamp provenance and let correlation observe one translated chunk.
+    async fn prepare(&mut self, pending: &Publication, ops: &mut [SpanOp]) -> anyhow::Result<()> {
+        let missing = ops
+            .iter()
+            .filter_map(|op| {
+                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                self.origins
+                    .get(&row.span_id)
+                    .is_none()
+                    .then(|| row.span_id.clone())
+            })
+            .collect();
+        let mut saved = self.journal.origins_for(missing).await?;
+        for op in ops.iter_mut() {
+            let insert = matches!(op, SpanOp::Insert(_));
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            let origin = self
+                .origins
+                .get(&row.span_id)
+                .or_else(|| saved.remove(&row.span_id))
+                .or_else(|| {
+                    insert.then(|| {
+                        Arc::new(pending.capture.clone().unwrap_or_else(|| OriginSnapshot {
+                            plugin_version: None,
+                            source_version: None,
+                            bt_version: self.options.version.clone(),
+                        }))
+                    })
+                });
+            if let Some(origin) = &origin {
+                self.origins.insert(row.span_id.clone(), origin);
+            }
+            row.origin = origin;
+        }
+        self.phase = Boundary::Journal;
+        if pending.observation {
+            for observer in &self.observers {
+                Self::observe(&self.options, &mut self.pending_snapshots, ops, observer).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn observe_history(&mut self, observer: &Observation) -> anyhow::Result<()> {
@@ -1078,7 +1066,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_partial_output_survives_failed_checkpoint_without_input_loss_or_redelivery() {
+    async fn a_failed_checkpoint_publishes_nothing_and_retries_the_whole_handoff() {
         let mut f = SourceFixture::new("debug").await;
         let db = f.db();
         db.inject(Fault::SaveCheckpoint).unwrap();
@@ -1090,24 +1078,17 @@ pub(crate) mod tests {
         let through = f.write(&event, true).await;
         f.source.advance(through).await.unwrap();
         assert!(f.source.barrier().await.is_err());
+        // The input is kept and none of its output reached delivery.
         assert_eq!(db.count(Table::Events), 1);
+        assert_eq!(db.count(Table::Ops), 0);
         let mut route = f
             .source
             .journal
             .subscribe(event.route.as_ref().unwrap(), 0)
             .await
             .unwrap();
-        route
-            .next_batch(8)
-            .await
-            .unwrap()
-            .unwrap()
-            .into_completed()
-            .await
-            .ok()
-            .unwrap();
-        assert_eq!(db.count(Table::Ops), 0);
-        assert_eq!(db.count(Table::Receipts), 2);
+        assert!(route.next_batch(8).await.unwrap().is_none());
+        drop(route);
         f.source.shutdown().await;
         db.clear(Fault::SaveCheckpoint).unwrap();
         f.reopen().await;
@@ -1120,7 +1101,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(f.source.journal.tail().await.unwrap(), 2);
-        assert!(f.source.journal.published(0, 8).await.unwrap().is_empty());
+        assert_eq!(f.source.journal.published(0, 8).await.unwrap().len(), 2);
         let (_, bytes) = f.source.journal.checkpoint().await.unwrap().unwrap();
         let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(state["native"]["event_seq"], 1);
@@ -1252,10 +1233,16 @@ pub(crate) mod tests {
                 }),
             ])
             .await;
-        translation.journal.begin(10, false).await.unwrap();
         translation
             .journal
-            .commit_with_roots(10, roots.pending())
+            .commit_translation(Translated {
+                input: 10,
+                observation: false,
+                ops: Vec::new(),
+                roots: roots.pending().clone(),
+                state: None,
+                acknowledged: None,
+            })
             .await
             .unwrap();
         let route = SessionRoute::default();
@@ -1310,11 +1297,10 @@ pub(crate) mod tests {
             .corrupt_events(0, input)
             .unwrap();
         let journal = SpanJournal::for_events(&events).await.unwrap();
-        journal.begin(input, true).await.unwrap();
-        journal
-            .append(
+        let tail = journal
+            .translated(
                 input,
-                &[SpanOp::Insert(SpanRow {
+                vec![SpanOp::Insert(SpanRow {
                     span_id: "durable".into(),
                     root_span_id: "durable".into(),
                     name: "already translated".into(),
@@ -1323,7 +1309,6 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let tail = journal.commit(input).await.unwrap();
         let translation = Translation::spawn(TranslationOptions {
             source: source.into(),
             session_id: session.into(),
@@ -1382,7 +1367,6 @@ pub(crate) mod tests {
         producer.translator = Some(Box::new(CountedTranslation(drains.clone())));
         producer.publication = Some(Publication {
             input: 10,
-            ordinal: 0,
             observation: true,
             capture: None,
             ops: Some(vec![
@@ -1396,21 +1380,21 @@ pub(crate) mod tests {
                     ..Default::default()
                 }),
             ]),
-            begun: false,
-            prepared: false,
+            built: Vec::new(),
             complete: false,
             continuation: None,
         });
+        // A failed handoff publishes nothing and keeps the built output.
         db.inject(Fault::InsertOps).unwrap();
         assert!(producer.publish().await.is_err());
-        assert_eq!(drains.load(Ordering::Relaxed), 0);
-        assert_eq!(journal.translated_through().await.unwrap(), 0);
-        db.clear(Fault::InsertOps).unwrap();
-        db.inject(Fault::CommitBatch).unwrap();
-        assert!(producer.publish().await.is_err());
         assert_eq!(drains.load(Ordering::Relaxed), 1);
-        assert_eq!(journal.tail().await.unwrap(), 1);
-        db.clear(Fault::CommitBatch).unwrap();
+        assert_eq!(journal.translated_through().await.unwrap(), 0);
+        assert_eq!(journal.tail().await.unwrap(), 0);
+        db.clear(Fault::InsertOps).unwrap();
+        db.inject(Fault::BeginTranslation).unwrap();
+        assert!(producer.publish().await.is_err());
+        assert_eq!(journal.tail().await.unwrap(), 0);
+        db.clear(Fault::BeginTranslation).unwrap();
         producer.publish().await.unwrap();
         assert_eq!(drains.load(Ordering::Relaxed), 1);
         assert_eq!(journal.translated_through().await.unwrap(), 10);

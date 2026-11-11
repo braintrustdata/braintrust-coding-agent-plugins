@@ -1,9 +1,11 @@
 //! Translated SpanOps for one source session, with one durable head per route.
 //!
-//! Translation inserts ops for an input event; each route removes ops from its
-//! view by advancing its head once a destination accepts them. An op is
-//! physically deleted when every route has passed it. Writers acquire the
-//! write lock before reading, so read-to-write upgrades cannot fail mid-way.
+//! Each stage handoff is one transaction. Translation stores an input event's
+//! ops, metadata and continuation in the same transaction that removes the
+//! event. A route removes ops from its view by advancing its head once a
+//! destination accepts them, and an op is deleted when every route has passed
+//! it. Writers acquire the write lock before reading, so read-to-write
+//! upgrades cannot fail mid-way.
 use super::{events::EventCollection, store::Store};
 use crate::{
     translate::{OriginSnapshot, SpanOp, SpanRow, SpanType},
@@ -199,6 +201,27 @@ fn encode_roots(roots: &BTreeMap<String, Vec<SpanOp>>) -> anyhow::Result<Vec<(St
         .collect()
 }
 
+/// One input event's complete translation.
+pub(crate) struct Translated {
+    pub input: u64,
+    /// Whether the ops are native observations; retirement output is not.
+    pub observation: bool,
+    pub ops: Vec<SpanOp>,
+    /// Root candidates still waiting for work after this input.
+    pub roots: BTreeMap<String, Vec<SpanOp>>,
+    /// The translator continuation after this input.
+    pub state: Option<Vec<u8>>,
+    /// A delivery checkpoint `(route, through)` an earlier daemon journaled.
+    pub acknowledged: Option<(SessionRoute, u64)>,
+}
+
+/// The publication tail after a handoff and each op's stored position and
+/// size. An op an earlier daemon already published has no new position.
+pub(crate) struct Committed {
+    pub tail: u64,
+    pub positions: Vec<Option<(u64, usize)>>,
+}
+
 /// One stored op read back for delivery.
 pub(crate) struct StoredRecord {
     pub position: u64,
@@ -234,103 +257,6 @@ impl SpanOps {
 
     pub async fn translated_through(&self) -> anyhow::Result<u64> {
         self.store.run(|db| Ok(committed_through(db)?)).await
-    }
-
-    /// Begin translating an input. Returns false if it was already committed.
-    pub async fn begin(&self, input: u64, observation: bool) -> anyhow::Result<bool> {
-        self.store
-            .write(move |tx| {
-                let done: Option<bool> = tx
-                    .query_row(
-                        "SELECT committed FROM batches WHERE input=?",
-                        [input],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if done == Some(true) {
-                    return Ok(false);
-                }
-                let published: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM receipts WHERE input=?)",
-                    [input],
-                    |r| r.get(0),
-                )?;
-                if !published {
-                    tx.execute("DELETE FROM ops WHERE input=?", [input])?;
-                }
-                tx.execute(
-                    "INSERT OR REPLACE INTO batches(input,committed,observation) VALUES (?,0,?)",
-                    params![input, observation],
-                )?;
-                Ok(true)
-            })
-            .await
-    }
-
-    /// Insert a leading run of `ops` produced for `input`, numbered from
-    /// `first` within it and bounded by encoded bytes and encoding time. An op
-    /// whose ordinal was already stored (before a crash) is skipped, returning
-    /// `None` in its place, so rebuilding translator state never duplicates it.
-    /// The result has one entry per consumed op.
-    pub async fn insert(
-        &self,
-        input: u64,
-        first: u64,
-        ops: &[SpanOp],
-        budget: usize,
-        window: std::time::Duration,
-    ) -> anyhow::Result<Vec<Option<(u64, usize)>>> {
-        let started = std::time::Instant::now();
-        let mut encoded = Vec::new();
-        let mut bytes = 0;
-        for op in ops {
-            let value = StoredOp::encode(op)?;
-            if !encoded.is_empty() && bytes + value.len() > budget {
-                break;
-            }
-            bytes += value.len();
-            encoded.push((value, metadata_only(op)));
-            if bytes >= budget || started.elapsed() >= window {
-                break;
-            }
-        }
-        self.store
-            .write(move |tx| {
-                let mut positions = Vec::new();
-                let (committed, observation): (bool, bool) = tx.query_row(
-                    "SELECT committed,observation FROM batches WHERE input=?",
-                    [input],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                for (index, (value, metadata)) in encoded.into_iter().enumerate() {
-                    let ordinal = first + index as u64;
-                    let exists = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM receipts WHERE input=? AND ordinal=?)",
-                        params![input, ordinal],
-                        |r| r.get::<_, bool>(0),
-                    )?;
-                    if exists {
-                        positions.push(None);
-                        continue;
-                    }
-                    anyhow::ensure!(!committed, "cannot change a completed translation input");
-                    save_metadata(tx, &metadata, observation)?;
-                    let bytes = value.len();
-                    tx.execute(
-                        "INSERT INTO ops(input,value) VALUES (?,?)",
-                        params![input, value],
-                    )?;
-                    let position = tx.last_insert_rowid() as u64;
-                    positions.push(Some((position, bytes)));
-                    tx.execute("UPDATE publication SET tail=? WHERE id=1", [position])?;
-                    tx.execute(
-                        "INSERT INTO receipts(input,ordinal) VALUES (?,?)",
-                        params![input, ordinal],
-                    )?;
-                }
-                Ok(positions)
-            })
-            .await
     }
 
     /// Published ops after `after`, bounded by bytes and elapsed decode time.
@@ -381,38 +307,105 @@ impl SpanOps {
             .await
     }
 
-    /// Transfer ownership of consumed input to its output in one transaction:
-    /// remove the events through `input`, commit the batch, replace root
-    /// candidates and save the translator continuation. Returns the new tail.
-    pub async fn commit_translation(
-        &self,
-        events: &EventCollection,
-        input: u64,
-        roots: &BTreeMap<String, Vec<SpanOp>>,
-        state: Vec<u8>,
-    ) -> anyhow::Result<u64> {
-        anyhow::ensure!(
-            self.store.same(events.store()),
-            "translation input and output must share a session database"
+    /// Hand one input event's complete translation to delivery in a single
+    /// transaction: store its ops, metadata, root candidates and translator
+    /// continuation, and remove the consumed events through `input`. Nothing
+    /// is visible to routes before this commits, and an input that is already
+    /// committed is left unchanged.
+    pub async fn commit_translation(&self, translated: &Translated) -> anyhow::Result<Committed> {
+        let encoded = translated
+            .ops
+            .iter()
+            .map(|op| Ok((StoredOp::encode(op)?, metadata_only(op))))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let roots = encode_roots(&translated.roots)?;
+        let acknowledged = translated
+            .acknowledged
+            .as_ref()
+            .map(|(route, through)| {
+                Ok::<_, anyhow::Error>((serde_json::to_string(route)?, *through))
+            })
+            .transpose()?;
+        let (input, observation, state) = (
+            translated.input,
+            translated.observation,
+            translated.state.clone(),
         );
-        let roots = encode_roots(roots)?;
         self.store
             .write(move |tx| {
+                if input <= committed_through(tx)? {
+                    return Ok(Committed {
+                        tail: publication_tail(tx)?,
+                        positions: vec![None; encoded.len()],
+                    });
+                }
+                let earlier: u64 = tx.query_row(
+                    "SELECT count(*) FROM batches WHERE committed=0 AND input<?",
+                    [input],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    earlier == 0,
+                    "translation cannot publish past an unfinished input"
+                );
+                if let Some((route, through)) = acknowledged {
+                    acknowledge_legacy(tx, &route, through)?;
+                }
+                // A daemon before atomic handoff could publish a prefix of an
+                // input's ops before crashing. Those ordinals are already
+                // delivered; anything else it stored for the input is not.
+                let published: u64 = tx.query_row(
+                    "SELECT count(*) FROM receipts WHERE input=?",
+                    [input],
+                    |r| r.get(0),
+                )?;
+                if published == 0 {
+                    tx.execute("DELETE FROM ops WHERE input=?", [input])?;
+                }
+                let mut positions = Vec::with_capacity(encoded.len());
+                for (ordinal, (value, metadata)) in encoded.into_iter().enumerate() {
+                    if (ordinal as u64) < published {
+                        positions.push(None);
+                        continue;
+                    }
+                    save_metadata(tx, &metadata, observation)?;
+                    let bytes = value.len();
+                    tx.execute(
+                        "INSERT INTO ops(input,value) VALUES (?,?)",
+                        params![input, value],
+                    )?;
+                    let position = tx.last_insert_rowid() as u64;
+                    tx.execute("UPDATE publication SET tail=? WHERE id=1", [position])?;
+                    positions.push(Some((position, bytes)));
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO batches(input,committed,observation) VALUES (?,1,?)",
+                    params![input, observation],
+                )?;
+                tx.execute("DELETE FROM receipts WHERE input=?", [input])?;
+                tx.execute("DELETE FROM root_candidates", [])?;
+                for (id, value) in roots {
+                    tx.execute(
+                        "INSERT INTO root_candidates(span_id,value) VALUES (?,?)",
+                        params![id, value],
+                    )?;
+                }
                 EventCollection::remove_through(tx, input)?;
-                commit_batch(tx, input, Some(roots), Some(state))
+                if let Some(state) = state {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO source_checkpoint VALUES(1,1,?,?)",
+                        params![input, state],
+                    )?;
+                    // The continuation replaces earlier inputs' bookkeeping.
+                    tx.execute("DELETE FROM batches WHERE input<? AND committed=1 AND NOT EXISTS(SELECT 1 FROM ops WHERE ops.input=batches.input) AND NOT EXISTS(SELECT 1 FROM receipts WHERE receipts.input=batches.input)", [input])?;
+                }
+                prune(tx)?;
+                super::store::touch(tx)?;
+                Ok(Committed {
+                    tail: publication_tail(tx)?,
+                    positions,
+                })
             })
-            .await
-    }
-
-    #[cfg(test)]
-    pub async fn commit(
-        &self,
-        input: u64,
-        roots: Option<&BTreeMap<String, Vec<SpanOp>>>,
-    ) -> anyhow::Result<u64> {
-        let roots = roots.map(encode_roots).transpose()?;
-        self.store
-            .write(move |tx| commit_batch(tx, input, roots, None))
             .await
     }
 
@@ -540,40 +533,6 @@ impl SpanOps {
                     }
                 }
                 Ok(result)
-            })
-            .await
-    }
-
-    /// Apply a pre-collection delivery checkpoint to the route's head. An
-    /// earlier daemon delivered those spans without recording provenance, so
-    /// their rebuilt origins are discarded rather than attributed to it.
-    pub async fn acknowledge_legacy(&self, route: &SessionRoute, input: u64) -> anyhow::Result<()> {
-        let route = serde_json::to_string(route)?;
-        self.store
-            .write(move |tx| {
-                let position: u64 = tx.query_row(
-                    "SELECT coalesce(max(position),0) FROM ops WHERE input<=?",
-                    [input],
-                    |r| r.get(0),
-                )?;
-                let spans = {
-                    let mut query = tx.prepare("SELECT value FROM ops WHERE input<=?")?;
-                    let rows = query.query_map([input], |r| r.get::<_, Vec<u8>>(0))?;
-                    let mut spans = Vec::new();
-                    for row in rows {
-                        let (SpanOp::Insert(op) | SpanOp::Merge(op)) = StoredOp::decode(&row?)?;
-                        spans.push(op.span_id);
-                    }
-                    spans
-                };
-                for span in spans {
-                    tx.execute("DELETE FROM origins WHERE span_id=?", [span])?;
-                }
-                tx.execute(
-                    "INSERT INTO heads(route,position) VALUES(?,?) ON CONFLICT(route) DO UPDATE SET position=max(position,excluded.position)",
-                    params![route, position],
-                )?;
-                prune(tx)
             })
             .await
     }
@@ -842,56 +801,37 @@ impl SpanOps {
     }
 }
 
-fn commit_batch(
+/// Apply a pre-collection delivery checkpoint to the route's head. An earlier
+/// daemon delivered those spans without recording provenance, so their
+/// rebuilt origins are discarded rather than attributed to it.
+fn acknowledge_legacy(
     tx: &rusqlite::Transaction<'_>,
-    input: u64,
-    roots: Option<Vec<(String, Vec<u8>)>>,
-    state: Option<Vec<u8>>,
-) -> anyhow::Result<u64> {
-    anyhow::ensure!(
-        input >= committed_through(tx)?,
-        "translation commits must be ordered"
-    );
-    let earlier: u64 = tx.query_row(
-        "SELECT count(*) FROM batches WHERE committed=0 AND input<?",
-        [input],
-        |row| row.get(0),
-    )?;
-    anyhow::ensure!(
-        earlier == 0,
-        "translation cannot publish past an unfinished input"
-    );
-    anyhow::ensure!(
-        tx.execute("UPDATE batches SET committed=1 WHERE input=?", [input])? == 1,
-        "missing translation batch"
-    );
-    if let Some(roots) = roots {
-        tx.execute("DELETE FROM root_candidates", [])?;
-        for (id, value) in roots {
-            tx.execute(
-                "INSERT INTO root_candidates(span_id,value) VALUES (?,?)",
-                params![id, value],
-            )?;
-        }
-    }
-    let tail: u64 = tx.query_row(
-        "SELECT max((SELECT floor FROM publication WHERE id=1),coalesce(max(position),0)) FROM ops WHERE input<=?",
-        [input],
+    route: &str,
+    through: u64,
+) -> anyhow::Result<()> {
+    let position: u64 = tx.query_row(
+        "SELECT coalesce(max(position),0) FROM ops WHERE input<=?",
+        [through],
         |r| r.get(0),
     )?;
-    tx.execute("UPDATE publication SET tail=max(tail,?) WHERE id=1", [tail])?;
-    let tail = publication_tail(tx)?;
-    prune(tx)?;
-    super::store::touch(tx)?;
-    if let Some(state) = state {
-        tx.execute(
-            "INSERT OR REPLACE INTO source_checkpoint VALUES(1,1,?,?)",
-            params![input, state],
-        )?;
-        // The continuation replaces every earlier batch's bookkeeping.
-        tx.execute("DELETE FROM batches WHERE input<? AND committed=1 AND NOT EXISTS(SELECT 1 FROM ops WHERE ops.input=batches.input) AND NOT EXISTS(SELECT 1 FROM receipts WHERE receipts.input=batches.input)", [input])?;
+    let spans = {
+        let mut query = tx.prepare("SELECT value FROM ops WHERE input<=?")?;
+        let rows = query.query_map([through], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut spans = Vec::new();
+        for row in rows {
+            let (SpanOp::Insert(op) | SpanOp::Merge(op)) = StoredOp::decode(&row?)?;
+            spans.push(op.span_id);
+        }
+        spans
+    };
+    for span in spans {
+        tx.execute("DELETE FROM origins WHERE span_id=?", [span])?;
     }
-    Ok(tail)
+    tx.execute(
+        "INSERT INTO heads(route,position) VALUES(?,?) ON CONFLICT(route) DO UPDATE SET position=max(position,excluded.position)",
+        params![route, position],
+    )?;
+    prune(tx)
 }
 
 #[cfg(test)]
@@ -930,26 +870,39 @@ impl SpanOps {
             .await
     }
 
-    /// Insert ops without receipts, as schema-5 translation did.
-    pub async fn insert_unreceipted(&self, input: u64, ops: &[SpanOp]) -> anyhow::Result<()> {
+    /// Store ops for an input that never committed, as a daemon before
+    /// atomic handoff left them after a crash mid-translation. With
+    /// `published`, they are a delivered prefix recorded by ordinal.
+    pub async fn legacy_uncommitted(
+        &self,
+        input: u64,
+        ops: &[SpanOp],
+        published: bool,
+    ) -> anyhow::Result<()> {
         let encoded = ops
             .iter()
             .map(StoredOp::encode)
             .collect::<anyhow::Result<Vec<_>>>()?;
         self.store
             .write(move |tx| {
-                let done: bool = tx.query_row(
-                    "SELECT committed FROM batches WHERE input=?",
+                tx.execute(
+                    "INSERT OR REPLACE INTO batches(input,committed,observation) VALUES (?,0,1)",
                     [input],
-                    |r| r.get(0),
                 )?;
-                anyhow::ensure!(!done, "cannot change a committed translation input");
-                for value in encoded {
+                for (ordinal, value) in encoded.into_iter().enumerate() {
                     save_metadata(tx, &StoredOp::decode(&value)?, true)?;
                     tx.execute(
                         "INSERT INTO ops(input,value) VALUES (?,?)",
                         params![input, value],
                     )?;
+                    if published {
+                        let position = tx.last_insert_rowid() as u64;
+                        tx.execute("UPDATE publication SET tail=? WHERE id=1", [position])?;
+                        tx.execute(
+                            "INSERT INTO receipts(input,ordinal) VALUES (?,?)",
+                            params![input, ordinal as u64],
+                        )?;
+                    }
                 }
                 Ok(())
             })
@@ -1004,9 +957,7 @@ mod tests {
         let path = tmp.path().join("upgrade.sqlite");
         let journal = SpanJournal::open(&path).await.unwrap();
         journal.register(&route("old")).await.unwrap();
-        journal.begin(10, true).await.unwrap();
-        journal.append(10, &[op("old")]).await.unwrap();
-        journal.commit(10).await.unwrap();
+        journal.translated(10, vec![op("old")]).await.unwrap();
         drop(journal);
         let db = Connection::open(&path).unwrap();
         db.execute_batch("UPDATE heads SET position=1; DROP TABLE receipts; DROP TABLE publication; DROP TABLE origins; DROP TABLE span_state; DROP TABLE events; DROP TABLE captured; DROP TABLE event_state; DROP TABLE source_checkpoint; PRAGMA user_version=5").unwrap();
@@ -1056,12 +1007,16 @@ mod tests {
         transaction
             .execute("INSERT INTO batches(input,committed) VALUES(10,1)", [])
             .unwrap();
-        let begin = tokio::spawn(async move { journal.begin(10, true).await });
+        let begin = tokio::spawn(async move {
+            journal.translated(10, vec![op("late")]).await.unwrap();
+            journal
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let failed_early = begin.is_finished();
         transaction.commit().unwrap();
-        assert!(
-            !begin.await.unwrap().unwrap(),
+        assert_eq!(
+            begin.await.unwrap().stored_ops().await,
+            0,
             "a committed input must remain committed after waiting for its writer"
         );
         assert!(
@@ -1079,9 +1034,17 @@ mod tests {
         drop(db);
         let journal = SpanJournal::open(&path).await.unwrap();
         assert_eq!(journal.translated_through().await.unwrap(), 10);
-        journal.begin(20, false).await.unwrap();
-        journal.append(20, &[op("retirement")]).await.unwrap();
-        journal.commit(20).await.unwrap();
+        journal
+            .commit_translation(Translated {
+                input: 20,
+                observation: false,
+                ops: vec![op("retirement")],
+                roots: BTreeMap::new(),
+                state: None,
+                acknowledged: None,
+            })
+            .await
+            .unwrap();
         assert!(
             journal.published(0, 8).await.unwrap().is_empty(),
             "retirement output is not a native correlation observation"

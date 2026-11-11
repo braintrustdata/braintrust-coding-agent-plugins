@@ -22,5 +22,5 @@ pub(crate) mod view;
 pub(crate) use catalog::{remove_session, sessions, SessionStorage};
 pub(crate) use delivery::{Completion, Delivery, InputPort, OutputPort};
 pub(crate) use events::{Appended, EventCollection, EventReader, EventRecord};
-pub(crate) use span_ops::{metadata_only, BindingChanged, HeldRoute, SpanOps};
+pub(crate) use span_ops::{metadata_only, BindingChanged, HeldRoute, SpanOps, Translated};
 pub(crate) use store::is_corruption;
