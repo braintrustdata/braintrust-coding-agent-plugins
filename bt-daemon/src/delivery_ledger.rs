@@ -66,7 +66,11 @@ async fn session_lease(
         if exclusive {
             match fs2::FileExt::try_lock_exclusive(&file) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error)
+                    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    return Ok(None)
+                }
                 Err(error) => return Err(error.into()),
             }
         } else {

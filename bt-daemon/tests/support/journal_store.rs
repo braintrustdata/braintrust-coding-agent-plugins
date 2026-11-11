@@ -86,3 +86,63 @@ pub fn unblock_translation(data: &Path, source: &str, session: &str) {
         .execute_batch("DROP TRIGGER block_translation")
         .unwrap();
 }
+
+// A native completion can still be queued, or already transferred into durable
+// continuation state while its RPC acknowledgement is held by the test proxy.
+pub fn has_completed_opencode_capture(data: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(data.join("pipeline")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().is_none_or(|ext| ext != "sqlite") {
+            continue;
+        }
+        let Ok(db) =
+            Connection::open_with_flags(entry.path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
+            continue;
+        };
+        let _ = db.busy_timeout(std::time::Duration::from_secs(1));
+        let queued = (|| -> rusqlite::Result<bool> {
+            let mut query = db.prepare(
+                "SELECT value FROM collection_records WHERE name='events'
+                 UNION ALL SELECT value FROM collection_identity WHERE name='events'",
+            )?;
+            for bytes in query.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
+                let Ok(bytes) = bytes else {
+                    continue;
+                };
+                if serde_json::from_slice::<Value>(&bytes).is_ok_and(|value| {
+                    value["source"] == "opencode" && value["event"] == "session.execution.succeeded"
+                }) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })()
+        .unwrap_or(false);
+        if queued {
+            return true;
+        }
+        // The schema can be incomplete during the first capture transaction.
+        let state = db
+            .query_row(
+                "SELECT value FROM source_checkpoint WHERE id=1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if state.is_some_and(|value| {
+            value["source"] == "opencode"
+                && value["native"]["v2"]["sessions"]
+                    .as_object()
+                    .is_some_and(|sessions| {
+                        sessions.values().any(|session| session["idle"] == true)
+                    })
+        }) {
+            return true;
+        }
+    }
+    false
+}

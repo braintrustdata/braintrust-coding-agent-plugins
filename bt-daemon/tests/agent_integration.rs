@@ -4,6 +4,8 @@
     reason = "Integration test assertions and fixtures fail immediately on unexpected values."
 )]
 
+#[path = "support/journal_store.rs"]
+mod journal_store;
 mod support;
 
 use axum::http::StatusCode;
@@ -1044,7 +1046,15 @@ async fn opencode_v2_subagent_is_nested() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let rows = world.wait_for_trace_delivery().await;
+    let rows = world
+        .wait_for_trace_rows_matching(|rows| {
+            rows.iter()
+                .any(|row| row["span_attributes"]["name"] == "OpenCode")
+                && rows
+                    .iter()
+                    .any(|row| row["metadata"]["is_subagent"] == true)
+        })
+        .await;
     let root = rows
         .iter()
         .find(|r| r["span_attributes"]["name"] == "OpenCode")
@@ -1377,20 +1387,19 @@ async fn opencode_v2_standalone_delivers_events_when_daemon_acknowledgements_are
     run.env("BRAINTRUST_DAEMON_SOCKET", &proxy_path);
     // Verify the journal boundary directly while acknowledgements are held.
     // The timeout bounds the test; it is not part of hook dispatch.
-    let journal_dir = world.temp_path("daemon/journal");
+    let data_dir = world.temp_path("daemon");
     let journaled = async {
         loop {
-            if let Ok(entries) = std::fs::read_dir(&journal_dir) {
-                if entries.flatten().any(|entry| {
-                    std::fs::read_to_string(entry.path()).is_ok_and(|contents| {
-                        contents.contains("session.execution.succeeded")
-                            && contents.contains("opencode")
-                    })
-                }) {
-                    break;
-                }
+            let data_dir = data_dir.clone();
+            let captured = tokio::task::spawn_blocking(move || {
+                journal_store::has_completed_opencode_capture(&data_dir)
+            })
+            .await
+            .unwrap();
+            if captured {
+                break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     };
     let (output, ()) = tokio::join!(world.output(&mut run), async {

@@ -2926,6 +2926,7 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         let host = test_host();
         let mut fixtures = DistributedFixtures::new();
         let mut events = pending_child(&mut fixtures, &socket, &host).await;
+        flush("bounded-parent", &socket).await;
         let original_route = events[0].route.clone().unwrap();
         let mut prompt = events[1].clone();
         prompt.capture = events[0].capture.clone();
@@ -2945,6 +2946,16 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
             .map(|value| format!("{value}\n"))
             .collect::<String>();
         assert!(!journal.is_empty());
+        let backup = data_dir.parent().unwrap().join("pending-backup.sqlite");
+        rusqlite::Connection::open(journal_store::path(
+            &data_dir,
+            "claude-code",
+            "bounded-child",
+        ))
+        .unwrap()
+        .execute("VACUUM INTO ?", [backup.to_str().unwrap()])
+        .unwrap();
+        let saved_database = std::fs::read(&backup).unwrap();
         shutdown_daemon(&socket).await.unwrap();
         daemon.await.unwrap();
         // Restore the accepted-but-undelivered checkpoint, as after an abrupt
@@ -2967,6 +2978,17 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
             if path.exists() {
                 tokio::fs::remove_file(path).await.unwrap();
             }
+        }
+        if format == "current" {
+            // A current-version crash preserves the SQLite collection and its
+            // exact IDs, rather than manufacturing a legacy NDJSON replacement.
+            tokio::fs::remove_file(&journal_path).await.unwrap();
+            tokio::fs::write(
+                journal_store::path(&data_dir, "claude-code", "bounded-child"),
+                saved_database,
+            )
+            .await
+            .unwrap();
         }
         // Graceful shutdown delivered the buffered spans. Roll back its local
         // delivery acknowledgements as well as the journal to model a crash.

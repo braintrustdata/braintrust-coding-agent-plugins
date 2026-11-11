@@ -39,10 +39,28 @@ async fn old(path: &std::path::Path, age: Duration) -> bool {
 }
 
 async fn collect_partitions(daemon: &Daemon, age: Duration) {
+    // Snapshot activity before catalog discovery or opening a reader: even a
+    // read-only SQLite open can create a fresh WAL for an otherwise closed store.
+    let mut eligible = HashSet::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(daemon.data_dir.join("pipeline")).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let storage = entry.path();
+            if storage.extension().is_none_or(|ext| ext != "sqlite") || !old(&storage, age).await {
+                continue;
+            }
+            let wal = storage.with_extension("sqlite-wal");
+            if !tokio::fs::try_exists(&wal).await.unwrap_or(true) || old(&wal, age).await {
+                eligible.insert(storage);
+            }
+        }
+    }
     let Ok(paths) = journal::paths(&daemon.data_dir).await else {
         return;
     };
     for path in paths {
+        if !eligible.contains(&crate::collections::database_path(&path)) {
+            continue;
+        }
         let recorded = journal::JournalReader::recorded_len(&path).await;
         let Ok(Some(mut reader)) = journal::JournalReader::open(&path, recorded).await else {
             continue;
@@ -65,13 +83,7 @@ async fn collect_partitions(daemon: &Daemon, age: Duration) {
             .data_dir
             .join("pipeline")
             .join(format!("{id}.sqlite"));
-        if !old(&storage, age).await {
-            continue;
-        }
         let wal = storage.with_extension("sqlite-wal");
-        if tokio::fs::try_exists(&wal).await.unwrap_or(true) && !old(&wal, age).await {
-            continue;
-        }
         // Scanning a large journal must not hold the capture lock. The length
         // and route set are revalidated under that lock before deletion.
         let Ok(partition) = crate::pipeline::journal::SpanJournal::open(&storage).await else {
@@ -835,6 +847,8 @@ mod tests {
             "active",
             "within_retention",
             "complete",
+            "old_complete",
+            "recent_wal",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let env = event(scenario, SessionRoute::default());
@@ -933,13 +947,36 @@ mod tests {
             std::fs::create_dir_all(&ledger_dir).unwrap();
             let ledger = ledger_dir.join(format!("{id}--destination.ndjson"));
             std::fs::write(&ledger, "completed receipt").unwrap();
+            let complete = matches!(scenario, "complete" | "old_complete");
+            let recent_wal = if scenario == "recent_wal" {
+                let db = rusqlite::Connection::open(&storage).unwrap();
+                db.execute_batch("CREATE TABLE recent_activity(value INTEGER)")
+                    .unwrap();
+                Some(db)
+            } else {
+                None
+            };
+            let age =
+                if matches!(scenario, "old_complete" | "recent_wal") {
+                    if scenario == "old_complete" {
+                        assert!(!storage.with_extension("sqlite-wal").exists());
+                    }
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&storage)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(
+                            SystemTime::now() - RETENTION - Duration::from_secs(3600),
+                        ))
+                        .unwrap();
+                    RETENTION
+                } else {
+                    age
+                };
             collect_partitions(&daemon, age).await;
-            assert_eq!(
-                ledger.exists(),
-                scenario != "complete",
-                "ledger: {scenario}"
-            );
-            assert_eq!(storage.exists(), scenario != "complete", "{scenario}");
+            assert_eq!(ledger.exists(), !complete, "ledger: {scenario}");
+            assert_eq!(storage.exists(), !complete, "{scenario}");
+            drop(recent_wal);
             assert!(
                 !raw.exists(),
                 "SQLite cutover removed the legacy file: {scenario}"
