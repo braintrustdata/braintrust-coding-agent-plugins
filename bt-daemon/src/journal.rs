@@ -414,6 +414,10 @@ impl JournalWriter {
         Ok(Self { records, position })
     }
 
+    pub(crate) fn collection(&self) -> Collection<serde_json::Value> {
+        self.records.clone()
+    }
+
     pub(crate) fn position(&self) -> u64 {
         self.position
     }

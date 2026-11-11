@@ -710,12 +710,16 @@ impl Producer {
                     if input > self.committed {
                         self.journal.begin(input, observation).await?;
                         let state = self.continuation().await?;
-                        self.journal
+                        let events = self.options.events.lock().await.collection();
+                        events
                             .transaction(|tx| {
-                                tx.roots.replace(self.roots.pending())?;
-                                tx.checkpoints.insert(input, state)?;
-                                tx.events.drain(..=input)?;
-                                Ok(())
+                                self.journal.commit_into(
+                                    tx,
+                                    &events,
+                                    input,
+                                    self.roots.pending(),
+                                    state,
+                                )
                             })
                             .await?;
                         self.committed = input;
@@ -853,12 +857,16 @@ impl Producer {
                     Some(state) => state.clone(),
                     None => self.continuation().await?,
                 };
-                self.journal
+                let events = self.options.events.lock().await.collection();
+                events
                     .transaction(|tx| {
-                        tx.roots.replace(self.roots.pending())?;
-                        tx.checkpoints.insert(pending.input, state)?;
-                        tx.events.drain(..=pending.input)?;
-                        Ok(())
+                        self.journal.commit_into(
+                            tx,
+                            &events,
+                            pending.input,
+                            self.roots.pending(),
+                            state,
+                        )
                     })
                     .await?;
                 self.committed = pending.input;
@@ -932,7 +940,7 @@ impl Producer {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{pipeline::delivery::InputPort, translate::SpanRow};
+    use crate::{collections::InputPort, translate::SpanRow};
     mod streams {
         use crate as bt_daemon;
         include!(concat!(

@@ -2,12 +2,9 @@
 //! capabilities stay inside this adapter while callers use read/remove.
 use super::{
     async_iter::{AsyncIterator, IntoAsyncIterator},
-    Entry,
+    Delivery, Entry, InputPort,
 };
-use crate::pipeline::{
-    delivery::{Delivery, InputPort},
-    recovery::Failure,
-};
+use crate::pipeline::recovery::Failure;
 use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,

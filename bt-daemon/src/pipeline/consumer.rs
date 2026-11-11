@@ -1,6 +1,5 @@
 //! Route processing consumes managed deliveries independently of their source.
 use super::{
-    delivery::InputPort,
     recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
     routing::RoutingSink,
     Stage,
@@ -8,6 +7,7 @@ use super::{
 use crate::collections::{
     async_iter::{AsyncIteratorExt, IntoAsyncIterator},
     view::{RemovalView, RouteCollection},
+    InputPort,
 };
 use crate::{
     delivery_ledger::{CommitFailure, LedgerSink},
@@ -390,7 +390,7 @@ impl Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::Delivery;
+    use crate::collections::Delivery;
     use crate::{
         pipeline::journal::SpanJournal,
         translate::{SpanOp, SpanRow},
@@ -610,7 +610,7 @@ mod tests {
     }
     struct Acknowledged(Arc<AtomicU64>);
     #[async_trait::async_trait]
-    impl crate::pipeline::Completion for Acknowledged {
+    impl crate::collections::Completion for Acknowledged {
         async fn complete(&mut self) -> anyhow::Result<()> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())

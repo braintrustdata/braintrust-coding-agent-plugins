@@ -1,6 +1,10 @@
 //! Typed, lazy persistent collections. Reading never changes durable membership.
 pub(crate) mod async_iter;
+pub(crate) mod delivery;
+pub(crate) mod transaction;
 pub(crate) mod view;
+pub(crate) use delivery::{Completion, Delivery, InputPort, OutputPort};
+pub(crate) use transaction::Transaction;
 
 use self::async_iter::{AsyncIterator, IntoAsyncIterator};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,6 +29,7 @@ pub(crate) struct Entry<T> {
 
 pub(crate) struct Collection<T> {
     database: Arc<Mutex<Connection>>,
+    path: Arc<PathBuf>,
     name: Arc<str>,
     marker: PhantomData<fn() -> T>,
 }
@@ -32,6 +37,7 @@ impl<T> Clone for Collection<T> {
     fn clone(&self) -> Self {
         Self {
             database: self.database.clone(),
+            path: self.path.clone(),
             name: self.name.clone(),
             marker: PhantomData,
         }
@@ -41,6 +47,7 @@ impl<T> Clone for Collection<T> {
 impl<T: Serialize + DeserializeOwned + Send + 'static> Collection<T> {
     pub async fn open(path: &Path, name: &str) -> anyhow::Result<Self> {
         let path = path.to_owned();
+        let identity = path.clone();
         let name: Arc<str> = Arc::from(name);
         let owned_name = name.clone();
         let db = tokio::task::spawn_blocking(move || {
@@ -65,9 +72,22 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> Collection<T> {
         }).await??;
         Ok(Self {
             database: Arc::new(Mutex::new(db)),
+            path: Arc::new(tokio::fs::canonicalize(identity).await?),
             name,
             marker: PhantomData,
         })
+    }
+
+    /// Stage typed mutations across collections in the same database, then commit
+    /// them together. The builder is synchronous; storage runs in one blocking commit.
+    pub async fn transaction<R>(
+        &self,
+        build: impl FnOnce(&mut Transaction) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        let mut transaction = Transaction::new(self.path.clone());
+        let result = build(&mut transaction)?;
+        self.with_db(move |db, _| transaction.commit(db)).await?;
+        Ok(result)
     }
 
     async fn with_db<R: Send + 'static>(
@@ -180,7 +200,10 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> Collection<T> {
     /// Stable IDs retain the original byte-boundary numbering during migration.
     /// New entries reserve their encoded size; deletion never shifts later IDs.
     pub async fn insert(&self, value: &T) -> anyhow::Result<u64> {
-        self.insert_with_identity(value, None).await
+        let insertion = self.transaction(|tx| tx.insert(self, value)).await?;
+        insertion
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("insert transaction did not commit"))
     }
 
     pub async fn insert_with_identity(
@@ -188,37 +211,12 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> Collection<T> {
         value: &T,
         identity: Option<&T>,
     ) -> anyhow::Result<u64> {
-        let value = serde_json::to_vec(value)?;
-        let identity = identity.map(serde_json::to_vec).transpose()?;
-        self.with_db(move |db, name| {
-            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let tail: u64 = tx.query_row(
-                "SELECT tail FROM collection_state WHERE name=?",
-                [name],
-                |r| r.get(0),
-            )?;
-            let id = tail
-                .checked_add(value.len() as u64 + 1)
-                .filter(|id| *id <= i64::MAX as u64)
-                .ok_or_else(|| anyhow::anyhow!("collection ID overflow"))?;
-            tx.execute(
-                "INSERT INTO collection_records VALUES(?,?,?)",
-                params![name, id, value],
-            )?;
-            tx.execute(
-                "UPDATE collection_state SET tail=? WHERE name=?",
-                params![id, name],
-            )?;
-            if let Some(identity) = identity {
-                tx.execute(
-                    "INSERT INTO collection_identity VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET position=excluded.position,value=excluded.value WHERE excluded.position>=collection_identity.position",
-                    params![name,id,identity],
-                )?;
-            }
-            tx.commit()?;
-            Ok(id)
-        })
-        .await
+        let insertion = self
+            .transaction(|tx| tx.insert_with_identity(self, value, identity))
+            .await?;
+        insertion
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("insert transaction did not commit"))
     }
 
     #[cfg(test)]
@@ -382,6 +380,38 @@ impl<T: Serialize + DeserializeOwned + Send + 'static> AsyncIterator for Iter<T>
 
 /// Canonical pipeline path for source-qualified legacy journals; other callers
 /// (including legacy fixtures) get an adjacent private SQLite file.
+fn insert_encoded(
+    db: &Connection,
+    name: &str,
+    value: Vec<u8>,
+    identity: Option<Vec<u8>>,
+) -> anyhow::Result<u64> {
+    let tail: u64 = db.query_row(
+        "SELECT tail FROM collection_state WHERE name=?",
+        [name],
+        |r| r.get(0),
+    )?;
+    let id = tail
+        .checked_add(value.len() as u64 + 1)
+        .filter(|id| *id <= i64::MAX as u64)
+        .ok_or_else(|| anyhow::anyhow!("collection ID overflow"))?;
+    db.execute(
+        "INSERT INTO collection_records VALUES(?,?,?)",
+        params![name, id, value],
+    )?;
+    db.execute(
+        "UPDATE collection_state SET tail=? WHERE name=?",
+        params![id, name],
+    )?;
+    if let Some(identity) = identity {
+        db.execute(
+                    "INSERT INTO collection_identity VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET position=excluded.position,value=excluded.value WHERE excluded.position>=collection_identity.position",
+                    params![name,id,identity],
+                )?;
+    }
+    Ok(id)
+}
+
 pub(crate) fn database_path(journal: &Path) -> PathBuf {
     let id = journal
         .file_stem()

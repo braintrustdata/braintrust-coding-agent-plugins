@@ -1,12 +1,12 @@
 //! Routing owns its sink behind a bounded typed port. Session dispatch is its facade.
-use super::delivery::{Delivery, InputPort, OutputPort};
 use super::plugins::{PluginOutcome, Plugins};
 use super::prepare::Prepare;
 use super::recovery::{RetryCondition, RouteFailure};
 use super::submission::{
     Input as SubmissionInput, Operation, Outcome as SubmissionOutcome, Submission,
 };
-use super::{Completion, Stage};
+use super::Stage;
+use crate::collections::{Completion, Delivery, InputPort, OutputPort};
 use crate::{sink::Sink, translate::SpanOp, wire::SessionConfig};
 use parking_lot::Mutex;
 use std::{path::PathBuf, sync::Arc};

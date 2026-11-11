@@ -1,4 +1,5 @@
-use super::recovery::Failure;
+//! Membership obligations and completion-preserving ports for collection views.
+use crate::pipeline::recovery::Failure;
 use tokio::sync::mpsc;
 
 /// A message owns its completion obligation until terminal handling succeeds.

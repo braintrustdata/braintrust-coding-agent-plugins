@@ -3,14 +3,13 @@
 //! Tracking mutations acquire SQLite write access before reading. Deferred
 //! read-to-write upgrades can fail without waiting when another connection
 //! writes concurrently, even with a busy timeout.
-mod mutation;
 
 use super::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
 use super::{
-    delivery::InputPort,
     recovery::{Boundary, Failure, Recovery, RecoveryOutcome},
-    Completion, Delivery, Stage,
+    Stage,
 };
+use crate::collections::{Collection, Completion, Delivery, InputPort, Transaction};
 use crate::{
     translate::{OriginSnapshot, SpanOp, SpanRow, SpanType},
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
@@ -20,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StorageMutex,
@@ -44,6 +43,7 @@ type ReplayWindow = Vec<(u64, std::sync::Weak<SpanOp>, usize)>;
 #[derive(Clone)]
 pub(crate) struct SpanJournal {
     connection: Arc<StorageMutex<Option<Connection>>>,
+    path: Arc<PathBuf>,
     changed: watch::Sender<u64>,
     live: Arc<Multiplexer>,
     replay: Arc<tokio::sync::Mutex<ReplayWindow>>,
@@ -181,6 +181,7 @@ fn prune(db: &Connection) -> anyhow::Result<()> {
 impl SpanJournal {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let path = path.to_owned();
+        let identity = path.clone();
         let connection = tokio::task::spawn_blocking(move || -> anyhow::Result<(Connection, u64)> {
             let parent = path.parent().ok_or_else(|| anyhow::anyhow!("SpanOp journal path has no parent"))?;
             std::fs::create_dir_all(parent)?;
@@ -262,6 +263,7 @@ impl SpanJournal {
         let (changed, _) = watch::channel(tail);
         Ok(Self {
             connection: Arc::new(StorageMutex::new(Some(connection))),
+            path: Arc::new(tokio::fs::canonicalize(identity).await?),
             changed,
             live: Arc::new(Multiplexer::default()),
             replay: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -554,26 +556,34 @@ impl SpanJournal {
         .await
     }
 
-    pub async fn transaction(
+    /// Join the collection transaction that transfers recovery ownership. The
+    /// input drain and output/continuation commit cannot succeed independently.
+    pub fn commit_into(
         &self,
-        build: impl FnOnce(&mut mutation::Mutations) -> anyhow::Result<()> + Send,
-    ) -> anyhow::Result<u64> {
-        let mut mutations = mutation::Mutations::default();
-        build(&mut mutations)?;
-        let input = mutations
-            .events
-            .through
-            .ok_or_else(|| anyhow::anyhow!("transaction is missing its consumed input range"))?;
-        let (checkpoint, state) = mutations
-            .checkpoints
-            .value
-            .ok_or_else(|| anyhow::anyhow!("event removal requires a continuation checkpoint"))?;
-        anyhow::ensure!(
-            input == checkpoint,
-            "checkpoint and consumed input boundaries differ"
-        );
-        self.commit_output_with_state(input, mutations.roots.values, Some(state))
-            .await
+        tx: &mut Transaction,
+        events: &Collection<serde_json::Value>,
+        input: u64,
+        roots: &BTreeMap<String, Vec<SpanOp>>,
+        state: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let roots = roots
+            .iter()
+            .map(|(id, ops)| {
+                let ops = ops
+                    .iter()
+                    .map(StoredOp::encode)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok((id.clone(), serde_json::to_vec(&ops)?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        tx.drain(events, ..=input)?;
+        let changed = self.changed.clone();
+        tx.stage_storage(&self.path, move |db| {
+            let tail = Self::commit_output_transaction(db, input, Some(roots), Some(state))?;
+            Ok(Some(Box::new(move || {
+                changed.send_replace(tail);
+            })))
+        })
     }
 
     #[cfg(test)]
@@ -627,6 +637,7 @@ impl SpanJournal {
         self.commit_output_with_state(input, roots, None).await
     }
 
+    #[cfg(test)]
     async fn commit_output_with_state(
         &self,
         input: u64,
@@ -636,58 +647,66 @@ impl SpanJournal {
         let tail = self
             .with_db(move |db| {
                 let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let previous: u64 = tx.query_row(
-                    "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
-                    [],
-                    |r| r.get(0),
-                )?;
-                anyhow::ensure!(input >= previous, "translation commits must be ordered");
-                let earlier: u64 = tx.query_row(
-                    "SELECT count(*) FROM batches WHERE committed=0 AND input<?",
-                    [input],
-                    |row| row.get(0),
-                )?;
-                anyhow::ensure!(
-                    earlier == 0,
-                    "translation cannot publish past an unfinished input"
-                );
-                anyhow::ensure!(
-                    tx.execute("UPDATE batches SET committed=1 WHERE input=?", [input])? == 1,
-                    "missing translation batch"
-                );
-                if let Some(roots) = roots {
-                    tx.execute("DELETE FROM root_candidates", [])?;
-                    for (id, value) in roots {
-                        tx.execute(
-                            "INSERT INTO root_candidates(span_id,value) VALUES (?,?)",
-                            params![id, value],
-                        )?;
-                    }
-                }
-                let tail = tx.query_row(
-                    "SELECT max((SELECT floor FROM publication WHERE id=1),coalesce(max(position),0)) FROM ops WHERE input<=?",
-                    [input],
-                    |r| r.get(0),
-                )?;
-                let tail: u64 = tail;
-                tx.execute("UPDATE publication SET tail=max(tail,?) WHERE id=1", [tail])?;
-                let tail =
-                    tx.query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))?;
-                prune(&tx)?;
-                if let Some(state) = state {
-                    tx.execute_batch("CREATE TABLE IF NOT EXISTS source_checkpoint(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,through INTEGER NOT NULL,value BLOB NOT NULL)")?;
-                    tx.execute("INSERT OR REPLACE INTO source_checkpoint VALUES(1,1,?,?)",params![input,state])?;
-                    // The same transaction transfers recovery ownership from input to
-                    // native continuation + output. Failed commits retain the input.
-                    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='collection_records')",[],|r|r.get(0))?;
-                    if exists { tx.execute("DELETE FROM collection_records WHERE name='events' AND id<=?",[input])?; }
-                    tx.execute("DELETE FROM batches WHERE input<? AND committed=1 AND NOT EXISTS(SELECT 1 FROM ops WHERE ops.input=batches.input) AND NOT EXISTS(SELECT 1 FROM receipts WHERE receipts.input=batches.input)",[input])?;
-                }
+                let tail = Self::commit_output_transaction(&tx, input, roots, state)?;
                 tx.commit()?;
                 Ok(tail)
             })
             .await?;
         self.changed.send_replace(tail);
+        Ok(tail)
+    }
+
+    fn commit_output_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        input: u64,
+        roots: Option<Vec<(String, Vec<u8>)>>,
+        state: Option<Vec<u8>>,
+    ) -> anyhow::Result<u64> {
+        let previous: u64 = tx.query_row(
+            "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
+            [],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(input >= previous, "translation commits must be ordered");
+        let earlier: u64 = tx.query_row(
+            "SELECT count(*) FROM batches WHERE committed=0 AND input<?",
+            [input],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            earlier == 0,
+            "translation cannot publish past an unfinished input"
+        );
+        anyhow::ensure!(
+            tx.execute("UPDATE batches SET committed=1 WHERE input=?", [input])? == 1,
+            "missing translation batch"
+        );
+        if let Some(roots) = roots {
+            tx.execute("DELETE FROM root_candidates", [])?;
+            for (id, value) in roots {
+                tx.execute(
+                    "INSERT INTO root_candidates(span_id,value) VALUES (?,?)",
+                    params![id, value],
+                )?;
+            }
+        }
+        let tail = tx.query_row(
+                    "SELECT max((SELECT floor FROM publication WHERE id=1),coalesce(max(position),0)) FROM ops WHERE input<=?",
+                    [input],
+                    |r| r.get(0),
+                )?;
+        let tail: u64 = tail;
+        tx.execute("UPDATE publication SET tail=max(tail,?) WHERE id=1", [tail])?;
+        let tail = tx.query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))?;
+        prune(tx)?;
+        if let Some(state) = state {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS source_checkpoint(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,through INTEGER NOT NULL,value BLOB NOT NULL)")?;
+            tx.execute(
+                "INSERT OR REPLACE INTO source_checkpoint VALUES(1,1,?,?)",
+                params![input, state],
+            )?;
+            tx.execute("DELETE FROM batches WHERE input<? AND committed=1 AND NOT EXISTS(SELECT 1 FROM ops WHERE ops.input=batches.input) AND NOT EXISTS(SELECT 1 FROM receipts WHERE receipts.input=batches.input)",[input])?;
+        }
         Ok(tail)
     }
 
@@ -2041,7 +2060,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_port_replays_abandoned_delivery_without_cursor_control() {
-        use crate::pipeline::delivery::InputPort;
+        use crate::collections::InputPort;
         let tmp = tempfile::tempdir().unwrap();
         let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
             .await
