@@ -160,12 +160,7 @@ bt trace run --plugin ./local.mjs codex -- "summarize this change"
 bt trace import codex SESSION_ID --plugin ./sanitize-history.mjs
 ```
 
-The daemon stores pending input events and canonical SpanOps in each session's
-SQLite database. Translation removes input only after its output and continuation
-state are durable. Each destination independently removes delivered operations;
-operations are reclaimed once all registered destinations have accepted them.
-New destinations start with new output. Existing NDJSON journals are migrated
-on startup, preserving delivery progress; interrupted imports can resume safely.
+The daemon journals raw input events and canonical SpanOps produced by translation.
 Route settings and plugins are applied after SpanOp persistence, so routing retries
 reuse the saved operations without rerunning translation. Ordinary sessions use
 their configured plugins; managed sessions retain their run's isolated plugin chain.
