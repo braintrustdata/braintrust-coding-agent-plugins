@@ -148,17 +148,27 @@ pub struct SessionCtx {
     pub config: Option<SessionConfig>,
 }
 
+/// A translator's durable continuation: what it still needs from consumed
+/// events to translate later ones, such as open spans and transcript offsets.
+/// A serializable translator is its own state.
+pub trait TranslatorState {
+    fn save_state(&self) -> anyhow::Result<Vec<u8>>;
+    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()>;
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> TranslatorState for T {
+    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        *self = serde_json::from_slice(bytes)?;
+        Ok(())
+    }
+}
+
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
-pub trait AgentTranslator: Send {
-    /// Versioned continuation state, after all output for an input has drained.
-    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
-        anyhow::bail!("translator does not support durable continuation")
-    }
-    fn restore_state(&mut self, _bytes: &[u8]) -> anyhow::Result<()> {
-        anyhow::bail!("translator does not support durable continuation")
-    }
-
+pub trait AgentTranslator: Send + TranslatorState {
     /// Handle one event, returning span ops to emit.
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>>;
 

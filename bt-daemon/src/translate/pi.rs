@@ -369,14 +369,6 @@ struct PiTranslator {
 }
 
 impl AgentTranslator for PiTranslator {
-    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(serde_json::to_vec(self)?)
-    }
-    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        *self = serde_json::from_slice(bytes)?;
-        Ok(())
-    }
-
     fn handle(&mut self, envelope: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts = self.last_ts.max(envelope.ts_ms);
         let event = envelope.payload.get("event").unwrap_or(&envelope.payload);

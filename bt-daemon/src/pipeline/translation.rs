@@ -1112,11 +1112,15 @@ pub(crate) mod tests {
                 .unwrap();
         }
     }
-    impl AgentTranslator for BlockedTranslator {
+    impl crate::translate::TranslatorState for BlockedTranslator {
         fn save_state(&self) -> anyhow::Result<Vec<u8>> {
             Ok(b"null".to_vec())
         }
-
+        fn restore_state(&mut self, _: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    impl AgentTranslator for BlockedTranslator {
         fn handle(
             &mut self,
             _: &crate::wire::Envelope,
@@ -1302,10 +1306,15 @@ pub(crate) mod tests {
         assert_eq!(route.completed_position(), tail);
     }
     struct CountedTranslation(Arc<AtomicU64>);
-    impl AgentTranslator for CountedTranslation {
+    impl crate::translate::TranslatorState for CountedTranslation {
         fn save_state(&self) -> anyhow::Result<Vec<u8>> {
             Ok(b"null".to_vec())
         }
+        fn restore_state(&mut self, _: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    impl AgentTranslator for CountedTranslation {
         fn handle(
             &mut self,
             _: &crate::wire::Envelope,

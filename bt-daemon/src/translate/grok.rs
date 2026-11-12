@@ -1223,14 +1223,6 @@ impl GrokTranslator {
 }
 
 impl AgentTranslator for GrokTranslator {
-    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(serde_json::to_vec(self)?)
-    }
-    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        *self = serde_json::from_slice(bytes)?;
-        Ok(())
-    }
-
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         anyhow::ensure!(
             self.pending.is_none(),

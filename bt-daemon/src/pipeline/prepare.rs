@@ -147,14 +147,16 @@ impl ConfiguredTranslator {
     }
 }
 
-impl crate::translate::AgentTranslator for ConfiguredTranslator {
+impl crate::translate::TranslatorState for ConfiguredTranslator {
     fn save_state(&self) -> anyhow::Result<Vec<u8>> {
         self.inner.save_state()
     }
     fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.inner.restore_state(bytes)
     }
+}
 
+impl crate::translate::AgentTranslator for ConfiguredTranslator {
     fn handle(
         &mut self,
         env: &crate::wire::Envelope,

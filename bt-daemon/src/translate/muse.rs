@@ -377,14 +377,6 @@ impl MuseTranslator {
     }
 }
 impl AgentTranslator for MuseTranslator {
-    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(serde_json::to_vec(self)?)
-    }
-    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        *self = serde_json::from_slice(bytes)?;
-        Ok(())
-    }
-
     fn handle(&mut self, e: &Envelope, ctx: &SessionCtx) -> Result<Vec<SpanOp>> {
         self.last_ts = self.last_ts.max(e.ts_ms);
         let event = match MuseEvent::decode(e) {

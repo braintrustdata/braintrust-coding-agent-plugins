@@ -41,7 +41,7 @@ struct OpenCodeVersionedTranslator {
     version: Option<bool>,
 }
 
-impl AgentTranslator for OpenCodeVersionedTranslator {
+impl super::TranslatorState for OpenCodeVersionedTranslator {
     fn save_state(&self) -> anyhow::Result<Vec<u8>> {
         let v1 =
             serde_json::value::RawValue::from_string(String::from_utf8(self.v1.save_state()?)?)?;
@@ -64,6 +64,9 @@ impl AgentTranslator for OpenCodeVersionedTranslator {
         self.version = saved.version;
         Ok(())
     }
+}
+
+impl AgentTranslator for OpenCodeVersionedTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         if event.event == "session_start" {
             return Ok(Vec::new());
@@ -601,14 +604,6 @@ struct OpenCodeTranslator {
 }
 
 impl AgentTranslator for OpenCodeTranslator {
-    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(serde_json::to_vec(self)?)
-    }
-    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        *self = serde_json::from_slice(bytes)?;
-        Ok(())
-    }
-
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
         self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut ops = match event.event.as_str() {
