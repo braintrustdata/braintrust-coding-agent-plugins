@@ -2432,3 +2432,133 @@ fn opencode_v2_interrupted_denial_does_not_suppress_later_tool_calls() {
         "the second execution's tool call must produce an approved tool span"
     );
 }
+
+fn tool_named<'a>(rows: &'a HashMap<String, SpanRow>, name: &str) -> &'a serde_json::Value {
+    rows.values()
+        .find(|row| row.span_type == SpanType::Tool && row.name == name)
+        .unwrap_or_else(|| panic!("no tool span named {name}"))
+        .metadata
+        .as_ref()
+        .unwrap()
+}
+
+#[test]
+fn opencode_marks_only_requested_skill_loads_explicit() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let prompt = "/skills:review then follow docs/.agents/skills/docs-gap/SKILL.md";
+    let mut events = vec![event(
+        "chat.message",
+        1,
+        json!({"input":{"sessionID":"native"},"output":{"parts":[{"type":"text","text":prompt}]}}),
+    )];
+    for (ts, call, tool, args) in [
+        (2, "requested", "skill", json!({"name":"review"})),
+        (4, "chosen", "skill", json!({"name":"simplify"})),
+        (
+            6,
+            "read",
+            "read",
+            json!({"filePath":"/repo/docs/.agents/skills/docs-gap/SKILL.md"}),
+        ),
+    ] {
+        events.push(event(
+            "tool.execute.before",
+            ts,
+            json!({"input":{"sessionID":"native","callID":call,"tool":tool},"output":{"args":args}}),
+        ));
+        events.push(event(
+            "tool.execute.after",
+            ts + 1,
+            json!({"input":{"sessionID":"native","callID":call,"tool":tool},"result":{"title":tool,"output":"loaded"}}),
+        ));
+    }
+    let mut ops = Vec::new();
+    for event in events {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+    }
+    let rows = reduce(ops);
+    let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["loaded_skill_names"],
+        json!(["review", "docs-gap"])
+    );
+    assert_eq!(
+        tool_named(&rows, "skill: review")["skill_load_trigger"],
+        "explicit"
+    );
+    assert!(tool_named(&rows, "skill: simplify")
+        .get("skill_load_trigger")
+        .is_none());
+    let read = tool_named(&rows, "skill: docs-gap");
+    assert_eq!(read["tool_kind"], "skill");
+    assert_eq!(
+        read["skill_path"],
+        "/repo/docs/.agents/skills/docs-gap/SKILL.md"
+    );
+    assert_eq!(read["skill_load_trigger"], "explicit");
+}
+
+#[test]
+fn opencode_v2_marks_prompt_skills_explicit() {
+    let mut translator = Registry::default_agents().create("opencode", "root-session");
+    let ctx = SessionCtx {
+        session_id: "root-session".into(),
+        config: None,
+    };
+    let mut events = vec![
+        (
+            "session.inbox.enqueued",
+            json!({"sessionID":"native","inboxID":"u","item":{"type":"user","payload":{"text":"go","skills":[{"id":"s1","name":"review"}]}}}),
+        ),
+        (
+            "session.inbox.delivered",
+            json!({"sessionID":"native","inboxID":"u"}),
+        ),
+    ];
+    for (call, name, input) in [
+        ("requested", "skill", json!({"name":"review"})),
+        ("chosen", "skill", json!({"name":"simplify"})),
+        (
+            "read",
+            "read",
+            json!({"filePath":"/home/u/.agents/skills/deploy/SKILL.md"}),
+        ),
+    ] {
+        events.extend([
+            (
+                "session.tool.input.started",
+                json!({"sessionID":"native","assistantMessageID":"m","id":call,"name":name}),
+            ),
+            (
+                "session.tool.called",
+                json!({"sessionID":"native","assistantMessageID":"m","id":call,"input":input,"executed":false}),
+            ),
+            (
+                "session.tool.success",
+                json!({"sessionID":"native","assistantMessageID":"m","id":call,"content":[{"type":"text","text":"loaded"}],"executed":true}),
+            ),
+        ]);
+    }
+    let mut ops = Vec::new();
+    for (i, (name, data)) in events.into_iter().enumerate() {
+        ops.extend(
+            translator
+                .handle(&v2_event(name, i as i64 + 1, data), &ctx)
+                .unwrap(),
+        );
+    }
+    let rows = reduce(ops);
+    let requested = tool_named(&rows, "skill: review");
+    assert_eq!(requested["tool_kind"], "skill");
+    assert_eq!(requested["skill_load_trigger"], "explicit");
+    assert!(tool_named(&rows, "skill: simplify")
+        .get("skill_load_trigger")
+        .is_none());
+    let read = tool_named(&rows, "skill: deploy");
+    assert_eq!(read["skill_path"], "/home/u/.agents/skills/deploy/SKILL.md");
+    assert!(read.get("skill_load_trigger").is_none());
+}
