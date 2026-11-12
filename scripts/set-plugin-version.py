@@ -15,6 +15,7 @@ import sys
 
 # agent -> globs of its per-plugin manifests (relative to repo root)
 MANIFEST_GLOBS = {
+    "devin": ["src/plugins/devin/content/.devin-plugin/plugin.json"],
     "claude": ["src/plugins/claude/content/plugins/*/.claude-plugin/plugin.json"],
     "codex": [
         "src/plugins/codex/content/plugins/*/.codex-plugin/plugin.json",
