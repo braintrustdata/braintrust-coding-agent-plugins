@@ -3,31 +3,49 @@ use super::{LateMergeVersion, SpanRow};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
+/// Row fields the wire format omits but delivery needs.
 #[derive(Serialize, Deserialize)]
-struct Row {
-    value: SpanRow,
+pub(crate) struct SinkFields {
     late_merge_key: Option<String>,
+    #[serde(default)]
     late_merge_version: Option<LateMergeVersion>,
     turn_span_id: Option<String>,
     is_turn: bool,
+}
+impl SinkFields {
+    pub fn of(row: &SpanRow) -> Self {
+        Self {
+            late_merge_key: row.late_merge_key.clone(),
+            late_merge_version: row.late_merge_version.clone(),
+            turn_span_id: row.turn_span_id.clone(),
+            is_turn: row.is_turn,
+        }
+    }
+    pub fn restore(self, row: &mut SpanRow) {
+        row.late_merge_key = self.late_merge_key;
+        row.late_merge_version = self.late_merge_version;
+        row.turn_span_id = self.turn_span_id;
+        row.is_turn = self.is_turn;
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Row {
+    value: SpanRow,
+    #[serde(flatten)]
+    fields: SinkFields,
 }
 impl From<&SpanRow> for Row {
     fn from(value: &SpanRow) -> Self {
         Self {
             value: value.clone(),
-            late_merge_key: value.late_merge_key.clone(),
-            late_merge_version: value.late_merge_version.clone(),
-            turn_span_id: value.turn_span_id.clone(),
-            is_turn: value.is_turn,
+            fields: SinkFields::of(value),
         }
     }
 }
 impl Row {
     fn restore(mut self) -> SpanRow {
-        self.value.late_merge_key = self.late_merge_key;
-        self.value.late_merge_version = self.late_merge_version;
-        self.value.turn_span_id = self.turn_span_id;
-        self.value.is_turn = self.is_turn;
+        self.fields.restore(&mut self.value);
         self.value
     }
 }

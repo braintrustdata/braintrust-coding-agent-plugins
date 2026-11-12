@@ -28,6 +28,7 @@ mod origins;
 mod recent;
 mod state;
 pub(crate) use origins::WeakOrigins;
+pub(crate) use state::SinkFields;
 mod tool;
 mod turn_lineage;
 pub use turn_lineage::TURN_SPAN_ID_KEY;

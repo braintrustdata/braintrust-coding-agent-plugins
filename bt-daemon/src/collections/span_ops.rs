@@ -10,7 +10,7 @@
 use super::{events::EventCollection, store::Store};
 use crate::{
     pipeline::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW},
-    translate::{OriginSnapshot, SpanOp, SpanRow, SpanType},
+    translate::{OriginSnapshot, SinkFields, SpanOp, SpanRow, SpanType},
     wire::{SessionConfig, SessionRoute},
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -32,35 +32,20 @@ impl std::error::Error for BindingChanged {}
 
 /// Explicit codec preserves fields intentionally omitted from wire/plugin JSON.
 #[derive(Serialize, Deserialize)]
-struct StoredOp {
+struct StoredOp<Op> {
     version: u32,
-    op: SpanOp,
-    late_merge_key: Option<String>,
-    #[serde(default)]
-    late_merge_version: Option<crate::translate::LateMergeVersion>,
-    turn_span_id: Option<String>,
-    is_turn: bool,
+    op: Op,
+    #[serde(flatten)]
+    fields: SinkFields,
 }
 
-impl StoredOp {
+impl StoredOp<SpanOp> {
     fn encode(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-        #[derive(Serialize)]
-        struct Borrowed<'a> {
-            version: u32,
-            op: &'a SpanOp,
-            late_merge_key: &'a Option<String>,
-            late_merge_version: &'a Option<crate::translate::LateMergeVersion>,
-            turn_span_id: &'a Option<String>,
-            is_turn: bool,
-        }
-        Ok(serde_json::to_vec(&Borrowed {
+        Ok(serde_json::to_vec(&StoredOp {
             version: 1,
             op,
-            late_merge_key: &row.late_merge_key,
-            late_merge_version: &row.late_merge_version,
-            turn_span_id: &row.turn_span_id,
-            is_turn: row.is_turn,
+            fields: SinkFields::of(row),
         })?)
     }
     fn decode(bytes: &[u8]) -> anyhow::Result<SpanOp> {
@@ -71,10 +56,7 @@ impl StoredOp {
             stored.version
         );
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut stored.op;
-        row.late_merge_key = stored.late_merge_key;
-        row.late_merge_version = stored.late_merge_version;
-        row.turn_span_id = stored.turn_span_id;
-        row.is_turn = stored.is_turn;
+        stored.fields.restore(row);
         Ok(stored.op)
     }
 }
