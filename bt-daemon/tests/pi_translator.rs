@@ -150,6 +150,121 @@ fn pi_captures_custom_trigger_input_and_keeps_following_spans_in_its_turn() {
 }
 
 #[test]
+fn pi_preserves_prompt_images_and_native_context_and_tool_images() {
+    let mut translator = Registry::default_agents().create("pi", "pi-session");
+    let ctx = SessionCtx {
+        session_id: "pi-session".into(),
+        config: None,
+    };
+    let images = json!([
+        {"type":"image","data":"cG5n","mimeType":"image/png"},
+        {"type":"image","data":"anBlZw==","mimeType":"image/jpeg"}
+    ]);
+    let messages = json!([{"role":"user","content":[
+        {"type":"text","text":"/skill:review compare these images"},
+        images[0], images[1]
+    ]}]);
+    let tool_result = json!({"content":[
+        {"type":"text","text":"Read image"}, images[0]
+    ]});
+    let events = [
+        event(
+            "before_agent_start",
+            1,
+            json!({
+                "messageType":"user", "prompt":"/skill:review compare these images", "images":images
+            }),
+        ),
+        event("context", 2, json!({"messages":messages})),
+        event(
+            "message_end",
+            3,
+            json!({"message":{
+                "role":"assistant", "content":[{"type":"text","text":"Inspecting"}]
+            }}),
+        ),
+        event(
+            "tool_execution_start",
+            4,
+            json!({
+                "toolCallId":"read-image", "toolName":"read", "args":{"path":"image.png"}
+            }),
+        ),
+        event(
+            "tool_execution_end",
+            5,
+            json!({
+                "toolCallId":"read-image", "toolName":"read", "result":tool_result
+            }),
+        ),
+        event("agent_end", 6, json!({})),
+        event("before_agent_start", 7, json!({"prompt":"continue"})),
+    ];
+    let rows = reduce(
+        events
+            .iter()
+            .flat_map(|event| translator.handle(event, &ctx).unwrap())
+            .collect(),
+    );
+    let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    assert_eq!(
+        turn.input,
+        Some(json!([
+            {"type":"text","text":"/skill:review compare these images"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,cG5n"}},
+            {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,anBlZw=="}}
+        ]))
+    );
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["loaded_skill_names"],
+        json!(["review"])
+    );
+    let llm = rows
+        .values()
+        .find(|row| row.span_type == SpanType::Llm)
+        .unwrap();
+    assert_eq!(llm.input, Some(messages));
+    let tool = rows.values().find(|row| row.name == "read").unwrap();
+    assert_eq!(tool.output, Some(tool_result));
+    let next_turn = rows.values().find(|row| row.name == "Turn 2").unwrap();
+    assert_eq!(next_turn.input, Some(json!("continue")));
+}
+
+#[test]
+fn pi_handles_image_only_prompts_and_absent_images() {
+    for (native, expected) in [
+        (
+            json!({"prompt":"", "images":[{"type":"image","data":"cG5n","mimeType":"image/png"}]}),
+            json!([{"type":"image_url","image_url":{"url":"data:image/png;base64,cG5n"}}]),
+        ),
+        (json!({"prompt":"plain"}), json!("plain")),
+        (json!({"prompt":"plain", "images":[]}), json!("plain")),
+        (json!({"prompt":"plain", "images":null}), json!("plain")),
+        (
+            json!({"messageType":"custom", "message":{"role":"custom","content":[{"type":"text","text":"work"}]}}),
+            json!({"role":"custom","content":[{"type":"text","text":"work"}]}),
+        ),
+    ] {
+        let mut translator = Registry::default_agents().create("pi", "pi-session");
+        let ctx = SessionCtx {
+            session_id: "pi-session".into(),
+            config: None,
+        };
+        let ops = translator
+            .handle(&event("before_agent_start", 1, native.clone()), &ctx)
+            .unwrap();
+        let turn = ops
+            .iter()
+            .find_map(|op| match op {
+                SpanOp::Insert(row) if row.is_turn => Some(row),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(turn.input, Some(expected), "native input: {native}");
+    }
+}
+
+#[test]
 fn pi_builds_turn_llm_tool_compaction_and_shutdown_spans() {
     let registry = Registry::default_agents();
     assert!(registry.sources().contains(&"pi".to_string()));

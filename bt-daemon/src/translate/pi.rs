@@ -57,6 +57,16 @@ struct BeforeAgentStart {
     prompt: Option<Value>,
     #[serde(default)]
     message: Option<Value>,
+    #[serde(default)]
+    images: Option<Vec<PromptImage>>,
+}
+
+/// Pi's before_agent_start images contain base64 data, separate from the prompt.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptImage {
+    data: String,
+    mime_type: String,
 }
 
 /// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
@@ -653,6 +663,24 @@ impl PiTranslator {
         let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_seq));
         let input = event.prompt.or(event.message).unwrap_or(Value::Null);
         let skills = input.as_str().map(explicit_skills).unwrap_or_default();
+        let images = event.images.unwrap_or_default();
+        let input = if images.is_empty() {
+            input
+        } else {
+            let mut content = match input {
+                Value::String(text) if text.is_empty() => Vec::new(),
+                Value::String(text) => vec![json!({"type":"text","text":text})],
+                Value::Array(parts) => parts,
+                Value::Null => Vec::new(),
+                other => vec![other],
+            };
+            content.extend(images.into_iter().map(|image| {
+                json!({"type":"image_url","image_url":{"url":format!(
+                    "data:{};base64,{}", image.mime_type, image.data
+                )}})
+            }));
+            Value::Array(content)
+        };
         let mut metadata = without_nulls(json!({
             "turn_number": self.turn_seq,
             "thinking_level": self.thinking_level,
