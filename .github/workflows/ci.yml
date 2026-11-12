@@ -317,14 +317,23 @@ jobs:
       - name: Install Rust
         uses: ./.github/actions/setup-rust
         with:
-          components: clippy rustfmt
+          components: rustfmt
       # PRs restore main's cache; pushes to main and manual runs refresh it.
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.os == 'Windows' && 'bt-daemon -> ../.devdrive/target' || 'bt-daemon -> target' }}
           save-if: ${{ github.event_name != 'pull_request' }}
+      # The key pins every resolved version, so a hit is the exact install a
+      # fresh `npm install` would produce. Any new agent release is a miss.
+      - name: Cache resolved coding agents
+        id: coding-agents-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/coding-agents
+          key: coding-agents-${{ runner.os }}-${{ runner.arch }}-codex-${{ needs.resolve-coding-agent-versions.outputs.codex }}-claude-${{ needs.resolve-coding-agent-versions.outputs.claude }}-opencode-${{ needs.resolve-coding-agent-versions.outputs.opencode }}-pi-${{ needs.resolve-coding-agent-versions.outputs.pi }}
       - name: Install resolved coding agents
+        if: steps.coding-agents-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           npm install --prefix "${{ runner.temp }}/coding-agents" \
@@ -426,9 +435,47 @@ jobs:
           PI_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/pi${{ matrix.agent_suffix }}
           PI_EXTENSION_PATH: ${{ runner.temp }}/pi-extension/node_modules/@braintrust/pi-extension/dist/index.mjs
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --test agent_integration -- --ignored --nocapture --test-threads=1
-      # macOS has no cfg-specific code beyond the unix paths linted on Linux.
+
+  # Separate from `daemon` so linting runs in parallel with the test suite
+  # instead of after it. macOS has no cfg-specific code beyond the unix paths
+  # linted on Linux.
+  daemon-lint:
+    name: Daemon lint (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Same Dev Drive layout as `daemon`: Defender scanning of C: dominates
+      # Windows compile time.
+      - name: Set up Windows Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@562171fe8df7401fdf582d766cd3b6ab80d5b1a0 # v4.1.0
+        with:
+          drive-size: 12GB
+          mount-path: ${{ github.workspace }}/.devdrive
+          trusted-dev-drive: true
+          env-mapping: |
+            CARGO_TARGET_DIR,{{ DEV_DRIVE }}/target
+            TMP,{{ DEV_DRIVE }}/tmp
+            TEMP,{{ DEV_DRIVE }}/tmp
+      - name: Create Dev Drive temp directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ runner.os == 'Windows' && 'bt-daemon -> ../.devdrive/target' || 'bt-daemon -> target' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Lint daemon
-        if: runner.os != 'macOS'
         run: cargo clippy --manifest-path bt-daemon/Cargo.toml --all-targets --all-features --locked -- -D warnings
 
   muse-integration:
@@ -478,6 +525,7 @@ jobs:
       - pi-compatibility
       - resolve-coding-agent-versions
       - daemon
+      - daemon-lint
       - muse-integration
     runs-on: ubuntu-24.04
     timeout-minutes: 5
