@@ -35,10 +35,6 @@ pub(crate) struct SourcePosition {
 pub(crate) enum SourceEvent {
     Event(Box<Envelope>),
     Control(PipelineControl),
-    LegacyDeliveryCheckpoint {
-        route: Box<crate::wire::SessionRoute>,
-        through: u64,
-    },
 }
 
 pub(crate) struct SourceRecord {

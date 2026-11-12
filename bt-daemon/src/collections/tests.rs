@@ -225,11 +225,10 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
         })],
         roots: Default::default(),
         state: Some(b"{}".to_vec()),
-        acknowledged: None,
     };
     let db = Inspector::session(temp.path(), "debug", "session").unwrap();
     db.inject(Fault::RemoveEvents).unwrap();
-    assert!(ops.commit_translation(&translated).await.is_err());
+    assert!(ops.commit_translation(translated.clone()).await.is_err());
     // Neither stage changed: the event remains and no output is visible.
     assert_eq!(ops.translated_through().await.unwrap(), 0);
     assert_eq!(db.count(Table::Events), 1);
@@ -237,8 +236,8 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
     assert_eq!(ops.tail().await.unwrap(), 0);
     assert!(ops.checkpoint().await.unwrap().is_none());
     db.clear(Fault::RemoveEvents).unwrap();
-    let committed = ops.commit_translation(&translated).await.unwrap();
-    assert_eq!(committed.tail, 1);
+    let committed = ops.commit_translation(translated.clone()).await.unwrap();
+    assert_eq!(committed, 1);
     assert_eq!(db.count(Table::Ops), 1);
     assert_eq!(ops.translated_through().await.unwrap(), input);
     assert_eq!(db.count(Table::Events), 0);

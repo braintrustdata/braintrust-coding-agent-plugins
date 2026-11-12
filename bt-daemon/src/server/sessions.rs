@@ -97,8 +97,6 @@ impl Daemon {
         // appended, so replay covers prior source observations only. Every
         // destination consumes that shared observation stream, with its own
         // delivery checkpoint controlling which rows reach its sink.
-        let events = self.events_for(&env.source, &env.session_id).await?;
-        let legacy_through = legacy_acknowledged(&events, replay_through, &route).await;
         let translation = self.translation_for(env).await?;
         let settings = translation.route_settings(&route).await?;
         let config = settings.with_auth(config.auth);
@@ -116,7 +114,7 @@ impl Daemon {
         // Materialize historical output before seeding a released completion boundary.
         translation.advance(replay_through).await?;
         let _ = translation.barrier().await;
-        let input = translation.subscribe(&route, legacy_through).await?;
+        let input = translation.subscribe(&route).await?;
         let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
@@ -319,27 +317,4 @@ impl Daemon {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
-}
-
-/// The latest delivery checkpoint an earlier daemon recorded for `route` in
-/// the recovered input. Storage without checkpoints keeps its replay behavior.
-pub(super) async fn legacy_acknowledged(
-    events: &EventCollection,
-    through: u64,
-    route: &SessionRoute,
-) -> u64 {
-    let mut reader = events.read(0, through);
-    let mut acknowledged = 0;
-    while let Ok(Some(entry)) = reader.next().await {
-        if let EventRecord::LegacyDeliveryCheckpoint {
-            route: candidate,
-            through,
-        } = entry.record
-        {
-            if candidate.same_route(route) {
-                acknowledged = acknowledged.max(through);
-            }
-        }
-    }
-    acknowledged
 }

@@ -17,7 +17,7 @@
 mod journal_store;
 
 use async_trait::async_trait;
-use bt_daemon::storage_inspect::Inspector;
+use bt_daemon::storage_inspect::{Inspector, Table};
 use bt_daemon::wire::{
     AuthSelection, AuthSource, BackendAuth, Envelope, SessionConfig, SessionRoute,
 };
@@ -915,7 +915,7 @@ async fn one_session_reports_to_multiple_routes_and_orgs_concurrently() {
 }
 
 #[tokio::test]
-async fn recovery_checkpoints_are_scoped_to_their_delivery_route() {
+async fn legacy_checkpoints_skip_only_input_every_route_delivered() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
@@ -952,15 +952,16 @@ async fn recovery_checkpoints_are_scoped_to_their_delivery_route() {
         .unwrap();
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
 
+    // Migration keeps one translation boundary for the session: work's later
+    // checkpoint must not suppress personal recovery, so work may see its
+    // delivered spans again (idempotent upserts of the same span IDs).
     let sinks = recording.sinks.lock().unwrap().clone();
-    assert_eq!(sinks.len(), 1, "only the unacknowledged route is recovered");
-    assert_eq!(
-        sinks[0].org.lock().unwrap().as_deref(),
-        Some("personal-org"),
-        "a later checkpoint for work must not suppress personal recovery"
-    );
+    let personal = sinks
+        .iter()
+        .find(|sink| sink.org.lock().unwrap().as_deref() == Some("personal-org"))
+        .expect("the unacknowledged route is recovered");
     assert!(
-        sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        personal.emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "the unacknowledged route must reach its sink"
     );
 
@@ -3882,7 +3883,7 @@ async fn missing_credentials_recover_without_another_native_event() {
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let count = Inspector::open(&db_path).unwrap().committed_ops();
+            let count = Inspector::open(&db_path).unwrap().count(Table::Ops);
             if count >= 2 {
                 break;
             }

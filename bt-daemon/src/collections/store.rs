@@ -6,11 +6,12 @@ use rusqlite::Connection;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Weak},
+    sync::{Arc, LazyLock, OnceLock, Weak},
 };
 
 /// Schema 1-6 belong to the original SpanOp channel. Schema 7 adds the event
-/// collection and the translator continuation, replacing NDJSON capture.
+/// collection, replacing NDJSON capture, and the translation state that makes
+/// each event-to-SpanOp handoff a single transaction.
 pub(super) const SCHEMA: u32 = 7;
 
 static OPEN: LazyLock<Mutex<HashMap<PathBuf, Weak<Inner>>>> = LazyLock::new(Default::default);
@@ -20,6 +21,7 @@ static CLOSING: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Default
 struct Inner {
     path: PathBuf,
     connection: std::sync::Mutex<Option<Connection>>,
+    channel: OnceLock<Arc<super::span_ops::Channel>>,
 }
 
 impl Drop for Inner {
@@ -77,10 +79,16 @@ impl Store {
         let inner = Arc::new(Inner {
             path: path.clone(),
             connection: std::sync::Mutex::new(Some(connection)),
+            channel: OnceLock::new(),
         });
         open.retain(|_, inner| inner.strong_count() > 0);
         open.insert(path, Arc::downgrade(&inner));
         Ok(Self(inner))
+    }
+
+    /// Live delivery state shared by every handle on this database.
+    pub fn channel(&self) -> &OnceLock<Arc<super::span_ops::Channel>> {
+        &self.0.channel
     }
 
     fn shared(path: &Path) -> Option<Self> {
@@ -247,9 +255,24 @@ fn migrate(db: &Connection) -> anyhow::Result<()> {
         super::span_ops::extract_metadata(db)?;
     }
     if version < 7 {
+        // Translation state replaces per-input batches: an input is handed
+        // over in one transaction, so only ops a route could already see
+        // survive. A partly published input is translated again.
         db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS source_checkpoint(id INTEGER PRIMARY KEY CHECK(id=1),
-                version INTEGER NOT NULL, through INTEGER NOT NULL, value BLOB NOT NULL);
+            "CREATE TABLE translation(id INTEGER PRIMARY KEY CHECK(id=1),
+                through INTEGER NOT NULL DEFAULT 0, tail INTEGER NOT NULL DEFAULT 0,
+                continuation BLOB, roots BLOB, failure TEXT);
+            INSERT INTO translation(id,through,tail,failure) VALUES(1,
+                (SELECT coalesce(max(input),0) FROM batches WHERE committed=1),
+                (SELECT tail FROM publication WHERE id=1),
+                (SELECT failure FROM recovery WHERE id=1));
+            DELETE FROM ops WHERE position>(SELECT tail FROM translation);",
+        )?;
+        super::span_ops::migrate_roots(db)?;
+        db.execute_batch(
+            "DROP TABLE batches; DROP TABLE receipts; DROP TABLE root_candidates;
+            DROP TABLE publication; DROP TABLE recovery;
+            DROP INDEX ops_input; ALTER TABLE ops DROP COLUMN input;
             CREATE TABLE events (id INTEGER PRIMARY KEY, value BLOB NOT NULL);
             CREATE TABLE captured (digest BLOB PRIMARY KEY) WITHOUT ROWID;
             CREATE TABLE event_state (id INTEGER PRIMARY KEY CHECK(id=1),

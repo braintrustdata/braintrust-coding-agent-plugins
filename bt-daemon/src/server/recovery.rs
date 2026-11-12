@@ -41,7 +41,6 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         }
         let mut reader = events.read(0, recorded_len);
         let mut before = 0u64;
-        let mut acknowledged_by_route: HashMap<String, u64> = HashMap::new();
         let mut latest_by_route: HashMap<String, PendingEvent> = HashMap::new();
         if let Ok(Some(template)) = events.identity().await {
             let env = journal::envelope_from_redacted(template);
@@ -91,11 +90,6 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
                     }
                 }
                 EventRecord::Control(_) => {}
-                EventRecord::LegacyDeliveryCheckpoint { route, through } => {
-                    let key = serde_json::to_string(&route).unwrap_or_default();
-                    let acknowledged = acknowledged_by_route.entry(key).or_default();
-                    *acknowledged = (*acknowledged).max(through);
-                }
             }
             before = through;
         }
@@ -165,23 +159,18 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
                     recovered_route.as_ref(),
                 ) {
                     (Ok(journal), Some(route)) => {
-                        let registered = journal
-                            .routes()
-                            .await
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|head| head.same_route(route));
-                        if registered {
+                        let routes = journal.routes().await.unwrap_or_default();
+                        if routes.iter().any(|head| head.same_route(route)) {
                             journal
                                 .route_complete(route, recorded_len)
                                 .await
                                 .unwrap_or(false)
                         } else {
-                            acknowledged_by_route
-                                .get(&serde_json::to_string(route).unwrap_or_default())
-                                .copied()
-                                .unwrap_or(0)
-                                >= event.journal_through
+                            // Only migrated input an earlier daemon delivered
+                            // is translated before any route subscribes.
+                            routes.is_empty()
+                                && journal.translated_through().await.unwrap_or(0)
+                                    >= event.journal_through
                         }
                     }
                     _ => false,
@@ -244,6 +233,7 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::pipeline::journal::Cursor;
     use crate::translate::{SpanOp, SpanRow};
 
     pub(crate) struct TestAuth;
@@ -287,7 +277,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         let through = writer.append(&env).await.unwrap().through;
-        let spans = crate::pipeline::journal::SpanJournal::for_events(&writer)
+        let spans = crate::collections::SpanOps::for_events(&writer)
             .await
             .unwrap();
         drop(writer);
@@ -304,10 +294,10 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        spans.subscribe(&route, 0).await.unwrap();
+        Cursor::open(&spans, &route).await.unwrap();
         let mut dormant = route.clone();
         dormant.tags.insert("dormant".into());
-        spans.subscribe(&dormant, 0).await.unwrap();
+        Cursor::open(&spans, &dormant).await.unwrap();
 
         let mut options = debug_serve_options("test", tmp.path());
         options.auth_provider = Some(Arc::new(TestAuth));
@@ -345,7 +335,8 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn startup_preserves_corrected_settings_before_a_held_head_completes() {
-        use crate::pipeline::{journal::SpanJournal, recovery::Failure};
+        use crate::collections::SpanOps;
+        use crate::pipeline::{journal::Cursor, recovery::Failure};
         let tmp = tempfile::tempdir().unwrap();
         let original = SessionRoute {
             destination: Some(crate::wire::TraceDestination::ProjectLogs {
@@ -383,7 +374,7 @@ pub(super) mod tests {
             .unwrap()
             .through;
         let path = crate::collections::inspect::session_path(tmp.path(), "debug", &env.session_id);
-        let spans = SpanJournal::for_events(&writer).await.unwrap();
+        let spans = SpanOps::for_events(&writer).await.unwrap();
         drop(writer);
         spans
             .translated(
@@ -398,7 +389,7 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        spans.subscribe(&original, 0).await.unwrap();
+        Cursor::open(&spans, &original).await.unwrap();
         let lease = TestAuth
             .resolve(&original.auth, AuthResolveReason::Initial)
             .await
@@ -411,8 +402,7 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        spans
-            .reconfigure_held(&corrected, settings_through)
+        crate::pipeline::journal::reconfigure_held(&spans, &corrected, settings_through)
             .await
             .unwrap();
         // Crash window: the correction is durable, but no consumer has retried it.
@@ -422,7 +412,7 @@ pub(super) mod tests {
         let daemon = Daemon::new(options, tmp.path().into());
         recover_unprocessed_journals(&daemon).await;
         daemon.ingress_barrier().await;
-        let restored = SpanJournal::open(&path).await.unwrap();
+        let restored = SpanOps::open(&path).await.unwrap();
         assert_eq!(
             restored.route_settings(&original).await.unwrap().tags,
             corrected.tags

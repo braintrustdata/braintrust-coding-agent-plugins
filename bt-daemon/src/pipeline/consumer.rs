@@ -351,9 +351,9 @@ impl Consumer {
 mod tests {
     use super::*;
     use crate::{
-        pipeline::journal::SpanJournal,
         translate::{SpanOp, SpanRow},
         wire::BackendAuth,
+        {collections::SpanOps, pipeline::journal::Cursor},
     };
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -468,7 +468,7 @@ mod tests {
         .await
         .unwrap();
     }
-    async fn stored(journal: &SpanJournal) {
+    async fn stored(journal: &SpanOps) {
         journal
             .translated(
                 10,
@@ -486,14 +486,14 @@ mod tests {
     #[tokio::test]
     async fn transient_rejection_resubmits_consumed_batch_before_completing() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
         let route = SessionRoute::default();
         let record = Arc::new(Recording::default());
         record.reject.store(true, Ordering::SeqCst);
-        let cursor = journal.subscribe(&route, 0).await.unwrap();
+        let cursor = Cursor::open(&journal, &route).await.unwrap();
         let opts = options(tmp.path(), &route, record.clone());
         let subscription = cursor.into_input(
             opts.config.subscribe(),
@@ -533,7 +533,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let plugin = tmp.path().join("redact.mjs");
         std::fs::write(&plugin, "let calls=0; export default span => {if(calls++===0) {while(true){}} return {...span,name:'redacted'};}").unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -544,7 +544,8 @@ mod tests {
         let record = Arc::new(Recording::default());
         let opts = options(tmp.path(), &route, record.clone());
         let recovery = opts.recovery.clone();
-        let (consumer, progress, error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        let (consumer, progress, error) =
+            spawn(Cursor::open(&journal, &route).await.unwrap(), opts);
         wait_for(|| recovery.lock().is_some()).await;
         assert_eq!(progress.completed(), 0);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 0);
@@ -599,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_delivery_can_read_ahead_and_acknowledge_original_receipts() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         let ops: Vec<_> = (0..129)
@@ -618,7 +619,7 @@ mod tests {
         let record = Arc::new(Recording::default());
         record.defer_until.store(129, Ordering::SeqCst);
         let (consumer, progress, _error) = spawn(
-            journal.subscribe(&route, 0).await.unwrap(),
+            Cursor::open(&journal, &route).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| progress.completed() == 129).await;
@@ -632,10 +633,10 @@ mod tests {
     async fn head_write_recovery_retries_only_completion() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
         stored(&journal).await;
         let route = SessionRoute::default();
-        let cursor = journal.subscribe(&route, 0).await.unwrap();
+        let cursor = Cursor::open(&journal, &route).await.unwrap();
         let db = crate::collections::inspect::Inspector::open(&path).unwrap();
         db.inject(crate::collections::inspect::Fault::AdvanceHead)
             .unwrap();
@@ -657,7 +658,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let plugin = tmp.path().join("plugin.mjs");
         std::fs::write(&plugin, "export default () => {throw new Error('bad')}").unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -668,7 +669,7 @@ mod tests {
         let key = serde_json::to_string(&route).unwrap();
         let record = Arc::new(Recording::default());
         let (consumer, _progress, error) = spawn(
-            journal.subscribe(&route, 0).await.unwrap(),
+            Cursor::open(&journal, &route).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| error.lock().is_some()).await;
@@ -678,7 +679,7 @@ mod tests {
         // Restart with an ordinary channel between the durable source and the
         // same consumer. Historical failure gating belongs to the source.
         let opts = options(tmp.path(), &route, record.clone());
-        let subscription = journal.subscribe(&route, 0).await.unwrap().into_input(
+        let subscription = Cursor::open(&journal, &route).await.unwrap().into_input(
             opts.config.subscribe(),
             opts.version.clone(),
             opts.error.clone(),
@@ -732,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn unauthorized_delivery_refreshes_credentials_at_the_same_head() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -743,7 +744,8 @@ mod tests {
         let refreshed = Arc::new(AtomicU64::new(0));
         let mut opts = options(tmp.path(), &route, record.clone());
         opts.auth_provider = Some(Arc::new(RefreshAuth(refreshed.clone())));
-        let (consumer, progress, _error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        let (consumer, progress, _error) =
+            spawn(Cursor::open(&journal, &route).await.unwrap(), opts);
         wait_for(|| progress.completed() == 1).await;
         assert_eq!(refreshed.load(Ordering::SeqCst), 1);
         assert_eq!(consumer.config.borrow().auth.token, "fresh");
@@ -769,7 +771,7 @@ mod tests {
             .mount_as_scoped(&server)
             .await;
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -789,7 +791,8 @@ mod tests {
             crate::BraintrustSinkConfig::default(),
         ));
         let mut config = opts.config.borrow().clone();
-        let (consumer, progress, error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        let (consumer, progress, error) =
+            spawn(Cursor::open(&journal, &route).await.unwrap(), opts);
         wait_for(|| error.lock().is_some()).await;
         assert_eq!(progress.completed(), 0);
         drop(rejection);
@@ -819,7 +822,7 @@ mod tests {
         std::fs::write(&first, "export default span => ({...span,name:'bad'})").unwrap();
         std::fs::write(&last,"export default span => {if(span.name==='bad') throw new Error('bad input'); return span}").unwrap();
         let last_digest = crate::span_processor::file_digest(&last);
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -829,7 +832,7 @@ mod tests {
         };
         let record = Arc::new(Recording::default());
         let (consumer, progress, error) = spawn(
-            journal.subscribe(&route, 0).await.unwrap(),
+            Cursor::open(&journal, &route).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| error.lock().is_some()).await;

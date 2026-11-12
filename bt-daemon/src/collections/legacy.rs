@@ -1,12 +1,17 @@
 //! Read-only migration of NDJSON event journals written before collections.
 //!
-//! Records are imported at their original byte boundaries, so translation and
-//! delivery positions recorded by an older daemon remain valid. A journal file
-//! is deleted only after every record it contributes has been committed.
+//! Records are imported at their original byte boundaries, so translation
+//! positions recorded by an older daemon remain valid. Delivery checkpoints are
+//! not imported: input every route had delivered is instead marked translated,
+//! so the translator rebuilds its state from it without publishing it again. A
+//! journal file is deleted only after every record it contributes has been
+//! committed.
 use super::events::{encode, EventCollection, EventRecord};
 use crate::journal::{journal_dir, journal_path, source_journal_path};
-use crate::wire::RedactedEnvelope;
+use crate::wire::{RedactedEnvelope, SessionRoute};
+use anyhow::Context;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::io::AsyncBufReadExt;
 
@@ -75,8 +80,8 @@ async fn import_unqualified(data_dir: &Path, path: &Path) -> anyhow::Result<()> 
     // span-id namespace: that daemon had one actor per native session.
     let mut owner = None;
     let mut reader = Reader::open(path).await?;
-    while let Some((_, record)) = reader.next().await? {
-        if let EventRecord::Event(event) = record {
+    while let Some((_, line)) = reader.next().await? {
+        if let Line::Record(EventRecord::Event(event)) = line {
             owner.get_or_insert_with(|| {
                 crate::translate::canonical_source_name(&event.source).to_owned()
             });
@@ -112,8 +117,8 @@ async fn import_unqualified(data_dir: &Path, path: &Path) -> anyhow::Result<()> 
 async fn sessions(path: &Path) -> anyhow::Result<BTreeSet<(String, String)>> {
     let mut sessions = BTreeSet::new();
     let mut reader = Reader::open(path).await?;
-    while let Some((_, record)) = reader.next().await? {
-        if let EventRecord::Event(event) = record {
+    while let Some((_, line)) = reader.next().await? {
+        if let Line::Record(EventRecord::Event(event)) = line {
             sessions.insert((
                 crate::translate::canonical_source_name(&event.source).to_owned(),
                 event.session_id,
@@ -130,18 +135,32 @@ async fn import_file(
     namespace: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut reader = Reader::open(path).await?;
-    let mut routes = Vec::new();
+    // Each route's latest event, and the latest checkpoint it delivered.
+    let mut routes: Vec<(SessionRoute, u64)> = Vec::new();
+    let mut delivered: HashMap<String, u64> = HashMap::new();
     let mut batch = Vec::new();
     let mut bytes = 0;
     let mut identity: Option<RedactedEnvelope> = None;
-    while let Some((through, record)) = reader.next().await? {
+    while let Some((through, line)) = reader.next().await? {
+        let record = match line {
+            Line::Record(record) => record,
+            Line::Checkpoint(checkpoint) => {
+                let key = serde_json::to_string(&checkpoint.route)?;
+                let entry = delivered.entry(key).or_default();
+                *entry = (*entry).max(checkpoint.through);
+                continue;
+            }
+        };
         match &record {
             EventRecord::Event(event) => {
                 if crate::translate::canonical_source_name(&event.source) != source {
                     continue;
                 }
                 if let Some(route) = &event.route {
-                    routes.push(route.clone());
+                    match routes.iter_mut().find(|(known, _)| known.same_route(route)) {
+                        Some((_, latest)) => *latest = through,
+                        None => routes.push((route.clone(), through)),
+                    }
                 }
                 let mut latest = event.clone();
                 let mut payload = serde_json::Map::new();
@@ -161,14 +180,6 @@ async fn import_file(
                 latest.payload = payload.into();
                 identity = Some(latest);
             }
-            EventRecord::LegacyDeliveryCheckpoint { route, .. } => {
-                if !routes
-                    .iter()
-                    .any(|known: &crate::wire::SessionRoute| known.same_route(route))
-                {
-                    continue;
-                }
-            }
             EventRecord::Control(_) => {}
         }
         let value = encode(&record)?;
@@ -182,7 +193,32 @@ async fn import_file(
         }
     }
     events.import(batch, identity, namespace).await?;
-    events.reserve(reader.position).await
+    // Input is delivered only through the point every route had delivered.
+    let delivered = routes
+        .iter()
+        .map(|(route, _)| {
+            let key = serde_json::to_string(route)?;
+            anyhow::Ok(delivered.get(&key).copied().unwrap_or(0))
+        })
+        .try_fold(None, |least: Option<u64>, through| {
+            let through = through?;
+            anyhow::Ok(Some(least.map_or(through, |least| least.min(through))))
+        })?
+        .unwrap_or(0);
+    events.reserve(reader.position, delivered).await
+}
+
+/// A delivery acknowledgement written by a daemon before SpanOp storage.
+#[derive(serde::Deserialize)]
+struct Checkpoint {
+    route: SessionRoute,
+    through: u64,
+}
+
+#[allow(clippy::large_enum_variant, reason = "One line is read at a time.")]
+enum Line {
+    Record(EventRecord),
+    Checkpoint(Checkpoint),
 }
 
 /// Streaming NDJSON reader. An incomplete final line was never acknowledged
@@ -202,7 +238,7 @@ impl Reader {
         })
     }
 
-    async fn next(&mut self) -> anyhow::Result<Option<(u64, EventRecord)>> {
+    async fn next(&mut self) -> anyhow::Result<Option<(u64, Line)>> {
         loop {
             let mut line = Vec::new();
             let read = self.lines.read_until(b'\n', &mut line).await?;
@@ -214,13 +250,24 @@ impl Reader {
             if text.is_empty() {
                 continue;
             }
-            let mut record = super::events::decode(text.as_bytes()).map_err(|error| {
-                error.context(format!("legacy journal offset {}", self.position))
-            })?;
+            let context = || format!("legacy journal offset {}", self.position);
+            let value: serde_json::Value = serde_json::from_str(text)?;
+            if value
+                .get("_bt_record_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("delivery_checkpoint")
+            {
+                let checkpoint = serde_json::from_value(value).map_err(anyhow::Error::from);
+                return Ok(Some((
+                    self.position,
+                    Line::Checkpoint(checkpoint.with_context(context)?),
+                )));
+            }
+            let mut record = super::events::decode_value(value).with_context(context)?;
             if let EventRecord::Event(event) = &mut record {
                 expand_pi_payload(event, &mut self.pi_context)?;
             }
-            return Ok(Some((self.position, record)));
+            return Ok(Some((self.position, Line::Record(record))));
         }
     }
 }

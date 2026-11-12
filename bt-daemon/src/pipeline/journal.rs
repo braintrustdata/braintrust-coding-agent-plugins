@@ -1,260 +1,54 @@
-//! The durable SpanOp channel: translation publishes ops, and each route
-//! receives them live or, after a gap, from storage. Storage itself lives in
-//! [`crate::collections::SpanOps`]; this layer only moves records.
+//! Route delivery from the durable SpanOp collection: each route receives
+//! committed ops live or, after a gap, from storage, and removes them from its
+//! view once its destination accepts them.
 
-use super::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
-use super::recovery::{Boundary, Failure, Recovery, RecoveryOutcome};
 use super::delivery::InputPort;
+use super::live::{Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
+use super::recovery::{Boundary, Failure, Recovery, RecoveryOutcome};
 use super::{Completion, Delivery, Stage};
-pub(crate) use crate::collections::BindingChanged;
-use crate::collections::{
-    EventCollection, HeldRoute, SpanOps, Translated,
-};
-use crate::{
-    translate::{OriginSnapshot, SpanOp},
-    wire::{RecoveryInfo, SessionConfig, SessionRoute},
-};
+use crate::collections::{BindingChanged, HeldRoute, SpanOps};
+#[cfg(test)]
+use crate::translate::SpanOp;
+use crate::wire::{RecoveryInfo, SessionConfig, SessionRoute};
 use parking_lot::Mutex;
-use std::{
-    collections::BTreeMap,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use tokio::sync::watch;
 
-type ReplayWindow = Vec<(u64, std::sync::Weak<SpanOp>, usize)>;
-
-#[derive(Clone)]
-pub(crate) struct SpanJournal {
-    ops: SpanOps,
-    changed: watch::Sender<u64>,
-    live: Arc<Multiplexer>,
-    replay: Arc<tokio::sync::Mutex<ReplayWindow>>,
-    #[cfg(test)]
-    payload_reads: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl SpanJournal {
-    #[cfg(test)]
-    pub async fn open(path: &std::path::Path) -> anyhow::Result<Self> {
-        Self::with_ops(SpanOps::open(path).await?).await
-    }
-
-    /// The SpanOp channel stored alongside a session's events.
-    pub async fn for_events(events: &EventCollection) -> anyhow::Result<Self> {
-        Self::with_ops(SpanOps::for_events(events).await?).await
-    }
-
-    async fn with_ops(ops: SpanOps) -> anyhow::Result<Self> {
-        let (changed, _) = watch::channel(ops.tail().await?);
-        Ok(Self {
-            ops,
-            changed,
-            live: Arc::new(Multiplexer::default()),
-            replay: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            #[cfg(test)]
-            payload_reads: Arc::default(),
-        })
-    }
-
-    /// One serialized, weakly held recovery window is shared by all routes.
-    /// No decoded payload remains alive solely because of the replay cache.
-    async fn recover_after(&self, after: u64) -> anyhow::Result<Vec<Record>> {
-        let mut cache = self.replay.lock().await;
-        if cache
-            .first()
-            .is_some_and(|(position, _, _)| *position <= after + 1)
-            && cache
-                .last()
-                .is_some_and(|(position, _, _)| *position > after)
+/// Keep the original subscription and backend binding while correcting
+/// settings that can unblock an explicitly configuration-held delivery.
+pub(crate) async fn reconfigure_held(
+    ops: &SpanOps,
+    route: &SessionRoute,
+    through: u64,
+) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
+    let route = route.clone();
+    ops.reconfigure_held(through, move |held: &HeldRoute| {
+        let failure = serde_json::from_str::<Failure>(&held.failure).ok()?;
+        if !matches!(
+            failure.condition,
+            super::recovery::Condition::Configuration { .. }
+                | super::recovery::Condition::Plugin { .. }
+        ) || !held.route.same_destination(&route)
         {
-            let shared = cache
-                .iter()
-                .filter(|(position, _, _)| *position > after)
-                .map(|(position, op, bytes)| {
-                    Some(Record {
-                        position: *position,
-                        op: SharedOp::from_arc(op.upgrade()?),
-                        bytes: *bytes,
-                    })
-                })
-                .collect::<Option<Vec<_>>>();
-            if let Some(shared) = shared {
-                return Ok(shared);
-            }
+            return None;
         }
-        let records: Vec<Record> = self
-            .ops
-            .read_after(after, BYTE_BUDGET, WINDOW)
-            .await?
-            .into_iter()
-            .map(|record| Record {
-                position: record.position,
-                op: SharedOp::new(record.op),
-                bytes: record.bytes,
-            })
-            .collect();
-        #[cfg(test)]
-        self.payload_reads
-            .fetch_add(records.len() as u64, Ordering::Relaxed);
-        *cache = records
-            .iter()
-            .map(|record| (record.position, record.op.downgrade(), record.bytes))
-            .collect();
-        Ok(records)
-    }
-
-    /// Hand one input's translation to delivery atomically, then give routes
-    /// the original op instances. Nothing is published before it is durable.
-    pub async fn commit_translation(&self, translated: Translated) -> anyhow::Result<u64> {
-        let committed = self.ops.commit_translation(&translated).await?;
-        // Every op is durable: advertise the tail first, so routes can drain
-        // the bounded live feed (or read storage) while it is being filled.
-        self.changed.send_replace(committed.tail);
-        for (position, op) in committed.positions.into_iter().zip(translated.ops) {
-            if let Some((position, bytes)) = position {
-                self.live
-                    .publish(Record {
-                        position,
-                        bytes,
-                        op: SharedOp::new(op),
-                    })
-                    .await;
-            }
+        let previous = held.settings.as_ref().unwrap_or(&held.route);
+        if previous.same_route(&route) {
+            return None;
         }
-        Ok(committed.tail)
-    }
-
-    /// Commit native output for `input` with no continuation.
-    #[cfg(test)]
-    pub async fn translated(&self, input: u64, ops: Vec<SpanOp>) -> anyhow::Result<u64> {
-        self.translated_with_roots(input, ops, &BTreeMap::new())
-            .await
-    }
-
-    #[cfg(test)]
-    pub async fn translated_with_roots(
-        &self,
-        input: u64,
-        ops: Vec<SpanOp>,
-        roots: &BTreeMap<String, Vec<SpanOp>>,
-    ) -> anyhow::Result<u64> {
-        self.commit_translation(Translated {
-            input,
-            observation: true,
-            ops,
-            roots: roots.clone(),
-            state: None,
-            acknowledged: None,
-        })
-        .await
-    }
-
-    pub async fn subscribe(
-        &self,
-        route: &SessionRoute,
-        legacy_through: u64,
-    ) -> anyhow::Result<Cursor> {
-        let live = self.live.subscribe();
-        let position = self.ops.subscribe(route, legacy_through).await?;
-        let (progress, _) = watch::channel(position);
-        Ok(Cursor {
-            journal: self.clone(),
-            route: serde_json::to_string(route)?,
-            read: position,
-            completed: position,
-            changes: self.changed.subscribe(),
-            progress,
-            drain: watch::channel(position).0,
-            abandoned: Arc::new(AtomicBool::new(false)),
-            settings: None,
-            version: String::new(),
-            restored: false,
-            live,
-            queued: None,
-            error: Arc::new(Mutex::new(None)),
-            recovery: Arc::new(Mutex::new(None)),
-        })
-    }
-
-    pub async fn translated_through(&self) -> anyhow::Result<u64> {
-        self.ops.translated_through().await
-    }
-    pub async fn checkpoint(&self) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
-        self.ops.checkpoint().await
-    }
-    pub async fn root_candidates(&self) -> anyhow::Result<BTreeMap<String, Vec<SpanOp>>> {
-        self.ops.root_candidates().await
-    }
-    pub async fn tail(&self) -> anyhow::Result<u64> {
-        self.ops.tail().await
-    }
-    pub async fn origins_for(
-        &self,
-        spans: Vec<String>,
-    ) -> anyhow::Result<BTreeMap<String, Arc<OriginSnapshot>>> {
-        self.ops.origins_for(spans).await
-    }
-    pub async fn observations(&self) -> anyhow::Result<Vec<SpanOp>> {
-        self.ops.observations().await
-    }
-    pub async fn register(&self, route: &SessionRoute) -> anyhow::Result<()> {
-        self.ops.register(route).await
-    }
-    pub async fn route_settings(&self, route: &SessionRoute) -> anyhow::Result<SessionRoute> {
-        self.ops.route_settings(route).await
-    }
-    pub async fn source_failure(&self) -> anyhow::Result<Option<String>> {
-        self.ops.source_failure().await
-    }
-    pub async fn set_source_failure(&self, failure: Option<String>) -> anyhow::Result<()> {
-        self.ops.set_source_failure(failure).await
-    }
-
-    /// Keep the original subscription and backend binding while correcting
-    /// settings that can unblock an explicitly configuration-held delivery.
-    pub async fn reconfigure_held(
-        &self,
-        route: &SessionRoute,
-        through: u64,
-    ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
-        let route = route.clone();
-        self.ops
-            .reconfigure_held(through, move |held: &HeldRoute| {
-                let failure = serde_json::from_str::<Failure>(&held.failure).ok()?;
-                if !matches!(
-                    failure.condition,
-                    super::recovery::Condition::Configuration { .. }
-                        | super::recovery::Condition::Plugin { .. }
-                ) || !held.route.same_destination(&route)
-                {
-                    return None;
-                }
-                let previous = held.settings.as_ref().unwrap_or(&held.route);
-                if previous.same_route(&route) {
-                    return None;
-                }
-                let mut corrected = route.clone();
-                // Preserve the subscription's pinned credential selection.
-                corrected.auth = held.route.auth.clone();
-                Some(corrected)
-            })
-            .await
-    }
-}
-
-#[cfg(test)]
-impl std::ops::Deref for SpanJournal {
-    type Target = SpanOps;
-    fn deref(&self) -> &SpanOps {
-        &self.ops
-    }
+        let mut corrected = route.clone();
+        // Preserve the subscription's pinned credential selection.
+        corrected.auth = held.route.auth.clone();
+        Some(corrected)
+    })
+    .await
 }
 
 pub(crate) struct Cursor {
-    journal: SpanJournal,
+    ops: SpanOps,
     pub route: String,
     read: u64,
     completed: u64,
@@ -330,6 +124,28 @@ pub(crate) struct Subscription {
 }
 
 impl Cursor {
+    pub async fn open(ops: &SpanOps, route: &SessionRoute) -> anyhow::Result<Self> {
+        let subscriber = ops.subscribe(route).await?;
+        let position = subscriber.position;
+        Ok(Self {
+            ops: ops.clone(),
+            route: serde_json::to_string(route)?,
+            read: position,
+            completed: position,
+            changes: subscriber.published,
+            progress: watch::channel(position).0,
+            drain: watch::channel(position).0,
+            abandoned: Arc::new(AtomicBool::new(false)),
+            settings: None,
+            version: String::new(),
+            restored: false,
+            live: subscriber.live,
+            queued: None,
+            error: Arc::new(Mutex::new(None)),
+            recovery: Arc::new(Mutex::new(None)),
+        })
+    }
+
     pub fn into_input(
         mut self,
         settings: watch::Receiver<SessionConfig>,
@@ -360,7 +176,6 @@ impl Cursor {
         anyhow::ensure!(limit > 0, "cursor batch limit must be nonzero");
         let after = self.read;
         let mut rows = self
-            .journal
             .ops
             .read_after(after, usize::MAX, std::time::Duration::MAX)
             .await?;
@@ -373,7 +188,7 @@ impl Cursor {
         Ok(Some(Delivery::new(
             ops,
             HeadCompletion {
-                journal: self.journal.clone(),
+                ops: self.ops.clone(),
                 live: self.live.control(),
                 route: self.route.clone(),
                 expected: after,
@@ -404,7 +219,7 @@ impl Cursor {
         if records.is_empty() {
             // Restart, abandoned delivery, a late subscription, or a bounded
             // live-queue overrun. Healthy live delivery never enters this path.
-            records = self.journal.recover_after(after).await?;
+            records = self.ops.recover_after(after).await?;
             self.live.clear();
         } else {
             let deadline = tokio::time::Instant::now() + WINDOW;
@@ -443,7 +258,7 @@ impl Cursor {
         Ok(Some(Delivery::new(
             records.into_iter().map(|record| record.op).collect(),
             HeadCompletion {
-                journal: self.journal.clone(),
+                ops: self.ops.clone(),
                 live: self.live.control(),
                 route: self.route.clone(),
                 expected: after,
@@ -463,7 +278,7 @@ impl Cursor {
     }
 
     pub async fn rewind(&mut self) -> anyhow::Result<()> {
-        self.completed = self.journal.ops.head(&self.route).await?;
+        self.completed = self.ops.head(&self.route).await?;
         self.read = self.completed;
         self.queued = None;
         self.live.clear();
@@ -497,7 +312,6 @@ impl InputPort for SharedCursor {
                 // Its source still owns persistence of the recovery evidence.
                 if let Err(error) = self
                     .0
-                    .journal
                     .ops
                     .set_failure(&self.0.route, Some(serde_json::to_string(&failure)?))
                     .await
@@ -525,7 +339,7 @@ impl Cursor {
                 .as_ref()
                 .map(|settings| settings.borrow().clone());
             if !self.restored {
-                if let Some(raw) = self.journal.ops.failure(&self.route).await? {
+                if let Some(raw) = self.ops.failure(&self.route).await? {
                     let failure = match serde_json::from_str::<Failure>(&raw) {
                         Ok(failure) => failure,
                         Err(error) => match &config {
@@ -536,7 +350,7 @@ impl Cursor {
                     if matches!(failure.boundary, Boundary::Completion)
                         && self.completed >= failure.through.unwrap_or(failure.position)
                     {
-                        self.journal.ops.set_failure(&self.route, None).await?;
+                        self.ops.set_failure(&self.route, None).await?;
                     } else {
                         *self.error.lock() = Some(failure.message());
                         *self.recovery.lock() = Some(failure.info(false));
@@ -557,12 +371,11 @@ impl Cursor {
                 }
             }
             if let Some(config) = &config {
-                if let Err(error) = self.journal.ops.bind(&self.route, config).await {
+                if let Err(error) = self.ops.bind(&self.route, config).await {
                     if error.downcast_ref::<BindingChanged>().is_some() {
                         let failure =
                             Failure::legacy(error.to_string(), self.completed + 1, config);
-                        self.journal
-                            .ops
+                        self.ops
                             .set_failure(&self.route, Some(serde_json::to_string(&failure)?))
                             .await?;
                         return Err(anyhow::Error::new(failure));
@@ -598,7 +411,7 @@ impl InputPort for Cursor {
 }
 
 struct HeadCompletion {
-    journal: SpanJournal,
+    ops: SpanOps,
     live: super::live::Control,
     route: String,
     expected: u64,
@@ -621,8 +434,7 @@ impl Drop for HeadCompletion {
 #[async_trait::async_trait]
 impl Completion for HeadCompletion {
     async fn complete(&mut self) -> anyhow::Result<()> {
-        self.journal
-            .ops
+        self.ops
             .remove_through(&self.route, self.expected, self.through)
             .await
             .map(|head| {
@@ -639,8 +451,7 @@ impl Completion for HeadCompletion {
         failure.through = Some(self.through);
         *self.error.lock() = Some(failure.message());
         *self.recovery.lock() = Some(failure.info(false));
-        self.journal
-            .ops
+        self.ops
             .set_failure(&self.route, Some(serde_json::to_string(failure)?))
             .await
     }
@@ -703,7 +514,7 @@ mod tests {
     #[tokio::test]
     async fn resolved_profile_completes_the_pre_authentication_placeholder() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("auth.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("auth.sqlite"))
             .await
             .unwrap();
         let mut named = route("profile");
@@ -713,7 +524,7 @@ mod tests {
         journal.translated(10, Vec::new()).await.unwrap();
         let mut resolved = named.clone();
         resolved.auth.profile_id = Some("stable-id".into());
-        let mut cursor = journal.subscribe(&resolved, 0).await.unwrap();
+        let mut cursor = Cursor::open(&journal, &resolved).await.unwrap();
         assert_eq!(journal.routes().await.unwrap().len(), 1);
         cursor
             .next_shared()
@@ -730,15 +541,15 @@ mod tests {
     #[tokio::test]
     async fn recovery_routes_at_different_heads_share_the_same_decode_window() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("shared-recovery.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("shared-recovery.sqlite"))
             .await
             .unwrap();
         journal
             .translated(10, vec![op("one"), op("two"), op("three")])
             .await
             .unwrap();
-        let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
-        let mut b = journal.subscribe(&route("b"), 0).await.unwrap();
+        let mut a = Cursor::open(&journal, &route("a")).await.unwrap();
+        let mut b = Cursor::open(&journal, &route("b")).await.unwrap();
         b.read = 1;
         let first = a.next_shared().await.unwrap().unwrap();
         let second = b.next_shared().await.unwrap().unwrap();
@@ -748,16 +559,16 @@ mod tests {
             first.value()[1].as_ref(),
             second.value()[0].as_ref()
         ));
-        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(journal.payload_reads(), 3);
     }
 
     #[tokio::test]
     async fn all_route_acknowledgements_reclaim_payloads_and_preserve_watermarks() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cleanup.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
-        let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
-        let mut b = journal.subscribe(&route("b"), 0).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
+        let mut a = Cursor::open(&journal, &route("a")).await.unwrap();
+        let mut b = Cursor::open(&journal, &route("b")).await.unwrap();
         journal.translated(10, vec![op("one")]).await.unwrap();
         journal.translated(10, Vec::new()).await.unwrap();
         let first = a.next_shared().await.unwrap().unwrap();
@@ -769,10 +580,10 @@ mod tests {
         assert_eq!(journal.tail().await.unwrap(), 1);
         assert_eq!(journal.origins().await.unwrap()["one"].bt_version, "test");
         drop(journal);
-        let restored = SpanJournal::open(&path).await.unwrap();
+        let restored = SpanOps::open(&path).await.unwrap();
         assert_eq!(restored.tail().await.unwrap(), 1);
         assert_eq!(restored.translated_through().await.unwrap(), 10);
-        let mut late = restored.subscribe(&route("new"), 0).await.unwrap();
+        let mut late = Cursor::open(&restored, &route("new")).await.unwrap();
         assert!(late.next_shared().await.unwrap().is_none());
         restored.translated(20, vec![op("two")]).await.unwrap();
         assert_eq!(restored.tail().await.unwrap(), 2);
@@ -782,10 +593,10 @@ mod tests {
     #[tokio::test]
     async fn explicit_flush_interrupts_live_batch_collection() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("flush.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("flush.sqlite"))
             .await
             .unwrap();
-        let mut cursor = journal.subscribe(&route("a"), 0).await.unwrap();
+        let mut cursor = Cursor::open(&journal, &route("a")).await.unwrap();
         let progress = Progress {
             completed: cursor.progress.subscribe(),
             published: cursor.changes.clone(),
@@ -818,26 +629,26 @@ mod tests {
         })
         .await
         .expect("explicit flush must bypass the 30-second window");
-        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(journal.payload_reads(), 0);
     }
 
     #[tokio::test]
     async fn newly_registered_route_starts_after_an_existing_routes_pending_output() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("routes.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("routes.sqlite"))
             .await
             .unwrap();
         journal.register(&route("first")).await.unwrap();
         journal.translated(10, vec![op("old")]).await.unwrap();
         journal.register(&route("new")).await.unwrap();
         journal.translated(20, vec![op("new")]).await.unwrap();
-        let mut new = journal.subscribe(&route("new"), 0).await.unwrap();
+        let mut new = Cursor::open(&journal, &route("new")).await.unwrap();
         let batch = new.next_batch(8).await.unwrap().unwrap();
         assert_eq!(batch.value().len(), 1);
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &batch.value()[0];
         assert_eq!(row.span_id, "new");
         batch.into_completed().await.ok().unwrap();
-        let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
+        let mut first = Cursor::open(&journal, &route("first")).await.unwrap();
         let batch = first.next_batch(8).await.unwrap().unwrap();
         assert_eq!(
             batch.value().len(),
@@ -849,11 +660,11 @@ mod tests {
     #[tokio::test]
     async fn live_routes_share_original_payload_without_sqlite_reads() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("live.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("live.sqlite"))
             .await
             .unwrap();
-        let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
-        let mut second = journal.subscribe(&route("second"), 0).await.unwrap();
+        let mut first = Cursor::open(&journal, &route("first")).await.unwrap();
+        let mut second = Cursor::open(&journal, &route("second")).await.unwrap();
         let payload = "x".repeat(BYTE_BUDGET * 2);
         let pointer = payload.as_ptr();
         let mut ops = vec![SpanOp::Insert(SpanRow {
@@ -874,7 +685,7 @@ mod tests {
             row.input.as_ref().unwrap().as_str().unwrap().as_ptr(),
             pointer
         );
-        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(journal.payload_reads(), 0);
         let weak = a.value()[0].downgrade();
         drop(a.into_completed().await.ok().unwrap());
         drop(b.into_completed().await.ok().unwrap());
@@ -884,16 +695,16 @@ mod tests {
     #[tokio::test]
     async fn recovery_decodes_once_for_concurrent_routes_and_keeps_only_weak_references() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("recovery.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("recovery.sqlite"))
             .await
             .unwrap();
         journal.translated(10, vec![op("recover")]).await.unwrap();
-        let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
-        let mut second = journal.subscribe(&route("second"), 0).await.unwrap();
+        let mut first = Cursor::open(&journal, &route("first")).await.unwrap();
+        let mut second = Cursor::open(&journal, &route("second")).await.unwrap();
         let a = first.next_shared().await.unwrap().unwrap();
         let b = second.next_shared().await.unwrap().unwrap();
         assert!(std::ptr::eq(a.value()[0].as_ref(), b.value()[0].as_ref()));
-        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(journal.payload_reads(), 1);
         let weak = a.value()[0].downgrade();
         drop(a);
         drop(b);
@@ -901,51 +712,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_partially_published_input_is_completed_without_redelivery() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("partial.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
-        let mut first = journal.subscribe(&route("first"), 0).await.unwrap();
-        // A daemon before atomic handoff published "one", then crashed while
-        // still translating its input.
-        journal
-            .legacy_uncommitted(10, &[op("one")], true)
-            .await
-            .unwrap();
-        let mut reader = journal.subscribe(&route("first"), 0).await.unwrap();
-        reader
-            .next_batch(8)
-            .await
-            .unwrap()
-            .unwrap()
-            .into_completed()
-            .await
-            .ok()
-            .unwrap();
-        drop((reader, first));
-        assert_eq!(journal.translated_through().await.unwrap(), 0);
-        drop(journal);
-        let journal = SpanJournal::open(&path).await.unwrap();
-        journal
-            .translated(10, vec![op("one"), op("two")])
-            .await
-            .unwrap();
-        first = journal.subscribe(&route("first"), 0).await.unwrap();
-        let delivery = first.next_shared().await.unwrap().unwrap();
-        assert_eq!(delivery.value().len(), 1);
-        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = delivery.value()[0].as_ref();
-        assert_eq!(row.name, "two");
-        assert_eq!(journal.tail().await.unwrap(), 2);
-    }
-
-    #[tokio::test]
     async fn paused_route_recovers_without_blocking_a_healthy_live_route() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("lag.sqlite"))
-            .await
-            .unwrap();
-        let mut fast = journal.subscribe(&route("fast"), 0).await.unwrap();
-        let mut slow = journal.subscribe(&route("slow"), 0).await.unwrap();
+        let journal = SpanOps::open(&tmp.path().join("lag.sqlite")).await.unwrap();
+        let mut fast = Cursor::open(&journal, &route("fast")).await.unwrap();
+        let mut slow = Cursor::open(&journal, &route("slow")).await.unwrap();
         slow.live.control().pause();
         for index in 0..3 {
             journal
@@ -968,7 +739,7 @@ mod tests {
                 .ok()
                 .unwrap();
         }
-        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(journal.payload_reads(), 0);
         for _ in 0..3 {
             let delivery = slow.next_shared().await.unwrap().unwrap();
             assert_eq!(
@@ -980,35 +751,35 @@ mod tests {
         }
         slow.rewind().await.unwrap();
         assert_eq!(slow.completed_position(), 3);
-        assert_eq!(journal.payload_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(journal.payload_reads(), 3);
     }
 
     #[tokio::test]
     async fn root_candidates_commit_and_release_atomically() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("roots.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
         let mut roots = crate::pipeline::roots::Roots::default();
         let mut root = op("root");
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut root;
         row.metadata = Some(serde_json::json!({"_bt_defer_root": true}));
         assert!(roots.process(&vec![root]).await.is_empty());
         let db = Inspector::open(&path).unwrap();
-        db.inject(Fault::ReplaceRoots).unwrap();
+        db.inject(Fault::Handoff).unwrap();
         assert!(journal
             .translated_with_roots(10, Vec::new(), roots.pending())
             .await
             .is_err());
         assert_eq!(journal.translated_through().await.unwrap(), 0);
         assert!(journal.root_candidates().await.unwrap().is_empty());
-        db.clear(Fault::ReplaceRoots).unwrap();
+        db.clear(Fault::Handoff).unwrap();
         journal
             .translated_with_roots(10, Vec::new(), roots.pending())
             .await
             .unwrap();
         drop(journal);
 
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
         let candidates = journal.root_candidates().await.unwrap();
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &candidates["root"][0];
         assert_eq!(row.late_merge_key.as_deref(), Some("late"));
@@ -1024,7 +795,7 @@ mod tests {
         });
         let ready = roots.process(&vec![child]).await;
         assert_eq!(ready.len(), 2);
-        db.inject(Fault::ReleaseRoots).unwrap();
+        db.inject(Fault::Handoff).unwrap();
         assert!(journal
             .translated_with_roots(20, ready.clone(), roots.pending())
             .await
@@ -1032,7 +803,7 @@ mod tests {
         assert_eq!(journal.translated_through().await.unwrap(), 10);
         assert_eq!(journal.tail().await.unwrap(), 0);
         assert_eq!(journal.root_candidates().await.unwrap().len(), 1);
-        db.clear(Fault::ReleaseRoots).unwrap();
+        db.clear(Fault::Handoff).unwrap();
         journal
             .translated_with_roots(20, ready.clone(), roots.pending())
             .await
@@ -1045,12 +816,12 @@ mod tests {
     async fn input_port_replays_abandoned_delivery_without_cursor_control() {
         use crate::pipeline::delivery::InputPort;
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         journal.translated(1, vec![op("one")]).await.unwrap();
         let mut input: Box<dyn InputPort<Item = Vec<SpanOp>>> =
-            Box::new(journal.subscribe(&route("a"), 0).await.unwrap());
+            Box::new(Cursor::open(&journal, &route("a")).await.unwrap());
         let delivery = input.receive().await.unwrap().unwrap();
         drop(delivery);
         // Cancel a receive while its storage read is pending, as a concurrent
@@ -1074,20 +845,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_uncommitted_output_empty_commit_and_restart_preserve_the_boundary() {
+    async fn a_committed_input_is_final_and_empty_commits_keep_the_boundary() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
-        journal
-            .legacy_uncommitted(10, &[op("abandoned")], false)
-            .await
-            .unwrap();
-        let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
-        assert!(reader.next_batch(8).await.unwrap().is_none());
-        drop(reader);
-        drop(journal);
-        let journal = SpanJournal::open(&path).await.unwrap();
-        assert_eq!(journal.translated_through().await.unwrap(), 0);
+        let journal = SpanOps::open(&path).await.unwrap();
         journal.translated(10, vec![op("retained")]).await.unwrap();
         let tail = journal.tail().await.unwrap();
         journal.translated(10, vec![op("again")]).await.unwrap();
@@ -1098,7 +859,7 @@ mod tests {
         );
         journal.translated(20, Vec::new()).await.unwrap();
         assert_eq!(journal.translated_through().await.unwrap(), 20);
-        let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
+        let mut reader = Cursor::open(&journal, &route("a")).await.unwrap();
         let message = reader.next_batch(8).await.unwrap().unwrap();
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &message.value()[0];
         assert_eq!(row.name, "retained");
@@ -1114,13 +875,13 @@ mod tests {
     async fn independent_heads_and_dropped_deliveries_resume_without_skipping() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
         journal
             .translated(10, vec![op("one"), op("two")])
             .await
             .unwrap();
-        let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
-        let mut b = journal.subscribe(&route("b"), 0).await.unwrap();
+        let mut a = Cursor::open(&journal, &route("a")).await.unwrap();
+        let mut b = Cursor::open(&journal, &route("b")).await.unwrap();
         a.next_batch(2)
             .await
             .unwrap()
@@ -1134,7 +895,7 @@ mod tests {
         b.rewind().await.unwrap();
         assert!(a.next_batch(2).await.unwrap().is_none());
         assert_eq!(b.next_batch(2).await.unwrap().unwrap().value().len(), 2);
-        let mut c = journal.subscribe(&route("c"), 0).await.unwrap();
+        let mut c = Cursor::open(&journal, &route("c")).await.unwrap();
         let first = c.next_batch(1).await.unwrap().unwrap();
         let second = c.next_batch(1).await.unwrap().unwrap();
         assert!(
@@ -1149,8 +910,8 @@ mod tests {
     async fn head_write_failure_retains_work_and_commit_wakes_readers() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
-        let mut reader = journal.subscribe(&route("a"), 0).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
+        let mut reader = Cursor::open(&journal, &route("a")).await.unwrap();
         journal.translated(10, vec![op("one")]).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), reader.changed())
             .await
@@ -1180,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn a_completed_canonical_head_also_covers_its_legacy_named_route() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         journal.translated(10, vec![op("one")]).await.unwrap();
@@ -1188,7 +949,7 @@ mod tests {
         legacy.auth.profile = Some("work".into());
         let mut canonical = legacy.clone();
         canonical.auth.profile_id = Some("profile-id".into());
-        let mut head = journal.subscribe(&canonical, 0).await.unwrap();
+        let mut head = Cursor::open(&journal, &canonical).await.unwrap();
         head.next_batch(8)
             .await
             .unwrap()
@@ -1209,7 +970,7 @@ mod tests {
     async fn corrected_settings_survive_restart_without_advancing_or_retargeting_heads() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
         let original = SessionRoute {
             destination: Some(crate::wire::TraceDestination::ProjectLogs {
                 project_id: Some("test-project".into()),
@@ -1217,7 +978,7 @@ mod tests {
             }),
             ..route("a")
         };
-        let cursor = journal.subscribe(&original, 0).await.unwrap();
+        let cursor = Cursor::open(&journal, &original).await.unwrap();
         let failure = Failure {
             boundary: Boundary::Sink,
             position: 1,
@@ -1252,15 +1013,13 @@ mod tests {
                 ..corrected.clone()
             },
         ] {
-            assert!(journal
-                .reconfigure_held(&unrelated, 20)
+            assert!(reconfigure_held(&journal, &unrelated, 20)
                 .await
                 .unwrap()
                 .is_empty());
         }
         assert_eq!(
-            journal
-                .reconfigure_held(&corrected, 20)
+            reconfigure_held(&journal, &corrected, 20)
                 .await
                 .unwrap()
                 .len(),
@@ -1269,25 +1028,26 @@ mod tests {
         assert_eq!(cursor.completed, 0);
         assert_eq!(journal.failure(&cursor.route).await.unwrap(), Some(raw));
         // A captured prefix must not revert a newer correction during startup replay.
-        assert!(journal
-            .reconfigure_held(&original, 10)
+        assert!(reconfigure_held(&journal, &original, 10)
             .await
             .unwrap()
             .is_empty());
         drop(journal);
-        let restored = SpanJournal::open(&path).await.unwrap();
+        let restored = SpanOps::open(&path).await.unwrap();
         assert_eq!(
             restored.route_settings(&original).await.unwrap().tags,
             corrected.tags
         );
         assert_eq!(restored.routes().await.unwrap().len(), 1);
-        assert_eq!(restored.subscribe(&original, 0).await.unwrap().completed, 0);
+        assert_eq!(
+            Cursor::open(&restored, &original).await.unwrap().completed,
+            0
+        );
         restored.set_failure(&cursor.route, None).await.unwrap();
         let mut newer = corrected.clone();
         newer.tags.insert("independent".into());
         assert!(
-            restored
-                .reconfigure_held(&newer, 30)
+            reconfigure_held(&restored, &newer, 30)
                 .await
                 .unwrap()
                 .is_empty(),

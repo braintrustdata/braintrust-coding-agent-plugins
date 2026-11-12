@@ -7,9 +7,8 @@
 //! measure bytes. Removal never renumbers later records.
 use super::store::Store;
 use crate::pipeline::input::PipelineControl;
-use crate::wire::{Envelope, RedactedEnvelope, SessionRoute};
+use crate::wire::{Envelope, RedactedEnvelope};
 use rusqlite::{params, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -39,11 +38,6 @@ const IDENTITY_PAYLOAD: [&str; 3] = [
 pub(crate) enum EventRecord {
     Event(RedactedEnvelope),
     Control(PipelineControl),
-    /// Delivery acknowledgement written by a pre-collection daemon.
-    LegacyDeliveryCheckpoint {
-        route: SessionRoute,
-        through: u64,
-    },
 }
 
 #[derive(Debug)]
@@ -59,14 +53,6 @@ pub(crate) struct Appended {
     pub through: u64,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Checkpoint {
-    #[serde(rename = "_bt_record_type")]
-    record_type: String,
-    route: SessionRoute,
-    through: u64,
-}
-
 pub(super) fn encode(record: &EventRecord) -> anyhow::Result<Vec<u8>> {
     let value = match record {
         EventRecord::Event(event) => serde_json::to_value(event)?,
@@ -75,31 +61,20 @@ pub(super) fn encode(record: &EventRecord) -> anyhow::Result<Vec<u8>> {
             value["_bt_record_type"] = "pipeline_control".into();
             value
         }
-        EventRecord::LegacyDeliveryCheckpoint { route, through } => {
-            serde_json::to_value(Checkpoint {
-                record_type: "delivery_checkpoint".into(),
-                route: route.clone(),
-                through: *through,
-            })?
-        }
     };
     Ok(serde_json::to_vec(&value)?)
 }
 
 pub(super) fn decode(bytes: &[u8]) -> anyhow::Result<EventRecord> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    decode_value(serde_json::from_slice(bytes)?)
+}
+
+pub(super) fn decode_value(value: serde_json::Value) -> anyhow::Result<EventRecord> {
     Ok(
         match value
             .get("_bt_record_type")
             .and_then(serde_json::Value::as_str)
         {
-            Some("delivery_checkpoint") => {
-                let checkpoint: Checkpoint = serde_json::from_value(value)?;
-                EventRecord::LegacyDeliveryCheckpoint {
-                    route: checkpoint.route,
-                    through: checkpoint.through,
-                }
-            }
             Some("pipeline_control") => EventRecord::Control(serde_json::from_value(value)?),
             _ => EventRecord::Event(serde_json::from_value(value)?),
         },
@@ -400,15 +375,16 @@ impl EventCollection {
             .await
     }
 
-    /// Preserve the legacy file's length as the boundary for new records.
-    pub(super) async fn reserve(&self, through: u64) -> anyhow::Result<()> {
+    /// Preserve the legacy file's length as the boundary for new records,
+    /// and mark input every route had delivered as already translated.
+    pub(super) async fn reserve(&self, through: u64, delivered: u64) -> anyhow::Result<()> {
         self.store
             .write(move |tx| {
                 tx.execute(
                     "UPDATE event_state SET tail=max(tail,?) WHERE id=1",
                     [through],
                 )?;
-                Ok(())
+                super::span_ops::seed_delivered(tx, delivered)
             })
             .await
     }
@@ -493,7 +469,7 @@ impl EventReader {
         Ok(Some(EventEntry { id, record }))
     }
 
-    /// The next native event, skipping controls and legacy checkpoints.
+    /// The next native event, skipping controls.
     pub async fn next_event(&mut self) -> anyhow::Result<Option<RedactedEnvelope>> {
         while let Some(entry) = self.next().await? {
             if let EventRecord::Event(event) = entry.record {

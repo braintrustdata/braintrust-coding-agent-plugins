@@ -8,25 +8,19 @@ use std::path::{Path, PathBuf};
 /// A storage write that can be made to fail.
 #[derive(Clone, Copy, Debug)]
 pub enum Fault {
-    /// The handoff of translated output for an input.
-    BeginTranslation,
+    /// The handoff of an input's translation and continuation.
+    Handoff,
     InsertOps,
-    SaveCheckpoint,
     AdvanceHead,
-    ReplaceRoots,
-    ReleaseRoots,
     RemoveEvents,
 }
 
 impl Fault {
     fn trigger(self) -> (&'static str, &'static str) {
         match self {
-            Self::BeginTranslation => ("fault_begin", "BEFORE INSERT ON batches"),
+            Self::Handoff => ("fault_handoff", "BEFORE UPDATE ON translation"),
             Self::InsertOps => ("fault_insert_ops", "BEFORE INSERT ON ops"),
-            Self::SaveCheckpoint => ("fault_checkpoint", "BEFORE INSERT ON source_checkpoint"),
             Self::AdvanceHead => ("fault_head", "BEFORE UPDATE OF position ON heads"),
-            Self::ReplaceRoots => ("fault_roots", "BEFORE INSERT ON root_candidates"),
-            Self::ReleaseRoots => ("fault_release", "BEFORE DELETE ON root_candidates"),
             Self::RemoveEvents => ("fault_remove_events", "BEFORE DELETE ON events"),
         }
     }
@@ -37,10 +31,7 @@ impl Fault {
 pub enum Table {
     Events,
     Ops,
-    Receipts,
-    Batches,
     Heads,
-    RootCandidates,
     Origins,
 }
 
@@ -49,10 +40,7 @@ impl Table {
         match self {
             Self::Events => "events",
             Self::Ops => "ops",
-            Self::Receipts => "receipts",
-            Self::Batches => "batches",
             Self::Heads => "heads",
-            Self::RootCandidates => "root_candidates",
             Self::Origins => "origins",
         }
     }
@@ -148,7 +136,7 @@ impl Inspector {
         let (through, bytes): (u64, Vec<u8>) = self
             .0
             .query_row(
-                "SELECT through,value FROM source_checkpoint WHERE id=1",
+                "SELECT through,continuation FROM translation WHERE id=1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -181,18 +169,7 @@ impl Inspector {
     /// The position of the last published SpanOp.
     pub fn published_tail(&self) -> u64 {
         self.0
-            .query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))
-            .unwrap_or(0)
-    }
-
-    /// Stored SpanOps whose translation input has committed.
-    pub fn committed_ops(&self) -> u64 {
-        self.0
-            .query_row(
-                "SELECT count(*) FROM ops JOIN batches USING(input) WHERE committed=1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT tail FROM translation WHERE id=1", [], |r| r.get(0))
             .unwrap_or(0)
     }
 
@@ -201,7 +178,7 @@ impl Inspector {
         self.0
             .query_row(
                 "SELECT count(*) FROM heads WHERE failure IS NOT NULL
-                 OR position<(SELECT tail FROM publication WHERE id=1)",
+                 OR position<(SELECT tail FROM translation WHERE id=1)",
                 [],
                 |r| r.get(0),
             )
@@ -240,7 +217,7 @@ impl Inspector {
 
     pub fn corrupt_checkpoint(&self) -> anyhow::Result<()> {
         self.0
-            .execute_batch("INSERT OR REPLACE INTO source_checkpoint VALUES(1,1,0,x'78')")?;
+            .execute_batch("UPDATE translation SET continuation=x'78' WHERE id=1")?;
         Ok(())
     }
 

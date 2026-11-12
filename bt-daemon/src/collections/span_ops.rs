@@ -1,19 +1,23 @@
 //! Translated SpanOps for one source session, with one durable head per route.
 //!
-//! Each stage handoff is one transaction. Translation stores an input event's
-//! ops, metadata and continuation in the same transaction that removes the
-//! event. A route removes ops from its view by advancing its head once a
-//! destination accepts them, and an op is deleted when every route has passed
-//! it. Writers acquire the write lock before reading, so read-to-write
-//! upgrades cannot fail mid-way.
+//! Translation hands each input event's ops, correlation metadata and
+//! translator continuation over in the same transaction that removes the
+//! event. Routes then receive the ops live, or read them back after a gap. A
+//! route removes ops from its view by advancing its head once a destination
+//! accepts them, and an op is deleted when every route has passed it.
+//! Writers acquire the write lock before reading, so read-to-write upgrades
+//! cannot fail mid-way.
 use super::{events::EventCollection, store::Store};
 use crate::{
+    pipeline::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW},
     translate::{OriginSnapshot, SpanOp, SpanRow, SpanType},
     wire::{SessionConfig, SessionRoute},
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::{collections::BTreeMap, path::Path, sync::Arc};
+use tokio::sync::watch;
 
 #[derive(Debug)]
 pub(crate) struct BindingChanged;
@@ -164,44 +168,84 @@ pub(super) fn extract_metadata(db: &Connection) -> anyhow::Result<()> {
 }
 
 fn prune(db: &Connection) -> anyhow::Result<()> {
-    let through: Option<u64> = db.query_row("SELECT min(position) FROM heads", [], |r| r.get(0))?;
-    if let Some(through) = through {
-        db.execute("DELETE FROM ops WHERE position<=?", [through])?;
-        db.execute(
-            "UPDATE publication SET floor=max(floor,?) WHERE id=1",
-            [through],
-        )?;
-        db.execute("DELETE FROM receipts WHERE EXISTS(SELECT 1 FROM batches WHERE batches.input=receipts.input AND committed=1) AND NOT EXISTS(SELECT 1 FROM ops WHERE ops.input=receipts.input)", [])?;
-    }
+    db.execute(
+        "DELETE FROM ops WHERE position<=(SELECT min(position) FROM heads)",
+        [],
+    )?;
     Ok(())
 }
 
-fn committed_through(db: &Connection) -> rusqlite::Result<u64> {
-    db.query_row(
-        "SELECT coalesce(max(input),0) FROM batches WHERE committed=1",
-        [],
-        |r| r.get(0),
-    )
+fn tail(db: &Connection) -> rusqlite::Result<u64> {
+    db.query_row("SELECT tail FROM translation WHERE id=1", [], |r| r.get(0))
 }
 
-fn publication_tail(db: &Connection) -> rusqlite::Result<u64> {
-    db.query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))
+fn translated_through(db: &Connection) -> rusqlite::Result<u64> {
+    db.query_row("SELECT through FROM translation WHERE id=1", [], |r| {
+        r.get(0)
+    })
 }
 
-fn encode_roots(roots: &BTreeMap<String, Vec<SpanOp>>) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    roots
+type Roots = BTreeMap<String, Vec<Box<RawValue>>>;
+
+fn encode_roots(roots: &BTreeMap<String, Vec<SpanOp>>) -> anyhow::Result<Option<Vec<u8>>> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let roots = roots
         .iter()
         .map(|(id, ops)| {
             let ops = ops
                 .iter()
-                .map(StoredOp::encode)
+                .map(|op| {
+                    Ok(RawValue::from_string(String::from_utf8(
+                        StoredOp::encode(op)?,
+                    )?)?)
+                })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok((id.clone(), serde_json::to_vec(&ops)?))
+            Ok((id.clone(), ops))
         })
-        .collect()
+        .collect::<anyhow::Result<Roots>>()?;
+    Ok(Some(serde_json::to_vec(&roots)?))
+}
+
+/// Schema 7 upgrade: a pre-collection channel stored each root candidate in
+/// its own row. Translation now replaces them all in one value.
+pub(super) fn migrate_roots(db: &Connection) -> anyhow::Result<()> {
+    let mut roots = Roots::new();
+    let mut query = db.prepare("SELECT span_id,value FROM root_candidates")?;
+    for row in query.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })? {
+        let (id, value) = row?;
+        let ops: Vec<Vec<u8>> = serde_json::from_slice(&value)?;
+        let ops = ops
+            .into_iter()
+            .map(|op| Ok(RawValue::from_string(String::from_utf8(op)?)?))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        roots.insert(id, ops);
+    }
+    if !roots.is_empty() {
+        db.execute(
+            "UPDATE translation SET roots=? WHERE id=1",
+            [serde_json::to_vec(&roots)?],
+        )?;
+    }
+    Ok(())
+}
+
+/// Mark legacy input through `through` as translated and delivered by an
+/// earlier daemon, unless this session already has SpanOp history. The
+/// translator rebuilds its state from that input without publishing it.
+pub(super) fn seed_delivered(tx: &Connection, through: u64) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE translation SET through=? WHERE id=1 AND through=0 AND tail=0",
+        [through],
+    )?;
+    Ok(())
 }
 
 /// One input event's complete translation.
+#[derive(Clone)]
 pub(crate) struct Translated {
     pub input: u64,
     /// Whether the ops are native observations; retirement output is not.
@@ -211,15 +255,6 @@ pub(crate) struct Translated {
     pub roots: BTreeMap<String, Vec<SpanOp>>,
     /// The translator continuation after this input.
     pub state: Option<Vec<u8>>,
-    /// A delivery checkpoint `(route, through)` an earlier daemon journaled.
-    pub acknowledged: Option<(SessionRoute, u64)>,
-}
-
-/// The publication tail after a handoff and each op's stored position and
-/// size. An op an earlier daemon already published has no new position.
-pub(crate) struct Committed {
-    pub tail: u64,
-    pub positions: Vec<Option<(u64, usize)>>,
 }
 
 /// One stored op read back for delivery.
@@ -236,213 +271,258 @@ pub(crate) struct HeldRoute {
     pub settings: Option<SessionRoute>,
 }
 
+/// A route's head and its feed of ops committed after subscribing.
+pub(crate) struct Subscriber {
+    pub position: u64,
+    pub live: Receiver,
+    /// The position of the last committed op.
+    pub published: watch::Receiver<u64>,
+}
+
+type ReplayWindow = Vec<(u64, std::sync::Weak<SpanOp>, usize)>;
+
+/// In-memory delivery state shared by every handle on one session database.
+pub(super) struct Channel {
+    published: watch::Sender<u64>,
+    live: Multiplexer,
+    replay: tokio::sync::Mutex<ReplayWindow>,
+    #[cfg(test)]
+    payload_reads: std::sync::atomic::AtomicU64,
+}
+
 #[derive(Clone)]
 pub(crate) struct SpanOps {
     store: Store,
+    channel: Arc<Channel>,
 }
 
 impl SpanOps {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        Ok(Self {
-            store: Store::open(path).await?,
-        })
+        Self::new(Store::open(path).await?).await
     }
 
     /// The SpanOps stored in the same session database as `events`.
     pub async fn for_events(events: &EventCollection) -> anyhow::Result<Self> {
-        Ok(Self {
-            store: events.store().clone(),
-        })
+        Self::new(events.store().clone()).await
     }
 
+    async fn new(store: Store) -> anyhow::Result<Self> {
+        let channel = match store.channel().get() {
+            Some(channel) => channel.clone(),
+            None => {
+                let tail = store.run(|db| Ok(tail(db)?)).await?;
+                store
+                    .channel()
+                    .get_or_init(|| {
+                        Arc::new(Channel {
+                            published: watch::channel(tail).0,
+                            live: Multiplexer::default(),
+                            replay: Default::default(),
+                            #[cfg(test)]
+                            payload_reads: Default::default(),
+                        })
+                    })
+                    .clone()
+            }
+        };
+        Ok(Self { store, channel })
+    }
+
+    /// The last input whose translation has been handed over.
     pub async fn translated_through(&self) -> anyhow::Result<u64> {
-        self.store.run(|db| Ok(committed_through(db)?)).await
+        self.store.run(|db| Ok(translated_through(db)?)).await
     }
 
-    /// Published ops after `after`, bounded by bytes and elapsed decode time.
+    /// The position of the last committed op.
+    pub async fn tail(&self) -> anyhow::Result<u64> {
+        self.store.run(|db| Ok(tail(db)?)).await
+    }
+
+    /// Stored ops after `after`, bounded by bytes and elapsed decode time.
     pub async fn read_after(
         &self,
         after: u64,
         budget: usize,
         window: std::time::Duration,
     ) -> anyhow::Result<Vec<StoredRecord>> {
-        self.store.run(move |db| {
-            let mut statement = db.prepare_cached("SELECT position,value FROM ops JOIN batches USING(input) WHERE (committed=1 OR EXISTS(SELECT 1 FROM receipts WHERE receipts.input=ops.input)) AND position>? ORDER BY position")?;
-            let mut rows = statement.query([after])?;
-            let started = std::time::Instant::now();
-            let mut records = Vec::new();
-            let mut bytes = 0;
-            while let Some(row) = rows.next()? {
-                let value = row.get_ref(1)?.as_blob()?;
-                if !records.is_empty() && bytes + value.len() > budget { break; }
-                bytes += value.len();
-                records.push(StoredRecord { position: row.get(0)?, op: StoredOp::decode(value)?, bytes: value.len() });
-                if bytes >= budget || started.elapsed() >= window { break; }
+        self.store
+            .run(move |db| {
+                let mut statement = db.prepare_cached(
+                    "SELECT position,value FROM ops WHERE position>? ORDER BY position",
+                )?;
+                let mut rows = statement.query([after])?;
+                let started = std::time::Instant::now();
+                let mut records = Vec::new();
+                let mut bytes = 0;
+                while let Some(row) = rows.next()? {
+                    let value = row.get_ref(1)?.as_blob()?;
+                    if !records.is_empty() && bytes + value.len() > budget {
+                        break;
+                    }
+                    bytes += value.len();
+                    records.push(StoredRecord {
+                        position: row.get(0)?,
+                        op: StoredOp::decode(value)?,
+                        bytes: value.len(),
+                    });
+                    if bytes >= budget || started.elapsed() >= window {
+                        break;
+                    }
+                }
+                Ok(records)
+            })
+            .await
+    }
+
+    /// Ops after `after` for a route that fell behind the live feed. One
+    /// weakly held window is shared by all routes, so no decoded payload
+    /// stays alive solely because of this cache.
+    pub async fn recover_after(&self, after: u64) -> anyhow::Result<Vec<Record>> {
+        let mut cache = self.channel.replay.lock().await;
+        if cache
+            .first()
+            .is_some_and(|(position, _, _)| *position <= after + 1)
+            && cache
+                .last()
+                .is_some_and(|(position, _, _)| *position > after)
+        {
+            let shared = cache
+                .iter()
+                .filter(|(position, _, _)| *position > after)
+                .map(|(position, op, bytes)| {
+                    Some(Record {
+                        position: *position,
+                        op: SharedOp::from_arc(op.upgrade()?),
+                        bytes: *bytes,
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(shared) = shared {
+                return Ok(shared);
             }
-            Ok(records)
-        }).await
+        }
+        let records: Vec<Record> = self
+            .read_after(after, BYTE_BUDGET, WINDOW)
+            .await?
+            .into_iter()
+            .map(|record| Record {
+                position: record.position,
+                op: SharedOp::new(record.op),
+                bytes: record.bytes,
+            })
+            .collect();
+        #[cfg(test)]
+        self.channel
+            .payload_reads
+            .fetch_add(records.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        *cache = records
+            .iter()
+            .map(|record| (record.position, record.op.downgrade(), record.bytes))
+            .collect();
+        Ok(records)
     }
 
     /// The saved translator continuation and the input it covers.
     pub async fn checkpoint(&self) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
         self.store
             .run(|db| {
-                let saved: Option<(u32, u64, Vec<u8>)> = db
+                Ok(db
                     .query_row(
-                        "SELECT version,through,value FROM source_checkpoint WHERE id=1",
+                        "SELECT through,continuation FROM translation WHERE id=1 AND continuation IS NOT NULL",
                         [],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )
-                    .optional()?;
-                saved
-                    .map(|(version, through, value)| {
-                        anyhow::ensure!(
-                            version == 1,
-                            "unsupported translator checkpoint version {version}"
-                        );
-                        Ok((through, value))
+                    .optional()?)
+            })
+            .await
+    }
+
+    /// Root candidates still waiting for work.
+    pub async fn root_candidates(&self) -> anyhow::Result<BTreeMap<String, Vec<SpanOp>>> {
+        self.store
+            .run(|db| {
+                let bytes: Option<Vec<u8>> =
+                    db.query_row("SELECT roots FROM translation WHERE id=1", [], |r| r.get(0))?;
+                let Some(bytes) = bytes else {
+                    return Ok(BTreeMap::new());
+                };
+                serde_json::from_slice::<Roots>(&bytes)?
+                    .into_iter()
+                    .map(|(id, ops)| {
+                        let ops = ops
+                            .iter()
+                            .map(|op| StoredOp::decode(op.get().as_bytes()))
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        Ok((id, ops))
                     })
-                    .transpose()
+                    .collect()
             })
             .await
     }
 
     /// Hand one input event's complete translation to delivery in a single
     /// transaction: store its ops, metadata, root candidates and translator
-    /// continuation, and remove the consumed events through `input`. Nothing
-    /// is visible to routes before this commits, and an input that is already
-    /// committed is left unchanged.
-    pub async fn commit_translation(&self, translated: &Translated) -> anyhow::Result<Committed> {
+    /// continuation, and remove the consumed events through `input`. Routes
+    /// then receive the original op instances. An input that is already
+    /// handed over is left unchanged. Returns the published tail.
+    pub async fn commit_translation(&self, translated: Translated) -> anyhow::Result<u64> {
         let encoded = translated
             .ops
             .iter()
             .map(|op| Ok((StoredOp::encode(op)?, metadata_only(op))))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let roots = encode_roots(&translated.roots)?;
-        let acknowledged = translated
-            .acknowledged
-            .as_ref()
-            .map(|(route, through)| {
-                Ok::<_, anyhow::Error>((serde_json::to_string(route)?, *through))
-            })
-            .transpose()?;
-        let (input, observation, state) = (
-            translated.input,
-            translated.observation,
-            translated.state.clone(),
-        );
-        self.store
+        let (input, observation, state) =
+            (translated.input, translated.observation, translated.state);
+        let (tail, positions) = self
+            .store
             .write(move |tx| {
-                if input <= committed_through(tx)? {
-                    return Ok(Committed {
-                        tail: publication_tail(tx)?,
-                        positions: vec![None; encoded.len()],
-                    });
-                }
-                let earlier: u64 = tx.query_row(
-                    "SELECT count(*) FROM batches WHERE committed=0 AND input<?",
-                    [input],
-                    |row| row.get(0),
-                )?;
-                anyhow::ensure!(
-                    earlier == 0,
-                    "translation cannot publish past an unfinished input"
-                );
-                if let Some((route, through)) = acknowledged {
-                    acknowledge_legacy(tx, &route, through)?;
-                }
-                // A daemon before atomic handoff could publish a prefix of an
-                // input's ops before crashing. Those ordinals are already
-                // delivered; anything else it stored for the input is not.
-                let published: u64 = tx.query_row(
-                    "SELECT count(*) FROM receipts WHERE input=?",
-                    [input],
-                    |r| r.get(0),
-                )?;
-                if published == 0 {
-                    tx.execute("DELETE FROM ops WHERE input=?", [input])?;
+                if input <= translated_through(tx)? {
+                    return Ok((tail(tx)?, Vec::new()));
                 }
                 let mut positions = Vec::with_capacity(encoded.len());
-                for (ordinal, (value, metadata)) in encoded.into_iter().enumerate() {
-                    if (ordinal as u64) < published {
-                        positions.push(None);
-                        continue;
-                    }
+                for (value, metadata) in encoded {
                     save_metadata(tx, &metadata, observation)?;
                     let bytes = value.len();
-                    tx.execute(
-                        "INSERT INTO ops(input,value) VALUES (?,?)",
-                        params![input, value],
-                    )?;
-                    let position = tx.last_insert_rowid() as u64;
-                    tx.execute("UPDATE publication SET tail=? WHERE id=1", [position])?;
-                    positions.push(Some((position, bytes)));
+                    tx.execute("INSERT INTO ops(value) VALUES (?)", [value])?;
+                    positions.push((tx.last_insert_rowid() as u64, bytes));
                 }
+                let tail = positions.last().map(|(position, _)| *position);
                 tx.execute(
-                    "INSERT OR REPLACE INTO batches(input,committed,observation) VALUES (?,1,?)",
-                    params![input, observation],
+                    "UPDATE translation SET through=?, tail=coalesce(?,tail), roots=?,
+                     continuation=coalesce(?,continuation) WHERE id=1",
+                    params![input, tail, roots, state],
                 )?;
-                tx.execute("DELETE FROM receipts WHERE input=?", [input])?;
-                tx.execute("DELETE FROM root_candidates", [])?;
-                for (id, value) in roots {
-                    tx.execute(
-                        "INSERT INTO root_candidates(span_id,value) VALUES (?,?)",
-                        params![id, value],
-                    )?;
-                }
                 EventCollection::remove_through(tx, input)?;
-                if let Some(state) = state {
-                    tx.execute(
-                        "INSERT OR REPLACE INTO source_checkpoint VALUES(1,1,?,?)",
-                        params![input, state],
-                    )?;
-                    // The continuation replaces earlier inputs' bookkeeping.
-                    tx.execute("DELETE FROM batches WHERE input<? AND committed=1 AND NOT EXISTS(SELECT 1 FROM ops WHERE ops.input=batches.input) AND NOT EXISTS(SELECT 1 FROM receipts WHERE receipts.input=batches.input)", [input])?;
-                }
                 prune(tx)?;
                 super::store::touch(tx)?;
-                Ok(Committed {
-                    tail: publication_tail(tx)?,
-                    positions,
+                Ok((self::tail(tx)?, positions))
+            })
+            .await?;
+        // Every op is durable: advertise the tail first, so routes can drain
+        // the bounded live feed (or read storage) while it is being filled.
+        self.channel.published.send_replace(tail);
+        for ((position, bytes), op) in positions.into_iter().zip(translated.ops) {
+            self.channel
+                .live
+                .publish(Record {
+                    position,
+                    bytes,
+                    op: SharedOp::new(op),
                 })
-            })
-            .await
+                .await;
+        }
+        Ok(tail)
     }
 
-    pub async fn root_candidates(&self) -> anyhow::Result<BTreeMap<String, Vec<SpanOp>>> {
-        self.store
-            .run(|db| {
-                let mut query = db.prepare("SELECT span_id,value FROM root_candidates")?;
-                let roots = query
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })?
-                    .map(|row| {
-                        let (id, bytes) = row?;
-                        let ops: Vec<Vec<u8>> = serde_json::from_slice(&bytes)?;
-                        Ok((
-                            id,
-                            ops.iter()
-                                .map(|bytes| StoredOp::decode(bytes))
-                                .collect::<anyhow::Result<Vec<_>>>()?,
-                        ))
-                    })
-                    .collect();
-                roots
-            })
-            .await
-    }
-
-    /// Create the route's head if needed and return its position. A new head
-    /// starts after ops a legacy delivery checkpoint proved were delivered.
-    pub async fn subscribe(
-        &self,
-        route: &SessionRoute,
-        legacy_through: u64,
-    ) -> anyhow::Result<u64> {
+    /// Create the route's head if needed. A new head starts after ops that
+    /// every existing route has already removed.
+    pub async fn subscribe(&self, route: &SessionRoute) -> anyhow::Result<Subscriber> {
+        let live = self.channel.live.subscribe();
         let key = serde_json::to_string(route)?;
         let candidate = route.clone();
-        self.store
+        let position = self
+            .store
             .write(move |tx| {
                 // Auth can register a named-profile obligation before learning
                 // its stable ID. Move that unresolved placeholder to the resolved
@@ -465,25 +545,21 @@ impl SpanOps {
                         }
                     }
                 }
-                let legacy: u64 = tx.query_row(
-                    "SELECT coalesce(max(position),0) FROM ops JOIN batches USING(input)
-                     WHERE input<=? AND committed=1",
-                    [legacy_through],
-                    |r| r.get(0),
-                )?;
                 tx.execute(
-                    "INSERT OR IGNORE INTO heads(route,position) VALUES (?,max(?,(SELECT floor FROM publication WHERE id=1)))",
-                    params![key, legacy],
+                    "INSERT OR IGNORE INTO heads(route,position) VALUES (?,coalesce(
+                        (SELECT min(position)-1 FROM ops),(SELECT tail FROM translation WHERE id=1)))",
+                    [&key],
                 )?;
                 Ok(tx.query_row("SELECT position FROM heads WHERE route=?", [key], |r| {
                     r.get(0)
                 })?)
             })
-            .await
-    }
-
-    pub async fn tail(&self) -> anyhow::Result<u64> {
-        self.store.run(|db| Ok(publication_tail(db)?)).await
+            .await?;
+        Ok(Subscriber {
+            position,
+            live,
+            published: self.channel.published.subscribe(),
+        })
     }
 
     pub async fn origins_for(
@@ -557,7 +633,7 @@ impl SpanOps {
                 };
                 if !existing {
                     tx.execute(
-                        "INSERT OR IGNORE INTO heads(route,position) VALUES (?,(SELECT tail FROM publication WHERE id=1))",
+                        "INSERT OR IGNORE INTO heads(route,position) VALUES (?,(SELECT tail FROM translation WHERE id=1))",
                         [key],
                     )?;
                 }
@@ -571,19 +647,60 @@ impl SpanOps {
         let route = route.clone();
         self.store
             .run(move |db| {
-                if committed_through(db)? < input {
+                if translated_through(db)? < input {
                     return Ok(false);
                 }
-                let tail = publication_tail(db)?;
-                let mut query =
-                    db.prepare("SELECT route FROM heads WHERE failure IS NULL AND position>=?")?;
-                for stored in query.query_map([tail], |r| r.get::<_, String>(0))? {
+                let mut query = db.prepare(
+                    "SELECT route FROM heads WHERE failure IS NULL
+                     AND position>=(SELECT tail FROM translation WHERE id=1)",
+                )?;
+                for stored in query.query_map([], |r| r.get::<_, String>(0))? {
                     let stored: SessionRoute = serde_json::from_str(&stored?)?;
                     if stored.same_route(&route) {
                         return Ok(true);
                     }
                 }
                 Ok(false)
+            })
+            .await
+    }
+
+    /// Every obligation is met: all input through `input` is translated and
+    /// every route has delivered every op. An empty route set is not completion.
+    pub async fn complete(&self, input: u64) -> anyhow::Result<bool> {
+        self.store
+            .run(move |db| {
+                Ok(db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM heads)
+                     AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position<t.tail)
+                     AND t.failure IS NULL AND t.roots IS NULL AND t.through>=?
+                     AND NOT EXISTS(SELECT 1 FROM events)
+                     FROM translation t WHERE id=1",
+                    [input],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+    }
+
+    /// A translation failure recorded for recovery.
+    pub async fn source_failure(&self) -> anyhow::Result<Option<String>> {
+        self.store
+            .run(|db| {
+                Ok(
+                    db.query_row("SELECT failure FROM translation WHERE id=1", [], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .await
+    }
+
+    pub async fn set_source_failure(&self, failure: Option<String>) -> anyhow::Result<()> {
+        self.store
+            .run(move |db| {
+                db.execute("UPDATE translation SET failure=? WHERE id=1", [failure])?;
+                Ok(())
             })
             .await
     }
@@ -693,43 +810,6 @@ impl SpanOps {
             .await
     }
 
-    /// Every obligation is met: all input through `input` is translated and
-    /// every route has delivered every op. An empty route set is not completion.
-    pub async fn complete(&self, input: u64) -> anyhow::Result<bool> {
-        self.store.run(move |db| Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM heads)
-            AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position < (SELECT tail FROM publication WHERE id=1))
-            AND NOT EXISTS(SELECT 1 FROM recovery WHERE failure IS NOT NULL)
-            AND NOT EXISTS(SELECT 1 FROM batches WHERE committed=0)
-            AND NOT EXISTS(SELECT 1 FROM root_candidates)
-            AND NOT EXISTS(SELECT 1 FROM events)
-            AND (SELECT coalesce(max(input),0) FROM batches WHERE committed=1)>=?",[input],|r|r.get(0))?)).await
-    }
-
-    pub async fn source_failure(&self) -> anyhow::Result<Option<String>> {
-        self.store
-            .run(|db| {
-                Ok(db
-                    .query_row("SELECT failure FROM recovery WHERE id=1", [], |row| {
-                        row.get(0)
-                    })
-                    .optional()?
-                    .flatten())
-            })
-            .await
-    }
-
-    pub async fn set_source_failure(&self, failure: Option<String>) -> anyhow::Result<()> {
-        self.store
-            .run(move |db| {
-                db.execute(
-                    "INSERT OR REPLACE INTO recovery(id,failure) VALUES(1,?)",
-                    [failure],
-                )?;
-                Ok(())
-            })
-            .await
-    }
-
     pub async fn failure(&self, route: &str) -> anyhow::Result<Option<String>> {
         let route = route.to_owned();
         self.store
@@ -801,39 +881,6 @@ impl SpanOps {
     }
 }
 
-/// Apply a pre-collection delivery checkpoint to the route's head. An earlier
-/// daemon delivered those spans without recording provenance, so their
-/// rebuilt origins are discarded rather than attributed to it.
-fn acknowledge_legacy(
-    tx: &rusqlite::Transaction<'_>,
-    route: &str,
-    through: u64,
-) -> anyhow::Result<()> {
-    let position: u64 = tx.query_row(
-        "SELECT coalesce(max(position),0) FROM ops WHERE input<=?",
-        [through],
-        |r| r.get(0),
-    )?;
-    let spans = {
-        let mut query = tx.prepare("SELECT value FROM ops WHERE input<=?")?;
-        let rows = query.query_map([through], |r| r.get::<_, Vec<u8>>(0))?;
-        let mut spans = Vec::new();
-        for row in rows {
-            let (SpanOp::Insert(op) | SpanOp::Merge(op)) = StoredOp::decode(&row?)?;
-            spans.push(op.span_id);
-        }
-        spans
-    };
-    for span in spans {
-        tx.execute("DELETE FROM origins WHERE span_id=?", [span])?;
-    }
-    tx.execute(
-        "INSERT INTO heads(route,position) VALUES(?,?) ON CONFLICT(route) DO UPDATE SET position=max(position,excluded.position)",
-        params![route, position],
-    )?;
-    prune(tx)
-}
-
 #[cfg(test)]
 impl SpanOps {
     pub async fn stored_ops(&self) -> u64 {
@@ -841,6 +888,22 @@ impl SpanOps {
             .run(|db| Ok(db.query_row("SELECT count(*) FROM ops", [], |r| r.get(0))?))
             .await
             .unwrap_or(u64::MAX)
+    }
+
+    /// Stored ops decoded for assertions.
+    pub async fn stored(&self) -> Vec<SpanOp> {
+        self.read_after(0, usize::MAX, std::time::Duration::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.op)
+            .collect()
+    }
+
+    pub fn payload_reads(&self) -> u64 {
+        self.channel
+            .payload_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hold the storage lock, blocking every operation until released.
@@ -870,52 +933,26 @@ impl SpanOps {
             .await
     }
 
-    /// Store ops for an input that never committed, as a daemon before
-    /// atomic handoff left them after a crash mid-translation. With
-    /// `published`, they are a delivered prefix recorded by ordinal.
-    pub async fn legacy_uncommitted(
-        &self,
-        input: u64,
-        ops: &[SpanOp],
-        published: bool,
-    ) -> anyhow::Result<()> {
-        let encoded = ops
-            .iter()
-            .map(StoredOp::encode)
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        self.store
-            .write(move |tx| {
-                tx.execute(
-                    "INSERT OR REPLACE INTO batches(input,committed,observation) VALUES (?,0,1)",
-                    [input],
-                )?;
-                for (ordinal, value) in encoded.into_iter().enumerate() {
-                    save_metadata(tx, &StoredOp::decode(&value)?, true)?;
-                    tx.execute(
-                        "INSERT INTO ops(input,value) VALUES (?,?)",
-                        params![input, value],
-                    )?;
-                    if published {
-                        let position = tx.last_insert_rowid() as u64;
-                        tx.execute("UPDATE publication SET tail=? WHERE id=1", [position])?;
-                        tx.execute(
-                            "INSERT INTO receipts(input,ordinal) VALUES (?,?)",
-                            params![input, ordinal as u64],
-                        )?;
-                    }
-                }
-                Ok(())
-            })
+    /// Commit native output for `input` with no continuation.
+    pub async fn translated(&self, input: u64, ops: Vec<SpanOp>) -> anyhow::Result<u64> {
+        self.translated_with_roots(input, ops, &BTreeMap::new())
             .await
     }
 
-    /// Observation ops visible to delivery, for assertions.
-    pub async fn published(&self, after: u64, limit: usize) -> anyhow::Result<Vec<(u64, SpanOp)>> {
-        self.store.run(move |db| {
-            let mut statement = db.prepare("SELECT position,value FROM ops JOIN batches USING(input) WHERE (committed=1 OR EXISTS(SELECT 1 FROM receipts WHERE receipts.input=ops.input)) AND observation=1 AND position>? ORDER BY position LIMIT ?")?;
-            let rows = statement.query_map(params![after,limit as u64], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,Vec<u8>>(1)?)))?;
-            rows.map(|row| { let (position,bytes)=row?; Ok((position,StoredOp::decode(&bytes)?)) }).collect()
-        }).await
+    pub async fn translated_with_roots(
+        &self,
+        input: u64,
+        ops: Vec<SpanOp>,
+        roots: &BTreeMap<String, Vec<SpanOp>>,
+    ) -> anyhow::Result<u64> {
+        self.commit_translation(Translated {
+            input,
+            observation: true,
+            ops,
+            roots: roots.clone(),
+            state: None,
+        })
+        .await
     }
 }
 
@@ -923,7 +960,7 @@ impl SpanOps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::journal::SpanJournal;
+    use crate::pipeline::journal::Cursor;
 
     fn op(name: &str) -> SpanOp {
         SpanOp::Insert(SpanRow {
@@ -951,22 +988,106 @@ mod tests {
         }
     }
 
+    /// The SpanOp channel schema written by the last pre-collection release.
+    const SCHEMA_FIVE: &str = "CREATE TABLE batches(input INTEGER PRIMARY KEY,
+            committed INTEGER NOT NULL DEFAULT 0, observation INTEGER NOT NULL DEFAULT 1);
+        CREATE TABLE ops(position INTEGER PRIMARY KEY AUTOINCREMENT,
+            input INTEGER NOT NULL, value BLOB NOT NULL);
+        CREATE INDEX ops_input ON ops(input);
+        CREATE TABLE heads(route TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
+            failure TEXT, binding TEXT, settings TEXT, settings_through INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE recovery(id INTEGER PRIMARY KEY CHECK(id=1), failure TEXT);
+        CREATE TABLE root_candidates(span_id TEXT PRIMARY KEY, value BLOB NOT NULL);
+        PRAGMA user_version=5;";
+
+    const SCHEMA_SIX: &str = "CREATE TABLE receipts(input INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL, PRIMARY KEY(input,ordinal));
+        CREATE TABLE publication(id INTEGER PRIMARY KEY CHECK(id=1),
+            tail INTEGER NOT NULL, floor INTEGER NOT NULL);
+        CREATE TABLE origins(span_id TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE span_state(span_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+            value BLOB NOT NULL, end_ms INTEGER);
+        PRAGMA user_version=6;";
+
     #[tokio::test]
     async fn schema_five_upgrade_reclaims_acknowledged_payloads_without_losing_provenance() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("upgrade.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
-        journal.register(&route("old")).await.unwrap();
-        journal.translated(10, vec![op("old")]).await.unwrap();
-        drop(journal);
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("UPDATE heads SET position=1; DROP TABLE receipts; DROP TABLE publication; DROP TABLE origins; DROP TABLE span_state; DROP TABLE events; DROP TABLE captured; DROP TABLE event_state; DROP TABLE source_checkpoint; PRAGMA user_version=5").unwrap();
+        db.execute_batch(SCHEMA_FIVE).unwrap();
+        db.execute(
+            "INSERT INTO heads(route,position) VALUES(?,1)",
+            [serde_json::to_string(&route("old")).unwrap()],
+        )
+        .unwrap();
+        db.execute_batch("INSERT INTO batches(input,committed) VALUES(10,1)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO ops(input,value) VALUES(10,?)",
+            [StoredOp::encode(&op("old")).unwrap()],
+        )
+        .unwrap();
         drop(db);
-        let upgraded = SpanJournal::open(&path).await.unwrap();
+        let upgraded = SpanOps::open(&path).await.unwrap();
         assert_eq!(upgraded.tail().await.unwrap(), 1);
         assert_eq!(upgraded.origins().await.unwrap()["old"].bt_version, "test");
         assert_eq!(upgraded.stored_ops().await, 0);
         assert!(upgraded.complete(10).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn schema_six_upgrade_keeps_only_published_ops_and_translation_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("upgrade.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(SCHEMA_FIVE).unwrap();
+        db.execute_batch(SCHEMA_SIX).unwrap();
+        db.execute(
+            "INSERT INTO heads(route,position) VALUES(?,0)",
+            [serde_json::to_string(&route("a")).unwrap()],
+        )
+        .unwrap();
+        // Input 10 committed; input 20 published one op, then the daemon
+        // stopped before storing or publishing the rest.
+        db.execute_batch(
+            "INSERT INTO batches(input,committed) VALUES(10,1),(20,0);
+             INSERT INTO receipts VALUES(20,0);
+             INSERT INTO publication VALUES(1,2,0);
+             INSERT INTO recovery VALUES(1,'held');",
+        )
+        .unwrap();
+        for (input, name) in [(10, "committed"), (20, "published"), (20, "unpublished")] {
+            db.execute(
+                "INSERT INTO ops(input,value) VALUES(?,?)",
+                params![input, StoredOp::encode(&op(name)).unwrap()],
+            )
+            .unwrap();
+        }
+        let root = serde_json::to_vec(&[StoredOp::encode(&op("root")).unwrap()]).unwrap();
+        db.execute("INSERT INTO root_candidates VALUES('root',?)", [root])
+            .unwrap();
+        drop(db);
+        let upgraded = SpanOps::open(&path).await.unwrap();
+        assert_eq!(upgraded.translated_through().await.unwrap(), 10);
+        assert_eq!(upgraded.tail().await.unwrap(), 2);
+        let names: Vec<_> = upgraded
+            .stored()
+            .await
+            .into_iter()
+            .map(|op| {
+                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+                row.span_id
+            })
+            .collect();
+        assert_eq!(names, ["committed", "published"]);
+        assert_eq!(
+            upgraded.source_failure().await.unwrap().as_deref(),
+            Some("held")
+        );
+        let roots = upgraded.root_candidates().await.unwrap();
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &roots["root"][0];
+        assert_eq!(row.late_merge_key.as_deref(), Some("late"));
+        assert!(upgraded.checkpoint().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -983,7 +1104,7 @@ mod tests {
             let ready = ready.clone();
             tasks.push(tokio::spawn(async move {
                 ready.wait().await;
-                SpanJournal::open(&path).await
+                SpanOps::open(&path).await
             }));
         }
         let mut opened = Vec::new();
@@ -999,13 +1120,13 @@ mod tests {
     async fn translation_begin_waits_for_a_concurrent_writer_before_reading() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("concurrent.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
         let mut peer = Connection::open(&path).unwrap();
         let transaction = peer
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
         transaction
-            .execute("INSERT INTO batches(input,committed) VALUES(10,1)", [])
+            .execute("UPDATE translation SET through=10", [])
             .unwrap();
         let begin = tokio::spawn(async move {
             journal.translated(10, vec![op("late")]).await.unwrap();
@@ -1032,7 +1153,7 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0); INSERT INTO batches VALUES(10,1); PRAGMA user_version=1;").unwrap();
         drop(db);
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
         assert_eq!(journal.translated_through().await.unwrap(), 10);
         journal
             .commit_translation(Translated {
@@ -1041,15 +1162,14 @@ mod tests {
                 ops: vec![op("retirement")],
                 roots: BTreeMap::new(),
                 state: None,
-                acknowledged: None,
             })
             .await
             .unwrap();
         assert!(
-            journal.published(0, 8).await.unwrap().is_empty(),
+            journal.observations().await.unwrap().is_empty(),
             "retirement output is not a native correlation observation"
         );
-        let mut route = journal.subscribe(&route("a"), 0).await.unwrap();
+        let mut route = Cursor::open(&journal, &route("a")).await.unwrap();
         assert_eq!(
             route.next_batch(8).await.unwrap().unwrap().value().len(),
             1,
@@ -1068,7 +1188,7 @@ mod tests {
         db.execute("INSERT INTO heads(route,position) VALUES(?,7)", [&key])
             .unwrap();
         drop(db);
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SpanOps::open(&path).await.unwrap();
         let mut config = route.with_auth(crate::wire::BackendAuth {
             token: "secret-a".into(),
             api_url: Some("https://one.test".into()),
@@ -1086,7 +1206,7 @@ mod tests {
             .unwrap_err()
             .downcast_ref::<BindingChanged>()
             .is_some());
-        let restored = journal.subscribe(&route, 0).await.unwrap();
+        let restored = Cursor::open(&journal, &route).await.unwrap();
         assert_eq!(restored.completed_position(), 7);
         let binding: String = Connection::open(&path)
             .unwrap()

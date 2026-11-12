@@ -379,6 +379,7 @@ pub(super) async fn probe_alive(endpoint: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::journal::Cursor;
     use crate::{
         translate::{SpanOp, SpanRow},
         wire::Envelope,
@@ -561,35 +562,23 @@ mod tests {
                 .events_for(&env.source, &env.session_id)
                 .await
                 .unwrap();
-            let partition = crate::pipeline::journal::SpanJournal::for_events(&events)
+            let partition = crate::collections::SpanOps::for_events(&events)
                 .await
                 .unwrap();
             assert_eq!(
                 partition.translated_through().await.unwrap(),
                 events.tail().await.unwrap()
             );
-            let count = crate::collections::inspect::Inspector::session(
-                tmp.path(),
-                &env.source,
-                &env.session_id,
-            )
-            .unwrap()
-            .count(crate::collections::inspect::Table::Batches) as usize;
             let expected: Vec<_> = (slot..total).step_by(envs.len()).collect();
-            assert!(
-                count <= expected.len(),
-                "completed batches can be reclaimed"
-            );
             let (_, state) = partition.checkpoint().await.unwrap().unwrap();
             let state: Value = serde_json::from_slice(&state).unwrap();
             if env.source == "debug" {
                 assert_eq!(state["native"]["event_seq"], expected.len() as u64);
                 let actual: Vec<_> = partition
-                    .published(0, total)
+                    .stored()
                     .await
-                    .unwrap()
                     .into_iter()
-                    .filter_map(|(_, op)| {
+                    .filter_map(|op| {
                         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
                         row.input?.get("index")?.as_u64()
                     })
@@ -714,7 +703,6 @@ mod tests {
             "held",
             "source_held",
             "untranslated",
-            "invisible",
             "active",
             "within_retention",
             "complete",
@@ -726,7 +714,7 @@ mod tests {
                     .await
                     .unwrap();
             let through = events.append(&env).await.unwrap().through;
-            let partition = crate::pipeline::journal::SpanJournal::for_events(&events)
+            let partition = crate::collections::SpanOps::for_events(&events)
                 .await
                 .unwrap();
             partition
@@ -739,7 +727,6 @@ mod tests {
                     })],
                     roots: Default::default(),
                     state: Some(b"null".to_vec()),
-                    acknowledged: None,
                 })
                 .await
                 .unwrap();
@@ -747,14 +734,13 @@ mod tests {
                 events.append(&env).await.unwrap();
             }
             if scenario != "no_heads" {
-                let mut head = partition
-                    .subscribe(env.route.as_ref().unwrap(), 0)
+                let mut head = Cursor::open(&partition, env.route.as_ref().unwrap())
                     .await
                     .unwrap();
                 if scenario == "second_unresolved" {
                     let mut second = env.route.clone().unwrap();
                     second.tags.insert("second".into());
-                    partition.subscribe(&second, 0).await.unwrap();
+                    Cursor::open(&partition, &second).await.unwrap();
                 }
                 if scenario != "unresolved" {
                     head.next_batch(8)
@@ -776,13 +762,6 @@ mod tests {
             if scenario == "source_held" {
                 partition
                     .set_source_failure(Some("held".into()))
-                    .await
-                    .unwrap();
-            }
-            if scenario == "invisible" {
-                // An input an earlier daemon began but never committed.
-                partition
-                    .legacy_uncommitted(through + 1, &[], false)
                     .await
                     .unwrap();
             }

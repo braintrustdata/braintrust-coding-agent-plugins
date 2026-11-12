@@ -1506,7 +1506,7 @@ mod tests {
             if corrupt {
                 db.corrupt_checkpoint().unwrap();
             } else {
-                db.inject(crate::collections::inspect::Fault::BeginTranslation)
+                db.inject(crate::collections::inspect::Fault::Handoff)
                     .unwrap();
             }
             daemon

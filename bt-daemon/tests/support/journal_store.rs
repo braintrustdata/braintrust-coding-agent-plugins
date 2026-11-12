@@ -48,13 +48,13 @@ pub fn accepted(data: &Path, source: &str, session: &str) -> u64 {
 pub fn block_translation(data: &Path, source: &str, session: &str) {
     Inspector::session(data, source, session)
         .unwrap()
-        .inject(Fault::BeginTranslation)
+        .inject(Fault::Handoff)
         .unwrap();
 }
 pub fn unblock_translation(data: &Path, source: &str, session: &str) {
     Inspector::session(data, source, session)
         .unwrap()
-        .clear(Fault::BeginTranslation)
+        .clear(Fault::Handoff)
         .unwrap();
 }
 

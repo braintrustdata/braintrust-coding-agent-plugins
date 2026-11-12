@@ -2,7 +2,7 @@
 use super::input::{
     ControlKind, PipelineControl, SourceEvent, SourceInput, SourcePosition, SourceRecord,
 };
-use super::journal::SpanJournal;
+use super::journal::Cursor;
 use super::prepare::Prepare;
 use super::roots::Roots;
 use super::{
@@ -10,7 +10,7 @@ use super::{
     Stage,
 };
 use crate::{
-    collections::{EventCollection, EventReader, EventRecord, Translated},
+    collections::{EventCollection, EventReader, EventRecord, SpanOps, Translated},
     translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, WeakOrigins},
     wire::{SessionConfig, SessionRoute},
 };
@@ -61,7 +61,7 @@ struct RouteLifetimes {
 pub(crate) struct Translation {
     tx: mpsc::Sender<Command>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    journal: SpanJournal,
+    ops: SpanOps,
     pub error: Arc<Mutex<Option<String>>>,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     routes: Mutex<RouteLifetimes>,
@@ -85,7 +85,7 @@ pub(crate) struct TranslationOptions {
 impl Translation {
     pub async fn spawn(options: TranslationOptions) -> anyhow::Result<Arc<Self>> {
         let actor = Producer::open(options).await?;
-        let journal = actor.journal.clone();
+        let ops = actor.ops.clone();
         let progress = actor.progress.clone();
         let error = actor.error.clone();
         let recovery = actor.recovery.clone();
@@ -94,7 +94,7 @@ impl Translation {
         Ok(Arc::new(Self {
             tx,
             task: tokio::sync::Mutex::new(Some(task)),
-            journal,
+            ops,
             error,
             recovery,
             routes: Mutex::new(RouteLifetimes::default()),
@@ -169,21 +169,17 @@ impl Translation {
         route: &SessionRoute,
         through: u64,
     ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
-        self.journal.reconfigure_held(route, through).await
+        super::journal::reconfigure_held(&self.ops, route, through).await
     }
 
     pub async fn route_settings(&self, route: &SessionRoute) -> anyhow::Result<SessionRoute> {
-        self.journal.route_settings(route).await
+        self.ops.route_settings(route).await
     }
 
     /// Connect a route to the committed SpanOp stream without exposing its
     /// storage adapter to the route actor.
-    pub async fn subscribe(
-        &self,
-        route: &SessionRoute,
-        legacy_through: u64,
-    ) -> anyhow::Result<super::journal::Cursor> {
-        self.journal.subscribe(route, legacy_through).await
+    pub async fn subscribe(&self, route: &SessionRoute) -> anyhow::Result<Cursor> {
+        Cursor::open(&self.ops, route).await
     }
 }
 
@@ -218,7 +214,7 @@ struct Publication {
 struct Producer {
     options: TranslationOptions,
     progress: Arc<Progress>,
-    journal: SpanJournal,
+    ops: SpanOps,
     error: Arc<Mutex<Option<String>>>,
     recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     translator: Option<Box<dyn AgentTranslator>>,
@@ -239,15 +235,15 @@ struct Producer {
 
 impl Producer {
     async fn open(options: TranslationOptions) -> anyhow::Result<Self> {
-        let journal = SpanJournal::for_events(&options.events).await?;
-        let committed = journal.translated_through().await?;
+        let ops = SpanOps::for_events(&options.events).await?;
+        let committed = ops.translated_through().await?;
         let progress = Arc::new(Progress {
             requested: AtomicU64::new(committed),
             committed: AtomicU64::new(committed),
         });
         let recovery = Arc::new(Mutex::new(None));
         let error = Arc::new(Mutex::new(None));
-        let state = match journal.source_failure().await? {
+        let state = match ops.source_failure().await? {
             Some(raw) => State::Recovering(serde_json::from_str(&raw).unwrap_or_else(|_| {
                 Failure::revision(Boundary::Journal, committed + 1, raw, &options.version)
             })),
@@ -256,7 +252,7 @@ impl Producer {
         Ok(Self {
             options,
             progress,
-            journal,
+            ops,
             error,
             recovery,
             translator: None,
@@ -326,7 +322,7 @@ impl Producer {
                 };
                 if recorded.as_ref() != Some(&encoded) && super::recovery::now_ms() >= record_retry
                 {
-                    match self.journal.set_source_failure(Some(encoded.clone())).await {
+                    match self.ops.set_source_failure(Some(encoded.clone())).await {
                         Ok(()) => recorded = Some(encoded.clone()),
                         Err(error) => {
                             record_retry = super::recovery::now_ms().saturating_add(1_000);
@@ -400,7 +396,7 @@ impl Producer {
                     self.state = State::Recovering(failure);
                     continue;
                 }
-                if let Err(error) = self.journal.set_source_failure(None).await {
+                if let Err(error) = self.ops.set_source_failure(None).await {
                     self.phase = Boundary::Journal;
                     self.state = State::Recovering(self.failure(error, attempts));
                     continue;
@@ -466,7 +462,7 @@ impl Producer {
         if let State::Recovering(failure) = &self.state {
             return Err(failure.message());
         }
-        self.journal.tail().await.map_err(|error| error.to_string())
+        self.ops.tail().await.map_err(|error| error.to_string())
     }
 
     async fn control(&mut self, kind: ControlKind) -> anyhow::Result<u64> {
@@ -480,7 +476,7 @@ impl Producer {
         if let Some(through) = self.append_control(kind).await? {
             self.advance(through).await?;
         }
-        self.journal.tail().await
+        self.ops.tail().await
     }
     async fn append_control(&mut self, kind: ControlKind) -> anyhow::Result<Option<u64>> {
         self.phase = Boundary::Journal;
@@ -525,9 +521,9 @@ impl Producer {
         if self.translator.is_some() {
             return Ok(());
         }
-        let checkpoint = self.journal.checkpoint().await?;
-        self.committed = self.journal.translated_through().await?;
-        self.roots = Roots::restore(self.journal.root_candidates().await?);
+        let checkpoint = self.ops.checkpoint().await?;
+        self.committed = self.ops.translated_through().await?;
+        self.roots = Roots::restore(self.ops.root_candidates().await?);
         for ops in self.roots.pending().values() {
             for op in ops {
                 let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
@@ -588,12 +584,6 @@ impl Producer {
                 SourceEvent::Event(Box::new(crate::journal::envelope_from_redacted(event)))
             }
             EventRecord::Control(control) => SourceEvent::Control(control),
-            EventRecord::LegacyDeliveryCheckpoint { route, through } => {
-                SourceEvent::LegacyDeliveryCheckpoint {
-                    route: Box::new(route),
-                    through,
-                }
-            }
         };
         Ok(Some(SourceRecord {
             event,
@@ -627,7 +617,7 @@ impl Producer {
                 SourceEvent::Event(mut env) => {
                     self.last_control = None;
                     if let Some(route) = &env.route {
-                        self.journal.register(route).await?;
+                        self.ops.register(route).await?;
                     }
                     if crate::translate::canonical_source_name(&env.source) != self.options.source {
                         self.position = input;
@@ -690,25 +680,6 @@ impl Producer {
                         .await?
                     };
                     (ops, self.capture.clone())
-                }
-                SourceEvent::LegacyDeliveryCheckpoint { route, through } => {
-                    if input > self.committed {
-                        let state = self.continuation().await?;
-                        self.journal
-                            .commit_translation(Translated {
-                                input,
-                                observation,
-                                ops: Vec::new(),
-                                roots: self.roots.pending().clone(),
-                                state: Some(state),
-                                acknowledged: Some((*route, through)),
-                            })
-                            .await?;
-                        self.committed = input;
-                        self.progress.committed.store(input, Ordering::Relaxed);
-                    }
-                    self.position = input;
-                    continue;
                 }
             };
             self.publication = Some(Publication {
@@ -795,14 +766,13 @@ impl Producer {
                     None => self.continuation().await?,
                 };
                 pending.continuation = Some(state.clone());
-                self.journal
+                self.ops
                     .commit_translation(Translated {
                         input: pending.input,
                         observation: pending.observation,
                         ops: pending.built.clone(),
                         roots: self.roots.pending().clone(),
                         state: Some(state),
-                        acknowledged: None,
                     })
                     .await?;
                 self.committed = pending.input;
@@ -832,7 +802,7 @@ impl Producer {
                     .then(|| row.span_id.clone())
             })
             .collect();
-        let mut saved = self.journal.origins_for(missing).await?;
+        let mut saved = self.ops.origins_for(missing).await?;
         for op in ops.iter_mut() {
             let insert = matches!(op, SpanOp::Insert(_));
             let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
@@ -841,7 +811,9 @@ impl Producer {
                 .get(&row.span_id)
                 .or_else(|| saved.remove(&row.span_id))
                 .or_else(|| {
-                    insert.then(|| {
+                    // Output rebuilt from input an earlier daemon already
+                    // delivered keeps only the provenance it recorded.
+                    (insert && pending.input > self.committed).then(|| {
                         Arc::new(pending.capture.clone().unwrap_or_else(|| OriginSnapshot {
                             plugin_version: None,
                             source_version: None,
@@ -867,7 +839,7 @@ impl Producer {
         // Candidates have no delivery position yet, but their birth records
         // identify the session for correlation. Defensive retirement updates
         // are not native observations and must not close a recreated observer.
-        for ops in self.journal.root_candidates().await?.into_values() {
+        for ops in self.ops.root_candidates().await?.into_values() {
             let births = ops
                 .into_iter()
                 .filter(|op| matches!(op, SpanOp::Insert(_)))
@@ -880,7 +852,7 @@ impl Producer {
             )
             .await?;
         }
-        let ops = self.journal.observations().await?;
+        let ops = self.ops.observations().await?;
         Self::observe(&self.options, &mut self.pending_snapshots, &ops, observer).await?;
         Ok(())
     }
@@ -973,10 +945,7 @@ pub(crate) mod tests {
         pub(crate) async fn process(&self, through: u64) {
             self.source.advance(through).await.unwrap();
             self.source.barrier().await.unwrap();
-            assert_eq!(
-                self.source.journal.translated_through().await.unwrap(),
-                through
-            );
+            assert_eq!(self.source.ops.translated_through().await.unwrap(), through);
         }
         async fn reopen(&mut self) {
             self.source.shutdown().await;
@@ -1023,7 +992,7 @@ pub(crate) mod tests {
                         f.process(positions[1]).await;
                         f.source.control(ControlKind::Checkpoint).await.unwrap();
                         assert_eq!(
-                            f.source.journal.translated_through().await.unwrap(),
+                            f.source.ops.translated_through().await.unwrap(),
                             positions[1]
                         );
                         assert_eq!(f.options.events.tail().await.unwrap(), tail);
@@ -1047,7 +1016,7 @@ pub(crate) mod tests {
                 }
                 f.process(tail).await;
                 f.source.control(ControlKind::Finalize).await.unwrap();
-                assert!(f.source.journal.translated_through().await.unwrap() > tail);
+                assert!(f.source.ops.translated_through().await.unwrap() > tail);
                 // StoredOp already includes the private correlation fields;
                 // compare its complete encoding rather than duplicate its codec.
                 let rows: Vec<Vec<u8>> = f.db().op_records();
@@ -1069,7 +1038,7 @@ pub(crate) mod tests {
     async fn a_failed_checkpoint_publishes_nothing_and_retries_the_whole_handoff() {
         let mut f = SourceFixture::new("debug").await;
         let db = f.db();
-        db.inject(Fault::SaveCheckpoint).unwrap();
+        db.inject(Fault::Handoff).unwrap();
         let event: crate::wire::Envelope = serde_json::from_value(serde_json::json!({
             "source":"debug", "session_id":"checkpoint", "event":"tool", "ts_ms":1,
             "payload":{"value":1}, "route":{}
@@ -1083,14 +1052,13 @@ pub(crate) mod tests {
         assert_eq!(db.count(Table::Ops), 0);
         let mut route = f
             .source
-            .journal
-            .subscribe(event.route.as_ref().unwrap(), 0)
+            .subscribe(event.route.as_ref().unwrap())
             .await
             .unwrap();
         assert!(route.next_batch(8).await.unwrap().is_none());
         drop(route);
         f.source.shutdown().await;
-        db.clear(Fault::SaveCheckpoint).unwrap();
+        db.clear(Fault::Handoff).unwrap();
         f.reopen().await;
         f.source.advance(through).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1100,13 +1068,12 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(f.source.journal.tail().await.unwrap(), 2);
-        assert_eq!(f.source.journal.published(0, 8).await.unwrap().len(), 2);
-        let (_, bytes) = f.source.journal.checkpoint().await.unwrap().unwrap();
+        assert_eq!(f.source.ops.tail().await.unwrap(), 2);
+        assert_eq!(f.source.ops.stored().await.len(), 2);
+        let (_, bytes) = f.source.ops.checkpoint().await.unwrap().unwrap();
         let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(state["native"]["event_seq"], 1);
         assert_eq!(db.count(Table::Events), 0);
-        assert_eq!(db.count(Table::Receipts), 0);
         f.source.shutdown().await;
     }
 
@@ -1122,12 +1089,12 @@ pub(crate) mod tests {
         f.process(through).await;
         f.source.control(ControlKind::Retire).await.unwrap();
         let through = f.options.events.tail().await.unwrap();
-        let tail = f.source.journal.tail().await.unwrap();
+        let tail = f.source.ops.tail().await.unwrap();
         for _ in 0..3 {
             f.reopen().await;
             f.source.control(ControlKind::Retire).await.unwrap();
             assert_eq!(f.options.events.tail().await.unwrap(), through);
-            assert_eq!(f.source.journal.tail().await.unwrap(), tail);
+            assert_eq!(f.source.ops.tail().await.unwrap(), tail);
             assert_eq!(f.db().count(Table::Events), 0);
         }
         f.source.shutdown().await;
@@ -1192,10 +1159,7 @@ pub(crate) mod tests {
         release.send(()).unwrap();
         let (producer, result) = work.await.unwrap();
         result.unwrap();
-        assert_eq!(
-            producer.journal.translated_through().await.unwrap(),
-            through
-        );
+        assert_eq!(producer.ops.translated_through().await.unwrap(), through);
         f.source.shutdown().await;
     }
 
@@ -1234,14 +1198,13 @@ pub(crate) mod tests {
             ])
             .await;
         translation
-            .journal
+            .ops
             .commit_translation(Translated {
                 input: 10,
                 observation: false,
                 ops: Vec::new(),
                 roots: roots.pending().clone(),
                 state: None,
-                acknowledged: None,
             })
             .await
             .unwrap();
@@ -1296,7 +1259,7 @@ pub(crate) mod tests {
             .unwrap()
             .corrupt_events(0, input)
             .unwrap();
-        let journal = SpanJournal::for_events(&events).await.unwrap();
+        let journal = SpanOps::for_events(&events).await.unwrap();
         let tail = journal
             .translated(
                 input,
@@ -1328,8 +1291,7 @@ pub(crate) mod tests {
         assert_eq!(translation.progress.pending(), 0);
         assert!(translation.error.lock().is_none());
         let mut route = translation
-            .journal
-            .subscribe(&SessionRoute::default(), 0)
+            .subscribe(&SessionRoute::default())
             .await
             .unwrap();
         let delivery = InputPort::receive(&mut route).await.unwrap().unwrap();
@@ -1361,7 +1323,7 @@ pub(crate) mod tests {
         let f = SourceFixture::new("debug").await;
         f.source.shutdown().await;
         let mut producer = Producer::open(f.options.clone()).await.unwrap();
-        let journal = producer.journal.clone();
+        let journal = producer.ops.clone();
         let db = f.db();
         let drains = Arc::new(AtomicU64::new(0));
         producer.translator = Some(Box::new(CountedTranslation(drains.clone())));
@@ -1391,10 +1353,10 @@ pub(crate) mod tests {
         assert_eq!(journal.translated_through().await.unwrap(), 0);
         assert_eq!(journal.tail().await.unwrap(), 0);
         db.clear(Fault::InsertOps).unwrap();
-        db.inject(Fault::BeginTranslation).unwrap();
+        db.inject(Fault::Handoff).unwrap();
         assert!(producer.publish().await.is_err());
         assert_eq!(journal.tail().await.unwrap(), 0);
-        db.clear(Fault::BeginTranslation).unwrap();
+        db.clear(Fault::Handoff).unwrap();
         producer.publish().await.unwrap();
         assert_eq!(drains.load(Ordering::Relaxed), 1);
         assert_eq!(journal.translated_through().await.unwrap(), 10);
