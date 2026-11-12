@@ -1,7 +1,6 @@
 {
   "name": "braintrust",
   "displayName": "Braintrust",
-  "version": "0.1.0",
   "description": "Investigate production traces, compare experiments, and run evals to improve your AI application",
   "shortDescription": "AI traces, experiments, and evals",
   "setup": {

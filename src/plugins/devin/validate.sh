@@ -11,13 +11,11 @@ done
 python3 - "$TARGET_DIR" <<'PYTHON' || fail "invalid Devin package"
 import json
 from pathlib import Path
-import re
 import sys
 
 root = Path(sys.argv[1])
 manifest = json.loads((root / ".devin-plugin/plugin.json").read_text())
 assert manifest["name"] == "braintrust"
-assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", manifest["version"])
 assert 0 < len(manifest["shortDescription"]) <= 40
 assert manifest["description"].strip()
 assert manifest["logo"] == "icon.png"
