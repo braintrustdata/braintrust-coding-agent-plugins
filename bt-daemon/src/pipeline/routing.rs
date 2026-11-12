@@ -100,6 +100,7 @@ impl RoutingSink {
                                 }
                             }
                         }
+                        super::prepare::unique_tags(&mut prepared);
                         let submit_input = SubmissionInput {
                             config: request.config.clone(),
                             operation: Operation::Emit(prepared),

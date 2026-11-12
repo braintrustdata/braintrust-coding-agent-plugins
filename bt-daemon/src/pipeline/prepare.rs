@@ -5,6 +5,25 @@ use crate::{
 };
 use std::collections::HashSet;
 
+/// Deliver each span's tags once, however many sources contributed them.
+/// Only a row that changes is copied; others keep sharing their payload.
+pub(crate) fn unique_tags(ops: &mut [super::live::SharedOp]) {
+    fn duplicated(tags: &[String]) -> bool {
+        let mut seen = HashSet::with_capacity(tags.len());
+        !tags.iter().all(|tag| seen.insert(tag))
+    }
+    for op in ops {
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.as_ref();
+        if row.tags.as_deref().is_some_and(duplicated) {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op.make_mut();
+            if let Some(tags) = &mut row.tags {
+                let mut seen = HashSet::with_capacity(tags.len());
+                tags.retain(|tag| seen.insert(tag.clone()));
+            }
+        }
+    }
+}
+
 pub(crate) struct Prepare {
     source: String,
     roots: HashSet<String>,
@@ -164,6 +183,25 @@ impl crate::translate::AgentTranslator for ConfiguredTranslator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_tags_copies_only_rows_with_duplicates() {
+        let original =
+            super::super::live::SharedOp::new(SpanOp::Insert(crate::translate::SpanRow {
+                span_id: "span".into(),
+                tags: Some(vec!["a".into(), "b".into(), "a".into()]),
+                ..Default::default()
+            }));
+        let mut ops = vec![original.clone()];
+        unique_tags(&mut ops);
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = ops[0].as_ref();
+        assert_eq!(
+            row.tags.as_deref(),
+            Some(["a".into(), "b".into()].as_slice())
+        );
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = original.as_ref();
+        assert_eq!(row.tags.as_ref().unwrap().len(), 3);
+    }
     use crate::{
         translate::{Registry, SessionCtx},
         wire::{BackendAuth, Envelope, SessionRoute},

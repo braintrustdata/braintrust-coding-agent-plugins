@@ -50,7 +50,7 @@ impl ConsumerOptions {
     async fn sink(&self, config: &SessionConfig) -> anyhow::Result<RoutingSink> {
         let inner = self.factory.create(&self.session_id, &self.source)?;
         let mut sink = RoutingSink::spawn(
-            Box::new(crate::sink::UniqueTags(inner)),
+            inner,
             self.source.clone(),
             self.session_id.clone(),
             self.data_dir.clone(),
