@@ -4,10 +4,11 @@
 
 use super::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
 use super::recovery::{Boundary, Failure, Recovery, RecoveryOutcome};
-use super::Stage;
+use super::delivery::InputPort;
+use super::{Completion, Delivery, Stage};
 pub(crate) use crate::collections::BindingChanged;
 use crate::collections::{
-    Completion, Delivery, EventCollection, HeldRoute, InputPort, SpanOps, Translated,
+    EventCollection, HeldRoute, SpanOps, Translated,
 };
 use crate::{
     translate::{OriginSnapshot, SpanOp},
@@ -619,9 +620,6 @@ impl Drop for HeadCompletion {
 }
 #[async_trait::async_trait]
 impl Completion for HeadCompletion {
-    fn record_id(&self) -> Option<u64> {
-        Some(self.through)
-    }
     async fn complete(&mut self) -> anyhow::Result<()> {
         self.journal
             .ops
@@ -1045,7 +1043,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_port_replays_abandoned_delivery_without_cursor_control() {
-        use crate::collections::InputPort;
+        use crate::pipeline::delivery::InputPort;
         let tmp = tempfile::tempdir().unwrap();
         let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
             .await

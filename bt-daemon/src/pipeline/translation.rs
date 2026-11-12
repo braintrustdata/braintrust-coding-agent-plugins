@@ -920,7 +920,7 @@ impl Producer {
 pub(crate) mod tests {
     use super::*;
     use crate::collections::inspect::{Fault, Inspector, Table};
-    use crate::{collections::InputPort, translate::SpanRow};
+    use crate::{pipeline::delivery::InputPort, translate::SpanRow};
     mod streams {
         use crate as bt_daemon;
         include!(concat!(

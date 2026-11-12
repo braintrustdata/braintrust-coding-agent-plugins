@@ -1,5 +1,4 @@
-//! Membership obligations and completion-preserving ports for collection views.
-use crate::pipeline::recovery::Failure;
+use super::recovery::Failure;
 use tokio::sync::mpsc;
 
 /// A message owns its completion obligation until terminal handling succeeds.
@@ -14,9 +13,6 @@ pub(crate) struct Delivery<T> {
 #[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(crate) trait Completion: Send {
-    fn record_id(&self) -> Option<u64> {
-        None
-    }
     async fn complete(&mut self) -> anyhow::Result<()>;
 
     /// Report a processing failure through the same obligation. Durable sources
@@ -37,10 +33,6 @@ impl<T> Delivery<T> {
             value,
             completion: Box::new(completion),
         }
-    }
-
-    pub(crate) fn record_id(&self) -> Option<u64> {
-        self.completion.record_id()
     }
 
     pub fn value(&self) -> &T {
