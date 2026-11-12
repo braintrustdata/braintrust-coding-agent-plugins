@@ -66,6 +66,10 @@ impl<T> Delivery<T> {
 #[async_trait::async_trait]
 pub(crate) trait InputPort: Send {
     type Item: Send;
+    /// Permanently remove this subscription's delivery obligation.
+    async fn detach(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("input does not support route detachment")
+    }
     async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>>;
 }
 
@@ -88,6 +92,9 @@ impl<T: Send + 'static> InputPort for mpsc::Receiver<Delivery<T>> {
 #[async_trait::async_trait]
 impl<T: InputPort + ?Sized> InputPort for Box<T> {
     type Item = T::Item;
+    async fn detach(&mut self) -> anyhow::Result<()> {
+        (**self).detach().await
+    }
     async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
         (**self).receive().await
     }

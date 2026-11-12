@@ -308,6 +308,7 @@ async fn import_transcripts_with_ledger(
 }
 
 struct ImportLive {
+    stopped: bool,
     source: String,
     translator: Box<dyn AgentTranslator>,
     sink: Box<dyn Sink>,
@@ -368,6 +369,7 @@ impl ImportProcessor {
                     self.sessions.insert(
                         sid.clone(),
                         ImportLive {
+                            stopped: false,
                             source: env.source.clone(),
                             translator,
                             sink,
@@ -415,6 +417,9 @@ impl ImportProcessor {
         live: &mut ImportLive,
         first: Vec<SpanOp>,
     ) -> anyhow::Result<()> {
+        if live.stopped {
+            return Ok(());
+        }
         let mut next = Some(first);
         while let Some(ops) = next {
             // Imports can contain tens of thousands of SDK log commands. Bound the
@@ -472,6 +477,10 @@ impl ImportProcessor {
                             if let Some(op) = result.op {
                                 transformed.push(op);
                             }
+                        }
+                        Err(error) if error.is::<crate::span_processor::StopTracing>() => {
+                            live.stopped = true;
+                            return Ok(());
                         }
                         Err(error) => {
                             if let (Some(data_dir), Some(plugin)) =
