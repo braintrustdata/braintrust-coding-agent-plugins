@@ -23,3 +23,17 @@ pub use rpc::{error_code, Message, Request, RequestId, Response, RpcError};
 /// The protocol version this build speaks. Bumped on any breaking change to
 /// the envelope or method contracts. See `docs/protocol.md`.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+// Approximate retained JSON memory without copying or serializing payloads.
+pub(crate) fn retained_json_bytes(value: &serde_json::Value) -> u64 {
+    std::mem::size_of::<serde_json::Value>() as u64
+        + match value {
+            serde_json::Value::String(text) => text.len() as u64,
+            serde_json::Value::Array(array) => array.iter().map(retained_json_bytes).sum(),
+            serde_json::Value::Object(object) => object
+                .iter()
+                .map(|(key, value)| key.len() as u64 + 64 + retained_json_bytes(value))
+                .sum(),
+            _ => 0,
+        }
+}

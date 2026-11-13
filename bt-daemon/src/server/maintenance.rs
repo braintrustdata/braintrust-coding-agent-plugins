@@ -552,6 +552,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_bound_excludes_an_interrupted_tail_and_its_live_replacement() {
+        use tokio::io::AsyncWriteExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = event("interrupted", SessionRoute::default());
+        let path = journal::source_journal_path(tmp.path(), &env.source, &env.session_id);
+        let old_end = JournalWriter::open_path(&path)
+            .await
+            .unwrap()
+            .append(&env)
+            .await
+            .unwrap();
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.write_all(b"{interrupted").await.unwrap();
+        file.flush().await.unwrap();
+        let (daemon, ready) = paused_ingress(tmp.path());
+        let recovered = discover_unprocessed_journals(&daemon).await;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].journal_through, old_end);
+        env.event = "replacement".into();
+        daemon.capture_event(env.clone()).await.unwrap();
+        assert_eq!(
+            daemon.startup_cutoffs.lock().as_ref().unwrap()[&path],
+            old_end
+        );
+        for event in recovered {
+            dispatch_ingress_event(&daemon, event).await;
+        }
+        drain_capture_buffer(&daemon).await.unwrap();
+        ready.send(()).unwrap();
+        daemon.settle_ingress().await;
+        let source = daemon.translation_for(&env).await.unwrap();
+        source.barrier().await.unwrap();
+        assert_eq!(source.progress.pending(), 0);
+        drain_all(&daemon).await;
+    }
+
+    #[tokio::test]
     async fn repeated_overflow_preserves_each_session_and_event_order() {
         let tmp = tempfile::tempdir().unwrap();
         let (daemon, ready) = paused_ingress(tmp.path());

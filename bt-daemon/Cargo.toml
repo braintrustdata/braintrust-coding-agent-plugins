@@ -36,7 +36,7 @@ regex = "1"
 rquickjs = "0.12.2"
 rquickjs-serde = "0.6.1"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 semver = "1"
 sha2 = "0.10"
 sysinfo = { version = "0.33.1", default-features = false, features = ["system"] }

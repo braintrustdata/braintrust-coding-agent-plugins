@@ -28,7 +28,15 @@ pub(crate) struct SourceRecord {
 
 impl SourceRecord {
     fn bytes(&self) -> u64 {
-        self.position.through.saturating_sub(self.position.before)
+        // Journal references can be tiny while the live payload is huge.
+        // Charge retained values, without serializing/copying their strings.
+        let stored = self.position.through.saturating_sub(self.position.before);
+        match &self.event {
+            SourceEvent::Event(event) => {
+                stored.max(crate::wire::retained_json_bytes(&event.payload))
+            }
+            _ => stored,
+        }
     }
 }
 
@@ -98,7 +106,8 @@ mod tests {
     fn oversized_events_flow_alone_and_eviction_exposes_a_recovery_gap() {
         let input = SourceInput::default();
         let event: Envelope = serde_json::from_value(json!({"source":"debug","session_id":"direct","event":"native","ts_ms":1,"payload":{"history":"x".repeat(9 * 1024 * 1024)}})).unwrap();
-        let stride = 9 * 1024 * 1024;
+        // References have a small disk footprint but retain full live data.
+        let stride = 128;
         let position = |before| SourcePosition {
             before,
             through: before + stride,
