@@ -36,34 +36,44 @@ async fn capture_stores_only_the_pi_fields_translation_reads() {
         .unwrap();
     let marker = "growing-partial-marker".repeat(64);
     events
-        .append(&event(
-            "pi",
-            "session",
-            "message_update",
-            json!({"event": {
-                "type": "message_update",
-                "assistantMessageEvent": {"type": "text_delta", "partial": marker},
-                "message": {"role": "assistant", "content": marker},
-            }}),
-        ))
+        .append(
+            (&event(
+                "pi",
+                "session",
+                "message_update",
+                json!({"event": {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "partial": marker},
+                    "message": {"role": "assistant", "content": marker},
+                }}),
+            ))
+                .into(),
+            None,
+        )
         .await
+        .unwrap()
         .unwrap();
     events
-        .append(&event(
-            "pi",
-            "session",
-            "before_provider_request",
-            json!({"event": {
-                "type": "before_provider_request",
-                "payload": {
-                    "system": "system-prompt-marker",
-                    "messages": [{"role": "user", "content": "message-marker"}],
-                    "tools": [{"name": "read", "input_schema": {"type": "object"}}],
-                    "max_tokens": 1024,
-                },
-            }}),
-        ))
+        .append(
+            (&event(
+                "pi",
+                "session",
+                "before_provider_request",
+                json!({"event": {
+                    "type": "before_provider_request",
+                    "payload": {
+                        "system": "system-prompt-marker",
+                        "messages": [{"role": "user", "content": "message-marker"}],
+                        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+                        "max_tokens": 1024,
+                    },
+                }}),
+            ))
+                .into(),
+            None,
+        )
         .await
+        .unwrap()
         .unwrap();
     let stored = Inspector::session(temp.path(), "pi", "session")
         .unwrap()
@@ -128,8 +138,9 @@ async fn legacy_import_keeps_byte_positions_expands_pi_history_and_deletes_the_f
     );
     assert!(reader.next().await.unwrap().is_none());
     let appended = events
-        .append(&event("pi", "session", "context", json!({})))
+        .append((&event("pi", "session", "context", json!({}))).into(), None)
         .await
+        .unwrap()
         .unwrap();
     assert_eq!(appended.before, through);
 }
@@ -187,8 +198,9 @@ async fn storage_is_removed_only_after_its_last_handle_closes() {
         .await
         .unwrap();
     events
-        .append(&event("debug", "session", "e", json!({})))
+        .append((&event("debug", "session", "e", json!({}))).into(), None)
         .await
+        .unwrap()
         .unwrap();
     let path = super::inspect::session_path(temp.path(), "debug", "session");
     let ops = SpanOps::for_events(&events).await.unwrap();
@@ -211,8 +223,9 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
         .await
         .unwrap();
     let input = events
-        .append(&event("debug", "session", "e", json!({})))
+        .append((&event("debug", "session", "e", json!({}))).into(), None)
         .await
+        .unwrap()
         .unwrap()
         .through;
     let ops = SpanOps::for_events(&events).await.unwrap();
@@ -251,8 +264,9 @@ async fn reopening_storage_does_not_count_as_activity() {
         .await
         .unwrap();
     events
-        .append(&event("debug", "session", "e", json!({})))
+        .append((&event("debug", "session", "e", json!({}))).into(), None)
         .await
+        .unwrap()
         .unwrap();
     drop(events);
     let day = std::time::Duration::from_secs(24 * 60 * 60);
@@ -266,8 +280,12 @@ async fn reopening_storage_does_not_count_as_activity() {
         .unwrap();
     assert!(events.idle_for().await.unwrap() >= day);
     events
-        .append(&event("debug", "session", "e", json!({})))
+        .append(
+            (&event("debug", "session", "later", json!({}))).into(),
+            None,
+        )
         .await
+        .unwrap()
         .unwrap();
     assert!(events.idle_for().await.unwrap() < day);
 }
@@ -281,8 +299,17 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
         .unwrap();
     let mut captured = event("debug", "session", "e", json!({}));
     captured.route = Some(Default::default());
-    let input = events.capture(&captured).await.unwrap().unwrap().through;
-    assert!(events.capture(&captured).await.unwrap().is_none());
+    let input = events
+        .append((&captured).into(), None)
+        .await
+        .unwrap()
+        .unwrap()
+        .through;
+    assert!(events
+        .append((&captured).into(), None)
+        .await
+        .unwrap()
+        .is_none());
     let ops = SpanOps::for_events(&events).await.unwrap();
     let route = |name: &str| crate::wire::SessionRoute {
         tags: [name.into()].into_iter().collect(),
@@ -340,7 +367,11 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
     assert_eq!(db.count(Table::Origins), 1, "an open span keeps its origin");
     assert!(ops.observations().await.unwrap().is_empty());
     assert!(
-        events.capture(&captured).await.unwrap().is_some(),
+        events
+            .append((&captured).into(), None)
+            .await
+            .unwrap()
+            .is_some(),
         "an expired capture identity is recorded again"
     );
 }

@@ -498,7 +498,7 @@ impl Producer {
         let Some(appended) = self
             .options
             .events
-            .append_control(&control, self.position)
+            .append(EventRecord::Control(control.clone()), Some(self.position))
             .await?
         else {
             return Ok(None);
@@ -951,7 +951,13 @@ pub(crate) mod tests {
             }
         }
         pub(crate) async fn write(&self, event: &crate::wire::Envelope, live: bool) -> u64 {
-            let appended = self.options.events.append(event).await.unwrap();
+            let appended = self
+                .options
+                .events
+                .append(event.into(), None)
+                .await
+                .unwrap()
+                .unwrap();
             let through = appended.through;
             let position = SourcePosition {
                 before: appended.before,
@@ -990,7 +996,10 @@ pub(crate) mod tests {
         let mut covered = Vec::new();
         for (agent, mut events, _files) in streams::native_streams() {
             covered.push(agent.clone());
-            events.insert(0, events[0].clone());
+            // A repeated native event, captured separately.
+            let mut repeated = events[0].clone();
+            repeated.ts_ms += 1;
+            events.insert(0, repeated);
             for event in &mut events {
                 event.payload["padding"] = serde_json::json!("é📚history".repeat(1024));
             }
@@ -1244,6 +1253,8 @@ pub(crate) mod tests {
         let f = SourceFixture::new("debug").await;
         let event = streams::native_streams().pop().unwrap().1.remove(0);
         let through = f.write(&event, false).await;
+        let mut later = event.clone();
+        later.ts_ms += 1;
         let mut producer = Producer::open(f.options.clone()).await.unwrap();
         let entered = Arc::new(Notify::new());
         let (release, receiver) = std::sync::mpsc::channel();
@@ -1259,7 +1270,7 @@ pub(crate) mod tests {
         entered.notified().await;
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), f.write(&event, true))
+            tokio::time::timeout(std::time::Duration::from_secs(1), f.write(&later, true))
                 .await
                 .unwrap()
                 > through
@@ -1357,13 +1368,16 @@ pub(crate) mod tests {
             .unwrap();
         let input = events
             .append(
-                &serde_json::from_value(serde_json::json!({
+                (&serde_json::from_value::<crate::wire::Envelope>(serde_json::json!({
                     "source": source, "session_id": session, "event": "native",
                     "ts_ms": 1, "payload": {}
                 }))
-                .unwrap(),
+                .unwrap())
+                    .into(),
+                None,
             )
             .await
+            .unwrap()
             .unwrap()
             .through;
         // Any translation replay of this record would fail immediately.

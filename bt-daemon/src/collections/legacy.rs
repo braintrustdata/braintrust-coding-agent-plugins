@@ -6,7 +6,7 @@
 //! so the translator rebuilds its state from it without publishing it again. A
 //! journal file is deleted only after every record it contributes has been
 //! committed.
-use super::events::{encode, EventCollection, EventRecord};
+use super::events::{encode, EventCollection, EventRecord, Imported};
 use crate::journal::{journal_dir, journal_path, source_journal_path};
 use crate::wire::{RedactedEnvelope, SessionRoute};
 use anyhow::Context;
@@ -95,8 +95,12 @@ async fn import_unqualified(data_dir: &Path, path: &Path) -> anyhow::Result<()> 
             events
                 .import(
                     Vec::new(),
-                    None,
-                    Some(owner.as_deref() == Some(source.as_str())),
+                    Some(Imported {
+                        identity: None,
+                        namespace: Some(owner.as_deref() == Some(source.as_str())),
+                        through: 0,
+                        delivered: 0,
+                    }),
                 )
                 .await?;
             continue;
@@ -186,13 +190,10 @@ async fn import_file(
         bytes += value.len();
         batch.push((through, value));
         if batch.len() >= IMPORT_RECORDS || bytes >= IMPORT_BYTES {
-            events
-                .import(std::mem::take(&mut batch), None, None)
-                .await?;
+            events.import(std::mem::take(&mut batch), None).await?;
             bytes = 0;
         }
     }
-    events.import(batch, identity, namespace).await?;
     // Input is delivered only through the point every route had delivered.
     let delivered = routes
         .iter()
@@ -205,7 +206,17 @@ async fn import_file(
             anyhow::Ok(Some(least.map_or(through, |least| least.min(through))))
         })?
         .unwrap_or(0);
-    events.reserve(reader.position, delivered).await
+    events
+        .import(
+            batch,
+            Some(Imported {
+                identity,
+                namespace,
+                through: reader.position,
+                delivered,
+            }),
+        )
+        .await
 }
 
 /// A delivery acknowledgement written by a daemon before SpanOp storage.

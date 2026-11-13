@@ -276,7 +276,12 @@ pub(super) mod tests {
         let writer = crate::collections::EventCollection::open(tmp.path(), "debug", "test")
             .await
             .unwrap();
-        let through = writer.append(&env).await.unwrap().through;
+        let through = writer
+            .append((&env).into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .through;
         let spans = crate::collections::SpanOps::for_events(&writer)
             .await
             .unwrap();
@@ -356,18 +361,28 @@ pub(super) mod tests {
             crate::collections::EventCollection::open(tmp.path(), "debug", &env.session_id)
                 .await
                 .unwrap();
-        let first = writer.append(&env).await.unwrap().through;
+        let first = writer
+            .append((&env).into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .through;
         env.route = Some(corrected.clone());
         env.event = "Stop".into();
         env.ts_ms = 2;
-        let settings_through = writer.append(&env).await.unwrap().through;
+        let settings_through = writer
+            .append((&env).into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .through;
         let tail = writer
-            .append_control(
-                &crate::pipeline::input::PipelineControl {
+            .append(
+                crate::collections::EventRecord::Control(crate::pipeline::input::PipelineControl {
                     kind: crate::pipeline::input::ControlKind::Checkpoint,
                     bounds: HashMap::new(),
-                },
-                settings_through,
+                }),
+                Some(settings_through),
             )
             .await
             .unwrap()
@@ -452,7 +467,12 @@ pub(super) mod tests {
             crate::collections::EventCollection::open(tmp.path(), "debug", &env.session_id)
                 .await
                 .unwrap();
-        let through = writer.append(&env).await.unwrap().through;
+        let through = writer
+            .append((&env).into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .through;
         drop(writer);
         let mut options = debug_serve_options("test", tmp.path());
         options.auth_provider = Some(Arc::new(TestAuth));

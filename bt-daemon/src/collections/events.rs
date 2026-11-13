@@ -7,7 +7,7 @@
 //! measure bytes. Removal never renumbers later records.
 use super::store::{Store, NOW_MS};
 use crate::pipeline::input::PipelineControl;
-use crate::wire::{Envelope, RedactedEnvelope};
+use crate::wire::RedactedEnvelope;
 use rusqlite::{params, OptionalExtension};
 use std::{
     collections::VecDeque,
@@ -40,10 +40,28 @@ pub(crate) enum EventRecord {
     Control(PipelineControl),
 }
 
+impl From<&crate::wire::Envelope> for EventRecord {
+    fn from(env: &crate::wire::Envelope) -> Self {
+        Self::Event(env.redacted())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EventEntry {
     pub id: u64,
     pub record: EventRecord,
+}
+
+/// What a fully imported legacy file implies about its session.
+pub(super) struct Imported {
+    /// The latest event, with only state-referencing payload fields.
+    pub identity: Option<RedactedEnvelope>,
+    /// Whether this source keeps the pre-qualification span-id namespace.
+    pub namespace: Option<bool>,
+    /// The file's length, the boundary for new records.
+    pub through: u64,
+    /// Input every route had delivered, already translated.
+    pub delivered: u64,
 }
 
 /// The ID range a successful insert occupies.
@@ -159,67 +177,43 @@ impl EventCollection {
             .await
     }
 
-    /// Insert one redacted event. The caller may acknowledge capture once this
-    /// returns: the record is durable and visible to translation.
-    #[cfg(test)]
-    pub async fn append(&self, env: &Envelope) -> anyhow::Result<Appended> {
-        self.insert_event(env, None).await.map(|appended| {
-            appended.unwrap_or(Appended {
-                before: 0,
-                through: 0,
-            })
-        })
-    }
-
-    /// Capture a native event once. The same event captured again, such as a
-    /// re-import or a capture retried across a daemon handover, returns `None`
-    /// while this session's storage exists.
-    pub async fn capture(&self, env: &Envelope) -> anyhow::Result<Option<Appended>> {
-        let mut identity = env.redacted();
-        if let Some(payload) = identity.payload.as_object_mut() {
-            // Daemon-added transcript references describe this capture, not
-            // the native event.
-            for key in CAPTURE_REFERENCES {
-                payload.remove(key);
-            }
-        }
-        // Route and capture context are part of a capture: hooks may deliver
-        // one native event to several destinations, each as its own capture.
-        let digest = Sha256::digest(serde_json::to_vec(&(
-            &identity.event,
-            identity.ts_ms,
-            &identity.payload,
-            &identity.route,
-            &identity.capture,
-        ))?);
-        self.insert_event(env, Some(digest.to_vec())).await
-    }
-
-    async fn insert_event(
+    /// Append a record and return the ID range it occupies. The caller may
+    /// acknowledge it once this returns: it is durable and visible to
+    /// translation. Returns `None` when nothing was appended:
+    /// - an event already captured, such as a re-import or a capture retried
+    ///   across a daemon handover, is acknowledged without a second record;
+    /// - with `after`, a record lands only if nothing else has since `after`,
+    ///   so a control is never ordered ahead of work translation has not seen.
+    pub async fn append(
         &self,
-        env: &Envelope,
-        digest: Option<Vec<u8>>,
+        mut record: EventRecord,
+        after: Option<u64>,
     ) -> anyhow::Result<Option<Appended>> {
-        let mut record = env.redacted();
-        compact_pi_payload(&mut record);
-        let mut identity = env.redacted();
-        identity.payload = serde_json::Value::Object(
-            IDENTITY_PAYLOAD
-                .iter()
-                .filter_map(|key| Some(((*key).into(), identity.payload.get(*key)?.clone())))
-                .collect(),
-        );
-        let value = encode(&EventRecord::Event(record))?;
+        let capture = match &mut record {
+            EventRecord::Event(event) => {
+                let capture = (digest(event)?, identity(event));
+                compact_pi_payload(event);
+                Some(capture)
+            }
+            EventRecord::Control(_) => None,
+        };
+        let value = encode(&record)?;
         self.store
             .write(move |tx| {
-                if let Some(digest) = digest {
-                    if tx.execute(
-                        &format!("INSERT OR IGNORE INTO captured(digest,at_ms) VALUES(?,{NOW_MS})"),
-                        [digest],
-                    )? == 0
-                    {
-                        return Ok(None);
-                    }
+                let tail: u64 =
+                    tx.query_row("SELECT tail FROM event_state WHERE id=1", [], |r| r.get(0))?;
+                if after.is_some_and(|after| tail > after) {
+                    return Ok(None);
+                }
+                let Some((digest, mut identity)) = capture else {
+                    return insert(tx, value).map(Some);
+                };
+                if tx.execute(
+                    &format!("INSERT OR IGNORE INTO captured(digest,at_ms) VALUES(?,{NOW_MS})"),
+                    [digest],
+                )? == 0
+                {
+                    return Ok(None);
                 }
                 let previous: Option<Vec<u8>> =
                     tx.query_row("SELECT identity FROM event_state WHERE id=1", [], |r| {
@@ -249,27 +243,6 @@ impl EventCollection {
                     [serde_json::to_vec(&identity)?],
                 )?;
                 Ok(Some(appended))
-            })
-            .await
-    }
-
-    /// Insert a control only if no capture has landed after `expected` (the
-    /// translator's position). Otherwise the control would be ordered ahead of
-    /// work the translator has not yet observed.
-    pub async fn append_control(
-        &self,
-        control: &PipelineControl,
-        expected: u64,
-    ) -> anyhow::Result<Option<Appended>> {
-        let value = encode(&EventRecord::Control(control.clone()))?;
-        self.store
-            .write(move |tx| {
-                let tail: u64 =
-                    tx.query_row("SELECT tail FROM event_state WHERE id=1", [], |r| r.get(0))?;
-                if tail > expected {
-                    return Ok(None);
-                }
-                insert(tx, value).map(Some)
             })
             .await
     }
@@ -331,14 +304,19 @@ impl EventCollection {
         }
     }
 
-    /// Import a legacy record at its original byte boundary. Retrying is idempotent.
+    /// Import legacy records at their original byte boundaries. Retrying is
+    /// idempotent. The last batch of a file carries what the file implies
+    /// about the session as a whole.
     pub(super) async fn import(
         &self,
         records: Vec<(u64, Vec<u8>)>,
-        identity: Option<RedactedEnvelope>,
-        namespace: Option<bool>,
+        finished: Option<Imported>,
     ) -> anyhow::Result<()> {
-        let identity = identity.map(|v| serde_json::to_vec(&v)).transpose()?;
+        let identity = finished
+            .as_ref()
+            .and_then(|finished| finished.identity.as_ref())
+            .map(serde_json::to_vec)
+            .transpose()?;
         self.store
             .write(move |tx| {
                 for (id, value) in records {
@@ -363,30 +341,23 @@ impl EventCollection {
                     }
                     tx.execute("UPDATE event_state SET tail=max(tail,?) WHERE id=1", [id])?;
                 }
+                let Some(finished) = finished else {
+                    return Ok(());
+                };
                 if let Some(identity) = identity {
                     tx.execute("UPDATE event_state SET identity=? WHERE id=1", [identity])?;
                 }
-                if let Some(namespace) = namespace {
+                if let Some(namespace) = finished.namespace {
                     tx.execute(
                         "UPDATE event_state SET legacy_namespace=? WHERE id=1",
                         [namespace],
                     )?;
                 }
-                Ok(())
-            })
-            .await
-    }
-
-    /// Preserve the legacy file's length as the boundary for new records,
-    /// and mark input every route had delivered as already translated.
-    pub(super) async fn reserve(&self, through: u64, delivered: u64) -> anyhow::Result<()> {
-        self.store
-            .write(move |tx| {
                 tx.execute(
                     "UPDATE event_state SET tail=max(tail,?) WHERE id=1",
-                    [through],
+                    [finished.through],
                 )?;
-                super::span_ops::seed_delivered(tx, delivered)
+                super::span_ops::seed_delivered(tx, finished.delivered)
             })
             .await
     }
@@ -415,6 +386,39 @@ impl EventCollection {
 /// The wall-clock time `retention` ago, in milliseconds.
 pub(super) fn cutoff_ms(retention: std::time::Duration) -> i64 {
     chrono::Utc::now().timestamp_millis() - i64::try_from(retention.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// What identifies one capture of a native event. Route and capture context
+/// are part of it: hooks may deliver one native event to several
+/// destinations, each as its own capture. Daemon-added transcript references
+/// describe the capture, not the native event.
+fn digest(event: &RedactedEnvelope) -> anyhow::Result<Vec<u8>> {
+    let mut payload = event.payload.clone();
+    if let Some(payload) = payload.as_object_mut() {
+        for key in CAPTURE_REFERENCES {
+            payload.remove(key);
+        }
+    }
+    Ok(Sha256::digest(serde_json::to_vec(&(
+        &event.event,
+        event.ts_ms,
+        &payload,
+        &event.route,
+        &event.capture,
+    ))?)
+    .to_vec())
+}
+
+/// The event with only the payload fields that reference on-disk state.
+fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
+    let mut identity = event.clone();
+    identity.payload = serde_json::Value::Object(
+        IDENTITY_PAYLOAD
+            .iter()
+            .filter_map(|key| Some(((*key).into(), event.payload.get(*key)?.clone())))
+            .collect(),
+    );
+    identity
 }
 
 fn insert(tx: &rusqlite::Transaction<'_>, value: Vec<u8>) -> anyhow::Result<Appended> {
