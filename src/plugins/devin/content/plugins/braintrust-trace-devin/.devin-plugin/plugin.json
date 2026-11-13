@@ -1,0 +1,15 @@
+{
+  "name": "braintrust-trace-devin",
+  "displayName": "Braintrust Trace Devin",
+  "description": "Scaffold for Devin session tracing to Braintrust; event capture is not implemented yet",
+  "shortDescription": "Devin tracing scaffold (inactive)",
+  "setup": {
+    "notice": "Tracing is not implemented yet. This package has an empty hook configuration and captures no events."
+  },
+  "homepage": "https://www.braintrust.dev",
+  "repository": "https://github.com/braintrustdata/braintrust-coding-agent-plugins",
+  "keywords": [
+    "Developer Tools",
+    "Monitoring & Analytics"
+  ]
+}

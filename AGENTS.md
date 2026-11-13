@@ -1,8 +1,10 @@
 # Braintrust coding-agent plugins — monorepo
 
 This repo is the single source of truth for Braintrust's coding-agent plugins.
-Each plugin is developed here, built, and deployed to a per-agent distribution
-repository that its marketplace installs from.
+Plugins are developed here and built for their agent's distribution format.
+Most deploy to a per-agent distribution repository that its marketplace installs
+from. Devin's marketplace references plugin subdirectories in this monorepo at
+an exact commit; it does not need a generated distribution repository.
 
 ## Layout
 
@@ -11,7 +13,7 @@ src/plugins/<agent>/         one directory per agent
   content/                   the deployable plugin tree, verbatim
   build.sh <dir>             assemble the deployable tree into <dir>
   validate.sh <dir>          validate manifests and required files
-  publish.sh                 deploy a built tree to a distribution repo
+  publish.sh                 optional deployment to a distribution repo
 scripts/publish.sh           dispatch PUBLISH_TARGETS to each plugin
 bt-daemon/                   shared Rust tracing crate embedded by bt
 Makefile                     build, test, and publish entry points
@@ -78,6 +80,14 @@ is unversioned.
 | codex | `braintrustdata/braintrust-codex-plugin` |
 | cursor | `braintrustdata/braintrust-cursor-extension` |
 | grok | `braintrustdata/braintrust-grok-plugin` |
+
+Devin packages live under `src/plugins/devin/content/plugins/`: `braintrust`
+provides hosted MCP access, and `braintrust-trace-devin` is an inactive tracing
+scaffold with an empty `hooks.json`. Devin tracing and daemon support are not
+implemented yet. Submit the MCP package's subdirectory to the Devin marketplace;
+keep the tracing scaffold out of the marketplace until capture is implemented
+and verified. Neither package needs version stamping or a publishing workflow;
+the marketplace pins an exact source commit.
 
 A distribution repository is a generated artifact. Each deploy clones it,
 replaces the tracked tree with a fresh build, and pushes the result.

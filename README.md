@@ -11,13 +11,17 @@ the official ChatGPT and Codex plugin directory. It connects to Braintrust's
 hosted MCP server through OAuth and requires no `bt` installation. Installing it
 does not enable session tracing.
 
-## Devin MCP plugin
+## Devin plugins
 
-The [Devin package](src/plugins/devin/content/README.md) connects Devin to
-Braintrust’s hosted MCP server with OAuth. It requires no `bt` installation and
-does not enable session tracing. Build and validate it with `make validate-devin`.
-The Devin marketplace references `src/plugins/devin/content` at a pinned source
-commit; agent-independent workflow skills remain in `braintrust-skills`.
+The [Braintrust MCP plugin](src/plugins/devin/content/plugins/braintrust/README.md)
+connects Devin to the hosted US MCP server through OAuth and requires no `bt`
+installation. The separate
+[`braintrust-trace-devin` scaffold](src/plugins/devin/content/plugins/braintrust-trace-devin/README.md)
+reserves the tracing package with an empty `hooks.json`; it does not capture
+events yet. Build and validate both packages with `make validate-devin`.
+
+Devin's marketplace references `src/plugins/devin/content/plugins/braintrust`
+at an exact source commit. It does not require a separate distribution repo.
 
 ## Get started
 

@@ -1,28 +1,30 @@
-# Braintrust for Devin
+# Braintrust plugins for Devin
 
-Connect Devin to [Braintrust MCP](https://docs.braintrust.dev/integrations/developer-tools/mcp)
-to investigate traces, compare experiments, and run evals. Sign in with your
-Braintrust account through OAuth. Tools use that account’s permissions.
-No `bt` installation is required, and session tracing is not enabled.
+This tree contains two independent Devin plugins:
 
-## Install
+| Package | Purpose | Status |
+| --- | --- | --- |
+| [`braintrust`](plugins/braintrust/README.md) | Hosted Braintrust MCP access through OAuth | Awaiting authenticated Devin verification |
+| [`braintrust-trace-devin`](plugins/braintrust-trace-devin/README.md) | Devin session tracing | Inactive scaffold; hooks and daemon support are not implemented |
 
-In Devin Cloud, use **Customize → Plugins → Add plugin → From repository** with
-`braintrustdata/braintrust-coding-agent-plugins` and subdirectory
-`src/plugins/devin/content` after this package merges to the default branch.
-The marketplace references this directory with a `git-subdir` entry pinned to
-an exact commit.
+Install the individual plugin subdirectory. This root is a build output container,
+not an installable plugin or a bundle that installs both packages.
 
-To test locally:
+The Devin marketplace should reference
+`src/plugins/devin/content/plugins/braintrust` in this monorepo using a
+`git-subdir` source pinned to the merged commit. Keep the tracing scaffold out of
+the marketplace until tracing is implemented and verified.
+
+From the monorepo root:
 
 ```bash
 make validate-devin
-devin plugins install --local ./dist/devin
+devin plugins install --local ./dist/devin/plugins/braintrust
+devin mcp login braintrust
 ```
 
-Complete OAuth, start a new session, and ask Devin to list your Braintrust projects.
+Start a new Devin session and call a Braintrust tool to verify the connection.
 
-The package connects to the US data plane. For EU, change
-`mcpServers.braintrust.url` in a local/team copy’s `.devin-plugin/plugin.json` to
-`https://api-eu.braintrust.dev/mcp`. For self-hosted deployments, use the complete
-MCP URL from **Settings → Data plane**, preserving any path prefix.
+Updating a marketplace listing requires advancing its source commit pin.
+Existing SHA-pinned installations also require their source pin to be updated;
+reindexing alone does not advance a pin. Plugin changes apply to new sessions.
