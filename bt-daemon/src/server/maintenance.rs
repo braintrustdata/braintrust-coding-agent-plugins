@@ -312,7 +312,12 @@ pub(super) fn spawn_log_rotation(daemon: Arc<Daemon>) {
                 _ = tokio::time::sleep(LOG_ROTATION_INTERVAL) => {}
             }
             let data_dir = daemon.data_dir.clone();
-            match tokio::task::spawn_blocking(move || crate::serve_log::rotate(&data_dir)).await {
+            let max_bytes = crate::serve_log::max_bytes();
+            match tokio::task::spawn_blocking(move || {
+                crate::serve_log::rotate(&data_dir, max_bytes)
+            })
+            .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(%error, "serve.log rotation failed"),
                 Err(error) => tracing::warn!(%error, "serve.log rotation did not run"),
