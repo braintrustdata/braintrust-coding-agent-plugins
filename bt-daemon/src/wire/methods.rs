@@ -11,6 +11,8 @@ pub mod method {
     pub const STATUS_GET: &str = "status.get";
     pub const AUTH_DIAGNOSE: &str = "auth.diagnose";
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
+    pub const IMPORT_FINISH: &str = "import.finish";
+    pub const IMPORT_RESET: &str = "import.reset";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +61,36 @@ pub struct FlushParams {
     pub session_id: String,
     #[serde(default = "default_flush_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+/// Deliver one imported source session's captured events through its route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportFinishParams {
+    pub source: String,
+    pub session_id: String,
+    pub route: crate::wire::SessionRoute,
+    /// Close the session's open spans, as a completed transcript does.
+    /// Otherwise only flush, leaving it open for later capture.
+    pub finalize: bool,
+    #[serde(default = "default_flush_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportFinishResult {
+    pub flushed: bool,
+    pub pending: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_span_id: Option<String>,
+    /// Distinct spans this route has delivered since its actor started.
+    pub span_count: u64,
+}
+
+/// Restart translation for a source session whose transcript was rewritten.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportResetParams {
+    pub source: String,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -11,14 +11,16 @@
 //! matrix in the ordinary test suite while still exercising IPC, journaling,
 //! translation, automatic routing, and sink configuration.
 
+#[path = "support/journal_store.rs"]
+mod journal_store;
 mod support;
 
 use async_trait::async_trait;
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{AuthSelection, BackendAuth, Envelope, SessionConfig, TraceDestination};
 use bt_daemon::{
-    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, source_journal_path,
-    AuthLease, AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs, ServeOptions, Sink,
+    flush_session, forward_envelope, run_serve, run_status, shutdown_daemon, AuthLease,
+    AuthProvider, AuthResolveReason, HostInfo, Registry, ServeArgs, ServeOptions, Sink,
     SinkFactory, SpanOp, SpanRow, SpanType, StatusArgs,
 };
 use std::collections::HashMap;
@@ -1332,14 +1334,11 @@ async fn ipc_initialize_pid_is_captured_without_hook_metadata() {
     shutdown_daemon(&socket).await.unwrap();
     daemon.await.unwrap();
 
-    let journal = tokio::fs::read_to_string(source_journal_path(
+    let row = journal_store::identity(
         &tmp.path().join("data"),
         "claude-code",
         "automatic-process-capture",
-    ))
-    .await
-    .unwrap();
-    let row: serde_json::Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    );
     let chain = row
         .pointer("/capture/process_chain")
         .and_then(serde_json::Value::as_array)
@@ -2927,6 +2926,7 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         let host = test_host();
         let mut fixtures = DistributedFixtures::new();
         let mut events = pending_child(&mut fixtures, &socket, &host).await;
+        flush("bounded-parent", &socket).await;
         let original_route = events[0].route.clone().unwrap();
         let mut prompt = events[1].clone();
         prompt.capture = events[0].capture.clone();
@@ -2941,11 +2941,28 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         let (path, saved) = stored_pending_child(&data_dir, "bounded-child").await;
         let journal_path =
             bt_daemon::source_journal_path(&data_dir, "claude-code", "bounded-child");
-        let journal = tokio::fs::read(&journal_path).await.unwrap();
+        let journal = journal_store::pending(&data_dir, "claude-code", "bounded-child")
+            .iter()
+            .map(|value| format!("{value}\n"))
+            .collect::<String>();
+        assert!(!journal.is_empty());
+        let backup = data_dir.parent().unwrap().join("pending-backup.sqlite");
+        bt_daemon::storage_inspect::Inspector::open(&journal_store::path(
+            &data_dir,
+            "claude-code",
+            "bounded-child",
+        ))
+        .unwrap()
+        .backup(&backup)
+        .unwrap();
+        let saved_database = std::fs::read(&backup).unwrap();
         shutdown_daemon(&socket).await.unwrap();
         daemon.await.unwrap();
         // Restore the accepted-but-undelivered checkpoint, as after an abrupt
         // process exit. Shutdown itself is covered separately above.
+        tokio::fs::create_dir_all(journal_path.parent().unwrap())
+            .await
+            .unwrap();
         tokio::fs::write(&journal_path, journal).await.unwrap();
         // This crash fixture rolls back source persistence as well as delivery.
         let id = journal_path
@@ -2962,11 +2979,17 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
                 tokio::fs::remove_file(path).await.unwrap();
             }
         }
-        // Graceful shutdown delivered the buffered spans. Roll back its local
-        // delivery acknowledgements as well as the journal to model a crash.
-        tokio::fs::remove_dir_all(data_dir.join("delivery-ledger"))
+        if format == "current" {
+            // A current-version crash preserves the SQLite collection and its
+            // exact IDs, rather than manufacturing a legacy NDJSON replacement.
+            tokio::fs::remove_file(&journal_path).await.unwrap();
+            tokio::fs::write(
+                journal_store::path(&data_dir, "claude-code", "bounded-child"),
+                saved_database,
+            )
             .await
             .unwrap();
+        }
         let mut legacy_route = original_route.clone();
         legacy_route.destination = Some(external_parent());
         // A decided legacy link already put earlier rows in that parent's
@@ -2977,7 +3000,7 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         } else {
             original_route.destination.clone()
         };
-        let state = if format == "current" {
+        let mut state = if format == "current" {
             saved
         } else {
             serde_json::json!({
@@ -2992,6 +3015,14 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
                 } else { saved["events"].clone() },
             })
         };
+        // Model an immediate crash/restart rather than spending the pending
+        // ancestry window on this fixture's graceful-shutdown rollback.
+        if format == "current" {
+            state["first_seen_ms"] = serde_json::json!(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64);
+        }
         tokio::fs::write(path, serde_json::to_vec(&state).unwrap())
             .await
             .unwrap();

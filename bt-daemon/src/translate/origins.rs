@@ -23,10 +23,6 @@ impl WeakOrigins {
         self.0.retain(|_, origin| origin.strong_count() > 0);
         self.0.insert(span, Arc::downgrade(origin));
     }
-
-    pub fn remove(&mut self, span: &str) {
-        self.0.remove(span);
-    }
 }
 
 #[cfg(test)]

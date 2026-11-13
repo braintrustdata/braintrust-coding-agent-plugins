@@ -309,7 +309,7 @@ snapshots using the original span-creating events and the daemon doing delivery.
 Transcript backfills snapshot versions available at materialization; they MUST
 NOT claim to reconstruct historical per-turn versions that were not captured.
 
-Legacy delivery ledgers may contain acknowledged spans without origin snapshots.
+Earlier daemons may have acknowledged spans without recording origin snapshots.
 Updates to those spans MUST preserve their existing backend provenance: omit
 `context.span_origin` rather than inject SDK defaults, copy an attached parent's
 origin, write `null`, or invent historical versions from the current daemon.

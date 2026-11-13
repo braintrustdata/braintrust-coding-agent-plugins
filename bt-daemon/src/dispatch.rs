@@ -26,6 +26,35 @@ const QUEUE_CAPACITY: usize = 1024;
 #[derive(Default)]
 pub struct Counters {
     pub spans_emitted: AtomicU64,
+    delivered: Mutex<Delivered>,
+}
+
+/// Identity of what a route has delivered since its actor started.
+#[derive(Default)]
+struct Delivered {
+    root_span_id: Option<String>,
+    spans: std::collections::HashSet<String>,
+}
+
+impl Counters {
+    pub(crate) fn record<'a>(&self, ops: impl Iterator<Item = &'a crate::translate::SpanOp>) {
+        let mut delivered = self.delivered.lock();
+        for op in ops {
+            let (crate::translate::SpanOp::Insert(row) | crate::translate::SpanOp::Merge(row)) = op;
+            if delivered.root_span_id.is_none() && !row.root_span_id.is_empty() {
+                delivered.root_span_id = Some(row.root_span_id.clone());
+            }
+            if !delivered.spans.contains(&row.span_id) {
+                delivered.spans.insert(row.span_id.clone());
+            }
+        }
+    }
+
+    /// The first delivered root span and the number of distinct delivered spans.
+    pub(crate) fn delivered(&self) -> (Option<String>, u64) {
+        let delivered = self.delivered.lock();
+        (delivered.root_span_id.clone(), delivered.spans.len() as u64)
+    }
 }
 
 enum SessionMsg {
@@ -130,9 +159,9 @@ impl Session {
                     }
                     SessionMsg::Flush(reply) | SessionMsg::Finalize(reply) => {
                         let kind = if finalize {
-                            crate::journal::ControlKind::Finalize
+                            crate::pipeline::input::ControlKind::Finalize
                         } else {
-                            crate::journal::ControlKind::Checkpoint
+                            crate::pipeline::input::ControlKind::Checkpoint
                         };
                         let target = producer.control(kind).await;
                         let progress = progress.clone();
@@ -163,7 +192,7 @@ impl Session {
                         let target = match target {
                             Some(tail) => Some(tail),
                             None if last => producer
-                                .control(crate::journal::ControlKind::Retire)
+                                .control(crate::pipeline::input::ControlKind::Retire)
                                 .await
                                 .ok(),
                             None => None,

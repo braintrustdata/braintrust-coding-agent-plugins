@@ -11,6 +11,8 @@ description = "Embeddable Braintrust coding-agent tracing daemon."
 default = []
 # Standalone development/test binary. Production embeds the library in `bt`.
 cli = []
+# Storage inspection and fault injection for this crate's integration tests.
+test-support = []
 
 [[bin]]
 name = "bt-daemon"
@@ -36,7 +38,7 @@ regex = "1"
 rquickjs = "0.12.2"
 rquickjs-serde = "0.6.1"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 semver = "1"
 sha2 = "0.10"
 sysinfo = { version = "0.33.1", default-features = false, features = ["system"] }
@@ -53,6 +55,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
 
 [dev-dependencies]
+bt-daemon = { path = ".", features = ["test-support"] }
 axum = "0.8"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }

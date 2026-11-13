@@ -277,9 +277,23 @@ async fn main() {
             }
         },
         Command::Import(args) => {
-            let data_dir = paths::data_dir(None);
-            let opts = debug_serve_options(VERSION, &data_dir);
-            match run_import(args, opts, None).await {
+            // The development binary imports into a debug-sink daemon, which
+            // writes span files instead of contacting Braintrust.
+            let mut host = host_info();
+            host.serve_argv.push(OsString::from("--debug-sink"));
+            let target = bt_daemon::ImportTarget {
+                socket: paths::socket_path(args.socket.as_deref()),
+                host,
+                route: bt_daemon::wire::SessionRoute {
+                    destination: Some(bt_daemon::wire::TraceDestination::ProjectLogs {
+                        project_id: None,
+                        project_name: Some("debug".into()),
+                    }),
+                    ..Default::default()
+                },
+                no_spawn: args.no_spawn,
+            };
+            match run_import(args, target).await {
                 Ok(summaries) => println!(
                     "{}",
                     render_output(&TraceCommandOutput::import(summaries), cli.json)

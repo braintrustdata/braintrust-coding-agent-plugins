@@ -65,9 +65,9 @@ not found, `-32602` invalid params, `-32603` internal); application errors use
 ### Ordering & delivery
 
 A capture adapter sends `event.log` as a **request** and waits only for the raw
-event and any transcript high-water reference to be flushed to the daemon's
-journal. The daemon then queues correlation, translation, and reporting on its
-own workers. Per-session journal appends are serialized, and the daemon keeps
+event and any transcript high-water reference to be committed to the daemon's
+session storage. The daemon then queues correlation, translation, and reporting on its
+own workers. Per-session captures are serialized, and the daemon keeps
 derived processing ordered without making the hook wait for it. Subprocess
 shims may exit as soon as they receive the response; long-lived in-process
 clients use the same request boundary.
@@ -109,7 +109,7 @@ The hot path. Params are the **Envelope** (see below). Request result:
 { "accepted": true }
 ```
 `accepted: true` means the raw capture is durably recorded in the source
-journal. It does not mean authentication, correlation, translation, session
+session's storage. It does not mean authentication, correlation, translation, session
 queueing, or Braintrust delivery has completed. Those steps run out-of-band;
 errors are surfaced via `status.get`. Before correlating a new session, the
 daemon settles previously dispatched parent events. Command-hook correlation
@@ -118,7 +118,7 @@ process. This discovery window ends after five seconds or three events, whicheve
 comes first; insufficient evidence falls back to the original standalone route.
 A timer enforces the deadline even if no further events arrive. Pending
 sessions remain visible in status with a nonzero `queued` count and an
-explanation in `last_error`. On restart, uncheckpointed journal entries are
+explanation in `last_error`. On restart, captured events not yet delivered are
 queued again automatically. Explicit status and flush requests act as
 daemon-worker barriers, but hook capture never does.
 
@@ -161,6 +161,33 @@ has flushed. Params:
 The result has the same shape as `session.flush`. The managed-run identifier is
 invocation-local and prevents the shared daemon from flushing unrelated agent
 sessions.
+
+### `import.finish` (request)
+
+Transcript import is a daemon client. It starts or upgrades the daemon exactly
+as hook capture does, sends every synthesized lifecycle event with `event.log`
+over one connection, then finishes each imported session with this request.
+The daemon waits for those captures to reach every delivery route of the
+session matching `route`. With `finalize: true` it first closes the session's
+open spans, as a completed transcript does; `false` only flushes, as when
+`--attach` detaches. Params:
+```json
+{ "source": "codex", "session_id": "…", "route": { … }, "finalize": true, "timeout_ms": 120000 }
+```
+Result:
+```json
+{ "flushed": true, "pending": 0, "root_span_id": "…", "span_count": 12 }
+```
+`span_count` counts distinct spans the route has delivered since its actor
+started. An attached import reports its parent's root span. A session that
+was never accepted for delivery, for example because its credentials could not
+be resolved, is an error.
+
+### `import.reset` (request)
+
+`{ "source": "…", "session_id": "…" }`. The native transcript was rewritten
+rather than appended. After every earlier capture, translation for the source
+session restarts from fresh state; output already delivered is unaffected.
 
 ### `status.get` (request)
 
@@ -259,13 +286,9 @@ version, `context.span_origin.<source>.version` is its coding-agent
 span creation. `<source>` is the canonical name, such as `codex` or `claude-code`,
 not a literal `agent` key. Unknown plugin and agent versions are explicit JSON
 `null`; they never fall back to another component's version. The
-destination-scoped delivery ledger persists each snapshot before export; later
-updates, resume, and replay reuse it unchanged, even across upgrades.
-New snapshots and delivery acknowledgements are appended as NDJSON records,
-without rewriting prior entries. Recovery combines any legacy JSON checkpoint
-with those records and discards an incomplete final record from an interrupted write.
-A per-ledger OS file lock serializes state refresh, origin selection, tail repair,
-and append across daemon and import processes. SDK delivery runs outside the lock.
+session's storage records each snapshot when its span is created, before
+delivery; later updates, resume, and replay reuse it unchanged, even across
+upgrades.
 New spans capture new snapshots instead of inheriting the root's versions.
 Provisional roots retain their original snapshot while waiting for work.
 An unmaterialized span replayed for a new destination uses its
@@ -279,7 +302,7 @@ translator. The Pi extension sends the running host package's version as
 `source_version` and its package name as `payload.host_name`. The translator records
 `metadata.host_name`; the session-root label remains `Pi` for every Pi-compatible host.
 
-For acknowledged spans from legacy ledgers without saved snapshots, stateless
+For spans an earlier daemon acknowledged without saving snapshots, stateless
 updates omit `context.span_origin` entirely, including SDK defaults and inherited
 parent origin fields. This preserves existing backend provenance without guessing
 historical versions; output, timing, and unrelated propagated context still merge
@@ -369,8 +392,8 @@ Field notes:
 
 ### Redaction
 
-Live credentials returned by the host provider are **never** written to the
-journal, logs, status, or RPC response. Envelopes journal only their non-secret
+Live credentials returned by the host provider are **never** written to
+session storage, logs, status, or RPC response. Stored envelopes keep only their non-secret
 `route`, allowing restart recovery to resolve a fresh lease. Span plugins read
 an environment snapshot captured inside their daemon worker process; it is not
 part of the envelope or journal schema.
@@ -392,32 +415,33 @@ part of the envelope or journal schema.
   zero active sessions and empty queues.
 - **Session retirement.** A delivery pipeline with no traffic for
   `--session-idle-timeout` (default 300 s) and an empty queue is flushed and
-  dropped: its translator state, sink handles, credential lease, and journal
+  dropped: its translator state, sink handles, credential lease, and storage
   handle are released rather than held for the daemon's lifetime. A later
-  event rebuilds it from the journal, and deterministic span ids merge the
+  event resumes it from session storage, and deterministic span ids merge the
   re-emitted rows. This matters because the idle exit above requires *every*
   session to be quiet, which for a continuously active user never happens.
 - **Version handover.** `initialize` compares versions. Older clients use a
   newer compatible daemon. A newer client sends `daemon.shutdown`; the old
   daemon quiesces and drains before acknowledging, then the client spawns its
-  daemon. In-flight session state is rebuilt from the journal. This makes
+  daemon. In-flight session state resumes from session storage. This makes
   upgrades monotonic instead of allowing mixed-version clients to repeatedly
   replace each other.
 
 ## Durability & idempotence
 
-Journal recovery and explicit transcript import are separate operations.
-Recovery consumes the daemon's auth-redacted event WAL to rebuild state and
-may idempotently re-emit rows under their original deterministic ids. The
+Transcript import and hook capture share one pipeline. The
 `import <codex|claude> <session-id> [project_logs:<project-id> |
-experiment:<experiment-id>]` command instead locates the selected agent's
-native transcript and creates a trace for that past coding-agent session by
-routing synthetic lifecycle events through the regular translator. `--parent
+experiment:<experiment-id>]` command locates the selected agent's native
+transcript and captures synthetic lifecycle events with the daemon, which
+translates and delivers them like hook events (see `import.finish`). Capture is
+idempotent while a session's storage exists: the same event captured again for
+the same route, such as a repeated import, is acknowledged without being
+recorded twice. `--parent
 <SpanComponents>` attaches it below an exported span and is mutually exclusive
 with an object destination.
 
-`--attach` keeps a single translator and sink alive, tails new native records,
-and finalizes the active turn on Ctrl-C.
+`--attach` keeps capturing new native records as the transcript grows, and
+detaches on Ctrl-C without closing the native session's open spans.
 `run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent with
 inherited stdio and injects its tracing integration for that invocation, so it
 works without plugin setup. Codex and Claude receive live hook configuration;
@@ -427,7 +451,7 @@ inherited environment marker makes installed Braintrust plugin hooks no-op for
 that managed child, while a private hook flag authorizes the injected hook process.
 Codex does not bypass hook trust: the user reviews the injected hook once through
 `/hooks`, and Codex reuses its hash-based trust while the definition is unchanged.
-The resulting native hook events follow the regular journal, translator, and
+The resulting native hook events follow the regular capture, translator, and
 sink path; transcript tailing remains specific to `import --attach`.
 The managed child inherits a non-secret invocation-settings value containing
 `trace_to_braintrust: true` and its immutable `SessionRoute`. This overrides the
@@ -435,45 +459,42 @@ persistent setup route only within that process tree. Other agent processes
 continue using setup settings, and concurrent managed runs can select distinct
 profiles, organizations, and destinations while sharing one daemon.
 
-- **Journal (WAL).** Every accepted event is appended (auth-redacted) to
-  `<data_dir>/journal/<source>--<session_id>--<stable-id>.ndjson` before/at
-  enqueue — one journal file per source and session_id, shared across every
-  route that session has opened. The sanitized session_id keeps only its tail
-  when the name would exceed 255 bytes; the stable id keeps names distinct.
-  `data_dir` defaults to `$XDG_STATE_HOME/braintrust/bt-daemon` or
+- **Session storage.** Each source session has one SQLite database,
+  `<data_dir>/pipeline/<stable-id>.sqlite`, shared by every route that session
+  has opened. `data_dir` defaults to `$XDG_STATE_HOME/braintrust/bt-daemon` or
   `$HOME/.braintrust/state/bt-daemon` on Unix, and
-  `%LOCALAPPDATA%\Braintrust\bt-daemon` on Windows. On restart the daemon
-  rebuilds each route's unfinished correlation state independently, replaying
-  only the journal entries whose delivery route matches that pipeline into a
-  fresh translator. Span plugin paths are ignored for this comparison so raw
-  events can be replayed through the current plugin chain. The resulting rows
-  may be resubmitted to repair delivery
-  interrupted by a crash, but their deterministic ids target the same backend
-  rows and must never create duplicate spans, and a route never receives
-  another route's rows. Replay streams the journal and is bounded to the
-  bytes recorded before the replaying session was created, so recovering a
-  long session costs no more memory than running it. The journal itself is
-  never capped or truncated — dropping entries would silently cost recovery
-  fidelity — so its size is governed by writing each transcript byte once
-  (below) and by GC after 7 days.
+  `%LOCALAPPDATA%\Braintrust\bt-daemon` on Windows. Capture inserts each
+  accepted event (auth-redacted) before acknowledging it. Translation removes
+  consumed events in the same transaction that stores their SpanOps and the
+  translator's continuation, so a crash either keeps the event or keeps its
+  output, never neither. Each route has a durable head; a SpanOp is removed
+  once every route has delivered it. Deterministic ids mean a route resuming
+  after a crash may resubmit rows that target the same backend rows, never
+  duplicate spans, and a route never receives another route's rows. What
+  remains after delivery is only the continuation and small per-span metadata
+  a resumed session needs; storage of a session that owes nothing is deleted
+  once it has been inactive for 7 days. Activity is recorded by capture,
+  translation and delivery, never by opening storage. NDJSON journals written
+  by earlier daemons are read only to import them, at their original
+  positions, and are then deleted; their delivery ledgers are deleted.
 - **Transcript mirrors.** Claude transcript files are external mutable state,
   so a lifecycle event must stay replayable after the agent rewrites the path
   it came from. The daemon appends new transcript bytes to
   `<data_dir>/transcripts/<uuid>.jsonl` — one mirror per
-  (session_id, transcript path) — and the journal entry carries only
+  (session_id, transcript path) — and the captured event carries only
   `_bt_transcript_mirror: {path, mirror, through}`. `through` is the mirror's
   high-water offset at acceptance, which bounds replay to exactly the bytes
-  the live run saw. Storing each byte once keeps a journal proportional to a
+  the live run saw. Storing each byte once keeps captured input proportional to a
   session's transcript rather than to its transcript times its turn count.
   Entries written before mirroring instead carry the whole transcript inline
   as `_bt_transcript_snapshot`, which translators still accept. Mirrors are
-  GC'd after 7 days like the journal.
-- **Managed-run acceptance records.** Alongside the journal, each accepted
+  GC'd after 7 days once no retained session references them.
+- **Managed-run acceptance records.** Alongside session storage, each accepted
   event that carries a `managed_run_id` also appends `{session_id, route}` to
   `<data_dir>/managed-runs/<managed_run_id>.ndjson`. `managed_run.flush` reads
   this record when the daemon that accepted the events has since restarted or
   idle-exited, so flush accounting for a child process tree survives a daemon
-  generation change. GC'd after 7 days like the journal.
+  generation change. GC'd after 7 days.
 - **Deterministic span ids.** Translators derive span ids as UUIDv5 over stable
   keys (`session_id`, `turn_id`, `call_id`, …) so a replayed re-emit merges
   server-side (`_is_merge`) instead of duplicating.

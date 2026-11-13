@@ -1,4 +1,4 @@
-//! Delivery keys and the per-session actors, journal writers and locks.
+//! Delivery keys and the per-session actors, event collections and locks.
 
 use super::*;
 
@@ -47,19 +47,12 @@ impl Daemon {
         if let Some(source) = self.translations.lock().get(&storage_key).cloned() {
             return Ok(source);
         }
-        let event_path =
-            journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
-        let namespace =
-            if journal::legacy_journal_has_session(&self.data_dir, &env.source, &env.session_id)
-                .await
-            {
-                env.session_id.clone()
-            } else {
-                storage_key.clone()
-            };
-        let events = self
-            .journal_writer_for(&env.source, &env.session_id)
-            .await?;
+        let events = self.events_for(&env.source, &env.session_id).await?;
+        let namespace = if events.legacy_namespace().await? {
+            env.session_id.clone()
+        } else {
+            storage_key.clone()
+        };
         let source = crate::pipeline::translation::Translation::spawn(
             crate::pipeline::translation::TranslationOptions {
                 source: env.source.clone(),
@@ -68,7 +61,6 @@ impl Daemon {
                 version: self.version.clone(),
                 data_dir: self.data_dir.clone(),
                 events,
-                event_path,
                 input: self.source_input_for(&env.source, &env.session_id),
                 registry: self.translators.clone(),
                 correlation: self.correlation.clone(),
@@ -105,11 +97,6 @@ impl Daemon {
         // appended, so replay covers prior source observations only. Every
         // destination consumes that shared observation stream, with its own
         // delivery checkpoint controlling which rows reach its sink.
-        let journal_path =
-            journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
-        let legacy_through =
-            journal::JournalReader::acknowledged_through(&journal_path, replay_through, &route)
-                .await;
         let translation = self.translation_for(env).await?;
         let settings = translation.route_settings(&route).await?;
         let config = settings.with_auth(config.auth);
@@ -127,7 +114,7 @@ impl Daemon {
         // Materialize historical output before seeding a released completion boundary.
         translation.advance(replay_through).await?;
         let _ = translation.barrier().await;
-        let input = translation.subscribe(&route, legacy_through).await?;
+        let input = translation.subscribe(&route).await?;
         let mut map = self.sessions.lock();
         if let Some(s) = map.get(key) {
             return Ok(s.clone());
@@ -223,11 +210,7 @@ impl Daemon {
             self.claude_transcripts.lock().retain(|candidate, _| {
                 candidate.source != key.source || candidate.session_id != key.session_id
             });
-            self.journals.lock().remove(&journal::source_journal_path(
-                &self.data_dir,
-                &key.source,
-                &key.session_id,
-            ));
+            self.journals.lock().remove(&storage_key);
             let mut inputs = self.source_inputs.lock();
             if inputs
                 .get(&storage_key)
@@ -262,45 +245,23 @@ impl Daemon {
             .collect()
     }
 
-    pub(super) async fn journal_writer_for(
+    /// The shared input collection for a source session. Opening it imports
+    /// any legacy journal once, before capture or recovery can use it.
+    pub(super) async fn events_for(
         &self,
         source: &str,
         session_id: &str,
-    ) -> anyhow::Result<Arc<tokio::sync::Mutex<JournalWriter>>> {
-        let path = journal::source_journal_path(&self.data_dir, source, session_id);
+    ) -> anyhow::Result<EventCollection> {
         let slot = self
             .journals
             .lock()
-            .entry(path.clone())
+            .entry(crate::ids::session_namespace(source, session_id))
             .or_default()
             .clone();
-        // A recovery actor and capture may open the same source concurrently.
-        // Tail repair must finish exactly once before either can append.
-        let writer = slot
-            .get_or_try_init(|| async {
-                let path =
-                    journal::ensure_source_journal(&self.data_dir, source, session_id).await?;
-                let writer = JournalWriter::open_path(&path).await?;
-                Ok::<_, anyhow::Error>(Arc::new(tokio::sync::Mutex::new(writer)))
-            })
+        let events = slot
+            .get_or_try_init(|| EventCollection::open(&self.data_dir, source, session_id))
             .await?;
-        Ok(writer.clone())
-    }
-
-    /// Take only the durable append position, never hold the writer while
-    /// reading/replaying records. Recheck after metadata I/O if it opened meanwhile.
-    pub(super) async fn journal_snapshot(&self, path: &std::path::Path) -> u64 {
-        let slot = self.journals.lock().get(path).cloned();
-        if let Some(writer) = slot.and_then(|slot| slot.get().cloned()) {
-            return writer.lock().await.position();
-        }
-        let recorded = journal::JournalReader::recorded_len(path).await;
-        let slot = self.journals.lock().get(path).cloned();
-        if let Some(writer) = slot.and_then(|slot| slot.get().cloned()) {
-            recorded.min(writer.lock().await.position())
-        } else {
-            recorded
-        }
+        Ok(events.clone())
     }
 
     pub(super) fn source_input_for(
@@ -315,18 +276,20 @@ impl Daemon {
             .clone()
     }
 
-    pub(super) async fn append_to_journal(
+    pub(super) async fn append_event(
         &self,
         env: &Envelope,
-        writer: &mut JournalWriter,
-    ) -> anyhow::Result<crate::pipeline::input::SourcePosition> {
-        let before = writer.position();
+        events: &EventCollection,
+    ) -> anyhow::Result<Option<crate::pipeline::input::SourcePosition>> {
+        let Some(appended) = events.append(env, None).await? else {
+            return Ok(None);
+        };
         if let Some(cutoffs) = self.startup_cutoffs.lock().as_mut() {
-            let path = journal::source_journal_path(&self.data_dir, &env.source, &env.session_id);
-            cutoffs.entry(path).or_insert(before);
+            cutoffs
+                .entry(crate::ids::session_namespace(&env.source, &env.session_id))
+                .or_insert(appended.before);
         }
-        let through = writer.append(env).await?;
-        Ok(crate::pipeline::input::SourcePosition { before, through })
+        Ok(Some(appended))
     }
 
     pub(super) fn session_lock(

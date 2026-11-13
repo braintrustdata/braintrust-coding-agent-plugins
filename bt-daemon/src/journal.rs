@@ -1,20 +1,15 @@
-//! Per-session write-ahead journal. Every accepted event is appended
-//! (auth-redacted) before the caller is acked, so a restarted daemon can
-//! rebuild session state by replaying the journal through the translator.
+//! On-disk naming for session state, and managed-run acceptance records.
 //!
-//! Format: one [`RedactedEnvelope`] JSON value per line in
-//! `<data_dir>/journal/<source>--<session>--<stable-id>.ndjson`, where an
-//! overlong sanitized session id keeps only its tail to fit one file name.
-//!
-//! Managed-run acceptance records live alongside the journals so a flush can
-//! still tell which delivery pipelines a managed child produced after the
-//! daemon that accepted them has restarted or idle-exited.
+//! Captured events live in [`crate::collections`]. NDJSON journals written by
+//! earlier daemons are only read there, to migrate them, and are then deleted.
+//! Managed-run acceptance records remain separate so flush can discover
+//! pipelines after the daemon that accepted them has restarted or idle-exited.
 
 use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 pub fn journal_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("journal")
@@ -39,7 +34,7 @@ pub fn journal_path(data_dir: &Path, session_id: &str) -> PathBuf {
     journal_dir(data_dir).join(format!("{}.ndjson", sanitize(session_id)))
 }
 
-/// Source-qualified journal path. The stable suffix prevents sanitized native
+/// Source-qualified legacy journal path. The stable suffix prevents sanitized native
 /// ids such as `a/b` and `a_b` from aliasing the same file, so a session id
 /// too long for one file name keeps only its tail (Pi ids embed the session
 /// file path). Names that fit are unchanged, so existing journals still match.
@@ -54,34 +49,6 @@ pub fn source_journal_path(data_dir: &Path, source: &str, session_id: &str) -> P
     // `sanitize` emits ASCII only, so any byte offset is a char boundary.
     let session = &session[session.len().saturating_sub(budget)..];
     journal_dir(data_dir).join(format!("{prefix}{session}{suffix}"))
-}
-
-/// Return the source-qualified journal, copying the legacy session-only file
-/// on first use so an upgrade retains replay history. The legacy file remains
-/// untouched for rollback and is no longer appended after migration.
-pub async fn ensure_source_journal(
-    data_dir: &Path,
-    source: &str,
-    session_id: &str,
-) -> anyhow::Result<PathBuf> {
-    let path = source_journal_path(data_dir, source, session_id);
-    if tokio::fs::metadata(&path).await.is_ok() {
-        return Ok(path);
-    }
-    let legacy = journal_path(data_dir, session_id);
-    // A legacy name too long for the filesystem was never written.
-    if legacy.file_name().map_or(0, |name| name.len()) > MAX_FILE_NAME_BYTES {
-        return Ok(path);
-    }
-    match tokio::fs::metadata(&legacy).await {
-        Ok(_) => {
-            tokio::fs::create_dir_all(journal_dir(data_dir)).await?;
-            tokio::fs::copy(&legacy, &path).await?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(path)
 }
 
 pub fn managed_run_dir(data_dir: &Path) -> PathBuf {
@@ -147,48 +114,48 @@ pub async fn read_managed_run_keys(data_dir: &Path, managed_run_id: &str) -> Vec
 
 /// Recover the source omitted by pre-source-qualified managed-run records.
 /// Route matching avoids selecting an unrelated delivery pipeline when an old
-/// session journal contains more than one destination.
+/// session contained more than one destination. The source that owned the
+/// legacy session namespace wins when several match.
 pub async fn legacy_journal_source(
     data_dir: &Path,
     session_id: &str,
     route: &SessionRoute,
 ) -> Option<String> {
-    let path = journal_path(data_dir, session_id);
-    let through = JournalReader::recorded_len(&path).await;
-    let mut reader = JournalReader::open(&path, through).await.ok().flatten()?;
-    while let Ok(Some(entry)) = reader.next_entry().await {
-        if entry
-            .route
-            .as_ref()
-            .is_some_and(|candidate| candidate.same_route(route))
-        {
-            return Some(entry.source);
+    let mut found = None;
+    for storage in crate::collections::sessions(data_dir).await.ok()? {
+        let Ok(events) = storage.events().await else {
+            continue;
+        };
+        let Ok(Some((source, session))) = events.owner().await else {
+            continue;
+        };
+        if session != session_id {
+            continue;
+        }
+        let recorded = events
+            .identity()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|identity| identity.route)
+            .is_some_and(|candidate| candidate.same_route(route));
+        let registered = match storage.span_ops().await {
+            Ok(ops) => ops
+                .routes()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|candidate| candidate.same_route(route)),
+            Err(_) => false,
+        };
+        if recorded || registered {
+            if events.legacy_namespace().await.unwrap_or(false) {
+                return Some(source);
+            }
+            found.get_or_insert(source);
         }
     }
-    None
-}
-
-/// Whether this source owned the session actor recorded by a pre-qualification
-/// daemon. Only the first source recorded for a native session keeps the old
-/// span-id namespace: the legacy daemon had one actor and one namespace per
-/// native session even if its journal later received mixed-source events.
-pub async fn legacy_journal_has_session(
-    data_dir: &Path,
-    canonical_source: &str,
-    session_id: &str,
-) -> bool {
-    let path = journal_path(data_dir, session_id);
-    let through = JournalReader::recorded_len(&path).await;
-    let Ok(Some(mut reader)) = JournalReader::open(&path, through).await else {
-        return false;
-    };
-    while let Ok(Some(entry)) = reader.next_entry().await {
-        let recorded_source = crate::translate::canonical_source_name(&entry.source);
-        if entry.session_id == session_id {
-            return recorded_source == canonical_source;
-        }
-    }
-    false
+    found
 }
 
 /// Best-effort age-based collection of managed-run records, mirroring journal
@@ -215,478 +182,6 @@ pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) 
             let _ = tokio::fs::remove_file(&path).await;
         }
     }
-}
-
-/// Append-only journal writer for one session.
-pub struct JournalWriter {
-    file: tokio::fs::File,
-    position: u64,
-    pi_context: Vec<serde_json::Value>,
-}
-
-impl JournalWriter {
-    pub async fn open_path(path: &Path) -> anyhow::Result<Self> {
-        if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        let position = file.metadata().await?.len();
-        Ok(Self {
-            file,
-            position,
-            pi_context: Vec::new(),
-        })
-    }
-
-    pub(crate) fn position(&self) -> u64 {
-        self.position
-    }
-
-    /// Append one redacted event and confirm its durable write before capture acknowledges it.
-    ///
-    /// The journal is a durability record and is never capped or truncated:
-    /// dropping entries would silently cost recovery fidelity. Its size is
-    /// bounded instead by writing each transcript byte once (see
-    /// [`crate::transcript_mirror`]) and by age-based GC, and replay reads it
-    /// as a stream so a large journal never becomes a large allocation.
-    pub async fn append(&mut self, env: &Envelope) -> anyhow::Result<u64> {
-        let mut redacted = env.redacted();
-        compact_pi_payload(&mut redacted, &mut self.pi_context);
-        let mut line = serde_json::to_vec(&redacted)?;
-        line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.flush().await?;
-        self.file.sync_data().await?;
-        self.position += line.len() as u64;
-        Ok(self.position)
-    }
-
-    pub(crate) async fn append_control(
-        &mut self,
-        control: &PipelineControl,
-    ) -> anyhow::Result<u64> {
-        let mut value = serde_json::to_value(control)?;
-        value["_bt_record_type"] = "pipeline_control".into();
-        let mut line = serde_json::to_vec(&value)?;
-        line.push(b'\n');
-        self.file.write_all(&line).await?;
-        self.file.flush().await?;
-        self.file.sync_data().await?;
-        self.position += line.len() as u64;
-        Ok(self.position)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DeliveryCheckpointRecord {
-    #[serde(rename = "_bt_record_type")]
-    record_type: String,
-    route: SessionRoute,
-    through: u64,
-}
-
-#[derive(Debug)]
-// Keep event records inline on the journal read path; the added capture
-// completeness bit makes this enum just exceed Clippy's size threshold.
-#[allow(clippy::large_enum_variant)]
-pub enum JournalRecord {
-    Event(RedactedEnvelope),
-    Control(PipelineControl),
-    DeliveryCheckpoint { route: SessionRoute, through: u64 },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlKind {
-    Checkpoint,
-    Finalize,
-    Retire,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineControl {
-    pub kind: ControlKind,
-    pub bounds: std::collections::HashMap<String, u64>,
-}
-
-#[derive(Debug)]
-pub struct JournalRecordEntry {
-    pub record: JournalRecord,
-    /// Exclusive byte offset after this record in the journal.
-    pub through: u64,
-}
-
-/// Streaming reader over one session's journal.
-///
-/// Replay must never materialize a whole journal: the file is read line by
-/// line so peak memory is one entry, not the entire recorded session.
-pub struct JournalReader {
-    reader: tokio::io::BufReader<tokio::io::Take<tokio::fs::File>>,
-    path: PathBuf,
-    line_no: usize,
-    position: u64,
-    pi_context: Vec<serde_json::Value>,
-}
-
-impl JournalReader {
-    pub(crate) fn position(&self) -> u64 {
-        self.position
-    }
-
-    /// Rebuild decoder context before continuing at a saved record boundary.
-    pub(crate) async fn resume(path: &Path, position: u64, through: u64) -> anyhow::Result<Self> {
-        anyhow::ensure!(position <= through, "invalid recovery range");
-        let mut reader = Self::open(path, through)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("recovery journal is missing"))?;
-        while reader.position < position {
-            anyhow::ensure!(
-                reader.next_record().await?.is_some(),
-                "recovery journal ended before its boundary"
-            );
-        }
-        anyhow::ensure!(reader.position == position, "invalid recovery boundary");
-        Ok(reader)
-    }
-
-    /// Open a journal for streaming, reading at most `through` bytes.
-    ///
-    /// That bound is what keeps replay from consuming the very event that
-    /// triggered the session's creation: the caller records the journal's
-    /// length before appending, so the actor replays strictly what was
-    /// already recovered state, never the live event still on its way to the
-    /// queue. `Ok(None)` means the session has no journal yet.
-    pub async fn open(path: &Path, through: u64) -> anyhow::Result<Option<Self>> {
-        let file = match tokio::fs::File::open(path).await {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        Ok(Some(Self {
-            reader: tokio::io::BufReader::new(file.take(through)),
-            path: path.to_path_buf(),
-            line_no: 0,
-            position: 0,
-            pi_context: Vec::new(),
-        }))
-    }
-
-    /// The journal's current length, which is the bound a session created now
-    /// should replay through. A missing journal replays nothing.
-    pub async fn recorded_len(path: &Path) -> u64 {
-        tokio::fs::metadata(path)
-            .await
-            .map(|meta| meta.len())
-            .unwrap_or(0)
-    }
-
-    /// The next entry, or `None` at end of file.
-    pub async fn next_entry(&mut self) -> anyhow::Result<Option<RedactedEnvelope>> {
-        while let Some(entry) = self.next_record().await? {
-            if let JournalRecord::Event(env) = entry.record {
-                return Ok(Some(env));
-            }
-        }
-        Ok(None)
-    }
-
-    /// The next journal record, including delivery checkpoints written by a
-    /// previous daemon generation.
-    pub async fn next_record(&mut self) -> anyhow::Result<Option<JournalRecordEntry>> {
-        loop {
-            let mut bytes = Vec::new();
-            let read = self.reader.read_until(b'\n', &mut bytes).await?;
-            if read == 0 {
-                return Ok(None);
-            }
-            self.position += read as u64;
-            self.line_no += 1;
-            let path = self.path.clone();
-            let line_no = self.line_no;
-            let position = self.position;
-            let mut pi_context = std::mem::take(&mut self.pi_context);
-            let (pi_context, record) = tokio::task::spawn_blocking(move || {
-                let record = decode_record(&bytes, &path, line_no, position, &mut pi_context);
-                (pi_context, record)
-            })
-            .await?;
-            self.pi_context = pi_context;
-            if let Some(record) = record? {
-                return Ok(Some(record));
-            }
-        }
-    }
-
-    pub(crate) fn extend(&mut self, through: u64) {
-        let buffered = self.reader.buffer().len() as u64;
-        self.reader
-            .get_mut()
-            .set_limit(through.saturating_sub(self.position + buffered));
-    }
-
-    /// The latest acknowledged event offset for `route` in the portion of the
-    /// journal being recovered. Older journals contain no checkpoints and
-    /// therefore retain their existing replay behavior.
-    pub async fn acknowledged_through(path: &Path, through: u64, route: &SessionRoute) -> u64 {
-        let Ok(Some(mut reader)) = Self::open(path, through).await else {
-            return 0;
-        };
-        let mut acknowledged = 0;
-        while let Ok(Some(entry)) = reader.next_record().await {
-            if let JournalRecord::DeliveryCheckpoint {
-                route: candidate,
-                through,
-            } = entry.record
-            {
-                if candidate.same_route(route) {
-                    acknowledged = acknowledged.max(through);
-                }
-            }
-        }
-        acknowledged
-    }
-}
-
-fn decode_record(
-    bytes: &[u8],
-    path: &Path,
-    line_no: usize,
-    position: u64,
-    pi_context: &mut Vec<serde_json::Value>,
-) -> anyhow::Result<Option<JournalRecordEntry>> {
-    let line = std::str::from_utf8(bytes)
-        .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?
-        .trim();
-    if line.is_empty() {
-        return Ok(None);
-    }
-    let value: serde_json::Value = serde_json::from_str(line)
-        .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-    let record = if value
-        .get("_bt_record_type")
-        .and_then(serde_json::Value::as_str)
-        == Some("delivery_checkpoint")
-    {
-        let checkpoint: DeliveryCheckpointRecord = serde_json::from_value(value)
-            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-        JournalRecord::DeliveryCheckpoint {
-            route: checkpoint.route,
-            through: checkpoint.through,
-        }
-    } else if value
-        .get("_bt_record_type")
-        .and_then(serde_json::Value::as_str)
-        == Some("pipeline_control")
-    {
-        JournalRecord::Control(serde_json::from_value(value)?)
-    } else {
-        let mut event = serde_json::from_value(value)
-            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-        expand_pi_payload(&mut event, pi_context)
-            .map_err(|error| anyhow::anyhow!("journal {}:{}: {error}", path.display(), line_no))?;
-        JournalRecord::Event(event)
-    };
-    Ok(Some(JournalRecordEntry {
-        record,
-        through: position,
-    }))
-}
-
-const PI_MESSAGES_DELTA: &str = "_bt_messages_delta";
-
-fn compact_pi_payload(event: &mut RedactedEnvelope, previous: &mut Vec<serde_json::Value>) {
-    if event.source != "pi" {
-        return;
-    }
-    let Some(native) = event
-        .payload
-        .get_mut("event")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-    match event.event.as_str() {
-        "context" => {
-            let Some(messages) = native
-                .remove("messages")
-                .and_then(|messages| messages.as_array().cloned())
-            else {
-                return;
-            };
-            let common_prefix = previous
-                .iter()
-                .zip(&messages)
-                .take_while(|(left, right)| left == right)
-                .count();
-            native.insert(
-                PI_MESSAGES_DELTA.into(),
-                serde_json::json!({
-                    "common_prefix": common_prefix,
-                    "suffix": messages[common_prefix..],
-                }),
-            );
-            *previous = messages;
-        }
-        "before_provider_request" => {
-            // The translator records only the allowlisted request
-            // configuration and tool definitions, never the prompt or messages.
-            if let Some(payload) = native.get_mut("payload") {
-                *payload = serde_json::Value::Object(crate::translate::pi_request_config(payload));
-            }
-        }
-        "agent_end" => {
-            // The translator only consumes willRetry from this lifecycle event.
-            native.remove("messages");
-        }
-        "message_update" => {
-            // Pi repeats the progressively growing assistant message on every
-            // streaming update. Translation only needs the update type to mark
-            // time-to-first-token; the completed message arrives separately in
-            // message_end.
-            native.remove("message");
-            if let Some(update) = native
-                .get_mut("assistantMessageEvent")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                update.retain(|key, _| key == "type");
-            }
-            native.retain(|key, _| key == "type" || key == "assistantMessageEvent");
-        }
-        _ => {}
-    }
-}
-
-fn expand_pi_payload(
-    event: &mut RedactedEnvelope,
-    previous: &mut Vec<serde_json::Value>,
-) -> anyhow::Result<()> {
-    if event.source != "pi" || event.event != "context" {
-        return Ok(());
-    }
-    let Some(native) = event
-        .payload
-        .get_mut("event")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-    let Some(delta) = native.remove(PI_MESSAGES_DELTA) else {
-        if let Some(messages) = native.get("messages").and_then(serde_json::Value::as_array) {
-            *previous = messages.clone();
-        }
-        return Ok(());
-    };
-    let common_prefix = delta
-        .get("common_prefix")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or_else(|| anyhow::anyhow!("invalid Pi context common prefix"))?;
-    anyhow::ensure!(
-        common_prefix <= previous.len(),
-        "Pi context common prefix exceeds prior context"
-    );
-    let suffix = delta
-        .get("suffix")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("invalid Pi context suffix"))?;
-    previous.truncate(common_prefix);
-    previous.extend(suffix.iter().cloned());
-    native.insert(
-        "messages".into(),
-        serde_json::Value::Array(previous.clone()),
-    );
-    Ok(())
-}
-
-/// Best-effort age-based journal collection. A failed stat/remove is logged
-/// and ignored; stale state must never prevent the daemon from serving hooks.
-pub async fn gc_old_journals(data_dir: &Path, max_age: std::time::Duration) {
-    let dir = journal_dir(data_dir);
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("ndjson") {
-            continue;
-        }
-        let old = entry
-            .metadata()
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > max_age);
-        let partition = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.rsplit("--").next());
-        let protected = match partition {
-            Some(id) => {
-                tokio::fs::try_exists(data_dir.join("pipeline").join(format!("{id}.sqlite")))
-                    .await
-                    .unwrap_or(true)
-            }
-            None => false,
-        };
-        if old && !protected && legacy_collectible(data_dir, &path).await {
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                tracing::warn!(path = %path.display(), "failed to remove stale journal: {e}");
-            }
-        }
-    }
-}
-
-// Pre-SpanOp journals can be collected only with explicit completion evidence.
-// Unknown or uncheckpointed history stays available for migration/reconstruction.
-async fn legacy_collectible(data_dir: &Path, path: &Path) -> bool {
-    let Ok(Some(mut reader)) =
-        JournalReader::open(path, JournalReader::recorded_len(path).await).await
-    else {
-        return false;
-    };
-    let mut observed = std::collections::HashMap::<String, u64>::new();
-    let mut completed = std::collections::HashMap::<String, u64>::new();
-    loop {
-        match reader.next_record().await {
-            Ok(Some(entry)) => match entry.record {
-                JournalRecord::Event(event) => {
-                    let partition = data_dir.join("pipeline").join(format!(
-                        "{}.sqlite",
-                        crate::ids::session_storage_id(&event.source, &event.session_id)
-                    ));
-                    if tokio::fs::try_exists(partition).await.unwrap_or(true) {
-                        return false;
-                    }
-                    let Some(route) = event.route else {
-                        return false;
-                    };
-                    observed.insert(
-                        serde_json::to_string(&route).unwrap_or_default(),
-                        entry.through,
-                    );
-                }
-                JournalRecord::DeliveryCheckpoint { route, through } => {
-                    completed
-                        .entry(serde_json::to_string(&route).unwrap_or_default())
-                        .and_modify(|previous| *previous = (*previous).max(through))
-                        .or_insert(through);
-                }
-                JournalRecord::Control(_) => return false,
-            },
-            Ok(None) => break,
-            Err(_) => return false,
-        }
-    }
-    !observed.is_empty()
-        && observed
-            .iter()
-            .all(|(route, through)| completed.get(route).copied().unwrap_or(0) >= *through)
 }
 
 /// Reconstruct a translator-usable [`Envelope`] from a redacted journal entry.
@@ -723,173 +218,6 @@ pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
 mod tests {
     use super::*;
 
-    fn pi_context(messages: Vec<serde_json::Value>, ts_ms: i64) -> Envelope {
-        Envelope {
-            source: "pi".into(),
-            source_version: None,
-            plugin_version: None,
-            session_id: "pi-session".into(),
-            event: "context".into(),
-            ts_ms,
-            managed_run_id: None,
-            capture: None,
-            payload: serde_json::json!({"event":{"type":"context","messages":messages}}),
-            route: None,
-            config: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn pi_context_history_is_delta_encoded_and_replayed() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pi.ndjson");
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let mut messages = Vec::new();
-        let mut naive_bytes = 0usize;
-        for index in 0..20 {
-            messages.push(serde_json::json!({
-                "role":"user",
-                "content": format!("{index}:{}", "x".repeat(4096)),
-            }));
-            let event = pi_context(messages.clone(), index);
-            naive_bytes += serde_json::to_vec(&event.redacted()).unwrap().len() + 1;
-            writer.append(&event).await.unwrap();
-        }
-        let compacted = vec![
-            serde_json::json!({"role":"compactionSummary","summary":"bounded"}),
-            serde_json::json!({"role":"user","content":"after"}),
-        ];
-        let event = pi_context(compacted.clone(), 20);
-        naive_bytes += serde_json::to_vec(&event.redacted()).unwrap().len() + 1;
-        writer.append(&event).await.unwrap();
-        drop(writer);
-
-        let stored = tokio::fs::read(&path).await.unwrap();
-        assert!(
-            stored.len() < naive_bytes / 3,
-            "Pi journal did not eliminate cumulative context copies: stored={} naive={naive_bytes}",
-            stored.len()
-        );
-        assert!(!String::from_utf8_lossy(&stored).contains("\"messages\""));
-
-        let through = stored.len() as u64;
-        let mut reader = JournalReader::open(&path, through).await.unwrap().unwrap();
-        let mut contexts = Vec::new();
-        while let Some(entry) = reader.next_entry().await.unwrap() {
-            contexts.push(
-                entry
-                    .payload
-                    .pointer("/event/messages")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap(),
-            );
-        }
-        assert_eq!(contexts.len(), 21);
-        assert_eq!(contexts[19].len(), 20);
-        assert_eq!(contexts[20], compacted);
-    }
-
-    #[tokio::test]
-    async fn pi_streaming_updates_do_not_persist_growing_partial_messages() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pi.ndjson");
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let marker = "growing-partial-marker".repeat(4096);
-        let event = Envelope {
-            source: "pi".into(),
-            source_version: None,
-            plugin_version: None,
-            session_id: "pi-session".into(),
-            event: "message_update".into(),
-            ts_ms: 1,
-            managed_run_id: None,
-            capture: None,
-            payload: serde_json::json!({
-                "event": {
-                    "type": "message_update",
-                    "assistantMessageEvent": {
-                        "type": "text_delta",
-                        "partial": marker,
-                    },
-                    "message": {"role": "assistant", "content": marker},
-                }
-            }),
-            route: None,
-            config: None,
-        };
-        writer.append(&event).await.unwrap();
-        drop(writer);
-
-        let stored = tokio::fs::read(&path).await.unwrap();
-        assert!(!String::from_utf8_lossy(&stored).contains("growing-partial-marker"));
-
-        let mut reader = JournalReader::open(&path, stored.len() as u64)
-            .await
-            .unwrap()
-            .unwrap();
-        let replayed = reader.next_entry().await.unwrap().unwrap();
-        assert_eq!(
-            replayed
-                .payload
-                .pointer("/event/assistantMessageEvent/type"),
-            Some(&serde_json::json!("text_delta"))
-        );
-    }
-
-    #[tokio::test]
-    async fn pi_provider_requests_persist_only_request_configuration() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("pi.ndjson");
-        let mut writer = JournalWriter::open_path(&path).await.unwrap();
-        let event = Envelope {
-            source: "pi".into(),
-            source_version: None,
-            plugin_version: None,
-            session_id: "pi-session".into(),
-            event: "before_provider_request".into(),
-            ts_ms: 1,
-            managed_run_id: None,
-            capture: None,
-            payload: serde_json::json!({
-                "event": {
-                    "type": "before_provider_request",
-                    "payload": {
-                        "system": "system-prompt-marker",
-                        "messages": [{"role": "user", "content": "message-marker"}],
-                        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
-                        "max_tokens": 1024,
-                    },
-                }
-            }),
-            route: None,
-            config: None,
-        };
-        writer.append(&event).await.unwrap();
-        drop(writer);
-
-        let stored = tokio::fs::read(&path).await.unwrap();
-        let stored_text = String::from_utf8_lossy(&stored);
-        assert!(!stored_text.contains("system-prompt-marker"));
-        assert!(!stored_text.contains("message-marker"));
-
-        let mut reader = JournalReader::open(&path, stored.len() as u64)
-            .await
-            .unwrap()
-            .unwrap();
-        let replayed = reader.next_entry().await.unwrap().unwrap();
-        assert_eq!(
-            replayed.payload.pointer("/event/payload"),
-            Some(&serde_json::json!({
-                "max_tokens": 1024,
-                "tools": [{"type": "function", "function": {
-                    "name": "read",
-                    "parameters": {"type": "object"},
-                }}],
-            }))
-        );
-    }
-
     #[test]
     fn pi_journaled_request_configuration_replays_unchanged() {
         let schema = serde_json::json!({"type": "object"});
@@ -921,37 +249,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn source_journals_are_distinct_and_migrate_legacy_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let legacy = journal_path(temp.path(), "same/session");
-        tokio::fs::create_dir_all(legacy.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&legacy, b"legacy\n").await.unwrap();
-
-        let codex = ensure_source_journal(temp.path(), "codex", "same/session")
-            .await
-            .unwrap();
-        let claude = ensure_source_journal(temp.path(), "claude-code", "same/session")
-            .await
-            .unwrap();
-        assert_ne!(codex, claude);
-        assert_eq!(tokio::fs::read(&codex).await.unwrap(), b"legacy\n");
-        assert_eq!(tokio::fs::read(&claude).await.unwrap(), b"legacy\n");
-        assert_eq!(tokio::fs::read(&legacy).await.unwrap(), b"legacy\n");
-    }
-
-    #[tokio::test]
-    async fn long_session_ids_get_distinct_bounded_journals() {
+    #[test]
+    fn long_session_ids_get_distinct_bounded_journal_names() {
         let temp = tempfile::tempdir().unwrap();
         let shared = "x".repeat(400);
-        let first = ensure_source_journal(temp.path(), "pi", &format!("a{shared}"))
-            .await
-            .unwrap();
-        let second = ensure_source_journal(temp.path(), "pi", &format!("b{shared}"))
-            .await
-            .unwrap();
+        let first = source_journal_path(temp.path(), "pi", &format!("a{shared}"));
+        let second = source_journal_path(temp.path(), "pi", &format!("b{shared}"));
         assert_ne!(first, second);
         for path in [&first, &second] {
             assert!(path.file_name().unwrap().len() <= MAX_FILE_NAME_BYTES);
@@ -971,46 +274,39 @@ mod tests {
     async fn legacy_managed_run_records_recover_source_from_the_old_journal() {
         let temp = tempfile::tempdir().unwrap();
         let route = SessionRoute::default();
-        let mut writer = JournalWriter::open_path(&journal_path(temp.path(), "legacy"))
+        let path = journal_path(temp.path(), "legacy");
+        tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        writer
-            .append(&Envelope {
-                source: "codex".into(),
+        let mut lines = String::new();
+        for (source, ts_ms) in [("codex", 1), ("claude", 2)] {
+            let env = Envelope {
+                source: source.into(),
                 source_version: None,
                 plugin_version: None,
                 session_id: "legacy".into(),
                 event: "SessionStart".into(),
-                ts_ms: 1,
+                ts_ms,
                 managed_run_id: None,
                 payload: serde_json::json!({}),
                 route: Some(route.clone()),
                 config: None,
                 capture: None,
-            })
-            .await
-            .unwrap();
-        writer
-            .append(&Envelope {
-                source: "claude".into(),
-                source_version: None,
-                plugin_version: None,
-                session_id: "legacy".into(),
-                event: "SessionStart".into(),
-                ts_ms: 2,
-                managed_run_id: None,
-                payload: serde_json::json!({}),
-                route: Some(route.clone()),
-                config: None,
-                capture: None,
-            })
-            .await
-            .unwrap();
+            };
+            lines.push_str(&serde_json::to_string(&env.redacted()).unwrap());
+            lines.push('\n');
+        }
+        tokio::fs::write(&path, lines).await.unwrap();
         assert_eq!(
             legacy_journal_source(temp.path(), "legacy", &route).await,
             Some("codex".into())
         );
-        assert!(legacy_journal_has_session(temp.path(), "codex", "legacy").await);
-        assert!(!legacy_journal_has_session(temp.path(), "claude-code", "legacy").await);
+        assert!(!path.exists());
+        for (source, owner) in [("codex", true), ("claude-code", false)] {
+            let events = crate::collections::EventCollection::open(temp.path(), source, "legacy")
+                .await
+                .unwrap();
+            assert_eq!(events.legacy_namespace().await.unwrap(), owner);
+        }
     }
 }

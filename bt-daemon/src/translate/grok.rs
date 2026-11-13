@@ -32,7 +32,7 @@ impl TranslatorFactory for crate::agents::Grok {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct BoundedOutput {
     values: Vec<Value>,
     bytes: usize,
@@ -110,7 +110,7 @@ impl BoundedOutput {
         }
     }
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenTurn {
     span_id: String,
     key: String,
@@ -121,13 +121,13 @@ struct OpenTurn {
     user_input_dirty: bool,
     assistant_output: BoundedOutput,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct TurnCompletion {
     metrics: Option<Value>,
     error: Option<String>,
     late_merge_key: Option<String>,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenLlm {
     span_id: String,
     parent_span_id: String,
@@ -138,13 +138,13 @@ struct OpenLlm {
     start_ms: i64,
     last_ms: i64,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OpenTool {
     span_id: String,
     parent_span_id: String,
     start_ms: i64,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CompletedTool {
     span_id: String,
     parent_span_id: String,
@@ -154,7 +154,7 @@ struct CompletedTool {
     failure_recorded: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct TranscriptCursor {
     path: Option<String>,
     offset: u64,
@@ -179,12 +179,12 @@ impl TranscriptCursor {
         }
     }
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct TranscriptRecord {
     end_offset: u64,
     value: Value,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct TranscriptBatch {
     cursor: TranscriptCursor,
     records: Vec<TranscriptRecord>,
@@ -192,11 +192,11 @@ struct TranscriptBatch {
     reset: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PendingWork {
     event: Envelope,
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct GrokTranslator {
     session_id: String,
     session_span_id: String,
@@ -221,6 +221,7 @@ struct GrokTranslator {
     first_llm_user_input: Option<Value>,
     pending: Option<PendingWork>,
     cwd: Option<String>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
     last_ts_ms: i64,
 }

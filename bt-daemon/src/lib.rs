@@ -16,9 +16,9 @@ mod agents;
 mod args;
 mod client;
 mod codex_hooks;
+mod collections;
 mod command_output;
 mod correlation;
-mod delivery_ledger;
 mod dispatch;
 mod env;
 mod hook;
@@ -54,6 +54,10 @@ pub use args::{
 pub use client::{
     flush_managed_run, flush_session, forward_envelope, run_status, shutdown_daemon, HostInfo,
 };
+/// Session storage inspection and fault injection for integration tests.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use collections::inspect as storage_inspect;
 pub use command_output::{
     AuthDiagnostic, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, ImportSummary,
     OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
@@ -77,7 +81,7 @@ pub use trace_command::{
 pub use trace_runtime::{
     run_trace, HostRouteSelection, RouteRequirements, TraceHostContext, TraceHostServices,
 };
-pub use transcript_import::{import_transcript, import_transcripts, run_import};
+pub use transcript_import::{import_transcript, import_transcripts, run_import, ImportTarget};
 pub use translate::{
     AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, SpanRow, SpanType,
     TURN_SPAN_ID_KEY,
