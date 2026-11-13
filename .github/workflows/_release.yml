@@ -157,11 +157,9 @@ jobs:
           RECORD: ${{ inputs.record }}
         run: |
           set -euo pipefail
-          if [ "$PLUGIN" != "antigravity" ]; then
-            python3 scripts/set-plugin-version.py "$PLUGIN" "$VERSION"
-            if [ "$RECORD" = "true" ]; then
-              git diff --exit-code -- "src/plugins/$PLUGIN"
-            fi
+          python3 scripts/set-plugin-version.py "$PLUGIN" "$VERSION"
+          if [ "$RECORD" = "true" ]; then
+            git diff --exit-code -- "src/plugins/$PLUGIN"
           fi
           if [ "$RECORD" = "true" ]; then
             if ! printf '%s\n' "$VERSION" | cmp -s - ".github/release-versions/$PLUGIN"; then
@@ -184,6 +182,24 @@ jobs:
         with:
           name: braintrust-mcp-${{ inputs.source_sha }}-${{ steps.vars.outputs.version }}
           path: dist/submissions/braintrust-${{ steps.vars.outputs.version }}.zip*
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Build and validate Antigravity submission from selected source
+        if: inputs.plugin == 'antigravity'
+        env:
+          RELEASE_VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          make test-antigravity-packaging antigravity-submission
+          test -f "dist/submissions/braintrust-antigravity-$RELEASE_VERSION.zip"
+
+      - name: Save Antigravity submission ZIP
+        if: inputs.plugin == 'antigravity'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: braintrust-antigravity-mcp-${{ inputs.source_sha }}-${{ steps.vars.outputs.version }}
+          path: dist/submissions/braintrust-antigravity-${{ steps.vars.outputs.version }}.zip*
           if-no-files-found: error
           overwrite: true
 
@@ -292,6 +308,50 @@ jobs:
               sys.exit("Submission ZIP checksum mismatch")
           PY
           gh release upload "v$VERSION" "braintrust-$VERSION.zip" "braintrust-$VERSION.zip.sha256" \
+            --repo "$DIST_REPO" --clobber
+
+  attach-antigravity-submission:
+    needs: release
+    if: inputs.plugin == 'antigravity' && inputs.record
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Download validated submission from release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: braintrust-antigravity-mcp-${{ inputs.source_sha }}-${{ needs.release.outputs.version }}
+          path: submission
+
+      - name: Generate distribution-repo token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BRAINTRUST_BOT_APP_ID }}
+          private-key: ${{ secrets.BRAINTRUST_BOT_PRIVATE_KEY }}
+          owner: ${{ needs.release.outputs.dist_owner }}
+          repositories: ${{ needs.release.outputs.dist_name }}
+          permission-contents: write
+
+      - name: Attach Antigravity MCP-only ZIP to distribution release
+        working-directory: submission
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DIST_REPO: ${{ inputs.dist_repo }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          archive = Path(f"braintrust-antigravity-{sys.argv[1]}.zip")
+          expected = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+          if archive.with_suffix(".zip.sha256").read_text() != expected:
+              sys.exit("Submission ZIP checksum mismatch")
+          PY
+          gh release upload "v$VERSION" "braintrust-antigravity-$VERSION.zip" "braintrust-antigravity-$VERSION.zip.sha256" \
             --repo "$DIST_REPO" --clobber
 
   # Post-deploy end-to-end smoke test (codex only): install the just-deployed

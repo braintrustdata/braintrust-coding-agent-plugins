@@ -41,4 +41,5 @@ for event, expected_event in expected.items():
                 "--flush-on-turn-end || exit 0"
             )
 PY
+python3 "$(dirname "${BASH_SOURCE[0]}")/mcp_package.py" validate "$TARGET_DIR/plugins/braintrust"
 echo "validate: antigravity dist OK ($TARGET_DIR)"

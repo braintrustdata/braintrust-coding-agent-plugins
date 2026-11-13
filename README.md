@@ -9,7 +9,9 @@ This repository also packages the [Braintrust
 plugin](src/plugins/codex/content/plugins/braintrust/README.md) for submission to
 the official ChatGPT and Codex plugin directory. It connects to Braintrust's
 hosted MCP server through OAuth and requires no `bt` installation. Installing it
-does not enable session tracing.
+does not enable session tracing. The [Antigravity MCP plugin](src/plugins/antigravity/content/plugins/braintrust/README.md)
+connects to the same hosted server and is packaged for Google Marketplace submission.
+Both Antigravity plugins ship from the existing Antigravity distribution repository.
 
 ## Get started
 
@@ -89,6 +91,9 @@ JavaScript packages, and stable Rust for the daemon. Run from the monorepo root:
 make build                 # Build all plugins into dist/<agent>
 make build-codex            # Build one plugin
 make codex-submission      # Validate and build the MCP-only OpenAI ZIP
+make antigravity-submission # Validate and build the Antigravity MCP-only ZIP
+make test-antigravity-packaging # Test MCP isolation and reviewed versioning
+make test-antigravity-mcp-loading # Check MCP loading with a local Antigravity CLI
 make test-codex-packaging  # Test Codex packaging and release contracts
 make test-codex-mcp-loading # Check installed MCP loading with a local Codex CLI
 make test                  # Build and validate plugin packages and forwarders
@@ -103,4 +108,6 @@ Real-agent tests require installed agents and are run separately; see the
 
 Edit plugin sources here. The per-agent GitHub distribution repositories and
 npm packages are generated artifacts. See [AGENTS.md](AGENTS.md) for the release
-PR and approval workflow, sandbox publishing, and npm release workflows.
+PR and approval workflow, sandbox publishing, and npm release workflows. See
+[Antigravity publishing](src/plugins/antigravity/PUBLISHING.md) for MCP validation
+and Google Marketplace submission steps.
