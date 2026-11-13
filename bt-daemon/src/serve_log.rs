@@ -3,9 +3,10 @@
 //! A daemon may run for days, so the log is bounded where it is written: once
 //! it outgrows its limit its newest bytes are kept as `serve.log.1` and it
 //! starts again. The limit is [`DEFAULT_MAX_MB`] MiB unless
-//! `BRAINTRUST_DAEMON_LOG_MAX_MB` sets another whole number of MiB. The running daemon writes through an inherited handle that
-//! always appends at the end of the file, so the file is truncated in place
-//! rather than renamed away from that handle.
+//! `BT_TRACE_LOG_MAX_MB` sets another whole number of MiB. The running daemon
+//! writes through an inherited handle that always appends at the end of the
+//! file, so the file is truncated in place rather than renamed away from that
+//! handle.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
@@ -15,12 +16,12 @@ use std::path::{Path, PathBuf};
 /// the same size is kept.
 pub(crate) const DEFAULT_MAX_MB: u64 = 10;
 
-const MAX_MB_ENV: &str = "BRAINTRUST_DAEMON_LOG_MAX_MB";
+const MAX_MB_ENV: &str = "BT_TRACE_LOG_MAX_MB";
 
 /// The configured limit in bytes. An unset, unparsable or zero value uses the
 /// default, so the log stays bounded.
 pub(crate) fn max_bytes() -> u64 {
-    limit(crate::env::var(MAX_MB_ENV).as_deref())
+    limit(std::env::var(MAX_MB_ENV).ok().as_deref())
 }
 
 fn limit(mb: Option<&str>) -> u64 {

@@ -1,13 +1,17 @@
 //! User-facing environment variables use the `BRAINTRUST_` prefix, matching
 //! `bt` and the Braintrust SDKs. Read them through [`var_os`] so that the
 //! deprecated `BT_` names keep working until support is removed.
+//!
+//! Variables that tune the trace daemon itself, such as `BT_TRACE_LOG_MAX_MB`,
+//! use the `BT_TRACE_` prefix instead. They have no deprecated aliases and are
+//! read directly.
 
 use std::ffi::{OsStr, OsString};
 
 /// Pre-`BRAINTRUST_` names of tracing env vars. Each `BT_<NAME>` is still
 /// honored as an alias for `BRAINTRUST_<NAME>` until support is removed in a
 /// major release. Do not add entries: new env vars must use the `BRAINTRUST_`
-/// prefix.
+/// prefix, or `BT_TRACE_` for daemon tuning.
 ///
 /// `BT_TRACE_MANAGED_RUN_ID` and `BT_TRACE_INVOCATION_SETTINGS` are not listed:
 /// they are the internal protocol `bt trace run` uses to configure its child
@@ -91,8 +95,9 @@ mod tests {
     }
 
     /// New user-facing env vars must use the `BRAINTRUST_` prefix. Every
-    /// `BT_*` name in the crate must be a deprecated alias or internal protocol,
-    /// and every deprecated alias must map to a name the crate reads.
+    /// `BT_*` name in the crate must be a deprecated alias, internal protocol
+    /// or daemon tuning, and every deprecated alias must map to a name the
+    /// crate reads.
     #[test]
     fn env_vars_use_braintrust_prefix() {
         const INTERNAL: &[&str] = &[
@@ -102,6 +107,8 @@ mod tests {
             "BT_TRACE_CURSOR_USER_HOOK",
             // Fallback for `BRAINTRUST_BT_BIN` in the Cursor hook launchers.
             "BT_BIN",
+            // Daemon tuning.
+            "BT_TRACE_LOG_MAX_MB",
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut sources = String::new();
