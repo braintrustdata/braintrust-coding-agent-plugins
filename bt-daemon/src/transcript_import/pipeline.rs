@@ -395,6 +395,9 @@ impl ImportProcessor {
                     })?
                 }
             };
+            if live.stopped {
+                continue;
+            }
             if let Some(cfg) = &env.config {
                 live.sink.configure(cfg);
                 live.ctx.config = Some(cfg.clone());
@@ -523,8 +526,10 @@ impl ImportProcessor {
     async fn finish(self) -> anyhow::Result<Vec<ImportSummary>> {
         let mut summaries = Vec::new();
         for (sid, mut live) in self.sessions {
-            let ops = live.translator.flush(&live.ctx)?;
-            Self::emit_translator_batches(&mut live, ops).await?;
+            if !live.stopped {
+                let ops = live.translator.flush(&live.ctx)?;
+                Self::emit_translator_batches(&mut live, ops).await?;
+            }
             live.sink.flush().await?;
             summaries.push(Self::summary(sid, live, true));
         }
@@ -536,8 +541,10 @@ impl ImportProcessor {
         let Some(mut live) = self.sessions.remove(session_id) else {
             return Ok(None);
         };
-        let ops = live.translator.flush(&live.ctx)?;
-        Self::emit_translator_batches(&mut live, ops).await?;
+        if !live.stopped {
+            let ops = live.translator.flush(&live.ctx)?;
+            Self::emit_translator_batches(&mut live, ops).await?;
+        }
         live.sink.flush().await?;
         Ok(Some(Self::summary(session_id.to_string(), live, true)))
     }
@@ -579,6 +586,93 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn stopped_import_bypasses_pending_translation_and_finalization() {
+        struct CatchUp {
+            pending: bool,
+        }
+        impl AgentTranslator for CatchUp {
+            fn handle(&mut self, _: &Envelope, _: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+                anyhow::ensure!(
+                    !self.pending,
+                    "catch-up must be drained before another event"
+                );
+                self.pending = true;
+                Ok(vec![SpanOp::Insert(crate::translate::SpanRow {
+                    span_id: "private".into(),
+                    root_span_id: "private".into(),
+                    ..Default::default()
+                })])
+            }
+            fn drain_pending(&mut self, _: &SessionCtx) -> anyhow::Result<Option<Vec<SpanOp>>> {
+                anyhow::bail!("stopped import must not drain catch-up work")
+            }
+            fn flush(&mut self, _: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+                anyhow::ensure!(!self.pending, "cannot finalize pending catch-up");
+                Ok(Vec::new())
+            }
+        }
+        for finish_one in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let plugin = temp.path().join("stop.mjs");
+            std::fs::write(
+                &plugin,
+                "export default () => { throw new StopTracingError(); }",
+            )
+            .unwrap();
+            let mut config = import_test_config("project-a");
+            config.span_plugins = vec![plugin];
+            let mut processor = ImportProcessor::new(
+                debug_serve_options("test", &temp.path().join("spans")),
+                Some(config),
+                None,
+            )
+            .unwrap();
+            let sink = processor
+                .opts
+                .sink_factory
+                .create("stopped", "debug")
+                .unwrap();
+            processor.sessions.insert(
+                "stopped".into(),
+                ImportLive {
+                    stopped: false,
+                    source: "debug".into(),
+                    translator: Box::new(CatchUp { pending: false }),
+                    sink,
+                    ctx: SessionCtx {
+                        session_id: "stopped".into(),
+                        config: None,
+                    },
+                    pending_ops: 0,
+                    span_ids: Default::default(),
+                    root_span_id: None,
+                    destination: None,
+                    diagnostics_dir: None,
+                },
+            );
+            let event = |session: &str, name: &str| {
+                serde_json::from_value::<Envelope>(json!({
+                "source": "debug", "session_id": session, "event": name, "ts_ms": 1, "payload": {}
+            })).unwrap()
+            };
+            processor
+                .process(vec![
+                    event("stopped", "first"),
+                    event("stopped", "SessionEnd"),
+                    event("other", "SessionEnd"),
+                ])
+                .await
+                .unwrap();
+            assert!(processor.sessions["stopped"].stopped);
+            assert!(processor.sessions.contains_key("other"));
+            if finish_one {
+                assert!(processor.finish_session("stopped").await.unwrap().is_some());
+            }
+            processor.finish().await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn muse_attach_snapshots_reuse_one_trace_and_keep_open_spans() {
