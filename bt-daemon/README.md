@@ -296,6 +296,9 @@ echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./bt-daemon/target
 ```
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
+A spawned daemon logs to `serve.log` in the data directory. Once that file
+passes 10 MiB its newest 10 MiB are kept as `serve.log.1` and it starts again;
+set `BT_TRACE_LOG_MAX_MB` to change the limit.
 
 `import <codex|claude|antigravity|muse> <session-id>` has a different purpose from restart
 recovery. It locates the native transcript in the selected agent's standard

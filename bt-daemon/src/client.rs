@@ -191,11 +191,7 @@ fn spawn_daemon(host: &HostInfo, socket: &Path, data_dir_arg: Option<&Path>) -> 
         .map(Path::to_path_buf)
         .unwrap_or_else(|| crate::paths::data_dir(None));
     let _ = crate::paths::ensure_private_dir(&data_dir);
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data_dir.join("serve.log"))
-        .ok();
+    let log = crate::serve_log::open(&data_dir).ok();
 
     #[cfg(windows)]
     {
