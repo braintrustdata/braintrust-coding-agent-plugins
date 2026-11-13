@@ -5,7 +5,7 @@
 //! Record IDs grow by each record's encoded size, so IDs imported from a legacy
 //! NDJSON journal keep their original byte boundaries and input budgets still
 //! measure bytes. Removal never renumbers later records.
-use super::store::Store;
+use super::store::{Store, NOW_MS};
 use crate::pipeline::input::PipelineControl;
 use crate::wire::{Envelope, RedactedEnvelope};
 use rusqlite::{params, OptionalExtension};
@@ -213,8 +213,10 @@ impl EventCollection {
         self.store
             .write(move |tx| {
                 if let Some(digest) = digest {
-                    if tx.execute("INSERT OR IGNORE INTO captured(digest) VALUES(?)", [digest])?
-                        == 0
+                    if tx.execute(
+                        &format!("INSERT OR IGNORE INTO captured(digest,at_ms) VALUES(?,{NOW_MS})"),
+                        [digest],
+                    )? == 0
                     {
                         return Ok(None);
                     }
@@ -389,6 +391,18 @@ impl EventCollection {
             .await
     }
 
+    /// Forget capture identities older than `retention`: a capture repeated
+    /// after that is recorded again.
+    pub async fn expire(&self, retention: std::time::Duration) -> anyhow::Result<()> {
+        let cutoff = cutoff_ms(retention);
+        self.store
+            .write(move |tx| {
+                tx.execute("DELETE FROM captured WHERE at_ms<?", [cutoff])?;
+                Ok(())
+            })
+            .await
+    }
+
     pub(super) fn remove_through(
         tx: &rusqlite::Transaction<'_>,
         through: u64,
@@ -396,6 +410,11 @@ impl EventCollection {
         tx.execute("DELETE FROM events WHERE id<=?", [through])?;
         Ok(())
     }
+}
+
+/// The wall-clock time `retention` ago, in milliseconds.
+pub(super) fn cutoff_ms(retention: std::time::Duration) -> i64 {
+    chrono::Utc::now().timestamp_millis() - i64::try_from(retention.as_millis()).unwrap_or(i64::MAX)
 }
 
 fn insert(tx: &rusqlite::Transaction<'_>, value: Vec<u8>) -> anyhow::Result<Appended> {

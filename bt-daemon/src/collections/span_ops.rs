@@ -7,7 +7,10 @@
 //! accepts them, and an op is deleted when every route has passed it.
 //! Writers acquire the write lock before reading, so read-to-write upgrades
 //! cannot fail mid-way.
-use super::{events::EventCollection, store::Store};
+use super::{
+    events::{cutoff_ms, EventCollection},
+    store::{Store, NOW_MS},
+};
 use crate::{
     pipeline::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW},
     translate::{OriginSnapshot, SinkFields, SpanOp, SpanRow, SpanType},
@@ -92,6 +95,12 @@ fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Res
             params![row.span_id, serde_json::to_string(origin)?],
         )?;
     }
+    if row.end_ms.is_some() {
+        db.execute(
+            &format!("UPDATE origins SET ended_ms={NOW_MS} WHERE span_id=?"),
+            [&row.span_id],
+        )?;
+    }
     if !observation {
         return Ok(());
     }
@@ -103,7 +112,10 @@ fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Res
         let (SpanOp::Insert(birth_row) | SpanOp::Merge(birth_row)) = &mut birth;
         birth_row.end_ms = None;
         db.execute(
-            "INSERT OR REPLACE INTO span_state(span_id,kind,value,end_ms) VALUES (?,?,?,?)",
+            &format!(
+                "INSERT OR REPLACE INTO span_state(span_id,kind,value,end_ms,touched_ms)
+                 VALUES (?,?,?,?,{NOW_MS})"
+            ),
             params![
                 row.span_id,
                 if row.span_type == SpanType::Tool {
@@ -117,7 +129,7 @@ fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Res
         )?;
     } else {
         db.execute(
-            "UPDATE span_state SET end_ms=? WHERE span_id=?",
+            &format!("UPDATE span_state SET end_ms=?, touched_ms={NOW_MS} WHERE span_id=?"),
             params![row.end_ms, row.span_id],
         )?;
     }
@@ -470,6 +482,16 @@ impl SpanOps {
                     positions.push((tx.last_insert_rowid() as u64, bytes));
                 }
                 let tail = positions.last().map(|(position, _)| *position);
+                if tail.is_some() {
+                    // Heads that had caught up start waiting for this output now.
+                    tx.execute(
+                        &format!(
+                            "UPDATE heads SET progress_ms={NOW_MS}
+                             WHERE position>=(SELECT tail FROM translation WHERE id=1)"
+                        ),
+                        [],
+                    )?;
+                }
                 tx.execute(
                     "UPDATE translation SET through=?, tail=coalesce(?,tail), roots=?,
                      continuation=coalesce(?,continuation) WHERE id=1",
@@ -528,10 +550,14 @@ impl SpanOps {
                     }
                 }
                 tx.execute(
-                    "INSERT OR IGNORE INTO heads(route,position) VALUES (?,coalesce(
-                        (SELECT min(position)-1 FROM ops),(SELECT tail FROM translation WHERE id=1)))",
+                    &format!(
+                        "INSERT OR IGNORE INTO heads(route,position,progress_ms) VALUES (?,coalesce(
+                        (SELECT min(position)-1 FROM ops),(SELECT tail FROM translation WHERE id=1)),
+                        {NOW_MS})"
+                    ),
                     [&key],
                 )?;
+                tx.execute("UPDATE heads SET subscribed=1 WHERE route=?", [&key])?;
                 Ok(tx.query_row("SELECT position FROM heads WHERE route=?", [key], |r| {
                     r.get(0)
                 })?)
@@ -615,7 +641,10 @@ impl SpanOps {
                 };
                 if !existing {
                     tx.execute(
-                        "INSERT OR IGNORE INTO heads(route,position) VALUES (?,(SELECT tail FROM translation WHERE id=1))",
+                        &format!(
+                            "INSERT OR IGNORE INTO heads(route,position,progress_ms)
+                             VALUES (?,(SELECT tail FROM translation WHERE id=1),{NOW_MS})"
+                        ),
                         [key],
                     )?;
                 }
@@ -649,14 +678,16 @@ impl SpanOps {
 
     /// Every obligation is met: all input through `input` is translated and
     /// every route has delivered every op. An empty route set is not completion.
+    /// Root candidates still waiting for work and input retained only to
+    /// rebuild translator state are not owed to any route.
     pub async fn complete(&self, input: u64) -> anyhow::Result<bool> {
         self.store
             .run(move |db| {
                 Ok(db.query_row(
                     "SELECT EXISTS(SELECT 1 FROM heads)
                      AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position<t.tail)
-                     AND t.failure IS NULL AND t.roots IS NULL AND t.through>=?
-                     AND NOT EXISTS(SELECT 1 FROM events)
+                     AND t.failure IS NULL AND t.through>=?
+                     AND NOT EXISTS(SELECT 1 FROM events WHERE id>t.through)
                      FROM translation t WHERE id=1",
                     [input],
                     |r| r.get(0),
@@ -674,6 +705,44 @@ impl SpanOps {
                         r.get(0)
                     })?,
                 )
+            })
+            .await
+    }
+
+    /// Expire what a live session no longer uses once `retention` passes:
+    /// metadata of spans that ended or were never completed, and heads that
+    /// were registered for output but never subscribed (such as a route whose
+    /// credentials never resolved) and have owed it that long. Ops no
+    /// remaining head needs are then deleted. A subscribed head held by a
+    /// failure is kept for recovery.
+    ///
+    /// `live` names routes with an active delivery that must be kept.
+    pub async fn expire(
+        &self,
+        retention: std::time::Duration,
+        live: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let cutoff = cutoff_ms(retention);
+        self.store
+            .write(move |tx| {
+                tx.execute("DELETE FROM origins WHERE ended_ms<?", [cutoff])?;
+                tx.execute(
+                    "DELETE FROM span_state WHERE touched_ms<? AND (kind='tool' OR end_ms IS NOT NULL)",
+                    [cutoff],
+                )?;
+                let stuck = {
+                    let mut query = tx.prepare(
+                        "SELECT route FROM heads WHERE subscribed=0 AND progress_ms<?
+                         AND position<(SELECT tail FROM translation WHERE id=1)",
+                    )?;
+                    let rows = query.query_map([cutoff], |r| r.get::<_, String>(0))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                for route in stuck.into_iter().filter(|route| !live.contains(route)) {
+                    tracing::warn!(%route, "undelivered output expired for a route that never subscribed");
+                    tx.execute("DELETE FROM heads WHERE route=?", [route])?;
+                }
+                prune(tx)
             })
             .await
     }
@@ -852,7 +921,9 @@ impl SpanOps {
                 }
                 anyhow::ensure!(head >= expected, "completion cannot skip unresolved input");
                 tx.execute(
-                    "UPDATE heads SET position=?, failure=NULL WHERE route=?",
+                    &format!(
+                        "UPDATE heads SET position=?, failure=NULL, progress_ms={NOW_MS} WHERE route=?"
+                    ),
                     params![through, route],
                 )?;
                 prune(tx)?;

@@ -82,11 +82,6 @@ pub(super) async fn collect_session(
     let namespace = crate::ids::session_namespace(&source, &session_id);
     let lock = daemon.session_lock(&source, &session_id);
     let _guard = lock.lock().await;
-    if daemon.journals.lock().contains_key(&namespace)
-        || daemon.translations.lock().contains_key(&namespace)
-    {
-        return Ok(());
-    }
     let queued = daemon.pending_sessions.lock().values().any(|state| {
         state
             .events
@@ -96,7 +91,24 @@ pub(super) async fn collect_session(
     if queued {
         return Ok(());
     }
+    // A session that never ends keeps only what it still uses: expire stale
+    // capture identities, finished span metadata and stuck routes, even
+    // while the session is live.
+    let live: Vec<String> = daemon
+        .sessions
+        .lock()
+        .keys()
+        .filter(|key| key.source == source && key.session_id == session_id)
+        .map(|key| key.route.clone())
+        .collect();
+    events.expire(RETENTION).await?;
     let ops = storage.span_ops().await?;
+    ops.expire(RETENTION, live).await?;
+    if daemon.journals.lock().contains_key(&namespace)
+        || daemon.translations.lock().contains_key(&namespace)
+    {
+        return Ok(());
+    }
     let routes = ops.routes().await?;
     if routes.iter().any(|route| {
         DeliveryKey::new(&source, &session_id, route)

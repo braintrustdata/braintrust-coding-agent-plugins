@@ -271,3 +271,76 @@ async fn reopening_storage_does_not_count_as_activity() {
         .unwrap();
     assert!(events.idle_for().await.unwrap() < day);
 }
+
+#[tokio::test]
+async fn a_live_session_expires_only_what_it_no_longer_uses() {
+    let retention = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    let temp = tempfile::tempdir().unwrap();
+    let events = EventCollection::open(temp.path(), "debug", "session")
+        .await
+        .unwrap();
+    let mut captured = event("debug", "session", "e", json!({}));
+    captured.route = Some(Default::default());
+    let input = events.capture(&captured).await.unwrap().unwrap().through;
+    assert!(events.capture(&captured).await.unwrap().is_none());
+    let ops = SpanOps::for_events(&events).await.unwrap();
+    let route = |name: &str| crate::wire::SessionRoute {
+        tags: [name.into()].into_iter().collect(),
+        ..Default::default()
+    };
+    let delivered = ops.subscribe(&route("delivered")).await.unwrap().position;
+    // A route registered for output whose delivery never starts.
+    ops.register(&route("unsubscribed")).await.unwrap();
+    let span = |id: &str, end_ms: Option<i64>| {
+        SpanOp::Insert(SpanRow {
+            span_id: id.into(),
+            root_span_id: id.into(),
+            span_type: crate::translate::SpanType::Tool,
+            end_ms,
+            origin: Some(
+                crate::translate::OriginSnapshot {
+                    plugin_version: None,
+                    source_version: None,
+                    bt_version: "test".into(),
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+    };
+    let tail = ops
+        .commit_translation(Translated {
+            input,
+            observation: true,
+            ops: vec![span("ended", Some(2)), span("abandoned", None)],
+            roots: Default::default(),
+            state: Some(b"{}".to_vec()),
+        })
+        .await
+        .unwrap();
+    let key = serde_json::to_string(&route("delivered")).unwrap();
+    ops.remove_through(&key, delivered, tail).await.unwrap();
+    let db = Inspector::session(temp.path(), "debug", "session").unwrap();
+    assert_eq!(
+        db.count(Table::Ops),
+        2,
+        "the unsubscribed head holds output"
+    );
+
+    db.age(retention + std::time::Duration::from_secs(60))
+        .unwrap();
+    let unsubscribed = serde_json::to_string(&route("unsubscribed")).unwrap();
+    ops.expire(retention, vec![unsubscribed]).await.unwrap();
+    assert_eq!(db.count(Table::Heads), 2, "a live route is never expired");
+
+    events.expire(retention).await.unwrap();
+    ops.expire(retention, Vec::new()).await.unwrap();
+    assert_eq!(db.count(Table::Heads), 1);
+    assert_eq!(db.count(Table::Ops), 0);
+    assert_eq!(db.count(Table::Origins), 1, "an open span keeps its origin");
+    assert!(ops.observations().await.unwrap().is_empty());
+    assert!(
+        events.capture(&captured).await.unwrap().is_some(),
+        "an expired capture identity is recorded again"
+    );
+}

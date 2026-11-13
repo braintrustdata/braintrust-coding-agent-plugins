@@ -221,12 +221,18 @@ impl Inspector {
         Ok(())
     }
 
-    /// Make the session's last recorded activity `by` older.
+    /// Make every activity the session recorded `by` older.
     pub fn age(&self, by: std::time::Duration) -> anyhow::Result<()> {
-        self.0.execute(
-            "UPDATE event_state SET active_ms=active_ms-? WHERE id=1",
-            [i64::try_from(by.as_millis())?],
-        )?;
+        let by = i64::try_from(by.as_millis())?;
+        for statement in [
+            "UPDATE event_state SET active_ms=active_ms-?",
+            "UPDATE captured SET at_ms=at_ms-?",
+            "UPDATE origins SET ended_ms=ended_ms-?",
+            "UPDATE span_state SET touched_ms=touched_ms-?",
+            "UPDATE heads SET progress_ms=progress_ms-?",
+        ] {
+            self.0.execute(statement, [by])?;
+        }
         Ok(())
     }
 
@@ -234,9 +240,20 @@ impl Inspector {
     /// any output existed.
     pub fn add_head(&self, route: &impl serde::Serialize) -> anyhow::Result<()> {
         self.0.execute(
-            "INSERT OR IGNORE INTO heads(route,position) VALUES (?,0)",
+            &format!(
+                "INSERT OR IGNORE INTO heads(route,position,progress_ms) VALUES (?,0,{})",
+                super::store::NOW_MS
+            ),
             [serde_json::to_string(route)?],
         )?;
+        Ok(())
+    }
+
+    /// Record input through `through` as translated, as an earlier daemon
+    /// left it, without a continuation.
+    pub fn set_translated(&self, through: u64) -> anyhow::Result<()> {
+        self.0
+            .execute("UPDATE translation SET through=? WHERE id=1", [through])?;
         Ok(())
     }
 

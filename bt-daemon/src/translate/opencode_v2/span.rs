@@ -9,7 +9,7 @@ pub(super) enum Content {
     Parts(Vec<ContentPart>),
     Dynamic(Value),
 }
-#[derive(Clone, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize)]
 #[serde(untagged)]
 pub(super) enum ContentPart {
     Text(TextPart),
@@ -18,19 +18,28 @@ pub(super) enum ContentPart {
     Tool(super::event::ToolContent),
     Dynamic(Value),
 }
-#[derive(Clone, Serialize, serde::Deserialize)]
+/// Parts are only ever serialized after construction, so saved translator
+/// state restores each one exactly as it was written. Matching the untagged
+/// variants instead would turn, for example, a reasoning part with provider
+/// options into a plain text part and drop its other fields.
+impl<'de> serde::Deserialize<'de> for ContentPart {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::Dynamic)
+    }
+}
+#[derive(Clone, Serialize)]
 pub(super) struct TextPart {
     #[serde(rename = "type")]
     pub kind: String,
     pub text: String,
 }
-#[derive(Clone, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct ImagePart {
     #[serde(rename = "type")]
     pub kind: String,
     pub image_url: ImageUrl,
 }
-#[derive(Clone, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct ImageUrl {
     pub url: String,
 }
@@ -198,5 +207,23 @@ impl Metrics {
             prompt_cache_creation_tokens: t.cache.write,
             reasoning_tokens: t.reasoning,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_content_parts_restore_every_field() {
+        let parts = vec![
+            ContentPart::text("prompt".into()),
+            ContentPart::Dynamic(serde_json::json!({
+                "type": "reasoning", "text": "thinking", "providerOptions": {"effort": "high"}
+            })),
+        ];
+        let saved = serde_json::to_value(&parts).unwrap();
+        let restored: Vec<ContentPart> = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), saved);
     }
 }

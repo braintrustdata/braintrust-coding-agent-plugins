@@ -695,6 +695,26 @@ impl Producer {
             self.phase = Boundary::Journal;
             self.position = input;
         }
+        if self.position < through {
+            // Every stored record through `through` is consumed. The rest of
+            // the range is what a legacy journal reserved without importing a
+            // record (such as a delivery checkpoint): input with no output.
+            if through > self.committed {
+                let state = self.continuation().await?;
+                self.ops
+                    .commit_translation(Translated {
+                        input: through,
+                        observation: true,
+                        ops: Vec::new(),
+                        roots: self.roots.pending().clone(),
+                        state: Some(state),
+                    })
+                    .await?;
+                self.committed = through;
+                self.progress.committed.store(through, Ordering::Relaxed);
+            }
+            self.position = through;
+        }
         Ok(())
     }
 
@@ -1098,6 +1118,94 @@ pub(crate) mod tests {
             assert_eq!(f.db().count(Table::Events), 0);
         }
         f.source.shutdown().await;
+    }
+
+    fn legacy_line(value: &serde_json::Value) -> Vec<u8> {
+        let mut line = serde_json::to_vec(value).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    fn legacy_options(dir: &std::path::Path, events: EventCollection) -> TranslationOptions {
+        TranslationOptions {
+            source: "debug".into(),
+            session_id: "s".into(),
+            namespace: crate::ids::session_namespace("debug", "s"),
+            version: "test".into(),
+            data_dir: dir.into(),
+            events,
+            input: SourceInput::default(),
+            registry: Arc::new(Registry::default_agents()),
+            correlation: Arc::default(),
+            correlation_changed: Arc::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bytes_a_legacy_journal_reserved_without_records_are_translated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "s");
+        let route = serde_json::json!({});
+        let event = serde_json::json!({"source":"debug","session_id":"s","event":"tool",
+            "ts_ms":1,"payload":{},"route":route});
+        let mut bytes = legacy_line(&event);
+        let first = bytes.len() as u64;
+        bytes.extend(legacy_line(&event));
+        // A trailing checkpoint is reserved but not imported as a record.
+        bytes.extend(legacy_line(&serde_json::json!({
+            "_bt_record_type":"delivery_checkpoint","route":route,"through":first})));
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        let events = EventCollection::open(tmp.path(), "debug", "s")
+            .await
+            .unwrap();
+        let tail = events.tail().await.unwrap();
+        assert_eq!(tail, bytes.len() as u64);
+        let translation = Translation::spawn(legacy_options(tmp.path(), events.clone()))
+            .await
+            .unwrap();
+        translation.advance(tail).await.unwrap();
+        translation.barrier().await.unwrap();
+        let ops = SpanOps::for_events(&events).await.unwrap();
+        assert_eq!(ops.translated_through().await.unwrap(), tail);
+        // Lifecycle controls can be ordered after the reserved range again.
+        translation.control(ControlKind::Retire).await.unwrap();
+        assert!(events.tail().await.unwrap() > tail);
+        let mut route = translation
+            .subscribe(&serde_json::from_value(route).unwrap())
+            .await
+            .unwrap();
+        while let Some(delivery) = route.next_batch(100).await.unwrap() {
+            delivery.into_completed().await.ok().unwrap();
+        }
+        assert!(ops.complete(events.tail().await.unwrap()).await.unwrap());
+        translation.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_delivered_session_migrated_from_main_is_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::journal::source_journal_path(tmp.path(), "debug", "s");
+        let event = serde_json::json!({"source":"debug","session_id":"s","event":"tool",
+            "ts_ms":1,"payload":{},"route":{}});
+        let bytes = legacy_line(&event);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        // Main translated and delivered the journal's only event.
+        let db = crate::collections::inspect::Inspector::session(tmp.path(), "debug", "s").unwrap();
+        db.add_head(&SessionRoute::default()).unwrap();
+        db.set_translated(bytes.len() as u64).unwrap();
+        drop(db);
+        let sessions = crate::collections::sessions(tmp.path()).await.unwrap();
+        let events = sessions[0].events().await.unwrap();
+        let ops = sessions[0].span_ops().await.unwrap();
+        // The imported input only rebuilds translator state if the session
+        // resumes; it does not keep a delivered session from collection.
+        assert!(ops.complete(events.tail().await.unwrap()).await.unwrap());
     }
 
     struct BlockedTranslator {

@@ -14,6 +14,9 @@ use std::{
 /// each event-to-SpanOp handoff a single transaction.
 pub(super) const SCHEMA: u32 = 7;
 
+/// The current time in milliseconds, as SQL.
+pub(super) const NOW_MS: &str = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
+
 static OPEN: LazyLock<Mutex<HashMap<PathBuf, Weak<Inner>>>> = LazyLock::new(Default::default);
 /// Files whose last handle is still compacting and closing its connection.
 static CLOSING: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Default::default);
@@ -252,7 +255,6 @@ fn migrate(db: &Connection) -> anyhow::Result<()> {
             CREATE TABLE origins (span_id TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE span_state (span_id TEXT PRIMARY KEY, kind TEXT NOT NULL, value BLOB NOT NULL, end_ms INTEGER);",
         )?;
-        super::span_ops::extract_metadata(db)?;
     }
     if version < 7 {
         // Translation state replaces per-input batches: an input is handed
@@ -269,12 +271,28 @@ fn migrate(db: &Connection) -> anyhow::Result<()> {
             DELETE FROM ops WHERE position>(SELECT tail FROM translation);",
         )?;
         super::span_ops::migrate_roots(db)?;
+        // Metadata kept for a live session expires once it goes unused.
+        db.execute_batch(&format!(
+            "ALTER TABLE origins ADD COLUMN ended_ms INTEGER;
+            CREATE INDEX origins_ended ON origins(ended_ms);
+            ALTER TABLE span_state ADD COLUMN touched_ms INTEGER NOT NULL DEFAULT 0;
+            UPDATE span_state SET touched_ms={NOW_MS};
+            ALTER TABLE heads ADD COLUMN progress_ms INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE heads ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 0;
+            UPDATE heads SET progress_ms={NOW_MS}, subscribed=1;"
+        ))?;
+        if version < 6 {
+            // One bounded pass extracts the metadata a schema-5 channel kept
+            // only inside its stored ops.
+            super::span_ops::extract_metadata(db)?;
+        }
         db.execute_batch(
             "DROP TABLE batches; DROP TABLE receipts; DROP TABLE root_candidates;
             DROP TABLE publication; DROP TABLE recovery;
             DROP INDEX ops_input; ALTER TABLE ops DROP COLUMN input;
             CREATE TABLE events (id INTEGER PRIMARY KEY, value BLOB NOT NULL);
-            CREATE TABLE captured (digest BLOB PRIMARY KEY) WITHOUT ROWID;
+            CREATE TABLE captured (digest BLOB PRIMARY KEY, at_ms INTEGER NOT NULL) WITHOUT ROWID;
+            CREATE INDEX captured_at ON captured(at_ms);
             CREATE TABLE event_state (id INTEGER PRIMARY KEY CHECK(id=1),
                 source TEXT, session_id TEXT, tail INTEGER NOT NULL DEFAULT 0,
                 identity BLOB, legacy_namespace INTEGER NOT NULL DEFAULT 0,
@@ -301,7 +319,7 @@ pub(crate) fn is_corruption(error: &anyhow::Error) -> bool {
 /// activity, so retention measures how long the session has been cold.
 pub(super) fn touch(tx: &Connection) -> rusqlite::Result<()> {
     tx.execute(
-        "UPDATE event_state SET active_ms=CAST(unixepoch('subsec') * 1000 AS INTEGER) WHERE id=1",
+        &format!("UPDATE event_state SET active_ms={NOW_MS} WHERE id=1"),
         [],
     )
     .map(|_| ())
