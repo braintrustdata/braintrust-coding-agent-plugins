@@ -1,6 +1,7 @@
 //! Storage behavior shared by the concrete collections.
 use super::inspect::{Fault, Inspector, Table};
 use super::span_ops::Translated;
+use super::store::One;
 use super::*;
 use crate::journal::{journal_path, source_journal_path};
 use crate::translate::{SpanOp, SpanRow};
@@ -309,6 +310,12 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
     let delivered = ops.subscribe(&route("delivered")).await.unwrap().position;
     // A route registered for output whose delivery never starts.
     ops.register(&route("unsubscribed")).await.unwrap();
+    // A route whose destination keeps rejecting what it is sent.
+    ops.subscribe(&route("rejected")).await.unwrap();
+    let rejected = serde_json::to_string(&route("rejected")).unwrap();
+    ops.set_failure(&rejected, Some("413 Request Too Long".into()))
+        .await
+        .unwrap();
     let span = |id: &str, end_ms: Option<i64>| {
         SpanOp::Insert(SpanRow {
             span_id: id.into(),
@@ -339,17 +346,24 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
     let key = serde_json::to_string(&route("delivered")).unwrap();
     ops.remove_through(&key, delivered, tail).await.unwrap();
     let db = Inspector::session(temp.path(), "debug", "session").unwrap();
-    assert_eq!(
-        db.count(Table::Ops),
-        2,
-        "the unsubscribed head holds output"
-    );
+    assert_eq!(db.count(Table::Ops), 2, "undelivered heads hold output");
+    assert!(ops.stalled(retention).await.unwrap().is_empty());
 
     db.age(retention + std::time::Duration::from_secs(60))
         .unwrap();
+    let mut stalled: Vec<_> = ops
+        .stalled(retention)
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|route| route.tags)
+        .collect();
+    stalled.sort();
+    assert_eq!(stalled, ["rejected", "unsubscribed"]);
     let unsubscribed = serde_json::to_string(&route("unsubscribed")).unwrap();
     ops.expire(retention, vec![unsubscribed]).await.unwrap();
     assert_eq!(db.count(Table::Heads), 2, "a live route is never expired");
+    assert_eq!(db.count(Table::Ops), 2);
 
     events.expire(retention).await.unwrap();
     ops.expire(retention, Vec::new()).await.unwrap();
@@ -361,4 +375,49 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
         events.append(&captured, None).await.unwrap().is_some(),
         "an expired capture identity is recorded again"
     );
+}
+
+#[tokio::test]
+async fn compaction_returns_deleted_space_to_the_file_system() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = super::inspect::session_path(temp.path(), "debug", "session");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Earlier daemons created storage without incremental auto-vacuum.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA auto_vacuum=NONE; CREATE TABLE filler(value BLOB)")
+        .unwrap();
+    let storage = super::SessionStorage { path: path.clone() };
+    let raw = || rusqlite::Connection::open(&path).unwrap();
+    let pragma = |name: &str| raw().one::<i64>(&format!("PRAGMA {name}"), []).unwrap();
+    let size = || std::fs::metadata(&path).unwrap().len();
+    let churn = || {
+        raw()
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+                 INSERT INTO filler SELECT randomblob(4096) FROM n;
+                 DELETE FROM filler; PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap()
+    };
+    storage.span_ops().await.unwrap();
+    assert_eq!(pragma("auto_vacuum"), 0);
+
+    churn();
+    let bloated = size();
+    assert!(pragma("freelist_count") > 0);
+    storage.compact().await.unwrap();
+    assert_eq!(
+        pragma("auto_vacuum"),
+        2,
+        "rebuilt with incremental auto-vacuum"
+    );
+    assert_eq!(pragma("freelist_count"), 0);
+    assert!(size() < bloated / 4, "{} of {bloated} bytes remain", size());
+
+    churn();
+    assert!(pragma("freelist_count") > 0);
+    storage.compact().await.unwrap();
+    assert_eq!(pragma("freelist_count"), 0);
+    assert!(size() < bloated / 4, "{} of {bloated} bytes remain", size());
 }

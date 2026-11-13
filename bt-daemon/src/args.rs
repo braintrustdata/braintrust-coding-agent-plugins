@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use crate::agents::{self, Agent, Identity};
 use crate::wire;
 
+/// How long `serve` keeps undelivered output and idle session state.
+pub const DEFAULT_RETENTION_HOURS: u64 = 7 * 24;
+
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
@@ -27,6 +30,16 @@ pub struct ServeArgs {
     /// retirement.
     #[arg(long, default_value_t = 30)]
     pub session_idle_timeout_secs: u64,
+    /// Discard output a destination has not accepted, and session state left
+    /// idle, after this many hours. Lower it to bound disk use more tightly
+    /// when a destination keeps rejecting spans.
+    #[arg(
+        long,
+        env = "BRAINTRUST_DAEMON_RETENTION_HOURS",
+        default_value_t = DEFAULT_RETENTION_HOURS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub retention_hours: u64,
 }
 
 /// Arguments for `hook`.
@@ -327,6 +340,7 @@ mod tests {
     fn serve_defaults_to_short_journal_backed_session_retirement() {
         let args = ServeCli::try_parse_from(["test"]).unwrap().args;
         assert_eq!(args.session_idle_timeout_secs, 30);
+        assert_eq!(args.retention_hours, DEFAULT_RETENTION_HOURS);
     }
 
     #[test]

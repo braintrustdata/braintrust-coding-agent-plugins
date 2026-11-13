@@ -67,6 +67,7 @@ pub async fn target(output: &Path, config: Option<SessionConfig>) -> ImportTarge
                 data_dir: Some(root.join("data")),
                 idle_timeout_secs: 0,
                 session_idle_timeout_secs: 0,
+                retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
             };
             let options = ServeOptions {
                 version: "test".into(),

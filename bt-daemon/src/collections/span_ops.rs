@@ -167,6 +167,15 @@ pub(super) fn extract_metadata(db: &Connection) -> anyhow::Result<()> {
     prune(db)
 }
 
+fn stalled(db: &Connection, cutoff: i64) -> anyhow::Result<Vec<String>> {
+    let mut query = db.prepare(
+        "SELECT route FROM heads WHERE progress_ms<?
+         AND position<(SELECT tail FROM translation WHERE id=1)",
+    )?;
+    let rows = query.query_map([cutoff], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 fn prune(db: &Connection) -> anyhow::Result<()> {
     db.execute(
         "DELETE FROM ops WHERE position<=(SELECT min(position) FROM heads)",
@@ -546,7 +555,6 @@ impl SpanOps {
                     ),
                     [&key],
                 )?;
-                tx.execute("UPDATE heads SET subscribed=1 WHERE route=?", [&key])?;
                 Ok(tx.one("SELECT position FROM heads WHERE route=?", [key])?)
             })
             .await?;
@@ -677,12 +685,26 @@ impl SpanOps {
             .await
     }
 
+    /// Routes that have owed output for `retention` without delivering any of
+    /// it: a route whose credentials never resolved, or one held by a failure
+    /// that was never corrected. Their output can no longer be expected to
+    /// arrive.
+    pub async fn stalled(
+        &self,
+        retention: std::time::Duration,
+    ) -> anyhow::Result<Vec<SessionRoute>> {
+        let cutoff = cutoff_ms(retention);
+        let routes = self.store.run(move |db| stalled(db, cutoff)).await?;
+        Ok(routes
+            .iter()
+            .map(|route| serde_json::from_str(route))
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Expire what a live session no longer uses once `retention` passes:
-    /// metadata of spans that ended or were never completed, and heads that
-    /// were registered for output but never subscribed (such as a route whose
-    /// credentials never resolved) and have owed it that long. Ops no
-    /// remaining head needs are then deleted. A subscribed head held by a
-    /// failure is kept for recovery.
+    /// metadata of spans that ended or were never completed, and the heads of
+    /// [`stalled`](Self::stalled) routes. Ops no remaining head needs are then
+    /// deleted.
     ///
     /// `live` names routes with an active delivery that must be kept.
     pub async fn expire(
@@ -698,17 +720,17 @@ impl SpanOps {
                     "DELETE FROM span_state WHERE touched_ms<? AND (kind='tool' OR end_ms IS NOT NULL)",
                     [cutoff],
                 )?;
-                let stuck = {
-                    let mut query = tx.prepare(
-                        "SELECT route FROM heads WHERE subscribed=0 AND progress_ms<?
-                         AND position<(SELECT tail FROM translation WHERE id=1)",
-                    )?;
-                    let rows = query.query_map([cutoff], |r| r.get::<_, String>(0))?;
-                    rows.collect::<Result<Vec<_>, _>>()?
-                };
-                for route in stuck.into_iter().filter(|route| !live.contains(route)) {
-                    tracing::warn!(%route, "undelivered output expired for a route that never subscribed");
+                let mut expired = false;
+                for route in stalled(tx, cutoff)?.into_iter().filter(|route| !live.contains(route)) {
+                    let failure: Option<String> =
+                        tx.one("SELECT failure FROM heads WHERE route=?", [&route])?;
+                    tracing::warn!(%route, ?failure, "undelivered output expired for a stalled route");
                     tx.execute("DELETE FROM heads WHERE route=?", [route])?;
+                    expired = true;
+                }
+                if expired && tx.one::<i64>("SELECT count(*) FROM heads", [])? == 0 {
+                    // Everything stored was owed only to expired routes.
+                    tx.execute("DELETE FROM ops", [])?;
                 }
                 prune(tx)
             })

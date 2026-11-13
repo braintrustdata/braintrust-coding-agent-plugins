@@ -339,11 +339,13 @@ reaches its size limit. Turn endings, explicit flushes, and daemon shutdown drai
 available traces without waiting for that interval.
 
 Local event logs and transcript copies contain conversation content. Credentials
-are excluded from saved routing settings. Storage can grow as sessions accumulate
-messages or uploads remain pending. Space used by completed delivery records is
-reused, so a database file may keep its previous size after delivery catches up.
-Completed sessions become eligible for cleanup after seven days without changes;
-unfinished work is retained for recovery.
+are excluded from saved routing settings. Storage holds events until they are
+translated and spans until every destination accepts them; space they used is
+returned to the file system. Spans a destination has accepted none of for the
+retention period, such as spans it keeps rejecting, are discarded, as is the
+storage of a completed session left unchanged that long. Retention defaults to
+seven days; set `BRAINTRUST_DAEMON_RETENTION_HOURS` (or `serve
+--retention-hours`) to bound disk use more tightly.
 
 ## Platform and integration coverage
 
