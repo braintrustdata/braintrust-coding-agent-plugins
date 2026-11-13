@@ -108,6 +108,4 @@ Real-agent tests require installed agents and are run separately; see the
 
 Edit plugin sources here. The per-agent GitHub distribution repositories and
 npm packages are generated artifacts. See [AGENTS.md](AGENTS.md) for the release
-PR and approval workflow, sandbox publishing, and npm release workflows. See
-[Antigravity publishing](src/plugins/antigravity/PUBLISHING.md) for MCP validation
-and Google Marketplace submission steps.
+PR and approval workflow, sandbox publishing, and npm release workflows.
