@@ -6,7 +6,7 @@
 //! so the translator rebuilds its state from it without publishing it again. A
 //! journal file is deleted only after every record it contributes has been
 //! committed.
-use super::events::{encode, EventCollection, EventRecord, Imported};
+use super::events::{EventCollection, EventRecord, Imported, Stored};
 use crate::journal::{journal_dir, journal_path, source_journal_path};
 use crate::wire::{RedactedEnvelope, SessionRoute};
 use anyhow::Context;
@@ -173,9 +173,9 @@ async fn import_file(
             }
             EventRecord::Control(_) => {}
         }
-        let value = encode(&record)?;
-        bytes += value.len();
-        batch.push((through, value));
+        let stored = Stored::try_from(&record)?;
+        bytes += stored.value.len();
+        batch.push((through, stored));
         if batch.len() >= IMPORT_RECORDS || bytes >= IMPORT_BYTES {
             events.import(std::mem::take(&mut batch), None).await?;
             bytes = 0;
@@ -260,7 +260,17 @@ impl Reader {
                     Line::Checkpoint(checkpoint.with_context(context)?),
                 )));
             }
-            let mut record = super::events::decode_value(value).with_context(context)?;
+            // Legacy journals tag controls and leave events untagged.
+            let control = value
+                .get("_bt_record_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("pipeline_control");
+            let mut record = if control {
+                serde_json::from_value(value).map(EventRecord::Control)
+            } else {
+                serde_json::from_value(value).map(EventRecord::Event)
+            }
+            .with_context(context)?;
             if let EventRecord::Event(event) = &mut record {
                 expand_pi_payload(event, &mut self.pi_context)?;
             }

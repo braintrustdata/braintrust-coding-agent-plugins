@@ -71,32 +71,38 @@ pub(super) struct Imported {
     pub delivered: u64,
 }
 
-pub(super) fn encode(record: &EventRecord) -> anyhow::Result<Vec<u8>> {
-    let value = match record {
-        EventRecord::Event(event) => serde_json::to_value(event)?,
-        EventRecord::Control(control) => {
-            let mut value = serde_json::to_value(control)?;
-            value["_bt_record_type"] = "pipeline_control".into();
-            value
-        }
-    };
-    Ok(serde_json::to_vec(&value)?)
+/// A record as stored: its kind, and the event or control as JSON.
+#[derive(PartialEq)]
+pub(super) struct Stored {
+    pub control: bool,
+    pub value: Vec<u8>,
 }
 
-pub(super) fn decode(bytes: &[u8]) -> anyhow::Result<EventRecord> {
-    decode_value(serde_json::from_slice(bytes)?)
+impl TryFrom<&EventRecord> for Stored {
+    type Error = serde_json::Error;
+    fn try_from(record: &EventRecord) -> serde_json::Result<Self> {
+        Ok(match record {
+            EventRecord::Event(event) => Self {
+                control: false,
+                value: serde_json::to_vec(event)?,
+            },
+            EventRecord::Control(control) => Self {
+                control: true,
+                value: serde_json::to_vec(control)?,
+            },
+        })
+    }
 }
 
-pub(super) fn decode_value(value: serde_json::Value) -> anyhow::Result<EventRecord> {
-    Ok(
-        match value
-            .get("_bt_record_type")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("pipeline_control") => EventRecord::Control(serde_json::from_value(value)?),
-            _ => EventRecord::Event(serde_json::from_value(value)?),
-        },
-    )
+impl TryFrom<&Stored> for EventRecord {
+    type Error = serde_json::Error;
+    fn try_from(stored: &Stored) -> serde_json::Result<Self> {
+        Ok(if stored.control {
+            Self::Control(serde_json::from_slice(&stored.value)?)
+        } else {
+            Self::Event(serde_json::from_slice(&stored.value)?)
+        })
+    }
 }
 
 /// The database file for one source session.
@@ -196,7 +202,7 @@ impl EventCollection {
             }
             EventRecord::Control(_) => None,
         };
-        let value = encode(&record)?;
+        let stored = Stored::try_from(&record)?;
         self.store
             .write(move |tx| {
                 let tail: u64 = tx.one("SELECT tail FROM event_state WHERE id=1", [])?;
@@ -204,7 +210,7 @@ impl EventCollection {
                     return Ok(None);
                 }
                 let Some((digest, mut identity)) = capture else {
-                    return insert(tx, value).map(Some);
+                    return insert(tx, stored).map(Some);
                 };
                 if tx.execute(
                     &format!("INSERT OR IGNORE INTO captured(digest,at_ms) VALUES(?,{NOW_MS})"),
@@ -218,7 +224,7 @@ impl EventCollection {
                 if let Some(Json(previous)) = previous {
                     retain_references(&mut identity, &previous);
                 }
-                let appended = insert(tx, value)?;
+                let appended = insert(tx, stored)?;
                 tx.execute(
                     "UPDATE event_state SET identity=? WHERE id=1",
                     [Json(&identity)],
@@ -274,28 +280,33 @@ impl EventCollection {
     /// about the session as a whole.
     pub(super) async fn import(
         &self,
-        records: Vec<(u64, Vec<u8>)>,
+        records: Vec<(u64, Stored)>,
         finished: Option<Imported>,
     ) -> anyhow::Result<()> {
         self.store
             .write(move |tx| {
-                for (id, value) in records {
+                for (id, stored) in records {
                     anyhow::ensure!(
                         id <= i64::MAX as u64,
                         "legacy position exceeds storage range"
                     );
-                    let prior: Option<Vec<u8>> = tx
-                        .one("SELECT value FROM events WHERE id=?", [id])
+                    let prior = tx
+                        .query_row("SELECT control,value FROM events WHERE id=?", [id], |r| {
+                            Ok(Stored {
+                                control: r.get(0)?,
+                                value: r.get(1)?,
+                            })
+                        })
                         .optional()?;
                     match prior {
                         Some(prior) => anyhow::ensure!(
-                            prior == value,
+                            prior == stored,
                             "legacy record changed during migration"
                         ),
                         None => {
                             tx.execute(
-                                "INSERT INTO events(id,value) VALUES(?,?)",
-                                params![id, value],
+                                "INSERT INTO events(id,control,value) VALUES(?,?,?)",
+                                params![id, stored.control, stored.value],
                             )?;
                         }
                     }
@@ -398,15 +409,15 @@ pub(super) fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
     identity
 }
 
-fn insert(tx: &rusqlite::Transaction<'_>, value: Vec<u8>) -> anyhow::Result<SourcePosition> {
+fn insert(tx: &rusqlite::Transaction<'_>, stored: Stored) -> anyhow::Result<SourcePosition> {
     let before: u64 = tx.one("SELECT tail FROM event_state WHERE id=1", [])?;
     let through = before
-        .checked_add(value.len() as u64 + 1)
+        .checked_add(stored.value.len() as u64 + 1)
         .filter(|id| *id <= i64::MAX as u64)
         .ok_or_else(|| anyhow::anyhow!("event ID overflow"))?;
     tx.execute(
-        "INSERT INTO events(id,value) VALUES(?,?)",
-        params![through, value],
+        "INSERT INTO events(id,control,value) VALUES(?,?,?)",
+        params![through, stored.control, stored.value],
     )?;
     tx.execute("UPDATE event_state SET tail=? WHERE id=1", [through])?;
     super::store::touch(tx)?;
@@ -418,7 +429,7 @@ pub(crate) struct EventReader {
     events: EventCollection,
     position: u64,
     through: u64,
-    buffer: VecDeque<(u64, Vec<u8>)>,
+    buffer: VecDeque<(u64, Stored)>,
 }
 
 impl EventReader {
@@ -438,33 +449,37 @@ impl EventReader {
                 .store
                 .run(move |db| {
                     let mut query = db.prepare_cached(
-                        "SELECT id,value FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
+                        "SELECT id,control,value FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
                     )?;
                     let mut rows = query.query(params![after, through, READ_RECORDS])?;
                     let mut records = VecDeque::new();
                     let mut bytes = 0;
                     while let Some(row) = rows.next()? {
-                        let value: Vec<u8> = row.get(1)?;
-                        if !records.is_empty() && bytes + value.len() > READ_BYTES {
+                        let stored = Stored {
+                            control: row.get(1)?,
+                            value: row.get(2)?,
+                        };
+                        if !records.is_empty() && bytes + stored.value.len() > READ_BYTES {
                             break;
                         }
-                        bytes += value.len();
-                        records.push_back((row.get(0)?, value));
+                        bytes += stored.value.len();
+                        records.push_back((row.get(0)?, stored));
                     }
                     Ok(records)
                 })
                 .await?;
         }
-        let Some((id, bytes)) = self.buffer.pop_front() else {
+        let Some((id, stored)) = self.buffer.pop_front() else {
             return Ok(None);
         };
-        let record = match tokio::task::spawn_blocking(move || decode(&bytes)).await? {
-            Ok(record) => record,
-            Err(error) => {
-                self.buffer.clear();
-                return Err(error.context(format!("event record {id}")));
-            }
-        };
+        let record =
+            match tokio::task::spawn_blocking(move || EventRecord::try_from(&stored)).await? {
+                Ok(record) => record,
+                Err(error) => {
+                    self.buffer.clear();
+                    return Err(anyhow::Error::new(error).context(format!("event record {id}")));
+                }
+            };
         self.position = id;
         Ok(Some(EventEntry { id, record }))
     }

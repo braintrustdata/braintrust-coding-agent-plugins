@@ -293,7 +293,7 @@ fn migrate(db: &Connection) -> anyhow::Result<()> {
             "DROP TABLE batches; DROP TABLE receipts; DROP TABLE root_candidates;
             DROP TABLE publication; DROP TABLE recovery;
             DROP INDEX ops_input; ALTER TABLE ops DROP COLUMN input;
-            CREATE TABLE events (id INTEGER PRIMARY KEY, value BLOB NOT NULL);
+            CREATE TABLE events (id INTEGER PRIMARY KEY, control INTEGER NOT NULL, value BLOB NOT NULL);
             CREATE TABLE captured (digest BLOB PRIMARY KEY, at_ms INTEGER NOT NULL) WITHOUT ROWID;
             CREATE INDEX captured_at ON captured(at_ms);
             CREATE TABLE event_state (id INTEGER PRIMARY KEY CHECK(id=1),
