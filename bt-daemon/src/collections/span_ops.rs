@@ -7,9 +7,10 @@
 //! accepts them, and an op is deleted when every route has passed it.
 //! Writers acquire the write lock before reading, so read-to-write upgrades
 //! cannot fail mid-way.
+use super::store::One;
 use super::{
     events::{cutoff_ms, EventCollection},
-    store::{Store, NOW_MS},
+    store::{Json, Store, NOW_MS},
 };
 use crate::{
     pipeline::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW},
@@ -97,7 +98,7 @@ fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Res
     if let Some(origin) = &row.origin {
         db.execute(
             "INSERT OR IGNORE INTO origins(span_id,value) VALUES (?,?)",
-            params![row.span_id, serde_json::to_string(origin)?],
+            params![row.span_id, Json(origin)],
         )?;
     }
     if row.end_ms.is_some() {
@@ -175,13 +176,11 @@ fn prune(db: &Connection) -> anyhow::Result<()> {
 }
 
 fn tail(db: &Connection) -> rusqlite::Result<u64> {
-    db.query_row("SELECT tail FROM translation WHERE id=1", [], |r| r.get(0))
+    db.one("SELECT tail FROM translation WHERE id=1", [])
 }
 
 fn translated_through(db: &Connection) -> rusqlite::Result<u64> {
-    db.query_row("SELECT through FROM translation WHERE id=1", [], |r| {
-        r.get(0)
-    })
+    db.one("SELECT through FROM translation WHERE id=1", [])
 }
 
 fn encode_roots(roots: &BTreeMap<String, Vec<SpanOp>>) -> anyhow::Result<Option<Vec<u8>>> {
@@ -429,7 +428,7 @@ impl SpanOps {
         self.store
             .run(|db| {
                 let bytes: Option<Vec<u8>> =
-                    db.query_row("SELECT roots FROM translation WHERE id=1", [], |r| r.get(0))?;
+                    db.one("SELECT roots FROM translation WHERE id=1", [])?;
                 let Some(bytes) = bytes else {
                     return Ok(BTreeMap::new());
                 };
@@ -548,9 +547,7 @@ impl SpanOps {
                     [&key],
                 )?;
                 tx.execute("UPDATE heads SET subscribed=1 WHERE route=?", [&key])?;
-                Ok(tx.query_row("SELECT position FROM heads WHERE route=?", [key], |r| {
-                    r.get(0)
-                })?)
+                Ok(tx.one("SELECT position FROM heads WHERE route=?", [key])?)
             })
             .await?;
         Ok(Subscriber {
@@ -572,11 +569,8 @@ impl SpanOps {
                 let mut query = db.prepare_cached("SELECT value FROM origins WHERE span_id=?")?;
                 let mut origins = BTreeMap::new();
                 for span in spans {
-                    if let Some(value) = query
-                        .query_row([&span], |r| r.get::<_, String>(0))
-                        .optional()?
-                    {
-                        origins.insert(span, serde_json::from_str(&value)?);
+                    if let Some(Json(origin)) = query.query_row([&span], |r| r.get(0)).optional()? {
+                        origins.insert(span, origin);
                     }
                 }
                 Ok(origins)
@@ -619,15 +613,10 @@ impl SpanOps {
             .write(move |tx| {
                 let existing = {
                     let mut query = tx.prepare("SELECT route FROM heads")?;
-                    let rows = query.query_map([], |r| r.get::<_, String>(0))?;
-                    let mut existing = false;
-                    for row in rows {
-                        if serde_json::from_str::<SessionRoute>(&row?)?.same_route(&candidate) {
-                            existing = true;
-                            break;
-                        }
-                    }
-                    existing
+                    let mut routes = query.query_map([], |r| r.get::<_, Json<SessionRoute>>(0))?;
+                    routes.try_fold(false, |found, route| {
+                        Ok::<_, rusqlite::Error>(found || route?.0.same_route(&candidate))
+                    })?
                 };
                 if !existing {
                     tx.execute(
@@ -655,9 +644,8 @@ impl SpanOps {
                     "SELECT route FROM heads WHERE failure IS NULL
                      AND position>=(SELECT tail FROM translation WHERE id=1)",
                 )?;
-                for stored in query.query_map([], |r| r.get::<_, String>(0))? {
-                    let stored: SessionRoute = serde_json::from_str(&stored?)?;
-                    if stored.same_route(&route) {
+                for stored in query.query_map([], |r| r.get::<_, Json<SessionRoute>>(0))? {
+                    if stored?.0.same_route(&route) {
                         return Ok(true);
                     }
                 }
@@ -673,15 +661,11 @@ impl SpanOps {
     pub async fn complete(&self, input: u64) -> anyhow::Result<bool> {
         self.store
             .run(move |db| {
-                Ok(db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM heads)
+                Ok(db.one("SELECT EXISTS(SELECT 1 FROM heads)
                      AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position<t.tail)
                      AND t.failure IS NULL AND t.through>=?
                      AND NOT EXISTS(SELECT 1 FROM events WHERE id>t.through)
-                     FROM translation t WHERE id=1",
-                    [input],
-                    |r| r.get(0),
-                )?)
+                     FROM translation t WHERE id=1", [input])?)
             })
             .await
     }
@@ -689,13 +673,7 @@ impl SpanOps {
     /// A translation failure recorded for recovery.
     pub async fn source_failure(&self) -> anyhow::Result<Option<String>> {
         self.store
-            .run(|db| {
-                Ok(
-                    db.query_row("SELECT failure FROM translation WHERE id=1", [], |r| {
-                        r.get(0)
-                    })?,
-                )
-            })
+            .run(|db| Ok(db.one("SELECT failure FROM translation WHERE id=1", [])?))
             .await
     }
 
@@ -756,9 +734,7 @@ impl SpanOps {
         self.store
             .run(move |db| {
                 let previous: Option<String> =
-                    db.query_row("SELECT binding FROM heads WHERE route=?", [&route], |r| {
-                        r.get(0)
-                    })?;
+                    db.one("SELECT binding FROM heads WHERE route=?", [&route])?;
                 anyhow::ensure!(
                     previous
                         .as_ref()
@@ -792,23 +768,24 @@ impl SpanOps {
                     let rows = query.query_map([through], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
+                            row.get::<_, Json<SessionRoute>>(0)?,
                             row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<Json<SessionRoute>>>(2)?,
                         ))
                     })?;
                     rows.collect::<Result<Vec<_>, _>>()?
                 };
                 let mut updates = Vec::new();
-                for (key, failure, settings) in held {
+                for (key, Json(route), failure, settings) in held {
                     let held = HeldRoute {
-                        route: serde_json::from_str(&key)?,
+                        route,
                         failure,
-                        settings: settings.as_deref().map(serde_json::from_str).transpose()?,
+                        settings: settings.map(|Json(settings)| settings),
                     };
                     if let Some(corrected) = correct(&held) {
                         tx.execute(
                             "UPDATE heads SET settings=?, settings_through=? WHERE route=?",
-                            params![serde_json::to_string(&corrected)?, through, key],
+                            params![Json(&corrected), through, key],
                         )?;
                         updates.push((held.route, corrected));
                     }
@@ -823,17 +800,11 @@ impl SpanOps {
         let key = serde_json::to_string(route)?;
         self.store
             .run(move |db| {
-                let settings: Option<String> = db
-                    .query_row("SELECT settings FROM heads WHERE route=?", [key], |row| {
-                        row.get(0)
-                    })
+                let settings: Option<Json<SessionRoute>> = db
+                    .one("SELECT settings FROM heads WHERE route=?", [key])
                     .optional()?
                     .flatten();
-                Ok(settings
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()?
-                    .unwrap_or(fallback))
+                Ok(settings.map_or(fallback, |Json(settings)| settings))
             })
             .await
     }
@@ -842,11 +813,11 @@ impl SpanOps {
         self.store
             .run(|db| {
                 let mut query = db.prepare("SELECT route FROM heads ORDER BY route")?;
-                let rows = query
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .map(|route| Ok(serde_json::from_str(&route?)?))
+                let routes = query
+                    .query_map([], |r| r.get::<_, Json<SessionRoute>>(0))?
+                    .map(|route| Ok(route?.0))
                     .collect();
-                rows
+                routes
             })
             .await
     }
@@ -854,13 +825,7 @@ impl SpanOps {
     pub async fn failure(&self, route: &str) -> anyhow::Result<Option<String>> {
         let route = route.to_owned();
         self.store
-            .run(move |db| {
-                Ok(
-                    db.query_row("SELECT failure FROM heads WHERE route=?", [route], |r| {
-                        r.get(0)
-                    })?,
-                )
-            })
+            .run(move |db| Ok(db.one("SELECT failure FROM heads WHERE route=?", [route])?))
             .await
     }
 
@@ -880,13 +845,7 @@ impl SpanOps {
     pub async fn head(&self, route: &str) -> anyhow::Result<u64> {
         let route = route.to_owned();
         self.store
-            .run(move |db| {
-                Ok(
-                    db.query_row("SELECT position FROM heads WHERE route=?", [route], |r| {
-                        r.get(0)
-                    })?,
-                )
-            })
+            .run(move |db| Ok(db.one("SELECT position FROM heads WHERE route=?", [route])?))
             .await
     }
 
@@ -903,9 +862,7 @@ impl SpanOps {
         self.store
             .write(move |tx| {
                 let head: u64 =
-                    tx.query_row("SELECT position FROM heads WHERE route=?", [&route], |r| {
-                        r.get(0)
-                    })?;
+                    tx.one("SELECT position FROM heads WHERE route=?", [&route])?;
                 if head >= through {
                     return Ok(head);
                 }
@@ -928,7 +885,7 @@ impl SpanOps {
 impl SpanOps {
     pub async fn stored_ops(&self) -> u64 {
         self.store
-            .run(|db| Ok(db.query_row("SELECT count(*) FROM ops", [], |r| r.get(0))?))
+            .run(|db| Ok(db.one("SELECT count(*) FROM ops", [])?))
             .await
             .unwrap_or(u64::MAX)
     }
@@ -965,13 +922,10 @@ impl SpanOps {
         self.store
             .run(|db| {
                 let mut query = db.prepare("SELECT span_id,value FROM origins")?;
-                let rows = query
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-                rows.map(|row| {
-                    let (id, value) = row?;
-                    Ok((id, serde_json::from_str(&value)?))
-                })
-                .collect()
+                let origins = query
+                    .query_map([], |r| Ok((r.get(0)?, r.get::<_, Json<_>>(1)?.0)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(origins)
             })
             .await
     }

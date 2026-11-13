@@ -1,6 +1,7 @@
 //! Test support: inspect session storage and inject storage faults through a
 //! typed interface, so tests outside this module never contain SQL.
 #![allow(dead_code, reason = "Different test suites use different inspectors.")]
+use super::store::{Json, One};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -86,9 +87,7 @@ impl Inspector {
 
     pub fn count(&self, table: Table) -> u64 {
         self.0
-            .query_row(&format!("SELECT count(*) FROM {}", table.name()), [], |r| {
-                r.get(0)
-            })
+            .one(&format!("SELECT count(*) FROM {}", table.name()), [])
             .unwrap_or(0)
     }
 
@@ -117,23 +116,21 @@ impl Inspector {
 
     pub fn event_tail(&self) -> u64 {
         self.0
-            .query_row("SELECT tail FROM event_state WHERE id=1", [], |r| r.get(0))
+            .one("SELECT tail FROM event_state WHERE id=1", [])
             .unwrap_or(0)
     }
 
     pub fn identity(&self) -> Option<Value> {
-        let bytes: Vec<u8> = self
+        let Json(identity) = self
             .0
-            .query_row("SELECT identity FROM event_state WHERE id=1", [], |r| {
-                r.get(0)
-            })
+            .one("SELECT identity FROM event_state WHERE id=1", [])
             .ok()?;
-        serde_json::from_slice(&bytes).ok()
+        Some(identity)
     }
 
     /// The translator continuation and the event ID it covers.
     pub fn checkpoint(&self) -> Option<(u64, Value)> {
-        let (through, bytes): (u64, Vec<u8>) = self
+        let (through, Json(continuation)) = self
             .0
             .query_row(
                 "SELECT through,continuation FROM translation WHERE id=1",
@@ -142,7 +139,7 @@ impl Inspector {
             )
             .optional()
             .ok()??;
-        Some((through, serde_json::from_slice(&bytes).ok()?))
+        Some((through, continuation))
     }
 
     pub fn heads(&self) -> Vec<Head> {
@@ -157,8 +154,8 @@ impl Inspector {
                 position: r.get(0)?,
                 failure: r.get(1)?,
                 settings: r
-                    .get::<_, Option<String>>(2)?
-                    .and_then(|settings| serde_json::from_str(&settings).ok()),
+                    .get::<_, Option<Json<_>>>(2)?
+                    .map(|Json(settings)| settings),
             })
         }) else {
             return Vec::new();
@@ -169,18 +166,17 @@ impl Inspector {
     /// The position of the last published SpanOp.
     pub fn published_tail(&self) -> u64 {
         self.0
-            .query_row("SELECT tail FROM translation WHERE id=1", [], |r| r.get(0))
+            .one("SELECT tail FROM translation WHERE id=1", [])
             .unwrap_or(0)
     }
 
     /// Heads that are failed or behind the published tail.
     pub fn held_heads(&self) -> u64 {
         self.0
-            .query_row(
+            .one(
                 "SELECT count(*) FROM heads WHERE failure IS NOT NULL
                  OR position<(SELECT tail FROM translation WHERE id=1)",
                 [],
-                |r| r.get(0),
             )
             .unwrap_or(0)
     }

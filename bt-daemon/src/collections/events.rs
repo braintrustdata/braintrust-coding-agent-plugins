@@ -5,7 +5,8 @@
 //! Record IDs grow by each record's encoded size, so IDs imported from a legacy
 //! NDJSON journal keep their original byte boundaries and input budgets still
 //! measure bytes. Removal never renumbers later records.
-use super::store::{Store, NOW_MS};
+use super::store::One;
+use super::store::{Json, Store, NOW_MS};
 use crate::pipeline::input::{PipelineControl, SourcePosition};
 use crate::wire::RedactedEnvelope;
 use rusqlite::{params, OptionalExtension};
@@ -155,9 +156,7 @@ impl EventCollection {
     /// The ID of the last record ever inserted, including removed records.
     pub async fn tail(&self) -> anyhow::Result<u64> {
         self.store
-            .run(
-                |db| Ok(db.query_row("SELECT tail FROM event_state WHERE id=1", [], |r| r.get(0))?),
-            )
+            .run(|db| Ok(db.one("SELECT tail FROM event_state WHERE id=1", [])?))
             .await
     }
 
@@ -200,8 +199,7 @@ impl EventCollection {
         let value = encode(&record)?;
         self.store
             .write(move |tx| {
-                let tail: u64 =
-                    tx.query_row("SELECT tail FROM event_state WHERE id=1", [], |r| r.get(0))?;
+                let tail: u64 = tx.one("SELECT tail FROM event_state WHERE id=1", [])?;
                 if after.is_some_and(|after| tail > after) {
                     return Ok(None);
                 }
@@ -215,21 +213,15 @@ impl EventCollection {
                 {
                     return Ok(None);
                 }
-                let previous: Option<Vec<u8>> =
-                    tx.query_row("SELECT identity FROM event_state WHERE id=1", [], |r| {
-                        r.get(0)
-                    })?;
-                if let Some(previous) = previous
-                    .as_deref()
-                    .map(serde_json::from_slice::<RedactedEnvelope>)
-                    .transpose()?
-                {
+                let previous: Option<Json<RedactedEnvelope>> =
+                    tx.one("SELECT identity FROM event_state WHERE id=1", [])?;
+                if let Some(Json(previous)) = previous {
                     retain_references(&mut identity, &previous);
                 }
                 let appended = insert(tx, value)?;
                 tx.execute(
                     "UPDATE event_state SET identity=? WHERE id=1",
-                    [serde_json::to_vec(&identity)?],
+                    [Json(&identity)],
                 )?;
                 Ok(Some(appended))
             })
@@ -240,13 +232,9 @@ impl EventCollection {
     pub async fn identity(&self) -> anyhow::Result<Option<RedactedEnvelope>> {
         self.store
             .run(|db| {
-                let bytes: Option<Vec<u8>> =
-                    db.query_row("SELECT identity FROM event_state WHERE id=1", [], |r| {
-                        r.get(0)
-                    })?;
-                bytes
-                    .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
-                    .transpose()
+                let identity: Option<Json<_>> =
+                    db.one("SELECT identity FROM event_state WHERE id=1", [])?;
+                Ok(identity.map(|Json(identity)| identity))
             })
             .await
     }
@@ -255,13 +243,7 @@ impl EventCollection {
     pub async fn idle_for(&self) -> anyhow::Result<std::time::Duration> {
         let active: i64 = self
             .store
-            .run(|db| {
-                Ok(
-                    db.query_row("SELECT active_ms FROM event_state WHERE id=1", [], |r| {
-                        r.get(0)
-                    })?,
-                )
-            })
+            .run(|db| Ok(db.one("SELECT active_ms FROM event_state WHERE id=1", [])?))
             .await?;
         let now = chrono::Utc::now().timestamp_millis();
         Ok(std::time::Duration::from_millis(
@@ -272,13 +254,7 @@ impl EventCollection {
     /// Whether this source kept the pre-qualification span-id namespace.
     pub async fn legacy_namespace(&self) -> anyhow::Result<bool> {
         self.store
-            .run(|db| {
-                Ok(db.query_row(
-                    "SELECT legacy_namespace FROM event_state WHERE id=1",
-                    [],
-                    |r| r.get(0),
-                )?)
-            })
+            .run(|db| Ok(db.one("SELECT legacy_namespace FROM event_state WHERE id=1", [])?))
             .await
     }
 
@@ -301,11 +277,6 @@ impl EventCollection {
         records: Vec<(u64, Vec<u8>)>,
         finished: Option<Imported>,
     ) -> anyhow::Result<()> {
-        let identity = finished
-            .as_ref()
-            .and_then(|finished| finished.identity.as_ref())
-            .map(serde_json::to_vec)
-            .transpose()?;
         self.store
             .write(move |tx| {
                 for (id, value) in records {
@@ -314,7 +285,7 @@ impl EventCollection {
                         "legacy position exceeds storage range"
                     );
                     let prior: Option<Vec<u8>> = tx
-                        .query_row("SELECT value FROM events WHERE id=?", [id], |r| r.get(0))
+                        .one("SELECT value FROM events WHERE id=?", [id])
                         .optional()?;
                     match prior {
                         Some(prior) => anyhow::ensure!(
@@ -333,8 +304,11 @@ impl EventCollection {
                 let Some(finished) = finished else {
                     return Ok(());
                 };
-                if let Some(identity) = identity {
-                    tx.execute("UPDATE event_state SET identity=? WHERE id=1", [identity])?;
+                if let Some(identity) = &finished.identity {
+                    tx.execute(
+                        "UPDATE event_state SET identity=? WHERE id=1",
+                        [Json(identity)],
+                    )?;
                 }
                 if let Some(namespace) = finished.namespace {
                     tx.execute(
@@ -425,7 +399,7 @@ pub(super) fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
 }
 
 fn insert(tx: &rusqlite::Transaction<'_>, value: Vec<u8>) -> anyhow::Result<SourcePosition> {
-    let before: u64 = tx.query_row("SELECT tail FROM event_state WHERE id=1", [], |r| r.get(0))?;
+    let before: u64 = tx.one("SELECT tail FROM event_state WHERE id=1", [])?;
     let through = before
         .checked_add(value.len() as u64 + 1)
         .filter(|id| *id <= i64::MAX as u64)

@@ -2,7 +2,10 @@
 //! database shares one connection, so a multi-collection transfer is a single
 //! local transaction and closing the last handle releases the file.
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{
+    types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef},
+    Connection, Params,
+};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -305,6 +308,36 @@ fn migrate(db: &Connection) -> anyhow::Result<()> {
         db.execute_batch(&format!("PRAGMA user_version={SCHEMA}"))?;
     }
     Ok(())
+}
+
+/// A column holding a JSON-encoded value, stored as text.
+pub(super) struct Json<T>(pub T);
+
+impl<T: serde::de::DeserializeOwned> FromSql for Json<T> {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        serde_json::from_slice(value.as_bytes()?)
+            .map(Json)
+            .map_err(|error| FromSqlError::Other(Box::new(error)))
+    }
+}
+
+impl<T: serde::Serialize> ToSql for Json<T> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        serde_json::to_string(&self.0)
+            .map(ToSqlOutput::from)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    }
+}
+
+/// Read the first column of the one row a query selects.
+pub(super) trait One {
+    fn one<T: FromSql>(&self, sql: &str, params: impl Params) -> rusqlite::Result<T>;
+}
+
+impl One for Connection {
+    fn one<T: FromSql>(&self, sql: &str, params: impl Params) -> rusqlite::Result<T> {
+        self.query_row(sql, params, |row| row.get(0))
+    }
 }
 
 /// Storage errors that will not succeed on retry without changing the data.
