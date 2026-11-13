@@ -2,7 +2,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub(super) enum Content {
     Text(String),
@@ -18,16 +18,25 @@ pub(super) enum ContentPart {
     Tool(super::event::ToolContent),
     Dynamic(Value),
 }
+/// Parts are only ever serialized after construction, so saved translator
+/// state restores each one exactly as it was written. Matching the untagged
+/// variants instead would turn, for example, a reasoning part with provider
+/// options into a plain text part and drop its other fields.
+impl<'de> serde::Deserialize<'de> for ContentPart {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::Dynamic)
+    }
+}
 #[derive(Clone, Serialize)]
 pub(super) struct TextPart {
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub text: String,
 }
 #[derive(Clone, Serialize)]
 pub(super) struct ImagePart {
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub image_url: ImageUrl,
 }
 #[derive(Clone, Serialize)]
@@ -36,23 +45,26 @@ pub(super) struct ImageUrl {
 }
 impl ContentPart {
     pub fn text(text: String) -> Self {
-        Self::Text(TextPart { kind: "text", text })
+        Self::Text(TextPart {
+            kind: "text".into(),
+            text,
+        })
     }
     pub fn image(url: String) -> Self {
         Self::Image(ImagePart {
-            kind: "image_url",
+            kind: "image_url".into(),
             image_url: ImageUrl { url },
         })
     }
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub function: FunctionCall,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct FunctionCall {
     pub name: String,
     pub arguments: String,
@@ -61,7 +73,7 @@ impl ToolCall {
     pub fn new(id: String, name: String, input: &Value) -> Self {
         Self {
             id,
-            kind: "function",
+            kind: "function".into(),
             function: FunctionCall {
                 name,
                 arguments: input.to_string(),
@@ -69,23 +81,23 @@ impl ToolCall {
         }
     }
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct Reasoning {
-    pub id: &'static str,
+    pub id: String,
     pub content: String,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub(super) struct Message {
     pub role: String,
     pub content: Content,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Vec<Reasoning>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_type: Option<&'static str>,
+    pub message_type: Option<String>,
 }
 impl Message {
     pub fn new(role: impl Into<String>, content: Content) -> Self {
@@ -105,7 +117,7 @@ impl Message {
     }
     pub fn summary(text: String) -> Self {
         let mut message = Self::new("assistant", Content::Text(text));
-        message.message_type = Some("compaction_summary");
+        message.message_type = Some("compaction_summary".into());
         message
     }
 }
@@ -195,5 +207,23 @@ impl Metrics {
             prompt_cache_creation_tokens: t.cache.write,
             reasoning_tokens: t.reasoning,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_content_parts_restore_every_field() {
+        let parts = vec![
+            ContentPart::text("prompt".into()),
+            ContentPart::Dynamic(serde_json::json!({
+                "type": "reasoning", "text": "thinking", "providerOptions": {"effort": "high"}
+            })),
+        ];
+        let saved = serde_json::to_value(&parts).unwrap();
+        let restored: Vec<ContentPart> = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), saved);
     }
 }

@@ -55,37 +55,25 @@ pub(crate) struct SpanJournal {
 
 /// Explicit codec preserves fields intentionally omitted from wire/plugin JSON.
 #[derive(Serialize, Deserialize)]
-struct StoredOp {
+struct StoredOp<Op> {
     version: u32,
-    op: SpanOp,
-    late_merge_key: Option<String>,
-    #[serde(default)]
-    late_merge_version: Option<crate::translate::LateMergeVersion>,
-    turn_span_id: Option<String>,
-    is_turn: bool,
+    op: Op,
+    #[serde(flatten)]
+    fields: crate::translate::SinkFields,
 }
 
-impl StoredOp {
+impl StoredOp<&SpanOp> {
     fn encode(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-        #[derive(Serialize)]
-        struct Borrowed<'a> {
-            version: u32,
-            op: &'a SpanOp,
-            late_merge_key: &'a Option<String>,
-            late_merge_version: &'a Option<crate::translate::LateMergeVersion>,
-            turn_span_id: &'a Option<String>,
-            is_turn: bool,
-        }
-        Ok(serde_json::to_vec(&Borrowed {
+        Ok(serde_json::to_vec(&StoredOp {
             version: 1,
             op,
-            late_merge_key: &row.late_merge_key,
-            late_merge_version: &row.late_merge_version,
-            turn_span_id: &row.turn_span_id,
-            is_turn: row.is_turn,
+            fields: crate::translate::SinkFields::of(row),
         })?)
     }
+}
+
+impl StoredOp<SpanOp> {
     fn decode(bytes: &[u8]) -> anyhow::Result<SpanOp> {
         let mut stored: Self = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
@@ -94,10 +82,7 @@ impl StoredOp {
             stored.version
         );
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut stored.op;
-        row.late_merge_key = stored.late_merge_key;
-        row.late_merge_version = stored.late_merge_version;
-        row.turn_span_id = stored.turn_span_id;
-        row.is_turn = stored.is_turn;
+        stored.fields.restore(row);
         Ok(stored.op)
     }
 }

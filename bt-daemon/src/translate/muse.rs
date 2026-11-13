@@ -1,7 +1,7 @@
 //! Muse hook reducer. Native hook decoding and export DTOs live in crate::muse;
 //! this module owns span correlation, ordering, and replay policy.
 use super::git::GitMetadataCache;
-use super::recent::RecentSet;
+use super::recent::{RecentMap, RecentSet};
 #[path = "muse_events.rs"]
 mod muse_events;
 use super::{
@@ -26,12 +26,19 @@ impl TranslatorFactory for crate::agents::Muse {
         Box::new(MuseTranslator::new(session_id, GitMetadataCache::shared()))
     }
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OpenOp {
     id: String,
     parents: Vec<String>,
     turn_span_id: Option<String>,
 }
+/// A completed span and the output it was completed with.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Completed {
+    op: OpenOp,
+    output: Option<Value>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
 struct MuseTranslator {
     session_id: String,
     root_id: String,
@@ -45,10 +52,17 @@ struct MuseTranslator {
     llms: HashMap<String, OpenOp>,
     closed_turns: RecentSet<String>,
     closed_llms: RecentSet<String>,
+    /// Identities of completed spans, so a later, richer completion of the
+    /// same native turn or model call (from an export) updates it in place.
+    #[serde(default)]
+    completed_turns: RecentMap<String, Completed>,
+    #[serde(default)]
+    completed_llms: RecentMap<String, Completed>,
     events: muse_events::Events,
     usage: UsageTracker,
     last_completed_turn: Option<String>,
     last_ts: i64,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 impl MuseTranslator {
@@ -65,6 +79,8 @@ impl MuseTranslator {
             llms: HashMap::new(),
             closed_turns: RecentSet::default(),
             closed_llms: RecentSet::default(),
+            completed_turns: RecentMap::default(),
+            completed_llms: RecentMap::default(),
             root_created: false,
             events: muse_events::Events::default(),
             usage: UsageTracker::default(),
@@ -147,6 +163,25 @@ impl MuseTranslator {
             late_merge_key: Some(format!("muse:complete:{key}:{ts}")),
             ..Default::default()
         })]
+    }
+    /// The open span for `key`. A completed span reopens only for a later
+    /// completion with different output, such as an export's full answer
+    /// after a live preview; an identical completion is a duplicate.
+    fn reopen(
+        open: &mut HashMap<String, OpenOp>,
+        completed: &RecentMap<String, Completed>,
+        key: &str,
+        output: &Option<Value>,
+    ) -> Option<OpenOp> {
+        if let Some(op) = open.get(key) {
+            return Some(op.clone());
+        }
+        let previous = completed.get(key)?;
+        if output.is_none() || *output == previous.output {
+            return None;
+        }
+        open.insert(key.into(), previous.op.clone());
+        Some(previous.op.clone())
     }
     fn close_all(&mut self, ts: i64, error: Option<&str>) -> Vec<SpanOp> {
         let mut out = self.close_events(ts, error);
@@ -257,16 +292,19 @@ impl MuseTranslator {
                 self.llms.contains_key(id),
             )
         });
+        let output = hook
+            .body
+            .output_text_preview
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let open = Self::reopen(&mut self.llms, &self.completed_llms, id, &output);
         let mut closed = Self::close(
             &self.effective_root_id,
             &mut self.llms,
             id,
             e.ts_ms,
-            hook.body
-                .output_text_preview
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()?,
+            output.clone(),
             metrics.map(serde_json::to_value).transpose()?,
             hook.body.outcome.error_message(),
         );
@@ -280,8 +318,10 @@ impl MuseTranslator {
                 options: &hook.body.options,
             })?);
         }
-        if !closed.is_empty() {
+        if let (false, Some(op)) = (closed.is_empty(), open) {
             self.closed_llms.insert(id.into());
+            self.completed_llms
+                .insert(id.into(), Completed { op, output });
         }
         Ok(closed)
     }
@@ -299,6 +339,7 @@ impl MuseTranslator {
             .map(serde_json::to_value)
             .transpose()?;
         let error = hook.body.outcome.error_message();
+        let open = Self::reopen(&mut self.turns, &self.completed_turns, id, &output);
         let mut out = Self::close(
             &self.effective_root_id,
             &mut self.turns,
@@ -308,7 +349,14 @@ impl MuseTranslator {
             None,
             error.clone(),
         );
-        if !out.is_empty() {
+        if let (false, Some(op)) = (out.is_empty(), open) {
+            self.completed_turns.insert(
+                id.into(),
+                Completed {
+                    op,
+                    output: output.clone(),
+                },
+            );
             self.closed_turns.insert(id.into());
             self.last_completed_turn = Some(id.into());
             out.push(SpanOp::Merge(SpanRow {

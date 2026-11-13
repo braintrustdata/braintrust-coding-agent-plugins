@@ -589,6 +589,7 @@ mod tests {
 
     #[tokio::test]
     async fn stopped_import_bypasses_pending_translation_and_finalization() {
+        #[derive(serde::Serialize, serde::Deserialize)]
         struct CatchUp {
             pending: bool,
         }
