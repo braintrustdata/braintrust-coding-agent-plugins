@@ -6,7 +6,7 @@
 //! NDJSON journal keep their original byte boundaries and input budgets still
 //! measure bytes. Removal never renumbers later records.
 use super::store::{Store, NOW_MS};
-use crate::pipeline::input::PipelineControl;
+use crate::pipeline::input::{PipelineControl, SourcePosition};
 use crate::wire::RedactedEnvelope;
 use rusqlite::{params, OptionalExtension};
 use std::{
@@ -46,6 +46,12 @@ impl From<&crate::wire::Envelope> for EventRecord {
     }
 }
 
+impl From<PipelineControl> for EventRecord {
+    fn from(control: PipelineControl) -> Self {
+        Self::Control(control)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EventEntry {
     pub id: u64,
@@ -62,13 +68,6 @@ pub(super) struct Imported {
     pub through: u64,
     /// Input every route had delivered, already translated.
     pub delivered: u64,
-}
-
-/// The ID range a successful insert occupies.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Appended {
-    pub before: u64,
-    pub through: u64,
 }
 
 pub(super) fn encode(record: &EventRecord) -> anyhow::Result<Vec<u8>> {
@@ -186,9 +185,10 @@ impl EventCollection {
     ///   so a control is never ordered ahead of work translation has not seen.
     pub async fn append(
         &self,
-        mut record: EventRecord,
+        record: impl Into<EventRecord>,
         after: Option<u64>,
-    ) -> anyhow::Result<Option<Appended>> {
+    ) -> anyhow::Result<Option<SourcePosition>> {
+        let mut record = record.into();
         let capture = match &mut record {
             EventRecord::Event(event) => {
                 let capture = (digest(event)?, identity(event));
@@ -219,23 +219,12 @@ impl EventCollection {
                     tx.query_row("SELECT identity FROM event_state WHERE id=1", [], |r| {
                         r.get(0)
                     })?;
-                // Keep referenced transcript paths that later events omit.
                 if let Some(previous) = previous
                     .as_deref()
                     .map(serde_json::from_slice::<RedactedEnvelope>)
                     .transpose()?
                 {
-                    if let (Some(payload), Some(old)) = (
-                        identity.payload.as_object_mut(),
-                        previous.payload.as_object(),
-                    ) {
-                        for key in IDENTITY_PAYLOAD {
-                            if let (false, Some(value)) = (payload.contains_key(key), old.get(key))
-                            {
-                                payload.insert(key.into(), value.clone());
-                            }
-                        }
-                    }
+                    retain_references(&mut identity, &previous);
                 }
                 let appended = insert(tx, value)?;
                 tx.execute(
@@ -409,8 +398,22 @@ fn digest(event: &RedactedEnvelope) -> anyhow::Result<Vec<u8>> {
     .to_vec())
 }
 
+/// Keep on-disk references an earlier identity recorded that `identity` omits.
+pub(super) fn retain_references(identity: &mut RedactedEnvelope, previous: &RedactedEnvelope) {
+    if let (Some(payload), Some(old)) = (
+        identity.payload.as_object_mut(),
+        previous.payload.as_object(),
+    ) {
+        for key in IDENTITY_PAYLOAD {
+            if let (false, Some(value)) = (payload.contains_key(key), old.get(key)) {
+                payload.insert(key.into(), value.clone());
+            }
+        }
+    }
+}
+
 /// The event with only the payload fields that reference on-disk state.
-fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
+pub(super) fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
     let mut identity = event.clone();
     identity.payload = serde_json::Value::Object(
         IDENTITY_PAYLOAD
@@ -421,7 +424,7 @@ fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
     identity
 }
 
-fn insert(tx: &rusqlite::Transaction<'_>, value: Vec<u8>) -> anyhow::Result<Appended> {
+fn insert(tx: &rusqlite::Transaction<'_>, value: Vec<u8>) -> anyhow::Result<SourcePosition> {
     let before: u64 = tx.query_row("SELECT tail FROM event_state WHERE id=1", [], |r| r.get(0))?;
     let through = before
         .checked_add(value.len() as u64 + 1)
@@ -433,7 +436,7 @@ fn insert(tx: &rusqlite::Transaction<'_>, value: Vec<u8>) -> anyhow::Result<Appe
     )?;
     tx.execute("UPDATE event_state SET tail=? WHERE id=1", [through])?;
     super::store::touch(tx)?;
-    Ok(Appended { before, through })
+    Ok(SourcePosition { before, through })
 }
 
 /// Ordered, batched reader over a range of event records.

@@ -517,13 +517,7 @@ impl Daemon {
         // An attached import delivers under its parent's trace root.
         let attached_root = params
             .route
-            .with_auth(BackendAuth {
-                token: String::new(),
-                api_url: None,
-                app_url: None,
-                org_name: None,
-                org_id: None,
-            })
+            .with_auth(BackendAuth::default())
             .attached_span_ids()
             .1;
         let mut result = crate::wire::ImportFinishResult {

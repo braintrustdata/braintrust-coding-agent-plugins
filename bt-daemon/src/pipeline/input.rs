@@ -25,8 +25,8 @@ pub struct PipelineControl {
     pub bounds: std::collections::HashMap<String, u64>,
 }
 
-/// Durable ID range returned by the event insert.
-#[derive(Clone)]
+/// The ID range a stored event record occupies.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SourcePosition {
     pub before: u64,
     pub through: u64,

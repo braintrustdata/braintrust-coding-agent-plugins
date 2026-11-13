@@ -304,7 +304,7 @@ impl TraceDestination {
 
 /// Backend credentials. `token` is an API key or an OAuth access token; the
 /// daemon does not care which. Never serialized or persisted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendAuth {
     pub token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

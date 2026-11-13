@@ -139,8 +139,8 @@ async fn import_file(
     namespace: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut reader = Reader::open(path).await?;
-    // Each route's latest event, and the latest checkpoint it delivered.
-    let mut routes: Vec<(SessionRoute, u64)> = Vec::new();
+    // Each route that captured events, and the latest checkpoint it delivered.
+    let mut routes: Vec<SessionRoute> = Vec::new();
     let mut delivered: HashMap<String, u64> = HashMap::new();
     let mut batch = Vec::new();
     let mut bytes = 0;
@@ -161,27 +161,14 @@ async fn import_file(
                     continue;
                 }
                 if let Some(route) = &event.route {
-                    match routes.iter_mut().find(|(known, _)| known.same_route(route)) {
-                        Some((_, latest)) => *latest = through,
-                        None => routes.push((route.clone(), through)),
+                    if !routes.iter().any(|known| known.same_route(route)) {
+                        routes.push(route.clone());
                     }
                 }
-                let mut latest = event.clone();
-                let mut payload = serde_json::Map::new();
-                for key in [
-                    "transcript_path",
-                    "agent_transcript_path",
-                    "_bt_transcript_mirror",
-                ] {
-                    let value =
-                        event.payload.get(key).cloned().or_else(|| {
-                            identity.as_ref().and_then(|v| v.payload.get(key)).cloned()
-                        });
-                    if let Some(value) = value {
-                        payload.insert(key.into(), value);
-                    }
+                let mut latest = super::events::identity(event);
+                if let Some(previous) = &identity {
+                    super::events::retain_references(&mut latest, previous);
                 }
-                latest.payload = payload.into();
                 identity = Some(latest);
             }
             EventRecord::Control(_) => {}
@@ -197,14 +184,13 @@ async fn import_file(
     // Input is delivered only through the point every route had delivered.
     let delivered = routes
         .iter()
-        .map(|(route, _)| {
+        .map(|route| {
             let key = serde_json::to_string(route)?;
             anyhow::Ok(delivered.get(&key).copied().unwrap_or(0))
         })
-        .try_fold(None, |least: Option<u64>, through| {
-            let through = through?;
-            anyhow::Ok(Some(least.map_or(through, |least| least.min(through))))
-        })?
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .min()
         .unwrap_or(0);
     events
         .import(

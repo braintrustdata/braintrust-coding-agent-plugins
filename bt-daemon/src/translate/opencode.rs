@@ -44,26 +44,26 @@ struct OpenCodeVersionedTranslator {
     version: Option<bool>,
 }
 
+/// The selected protocol and both translators' states.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    version: Option<bool>,
+    v1: Box<super::RawValue>,
+    v2: Box<super::RawValue>,
+}
+
 impl super::TranslatorState for OpenCodeVersionedTranslator {
-    fn save_state(&self) -> anyhow::Result<Vec<u8>> {
-        let v1 =
-            serde_json::value::RawValue::from_string(String::from_utf8(self.v1.save_state()?)?)?;
-        let v2 =
-            serde_json::value::RawValue::from_string(String::from_utf8(self.v2.save_state()?)?)?;
-        Ok(serde_json::to_vec(
-            &serde_json::json!({"version":self.version,"v1":v1,"v2":v2}),
-        )?)
+    fn save_state(&self) -> anyhow::Result<Box<super::RawValue>> {
+        Ok(serde_json::value::to_raw_value(&Saved {
+            version: self.version,
+            v1: self.v1.save_state()?,
+            v2: self.v2.save_state()?,
+        })?)
     }
-    fn restore_state(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        #[derive(serde::Deserialize)]
-        struct Saved {
-            version: Option<bool>,
-            v1: Box<serde_json::value::RawValue>,
-            v2: Box<serde_json::value::RawValue>,
-        }
-        let saved: Saved = serde_json::from_slice(bytes)?;
-        self.v1.restore_state(saved.v1.get().as_bytes())?;
-        self.v2.restore_state(saved.v2.get().as_bytes())?;
+    fn restore_state(&mut self, state: &super::RawValue) -> anyhow::Result<()> {
+        let saved: Saved = serde_json::from_str(state.get())?;
+        self.v1.restore_state(&saved.v1)?;
+        self.v2.restore_state(&saved.v2)?;
         self.version = saved.version;
         Ok(())
     }

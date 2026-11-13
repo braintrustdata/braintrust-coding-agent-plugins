@@ -280,8 +280,8 @@ impl Daemon {
         &self,
         env: &Envelope,
         events: &EventCollection,
-    ) -> anyhow::Result<Option<crate::collections::Appended>> {
-        let Some(appended) = events.append(env.into(), None).await? else {
+    ) -> anyhow::Result<Option<crate::pipeline::input::SourcePosition>> {
+        let Some(appended) = events.append(env, None).await? else {
             return Ok(None);
         };
         if let Some(cutoffs) = self.startup_cutoffs.lock().as_mut() {

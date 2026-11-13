@@ -473,12 +473,7 @@ mod tests {
             crate::collections::EventCollection::open(tmp.path(), &env.source, &env.session_id)
                 .await
                 .unwrap();
-        let old_end = events
-            .append((&env).into(), None)
-            .await
-            .unwrap()
-            .unwrap()
-            .through;
+        let old_end = events.append(&env, None).await.unwrap().unwrap().through;
         let (daemon, ready) = paused_ingress(tmp.path());
         env.ts_ms = 2;
         env.event = "next".into();
@@ -730,12 +725,7 @@ mod tests {
                 crate::collections::EventCollection::open(tmp.path(), &env.source, &env.session_id)
                     .await
                     .unwrap();
-            let through = events
-                .append((&env).into(), None)
-                .await
-                .unwrap()
-                .unwrap()
-                .through;
+            let through = events.append(&env, None).await.unwrap().unwrap().through;
             let partition = crate::collections::SpanOps::for_events(&events)
                 .await
                 .unwrap();
@@ -755,7 +745,7 @@ mod tests {
             if scenario == "untranslated" {
                 let mut later = env.clone();
                 later.ts_ms += 1;
-                events.append((&later).into(), None).await.unwrap().unwrap();
+                events.append(&later, None).await.unwrap().unwrap();
             }
             if scenario != "no_heads" {
                 let mut head = Cursor::open(&partition, env.route.as_ref().unwrap())
@@ -841,7 +831,7 @@ mod tests {
             crate::collections::EventCollection::open(tmp.path(), "debug", "test")
                 .await
                 .unwrap()
-                .append((&env).into(), None)
+                .append(&env, None)
                 .await
                 .unwrap()
                 .unwrap();

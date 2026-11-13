@@ -498,7 +498,7 @@ impl Producer {
         let Some(appended) = self
             .options
             .events
-            .append(EventRecord::Control(control.clone()), Some(self.position))
+            .append(control.clone(), Some(self.position))
             .await?
         else {
             return Ok(None);
@@ -506,10 +506,7 @@ impl Producer {
         let through = appended.through;
         self.options.input.push(SourceRecord {
             event: SourceEvent::Control(control),
-            position: SourcePosition {
-                before: appended.before,
-                through,
-            },
+            position: appended,
         });
         self.progress
             .requested
@@ -539,7 +536,7 @@ impl Producer {
                 .translate(move |translator, _| {
                     let saved: Continuation = serde_json::from_slice(&bytes)?;
                     anyhow::ensure!(saved.source == source, "checkpoint source mismatch");
-                    translator.restore_state(saved.native.get().as_bytes())?;
+                    translator.restore_state(&saved.native)?;
                     Ok(saved)
                 })
                 .await?;
@@ -739,12 +736,9 @@ impl Producer {
         let bounds = self.bounds.clone();
         let capture = self.capture.clone();
         self.translate(move |translator, _| {
-            let native = serde_json::value::RawValue::from_string(String::from_utf8(
-                translator.save_state()?,
-            )?)?;
             Ok(serde_json::to_vec(&Continuation {
                 source,
-                native,
+                native: translator.save_state()?,
                 last_control,
                 bounds,
                 capture,
@@ -954,19 +948,14 @@ pub(crate) mod tests {
             let appended = self
                 .options
                 .events
-                .append(event.into(), None)
+                .append(event, None)
                 .await
                 .unwrap()
                 .unwrap();
-            let through = appended.through;
-            let position = SourcePosition {
-                before: appended.before,
-                through,
-            };
             if live {
-                self.options.input.push_event(event.clone(), position);
+                self.options.input.push_event(event.clone(), appended);
             }
-            through
+            appended.through
         }
         pub(crate) async fn process(&self, through: u64) {
             self.source.advance(through).await.unwrap();
@@ -1230,10 +1219,10 @@ pub(crate) mod tests {
         }
     }
     impl crate::translate::TranslatorState for BlockedTranslator {
-        fn save_state(&self) -> anyhow::Result<Vec<u8>> {
-            Ok(b"null".to_vec())
+        fn save_state(&self) -> anyhow::Result<Box<crate::translate::RawValue>> {
+            Ok(serde_json::value::to_raw_value(&())?)
         }
-        fn restore_state(&mut self, _: &[u8]) -> anyhow::Result<()> {
+        fn restore_state(&mut self, _: &crate::translate::RawValue) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -1368,12 +1357,11 @@ pub(crate) mod tests {
             .unwrap();
         let input = events
             .append(
-                (&serde_json::from_value::<crate::wire::Envelope>(serde_json::json!({
+                &serde_json::from_value::<crate::wire::Envelope>(serde_json::json!({
                     "source": source, "session_id": session, "event": "native",
                     "ts_ms": 1, "payload": {}
                 }))
-                .unwrap())
-                    .into(),
+                .unwrap(),
                 None,
             )
             .await
@@ -1429,10 +1417,10 @@ pub(crate) mod tests {
     }
     struct CountedTranslation(Arc<AtomicU64>);
     impl crate::translate::TranslatorState for CountedTranslation {
-        fn save_state(&self) -> anyhow::Result<Vec<u8>> {
-            Ok(b"null".to_vec())
+        fn save_state(&self) -> anyhow::Result<Box<crate::translate::RawValue>> {
+            Ok(serde_json::value::to_raw_value(&())?)
         }
-        fn restore_state(&mut self, _: &[u8]) -> anyhow::Result<()> {
+        fn restore_state(&mut self, _: &crate::translate::RawValue) -> anyhow::Result<()> {
             Ok(())
         }
     }

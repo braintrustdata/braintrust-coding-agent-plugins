@@ -22,13 +22,12 @@ impl AuthProvider for StaticAuth {
             selection: selection.clone(),
             auth: BackendAuth {
                 token: "test".into(),
-                api_url: None,
-                app_url: None,
                 org_name: selection
                     .org_name
                     .clone()
                     .or_else(|| Some("test-org".into())),
                 org_id: Some("org-test".into()),
+                ..Default::default()
             },
             expires_at_ms: None,
         })

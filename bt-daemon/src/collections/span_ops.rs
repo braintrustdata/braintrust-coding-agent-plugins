@@ -22,16 +22,9 @@ use serde_json::value::RawValue;
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tokio::sync::watch;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("credential resolution changed the durable head's pinned backend or organization")]
 pub(crate) struct BindingChanged;
-impl std::fmt::Display for BindingChanged {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "credential resolution changed the durable head's pinned backend or organization",
-        )
-    }
-}
-impl std::error::Error for BindingChanged {}
 
 /// Explicit codec preserves fields intentionally omitted from wire/plugin JSON.
 #[derive(Serialize, Deserialize)]
@@ -42,17 +35,20 @@ struct StoredOp<Op> {
     fields: SinkFields,
 }
 
-impl StoredOp<SpanOp> {
-    fn encode(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
+impl<'a> From<&'a SpanOp> for StoredOp<&'a SpanOp> {
+    fn from(op: &'a SpanOp) -> Self {
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-        Ok(serde_json::to_vec(&StoredOp {
+        Self {
             version: 1,
             op,
             fields: SinkFields::of(row),
-        })?)
+        }
     }
-    fn decode(bytes: &[u8]) -> anyhow::Result<SpanOp> {
-        let mut stored: Self = serde_json::from_slice(bytes)?;
+}
+
+impl TryFrom<StoredOp<SpanOp>> for SpanOp {
+    type Error = anyhow::Error;
+    fn try_from(mut stored: StoredOp<SpanOp>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             stored.version == 1,
             "unsupported SpanOp codec {}",
@@ -61,6 +57,15 @@ impl StoredOp<SpanOp> {
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut stored.op;
         stored.fields.restore(row);
         Ok(stored.op)
+    }
+}
+
+impl StoredOp<SpanOp> {
+    fn encode(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&StoredOp::from(op))?)
+    }
+    fn decode(bytes: &[u8]) -> anyhow::Result<SpanOp> {
+        serde_json::from_slice::<Self>(bytes)?.try_into()
     }
 }
 
@@ -179,33 +184,21 @@ fn translated_through(db: &Connection) -> rusqlite::Result<u64> {
     })
 }
 
-type Roots = BTreeMap<String, Vec<Box<RawValue>>>;
-
 fn encode_roots(roots: &BTreeMap<String, Vec<SpanOp>>) -> anyhow::Result<Option<Vec<u8>>> {
     if roots.is_empty() {
         return Ok(None);
     }
-    let roots = roots
+    let roots: BTreeMap<_, Vec<StoredOp<&SpanOp>>> = roots
         .iter()
-        .map(|(id, ops)| {
-            let ops = ops
-                .iter()
-                .map(|op| {
-                    Ok(RawValue::from_string(String::from_utf8(
-                        StoredOp::encode(op)?,
-                    )?)?)
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok((id.clone(), ops))
-        })
-        .collect::<anyhow::Result<Roots>>()?;
+        .map(|(id, ops)| (id, ops.iter().map(StoredOp::from).collect()))
+        .collect();
     Ok(Some(serde_json::to_vec(&roots)?))
 }
 
 /// Schema 7 upgrade: a pre-collection channel stored each root candidate in
 /// its own row. Translation now replaces them all in one value.
 pub(super) fn migrate_roots(db: &Connection) -> anyhow::Result<()> {
-    let mut roots = Roots::new();
+    let mut roots = BTreeMap::<String, Vec<Box<RawValue>>>::new();
     let mut query = db.prepare("SELECT span_id,value FROM root_candidates")?;
     for row in query.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -440,14 +433,11 @@ impl SpanOps {
                 let Some(bytes) = bytes else {
                     return Ok(BTreeMap::new());
                 };
-                serde_json::from_slice::<Roots>(&bytes)?
+                serde_json::from_slice::<BTreeMap<String, Vec<StoredOp<SpanOp>>>>(&bytes)?
                     .into_iter()
                     .map(|(id, ops)| {
-                        let ops = ops
-                            .iter()
-                            .map(|op| StoredOp::decode(op.get().as_bytes()))
-                            .collect::<anyhow::Result<Vec<_>>>()?;
-                        Ok((id, ops))
+                        let ops = ops.into_iter().map(SpanOp::try_from);
+                        Ok((id, ops.collect::<anyhow::Result<_>>()?))
                     })
                     .collect()
             })
