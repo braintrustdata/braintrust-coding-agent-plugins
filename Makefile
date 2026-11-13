@@ -73,3 +73,15 @@ test-codex-packaging:
 # Loads the installed MCP entry without OAuth, inference, or tool calls.
 test-codex-mcp-loading: validate-codex
 	node src/plugins/codex/tests/mcp-loading.mjs "$(DIST)/codex"
+
+# Standalone MCP package within the existing Antigravity distribution.
+.PHONY: antigravity-submission test-antigravity-packaging test-antigravity-mcp-loading
+antigravity-submission: validate-antigravity
+	python3 src/plugins/antigravity/mcp_package.py zip "$(DIST)/antigravity/plugins/braintrust" "$(DIST)/submissions"
+
+test-antigravity-packaging:
+	python3 -m unittest discover -s src/plugins/antigravity/tests -p 'test_*.py' -v
+
+# Requires the Antigravity CLI; installs and inspects MCP in a temporary profile.
+test-antigravity-mcp-loading: validate-antigravity
+	python3 src/plugins/antigravity/tests/mcp_loading.py "$(DIST)/antigravity/plugins/braintrust"

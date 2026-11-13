@@ -45,6 +45,14 @@ jobs:
         run: make test
       - name: Test Codex packaging and release contracts
         run: make test-codex-packaging codex-submission
+      - name: Test Antigravity packaging and release contracts
+        run: make test-antigravity-packaging antigravity-submission
+      - name: Save Antigravity MCP submission ZIP
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: braintrust-antigravity-mcp-submission
+          path: dist/submissions/braintrust-antigravity-*.zip*
+          if-no-files-found: error
       - name: Save MCP submission ZIP
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

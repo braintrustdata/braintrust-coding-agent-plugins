@@ -28,16 +28,38 @@ jobs:
           set -euo pipefail
           agy plugin install "https://github.com/$DIST_REPO"
           agy plugin validate "$HOME/.gemini/config/plugins/braintrust-antigravity-tracing"
-          agy plugin list | jq -e '
-            .imports[]
+          agy plugin list --json | jq -e '
+            .[]
             | select(
                 .name == "braintrust-antigravity-tracing"
                 and .source == "antigravity"
-                and (.components | index("hooks")) != null
+                and .hooks == ["braintrust-antigravity-tracing"]
               )
           '
 
-      - name: Uninstall published plugin
+      - name: Install and inspect published MCP plugin
+        env:
+          DIST_REPO: ${{ inputs.dist_repo }}
+        run: |
+          set -euo pipefail
+          agy plugin install "https://github.com/$DIST_REPO/tree/main/plugins/braintrust"
+          agy plugin validate --strict "$HOME/.gemini/config/plugins/braintrust"
+          agy plugin list --json | jq -e '
+            .[] | select(
+              .name == "braintrust" and .enabled == true
+              and .mcpServers == ["braintrust"]
+              and ((.hooks // []) | length) == 0
+            )
+          '
+
+      - name: Uninstall published MCP plugin
+        run: |
+          set -euo pipefail
+          agy plugin uninstall braintrust
+          test ! -e "$HOME/.gemini/config/plugins/braintrust"
+          test -f "$HOME/.gemini/config/plugins/braintrust-antigravity-tracing/hooks.json"
+
+      - name: Uninstall published tracing plugin
         run: |
           set -euo pipefail
           agy plugin uninstall braintrust-antigravity-tracing
