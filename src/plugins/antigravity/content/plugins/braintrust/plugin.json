@@ -1,0 +1,22 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "braintrust",
+  "displayName": "Braintrust",
+  "version": "0.2.0",
+  "description": "Explore Braintrust traces, investigate agent failures, manage prompts and datasets, and run evaluations from your Antigravity workspace.",
+  "logo": "assets/icon.png",
+  "suggestedPrompts": [
+    "Show me my Braintrust projects.",
+    "Summarize recent errors in my Braintrust project.",
+    "Compare the results of two experiments in my Braintrust project."
+  ],
+  "author": {
+    "name": "Braintrust",
+    "email": "support@braintrust.dev",
+    "url": "https://www.braintrust.dev/"
+  },
+  "homepage": "https://docs.braintrust.dev/integrations/developer-tools/mcp",
+  "repository": "https://github.com/braintrustdata/braintrust-antigravity-plugin",
+  "license": "MIT",
+  "keywords": ["braintrust", "evaluations", "observability", "mcp"]
+}

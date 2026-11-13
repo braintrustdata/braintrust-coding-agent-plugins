@@ -1,8 +1,10 @@
 # Braintrust coding-agent plugins — monorepo
 
 This repo is the single source of truth for Braintrust's coding-agent plugins.
-Each plugin is developed here, built, and deployed to a per-agent distribution
-repository that its marketplace installs from.
+Plugins are developed here and built for their agent's distribution format.
+Most deploy to a per-agent distribution repository that its marketplace installs
+from. Devin's marketplace references plugin subdirectories in this monorepo at
+an exact commit; it does not need a generated distribution repository.
 
 ## Layout
 
@@ -11,7 +13,7 @@ src/plugins/<agent>/         one directory per agent
   content/                   the deployable plugin tree, verbatim
   build.sh <dir>             assemble the deployable tree into <dir>
   validate.sh <dir>          validate manifests and required files
-  publish.sh                 deploy a built tree to a distribution repo
+  publish.sh                 optional deployment to a distribution repo
 scripts/publish.sh           dispatch PUBLISH_TARGETS to each plugin
 bt-daemon/                   shared Rust tracing crate embedded by bt
 Makefile                     build, test, and publish entry points
@@ -65,8 +67,10 @@ internal protocol between `bt trace run` and its child processes.
 
 Versioning is per distribution. Claude, Codex, Cursor, and Grok plugins carry
 their version in their plugin manifests. `scripts/set-plugin-version.py`
-updates those manifests for a release. Antigravity's schema does not expose a
-version field, so its distribution is versioned by repository tags and GitHub Releases.
+updates those manifests for a release. Antigravity's MCP version lives in
+`src/plugins/antigravity/content/plugins/braintrust/plugin.json`; the existing
+root tracing manifest remains unversioned. Both ship in the same Antigravity
+distribution, versioned by repository tags and GitHub Releases.
 Claude's marketplace manifest carries a separate catalog version; bump it
 independently for breaking marketplace changes. The Codex marketplace manifest
 is unversioned.
@@ -78,6 +82,14 @@ is unversioned.
 | codex | `braintrustdata/braintrust-codex-plugin` |
 | cursor | `braintrustdata/braintrust-cursor-extension` |
 | grok | `braintrustdata/braintrust-grok-plugin` |
+
+Devin packages live under `src/plugins/devin/content/plugins/`: `braintrust`
+provides hosted MCP access, and `braintrust-trace-devin` is an inactive tracing
+scaffold with an empty `hooks.json`. Devin tracing and daemon support are not
+implemented yet. Submit the MCP package's subdirectory to the Devin marketplace;
+keep the tracing scaffold out of the marketplace until capture is implemented
+and verified. Neither package needs version stamping or a publishing workflow;
+the marketplace pins an exact source commit.
 
 A distribution repository is a generated artifact. Each deploy clones it,
 replaces the tracked tree with a fresh build, and pushes the result.
@@ -97,9 +109,9 @@ Cross-repository pushes use `GH_TOKEN` or ambient Git credentials.
 Run **Release Plugin** (`release.yml`) on `main` with a plugin and
 version. It opens or updates `release/<plugin>/v<version>` using Braintrust Bot,
 with the manifest changes and a monorepo-only
-`.github/release-versions/<plugin>` approval record. The record gives Antigravity
-a reviewable diff without adding a native manifest version. Preparation never
-tags or deploys.
+`.github/release-versions/<plugin>` approval record. The record and plugin manifests
+provide the reviewable version diff, including Antigravity's nested MCP manifest.
+Preparation never tags or deploys.
 
 A human approves and merges the PR under the existing branch protection rules.
 That merge starts a new run of **Release Plugin** (`release.yml`), which calls
@@ -121,8 +133,9 @@ do not publish to Open VSX. No Open VSX access-token secret is required.
 If publishing is interrupted, rerun the **publication run** in Release Plugin
 rather than manually preparing the merged version again. An existing source tag must match the
 approved merge SHA; an existing distribution tag still rejects publication.
-An unchanged Antigravity artifact may reuse its previous distribution commit
-under the new version tag.
+Antigravity releases attach an MCP-only ZIP for manual Google Marketplace
+submission; install its MCP plugin using the distribution's
+`tree/main/plugins/braintrust` URL. The root remains the tracing plugin.
 If only the Cursor Open VSX job failed after distribution publication succeeded,
 use **Re-run failed jobs** to preserve the completed distribution release.
 

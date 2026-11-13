@@ -7,6 +7,15 @@
 
 Trace Google Antigravity coding sessions in Braintrust.
 
+To query Braintrust traces, manage prompts and datasets, or run evaluations
+from Antigravity, install the separate [Braintrust MCP plugin](plugins/braintrust/README.md):
+
+```bash
+agy plugin install https://github.com/braintrustdata/braintrust-antigravity-plugin/tree/main/plugins/braintrust
+```
+
+The MCP plugin authenticates through browser OAuth and requires no `bt` installation.
+
 ## Quickstart
 
 Prerequisites:

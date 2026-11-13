@@ -167,6 +167,10 @@ pub(super) fn extract_metadata(db: &Connection) -> anyhow::Result<()> {
     prune(db)
 }
 
+/// The head position of a detached route. SQLite integers are signed, so this
+/// is the largest position a head can hold; it is past every SpanOp.
+pub(crate) const DETACHED: u64 = i64::MAX as u64;
+
 fn prune(db: &Connection) -> anyhow::Result<()> {
     db.execute(
         "DELETE FROM ops WHERE position<=(SELECT min(position) FROM heads)",
@@ -826,6 +830,21 @@ impl SpanOps {
         let route = route.to_owned();
         self.store
             .run(move |db| Ok(db.one("SELECT failure FROM heads WHERE route=?", [route])?))
+            .await
+    }
+
+    /// Stop a route for good, as when a span plugin stops tracing it: it owes
+    /// nothing from now on and never resumes, even after a restart.
+    pub async fn detach(&self, route: &str) -> anyhow::Result<()> {
+        let route = route.to_string();
+        self.store
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE heads SET position=?, failure=NULL WHERE route=?",
+                    params![DETACHED, route],
+                )?;
+                prune(tx)
+            })
             .await
     }
 

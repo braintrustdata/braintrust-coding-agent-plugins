@@ -1,0 +1,21 @@
+{
+  "name": "braintrust",
+  "displayName": "Braintrust",
+  "description": "Investigate production traces, compare experiments, and run evals to improve your AI application",
+  "shortDescription": "AI traces, experiments, and evals",
+  "setup": {
+    "notice": "This plugin connects to Braintrust’s US data plane."
+  },
+  "homepage": "https://www.braintrust.dev",
+  "repository": "https://github.com/braintrustdata/braintrust-coding-agent-plugins",
+  "logo": "icon.png",
+  "keywords": [
+    "Developer Tools",
+    "Monitoring & Analytics"
+  ],
+  "mcpServers": {
+    "braintrust": {
+      "url": "https://api.braintrust.dev/mcp"
+    }
+  }
+}

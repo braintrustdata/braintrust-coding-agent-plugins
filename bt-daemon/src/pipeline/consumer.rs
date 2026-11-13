@@ -271,6 +271,7 @@ impl Consumer {
                     };
                     let current = settings.borrow_and_update().clone();
                     let ops = delivery.value().as_slice();
+                    let mut stopped = false;
                     let result = async {
                         if sink.is_none() {
                             sink =
@@ -286,16 +287,32 @@ impl Consumer {
                             )
                         })?;
                         routing.configure(&current);
-                        routing
-                            .emit_shared(ops)
-                            .await
-                            .map_err(|error| options.routing(&error, &current, attempts))
+                        match routing.emit_shared(ops).await {
+                            Err(error) if error.is::<crate::span_processor::StopTracing>() => {
+                                // Never resubmit after the signal, including when
+                                // the terminal-state write temporarily fails.
+                                while let Err(error) = input.detach().await {
+                                    *options.error.lock() = Some(error.to_string());
+                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                }
+                                *options.error.lock() = None;
+                                stopped = true;
+                                Ok(0)
+                            }
+                            result => {
+                                result.map_err(|error| options.routing(&error, &current, attempts))
+                            }
+                        }
                     }
                     .await;
                     if result.is_ok() {
                         options.counters.record(ops.iter().map(|op| op.as_ref()));
                     }
                     pending.push_back(delivery.map(|_| ()));
+                    if stopped {
+                        pending.clear();
+                        return Ok(None);
+                    }
                     let count = result?;
                     options
                         .counters
@@ -730,6 +747,53 @@ mod tests {
             })
         }
     }
+    #[tokio::test]
+    async fn stop_signal_detaches_only_its_route_without_reporting_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+            .await
+            .unwrap();
+        let plugin = tmp.path().join("stop.mjs");
+        std::fs::write(
+            &plugin,
+            "export default () => { throw new StopTracingError('private'); }",
+        )
+        .unwrap();
+        let stopped_route = SessionRoute {
+            span_plugins: vec![plugin],
+            ..Default::default()
+        };
+        let healthy_route = SessionRoute::default();
+        let stopped_record = Arc::new(Recording::default());
+        let healthy_record = Arc::new(Recording::default());
+        stored(&journal).await;
+        let stopped_cursor = Cursor::open(&journal, &stopped_route).await.unwrap();
+        let healthy_cursor = Cursor::open(&journal, &healthy_route).await.unwrap();
+        let (stopped, stopped_progress, error) = spawn(
+            stopped_cursor,
+            options(tmp.path(), &stopped_route, stopped_record.clone()),
+        );
+        let (healthy, healthy_progress, _) = spawn(
+            healthy_cursor,
+            options(tmp.path(), &healthy_route, healthy_record.clone()),
+        );
+        wait_for(|| {
+            stopped_progress.completed() == crate::collections::DETACHED
+                && healthy_progress.completed() == 1
+        })
+        .await;
+        assert!(error.lock().is_none());
+        assert_eq!(stopped_record.submitted.load(Ordering::SeqCst), 0);
+        assert_eq!(healthy_record.submitted.load(Ordering::SeqCst), 1);
+        assert!(journal
+            .failure(&serde_json::to_string(&stopped_route).unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        stopped.shutdown().await;
+        healthy.shutdown().await;
+    }
+
     #[tokio::test]
     async fn unauthorized_delivery_refreshes_credentials_at_the_same_head() {
         let tmp = tempfile::tempdir().unwrap();

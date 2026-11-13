@@ -188,6 +188,20 @@ file or another plugin in its configured chain to change, or for the chain itsel
 to change. It then retries from the SpanOp journal without requiring a restart or
 another agent event. Restarting alone does not retry an unchanged failing chain.
 
+A plugin can permanently stop reporting the current session route by throwing
+`new StopTracingError()`. This built-in error is a control signal and is not
+recorded as a plugin failure. The triggering batch and all future operations
+for that route are discarded, including after a daemon restart or plugin edit.
+Other routes consuming the session continue normally. Previously submitted data
+is not retracted, and raw source events may still be journaled locally.
+
+```js
+export default function guard(span) {
+  if (span.metadata?.sensitive) throw new StopTracingError();
+  return span;
+}
+```
+
 Plugin failures are deduplicated in the daemon's private local state, including
 the raw QuickJS exception and stack. Inspect them with:
 

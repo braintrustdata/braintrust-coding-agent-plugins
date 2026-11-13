@@ -6,7 +6,7 @@ use super::delivery::InputPort;
 use super::live::{Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW};
 use super::recovery::{Boundary, Failure, Recovery, RecoveryOutcome};
 use super::{Completion, Delivery, Stage};
-use crate::collections::{BindingChanged, HeldRoute, SpanOps};
+use crate::collections::{BindingChanged, HeldRoute, SpanOps, DETACHED};
 #[cfg(test)]
 use crate::translate::SpanOp;
 use crate::wire::{RecoveryInfo, SessionConfig, SessionRoute};
@@ -297,7 +297,18 @@ struct SharedCursor(Cursor);
 #[async_trait::async_trait]
 impl InputPort for SharedCursor {
     type Item = Vec<SharedOp>;
+    async fn detach(&mut self) -> anyhow::Result<()> {
+        self.0.ops.detach(&self.0.route).await?;
+        self.0.live.control().pause();
+        self.0.live.clear();
+        self.0.progress.send_replace(DETACHED);
+        Ok(())
+    }
     async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
+        if *self.0.progress.borrow() == DETACHED {
+            self.0.live.control().pause();
+            return Ok(None);
+        }
         let result = self.0.receive_managed().await;
         match result {
             Ok(delivery) => Ok(Some(delivery)),
@@ -560,6 +571,24 @@ mod tests {
             second.value()[0].as_ref()
         ));
         assert_eq!(journal.payload_reads(), 3);
+    }
+
+    #[tokio::test]
+    async fn detached_route_stays_detached_and_does_not_pin_other_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spans.sqlite");
+        let journal = SpanOps::open(&path).await.unwrap();
+        let route = route("a");
+        let mut input = SharedCursor(Cursor::open(&journal, &route).await.unwrap());
+        input.detach().await.unwrap();
+        assert!(input.receive().await.unwrap().is_none());
+        journal.translated(1, vec![op("later")]).await.unwrap();
+        assert!(journal.route_complete(&route, 1).await.unwrap());
+        assert_eq!(journal.stored_ops().await, 0);
+        drop((input, journal));
+        let restored = SpanOps::open(&path).await.unwrap();
+        let mut input = SharedCursor(Cursor::open(&restored, &route).await.unwrap());
+        assert!(input.receive().await.unwrap().is_none());
     }
 
     #[tokio::test]
