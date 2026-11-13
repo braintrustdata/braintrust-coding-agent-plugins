@@ -473,8 +473,9 @@ profiles, organizations, and destinations while sharing one daemon.
   duplicate spans, and a route never receives another route's rows. What
   remains after delivery is only the continuation and small per-span metadata
   a resumed session needs; storage of a session that owes nothing is deleted
-  once it has been inactive for the retention period (`--retention-hours`,
-  or `BT_TRACE_RETENTION_HOURS`; default 7 days). A route that has
+  once it has been inactive for the retention period (`--retention`, or
+  `BT_TRACE_RETENTION`, a duration such as `7d`, `12h` or `90m`; default 7
+  days). GC runs hourly. A route that has
   delivered nothing for that long, such as one whose destination keeps
   rejecting its spans, is stopped and its undelivered SpanOps are discarded;
   a later event starts it again from the current output. GC returns the space

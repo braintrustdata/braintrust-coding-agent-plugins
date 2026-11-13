@@ -358,8 +358,9 @@ translated and spans until every destination accepts them; space they used is
 returned to the file system. Spans a destination has accepted none of for the
 retention period, such as spans it keeps rejecting, are discarded, as is the
 storage of a completed session left unchanged that long. Retention defaults to
-seven days; set `BT_TRACE_RETENTION_HOURS` (or `serve
---retention-hours`) to bound disk use more tightly.
+seven days; set `BT_TRACE_RETENTION` (or `serve --retention`) to a duration
+such as `12h`, `2d` or `1h 30m` to bound disk use more tightly. Cleanup runs
+hourly, so expired data is removed by the next pass after it expires.
 
 ## Platform and integration coverage
 

@@ -5,8 +5,7 @@ use super::*;
 
 /// The retention `serve` uses unless told otherwise.
 #[cfg(test)]
-pub(super) const RETENTION: Duration =
-    Duration::from_secs(crate::args::DEFAULT_RETENTION_HOURS * 60 * 60);
+pub(super) const RETENTION: Duration = crate::args::DEFAULT_RETENTION;
 
 /// How often that retention is enforced while the daemon keeps running.
 pub(super) const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
