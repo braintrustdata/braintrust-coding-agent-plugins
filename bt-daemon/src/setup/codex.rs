@@ -10,6 +10,15 @@ use serde_json::Value;
 const MARKETPLACE_NAME: &str = "braintrust-codex-plugins";
 const MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-codex-plugin";
 const PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
+// An unfiltered list also fetches Codex's remote catalog. All our checks need
+// only this configured marketplace, including doctor's plugin version probe.
+const LIST_PLUGINS_ARGS: &[&str] = &[
+    "plugin",
+    "list",
+    "--marketplace",
+    MARKETPLACE_NAME,
+    "--json",
+];
 const PLUGIN_MANIFEST: &str =
     plugin_source!("codex/content/plugins/trace-codex/.codex-plugin/plugin.json");
 
@@ -42,7 +51,7 @@ fn installed_plugin(value: &Value) -> Option<&Value> {
 }
 
 fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
-    runner.json("codex", &["plugin", "list", "--json"])
+    runner.json("codex", LIST_PLUGINS_ARGS)
 }
 
 impl Setup for Codex {
@@ -73,7 +82,7 @@ impl Setup for Codex {
     fn stale(&self) -> bool {
         installed_json_version_is_older(
             "codex",
-            &["plugin", "list", "--json"],
+            LIST_PLUGINS_ARGS,
             |value| {
                 installed_plugin(value)
                     .and_then(|plugin| plugin.get("version"))
@@ -170,7 +179,7 @@ mod tests {
         assert_eq!(
             runner.calls,
             [
-                "codex plugin list --json",
+                "codex plugin list --marketplace braintrust-codex-plugins --json",
                 "codex plugin marketplace list --json",
                 "codex plugin marketplace upgrade braintrust-codex-plugins",
                 "codex plugin add trace-codex@braintrust-codex-plugins",
@@ -184,6 +193,7 @@ mod tests {
             "installed": [{"pluginId": PLUGIN}]
         })]);
         Codex.disable(&mut runner).unwrap();
+        assert!(runner.called("codex plugin list --marketplace braintrust-codex-plugins --json"));
         assert!(runner.called("codex plugin remove trace-codex@braintrust-codex-plugins --json"));
     }
 }
