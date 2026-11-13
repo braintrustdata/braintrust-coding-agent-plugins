@@ -5,8 +5,12 @@ mod span;
 use self::event::*;
 use self::span::*;
 use super::{
-    git::GitMetadataCache, local_username, recent::RecentSet, tool::ToolApproval, AgentTranslator,
-    SessionCtx, SpanOp, SpanRow, SpanType,
+    git::GitMetadataCache,
+    local_username,
+    opencode::{requested_skills, skill_load},
+    recent::RecentSet,
+    tool::{push_unique, skill_was_requested, SkillLoad, ToolApproval},
+    AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
 };
 use crate::{ids, wire::Envelope};
 use serde::Serialize;
@@ -50,7 +54,7 @@ struct SessionState {
 }
 struct ToolState {
     name: String,
-    skill_name: Option<String>,
+    skill: Option<SkillLoad>,
     message_id: String,
     span_id: String,
     parent: String,
@@ -245,20 +249,9 @@ impl OpenCodeV2Translator {
                 .into_iter()
                 .collect(),
         });
-        let mut skills = prompt
-            .text
-            .split_whitespace()
-            .filter_map(|s| {
-                s.strip_prefix("/skills:")
-                    .or_else(|| s.strip_prefix("/skills"))
-            })
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let mut skills = requested_skills(&prompt.text);
         for skill in prompt.skills {
-            if !skills.contains(&skill.name) {
-                skills.push(skill.name);
-            }
+            push_unique(&mut skills, skill.name);
         }
         s.turn = Some(turn.clone());
         s.turn_skills = skills.clone();
@@ -482,23 +475,11 @@ impl AgentTranslator for OpenCodeV2Translator {
                     &self.daemon_session_id,
                     &format!("tool:{}:{}:{}", data.session_id, data.message_id, data.id),
                 );
-                let span_name = if name == "skill" {
-                    data.input
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(|skill| format!("skill: {skill}"))
-                        .unwrap_or_else(|| name.clone())
-                } else {
-                    name.clone()
-                };
-                let skill_name = (name == "skill")
-                    .then(|| {
-                        data.input
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .flatten();
+                let skill = skill_load(&name, &data.input);
+                let span_name = skill
+                    .as_ref()
+                    .and_then(|skill| skill.name.as_ref())
+                    .map_or_else(|| name.clone(), |skill| format!("skill: {skill}"));
                 s.calls
                     .entry(data.message_id.clone())
                     .or_default()
@@ -507,7 +488,7 @@ impl AgentTranslator for OpenCodeV2Translator {
                     tool_key,
                     ToolState {
                         name: name.clone(),
-                        skill_name,
+                        skill,
                         message_id: data.message_id,
                         span_id: span_id.clone(),
                         parent: parent.clone(),
@@ -794,9 +775,15 @@ impl OpenCodeV2Translator {
             .push(Message::tool(call.into(), result));
         let mut metadata = ToolMetadata::new(&tool.name, call);
         metadata.tool_approval = Some(ToolApproval::Approved);
-        if tool.name == "skill" {
+        if let Some(skill) = &tool.skill {
             metadata.tool_kind = Some("skill");
-            metadata.skill_name = Some(tool.skill_name.as_deref());
+            metadata.skill_name = Some(skill.name.as_deref());
+            metadata.skill_path = skill.path.as_deref();
+            metadata.skill_load_trigger = skill
+                .name
+                .as_deref()
+                .is_some_and(|name| skill_was_requested(&s.turn_skills, name))
+                .then_some("explicit");
         }
         vec![SpanOp::Merge(SpanRow {
             span_id: tool.span_id,

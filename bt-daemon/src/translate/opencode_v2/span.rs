@@ -146,6 +146,11 @@ pub(super) struct ToolMetadata<'a> {
     pub tool_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_name: Option<Option<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_path: Option<&'a str>,
+    /// Set only when the user requested the skill; absent means model-chosen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_load_trigger: Option<&'static str>,
 }
 impl<'a> ToolMetadata<'a> {
     pub fn new(tool_name: &'a str, call_id: &'a str) -> Self {
@@ -157,6 +162,8 @@ impl<'a> ToolMetadata<'a> {
             permission_type: None,
             tool_kind: None,
             skill_name: None,
+            skill_path: None,
+            skill_load_trigger: None,
         }
     }
 }
