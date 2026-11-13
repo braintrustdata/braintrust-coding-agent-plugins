@@ -31,6 +31,7 @@ mod pipeline;
 mod plugin_diagnostics;
 pub(crate) mod process;
 mod route;
+mod serve_log;
 mod server;
 mod settings;
 mod setup;

@@ -266,6 +266,7 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
 
     let (ready, startup) = oneshot::channel();
     let daemon = Daemon::new_with_startup(opts, data_dir, Some(startup));
+    spawn_log_rotation(daemon.clone());
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
     let session_idle_timeout = Duration::from_secs(args.session_idle_timeout_secs);
     let recovery_daemon = daemon.clone();

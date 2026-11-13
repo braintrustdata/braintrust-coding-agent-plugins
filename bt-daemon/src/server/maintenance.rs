@@ -301,6 +301,26 @@ pub(super) fn spawn_gc(daemon: Arc<Daemon>) {
     });
 }
 
+/// How often a running daemon bounds the log its standard streams write to.
+const LOG_ROTATION_INTERVAL: Duration = Duration::from_secs(60);
+
+pub(super) fn spawn_log_rotation(daemon: Arc<Daemon>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = daemon.shutdown.notified() => return,
+                _ = tokio::time::sleep(LOG_ROTATION_INTERVAL) => {}
+            }
+            let data_dir = daemon.data_dir.clone();
+            match tokio::task::spawn_blocking(move || crate::serve_log::rotate(&data_dir)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "serve.log rotation failed"),
+                Err(error) => tracing::warn!(%error, "serve.log rotation did not run"),
+            }
+        }
+    });
+}
+
 pub(super) fn spawn_idle_watchdog(daemon: Arc<Daemon>, idle_timeout: Duration) {
     if idle_timeout.is_zero() {
         return; // 0 disables the watchdog (useful in tests)
