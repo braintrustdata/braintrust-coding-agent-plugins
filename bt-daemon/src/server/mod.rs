@@ -108,6 +108,8 @@ type EventSlot = Arc<tokio::sync::OnceCell<EventCollection>>;
 pub struct Daemon {
     version: String,
     data_dir: PathBuf,
+    /// How long undelivered and idle state is kept on disk.
+    retention: Duration,
     translators: Arc<Registry>,
     sink_factory: Arc<dyn SinkFactory>,
     auth_provider: Option<Arc<dyn AuthProvider>>,
@@ -153,19 +155,21 @@ pub struct Daemon {
 impl Daemon {
     #[cfg(test)]
     fn new(opts: ServeOptions, data_dir: PathBuf) -> Arc<Self> {
-        Self::new_with_startup(opts, data_dir, None)
+        Self::new_with_startup(opts, data_dir, None, maintenance::RETENTION)
     }
 
     fn new_with_startup(
         opts: ServeOptions,
         data_dir: PathBuf,
         startup: Option<oneshot::Receiver<()>>,
+        retention: Duration,
     ) -> Arc<Self> {
         let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_QUEUE_CAPACITY);
         let startup_cutoffs = startup.as_ref().map(|_| HashMap::new());
         let daemon = Arc::new(Daemon {
             version: opts.version,
             data_dir,
+            retention,
             translators: opts.translators,
             sink_factory: opts.sink_factory,
             auth_provider: opts.auth_provider,
@@ -267,7 +271,8 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
     tracing::info!(socket = %socket.display(), "bt-daemon listening");
 
     let (ready, startup) = oneshot::channel();
-    let daemon = Daemon::new_with_startup(opts, data_dir, Some(startup));
+    let retention = args.retention();
+    let daemon = Daemon::new_with_startup(opts, data_dir, Some(startup), retention);
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
     let session_idle_timeout = Duration::from_secs(args.session_idle_timeout_secs);
     let recovery_daemon = daemon.clone();

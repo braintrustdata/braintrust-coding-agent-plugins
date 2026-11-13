@@ -272,6 +272,7 @@ async fn start_with_sink(
         socket: Some(socket.into()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
+        retention: None,
     };
     let mut options = debug_serve_options("test", data);
     options.auth_provider = Some(Arc::new(TestAuth));

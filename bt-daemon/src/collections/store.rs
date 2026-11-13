@@ -52,8 +52,8 @@ impl Inner {
         };
         if let Some(connection) = connection {
             // Reclaim a bounded number of free pages and leave no WAL behind.
-            if let Err(error) = connection
-                .execute_batch("PRAGMA incremental_vacuum(256); PRAGMA wal_checkpoint(TRUNCATE)")
+            if let Err(error) = incremental_vacuum(&connection, "PRAGMA incremental_vacuum(256)")
+                .and_then(|()| connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
             {
                 tracing::warn!(%error, path = %self.path.display(), "session storage could not be compacted on close");
             }
@@ -118,6 +118,26 @@ impl Store {
             )
         })
         .await?
+    }
+
+    /// Return the space of deleted rows to the file system. Deleting rows
+    /// only frees pages inside the file. Databases created before incremental
+    /// auto-vacuum was enabled are rebuilt once to turn it on; afterwards
+    /// free pages are released incrementally.
+    pub async fn compact(&self) -> anyhow::Result<()> {
+        self.run(|db| {
+            if db.one::<i64>("PRAGMA freelist_count", [])? == 0 {
+                return Ok(());
+            }
+            if db.one::<i64>("PRAGMA auto_vacuum", [])? == 0 {
+                db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM")?;
+            } else {
+                incremental_vacuum(db, "PRAGMA incremental_vacuum")?;
+            }
+            db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            Ok(())
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -281,8 +301,7 @@ fn migrate(db: &Connection) -> anyhow::Result<()> {
             ALTER TABLE span_state ADD COLUMN touched_ms INTEGER NOT NULL DEFAULT 0;
             UPDATE span_state SET touched_ms={NOW_MS};
             ALTER TABLE heads ADD COLUMN progress_ms INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE heads ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 0;
-            UPDATE heads SET progress_ms={NOW_MS}, subscribed=1;"
+            UPDATE heads SET progress_ms={NOW_MS};"
         ))?;
         if version < 6 {
             // One bounded pass extracts the metadata a schema-5 channel kept
@@ -330,6 +349,15 @@ impl<T: serde::Serialize> ToSql for Json<T> {
 }
 
 /// Read the first column of the one row a query selects.
+/// Incremental vacuum frees one page per step, so it must be stepped to the
+/// end; `execute_batch` steps each statement only once.
+fn incremental_vacuum(db: &Connection, pragma: &str) -> rusqlite::Result<()> {
+    let mut statement = db.prepare(pragma)?;
+    let mut rows = statement.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
+}
+
 pub(super) trait One {
     fn one<T: FromSql>(&self, sql: &str, params: impl Params) -> rusqlite::Result<T>;
 }

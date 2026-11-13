@@ -16,6 +16,11 @@ impl SessionStorage {
         SpanOps::open(&self.path).await
     }
 
+    /// Release the space of rows that have been deleted.
+    pub async fn compact(&self) -> anyhow::Result<()> {
+        store::Store::open(&self.path).await?.compact().await
+    }
+
     /// Time since the database file last changed, for storage with no owner.
     pub async fn modified_ago(&self) -> Option<std::time::Duration> {
         let modified = tokio::fs::metadata(&self.path)

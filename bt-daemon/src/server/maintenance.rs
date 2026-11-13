@@ -3,8 +3,9 @@
 
 use super::*;
 
-/// How long recovery state is kept on disk.
-pub(super) const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// The retention `serve` uses unless told otherwise.
+#[cfg(test)]
+pub(super) const RETENTION: Duration = crate::args::DEFAULT_RETENTION;
 
 /// How often that retention is enforced while the daemon keeps running.
 pub(super) const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -18,17 +19,22 @@ pub(super) async fn collect_garbage(daemon: &Daemon) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!(%error, "legacy delivery ledger cleanup failed"),
     }
-    journal::gc_old_managed_runs(&daemon.data_dir, RETENTION).await;
+    journal::gc_old_managed_runs(&daemon.data_dir, daemon.retention).await;
     // Protect references held by every retained session, including sessions
     // still inside retention and sessions with no registered heads.
     let Ok(protected) = retained_references(&daemon.data_dir).await else {
         return;
     };
-    crate::transcript_mirror::gc_old_mirrors(&daemon.data_dir, RETENTION, &protected).await;
-    gc_old_correlation_dir(&daemon.data_dir.join("correlation"), RETENTION, &protected).await;
+    crate::transcript_mirror::gc_old_mirrors(&daemon.data_dir, daemon.retention, &protected).await;
+    gc_old_correlation_dir(
+        &daemon.data_dir.join("correlation"),
+        daemon.retention,
+        &protected,
+    )
+    .await;
     gc_old_correlation_dir(
         &daemon.data_dir.join("correlation/parents"),
-        RETENTION,
+        daemon.retention,
         &protected,
     )
     .await;
@@ -73,12 +79,23 @@ pub(super) async fn collect_session(
         if storage
             .modified_ago()
             .await
-            .is_some_and(|idle| idle > RETENTION)
+            .is_some_and(|idle| idle > daemon.retention)
         {
             crate::collections::remove_session(&storage.path).await?;
         }
         return Ok(());
     };
+    // A route that has delivered nothing for the whole retention period, such
+    // as one whose spans its destination keeps rejecting, is expired below.
+    // Stop its delivery first; retirement takes the session lock itself.
+    for route in storage.span_ops().await?.stalled(daemon.retention).await? {
+        let Ok(key) = DeliveryKey::new(&source, &session_id, &route) else {
+            continue;
+        };
+        if daemon.sessions.lock().contains_key(&key) {
+            daemon.retire_session(&key).await;
+        }
+    }
     let namespace = crate::ids::session_namespace(&source, &session_id);
     let lock = daemon.session_lock(&source, &session_id);
     let _guard = lock.lock().await;
@@ -101,9 +118,10 @@ pub(super) async fn collect_session(
         .filter(|key| key.source == source && key.session_id == session_id)
         .map(|key| key.route.clone())
         .collect();
-    events.expire(RETENTION).await?;
+    events.expire(daemon.retention).await?;
     let ops = storage.span_ops().await?;
-    ops.expire(RETENTION, live).await?;
+    ops.expire(daemon.retention, live).await?;
+    storage.compact().await?;
     if daemon.journals.lock().contains_key(&namespace)
         || daemon.translations.lock().contains_key(&namespace)
     {
@@ -121,7 +139,7 @@ pub(super) async fn collect_session(
     // trace instead of re-creating it, so keep it until the session goes cold.
     // Output that no destination ever subscribed to can never be delivered.
     let complete = routes.is_empty() || ops.complete(events.tail().await?).await?;
-    if !complete || events.idle_for().await? <= RETENTION {
+    if !complete || events.idle_for().await? <= daemon.retention {
         return Ok(());
     }
     drop((ops, events));
@@ -431,6 +449,7 @@ mod tests {
                 debug_serve_options("test", root),
                 root.into(),
                 Some(startup),
+                RETENTION,
             ),
             ready,
         )
@@ -650,7 +669,7 @@ mod tests {
         let (ready, startup) = oneshot::channel();
         let mut opts = debug_serve_options("test", tmp.path());
         opts.auth_provider = Some(Arc::new(TestAuth));
-        let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup));
+        let daemon = Daemon::new_with_startup(opts, tmp.path().into(), Some(startup), RETENTION);
         let mut fixtures = DistributedFixtures::new();
         let parent = ProcessTree::root(1000);
         let child = ProcessTree::child(1002, 1001, &parent);
@@ -707,11 +726,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_inactive_sessions_are_removed_and_every_obligation_retains_one() {
+    async fn completed_inactive_sessions_are_removed_and_every_current_obligation_retains_one() {
         for scenario in [
             "no_heads",
             "unresolved",
             "second_unresolved",
+            "rejected",
             "held",
             "source_held",
             "untranslated",
@@ -756,7 +776,7 @@ mod tests {
                     second.tags.insert("second".into());
                     Cursor::open(&partition, &second).await.unwrap();
                 }
-                if scenario != "unresolved" {
+                if !matches!(scenario, "unresolved" | "rejected") {
                     head.next_batch(8)
                         .await
                         .unwrap()
@@ -766,7 +786,7 @@ mod tests {
                         .ok()
                         .unwrap();
                 }
-                if scenario == "held" {
+                if matches!(scenario, "held" | "rejected") {
                     partition
                         .set_failure(&head.route, Some("held".into()))
                         .await
@@ -799,8 +819,12 @@ mod tests {
                     .unwrap();
             }
             collect_sessions(&daemon).await;
-            // Output no destination subscribed to can never be delivered.
-            let complete = matches!(scenario, "complete" | "no_heads");
+            // Output that no destination has accepted for the whole retention
+            // period is expired with the route that owed it.
+            let complete = matches!(
+                scenario,
+                "complete" | "no_heads" | "unresolved" | "second_unresolved" | "rejected"
+            );
             assert_eq!(storage.exists(), !complete, "{scenario}");
             for sidecar in ["sqlite-wal", "sqlite-shm"] {
                 assert!(
@@ -810,6 +834,89 @@ mod tests {
             }
             drain_all(&daemon).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_live_route_held_by_a_failure_expires_after_retention() {
+        use crate::pipeline::recovery::Failure;
+        let tmp = tempfile::tempdir().unwrap();
+        let route = SessionRoute {
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: Some("test-project".into()),
+                project_name: None,
+            }),
+            ..Default::default()
+        };
+        let env = event("rejected", route.clone());
+        let events =
+            crate::collections::EventCollection::open(tmp.path(), &env.source, &env.session_id)
+                .await
+                .unwrap();
+        let through = events.append(&env, None).await.unwrap().unwrap().through;
+        let spans = crate::collections::SpanOps::for_events(&events)
+            .await
+            .unwrap();
+        drop(events);
+        spans
+            .translated(
+                through,
+                vec![SpanOp::Insert(SpanRow {
+                    span_id: "rejected".into(),
+                    root_span_id: "rejected".into(),
+                    end_ms: Some(1),
+                    ..Default::default()
+                })],
+            )
+            .await
+            .unwrap();
+        Cursor::open(&spans, &route).await.unwrap();
+        let lease = TestAuth
+            .resolve(&route.auth, AuthResolveReason::Initial)
+            .await
+            .unwrap();
+        // A rejection that no new settings correct, such as a span too large
+        // for its destination.
+        let failure = Failure::legacy(
+            "413 Request Too Long".into(),
+            1,
+            &route.with_auth(lease.auth),
+        );
+        let key = serde_json::to_string(&route).unwrap();
+        spans
+            .set_failure(&key, Some(serde_json::to_string(&failure).unwrap()))
+            .await
+            .unwrap();
+
+        let mut options = debug_serve_options("test", tmp.path());
+        options.auth_provider = Some(Arc::new(TestAuth));
+        let daemon = Daemon::new(options, tmp.path().into());
+        super::super::recovery::recover_unprocessed_journals(&daemon).await;
+        daemon.ingress_barrier().await;
+        let delivery = DeliveryKey::new(&env.source, &env.session_id, &route).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !daemon.sessions.lock().contains_key(&delivery) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let path =
+            crate::collections::inspect::session_path(tmp.path(), &env.source, &env.session_id);
+        let db = crate::collections::inspect::Inspector::open(&path).unwrap();
+        collect_sessions(&daemon).await;
+        assert!(daemon.sessions.lock().contains_key(&delivery));
+        assert_eq!(db.heads().len(), 1, "a recent failure is kept for recovery");
+
+        db.age(RETENTION + Duration::from_secs(3600)).unwrap();
+        collect_sessions(&daemon).await;
+        assert!(
+            !daemon.sessions.lock().contains_key(&delivery),
+            "the held delivery is stopped"
+        );
+        assert!(db.heads().is_empty());
+        assert_eq!(db.count(crate::collections::inspect::Table::Ops), 0);
+        drain_all(&daemon).await;
     }
 
     #[tokio::test]

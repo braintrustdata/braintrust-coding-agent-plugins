@@ -3414,6 +3414,7 @@ async fn spawn_daemon_with_timeouts(
         data_dir: Some(data_dir),
         idle_timeout_secs,
         session_idle_timeout_secs,
+        retention: None,
     };
     let daemon = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;

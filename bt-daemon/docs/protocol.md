@@ -473,7 +473,13 @@ profiles, organizations, and destinations while sharing one daemon.
   duplicate spans, and a route never receives another route's rows. What
   remains after delivery is only the continuation and small per-span metadata
   a resumed session needs; storage of a session that owes nothing is deleted
-  once it has been inactive for 7 days. Activity is recorded by capture,
+  once it has been inactive for the retention period (`--retention`, or
+  `BT_TRACE_RETENTION`, a duration such as `7d`, `12h` or `90m`; default 7
+  days). GC runs hourly. A route that has
+  delivered nothing for that long, such as one whose destination keeps
+  rejecting its spans, is stopped and its undelivered SpanOps are discarded;
+  a later event starts it again from the current output. GC returns the space
+  of deleted rows to the file system. Activity is recorded by capture,
   translation and delivery, never by opening storage. NDJSON journals written
   by earlier daemons are read only to import them, at their original
   positions, and are then deleted; their delivery ledgers are deleted.
@@ -488,13 +494,13 @@ profiles, organizations, and destinations while sharing one daemon.
   session's transcript rather than to its transcript times its turn count.
   Entries written before mirroring instead carry the whole transcript inline
   as `_bt_transcript_snapshot`, which translators still accept. Mirrors are
-  GC'd after 7 days once no retained session references them.
+  GC'd after the retention period once no retained session references them.
 - **Managed-run acceptance records.** Alongside session storage, each accepted
   event that carries a `managed_run_id` also appends `{session_id, route}` to
   `<data_dir>/managed-runs/<managed_run_id>.ndjson`. `managed_run.flush` reads
   this record when the daemon that accepted the events has since restarted or
   idle-exited, so flush accounting for a child process tree survives a daemon
-  generation change. GC'd after 7 days.
+  generation change. GC'd after the retention period.
 - **Deterministic span ids.** Translators derive span ids as UUIDv5 over stable
   keys (`session_id`, `turn_id`, `call_id`, …) so a replayed re-emit merges
   server-side (`_is_merge`) instead of duplicating.

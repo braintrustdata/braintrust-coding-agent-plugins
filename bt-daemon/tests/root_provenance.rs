@@ -94,6 +94,7 @@ impl Daemon {
             data_dir: Some(tmp.join("data")),
             idle_timeout_secs: 0,
             session_idle_timeout_secs: 0,
+            retention: None,
         };
         let opts = ServeOptions {
             version: version.into(),
