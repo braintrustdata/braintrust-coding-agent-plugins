@@ -49,7 +49,7 @@ mod win_acl;
 pub mod wire;
 pub use args::{
     HookArgs, ImportArgs, ImportSource, ParentObjectType, RunArgs, RunHookCommand, RunSource,
-    ServeArgs, StatusArgs, DEFAULT_RETENTION_HOURS,
+    ServeArgs, StatusArgs,
 };
 pub use client::{
     flush_managed_run, flush_session, forward_envelope, run_status, shutdown_daemon, HostInfo,

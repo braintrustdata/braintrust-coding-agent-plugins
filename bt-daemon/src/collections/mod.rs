@@ -18,5 +18,7 @@ mod tests;
 
 pub(crate) use catalog::{remove_session, sessions, SessionStorage};
 pub(crate) use events::{EventCollection, EventReader, EventRecord};
-pub(crate) use span_ops::{metadata_only, BindingChanged, HeldRoute, SpanOps, Translated};
+pub(crate) use span_ops::{
+    metadata_only, BindingChanged, HeldRoute, SpanOps, Translated, DETACHED,
+};
 pub(crate) use store::is_corruption;

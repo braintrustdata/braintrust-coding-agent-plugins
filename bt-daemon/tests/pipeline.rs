@@ -324,7 +324,7 @@ async fn start_routed_daemon(
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let mut opts = debug_serve_options("test", &data_dir);
     opts.auth_provider = Some(provider);
@@ -375,7 +375,7 @@ async fn start_daemon_at_with(
         data_dir: Some(data_dir),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let opts = ServeOptions {
         version: "test".to_string(),
@@ -457,7 +457,7 @@ async fn start_daemon() -> (
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0, // disable the watchdog for the test
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let mut opts = debug_serve_options("test", &data_dir);
     opts.auth_provider = Some(Arc::new(TestAuthProvider {
@@ -501,7 +501,7 @@ async fn start_tracking_daemon(
         data_dir: Some(data_dir),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let handle = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;
@@ -529,7 +529,7 @@ async fn start_slow_daemon() -> (PathBuf, tokio::task::JoinHandle<()>, tempfile:
         data_dir: Some(data_dir),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let handle = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;
@@ -569,7 +569,7 @@ async fn start_gated_daemon(
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let handle = tokio::spawn(async move {
         let _ = run_serve(args, opts).await;
@@ -584,7 +584,7 @@ async fn start_daemon_at(data_dir: PathBuf, socket: PathBuf) -> tokio::task::Joi
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let mut opts = debug_serve_options("test", &data_dir);
     opts.auth_provider = Some(Arc::new(TestAuthProvider {
@@ -645,7 +645,7 @@ async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
             data_dir: Some(data_dir.clone()),
             idle_timeout_secs: 0,
             session_idle_timeout_secs: 0,
-            retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+            retention_hours: None,
         };
         let opts = ServeOptions {
             version: "test".into(),
@@ -1777,7 +1777,7 @@ async fn a_second_server_detects_the_existing_daemon() {
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let result = tokio::time::timeout(
         Duration::from_secs(2),
@@ -2234,7 +2234,7 @@ async fn start_daemon_with_session_ttl(
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: ttl_secs,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let mut opts = debug_serve_options("test", &data_dir);
     opts.auth_provider = Some(Arc::new(TestAuthProvider {
@@ -2271,7 +2271,7 @@ async fn start_claude_recording_daemon(
         data_dir: Some(data_dir),
         idle_timeout_secs: 0,
         session_idle_timeout_secs,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let opts = ServeOptions {
         version: "test".into(),
@@ -2802,7 +2802,7 @@ async fn managed_run_parent_continues_trace_through_live_hooks() {
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let handle = tokio::spawn(run_serve(args, opts));
     wait_for(&socket).await;
@@ -3268,7 +3268,7 @@ async fn start_grok_debug_daemon_at(
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let opts = ServeOptions {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -3852,7 +3852,7 @@ async fn missing_credentials_recover_without_another_native_event() {
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let handle = tokio::spawn(async move { run_serve(args, options).await.unwrap() });
     wait_for(&socket).await;
@@ -4061,7 +4061,7 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
         data_dir: Some(data_dir.clone()),
         idle_timeout_secs: 0,
         session_idle_timeout_secs: 0,
-        retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+        retention_hours: None,
     };
     let handle = tokio::spawn(async move { run_serve(args, opts).await.unwrap() });
     wait_for(&socket).await;
@@ -4237,7 +4237,7 @@ async fn changed_settings_resume_the_original_rejected_route_through_ingress() {
             data_dir: Some(data.clone()),
             idle_timeout_secs: 0,
             session_idle_timeout_secs: 0,
-            retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+            retention_hours: None,
         };
         tokio::spawn(async move { run_serve(args, opts).await.unwrap() })
     };
@@ -4590,7 +4590,7 @@ async fn managed_run_flush_shares_one_budget_and_returns_pending_counts() {
                 data_dir: Some(data_dir),
                 idle_timeout_secs: 0,
                 session_idle_timeout_secs: 0,
-                retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+                retention_hours: None,
             },
             options,
         )

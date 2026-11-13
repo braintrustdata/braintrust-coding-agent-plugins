@@ -94,7 +94,7 @@ impl Daemon {
             data_dir: Some(tmp.join("data")),
             idle_timeout_secs: 0,
             session_idle_timeout_secs: 0,
-            retention_hours: bt_daemon::DEFAULT_RETENTION_HOURS,
+            retention_hours: None,
         };
         let opts = ServeOptions {
             version: version.into(),

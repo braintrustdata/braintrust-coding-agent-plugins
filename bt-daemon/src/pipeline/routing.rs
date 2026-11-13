@@ -52,6 +52,7 @@ impl RoutingSink {
             let mut plugins = Plugins::new(&source, &session_id);
             let mut prepare = Prepare::new(&source);
             let mut submission = Submission::new(sink);
+            let mut stopped = false;
             while let Ok(Some(delivery)) = InputPort::receive(&mut rx).await {
                 let request = delivery.value();
                 let (result, state) = match &request.operation {
@@ -63,6 +64,9 @@ impl RoutingSink {
                         let mut failure = None;
                         let mut report = false;
                         for op in &ops {
+                            if stopped {
+                                break;
+                            }
                             if request.config.span_plugins.is_empty() {
                                 prepared.push(op.clone());
                                 continue;
@@ -93,6 +97,14 @@ impl RoutingSink {
                                             processors: error.processors.clone(),
                                         },
                                     ));
+                                }
+                                PluginOutcome::Unavailable(error)
+                                    if error.is::<crate::span_processor::StopTracing>() =>
+                                {
+                                    stopped = true;
+                                    prepared.clear();
+                                    failure = None;
+                                    break;
                                 }
                                 PluginOutcome::Unavailable(error) => {
                                     report = true;
@@ -131,6 +143,9 @@ impl RoutingSink {
                                 })),
                                 state,
                             ),
+                            (Ok(_), None) if stopped => {
+                                (Err(crate::span_processor::StopTracing.into()), state)
+                            }
                             (Ok(emitted), None) => (Ok(emitted), state),
                         }
                     }
@@ -158,7 +173,9 @@ impl RoutingSink {
                     }
                 };
                 if let Err(error) = &result {
-                    *last_error.lock() = Some(error.to_string());
+                    if !error.is::<crate::span_processor::StopTracing>() {
+                        *last_error.lock() = Some(error.to_string());
+                    }
                 }
                 let request = match delivery.into_completed().await {
                     Ok(request) => request,
@@ -272,6 +289,55 @@ mod tests {
         async fn flush(&mut self) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn stop_discards_prepared_batch_and_stays_latched_after_reconfiguration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("stop.mjs");
+        std::fs::write(&plugin, "export default span => { if (span.name === 'private') throw new StopTracingError(); return span; }").unwrap();
+        let emitted = Arc::new(AtomicU64::new(0));
+        let error = Arc::new(Mutex::new(None));
+        let mut sink = RoutingSink::spawn(
+            Box::new(CountingSink(emitted.clone())),
+            "debug".into(),
+            "session".into(),
+            tmp.path().into(),
+            error.clone(),
+        );
+        let mut config = SessionRoute {
+            span_plugins: vec![plugin],
+            ..Default::default()
+        }
+        .with_auth(BackendAuth {
+            token: "test".into(),
+            api_url: None,
+            app_url: None,
+            org_name: None,
+            org_id: None,
+        });
+        sink.configure(&config);
+        let op = |name: &str| {
+            SpanOp::Insert(SpanRow {
+                name: name.into(),
+                ..Default::default()
+            })
+        };
+        assert!(sink
+            .emit(&[op("allowed"), op("private"), op("later")])
+            .await
+            .unwrap_err()
+            .is::<crate::span_processor::StopTracing>());
+        config.span_plugins.clear();
+        sink.configure(&config);
+        assert!(sink
+            .emit(&[op("future")])
+            .await
+            .unwrap_err()
+            .is::<crate::span_processor::StopTracing>());
+        assert_eq!(emitted.load(Ordering::SeqCst), 0);
+        assert!(error.lock().is_none());
+        sink.shutdown().await;
     }
 
     #[tokio::test]

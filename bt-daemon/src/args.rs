@@ -10,7 +10,10 @@ use crate::agents::{self, Agent, Identity};
 use crate::wire;
 
 /// How long `serve` keeps undelivered output and idle session state.
-pub const DEFAULT_RETENTION_HOURS: u64 = 7 * 24;
+pub(crate) const DEFAULT_RETENTION_HOURS: u64 = 7 * 24;
+
+/// Sets the retention when `--retention-hours` is not given.
+pub(crate) const RETENTION_ENV: &str = "BT_TRACE_RETENTION_HOURS";
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -32,14 +35,32 @@ pub struct ServeArgs {
     pub session_idle_timeout_secs: u64,
     /// Discard output a destination has not accepted, and session state left
     /// idle, after this many hours. Lower it to bound disk use more tightly
-    /// when a destination keeps rejecting spans.
-    #[arg(
-        long,
-        env = "BRAINTRUST_DAEMON_RETENTION_HOURS",
-        default_value_t = DEFAULT_RETENTION_HOURS,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    pub retention_hours: u64,
+    /// when a destination keeps rejecting spans. Defaults to
+    /// `BT_TRACE_RETENTION_HOURS`, or 168 (7 days).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub retention_hours: Option<u64>,
+}
+
+impl ServeArgs {
+    /// How long undelivered output and idle session state are kept.
+    pub(crate) fn retention(&self) -> std::time::Duration {
+        let hours = retention_hours(self.retention_hours, crate::env::var(RETENTION_ENV));
+        std::time::Duration::from_secs(hours.saturating_mul(60 * 60))
+    }
+}
+
+/// The explicit flag, else a positive whole number of hours from the
+/// environment, else the default.
+fn retention_hours(flag: Option<u64>, env: Option<String>) -> u64 {
+    flag.or_else(|| {
+        let value = env?;
+        let hours = value.trim().parse::<u64>().ok().filter(|hours| *hours > 0);
+        if hours.is_none() {
+            tracing::warn!(%value, "ignoring {RETENTION_ENV}: expected a positive number of hours");
+        }
+        hours
+    })
+    .unwrap_or(DEFAULT_RETENTION_HOURS)
 }
 
 /// Arguments for `hook`.
@@ -340,7 +361,20 @@ mod tests {
     fn serve_defaults_to_short_journal_backed_session_retirement() {
         let args = ServeCli::try_parse_from(["test"]).unwrap().args;
         assert_eq!(args.session_idle_timeout_secs, 30);
-        assert_eq!(args.retention_hours, DEFAULT_RETENTION_HOURS);
+        assert_eq!(args.retention_hours, None);
+    }
+
+    #[test]
+    fn retention_prefers_the_flag_then_a_usable_environment_value() {
+        assert_eq!(retention_hours(Some(2), Some("5".into())), 2);
+        assert_eq!(retention_hours(None, Some(" 5 ".into())), 5);
+        for unusable in [None, Some(""), Some("0"), Some("-1"), Some("1d")] {
+            assert_eq!(
+                retention_hours(None, unusable.map(String::from)),
+                DEFAULT_RETENTION_HOURS,
+                "{unusable:?}"
+            );
+        }
     }
 
     #[test]

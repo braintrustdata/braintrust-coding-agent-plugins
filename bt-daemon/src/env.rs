@@ -1,13 +1,17 @@
 //! User-facing environment variables use the `BRAINTRUST_` prefix, matching
 //! `bt` and the Braintrust SDKs. Read them through [`var_os`] so that the
 //! deprecated `BT_` names keep working until support is removed.
+//!
+//! Variables that tune the trace daemon itself use the `BT_TRACE_` prefix
+//! instead and are listed in `DAEMON_TUNING_ENV_VARS`. They are read through
+//! [`var_os`] like every other variable.
 
 use std::ffi::{OsStr, OsString};
 
 /// Pre-`BRAINTRUST_` names of tracing env vars. Each `BT_<NAME>` is still
 /// honored as an alias for `BRAINTRUST_<NAME>` until support is removed in a
 /// major release. Do not add entries: new env vars must use the `BRAINTRUST_`
-/// prefix.
+/// prefix, or be daemon tuning listed in `DAEMON_TUNING_ENV_VARS`.
 ///
 /// `BT_TRACE_MANAGED_RUN_ID` and `BT_TRACE_INVOCATION_SETTINGS` are not listed:
 /// they are the internal protocol `bt trace run` uses to configure its child
@@ -22,6 +26,11 @@ pub(crate) const DEPRECATED_BT_ENV_VARS: &[&str] = &[
     "BT_TRACE_OPENCODE_PLUGIN_SPEC",
     "BT_TRACE_PI_PLUGIN_SPEC",
 ];
+
+/// Variables that tune the trace daemon itself rather than what it traces.
+/// The prefix test below holds every `BT_*` name to this list.
+#[cfg(test)]
+pub(crate) const DAEMON_TUNING_ENV_VARS: &[&str] = &[crate::args::RETENTION_ENV];
 
 pub(crate) fn canonical_env_name(deprecated: &str) -> String {
     let name = deprecated.strip_prefix("BT_").unwrap_or(deprecated);
@@ -117,7 +126,11 @@ mod tests {
         let unexpected: BTreeSet<_> = pattern
             .find_iter(&sources)
             .map(|m| m.as_str())
-            .filter(|name| !DEPRECATED_BT_ENV_VARS.contains(name) && !INTERNAL.contains(name))
+            .filter(|name| {
+                !DEPRECATED_BT_ENV_VARS.contains(name)
+                    && !INTERNAL.contains(name)
+                    && !DAEMON_TUNING_ENV_VARS.contains(name)
+            })
             .collect();
         assert!(
             unexpected.is_empty(),

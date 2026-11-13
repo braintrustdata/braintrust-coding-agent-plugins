@@ -188,6 +188,20 @@ file or another plugin in its configured chain to change, or for the chain itsel
 to change. It then retries from the SpanOp journal without requiring a restart or
 another agent event. Restarting alone does not retry an unchanged failing chain.
 
+A plugin can permanently stop reporting the current session route by throwing
+`new StopTracingError()`. This built-in error is a control signal and is not
+recorded as a plugin failure. The triggering batch and all future operations
+for that route are discarded, including after a daemon restart or plugin edit.
+Other routes consuming the session continue normally. Previously submitted data
+is not retracted, and raw source events may still be journaled locally.
+
+```js
+export default function guard(span) {
+  if (span.metadata?.sensitive) throw new StopTracingError();
+  return span;
+}
+```
+
 Plugin failures are deduplicated in the daemon's private local state, including
 the raw QuickJS exception and stack. Inspect them with:
 
@@ -344,7 +358,7 @@ translated and spans until every destination accepts them; space they used is
 returned to the file system. Spans a destination has accepted none of for the
 retention period, such as spans it keeps rejecting, are discarded, as is the
 storage of a completed session left unchanged that long. Retention defaults to
-seven days; set `BRAINTRUST_DAEMON_RETENTION_HOURS` (or `serve
+seven days; set `BT_TRACE_RETENTION_HOURS` (or `serve
 --retention-hours`) to bound disk use more tightly.
 
 ## Platform and integration coverage

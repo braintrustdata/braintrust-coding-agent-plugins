@@ -474,7 +474,7 @@ profiles, organizations, and destinations while sharing one daemon.
   remains after delivery is only the continuation and small per-span metadata
   a resumed session needs; storage of a session that owes nothing is deleted
   once it has been inactive for the retention period (`--retention-hours`,
-  or `BRAINTRUST_DAEMON_RETENTION_HOURS`; default 7 days). A route that has
+  or `BT_TRACE_RETENTION_HOURS`; default 7 days). A route that has
   delivered nothing for that long, such as one whose destination keeps
   rejecting its spans, is stopped and its undelivered SpanOps are discarded;
   a later event starts it again from the current output. GC returns the space

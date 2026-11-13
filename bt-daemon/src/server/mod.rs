@@ -271,7 +271,7 @@ pub async fn run(args: ServeArgs, opts: ServeOptions) -> anyhow::Result<()> {
     tracing::info!(socket = %socket.display(), "bt-daemon listening");
 
     let (ready, startup) = oneshot::channel();
-    let retention = Duration::from_secs(args.retention_hours.saturating_mul(60 * 60));
+    let retention = args.retention();
     let daemon = Daemon::new_with_startup(opts, data_dir, Some(startup), retention);
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
     let session_idle_timeout = Duration::from_secs(args.session_idle_timeout_secs);
