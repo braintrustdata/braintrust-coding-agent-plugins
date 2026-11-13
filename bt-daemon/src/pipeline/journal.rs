@@ -37,6 +37,10 @@ impl std::fmt::Display for BindingChanged {
 }
 impl std::error::Error for BindingChanged {}
 
+// SQLite positions are signed integers. The maximum value is a durable terminal
+// subscription marker; it never pins payload retention or resumes on replay.
+const DETACHED: u64 = i64::MAX as u64;
+
 type ReplayWindow = Vec<(u64, std::sync::Weak<SpanOp>, usize)>;
 
 #[derive(Clone)]
@@ -164,7 +168,11 @@ fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Res
     Ok(())
 }
 fn prune(db: &Connection) -> anyhow::Result<()> {
-    let through: Option<u64> = db.query_row("SELECT min(position) FROM heads", [], |r| r.get(0))?;
+    let through: Option<u64> = db.query_row(
+        "SELECT min(CASE WHEN position=9223372036854775807 THEN (SELECT tail FROM publication WHERE id=1) ELSE position END) FROM heads",
+        [],
+        |r| r.get(0),
+    )?;
     if let Some(through) = through {
         db.execute("DELETE FROM ops WHERE position<=?", [through])?;
         db.execute(
@@ -1237,7 +1245,31 @@ struct SharedCursor(Cursor);
 #[async_trait::async_trait]
 impl InputPort for SharedCursor {
     type Item = Vec<SharedOp>;
+    async fn detach(&mut self) -> anyhow::Result<()> {
+        let route = self.0.route.clone();
+        self.0
+            .journal
+            .with_db(move |db| {
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "UPDATE heads SET position=9223372036854775807, failure=NULL WHERE route=?",
+                    [route],
+                )?;
+                prune(&tx)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        self.0.live.control().pause();
+        self.0.live.clear();
+        self.0.progress.send_replace(DETACHED);
+        Ok(())
+    }
     async fn receive(&mut self) -> anyhow::Result<Option<Delivery<Self::Item>>> {
+        if *self.0.progress.borrow() == DETACHED {
+            self.0.live.control().pause();
+            return Ok(None);
+        }
         let result = self.0.receive_managed().await;
         match result {
             Ok(delivery) => Ok(Some(delivery)),
@@ -1438,6 +1470,26 @@ mod tests {
             ..SpanRow::default()
         })
     }
+    #[tokio::test]
+    async fn detached_route_stays_detached_and_does_not_pin_other_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spans.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let route = SessionRoute::default();
+        let cursor = journal.subscribe(&route, 0).await.unwrap();
+        let mut input = SharedCursor(cursor);
+        input.detach().await.unwrap();
+        assert!(input.receive().await.unwrap().is_none());
+        journal.begin(1, true).await.unwrap();
+        journal.append(1, &[op("later")]).await.unwrap();
+        journal.commit(1).await.unwrap();
+        assert!(journal.route_complete(&route, 1).await.unwrap());
+        assert!(journal.read_after(0, 10).await.unwrap().is_empty());
+        let restored = SpanJournal::open(&path).await.unwrap();
+        let mut input = SharedCursor(restored.subscribe(&route, 0).await.unwrap());
+        assert!(input.receive().await.unwrap().is_none());
+    }
+
     #[test]
     fn codec_preserves_aggregate_watermarks_and_reads_older_records() {
         let mut op = op("root");

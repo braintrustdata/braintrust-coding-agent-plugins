@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, thiserror::Error)]
+#[error("route tracing stopped by plugin")]
+pub(crate) struct StopTracing;
+
 const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const STACK_LIMIT_BYTES: usize = 512 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -101,6 +105,9 @@ impl Engine {
             expired
         })));
         let context = Context::full(&runtime)?;
+        context.with(|ctx| ctx.eval::<(), _>(
+            "Object.defineProperty(globalThis, 'StopTracingError', {value: class StopTracingError extends Error {}, writable: false, configurable: false});"
+        ))?;
         Ok(Self {
             modules: HashMap::new(),
             failed_plugins: HashMap::new(),
@@ -222,7 +229,18 @@ impl Engine {
             let result = function
                 .call::<_, rquickjs::Value<'_>>((row, context))
                 .catch(&ctx)
-                .map_err(|error| anyhow::anyhow!(error.to_string()));
+                .map_err(|error| {
+                    if let rquickjs::CaughtError::Exception(exception) = &error {
+                        if let Ok(class) =
+                            ctx.globals().get::<_, rquickjs::Value>("StopTracingError")
+                        {
+                            if exception.as_object().is_instance_of(class) {
+                                return anyhow::Error::new(StopTracing);
+                            }
+                        }
+                    }
+                    anyhow::anyhow!(error.to_string())
+                });
             execution_ms = executing.elapsed().as_millis();
             let result = result?;
             if result.as_promise().is_some() {
@@ -379,6 +397,9 @@ fn process_inner(
                     break;
                 }
                 Err(error) => {
+                    if error.is::<StopTracing>() {
+                        return Err(error);
+                    }
                     let timed_out = error.downcast_ref::<PluginTimeout>().is_some();
                     let message = error.to_string();
                     engine.failed_plugins.insert(
@@ -517,6 +538,31 @@ mod tests {
             name: "original".into(),
             ..SpanRow::default()
         }
+    }
+
+    #[test]
+    fn stop_signal_is_typed_and_does_not_poison_the_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("stop.mjs");
+        std::fs::write(&plugin, "export default span => { if (span.name === 'original') throw new StopTracingError('sensitive'); return span; }").unwrap();
+        let error = process(
+            std::slice::from_ref(&plugin),
+            &SpanOp::Insert(row()),
+            "debug",
+            "stopped",
+        )
+        .err()
+        .unwrap();
+        assert!(error.is::<StopTracing>());
+        assert!(failed_digest(&plugin).is_none());
+        let mut allowed = row();
+        allowed.name = "allowed".into();
+        assert!(
+            process(&[plugin], &SpanOp::Insert(allowed), "debug", "other")
+                .unwrap()
+                .op
+                .is_some()
+        );
     }
 
     #[test]
