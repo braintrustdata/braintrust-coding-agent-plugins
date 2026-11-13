@@ -35,7 +35,7 @@ impl TranslatorFactory for DebugTranslatorFactory {
         })
     }
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct DebugTranslator {
     root_span_id: String,
     root_emitted: bool,

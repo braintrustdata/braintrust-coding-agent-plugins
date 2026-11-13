@@ -1027,6 +1027,14 @@ fn opencode_v2_reduces_native_text_session_without_session_created() {
         );
         e.source_version = Some("2.2.5".into());
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
         assert!(translator.handle(&e, &ctx).unwrap().is_empty());
     }
     let rows = reduce(ops);
@@ -1083,6 +1091,14 @@ fn opencode_v2_emits_tool_span_from_native_events() {
     for (i, (name, data)) in events.into_iter().enumerate() {
         let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     let tool = rows
@@ -1131,6 +1147,14 @@ fn opencode_v2_preserves_attached_images_in_turn_and_model_input() {
     for (i, (name, data)) in events.into_iter().enumerate() {
         let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     let turn = rows.values().find(|r| r.name == "Turn 1").unwrap();
@@ -1186,6 +1210,14 @@ fn opencode_v2_resume_keeps_the_first_native_event_after_synthetic_start() {
         let mut e = event(name, i, json!({"id":format!("event-{i}"),"data":data}));
         e.source_version = Some("2.2.5".into());
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     assert!(rows
@@ -1267,6 +1299,14 @@ fn opencode_v2_compaction_preserves_native_model_context_after_resume() {
         let mut e = event(name, i, json!({"id":format!("event-{i}"),"data":data}));
         e.source_version = Some("2.0.0".into());
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     let llm = rows
@@ -1338,6 +1378,14 @@ fn opencode_v2_distinguishes_denied_and_failed_tools() {
     for (i, (name, data)) in events.into_iter().enumerate() {
         let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     let tools: Vec<_> = rows
@@ -1423,6 +1471,15 @@ fn opencode_v2_compaction_keeps_native_tail_without_context_hook() {
         );
         envelope.source_version = Some("2.2.5".into());
         ops.extend(translator.handle(&envelope, &ctx).unwrap());
+        if envelope
+            .source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     let llm = rows
@@ -1490,6 +1547,14 @@ fn opencode_v2_permission_denied_before_tool_call_creates_one_tool_span() {
     for (i, (name, data)) in events.into_iter().enumerate() {
         let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     let tools: Vec<_> = rows
@@ -1549,6 +1614,15 @@ fn opencode_v2_preserves_provider_defined_context_and_tool_content() {
     for (i, (name, data)) in events.into_iter().enumerate() {
         let envelope = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&envelope, &ctx).unwrap());
+        if envelope
+            .source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     let llm = rows
@@ -1613,6 +1687,15 @@ fn opencode_v2_native_compaction_window_is_scoped_to_its_model() {
         for (i, (name, data)) in events.into_iter().enumerate() {
             let envelope = v2_event(name, i as i64 + 1, data);
             ops.extend(translator.handle(&envelope, &ctx).unwrap());
+            if envelope
+                .source_version
+                .as_deref()
+                .is_some_and(|v| v.starts_with('2'))
+            {
+                let state = translator.save_state().unwrap();
+                translator = Registry::default_agents().create("opencode", "root-session");
+                translator.restore_state(&state).unwrap();
+            }
         }
         let rows = reduce(ops);
         let llm = rows
@@ -1666,6 +1749,15 @@ fn opencode_v2_preserves_opaque_provider_compaction_output() {
     for (i, (name, data)) in events.into_iter().enumerate() {
         let envelope = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&envelope, &ctx).unwrap());
+        if envelope
+            .source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     let compact = rows
@@ -1712,6 +1804,14 @@ fn opencode_v2_checkpoint_resume_and_finalize_preserve_session_and_close_missing
         ),
     ] {
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     assert!(translator.checkpoint(&ctx).unwrap().is_empty());
     for e in [
@@ -1732,6 +1832,14 @@ fn opencode_v2_checkpoint_resume_and_finalize_preserve_session_and_close_missing
         ),
     ] {
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     ops.extend(translator.finalize(&ctx).unwrap());
     let rows = reduce(ops);
@@ -2421,6 +2529,14 @@ fn opencode_v2_interrupted_denial_does_not_suppress_later_tool_calls() {
     for (i, (name, data)) in events.into_iter().enumerate() {
         let e = v2_event(name, i as i64 + 1, data);
         ops.extend(translator.handle(&e, &ctx).unwrap());
+        if e.source_version
+            .as_deref()
+            .is_some_and(|v| v.starts_with('2'))
+        {
+            let state = translator.save_state().unwrap();
+            translator = Registry::default_agents().create("opencode", "root-session");
+            translator.restore_state(&state).unwrap();
+        }
     }
     let rows = reduce(ops);
     assert!(

@@ -53,6 +53,7 @@ impl TranslatorFactory for crate::agents::Pi {
 // and makes each translator reducer explicit about the fields it consumes.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct BeforeAgentStart {
     #[serde(default)]
     prompt: Option<Value>,
@@ -63,7 +64,7 @@ struct BeforeAgentStart {
 }
 
 /// Pi's before_agent_start images contain base64 data, separate from the prompt.
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PromptImage {
     data: String,
@@ -72,13 +73,13 @@ struct PromptImage {
 
 /// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
 /// routes each request to a physical model.
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct SelectedModel {
     provider: String,
     id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct ContextEvent {
     #[serde(default)]
     messages: Vec<Value>,
@@ -86,6 +87,7 @@ struct ContextEvent {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct MessageUpdate {
     #[serde(default)]
     assistant_message_event: Option<MessageDelta>,
@@ -93,13 +95,13 @@ struct MessageUpdate {
     kind: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct MessageDelta {
     #[serde(default, rename = "type")]
     kind: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct ThinkingLevel {
     #[serde(default)]
     level: Option<String>,
@@ -107,6 +109,7 @@ struct ThinkingLevel {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct AssistantMessage {
     #[serde(default)]
     role: Option<String>,
@@ -148,6 +151,7 @@ struct AssistantMessage {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct Usage {
     #[serde(default)]
     input: i64,
@@ -170,7 +174,7 @@ struct Usage {
     cost: Option<Cost>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, serde::Serialize)]
 struct Cost {
     #[serde(default)]
     total: Option<f64>,
@@ -178,6 +182,7 @@ struct Cost {
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
+#[derive(serde::Serialize)]
 enum AssistantContent {
     #[serde(rename = "text")]
     Text {
@@ -204,6 +209,7 @@ enum AssistantContent {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct ToolExecutionStart {
     tool_call_id: String,
     #[serde(default)]
@@ -218,6 +224,7 @@ struct ToolExecutionStart {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct ToolExecutionEnd {
     #[serde(default)]
     tool_call_id: Option<String>,
@@ -233,6 +240,7 @@ struct ToolExecutionEnd {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct AgentEnd {
     #[serde(default)]
     will_retry: bool,
@@ -240,6 +248,7 @@ struct AgentEnd {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct SessionCompact {
     #[serde(default)]
     compaction_entry: Option<CompactionEntry>,
@@ -247,6 +256,7 @@ struct SessionCompact {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct CompactionEntry {
     #[serde(default)]
     summary: Option<Value>,
@@ -258,6 +268,7 @@ struct CompactionEntry {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct Preparation {
     #[serde(default)]
     tokens_before: Option<Value>,
@@ -289,6 +300,7 @@ struct Preparation {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct BeforeCompact {
     #[serde(default)]
     reason: Option<Value>,
@@ -304,6 +316,7 @@ struct BeforeCompact {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct BeforeTree {
     #[serde(default)]
     preparation: Option<Preparation>,
@@ -311,6 +324,7 @@ struct BeforeTree {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(serde::Serialize)]
 struct SessionTree {
     #[serde(default)]
     summary_entry: Option<Value>,
@@ -319,7 +333,7 @@ struct SessionTree {
 fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingLlm {
     start_ms: i64,
     input: Value,
@@ -327,13 +341,14 @@ struct PendingLlm {
     request_config: Map<String, Value>,
     selected_model: Option<SelectedModel>,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ToolStart {
     start_ms: i64,
     name: String,
     args: Value,
     parent_call: Option<String>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PiTranslator {
     session_id: String,
     root_span_id: String,
@@ -360,6 +375,7 @@ struct PiTranslator {
     branch_summary: Option<(String, i64, Value)>,
     last_ts: i64,
     thinking_level: Option<String>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 
@@ -1033,7 +1049,7 @@ impl PiTranslator {
         })
     }
 }
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct LegacyContinuation {
     root_span_id: String,
     trace_root_span_id: String,

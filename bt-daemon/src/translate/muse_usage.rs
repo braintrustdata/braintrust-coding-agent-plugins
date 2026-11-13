@@ -3,7 +3,7 @@
 use super::super::recent::RecentMap;
 use crate::muse::usage::{TokenMetrics, TokenUsage, UsageScope};
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct UsageTracker {
     turn_usage: RecentMap<String, TokenUsage>,
     model_metrics: RecentMap<String, TokenMetrics>,
