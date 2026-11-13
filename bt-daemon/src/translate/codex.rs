@@ -20,7 +20,9 @@
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
 use super::tool::{
-    add_tool_approval, explicit_skill_metadata, tool_approval_metadata, ToolApproval,
+    add_tool_approval, compile_skill_regex, explicit_skill_metadata, insert_skill_metadata,
+    is_skill_name, prompt_skill_names, push_unique, skill_md_paths, tool_approval_metadata,
+    SkillLoad, ToolApproval,
 };
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -32,7 +34,6 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 mod tool_output;
@@ -946,9 +947,7 @@ impl CodexTranslator {
             // filtered before reaching this point, so it cannot contribute
             // attribution when the legacy authoritative event is absent.
             for name in explicit_skill_names(&text) {
-                if !turn.explicit_skill_names.contains(&name) {
-                    turn.explicit_skill_names.push(name);
-                }
+                push_unique(&mut turn.explicit_skill_names, name);
             }
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.span_id.clone(),
@@ -959,6 +958,34 @@ impl CodexTranslator {
                 ..Default::default()
             }));
         }
+    }
+
+    /// When the user invokes a skill (`$name` or the skill picker), Codex
+    /// resolves it and injects a `<skill>` row carrying the skill's name and
+    /// instructions. That row, not the prompt text, proves the request: shell
+    /// variables like `$HOME` never resolve to one.
+    fn record_injected_skills(&mut self, scope: &mut Scope, text: &str, ops: &mut Vec<SpanOp>) {
+        if !text.trim_start().starts_with("<skill") {
+            return;
+        }
+        let names = injected_skill_names(text);
+        let turn_parent_span_id = scope.turn_parent_span_id.clone();
+        let Some(turn) = scope.open_turns.last_mut() else {
+            return;
+        };
+        if names.is_empty() {
+            return;
+        }
+        for name in names {
+            push_unique(&mut turn.explicit_skill_names, name);
+        }
+        ops.push(SpanOp::Merge(SpanRow {
+            span_id: turn.span_id.clone(),
+            root_span_id: self.effective_root_span_id.clone(),
+            parent_span_ids: vec![turn_parent_span_id],
+            metadata: explicit_skill_metadata(&turn.explicit_skill_names),
+            ..Default::default()
+        }));
     }
 
     fn set_turn_input_image_message(
@@ -979,9 +1006,7 @@ impl CodexTranslator {
             turn.native_prompt_seen = true;
             turn.input_source.get_or_insert(TurnInputSource::Native);
             for name in explicit_skill_names(text) {
-                if !turn.explicit_skill_names.contains(&name) {
-                    turn.explicit_skill_names.push(name);
-                }
+                push_unique(&mut turn.explicit_skill_names, name);
             }
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.span_id.clone(),
@@ -1049,6 +1074,9 @@ impl CodexTranslator {
         let (text, multimodal_content) = message_content(payload);
         if text.is_empty() && multimodal_content.is_none() {
             return;
+        }
+        if role == "user" {
+            self.record_injected_skills(scope, &text, ops);
         }
         let content = multimodal_content.clone().unwrap_or_else(|| json!(text));
         let msg = json!({ "role": role, "content": content });
@@ -1173,15 +1201,8 @@ impl CodexTranslator {
         if let Some(skill) = &skill {
             if let Some(skill_name) = &skill.name {
                 name = format!("skill: {skill_name}");
-                metadata.insert("skill_name".into(), json!(skill_name));
-                if explicit_skills.contains(skill_name) {
-                    metadata.insert("skill_load_trigger".into(), json!("explicit"));
-                }
             }
-            if let Some(skill_path) = &skill.path {
-                metadata.insert("skill_path".into(), json!(skill_path));
-            }
-            metadata.insert("tool_kind".into(), json!("skill"));
+            insert_skill_metadata(&mut metadata, skill, &explicit_skills);
         }
         if let Some(permission) = permission {
             metadata.insert("permission".into(), permission);
@@ -1820,12 +1841,6 @@ fn args_object(args: Option<&Value>) -> Option<Map<String, Value>> {
     }
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct SkillLoad {
-    name: Option<String>,
-    path: Option<String>,
-}
-
 fn string_candidates(args: Option<&Value>) -> Vec<String> {
     let mut candidates = Vec::new();
     if let Some(raw) = args.and_then(Value::as_str) {
@@ -1849,16 +1864,6 @@ fn string_candidates(args: Option<&Value>) -> Vec<String> {
     candidates
 }
 
-fn compile_skill_regex(pattern: &str) -> Option<Regex> {
-    match Regex::new(pattern) {
-        Ok(regex) => Some(regex),
-        Err(error) => {
-            tracing::error!(%error, pattern, "could not compile skill metadata pattern");
-            None
-        }
-    }
-}
-
 fn detect_skill(tool_name: &str, args: Option<&Value>) -> Option<SkillLoad> {
     if tool_name == "skills.read" {
         if let Some(object) = args_object(args) {
@@ -1872,46 +1877,32 @@ fn detect_skill(tool_name: &str, args: Option<&Value>) -> Option<SkillLoad> {
             });
         }
     }
-    static SKILL_PATH: OnceLock<Option<Regex>> = OnceLock::new();
     static SCRIPT_PATH: OnceLock<Option<Regex>> = OnceLock::new();
-    let skill_path = SKILL_PATH
-        .get_or_init(|| compile_skill_regex(r#"(?i)([^\s"']*SKILL\.md)"#))
-        .as_ref()?;
+    // A script only identifies a skill when it lives in a skill directory's
+    // own `scripts/` folder (`…/skills/<name>/scripts/…`). Arbitrary
+    // `scripts/` folders (`runtime/scripts/x.sh`, `scripts/scripts/y`) are
+    // ordinary project files, not skill loads.
     let script_path = SCRIPT_PATH
-        .get_or_init(|| compile_skill_regex(r#"(?i)([^\s"']*[\\/]scripts[\\/][^\s"']+)"#))
+        .get_or_init(|| {
+            compile_skill_regex(
+                r#"(?i)(?:^|[\s"'`=])((?:[^\s"'`]*[\\/])?skills[\\/](?:[^\s"'`\\/]+[\\/])*?([^\s"'`\\/]+)[\\/]scripts[\\/][^\s"'`]+)"#,
+            )
+        })
         .as_ref()?;
     for candidate in string_candidates(args) {
-        if let Some(path) = skill_path
-            .captures(&candidate)
-            .and_then(|capture| capture.get(1))
-            .map(|capture| capture.as_str().to_string())
-        {
-            let normalized = path.replace('\\', "/");
-            let name = Path::new(&normalized)
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|value| value.to_str())
-                .map(str::to_string);
-            return Some(SkillLoad {
-                name,
-                path: Some(path),
-            });
+        if let Some(load) = skill_md_paths(&candidate).next() {
+            return Some(load);
         }
-        if let Some(path) = script_path
-            .captures(&candidate)
-            .and_then(|capture| capture.get(1))
-            .map(|capture| capture.as_str().to_string())
-        {
-            let normalized = path.replace('\\', "/");
-            let name = Path::new(&normalized)
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .and_then(|value| value.to_str())
-                .map(str::to_string);
+        if let Some(capture) = script_path.captures(&candidate) {
+            let (Some(path), Some(name)) = (capture.get(1), capture.get(2)) else {
+                continue;
+            };
+            if !is_skill_name(name.as_str()) {
+                continue;
+            }
             return Some(SkillLoad {
-                name,
-                path: Some(path),
+                name: Some(name.as_str().to_string()),
+                path: Some(path.as_str().to_string()),
             });
         }
     }
@@ -1935,17 +1926,14 @@ fn permission_info(args: Option<&Value>) -> Option<Value> {
     Some(Value::Object(permission))
 }
 
+/// Skills the prompt text itself names: `/skills name`, `skill://name`,
+/// `UserInput::Skill(..)`, or a `…/<name>/SKILL.md` path.
 fn explicit_skill_names(text: &str) -> Vec<String> {
     static EXPLICIT_SKILLS: OnceLock<Vec<Option<Regex>>> = OnceLock::new();
-    static SKILL_XML: OnceLock<Option<Regex>> = OnceLock::new();
-    static SKILL_XML_NAME: OnceLock<Option<Regex>> = OnceLock::new();
-    static SKILL_FRONTMATTER_NAME: OnceLock<Option<Regex>> = OnceLock::new();
     let patterns = EXPLICIT_SKILLS.get_or_init(|| {
         [
-            r#"\$([A-Za-z0-9_.:-]+)"#,
             r#"(?:^|\s)/skills\s+([A-Za-z0-9_.:-]+)"#,
             r#"skill://([A-Za-z0-9_.:-]+)"#,
-            r#"(?i)(?:^|[\s"'])([^\s"']*SKILL\.md)(?:$|[\s"'])"#,
             r#"UserInput::Skill\([^)]*(?:name|skill|id)\s*[:=]\s*["']?([A-Za-z0-9_.:-]+)"#,
         ]
         .into_iter()
@@ -1953,66 +1941,63 @@ fn explicit_skill_names(text: &str) -> Vec<String> {
         .collect()
     });
     let mut names = Vec::new();
-    for (index, pattern) in patterns.iter().enumerate() {
-        let Some(pattern) = pattern else { continue };
+    for pattern in patterns.iter().flatten() {
         for capture in pattern.captures_iter(text) {
-            let Some(value) = capture.get(1).map(|capture| capture.as_str()) else {
-                continue;
-            };
-            let name = if index == 3 {
-                let normalized = value.replace('\\', "/");
-                Path::new(&normalized)
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(|value| value.to_str())
-                    .unwrap_or(value)
-                    .to_string()
-            } else {
-                value
-                    .trim()
-                    .trim_start_matches('$')
-                    .trim_end_matches([',', ')', '.', ';'])
-                    .to_string()
-            };
-            if !name.is_empty() && !names.contains(&name) {
-                names.push(name);
+            if let Some(value) = capture.get(1) {
+                push_unique(&mut names, value.as_str().trim_end_matches('.').to_string());
             }
         }
     }
-    let Some(xml) = SKILL_XML
-        .get_or_init(|| compile_skill_regex(r#"(?is)<skill\b([^>]*)>(.*?)</skill>"#))
+    for name in prompt_skill_names(text) {
+        push_unique(&mut names, name);
+    }
+    names
+}
+
+/// Skill names in Codex's injected `<skill>` rows:
+/// `<skill>\n<name>x</name>\n<path>…</path>\n---\nname: x\n…</skill>`.
+/// The `<name>` element is preferred; a `name`/`id` attribute or the skill's
+/// frontmatter `name:` covers other row shapes.
+fn injected_skill_names(text: &str) -> Vec<String> {
+    static ROW: OnceLock<Option<Regex>> = OnceLock::new();
+    static NAME: OnceLock<Vec<Option<Regex>>> = OnceLock::new();
+    let Some(row) = ROW
+        .get_or_init(|| compile_skill_regex(r#"(?is)<skill\b([^>]*)>(.*?)(?:</skill>|$)"#))
         .as_ref()
     else {
-        return names;
+        return Vec::new();
     };
-    let Some(attr_name) = SKILL_XML_NAME
-        .get_or_init(|| compile_skill_regex(r#"(?:name|id)=["']([^"']+)["']"#))
-        .as_ref()
+    let [element, attribute, frontmatter] = NAME
+        .get_or_init(|| {
+            [
+                r#"^\s*<name>\s*([^<\s]+)\s*</name>"#,
+                r#"(?:name|id)=["']([^"']+)["']"#,
+                r#"(?m)^name:\s*([A-Za-z0-9_.:-]+)"#,
+            ]
+            .into_iter()
+            .map(compile_skill_regex)
+            .collect()
+        })
+        .as_slice()
     else {
-        return names;
+        return Vec::new();
     };
-    let Some(frontmatter_name) = SKILL_FRONTMATTER_NAME
-        .get_or_init(|| compile_skill_regex(r#"(?m)(?:^|\n)name:\s*([A-Za-z0-9_.:-]+)"#))
-        .as_ref()
-    else {
-        return names;
-    };
-    for capture in xml.captures_iter(text) {
-        let candidate = capture
+    let first = |pattern: &Option<Regex>, text: &str| {
+        pattern
+            .as_ref()?
+            .captures(text)?
             .get(1)
-            .and_then(|attrs| attr_name.captures(attrs.as_str()))
-            .and_then(|capture| capture.get(1))
-            .or_else(|| {
-                capture
-                    .get(2)
-                    .and_then(|body| frontmatter_name.captures(body.as_str()))
-                    .and_then(|capture| capture.get(1))
-            })
-            .map(|capture| capture.as_str().to_string());
-        if let Some(name) = candidate {
-            if !name.is_empty() && !names.contains(&name) {
-                names.push(name);
-            }
+            .map(|name| name.as_str().to_string())
+    };
+    let mut names = Vec::new();
+    for capture in row.captures_iter(text) {
+        let attrs = capture.get(1).map_or("", |attrs| attrs.as_str());
+        let body = capture.get(2).map_or("", |body| body.as_str());
+        let name = first(element, body)
+            .or_else(|| first(attribute, attrs))
+            .or_else(|| first(frontmatter, body));
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            push_unique(&mut names, name);
         }
     }
     names

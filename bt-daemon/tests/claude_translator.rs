@@ -1232,7 +1232,7 @@ fn claude_unfinished_tools_are_cancelled_at_explicit_boundaries() {
 }
 
 #[test]
-fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
+fn claude_pairs_tool_lifecycle_and_records_stop_failures() {
     let registry = Registry::default_agents();
     let mut translator = registry.create("claude-code", "lifecycle");
     let ctx = SessionCtx {
@@ -1277,10 +1277,6 @@ fn claude_pairs_tool_lifecycle_and_marks_explicit_skills_and_stop_failures() {
     assert_eq!(skill.start_ms, Some(20));
     assert_eq!(skill.end_ms, Some(30));
     assert_eq!(skill.error, None);
-    assert_eq!(
-        skill.metadata.as_ref().unwrap()["skill_load_trigger"],
-        json!("explicit")
-    );
     let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
     assert_eq!(
         turn.error.as_deref(),
@@ -2757,4 +2753,144 @@ fn claude_root_records_the_last_completed_turn_output() {
         None,
         "a session with no completed turn has no outcome to record"
     );
+}
+
+#[test]
+fn claude_marks_only_requested_skill_loads_explicit() {
+    let mut translator = Registry::default_agents().create("claude-code", "skills");
+    let ctx = SessionCtx {
+        session_id: "skills".into(),
+        config: None,
+    };
+    let prompt =
+        "Read the skill instructions at docs/.agents/skills/docs-gap/SKILL.md and follow them.";
+    let mut ops = Vec::new();
+    for (name, ts, payload) in [
+        (
+            "UserPromptExpansion",
+            5,
+            json!({"expansion_type": "slash_command", "skill_name": "review"}),
+        ),
+        ("UserPromptSubmit", 10, json!({"prompt": prompt})),
+        (
+            "PreToolUse",
+            20,
+            json!({"tool_name": "Read", "tool_use_id": "read-skill",
+                   "tool_input": {"file_path": "/repo/docs/.agents/skills/docs-gap/SKILL.md"}}),
+        ),
+        (
+            "PreToolUse",
+            30,
+            json!({"tool_name": "Skill", "tool_use_id": "requested", "tool_input": {"skill": "review"}}),
+        ),
+        (
+            "PreToolUse",
+            40,
+            json!({"tool_name": "Skill", "tool_use_id": "chosen", "tool_input": {"skill": "simplify"}}),
+        ),
+        (
+            "PreToolUse",
+            50,
+            json!({"tool_name": "Bash", "tool_use_id": "cat-skill",
+                   "tool_input": {"command": "cat ~/.claude/skills/deploy/SKILL.md"}}),
+        ),
+        (
+            "PreToolUse",
+            60,
+            json!({"tool_name": "Bash", "tool_use_id": "find-skills",
+                   "tool_input": {"command": "find . -name SKILL.md"}}),
+        ),
+        ("Stop", 70, json!({})),
+        // Requests end with their turn: the same skill later is model-chosen.
+        ("UserPromptSubmit", 80, json!({"prompt": "again"})),
+        (
+            "PreToolUse",
+            90,
+            json!({"tool_name": "Skill", "tool_use_id": "later", "tool_input": {"skill": "review"}}),
+        ),
+        ("Stop", 100, json!({})),
+    ] {
+        ops.extend(
+            translator
+                .handle(&claude_event("skills", name, ts, payload), &ctx)
+                .unwrap(),
+        );
+    }
+    let rows = reduce(ops);
+    let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["loaded_skill_names"],
+        json!(["review", "docs-gap"])
+    );
+
+    let read = tool_span(&rows, "read-skill");
+    assert_eq!(read.name, "skill: docs-gap");
+    let metadata = read.metadata.as_ref().unwrap();
+    assert_eq!(metadata["tool_kind"], json!("skill"));
+    assert_eq!(metadata["skill_name"], json!("docs-gap"));
+    assert_eq!(
+        metadata["skill_path"],
+        json!("/repo/docs/.agents/skills/docs-gap/SKILL.md")
+    );
+    assert_eq!(metadata["skill_load_trigger"], json!("explicit"));
+
+    let requested = tool_span(&rows, "requested").metadata.as_ref().unwrap();
+    assert_eq!(requested["skill_load_trigger"], json!("explicit"));
+
+    let chosen = tool_span(&rows, "chosen").metadata.as_ref().unwrap();
+    assert_eq!(chosen["skill_name"], json!("simplify"));
+    assert!(chosen.get("skill_load_trigger").is_none());
+
+    let cat = tool_span(&rows, "cat-skill");
+    assert_eq!(cat.name, "skill: deploy");
+    let metadata = cat.metadata.as_ref().unwrap();
+    assert_eq!(metadata["tool_kind"], json!("skill"));
+    assert!(metadata.get("skill_load_trigger").is_none());
+
+    let later = tool_span(&rows, "later").metadata.as_ref().unwrap();
+    assert!(later.get("skill_load_trigger").is_none());
+
+    let find = tool_span(&rows, "find-skills");
+    assert!(find.metadata.as_ref().unwrap().get("tool_kind").is_none());
+}
+
+#[test]
+fn claude_expansion_before_submit_reaches_the_incoming_turn_while_another_is_open() {
+    let mut translator = Registry::default_agents().create("claude-code", "steer");
+    let ctx = SessionCtx {
+        session_id: "steer".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for (name, ts, payload) in [
+        ("UserPromptSubmit", 10, json!({"prompt": "first"})),
+        // No Stop: the user sends a `/review` prompt while turn 1 is active,
+        // and Claude reports the expansion before the prompt it belongs to.
+        (
+            "UserPromptExpansion",
+            20,
+            json!({"expansion_type": "slash_command", "skill_name": "review"}),
+        ),
+        ("UserPromptSubmit", 30, json!({"prompt": "/review"})),
+        (
+            "PreToolUse",
+            40,
+            json!({"tool_name": "Skill", "tool_use_id": "review", "tool_input": {"skill": "review"}}),
+        ),
+        ("Stop", 50, json!({})),
+    ] {
+        ops.extend(
+            translator
+                .handle(&claude_event("steer", name, ts, payload), &ctx)
+                .unwrap(),
+        );
+    }
+    let rows = reduce(ops);
+    let turn = rows.values().find(|row| row.name == "Turn 2").unwrap();
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["loaded_skill_names"],
+        json!(["review"])
+    );
+    let skill = tool_span(&rows, "review").metadata.as_ref().unwrap();
+    assert_eq!(skill["skill_load_trigger"], json!("explicit"));
 }

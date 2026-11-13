@@ -8,7 +8,10 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
-use super::tool::{add_tool_approval, explicit_skill_metadata, nonempty_error_text, ToolApproval};
+use super::tool::{
+    add_tool_approval, explicit_skill_metadata, insert_skill_metadata, nonempty_error_text,
+    prompt_skill_names, push_unique, skill_file_load, skill_md_paths, SkillLoad, ToolApproval,
+};
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
@@ -297,7 +300,11 @@ struct ClaudeTranslator {
     pending_tools: HashMap<String, PendingTool>,
     subagents: HashMap<String, Subagent>,
     subagent_handbacks: HashMap<String, Value>,
-    pending_skills: Vec<String>,
+    /// Skills the user asked for on the current (or next) turn: `/skill`
+    /// expansions and `SKILL.md` paths named in the prompt. Cleared when a
+    /// turn stops, so a turn that ends without a Stop hands its skills to the
+    /// next one. Skill loads outside this list were the model's choice.
+    requested_skills: Vec<String>,
     pending_emission: Option<PendingEmission>,
     claude_version: Option<String>,
     claude_version_logged: bool,
@@ -349,7 +356,7 @@ impl ClaudeTranslator {
             pending_tools: HashMap::new(),
             subagents: HashMap::new(),
             subagent_handbacks: HashMap::new(),
-            pending_skills: Vec::new(),
+            requested_skills: Vec::new(),
             pending_emission: None,
             claude_version: None,
             claude_version_logged: false,
@@ -531,10 +538,20 @@ impl ClaudeTranslator {
                 format!("Turn {}", self.turn_count),
             )
         };
-        let mut metadata = explicit_skill_metadata(&self.pending_skills)
+        // A prompt that points the model at a skill file ("Read the skill
+        // instructions at docs/.agents/skills/x/SKILL.md") requests that skill
+        // as directly as a `/x` slash command. Continuations are runtime
+        // notifications, not user requests.
+        if continuation.is_none() {
+            if let Some(prompt) = event.payload.get("prompt").and_then(Value::as_str) {
+                for name in prompt_skill_names(prompt) {
+                    push_unique(&mut self.requested_skills, name);
+                }
+            }
+        }
+        let mut metadata = explicit_skill_metadata(&self.requested_skills)
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
-        self.pending_skills.clear();
         if let Some(permission_mode) = &self.permission_mode {
             metadata.insert("permission_mode".into(), json!(permission_mode));
         }
@@ -678,15 +695,13 @@ impl ClaudeTranslator {
         let Some(name) = name.filter(|name| !name.is_empty()) else {
             return;
         };
-        if !self.pending_skills.contains(&name) {
-            self.pending_skills.push(name);
-        }
+        push_unique(&mut self.requested_skills, name);
         if let Some(turn) = &self.turn {
             ops.push(SpanOp::Merge(SpanRow {
                 span_id: turn.id.clone(),
                 root_span_id: self.root_span_id.clone(),
                 parent_span_ids: vec![turn.parent_id.clone()],
-                metadata: explicit_skill_metadata(&self.pending_skills),
+                metadata: explicit_skill_metadata(&self.requested_skills),
                 ..Default::default()
             }));
         }
@@ -778,7 +793,15 @@ impl ClaudeTranslator {
         // PreToolUse only proves that Claude proposed a call. Approval is
         // recorded once a terminal hook or transcript result proves whether
         // the call executed or was denied.
-        let mut metadata = tool_metadata(event, &tool_name, &call_id, None, &input);
+        let skill = skill_load(&tool_name, &input);
+        let mut metadata = tool_metadata(
+            event,
+            &tool_name,
+            &call_id,
+            None,
+            skill.as_ref(),
+            &self.requested_skills,
+        );
         let span_type = if tool_name == "AskUserQuestion" {
             if let Some(fields) = metadata.as_object_mut() {
                 fields.insert("wait_kind".into(), json!("user_question"));
@@ -791,7 +814,7 @@ impl ClaudeTranslator {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: vec![parent_id.clone()],
-            name: tool_span_name(&tool_name, &input),
+            name: tool_span_name(&tool_name, &input, skill.as_ref()),
             span_type,
             start_ms: Some(event.ts_ms),
             input: Some(input.clone()),
@@ -835,7 +858,15 @@ impl ClaudeTranslator {
                 self.subagent_handbacks.insert(agent_id, message.clone());
             }
         }
-        let mut metadata = tool_metadata(event, &tool_name, &call_id, Some(approval), &input);
+        let skill = skill_load(&tool_name, &input);
+        let mut metadata = tool_metadata(
+            event,
+            &tool_name,
+            &call_id,
+            Some(approval),
+            skill.as_ref(),
+            &self.requested_skills,
+        );
         let duration = event.payload.get("duration_ms").and_then(Value::as_i64);
         if let Some(duration) = duration {
             metadata["native_duration_ms"] = json!(duration);
@@ -853,7 +884,7 @@ impl ClaudeTranslator {
                 root_span_id: self.root_span_id.clone(),
                 parent_span_ids: vec![pending.parent_id],
                 name: if rewritten {
-                    tool_span_name(&tool_name, &input)
+                    tool_span_name(&tool_name, &input, skill.as_ref())
                 } else {
                     String::new()
                 },
@@ -881,7 +912,7 @@ impl ClaudeTranslator {
                 root_span_id: self.root_span_id.clone(),
                 turn_span_id: self.owner_of(&parent_id),
                 parent_span_ids: vec![parent_id],
-                name: tool_span_name(&tool_name, &input),
+                name: tool_span_name(&tool_name, &input, skill.as_ref()),
                 span_type,
                 start_ms: Some(event.ts_ms.saturating_sub(duration.unwrap_or(0))),
                 end_ms: Some(event.ts_ms),
@@ -1051,7 +1082,7 @@ impl ClaudeTranslator {
         self.user_turn_ends = RecentMap::default();
         self.last_user_turn_id = None;
         self.pending_tools.clear();
-        self.pending_skills.clear();
+        self.requested_skills.clear();
         self.emitted_requests.clear();
         self.emitted_tools.clear();
         self.prompt_turns = RecentMap::default();
@@ -1270,7 +1301,7 @@ impl ClaudeTranslator {
         self.last_turn_cwd = turn.cwd;
         self.last_user_turn_id = turn.user_turn_id;
         self.last_turn_id = Some(turn_id);
-        self.pending_skills.clear();
+        self.requested_skills.clear();
     }
 
     fn close_pending_tools(
@@ -2228,7 +2259,11 @@ impl TranscriptTool {
             span_id,
             root_span_id,
             parent_span_ids: vec![parent],
-            name: tool_span_name(&self.tool_name, &self.input),
+            name: tool_span_name(
+                &self.tool_name,
+                &self.input,
+                skill_load(&self.tool_name, &self.input).as_ref(),
+            ),
             span_type: SpanType::Tool,
             start_ms: Some(self.start_ms),
             end_ms: Some(self.end_ms),
@@ -2428,7 +2463,8 @@ fn tool_metadata(
     tool_name: &str,
     call_id: &str,
     approval: Option<ToolApproval>,
-    input: &Value,
+    skill: Option<&SkillLoad>,
+    requested_skills: &[String],
 ) -> Value {
     let mut metadata = Map::new();
     metadata.insert("tool_name".into(), json!(tool_name));
@@ -2449,15 +2485,28 @@ fn tool_metadata(
             metadata.insert(target.into(), json!(value));
         }
     }
-    if tool_name == "Skill" {
-        let skill_name = ["name", "skill", "skill_name", "skillName"]
-            .iter()
-            .find_map(|key| string_field(input, key));
-        metadata.insert("tool_kind".into(), json!("skill"));
-        metadata.insert("skill_name".into(), json!(skill_name));
-        metadata.insert("skill_load_trigger".into(), json!("explicit"));
+    if let Some(skill) = skill {
+        insert_skill_metadata(&mut metadata, skill, requested_skills);
     }
     Value::Object(metadata)
+}
+
+/// Claude loads a skill through the `Skill` tool, or by reading its `SKILL.md`
+/// directly when a prompt or instruction points at the file.
+fn skill_load(tool_name: &str, input: &Value) -> Option<SkillLoad> {
+    let text = |key: &str| input.get(key).and_then(Value::as_str);
+    match tool_name {
+        "Skill" => Some(SkillLoad {
+            name: ["skill", "name", "skill_name", "skillName"]
+                .iter()
+                .find_map(|key| text(key).filter(|name| !name.is_empty()))
+                .map(normalize_skill_name),
+            path: None,
+        }),
+        "Read" => skill_file_load(text("file_path").or_else(|| text("path"))?),
+        "Bash" => skill_md_paths(text("command")?).next(),
+        _ => None,
+    }
 }
 
 fn raw_tool_input(payload: &Value) -> Option<&Value> {
@@ -2563,12 +2612,14 @@ fn command_output(cwd: &str, command: &str, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn tool_span_name(tool: &str, input: &Value) -> String {
+fn tool_span_name(tool: &str, input: &Value, skill: Option<&SkillLoad>) -> String {
+    if let Some(skill) = skill {
+        return skill
+            .name
+            .as_ref()
+            .map_or_else(|| "skill".into(), |name| format!("skill: {name}"));
+    }
     match tool {
-        "Skill" => string_field(input, "name")
-            .or_else(|| string_field(input, "skill"))
-            .map(|name| format!("skill: {name}"))
-            .unwrap_or_else(|| "skill".into()),
         "Read" | "Write" | "Edit" | "MultiEdit" => string_field(input, "file_path")
             .or_else(|| string_field(input, "path"))
             .map(|path| format!("{tool}: {}", basename(&path)))

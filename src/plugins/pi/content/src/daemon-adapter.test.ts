@@ -232,7 +232,8 @@ describe("Pi daemon adapter", () => {
     ]);
 
     await handlers.get("session_start")?.({ reason: "new" }, ctx);
-    await handlers.get("before_agent_start")?.({ prompt: "hello" }, ctx);
+    const images = [{ type: "image", data: "cG5n", mimeType: "image/png" }];
+    await handlers.get("before_agent_start")?.({ prompt: "hello", images }, ctx);
     await handlers.get("context")?.({ messages: [{ role: "user", content: "hello" }] }, ctx);
     await handlers.get("message_update")?.({
       type: "message_update",
@@ -296,6 +297,9 @@ describe("Pi daemon adapter", () => {
       model: { provider: "openai", id: "gpt-5" },
     });
     const streamingUpdates = mockState.logs.filter((log) => log.event === "message_update");
+    expect(mockState.logs.find((log) => log.event === "before_agent_start")?.payload).toMatchObject(
+      { event: { prompt: "hello", images } },
+    );
     expect(streamingUpdates).toHaveLength(2);
     expect(
       streamingUpdates.map(

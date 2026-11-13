@@ -24,6 +24,9 @@ use span_identity::{assert_merges_preserve_insert_identity, assert_turn_lineage}
 use std::collections::HashMap;
 use std::io::Write;
 
+/// The row Codex injects after resolving a `$review` mention.
+const REVIEW_SKILL_ROW: &str = "<skill>\n<name>review</name>\n<path>/home/u/.agents/skills/review/SKILL.md</path>\n---\nname: review\ndescription: Review code.\n---\n\n# Review\n</skill>";
+
 fn line(v: Value) -> String {
     serde_json::to_string(&v).unwrap()
 }
@@ -506,7 +509,7 @@ fn codex_trailing_injected_user_row_does_not_replace_hook_prompt() {
                 "payload": { "type": "user_message", "message": "fix the timestamps" } }),
         json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
                 "payload": { "type": "message", "role": "user",
-                             "content": [{ "type": "input_text", "text": "<skill>$review injected context</skill>" }] } }),
+                             "content": [{ "type": "input_text", "text": REVIEW_SKILL_ROW }] } }),
         json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
                 "payload": { "type": "task_complete", "turn_id": "t1" } }),
     ];
@@ -528,13 +531,14 @@ fn codex_trailing_injected_user_row_does_not_replace_hook_prompt() {
             .unwrap(),
     );
 
+    // The injected row records the skill Codex resolved, but never becomes
+    // the turn's prompt.
     let turn = find(&rows, SpanType::Task, "turn: t1");
     assert_eq!(turn.input, Some(json!("fix the timestamps")));
-    assert!(turn
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("loaded_skill_names"))
-        .is_none());
+    assert_eq!(
+        turn.metadata.as_ref().unwrap()["loaded_skill_names"],
+        json!(["review"])
+    );
 }
 
 #[test]
@@ -554,7 +558,7 @@ fn codex_native_prompt_ignores_surrounding_injected_user_rows() {
                              "content": [{ "type": "input_text", "text": "$review fix the timestamps" }] } }),
         json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item",
                 "payload": { "type": "message", "role": "user",
-                             "content": [{ "type": "input_text", "text": "<skill>$review injected after</skill>" }] } }),
+                             "content": [{ "type": "input_text", "text": REVIEW_SKILL_ROW }] } }),
         json!({ "timestamp": "2026-01-01T00:00:06Z", "type": "event_msg",
                 "payload": { "type": "task_complete", "turn_id": "t1" } }),
     ];
@@ -1100,6 +1104,9 @@ fn tool_and_llm_payloads_preserve_original_contract() {
         json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
                 "payload": { "type": "message", "role": "user",
                              "content": [{ "type": "input_text", "text": "$review inspect this" }] } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+                "payload": { "type": "message", "role": "user",
+                             "content": [{ "type": "input_text", "text": REVIEW_SKILL_ROW }] } }),
         json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "response_item",
                 "payload": { "type": "function_call", "call_id": "c1", "name": "exec_command",
                              "arguments": "{\"cmd\":\"cat /tmp/review/SKILL.md\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"Need access\",\"prefix_rule\":[\"cat\"]}",
@@ -1295,31 +1302,13 @@ fn exec_output(result: Value) -> Value {
 }
 
 fn translate_tool_output(name: &str, output: Value) -> SpanRow {
-    let tmp = tempfile::tempdir().unwrap();
-    let transcript = tmp.path().join("rollout.jsonl");
-    for record in [
+    let rows = translate_rollout(vec![
         json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"s","cwd":"/x/app"}}),
         json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}),
         json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":name,"call_id":"c1","input":"text(await tools.exec_command({cmd:'git commit'}));"}}),
         json!({"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":output}}),
         json!({"timestamp":"2026-01-01T00:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}),
-    ] {
-        append(&transcript, record);
-    }
-    let mut translator = Registry::default_agents().create("codex", "s");
-    let ctx = SessionCtx {
-        session_id: "s".into(),
-        config: None,
-    };
-    let mut ops = translator
-        .handle(
-            &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
-            &ctx,
-        )
-        .unwrap();
-    ops.extend(translator.flush(&ctx).unwrap());
-    assert_merges_preserve_insert_identity(&ops);
-    let rows = reduce(ops);
+    ]);
     find(&rows, SpanType::Tool, name).clone()
 }
 
@@ -2413,4 +2402,106 @@ fn codex_steering_and_interleaved_tools_replay_deterministically() {
             .count(),
         3
     );
+}
+
+fn translate_rollout(records: Vec<Value>) -> HashMap<String, SpanRow> {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    for record in records {
+        append(&transcript, record);
+    }
+    let mut translator = Registry::default_agents().create("codex", "s");
+    let ctx = SessionCtx {
+        session_id: "s".into(),
+        config: None,
+    };
+    let mut ops = translator
+        .handle(
+            &envelope("s", "SessionStart", transcript.to_str().unwrap(), json!({})),
+            &ctx,
+        )
+        .unwrap();
+    ops.extend(translator.flush(&ctx).unwrap());
+    assert_merges_preserve_insert_identity(&ops);
+    reduce(ops)
+}
+
+fn prompt_records(prompt: &str) -> Vec<Value> {
+    vec![
+        json!({ "timestamp": "2026-01-01T00:00:01Z", "type": "session_meta",
+                "payload": { "id": "s", "cwd": "/x/app" } }),
+        json!({ "timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "t1" } }),
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+                "payload": { "type": "user_message", "message": prompt } }),
+        json!({ "timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "t1" } }),
+    ]
+}
+
+fn loaded_skill_names(rows: &HashMap<String, SpanRow>) -> Value {
+    find(rows, SpanType::Task, "turn: t1")
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("loaded_skill_names"))
+        .cloned()
+        .unwrap_or(json!([]))
+}
+
+#[test]
+fn codex_explicit_skills_come_from_injected_skill_rows() {
+    // Shell variables and an unresolved `$review` are just prompt text: only
+    // the `<skill>` row Codex injects on resolving a mention requests a skill.
+    let prompt = "$review this, then run `cd $base && ls` and check $HOME and $CODEX_HOME/skills";
+    let rows = translate_rollout(prompt_records(prompt));
+    assert_eq!(loaded_skill_names(&rows), json!([]));
+
+    let mut records = prompt_records(prompt);
+    let complete = records.pop().unwrap();
+    records.push(
+        json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+        "payload": { "type": "message", "role": "user",
+                     "content": [{ "type": "input_text", "text": REVIEW_SKILL_ROW }] } }),
+    );
+    records.push(complete);
+    let rows = translate_rollout(records);
+    assert_eq!(loaded_skill_names(&rows), json!(["review"]));
+}
+
+#[test]
+fn codex_script_paths_are_skills_only_inside_a_skill_directory() {
+    let mut records = prompt_records("run the scripts");
+    let complete = records.pop().unwrap();
+    for (index, command) in [
+        "bash runtime/scripts/build.sh",
+        "python3 tools/scripts/scripts/gen.py",
+        "python3 agent_runtime/scripts/run.py",
+        "python3 /home/u/.codex/skills/.system/skill-creator/scripts/init_skill.py demo",
+        "cd /repo && bash .agents/skills/release/scripts/publish.sh",
+        "find . -name SKILL.md",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        records.push(
+            json!({ "timestamp": "2026-01-01T00:00:04Z", "type": "response_item",
+            "payload": { "type": "function_call", "call_id": format!("c{index}"),
+                         "name": "exec_command",
+                         "arguments": json!({ "cmd": command }).to_string(),
+                         "metadata": { "turn_id": "t1" } } }),
+        );
+    }
+    records.push(complete);
+    let rows = translate_rollout(records);
+    let mut skills: Vec<_> = rows
+        .values()
+        .filter(|row| row.span_type == SpanType::Tool)
+        .filter_map(|row| {
+            let metadata = row.metadata.as_ref()?;
+            (metadata.get("tool_kind") == Some(&json!("skill")))
+                .then(|| metadata["skill_name"].as_str().unwrap().to_string())
+        })
+        .collect();
+    skills.sort();
+    assert_eq!(skills, vec!["release", "skill-creator"]);
 }

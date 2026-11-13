@@ -3,7 +3,10 @@
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
-use super::tool::{error_text, with_tool_approval, ToolApproval};
+use super::tool::{
+    error_text, insert_skill_metadata, prompt_skill_names, push_unique, skill_file_load,
+    skill_md_paths, with_tool_approval, SkillLoad, ToolApproval,
+};
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
@@ -440,6 +443,9 @@ struct NativeSession {
     owner_turn_span_id: Option<String>,
     root_idle: bool,
     current_turn_span_id: Option<String>,
+    /// Skills the current turn's prompt requested. Skill loads outside this
+    /// list were the model's choice.
+    requested_skills: Vec<String>,
     turn_number: u32,
     tool_call_count: u32,
     current_input: Option<String>,
@@ -874,7 +880,8 @@ impl OpenCodeTranslator {
             .pointer("/input/model/modelID")
             .or_else(|| event.payload.pointer("/model/modelID"))
             .and_then(Value::as_str);
-        let skills = explicit_skills(&input);
+        let skills = requested_skills(&input);
+        state.requested_skills = skills.clone();
         ops.push(SpanOp::Insert(SpanRow {
             span_id: turn_id.clone(),
             root_span_id: state.effective_root_span_id.clone(),
@@ -1156,12 +1163,17 @@ impl OpenCodeTranslator {
                 s.tool_args.insert(call.clone(), args);
             }
             s.tool_names.insert(call.clone(), tool.clone());
+            let name = s
+                .tool_args
+                .get(&call)
+                .and_then(|args| skill_load(&tool, args))
+                .map_or_else(|| tool.clone(), |skill| skill_span_name(&skill));
             return vec![SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
                 root_span_id: s.effective_root_span_id.clone(),
                 turn_span_id: s.turn_owner(),
                 parent_span_ids: vec![turn],
-                name: tool.clone(),
+                name,
                 span_type: SpanType::Tool,
                 start_ms: Some(ts_ms),
                 input: s.tool_args.get(&call).cloned(),
@@ -1204,12 +1216,9 @@ impl OpenCodeTranslator {
             .or(event.output);
         let error = s.tool_errors.remove(&call);
         let args = s.tool_args.remove(&call);
-        let name = if tool == "skill" {
-            args.as_ref()
-                .and_then(|v| v.get("name"))
-                .and_then(Value::as_str)
-                .map(|n| format!("skill: {n}"))
-                .unwrap_or_else(|| "skill".into())
+        let skill = args.as_ref().and_then(|args| skill_load(&tool, args));
+        let name = if let Some(skill) = &skill {
+            skill_span_name(skill)
         } else {
             event
                 .result
@@ -1222,13 +1231,8 @@ impl OpenCodeTranslator {
             json!({"tool_name":tool,"call_id":call}),
             Some(ToolApproval::Approved),
         );
-        if tool == "skill" {
-            metadata["tool_kind"] = json!("skill");
-            metadata["skill_name"] = args
-                .as_ref()
-                .and_then(|v| v.get("name"))
-                .cloned()
-                .unwrap_or(Value::Null)
+        if let (Some(skill), Some(fields)) = (&skill, metadata.as_object_mut()) {
+            insert_skill_metadata(fields, skill, &s.requested_skills);
         }
         let had_start = s.tool_starts.contains_key(&call);
         let parent_span_id = s.tool_parent_span_ids.remove(&call).unwrap_or(turn);
@@ -1555,17 +1559,45 @@ fn subagent_name(title: &str) -> String {
     let agent = tail.strip_suffix(" subagent)").unwrap_or(tail);
     format!("{agent}: {description}")
 }
-fn explicit_skills(input: &str) -> Vec<String> {
-    input
+/// Skills an OpenCode prompt requests: `/skills:name` mentions and `SKILL.md`
+/// paths named in the prompt.
+pub(super) fn requested_skills(input: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mentions = input
         .split_whitespace()
         .filter_map(|s| {
             s.strip_prefix("/skills:")
                 .or_else(|| s.strip_prefix("/skills"))
         })
-        .map(|s| {
-            s.trim_matches(|c: char| matches!(c, ',' | ')' | '.' | ';'))
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
-        .collect()
+        .map(|s| s.trim_matches(|c: char| matches!(c, ',' | ')' | '.' | ';')))
+        .filter(|s| !s.is_empty());
+    for name in mentions {
+        push_unique(&mut names, name.to_string());
+    }
+    for name in prompt_skill_names(input) {
+        push_unique(&mut names, name);
+    }
+    names
+}
+
+fn skill_span_name(skill: &SkillLoad) -> String {
+    skill
+        .name
+        .as_ref()
+        .map_or_else(|| "skill".into(), |name| format!("skill: {name}"))
+}
+
+/// OpenCode loads a skill through its `skill` tool, or by reading the skill's
+/// `SKILL.md` directly with `read` or `bash`.
+pub(super) fn skill_load(tool: &str, args: &Value) -> Option<SkillLoad> {
+    let text = |key: &str| args.get(key).and_then(Value::as_str);
+    match tool {
+        "skill" => Some(SkillLoad {
+            name: text("name").map(str::to_owned),
+            path: None,
+        }),
+        "read" => skill_file_load(text("filePath").or_else(|| text("path"))?),
+        "bash" => skill_md_paths(text("command")?).next(),
+        _ => None,
+    }
 }

@@ -3,7 +3,8 @@
 
 use super::git::GitMetadataCache;
 use super::tool::{
-    error_text, explicit_skill_metadata, with_tool_approval, without_nulls, ToolApproval,
+    error_text, explicit_skill_metadata, insert_skill_metadata, skill_file_load,
+    with_tool_approval, without_nulls, SkillLoad, ToolApproval,
 };
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -58,6 +59,16 @@ struct BeforeAgentStart {
     prompt: Option<Value>,
     #[serde(default)]
     message: Option<Value>,
+    #[serde(default)]
+    images: Option<Vec<PromptImage>>,
+}
+
+/// Pi's before_agent_start images contain base64 data, separate from the prompt.
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptImage {
+    data: String,
+    mime_type: String,
 }
 
 /// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
@@ -669,6 +680,24 @@ impl PiTranslator {
         let id = ids::span_id(&self.session_id, &format!("turn:{}", self.turn_seq));
         let input = event.prompt.or(event.message).unwrap_or(Value::Null);
         let skills = input.as_str().map(explicit_skills).unwrap_or_default();
+        let images = event.images.unwrap_or_default();
+        let input = if images.is_empty() {
+            input
+        } else {
+            let mut content = match input {
+                Value::String(text) if text.is_empty() => Vec::new(),
+                Value::String(text) => vec![json!({"type":"text","text":text})],
+                Value::Array(parts) => parts,
+                Value::Null => Vec::new(),
+                other => vec![other],
+            };
+            content.extend(images.into_iter().map(|image| {
+                json!({"type":"image_url","image_url":{"url":format!(
+                    "data:{};base64,{}", image.mime_type, image.data
+                )}})
+            }));
+            Value::Array(content)
+        };
         let mut metadata = without_nulls(json!({
             "turn_number": self.turn_seq,
             "thinking_level": self.thinking_level,
@@ -906,11 +935,13 @@ impl PiTranslator {
         let skill = skill_from_read(&tracked.name, &tracked.args);
         let name = skill
             .as_ref()
-            .map(|skill| format!("skill: {}", skill.name))
+            .and_then(|skill| skill.name.as_ref())
+            .map(|name| format!("skill: {name}"))
             .unwrap_or_else(|| tracked.name.clone());
-        let explicit = skill
-            .as_ref()
-            .is_some_and(|skill| requested_skills.contains(&skill.name));
+        let mut skill_metadata = serde_json::Map::new();
+        if let Some(skill) = &skill {
+            insert_skill_metadata(&mut skill_metadata, skill, requested_skills);
+        }
         let row = SpanRow {
             span_id: self.tool_span_id(&call),
             root_span_id: self.effective_root_span_id.clone(),
@@ -926,12 +957,7 @@ impl PiTranslator {
                 &tracked.name,
                 &call,
                 tracked.parent_call.as_deref(),
-                json!({
-                    "tool_kind": skill.as_ref().map(|_| "skill"),
-                    "skill_name": skill.as_ref().map(|skill| &skill.name),
-                    "skill_path": skill.as_ref().map(|skill| &skill.path),
-                    "skill_load_trigger": explicit.then_some("explicit"),
-                }),
+                Value::Object(skill_metadata),
             )),
             error: failed.then(|| format_error(&tracked.name, event.result.as_ref())),
             ..Default::default()
@@ -1368,11 +1394,6 @@ fn normalize_assistant(message: &AssistantMessage) -> Value {
     }
     out
 }
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SkillLoad {
-    name: String,
-    path: String,
-}
 fn skill_from_read(tool: &str, args: &Value) -> Option<SkillLoad> {
     if tool != "read" {
         return None;
@@ -1382,14 +1403,7 @@ fn skill_from_read(tool: &str, args: &Value) -> Option<SkillLoad> {
         .or_else(|| args.get("filePath"))
         .or_else(|| args.get("file_path"))
         .and_then(Value::as_str)?;
-    if !path.to_ascii_lowercase().ends_with("/skill.md") {
-        return None;
-    }
-    let name = path.rsplit('/').nth(1)?.to_owned();
-    Some(SkillLoad {
-        name,
-        path: path.to_owned(),
-    })
+    skill_file_load(path)
 }
 fn explicit_skills(input: &str) -> Vec<String> {
     input

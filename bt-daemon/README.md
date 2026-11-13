@@ -262,8 +262,8 @@ cargo test --all-features --locked              # Include the standalone CLI
 cargo build --features cli --locked --bin bt-daemon
 ```
 
-CI runs the all-feature build, test suite, and Clippy on Linux, macOS, and
-Windows. The pipeline integration tests use Unix-domain sockets on Unix and
+CI runs the all-feature build and test suite on Linux, macOS, and Windows, and
+Clippy on Linux and Windows. The pipeline integration tests use Unix-domain sockets on Unix and
 real Windows named pipes on Windows. Real-agent tests are separate from the
 default suite; see the [test harness guide](tests/support/README.md).
 
