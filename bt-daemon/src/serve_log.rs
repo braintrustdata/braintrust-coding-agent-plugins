@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 /// the same size is kept.
 pub(crate) const DEFAULT_MAX_MB: u64 = 10;
 
-const MAX_MB_ENV: &str = "BT_TRACE_LOG_MAX_MB";
+pub(crate) const MAX_MB_ENV: &str = "BT_TRACE_LOG_MAX_MB";
 
 /// The configured limit in bytes. An unset, unparsable or zero value uses the
 /// default, so the log stays bounded.
 pub(crate) fn max_bytes() -> u64 {
-    limit(std::env::var(MAX_MB_ENV).ok().as_deref())
+    limit(crate::env::var(MAX_MB_ENV).as_deref())
 }
 
 fn limit(mb: Option<&str>) -> u64 {
