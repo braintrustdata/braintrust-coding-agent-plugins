@@ -16,7 +16,7 @@
     "url": "https://www.braintrust.dev/"
   },
   "homepage": "https://docs.braintrust.dev/integrations/developer-tools/mcp",
-  "repository": "https://github.com/braintrustdata/braintrust-coding-agent-plugins",
+  "repository": "https://github.com/braintrustdata/braintrust-antigravity-plugin",
   "license": "MIT",
   "keywords": ["braintrust", "evaluations", "observability", "mcp"]
 }
