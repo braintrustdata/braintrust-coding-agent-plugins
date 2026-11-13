@@ -998,7 +998,15 @@ async fn opencode_v2_subagent_is_nested() {
                 .split("sessionID=\"")
                 .nth(1)
                 .and_then(|s| s.split('"').next())
-                .expect("subagent session ID");
+                .or_else(|| {
+                    content
+                        .split("sessionID: ")
+                        .nth(1)
+                        .and_then(|s| s.split(')').next())
+                })
+                .unwrap_or_else(|| {
+                    panic!("subagent session ID missing from tool result: {content}")
+                });
             MockReply::response(OpenAiTurn::tool_call(
                 "subagent_resume",
                 "subagent",
