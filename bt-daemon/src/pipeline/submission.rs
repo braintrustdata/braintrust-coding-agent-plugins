@@ -54,6 +54,17 @@ impl std::error::Error for Failure {
 
 impl Failure {
     fn classify(cause: anyhow::Error) -> Self {
+        // Attachment API calls use the same route recovery policy as span delivery.
+        let cause = match cause.downcast::<reqwest::Error>() {
+            Ok(error) => match error.status() {
+                Some(status) => anyhow::Error::new(braintrust_sdk_rust::BraintrustError::Api {
+                    status: status.as_u16(),
+                    message: error.without_url().to_string(),
+                }),
+                None => anyhow::Error::new(error.without_url()),
+            },
+            Err(cause) => cause,
+        };
         let retry = match cause.downcast_ref::<braintrust_sdk_rust::BraintrustError>() {
             Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. }) => {
                 RetryCondition::Credentials

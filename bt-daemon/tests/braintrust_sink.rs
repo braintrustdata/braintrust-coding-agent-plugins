@@ -48,6 +48,7 @@ fn row(
     end: Option<i64>,
 ) -> SpanRow {
     SpanRow {
+        attachments: Vec::new(),
         span_id: span_id.into(),
         root_span_id: root.into(),
         parent_span_ids: parents.iter().map(|s| s.to_string()).collect(),
@@ -994,4 +995,68 @@ async fn permalink_is_absent_when_no_logs_url_can_be_built() {
         sink.flush().await.unwrap();
         assert_eq!(sink.permalink(), None, "{name} has no logs URL");
     }
+}
+
+#[tokio::test]
+async fn attachments_upload_before_span_and_failures_remain_retryable() {
+    let server = mock_backend().await;
+    let storage = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/attachment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"signedUrl":format!("{}/object", storage.uri()),"headers":{"x-test":"signed"}}),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/object"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&storage)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/attachment/status"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut sink = factory.create("session", "test").unwrap();
+    let mut config = session_config(&server.uri());
+    config.auth.org_id = Some("org-test".into());
+    sink.configure(&config);
+    let attachment = bt_daemon::attachments::Attachment::new(
+        "document.pdf".into(),
+        "application/pdf".into(),
+        b"pdf-bytes".to_vec(),
+    );
+    let mut span = row(
+        "attachment-span",
+        "attachment-span",
+        &[],
+        "Attachment",
+        SpanType::Task,
+        1,
+        Some(2),
+    );
+    span.input = Some(json!({"type":"_bt_attachment","digest":attachment.digest}));
+    span.attachments.push(attachment);
+    let op = SpanOp::Insert(span);
+    assert!(sink.emit(std::slice::from_ref(&op)).await.is_err());
+    assert!(logs3_rows(&server).await.is_empty());
+    storage.reset().await;
+    Mock::given(method("PUT"))
+        .and(path("/object"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&storage)
+        .await;
+    sink.emit(&[op]).await.unwrap();
+    sink.flush().await.unwrap();
+    let rows = logs3_rows(&server).await;
+    assert!(rows
+        .iter()
+        .any(|row| row["input"]["type"] == "braintrust_attachment"));
+    let requests = storage.received_requests().await.unwrap();
+    assert_eq!(requests[0].body, b"pdf-bytes");
+    assert!(!requests[0].headers.contains_key("authorization"));
+    assert_eq!(requests[0].headers["x-test"], "signed");
 }

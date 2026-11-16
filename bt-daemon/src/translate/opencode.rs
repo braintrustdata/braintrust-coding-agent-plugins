@@ -824,7 +824,11 @@ impl OpenCodeTranslator {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
+            .filter(|part| {
+                part.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "image_url" | "file"))
+            })
             .cloned()
             .collect::<Vec<_>>();
         let input_value = if images.is_empty() {
@@ -1492,14 +1496,17 @@ impl OpenCodeTranslator {
 fn tool_result_content(output: Value, attachments: Vec<ToolAttachment>) -> Value {
     let images = attachments
         .into_iter()
-        .filter(|attachment| {
-            attachment
+        .filter_map(|attachment| {
+            let url = attachment.url?;
+            let mime = attachment
                 .mime
-                .as_deref()
-                .is_some_and(|mime| mime.starts_with("image/"))
+                .unwrap_or_else(|| "application/octet-stream".into());
+            Some(if mime.starts_with("image/") {
+                json!({"type":"image_url","image_url":{"url":url}})
+            } else {
+                json!({"type":"file", "mime":mime, "url":url})
+            })
         })
-        .filter_map(|attachment| attachment.url)
-        .map(|url| json!({"type":"image_url","image_url":{"url":url}}))
         .collect::<Vec<_>>();
     if images.is_empty() {
         return output;

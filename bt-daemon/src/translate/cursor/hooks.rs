@@ -187,6 +187,8 @@ pub(crate) const IMPORT_STOP: &str = "_bt_importStop";
 #[derive(Deserialize)]
 pub(super) struct PromptHook {
     pub prompt: String,
+    #[serde(default)]
+    pub attachments: Vec<serde_json::Value>,
 }
 
 pub(super) enum ToolPhase {

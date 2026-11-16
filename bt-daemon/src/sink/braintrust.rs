@@ -353,6 +353,88 @@ impl BraintrustSink {
     }
 
     async fn emit_op(&mut self, op: &SpanOp) -> anyhow::Result<()> {
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+        let prepared;
+        let op = if row.attachments.is_empty() {
+            op
+        } else {
+            let creds = self
+                .creds
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing attachment credentials"))?;
+            let (api, _) = self
+                .urls
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing attachment backend"))?;
+            let http = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?;
+            let mut references = HashMap::new();
+            for attachment in &row.attachments {
+                let key = uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_URL,
+                    format!("{api}/{}/{}", creds.org_id, attachment.digest).as_bytes(),
+                )
+                .to_string();
+                let reference = json!({"type":"braintrust_attachment", "key":key, "filename":attachment.filename, "content_type":attachment.content_type});
+                let metadata: Value = http.post(format!("{}/attachment", api.trim_end_matches('/'))).bearer_auth(&creds.token).json(&json!({"key":key,"filename":attachment.filename,"content_type":attachment.content_type,"org_id":creds.org_id})).send().await?.error_for_status()?.json().await?;
+                let url = metadata
+                    .get("signedUrl")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("attachment response has no signed URL"))?;
+                let mut request = http.put(url);
+                if let Some(headers) = metadata.get("headers").and_then(Value::as_object) {
+                    for (name, value) in headers {
+                        let value = value
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("invalid attachment upload header"))?;
+                        request = request.header(name, value);
+                    }
+                }
+                if url.contains(".blob.core.windows.net/") {
+                    request = request.header("x-ms-blob-type", "BlockBlob");
+                }
+                // Object storage receives only signed-upload headers, never Braintrust credentials.
+                request
+                    .body(attachment.data.clone())
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("attachment object upload failed: {}", error.without_url())
+                    })?
+                    .error_for_status()
+                    .map_err(|error| {
+                        anyhow::anyhow!("attachment object upload failed: {}", error.without_url())
+                    })?;
+                http.post(format!("{}/attachment/status", api.trim_end_matches('/')))
+                    .bearer_auth(&creds.token)
+                    .json(
+                        &json!({"key":key,"org_id":creds.org_id,"status":{"upload_status":"done"}}),
+                    )
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                references.insert(attachment.digest.clone(), reference);
+            }
+            let mut row = row.clone();
+            for value in [&mut row.input, &mut row.output].into_iter().flatten() {
+                crate::attachments::materialize(value, &references);
+            }
+            let metadata = row.metadata.get_or_insert_with(|| json!({}));
+            if let Some(metadata) = metadata.as_object_mut() {
+                metadata.insert(
+                    "braintrust.attachments".into(),
+                    Value::Array(references.into_values().collect()),
+                );
+            }
+            row.attachments.clear();
+            prepared = match op {
+                SpanOp::Insert(_) => SpanOp::Insert(row),
+                SpanOp::Merge(_) => SpanOp::Merge(row),
+            };
+            &prepared
+        };
         let client = self.ensure_client().await?;
         match op {
             SpanOp::Insert(row) => self.update_open(&client.client, row)?,

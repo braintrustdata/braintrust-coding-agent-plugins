@@ -83,6 +83,8 @@ pub struct LateMergeVersion {
 /// subset every current plugin uses; extend as translators need more.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpanRow {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::attachments::Attachment>,
     pub span_id: String,
     pub root_span_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

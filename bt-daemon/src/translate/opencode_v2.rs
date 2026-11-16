@@ -247,6 +247,10 @@ impl OpenCodeV2Translator {
                     "data:{};base64,{}",
                     file.mime, file.data
                 )));
+            } else {
+                content.push(ContentPart::Dynamic(
+                    serde_json::json!({"type":"file", "mime":file.mime, "data":file.data}),
+                ));
             }
         }
         let input = if content.len() == 1 {

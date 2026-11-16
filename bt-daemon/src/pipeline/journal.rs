@@ -87,6 +87,45 @@ impl StoredOp<SpanOp> {
     }
 }
 
+fn store_attachments(db: &Connection, position: i64, value: &[u8]) -> anyhow::Result<()> {
+    let mut op = StoredOp::decode(value)?;
+    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut op;
+    for attachment in &mut row.attachments {
+        use sha2::Digest;
+        anyhow::ensure!(
+            format!("{:x}", sha2::Sha256::digest(&attachment.data)) == attachment.digest,
+            "attachment digest does not match captured bytes"
+        );
+        db.execute(
+            "INSERT OR IGNORE INTO attachment_blobs(digest,data,refs) VALUES (?,?,0)",
+            params![attachment.digest, attachment.data],
+        )?;
+        db.execute(
+            "INSERT OR IGNORE INTO operation_attachments(position,digest) VALUES (?,?)",
+            params![position, attachment.digest],
+        )?;
+        attachment.data.clear();
+    }
+    db.execute(
+        "UPDATE ops SET value=? WHERE position=?",
+        params![StoredOp::encode(&op)?, position],
+    )?;
+    Ok(())
+}
+
+fn load_attachments(db: &Connection, value: &[u8]) -> anyhow::Result<SpanOp> {
+    let mut op = StoredOp::decode(value)?;
+    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut op;
+    for attachment in &mut row.attachments {
+        attachment.data = db.query_row(
+            "SELECT data FROM attachment_blobs WHERE digest=?",
+            [&attachment.digest],
+            |r| r.get(0),
+        )?;
+    }
+    Ok(op)
+}
+
 /// Metadata needed to restore correlation and provenance without retaining
 /// conversation input/output after all delivery obligations are complete.
 pub(super) fn metadata_only(op: &SpanOp) -> SpanOp {
@@ -194,7 +233,7 @@ impl SpanJournal {
             // Read the version under the same write transaction as every
             // upgrade, so another opener cannot run a stale migration plan.
             let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            anyhow::ensure!(version <= 6, "unsupported SpanOp journal schema {version}");
+            anyhow::ensure!(version <= 7, "unsupported SpanOp journal schema {version}");
             if version < 3 {
                 db.execute_batch(
                     "CREATE TABLE IF NOT EXISTS batches (
@@ -243,6 +282,14 @@ impl SpanJournal {
                 }
                 prune(&db)?;
                 db.execute_batch("PRAGMA user_version=6")?;
+            }
+            if version < 7 {
+                db.execute_batch("CREATE TABLE attachment_blobs(digest TEXT PRIMARY KEY, data BLOB NOT NULL, refs INTEGER NOT NULL CHECK(refs>=0));
+                    CREATE TABLE operation_attachments(position INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(position,digest));
+                    CREATE TRIGGER attachment_acquire AFTER INSERT ON operation_attachments BEGIN UPDATE attachment_blobs SET refs=refs+1 WHERE digest=NEW.digest; END;
+                    CREATE TRIGGER attachment_release AFTER DELETE ON operation_attachments BEGIN UPDATE attachment_blobs SET refs=refs-1 WHERE digest=OLD.digest; DELETE FROM attachment_blobs WHERE digest=OLD.digest AND refs=0; END;
+                    CREATE TRIGGER operation_release AFTER DELETE ON ops BEGIN DELETE FROM operation_attachments WHERE position=OLD.position; END;
+                    PRAGMA user_version=7;")?;
             }
             let tail = db.query_row("SELECT tail FROM publication WHERE id=1", [], |row| row.get(0))?;
             db.execute_batch("COMMIT")?;
@@ -346,10 +393,16 @@ impl SpanJournal {
         ordinal: &mut u64,
         ops: &mut Vec<SpanOp>,
     ) -> anyhow::Result<()> {
+        for op in ops.iter_mut() {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            for value in [&mut row.input, &mut row.output].into_iter().flatten() {
+                crate::attachments::capture(value, &mut row.attachments);
+            }
+        }
         while !ops.is_empty() {
             let started = std::time::Instant::now();
             let mut encoded = Vec::new();
-            let mut bytes = 0;
+            let mut bytes: usize = 0;
             for op in ops.iter() {
                 let value = StoredOp::encode(op)?;
                 if !encoded.is_empty() && bytes + value.len() > BYTE_BUDGET {
@@ -396,6 +449,7 @@ impl SpanJournal {
                             params![input, value],
                         )?;
                         let position = tx.last_insert_rowid() as u64;
+                        store_attachments(&tx, position as i64, &value)?;
                         positions.push(Some(position));
                         tx.execute("UPDATE publication SET tail=? WHERE id=1", [position])?;
                         tx.execute(
@@ -457,12 +511,15 @@ impl SpanJournal {
             let mut rows = statement.query([after])?;
             let started = std::time::Instant::now();
             let mut records = Vec::new();
-            let mut bytes = 0;
+            let mut bytes: usize = 0;
             while let Some(row) = rows.next()? {
                 let value = row.get_ref(1)?.as_blob()?;
-                if !records.is_empty() && bytes + value.len() > BYTE_BUDGET { break; }
-                bytes += value.len();
-                records.push(Record { position:row.get(0)?, op:SharedOp::new(StoredOp::decode(value)?), bytes:value.len() });
+                let op = load_attachments(db, value)?;
+                let (SpanOp::Insert(span) | SpanOp::Merge(span)) = &op;
+                let size = value.len().saturating_add(span.attachments.iter().map(|attachment| attachment.data.len()).sum::<usize>());
+                if !records.is_empty() && bytes.saturating_add(size) > BYTE_BUDGET { break; }
+                bytes = bytes.saturating_add(size);
+                records.push(Record { position:row.get(0)?, op:SharedOp::new(op), bytes:size });
                 if bytes >= BYTE_BUDGET || started.elapsed() >= WINDOW { break; }
             }
             Ok(records)
@@ -497,6 +554,7 @@ impl SpanJournal {
                     "INSERT INTO ops(input,value) VALUES (?,?)",
                     params![input, value],
                 )?;
+                store_attachments(&tx, tx.last_insert_rowid(), &value)?;
             }
             tx.commit()?;
             Ok(())
@@ -677,7 +735,7 @@ impl SpanJournal {
         self.with_db(move |db| {
             let mut statement = db.prepare("SELECT position,value FROM ops JOIN batches USING(input) WHERE (committed=1 OR EXISTS(SELECT 1 FROM receipts WHERE receipts.input=ops.input)) AND observation=1 AND position>? ORDER BY position LIMIT ?")?;
             let rows = statement.query_map(params![after,limit as u64], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,Vec<u8>>(1)?)))?;
-            rows.map(|row| { let (position,bytes)=row?; Ok((position,StoredOp::decode(&bytes)?)) }).collect()
+            rows.map(|row| { let (position,bytes)=row?; Ok((position,load_attachments(db, &bytes)?)) }).collect()
         }).await
     }
 
@@ -1134,16 +1192,13 @@ impl Cursor {
                 let rows = statement.query_map(params![after, limit as u64], |r| {
                     Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?))
                 })?;
-                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+                rows.map(|row| { let (position, bytes) = row?; Ok((position, load_attachments(db, &bytes)?)) }).collect::<anyhow::Result<Vec<_>>>()
             })
             .await?;
         let Some(&(through, _)) = rows.last() else {
             return Ok(None);
         };
-        let ops = rows
-            .into_iter()
-            .map(|(_, bytes)| StoredOp::decode(&bytes))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let ops = rows.into_iter().map(|(_, op)| op).collect::<Vec<_>>();
         self.read = through;
         Ok(Some(Delivery::new(
             ops,
@@ -1553,7 +1608,7 @@ mod tests {
         journal.commit(10).await.unwrap();
         journal.close().await.unwrap();
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("UPDATE heads SET position=1; DROP TABLE receipts; DROP TABLE publication; DROP TABLE origins; DROP TABLE span_state; PRAGMA user_version=5").unwrap();
+        db.execute_batch("UPDATE heads SET position=1; DROP TABLE receipts; DROP TABLE publication; DROP TABLE origins; DROP TABLE span_state; DROP TRIGGER operation_release; DROP TRIGGER attachment_release; DROP TRIGGER attachment_acquire; DROP TABLE operation_attachments; DROP TABLE attachment_blobs; PRAGMA user_version=5").unwrap();
         drop(db);
         let upgraded = SpanJournal::open(&path).await.unwrap();
         assert_eq!(upgraded.tail().await.unwrap(), 1);
@@ -1683,6 +1738,109 @@ mod tests {
         assert!(
             !failed_early,
             "a read-before-write transaction must wait rather than fail to upgrade its snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachments_deduplicate_replay_and_release_after_all_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("attachments.sqlite");
+        let journal = SpanJournal::open(&path).await.unwrap();
+        journal.register(&route("a")).await.unwrap();
+        journal.register(&route("b")).await.unwrap();
+        journal.begin(10, true).await.unwrap();
+        let mut ops = vec![op("one"), op("two")];
+        for op in &mut ops {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            row.input =
+                Some(serde_json::json!({"type":"file", "mime":"application/pdf", "data":"YWJj"}));
+        }
+        journal.append_live(10, &mut 0, &mut ops).await.unwrap();
+        // Rebuilding a partially published input must not acquire another reference.
+        let mut repeated = vec![op("one"), op("two")];
+        journal
+            .append_live(10, &mut 0, &mut repeated)
+            .await
+            .unwrap();
+        journal.commit(10).await.unwrap();
+        journal.close().await.unwrap();
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let mut a = journal.subscribe(&route("a"), 0).await.unwrap();
+        let mut b = journal.subscribe(&route("b"), 0).await.unwrap();
+        assert_eq!(
+            journal
+                .with_db(|db| Ok(db
+                    .query_row("SELECT refs FROM attachment_blobs", [], |r| r
+                        .get::<_, u64>(0))?))
+                .await
+                .unwrap(),
+            2
+        );
+        let rows = journal.read_after(0, 10).await.unwrap();
+        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &rows[0].1;
+        assert_eq!(row.attachments[0].data, b"abc");
+        a.next_batch(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_completed()
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            journal
+                .with_db(|db| Ok(db.query_row(
+                    "SELECT count(*) FROM attachment_blobs",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )?))
+                .await
+                .unwrap(),
+            1
+        );
+        b.next_batch(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_completed()
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            journal
+                .with_db(|db| Ok(db
+                    .query_row("SELECT refs FROM attachment_blobs", [], |r| r
+                        .get::<_, u64>(0))?))
+                .await
+                .unwrap(),
+            1
+        );
+        a.next_batch(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_completed()
+            .await
+            .ok()
+            .unwrap();
+        b.next_batch(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_completed()
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            journal
+                .with_db(|db| Ok(db.query_row(
+                    "SELECT count(*) FROM attachment_blobs",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )?))
+                .await
+                .unwrap(),
+            0
         );
     }
 
