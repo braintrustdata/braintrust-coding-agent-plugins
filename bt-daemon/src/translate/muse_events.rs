@@ -1,6 +1,7 @@
 //! Typed tool, observation, subagent, and compaction reducers.
 use super::*;
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+use serde::{Deserialize, Serialize};
+#[derive(Default, Serialize, Deserialize)]
 pub(super) struct Events {
     open: HashMap<String, OpenOp>,
     closed: RecentSet<String>,

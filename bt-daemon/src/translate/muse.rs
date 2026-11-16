@@ -14,6 +14,7 @@ use crate::muse::metadata::*;
 mod muse_usage;
 use crate::wire::Envelope;
 use muse_usage::UsageTracker;
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
@@ -26,19 +27,19 @@ impl TranslatorFactory for crate::agents::Muse {
         Box::new(MuseTranslator::new(session_id, GitMetadataCache::shared()))
     }
 }
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OpenOp {
     id: String,
     parents: Vec<String>,
     turn_span_id: Option<String>,
 }
 /// A completed span and the output it was completed with.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Completed {
     op: OpenOp,
     output: Option<Value>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct MuseTranslator {
     session_id: String,
     root_id: String,

@@ -1,8 +1,8 @@
 //! Concrete span data produced from OpenCode 2 events.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(super) enum Content {
     Text(String),
@@ -57,14 +57,14 @@ impl ContentPart {
         })
     }
 }
-#[derive(Clone, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
     pub function: FunctionCall,
 }
-#[derive(Clone, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct FunctionCall {
     pub name: String,
     pub arguments: String,
@@ -81,12 +81,12 @@ impl ToolCall {
         }
     }
 }
-#[derive(Clone, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Reasoning {
     pub id: String,
     pub content: String,
 }
-#[derive(Clone, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Message {
     pub role: String,
     pub content: Content,

@@ -2,8 +2,9 @@
 //! are independent of the translator in crate::muse::usage.
 use super::super::recent::RecentMap;
 use crate::muse::usage::{TokenMetrics, TokenUsage, UsageScope};
+use serde::{Deserialize, Serialize};
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub(super) struct UsageTracker {
     turn_usage: RecentMap<String, TokenUsage>,
     model_metrics: RecentMap<String, TokenMetrics>,

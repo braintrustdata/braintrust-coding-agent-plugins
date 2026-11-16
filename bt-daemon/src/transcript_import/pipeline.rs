@@ -584,12 +584,13 @@ mod tests {
     use crate::{ids, DebugSinkFactory, Registry};
     use braintrust_sdk_rust::SpanObjectType;
     use clap::Parser;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::sync::Arc;
 
     #[tokio::test]
     async fn stopped_import_bypasses_pending_translation_and_finalization() {
-        #[derive(serde::Serialize, serde::Deserialize)]
+        #[derive(Serialize, Deserialize)]
         struct CatchUp {
             pending: bool,
         }

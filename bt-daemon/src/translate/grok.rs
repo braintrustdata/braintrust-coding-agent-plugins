@@ -12,6 +12,7 @@ use super::{
 };
 use crate::ids;
 use crate::wire::Envelope;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -32,7 +33,7 @@ impl TranslatorFactory for crate::agents::Grok {
     }
 }
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct BoundedOutput {
     values: Vec<Value>,
     bytes: usize,
@@ -110,7 +111,7 @@ impl BoundedOutput {
         }
     }
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct OpenTurn {
     span_id: String,
     key: String,
@@ -121,13 +122,13 @@ struct OpenTurn {
     user_input_dirty: bool,
     assistant_output: BoundedOutput,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TurnCompletion {
     metrics: Option<Value>,
     error: Option<String>,
     late_merge_key: Option<String>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct OpenLlm {
     span_id: String,
     parent_span_id: String,
@@ -138,13 +139,13 @@ struct OpenLlm {
     start_ms: i64,
     last_ms: i64,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct OpenTool {
     span_id: String,
     parent_span_id: String,
     start_ms: i64,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct CompletedTool {
     span_id: String,
     parent_span_id: String,
@@ -154,7 +155,7 @@ struct CompletedTool {
     failure_recorded: bool,
 }
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct TranscriptCursor {
     path: Option<String>,
     offset: u64,
@@ -179,12 +180,12 @@ impl TranscriptCursor {
         }
     }
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TranscriptRecord {
     end_offset: u64,
     value: Value,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TranscriptBatch {
     cursor: TranscriptCursor,
     records: Vec<TranscriptRecord>,
@@ -192,11 +193,11 @@ struct TranscriptBatch {
     reset: bool,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PendingWork {
     event: Envelope,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct GrokTranslator {
     session_id: String,
     session_span_id: String,
