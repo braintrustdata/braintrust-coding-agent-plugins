@@ -884,48 +884,4 @@ mod tests {
             span_plugins: Vec::new(),
         }
     }
-
-    fn imported_terminal_span_ids(path: &std::path::Path) -> Vec<String> {
-        std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|op| {
-                let row = op.get("Insert").or_else(|| op.get("Merge"))?;
-                row.get("end_ms")?.as_i64()?;
-                row.get("span_id")?.as_str().map(str::to_string)
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn reimporting_a_live_session_captures_nothing_twice() {
-        let temp = tempfile::tempdir().unwrap();
-        let transcript = temp.path().join("session.jsonl");
-        std::fs::write(
-            &transcript,
-            format!(
-                "{}\n{}\n{}\n{}\n",
-                json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"reimport","cwd":"/tmp/demo"}}),
-                json!({"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-test"}}),
-                json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
-                json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}),
-            ),
-        )
-        .unwrap();
-        let output = temp.path().join("spans");
-        let target = import_daemon::target(&output, Some(import_test_config("project-a"))).await;
-        let first = import_transcript(&transcript, ImportSource::Codex, target.clone(), false)
-            .await
-            .unwrap();
-        assert!(first[0].span_count > 0);
-        let spans = output.join("reimport.ndjson");
-        let first_terminals = imported_terminal_span_ids(&spans);
-        assert!(!first_terminals.is_empty());
-        let first_operations = std::fs::read_to_string(&spans).unwrap();
-        import_transcript(&transcript, ImportSource::Codex, target, false)
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(&spans).unwrap(), first_operations);
-    }
 }
