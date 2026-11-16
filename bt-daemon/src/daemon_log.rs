@@ -8,21 +8,19 @@
 //!   `serve.log`, which therefore only holds warnings and anything printed
 //!   before logging starts.
 //!
-//! Both files are bounded by rename-and-reopen rotation: once a file would
-//! outgrow its limit (`BT_TRACE_LOG_MAX_MB` MiB, default [`DEFAULT_MAX_MB`]),
-//! it is renamed to `<name>.1`, replacing the previous generation, and a fresh
-//! file is started. Every line lands whole in one generation or the next.
-//! `daemon.log` rotates as it is written; `serve.log` rotates before a daemon
-//! is spawned, since the daemon writes it through an inherited handle.
+//! Both files are rotated by `file-rotate` once they pass
+//! `BT_TRACE_LOG_MAX_MB` MiB (default [`DEFAULT_MAX_MB`]), keeping one earlier
+//! generation as `<name>.1`. `daemon.log` rotates as it is written; `serve.log`
+//! rotates before a daemon is spawned, since the daemon writes it through an
+//! inherited handle.
 //!
 //! The global subscriber can be set once per process, so a host that installs
 //! its own must not do so before running the daemon command.
 
-use parking_lot::{Mutex, MutexGuard};
+use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, FileRotate};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::Mutex;
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt, EnvFilter, Layer};
 
 /// Rotate once a log would grow past this many MiB. One earlier generation of
@@ -51,7 +49,7 @@ fn limit(mb: Option<&str>) -> u64 {
 /// has one, which then keeps receiving the daemon's events.
 pub(crate) fn init(data_dir: &Path, verbose: bool) -> bool {
     let (subscriber, errors) = subscriber(
-        RotatingFile::new(data_dir.join("daemon.log"), max_bytes()),
+        Mutex::new(rotating(&data_dir.join("daemon.log"))),
         std::io::stderr,
         // A spawned daemon's stderr is `serve.log`, which must stay plain.
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
@@ -72,13 +70,14 @@ pub(crate) fn init(data_dir: &Path, verbose: bool) -> bool {
 }
 
 /// The daemon's subscriber, and any filter settings it had to reject.
-fn subscriber<E>(
-    file: RotatingFile,
+fn subscriber<F, E>(
+    file: F,
     stderr: E,
     ansi: bool,
     verbose: bool,
 ) -> (impl tracing::Subscriber + Send + Sync, Vec<String>)
 where
+    F: for<'a> MakeWriter<'a> + Send + Sync + 'static,
     E: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
     let (file_filter, file_error) = filter(LEVEL_ENV, "debug");
@@ -121,172 +120,55 @@ fn parse_filter(env: &str, value: Option<String>, default: &str) -> (EnvFilter, 
     }
 }
 
+/// A log at `path` that rotates once it passes the configured size, keeping
+/// one earlier generation as `<path>.1`.
+fn rotating(path: &Path) -> FileRotate<AppendCount> {
+    FileRotate::new(
+        path,
+        AppendCount::new(1),
+        ContentLimit::BytesSurpassed(usize::try_from(max_bytes()).unwrap_or(usize::MAX)),
+        Compression::None,
+        None,
+    )
+}
+
 /// Open `serve.log` for a new daemon's standard streams, rotating it first.
-/// No writer of this process holds it, so renaming it away is safe; a daemon
-/// still exiting keeps writing into the rotated generation.
+/// A daemon still exiting keeps writing into the rotated generation.
 pub(crate) fn open_serve_log(data_dir: &Path) -> std::io::Result<File> {
+    std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join("serve.log");
     let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     if len > max_bytes() {
-        if let Err(error) = rotate(&path) {
+        if let Err(error) = rotating(&path).rotate() {
             tracing::warn!(%error, "serve.log rotation failed");
         }
     }
-    append(&path)
-}
-
-fn append(path: &Path) -> std::io::Result<File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     OpenOptions::new().create(true).append(true).open(path)
-}
-
-/// Rename `path` to `<path>.1`, replacing the previous generation. A virus
-/// scanner or indexer can briefly hold a file on Windows, so a failed rename
-/// is retried a few times before giving up.
-fn rotate(path: &Path) -> std::io::Result<()> {
-    let mut rotated = path.as_os_str().to_owned();
-    rotated.push(".1");
-    let mut attempt = 0;
-    loop {
-        match std::fs::rename(path, &rotated) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(_) if attempt < 3 => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-/// A log file that rotates by renaming itself once a write would take it past
-/// its limit. `tracing` writes each event with one call, so rotation happens
-/// between whole lines.
-#[derive(Clone)]
-pub(crate) struct RotatingFile(Arc<Mutex<State>>);
-
-struct State {
-    path: PathBuf,
-    max_bytes: u64,
-    file: Option<File>,
-    written: u64,
-}
-
-impl RotatingFile {
-    pub(crate) fn new(path: PathBuf, max_bytes: u64) -> Self {
-        Self(Arc::new(Mutex::new(State {
-            path,
-            max_bytes,
-            file: None,
-            written: 0,
-        })))
-    }
-}
-
-impl State {
-    fn file(&mut self) -> std::io::Result<&mut File> {
-        let file = match self.file.take() {
-            Some(file) => file,
-            None => {
-                let file = append(&self.path)?;
-                self.written = file.metadata()?.len();
-                file
-            }
-        };
-        Ok(self.file.insert(file))
-    }
-
-    fn write_line(&mut self, line: &[u8]) -> std::io::Result<()> {
-        self.file()?;
-        if self.written > 0 && self.written + line.len() as u64 > self.max_bytes {
-            self.file = None;
-            // Keep writing to the current generation if it cannot move.
-            let _ = rotate(&self.path);
-        }
-        self.file()?.write_all(line)?;
-        self.written += line.len() as u64;
-        Ok(())
-    }
-}
-
-pub(crate) struct Writer<'a>(MutexGuard<'a, State>);
-
-impl Write for Writer<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write_line(buf)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self.0.file.as_mut() {
-            Some(file) => file.flush(),
-            None => Ok(()),
-        }
-    }
-}
-
-impl<'a> MakeWriter<'a> for RotatingFile {
-    type Writer = Writer<'a>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        Writer(self.0.lock())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn write(file: &RotatingFile, line: &str) {
-        file.make_writer().write_all(line.as_bytes()).unwrap();
-    }
+    use std::io::Write;
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
     #[test]
-    fn rotation_keeps_every_line_across_generations() {
+    fn daemon_log_keeps_one_rotated_generation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.log");
-        let rotated = dir.path().join("daemon.log.1");
-        let file = RotatingFile::new(path.clone(), 30);
-        let lines: Vec<String> = (0..6).map(|i| format!("line {i:02} ......\n")).collect();
-        for line in &lines[..3] {
-            write(&file, line);
+        let mut log = rotating(&path);
+        let line = vec![b'.'; 1024 * 1024];
+        for _ in 0..(DEFAULT_MAX_MB * 3) {
+            log.write_all(&line).unwrap();
         }
-        // Two 15-byte lines fit in 30 bytes, so the third starts a new file.
-        assert_eq!(read(&rotated), lines[..2].concat());
-        assert_eq!(read(&path), lines[2]);
-        for line in &lines[3..] {
-            write(&file, line);
-        }
-        // A later rotation replaces the earlier generation; the two files
-        // still read as one continuous log.
-        assert_eq!(read(&rotated) + &read(&path), lines[2..].concat());
-    }
-
-    #[test]
-    fn a_line_longer_than_the_limit_is_still_written() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("daemon.log");
-        let file = RotatingFile::new(path.clone(), 4);
-        write(&file, "longer than the limit\n");
-        assert_eq!(read(&path), "longer than the limit\n");
-    }
-
-    #[test]
-    fn writing_resumes_an_existing_log_and_counts_its_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("daemon.log");
-        std::fs::write(&path, "earlier daemon\n").unwrap();
-        let file = RotatingFile::new(path.clone(), 20);
-        write(&file, "this daemon\n");
-        assert_eq!(read(&dir.path().join("daemon.log.1")), "earlier daemon\n");
-        assert_eq!(read(&path), "this daemon\n");
+        log.flush().unwrap();
+        let generations = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(generations, 2, "the current log and one rotated generation");
+        assert!(dir.path().join("daemon.log.1").exists());
+        assert!(std::fs::metadata(&path).unwrap().len() <= (DEFAULT_MAX_MB + 1) * 1024 * 1024);
     }
 
     #[test]
@@ -320,13 +202,8 @@ mod tests {
     fn each_output_has_its_own_level_and_format() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.log");
-        let stderr = RotatingFile::new(dir.path().join("stderr"), u64::MAX);
-        let (subscriber, errors) = subscriber(
-            RotatingFile::new(path.clone(), u64::MAX),
-            stderr,
-            false,
-            false,
-        );
+        let stderr = Mutex::new(File::create(dir.path().join("stderr")).unwrap());
+        let (subscriber, errors) = subscriber(Mutex::new(rotating(&path)), stderr, false, false);
         assert!(errors.is_empty());
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(session_id = "s", "event received");
