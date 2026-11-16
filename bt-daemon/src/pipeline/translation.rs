@@ -15,6 +15,7 @@ use crate::{
     wire::{SessionConfig, SessionRoute},
 };
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -187,7 +188,7 @@ enum State {
     Processing,
     Recovering(Failure),
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Continuation {
     source: String,
     native: Box<serde_json::value::RawValue>,

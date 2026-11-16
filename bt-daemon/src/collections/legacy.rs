@@ -10,6 +10,7 @@ use super::events::{EventCollection, EventRecord, Imported, Stored};
 use crate::journal::{journal_dir, journal_path, source_journal_path};
 use crate::wire::{RedactedEnvelope, SessionRoute};
 use anyhow::Context;
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::Path;
@@ -206,7 +207,7 @@ async fn import_file(
 }
 
 /// A delivery acknowledgement written by a daemon before SpanOp storage.
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 struct Checkpoint {
     route: SessionRoute,
     through: u64,
