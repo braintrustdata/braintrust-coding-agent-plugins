@@ -66,7 +66,7 @@ pub(crate) fn capture(value: &mut Value, attachments: &mut Vec<Attachment>) {
                     if url.starts_with("data:") {
                         return decode_url(url);
                     }
-                    let path = reqwest::Url::parse(url).ok()?.to_file_path().ok()?;
+                    let path = url::Url::parse(url).ok()?.to_file_path().ok()?;
                     let data = std::fs::read(path).ok()?;
                     Some((mime.unwrap_or("application/octet-stream").to_owned(), data))
                 })
@@ -173,7 +173,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("artifact.bin");
         std::fs::write(&path, [0, 255, 1]).unwrap();
-        let mut value = json!({"type":"file","mime":"application/octet-stream","uri":reqwest::Url::from_file_path(&path).unwrap().as_str()});
+        let mut value = json!({"type":"file","mime":"application/octet-stream","uri":url::Url::from_file_path(&path).unwrap().as_str()});
         let mut attachments = Vec::new();
         capture(&mut value, &mut attachments);
         std::fs::remove_file(path).unwrap();

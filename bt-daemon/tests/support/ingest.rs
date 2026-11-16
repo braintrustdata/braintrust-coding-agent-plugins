@@ -1,7 +1,7 @@
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,6 +62,7 @@ impl IngestScenario {
 #[derive(Default)]
 struct CollectorState {
     rows: Mutex<Vec<Value>>,
+    attachments: Mutex<std::collections::HashMap<String, Vec<u8>>>,
     registrations: AtomicUsize,
     log_requests: AtomicUsize,
 }
@@ -78,12 +79,19 @@ impl IngestMock {
 
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/attachment", post(attachment_slot))
+            .route("/attachment/object/{key}", put(attachment_upload))
+            .route("/attachment/status", post(attachment_status))
             .route("/version", get(version))
             .route("/api/apikey/login", post(login))
             .route("/api/project/register", post(register_project))
             .route("/logs3", post(logs))
             .route("/logs3/overflow", post(logs))
             .with_state(Arc::clone(&self.state))
+    }
+
+    pub fn attachment(&self, key: &str) -> Option<Vec<u8>> {
+        self.state.attachments.lock().unwrap().get(key).cloned()
     }
 
     pub fn rows(&self) -> Vec<Value> {
@@ -104,6 +112,37 @@ impl IngestMock {
         scenario.evaluate(&rows)?;
         Ok(rows)
     }
+}
+
+async fn attachment_slot(headers: HeaderMap, Json(request): Json<Value>) -> Json<Value> {
+    assert!(headers.contains_key("authorization"));
+    let host = headers.get("host").unwrap().to_str().unwrap();
+    Json(
+        json!({"signedUrl":format!("http://{host}/attachment/object/{}", request["key"].as_str().unwrap()),"headers":{}}),
+    )
+}
+
+async fn attachment_upload(
+    State(state): State<Arc<CollectorState>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) {
+    assert!(!headers.contains_key("authorization"));
+    state.attachments.lock().unwrap().insert(key, body.to_vec());
+}
+
+async fn attachment_status(
+    State(state): State<Arc<CollectorState>>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    assert_eq!(request["status"]["upload_status"], "done");
+    assert!(state
+        .attachments
+        .lock()
+        .unwrap()
+        .contains_key(request["key"].as_str().unwrap()));
+    Json(json!({}))
 }
 
 async fn version() -> Json<Value> {

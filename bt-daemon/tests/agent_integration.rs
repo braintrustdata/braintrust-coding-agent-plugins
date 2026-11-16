@@ -604,7 +604,7 @@ async fn opencode_v2_session_emits_traces() {
     let world = AgentTestWorld::start().await;
     let workspace = world.workspace();
     let image = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==").unwrap();
-    std::fs::write(workspace.join("image.png"), image).unwrap();
+    std::fs::write(workspace.join("image.png"), &image).unwrap();
     let home = world.temp_path("opencode-v2-home");
     std::fs::create_dir_all(&home).unwrap();
     let config = json!({
@@ -657,7 +657,7 @@ async fn opencode_v2_session_emits_traces() {
     );
     let scenario = IngestScenario::new()
         .expect("v2 input", |row| {
-            row_contains(row, &["Turn 1", "say hello", "data:image/png;base64,"])
+            row_contains(row, &["Turn 1", "say hello", "braintrust_attachment"])
         })
         .expect("v2 tool", |row| {
             row_contains(row, &[r#""type":"tool""#, "OPENCODE_V2_TOOL_OK"])
@@ -695,9 +695,24 @@ async fn opencode_v2_session_emits_traces() {
         final_llm["input"]
     );
 
+    let attachment = rows
+        .iter()
+        .find_map(|row| {
+            row["metadata"]["braintrust.attachments"]
+                .as_array()
+                .and_then(|items| items.first())
+        })
+        .expect("uploaded prompt image");
+    assert_eq!(
+        world
+            .uploaded_attachment(attachment["key"].as_str().unwrap())
+            .as_deref(),
+        Some(image.as_slice())
+    );
+
     let managed_turn_id = rows
         .iter()
-        .find(|row| row_contains(row, &["Turn 1", "say hello", "data:image/png;base64,"]))
+        .find(|row| row_contains(row, &["Turn 1", "say hello", "braintrust_attachment"]))
         .unwrap()["id"]
         .as_str()
         .unwrap()
@@ -944,14 +959,14 @@ async fn opencode_v2_session_emits_traces() {
                 })
                 .expect("image tool result", |row| {
                     row["span_attributes"]["type"] == "tool"
-                        && row["output"].to_string().contains("image_url")
+                        && row["output"].to_string().contains("braintrust_attachment")
                         && row["output"].to_string().contains("image/png")
                 })
                 .expect("model input with tool image", |row| {
                     row["span_attributes"]["type"] == "llm"
                         && row["input"].to_string().contains("image tool marker")
                         && row["input"].to_string().contains("image/png")
-                        && row["input"].to_string().contains("image_url")
+                        && row["input"].to_string().contains("braintrust_attachment")
                 }),
         )
         .await;
@@ -961,7 +976,7 @@ async fn opencode_v2_session_emits_traces() {
             .any(|row| row["span_attributes"]["type"] == "llm"
                 && row["input"].to_string().contains("image tool marker")
                 && row["input"].to_string().contains("image/png")
-                && row["input"].to_string().contains("image_url")),
+                && row["input"].to_string().contains("braintrust_attachment")),
         "model input lost tool image: {image_rows:?}"
     );
 }

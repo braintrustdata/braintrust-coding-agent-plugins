@@ -362,14 +362,19 @@ impl BraintrustSink {
                 .creds
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing attachment credentials"))?;
-            let (api, _) = self
+            let (api, app) = self
                 .urls
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing attachment backend"))?;
-            let http = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(120))
-                .build()?;
+            let backend = braintrust_api_client::backend::BackendClient::new(
+                api,
+                app,
+                &creds.token,
+                &creds.org_id,
+                creds.org_name.as_deref().unwrap_or_default(),
+                concat!("bt-daemon/", env!("CARGO_PKG_VERSION")),
+            )?;
+            use braintrust_api_client::backend::extensions::AttachmentRequest;
             let mut references = HashMap::new();
             for attachment in &row.attachments {
                 let key = uuid::Uuid::new_v5(
@@ -378,43 +383,17 @@ impl BraintrustSink {
                 )
                 .to_string();
                 let reference = json!({"type":"braintrust_attachment", "key":key, "filename":attachment.filename, "content_type":attachment.content_type});
-                let metadata: Value = http.post(format!("{}/attachment", api.trim_end_matches('/'))).bearer_auth(&creds.token).json(&json!({"key":key,"filename":attachment.filename,"content_type":attachment.content_type,"org_id":creds.org_id})).send().await?.error_for_status()?.json().await?;
-                let url = metadata
-                    .get("signedUrl")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("attachment response has no signed URL"))?;
-                let mut request = http.put(url);
-                if let Some(headers) = metadata.get("headers").and_then(Value::as_object) {
-                    for (name, value) in headers {
-                        let value = value
-                            .as_str()
-                            .ok_or_else(|| anyhow::anyhow!("invalid attachment upload header"))?;
-                        request = request.header(name, value);
-                    }
-                }
-                if url.contains(".blob.core.windows.net/") {
-                    request = request.header("x-ms-blob-type", "BlockBlob");
-                }
-                // Object storage receives only signed-upload headers, never Braintrust credentials.
-                request
-                    .body(attachment.data.clone())
-                    .send()
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("attachment object upload failed: {}", error.without_url())
-                    })?
-                    .error_for_status()
-                    .map_err(|error| {
-                        anyhow::anyhow!("attachment object upload failed: {}", error.without_url())
-                    })?;
-                http.post(format!("{}/attachment/status", api.trim_end_matches('/')))
-                    .bearer_auth(&creds.token)
-                    .json(
-                        &json!({"key":key,"org_id":creds.org_id,"status":{"upload_status":"done"}}),
+                backend
+                    .upload_attachment(
+                        &AttachmentRequest::new(
+                            key,
+                            attachment.filename.clone(),
+                            attachment.content_type.clone(),
+                            creds.org_id.clone(),
+                        ),
+                        attachment.data.clone(),
                     )
-                    .send()
-                    .await?
-                    .error_for_status()?;
+                    .await?;
                 references.insert(attachment.digest.clone(), reference);
             }
             let mut row = row.clone();
