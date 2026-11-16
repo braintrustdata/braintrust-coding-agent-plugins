@@ -8,6 +8,7 @@ use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFa
 use crate::agents::{Agent, Identity};
 use crate::ids;
 use crate::wire::Envelope;
+use serde::{Deserialize, Serialize};
 
 /// Not a coding agent, so it is never registered in [`crate::agents`]; the
 /// translator registry adds it directly.
@@ -35,7 +36,7 @@ impl TranslatorFactory for DebugTranslatorFactory {
         })
     }
 }
-
+#[derive(Serialize, Deserialize)]
 struct DebugTranslator {
     root_span_id: String,
     root_emitted: bool,

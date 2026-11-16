@@ -13,7 +13,7 @@ use super::{
 use crate::ids;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -42,6 +42,31 @@ struct OpenCodeVersionedTranslator {
     v1: Box<dyn AgentTranslator>,
     v2: super::opencode_v2::OpenCodeV2Translator,
     version: Option<bool>,
+}
+
+/// The selected protocol and both translators' states.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    version: Option<bool>,
+    v1: Box<super::RawValue>,
+    v2: Box<super::RawValue>,
+}
+
+impl super::TranslatorState for OpenCodeVersionedTranslator {
+    fn save_state(&self) -> anyhow::Result<Box<super::RawValue>> {
+        Ok(serde_json::value::to_raw_value(&Saved {
+            version: self.version,
+            v1: self.v1.save_state()?,
+            v2: self.v2.save_state()?,
+        })?)
+    }
+    fn restore_state(&mut self, state: &super::RawValue) -> anyhow::Result<()> {
+        let saved: Saved = serde_json::from_str(state.get())?;
+        self.v1.restore_state(&saved.v1)?;
+        self.v2.restore_state(&saved.v2)?;
+        self.version = saved.version;
+        Ok(())
+    }
 }
 
 impl AgentTranslator for OpenCodeVersionedTranslator {
@@ -91,6 +116,7 @@ impl AgentTranslator for OpenCodeVersionedTranslator {
 // content remain raw JSON where Braintrust preserves the native representation.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Serialize)]
 struct ToolInput {
     #[serde(rename = "sessionID")]
     session_id: String,
@@ -100,13 +126,13 @@ struct ToolInput {
     tool: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolBeforeOutput {
     #[serde(default)]
     args: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolAfterResult {
     #[serde(default)]
     title: Option<String>,
@@ -116,6 +142,7 @@ struct ToolAfterResult {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[derive(Serialize)]
 enum ToolBeforePayload {
     Wrapped {
         input: ToolInput,
@@ -129,7 +156,7 @@ enum ToolBeforePayload {
         output: Option<ToolBeforeOutput>,
     },
 }
-
+#[derive(Serialize, Deserialize)]
 struct ToolBefore {
     input: ToolInput,
     output: Option<ToolBeforeOutput>,
@@ -137,6 +164,7 @@ struct ToolBefore {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[derive(Serialize)]
 enum ToolAfterPayload {
     Wrapped {
         input: ToolInput,
@@ -154,7 +182,7 @@ enum ToolAfterPayload {
         output: Option<Value>,
     },
 }
-
+#[derive(Serialize, Deserialize)]
 struct ToolAfter {
     input: ToolInput,
     result: Option<ToolAfterResult>,
@@ -191,7 +219,7 @@ impl From<ToolAfterPayload> for ToolAfter {
     }
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct PermissionToolRecord {
     #[serde(default, rename = "sessionID")]
     session_id: Option<String>,
@@ -207,12 +235,13 @@ struct PermissionToolRecord {
 
 #[derive(Clone, Deserialize)]
 #[serde(untagged)]
+#[derive(Serialize)]
 enum PermissionTool {
     Name(String),
     Record(PermissionToolRecord),
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct PermissionFields {
     #[serde(default)]
     id: Option<String>,
@@ -238,12 +267,13 @@ struct PermissionFields {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[derive(Serialize)]
 enum PermissionPayload {
     Record(Box<PermissionFields>),
     Kind(String),
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 struct PermissionProperties {
     #[serde(default)]
     permission: Option<PermissionPayload>,
@@ -285,6 +315,7 @@ fn permission_properties(payload: &Value) -> Option<PermissionProperties> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Serialize)]
 struct PartEvent {
     #[serde(rename = "sessionID")]
     session_id: String,
@@ -308,13 +339,13 @@ struct PartEvent {
     tail_start_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct PartTime {
     #[serde(default)]
     end: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolPartState {
     #[serde(default)]
     status: Option<String>,
@@ -328,7 +359,7 @@ struct ToolPartState {
     error: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolAttachment {
     #[serde(default)]
     mime: Option<String>,
@@ -338,6 +369,7 @@ struct ToolAttachment {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Serialize)]
 struct MessageInfo {
     id: String,
     #[serde(rename = "sessionID")]
@@ -361,7 +393,7 @@ struct MessageInfo {
     error: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct MessageTime {
     #[serde(default)]
     created: Option<i64>,
@@ -369,7 +401,7 @@ struct MessageTime {
     completed: Option<i64>,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct MessageTokens {
     #[serde(default)]
     input: i64,
@@ -381,7 +413,7 @@ struct MessageTokens {
     cache: MessageCacheTokens,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct MessageCacheTokens {
     #[serde(default)]
     read: i64,
@@ -401,7 +433,7 @@ fn properties<T: DeserializeOwned>(payload: &Value, field: &str) -> Option<T> {
         .and_then(decode)
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct NativeSession {
     root_span_id: String,
     effective_root_span_id: String,
@@ -437,7 +469,7 @@ struct NativeSession {
     user_parts: HashMap<String, Vec<(String, String)>>,
     history_tool_results: HashMap<String, HashMap<String, Value>>,
 }
-
+#[derive(Serialize, Deserialize)]
 struct ClosedToolSpan {
     span_id: String,
     root_span_id: String,
@@ -453,17 +485,17 @@ impl NativeSession {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct MessageHistory {
     entries: Vec<HistoryEntry>,
     pending_compaction: Option<CompactionBoundary>,
 }
-
+#[derive(Serialize, Deserialize)]
 struct HistoryEntry {
     message_id: String,
     values: Vec<Value>,
 }
-
+#[derive(Serialize, Deserialize)]
 struct CompactionBoundary {
     tail_start_id: Option<String>,
 }
@@ -557,7 +589,7 @@ impl MessageHistory {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct PermissionRequest {
     id: Option<String>,
     session_id: Option<String>,
@@ -567,11 +599,12 @@ struct PermissionRequest {
     title: Option<String>,
     permission_type: Option<String>,
 }
-
+#[derive(Serialize, Deserialize)]
 struct OpenCodeTranslator {
     daemon_session_id: String,
     sessions: HashMap<String, NativeSession>,
     permission_requests: HashMap<String, PermissionRequest>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
     last_ts_ms: i64,
 }

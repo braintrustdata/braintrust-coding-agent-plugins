@@ -17,6 +17,7 @@ use hooks::{
     TranscriptRecord, TurnUsage,
 };
 pub(crate) use hooks::{IMPORT_CHECKPOINT, IMPORT_START, IMPORT_STOP};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
@@ -73,7 +74,7 @@ impl TranslatorFactory for crate::agents::Cursor {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct History {
     messages: VecDeque<Value>,
     bytes: usize,
@@ -100,7 +101,7 @@ impl History {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Turn {
     ordinal: u64,
     id: String,
@@ -113,7 +114,9 @@ struct Turn {
     emitted_text: String,
     usage: serde_json::Map<String, Value>,
 }
+#[derive(Serialize, Deserialize)]
 struct ModelStep {
+    #[serde(with = "super::state::row")]
     row: SpanRow,
     content: Vec<Value>,
     text: String,
@@ -153,14 +156,15 @@ impl ModelStep {
         self.content.push(value);
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Tool {
+    #[serde(with = "super::state::row")]
     row: SpanRow,
     turn: String,
     call_id: String,
     ended: bool,
 }
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct TranscriptCursor {
     path: String,
     offset: u64,
@@ -207,7 +211,7 @@ impl TranscriptCursor {
         Ok((records, truncated, self.offset >= through))
     }
 }
-
+#[derive(Serialize, Deserialize)]
 struct CursorTranslator {
     namespace: String,
     root: String,
@@ -218,6 +222,7 @@ struct CursorTranslator {
     cwd: Option<String>,
     model: Option<String>,
     model_params: Option<Value>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
     turn_seq: u64,
     turn: Option<Turn>,
@@ -233,6 +238,7 @@ struct CursorTranslator {
     transcript_owner: Option<String>,
     transcript_unattributed: bool,
     pending: Option<Envelope>,
+    #[serde(with = "super::state::rows")]
     subagents: BTreeMap<String, SpanRow>,
     compact_seq: u64,
 }

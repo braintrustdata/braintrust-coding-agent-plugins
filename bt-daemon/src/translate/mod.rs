@@ -26,7 +26,9 @@ pub(crate) use claude::successful_subagent_handback_message;
 pub(crate) use pi::request_config as pi_request_config;
 mod origins;
 mod recent;
+mod state;
 pub(crate) use origins::WeakOrigins;
+pub(crate) use state::SinkFields;
 mod tool;
 mod turn_lineage;
 pub use turn_lineage::TURN_SPAN_ID_KEY;
@@ -35,6 +37,7 @@ use debug::DebugTranslatorFactory;
 
 use crate::agents::{registrar, Agent};
 use crate::wire::{Envelope, SessionConfig};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,9 +149,29 @@ pub struct SessionCtx {
     pub config: Option<SessionConfig>,
 }
 
+/// A translator's durable continuation: what it still needs from consumed
+/// events to translate later ones, such as open spans and transcript offsets.
+/// A serializable translator is its own state.
+pub use serde_json::value::RawValue;
+
+pub trait TranslatorState {
+    fn save_state(&self) -> anyhow::Result<Box<RawValue>>;
+    fn restore_state(&mut self, state: &RawValue) -> anyhow::Result<()>;
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> TranslatorState for T {
+    fn save_state(&self) -> anyhow::Result<Box<RawValue>> {
+        Ok(serde_json::value::to_raw_value(self)?)
+    }
+    fn restore_state(&mut self, state: &RawValue) -> anyhow::Result<()> {
+        *self = serde_json::from_str(state.get())?;
+        Ok(())
+    }
+}
+
 /// A per-session state machine. One instance per session; `&mut self` so it
 /// can hold open-span maps, transcript offsets, etc.
-pub trait AgentTranslator: Send {
+pub trait AgentTranslator: Send + TranslatorState {
     /// Handle one event, returning span ops to emit.
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>>;
 

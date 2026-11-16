@@ -5,12 +5,18 @@
 //! slightly reordered events; keeping every identifier for the whole session
 //! makes payload-free bookkeeping grow without bound.
 
+use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
 pub(super) const RECENT_ID_CAPACITY: usize = 1_024;
 
+#[derive(Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "K: serde::Serialize",
+    deserialize = "K: serde::Deserialize<'de> + Eq + Hash"
+))]
 pub(super) struct RecentSet<K> {
     values: HashSet<K>,
     order: VecDeque<K>,
@@ -59,6 +65,11 @@ impl<K: Eq + Hash + Clone> RecentSet<K> {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "K: serde::Serialize, V: serde::Serialize",
+    deserialize = "K: serde::Deserialize<'de> + Eq + Hash, V: serde::Deserialize<'de>"
+))]
 pub(super) struct RecentMap<K, V> {
     values: HashMap<K, V>,
     order: VecDeque<K>,

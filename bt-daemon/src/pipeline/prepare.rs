@@ -128,6 +128,15 @@ impl ConfiguredTranslator {
     }
 }
 
+impl crate::translate::TranslatorState for ConfiguredTranslator {
+    fn save_state(&self) -> anyhow::Result<Box<crate::translate::RawValue>> {
+        self.inner.save_state()
+    }
+    fn restore_state(&mut self, state: &crate::translate::RawValue) -> anyhow::Result<()> {
+        self.inner.restore_state(state)
+    }
+}
+
 impl crate::translate::AgentTranslator for ConfiguredTranslator {
     fn handle(
         &mut self,
