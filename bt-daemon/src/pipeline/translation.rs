@@ -280,7 +280,7 @@ impl Producer {
             .take()
             .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
         let ctx = SessionCtx {
-            session_id: self.options.session_id.clone(),
+            session_id: crate::ids::native_session_id(&self.options.session_id).to_owned(),
             config: None,
         };
         let (translator, result) = tokio::task::spawn_blocking(move || {

@@ -235,7 +235,11 @@ const FINISH_TIMEOUT_MS: u64 = 120_000;
 struct ImportProcessor {
     client: DaemonClient,
     route: SessionRoute,
-    /// Session id to source, for each session with captured records.
+    /// This import run. Each run captures into its own daemon-side session
+    /// (see [`crate::ids::import_session_id`]), so it translates from fresh
+    /// state and delivers the whole native session to its destination.
+    run: String,
+    /// Native session id to source, for each session with captured records.
     sessions: std::collections::BTreeMap<String, String>,
 }
 
@@ -244,6 +248,7 @@ impl ImportProcessor {
         Self {
             client: DaemonClient::new(&target.socket, &target.host, target.no_spawn),
             route: target.route,
+            run: uuid::Uuid::new_v4().to_string(),
             sessions: std::collections::BTreeMap::new(),
         }
     }
@@ -252,10 +257,10 @@ impl ImportProcessor {
         for mut env in entries {
             env.route = Some(self.route.clone());
             env.config = None;
+            let native = env.session_id.clone();
+            env.session_id = crate::ids::import_session_id(&native, &self.run);
             self.client.log(&env).await?;
-            self.sessions
-                .entry(env.session_id.clone())
-                .or_insert(env.source);
+            self.sessions.entry(native).or_insert(env.source);
         }
         Ok(())
     }
@@ -268,7 +273,7 @@ impl ImportProcessor {
                     method::IMPORT_RESET,
                     wire::ImportResetParams {
                         source: source.clone(),
-                        session_id: session_id.clone(),
+                        session_id: crate::ids::import_session_id(session_id, &self.run),
                     },
                 )
                 .await?;
@@ -288,7 +293,7 @@ impl ImportProcessor {
                 method::IMPORT_FINISH,
                 wire::ImportFinishParams {
                     source: source.to_owned(),
-                    session_id: session_id.to_owned(),
+                    session_id: crate::ids::import_session_id(session_id, &self.run),
                     route: self.route.clone(),
                     finalize,
                     timeout_ms: FINISH_TIMEOUT_MS,
@@ -455,6 +460,21 @@ mod tests {
         }
     }
 
+    /// The span and trace ids of delivered rows. Each import run translates
+    /// from fresh state, so repeating one re-delivers rows under these ids.
+    fn identities(rows: &str) -> std::collections::BTreeSet<(String, String)> {
+        rows.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter_map(|row| {
+                let row = row.get("Insert").or_else(|| row.get("Merge"))?;
+                Some((
+                    row["span_id"].as_str()?.to_string(),
+                    row["root_span_id"].as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn repeated_muse_import_does_not_emit_a_second_trace() {
         let temp = tempfile::tempdir().unwrap();
@@ -483,7 +503,12 @@ mod tests {
         let first = std::fs::read_to_string(&rows).unwrap();
         assert!(first.contains("Muse Code"));
         import().await.unwrap();
-        assert_eq!(std::fs::read_to_string(&rows).unwrap(), first);
+        let repeated = std::fs::read_to_string(&rows).unwrap();
+        assert!(
+            repeated.len() > first.len(),
+            "each run delivers the session"
+        );
+        assert_eq!(identities(&repeated), identities(&first));
     }
 
     #[tokio::test]
@@ -539,8 +564,8 @@ mod tests {
                     .and_then(|value| value.as_str())
                     == Some(root_id.as_str()))
                 .count(),
-            1,
-            "the live session already holds the root; capture is not repeated"
+            2,
+            "each import run delivers the root under the same id"
         );
         assert_eq!(
             parsed
@@ -556,7 +581,10 @@ mod tests {
         assert!(rows.contains("\"end_ms\":1002"));
         let completed = rows.clone();
         import().await.unwrap();
-        assert_eq!(std::fs::read_to_string(&rows_path).unwrap(), completed);
+        assert_eq!(
+            identities(&std::fs::read_to_string(&rows_path).unwrap()),
+            identities(&completed)
+        );
     }
 
     #[tokio::test]
@@ -649,7 +677,8 @@ mod tests {
                     .and_then(serde_json::Value::as_str)
                     == Some(model.as_str()))
                 .count(),
-            1
+            2,
+            "both runs deliver the span under one id"
         );
         assert!(rows
             .iter()
@@ -673,7 +702,8 @@ mod tests {
                 .unwrap()["output"],
             "latest answer"
         );
-        // An older complete export must not roll the root back to run-1.
+        // An older export re-delivers what it covers under the same ids rather
+        // than starting another trace. Its content may replace newer content.
         let rows_path = output.join("spans/cross-ingress.ndjson");
         let before_stale = std::fs::read_to_string(&rows_path).unwrap();
         let mut stale: serde_json::Value =
@@ -688,7 +718,8 @@ mod tests {
             .await
             .unwrap();
         old.finish().await.unwrap();
-        assert_eq!(std::fs::read_to_string(rows_path).unwrap(), before_stale);
+        let after_stale = std::fs::read_to_string(rows_path).unwrap();
+        assert_eq!(identities(&after_stale), identities(&before_stale));
     }
 
     #[tokio::test]
@@ -761,7 +792,8 @@ mod tests {
                     .and_then(serde_json::Value::as_str)
                     == Some(tool.as_str()))
                 .count(),
-            1
+            2,
+            "both runs deliver the span under one id"
         );
         assert!(rows
             .iter()

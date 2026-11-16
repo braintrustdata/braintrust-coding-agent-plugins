@@ -116,7 +116,7 @@ impl Session {
             subscription.input,
             ConsumerOptions {
                 source: options.source.clone(),
-                session_id: options.session_id.clone(),
+                session_id: crate::ids::native_session_id(&options.session_id).to_owned(),
                 version: options.bt_version,
                 data_dir: options.data_dir,
                 config,
