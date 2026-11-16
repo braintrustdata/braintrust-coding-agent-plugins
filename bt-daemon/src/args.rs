@@ -10,10 +10,11 @@ use crate::agents::{self, Agent, Identity};
 use crate::wire;
 
 /// How long `serve` keeps undelivered output and idle session state.
-pub(crate) const DEFAULT_RETENTION_HOURS: u64 = 7 * 24;
+pub(crate) const DEFAULT_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Sets the retention when `--retention-hours` is not given.
-pub(crate) const RETENTION_ENV: &str = "BT_TRACE_RETENTION_HOURS";
+/// Sets the retention when `--retention` is not given.
+pub(crate) const RETENTION_ENV: &str = "BT_TRACE_RETENTION";
 
 /// Arguments for `serve`.
 #[derive(Debug, Clone, Args)]
@@ -34,33 +35,44 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 30)]
     pub session_idle_timeout_secs: u64,
     /// Discard output a destination has not accepted, and session state left
-    /// idle, after this many hours. Lower it to bound disk use more tightly
-    /// when a destination keeps rejecting spans. Defaults to
-    /// `BT_TRACE_RETENTION_HOURS`, or 168 (7 days).
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-    pub retention_hours: Option<u64>,
+    /// idle, after this long, such as `7d`, `12h` or `90m`. Lower it to bound
+    /// disk use more tightly when a destination keeps rejecting spans.
+    /// Defaults to `BT_TRACE_RETENTION`, or 7 days.
+    #[arg(long, value_parser = parse_retention)]
+    pub retention: Option<std::time::Duration>,
 }
 
 impl ServeArgs {
     /// How long undelivered output and idle session state are kept.
     pub(crate) fn retention(&self) -> std::time::Duration {
-        let hours = retention_hours(self.retention_hours, crate::env::var(RETENTION_ENV));
-        std::time::Duration::from_secs(hours.saturating_mul(60 * 60))
+        resolve_retention(self.retention, crate::env::var(RETENTION_ENV))
     }
 }
 
-/// The explicit flag, else a positive whole number of hours from the
-/// environment, else the default.
-fn retention_hours(flag: Option<u64>, env: Option<String>) -> u64 {
+/// A positive human-readable duration, such as `7d`, `12h` or `1h 30m`.
+fn parse_retention(value: &str) -> Result<std::time::Duration, String> {
+    match humantime::parse_duration(value.trim()) {
+        Ok(retention) if !retention.is_zero() => Ok(retention),
+        Ok(_) => Err("retention must be longer than zero".into()),
+        Err(error) => Err(format!(
+            "{error}; expected a duration such as 7d, 12h or 90m"
+        )),
+    }
+}
+
+/// The explicit flag, else a usable duration from the environment, else the
+/// default.
+fn resolve_retention(
+    flag: Option<std::time::Duration>,
+    env: Option<String>,
+) -> std::time::Duration {
     flag.or_else(|| {
         let value = env?;
-        let hours = value.trim().parse::<u64>().ok().filter(|hours| *hours > 0);
-        if hours.is_none() {
-            tracing::warn!(%value, "ignoring {RETENTION_ENV}: expected a positive number of hours");
-        }
-        hours
+        parse_retention(&value)
+            .inspect_err(|error| tracing::warn!(%value, "ignoring {RETENTION_ENV}: {error}"))
+            .ok()
     })
-    .unwrap_or(DEFAULT_RETENTION_HOURS)
+    .unwrap_or(DEFAULT_RETENTION)
 }
 
 /// Arguments for `hook`.
@@ -344,6 +356,7 @@ pub enum RunSource {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::time::Duration;
 
     #[derive(Debug, Parser)]
     struct ImportCli {
@@ -361,17 +374,40 @@ mod tests {
     fn serve_defaults_to_short_journal_backed_session_retirement() {
         let args = ServeCli::try_parse_from(["test"]).unwrap().args;
         assert_eq!(args.session_idle_timeout_secs, 30);
-        assert_eq!(args.retention_hours, None);
+        assert_eq!(args.retention, None);
+    }
+
+    #[test]
+    fn retention_accepts_human_readable_durations() {
+        let args = ServeCli::try_parse_from(["test", "--retention", "12h"])
+            .unwrap()
+            .args;
+        assert_eq!(args.retention, Some(Duration::from_secs(12 * 60 * 60)));
+        for (value, expected) in [("7d", 7 * 24 * 60), ("10m", 10), (" 1h 30m ", 90)] {
+            assert_eq!(
+                parse_retention(value),
+                Ok(Duration::from_secs(expected * 60)),
+                "{value}"
+            );
+        }
+        for rejected in ["", "0s", "7", "seven days", "-1h"] {
+            assert!(parse_retention(rejected).is_err(), "{rejected:?}");
+            assert!(
+                ServeCli::try_parse_from(["test", "--retention", rejected]).is_err(),
+                "{rejected:?}"
+            );
+        }
     }
 
     #[test]
     fn retention_prefers_the_flag_then_a_usable_environment_value() {
-        assert_eq!(retention_hours(Some(2), Some("5".into())), 2);
-        assert_eq!(retention_hours(None, Some(" 5 ".into())), 5);
-        for unusable in [None, Some(""), Some("0"), Some("-1"), Some("1d")] {
+        let hour = Duration::from_secs(60 * 60);
+        assert_eq!(resolve_retention(Some(hour), Some("5d".into())), hour);
+        assert_eq!(resolve_retention(None, Some("2h".into())), 2 * hour);
+        for unusable in [None, Some("0s"), Some("5")] {
             assert_eq!(
-                retention_hours(None, unusable.map(String::from)),
-                DEFAULT_RETENTION_HOURS,
+                resolve_retention(None, unusable.map(String::from)),
+                DEFAULT_RETENTION,
                 "{unusable:?}"
             );
         }
