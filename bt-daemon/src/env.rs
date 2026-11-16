@@ -34,6 +34,7 @@ pub(crate) const DAEMON_TUNING_ENV_VARS: &[&str] = &[
     crate::daemon_log::MAX_MB_ENV,
     crate::daemon_log::LEVEL_ENV,
     crate::daemon_log::STDERR_LEVEL_ENV,
+    crate::args::RETENTION_ENV,
 ];
 
 pub(crate) fn canonical_env_name(deprecated: &str) -> String {

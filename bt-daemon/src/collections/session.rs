@@ -3,8 +3,8 @@
 //! Everything that spans both collections, such as handing an input's
 //! translation over or deciding the session owes nothing, lives here.
 use super::span_ops::{
-    decode_roots, detach_attachments, encode_roots, prune, save_metadata, store_attachments,
-    Translated,
+    decode_roots, detach_attachments, encode_roots, prune, save_metadata, stalled,
+    store_attachments, Translated,
 };
 use super::store::{select, One, SessionStorage, NOW_MS};
 use crate::pipeline::live::{Record, SharedOp};
@@ -238,35 +238,36 @@ impl SessionStorage {
 
     /// Expire what a live session no longer uses once `retention` passes:
     /// capture identities, metadata of spans that ended or were never
-    /// completed, and heads that were registered for output but never
-    /// subscribed (such as a route whose credentials never resolved) and have
-    /// owed it that long. Ops no remaining head needs are then deleted. A
-    /// subscribed head held by a failure is kept for recovery, and so is every
-    /// route named in `live`, which has an active delivery.
+    /// completed, and the heads of [`stalled`](Self::stalled) routes. Ops no
+    /// remaining head needs are then deleted. Every route named in `live`,
+    /// which has an active delivery, is kept.
     pub async fn expire(&self, retention: Duration, live: Vec<String>) -> anyhow::Result<()> {
         let retention = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
         self.write(move |tx| {
-                let cutoff: i64 = tx.one(&format!("SELECT {NOW_MS}-?"), [retention])?;
-                tx.execute("DELETE FROM captured WHERE at_ms<?", [cutoff])?;
-                tx.execute("DELETE FROM origins WHERE ended_ms<?", [cutoff])?;
-                tx.execute(
-                    "DELETE FROM span_state WHERE touched_ms<? AND (kind='tool' OR end_ms IS NOT NULL)",
-                    [cutoff],
-                )?;
-                let stuck = {
-                    let mut query = tx.prepare(
-                        "SELECT route FROM heads WHERE subscribed=0 AND progress_ms<?
-                         AND position<(SELECT op_tail FROM session WHERE id=1)",
-                    )?;
-                    let rows = query.query_map([cutoff], |r| r.get::<_, String>(0))?;
-                    rows.collect::<Result<Vec<_>, _>>()?
-                };
-                for route in stuck.into_iter().filter(|route| !live.contains(route)) {
-                    tracing::warn!(%route, "undelivered output expired for a route that never subscribed");
-                    tx.execute("DELETE FROM heads WHERE route=?", [route])?;
-                }
-                prune(tx)
-            })
-            .await
+            let cutoff: i64 = tx.one(&format!("SELECT {NOW_MS}-?"), [retention])?;
+            tx.execute("DELETE FROM captured WHERE at_ms<?", [cutoff])?;
+            tx.execute("DELETE FROM origins WHERE ended_ms<?", [cutoff])?;
+            tx.execute(
+                "DELETE FROM span_state WHERE touched_ms<? AND (kind='tool' OR end_ms IS NOT NULL)",
+                [cutoff],
+            )?;
+            let mut expired = false;
+            for route in stalled(tx, cutoff)?
+                .into_iter()
+                .filter(|route| !live.contains(route))
+            {
+                let failure: Option<String> =
+                    tx.one("SELECT failure FROM heads WHERE route=?", [&route])?;
+                tracing::warn!(%route, ?failure, "undelivered output expired for a stalled route");
+                tx.execute("DELETE FROM heads WHERE route=?", [route])?;
+                expired = true;
+            }
+            if expired && tx.one::<i64>("SELECT count(*) FROM heads", [])? == 0 {
+                // Everything stored was owed only to expired routes.
+                tx.execute("DELETE FROM ops", [])?;
+            }
+            prune(tx)
+        })
+        .await
     }
 }

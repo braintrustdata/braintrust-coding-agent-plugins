@@ -99,8 +99,7 @@ pub(super) fn migrate(db: &Connection) -> anyhow::Result<()> {
             ALTER TABLE span_state ADD COLUMN touched_ms INTEGER NOT NULL DEFAULT 0;
             UPDATE span_state SET touched_ms={NOW_MS};
             ALTER TABLE heads ADD COLUMN progress_ms INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE heads ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 0;
-            UPDATE heads SET progress_ms={NOW_MS}, subscribed=1;"
+            UPDATE heads SET progress_ms={NOW_MS};"
         ))?;
         if version < 6 {
             // One bounded pass extracts the metadata a schema-5 channel kept

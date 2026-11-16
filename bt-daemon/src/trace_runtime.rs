@@ -1368,6 +1368,7 @@ mod tests {
                 data_dir: Some(data_dir.clone()),
                 idle_timeout_secs: 0,
                 session_idle_timeout_secs: 0,
+                retention_hours: None,
             };
             let options = ServeOptions {
                 version: "test".into(),
