@@ -5,12 +5,12 @@
 //! source-specific interpretation has been made.
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::path::Path;
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolApproval {
     Approved,
@@ -62,7 +62,7 @@ pub fn compile_skill_regex(pattern: &str) -> Option<Regex> {
 }
 
 /// A tool call that loaded a skill, as far as the source reveals it.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct SkillLoad {
     pub name: Option<String>,
     pub path: Option<String>,

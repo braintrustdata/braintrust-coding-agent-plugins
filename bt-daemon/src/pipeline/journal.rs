@@ -55,37 +55,25 @@ pub(crate) struct SpanJournal {
 
 /// Explicit codec preserves fields intentionally omitted from wire/plugin JSON.
 #[derive(Serialize, Deserialize)]
-struct StoredOp {
+struct StoredOp<Op> {
     version: u32,
-    op: SpanOp,
-    late_merge_key: Option<String>,
-    #[serde(default)]
-    late_merge_version: Option<crate::translate::LateMergeVersion>,
-    turn_span_id: Option<String>,
-    is_turn: bool,
+    op: Op,
+    #[serde(flatten)]
+    fields: crate::translate::SinkFields,
 }
 
-impl StoredOp {
+impl StoredOp<&SpanOp> {
     fn encode(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-        #[derive(Serialize)]
-        struct Borrowed<'a> {
-            version: u32,
-            op: &'a SpanOp,
-            late_merge_key: &'a Option<String>,
-            late_merge_version: &'a Option<crate::translate::LateMergeVersion>,
-            turn_span_id: &'a Option<String>,
-            is_turn: bool,
-        }
-        Ok(serde_json::to_vec(&Borrowed {
+        Ok(serde_json::to_vec(&StoredOp {
             version: 1,
             op,
-            late_merge_key: &row.late_merge_key,
-            late_merge_version: &row.late_merge_version,
-            turn_span_id: &row.turn_span_id,
-            is_turn: row.is_turn,
+            fields: crate::translate::SinkFields::of(row),
         })?)
     }
+}
+
+impl StoredOp<SpanOp> {
     fn decode(bytes: &[u8]) -> anyhow::Result<SpanOp> {
         let mut stored: Self = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
@@ -94,10 +82,7 @@ impl StoredOp {
             stored.version
         );
         let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut stored.op;
-        row.late_merge_key = stored.late_merge_key;
-        row.late_merge_version = stored.late_merge_version;
-        row.turn_span_id = stored.turn_span_id;
-        row.is_turn = stored.is_turn;
+        stored.fields.restore(row);
         Ok(stored.op)
     }
 }
@@ -699,6 +684,43 @@ impl SpanJournal {
     pub async fn tail(&self) -> anyhow::Result<u64> {
         self.with_db(|db| {
             Ok(db.query_row("SELECT tail FROM publication WHERE id=1", [], |r| r.get(0))?)
+        })
+        .await
+    }
+
+    /// Apply a legacy delivery checkpoint to the route's head: an earlier
+    /// daemon delivered the output of every input through `input`. It did so
+    /// without recording provenance, so origins rebuilt for those spans are
+    /// discarded rather than attributed to this daemon.
+    pub async fn acknowledge_legacy(&self, route: &SessionRoute, input: u64) -> anyhow::Result<()> {
+        let route = serde_json::to_string(route)?;
+        self.with_db(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let position: u64 = tx.query_row(
+                "SELECT coalesce(max(position),0) FROM ops WHERE input<=?",
+                [input],
+                |r| r.get(0),
+            )?;
+            let spans = {
+                let mut query = tx.prepare("SELECT value FROM ops WHERE input<=?")?;
+                let rows = query.query_map([input], |r| r.get::<_, Vec<u8>>(0))?;
+                let mut spans = Vec::new();
+                for row in rows {
+                    let (SpanOp::Insert(op) | SpanOp::Merge(op)) = StoredOp::decode(&row?)?;
+                    spans.push(op.span_id);
+                }
+                spans
+            };
+            for span in spans {
+                tx.execute("DELETE FROM origins WHERE span_id=?", [span])?;
+            }
+            tx.execute(
+                "INSERT INTO heads(route,position) VALUES(?,?) ON CONFLICT(route) DO UPDATE SET position=max(position,excluded.position)",
+                params![route, position],
+            )?;
+            prune(&tx)?;
+            tx.commit()?;
+            Ok(())
         })
         .await
     }

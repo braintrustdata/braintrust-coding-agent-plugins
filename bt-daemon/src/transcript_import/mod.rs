@@ -14,7 +14,7 @@ mod cursor;
 pub(crate) mod muse;
 mod pipeline;
 
-pub use pipeline::{import_transcript, import_transcripts, run_import};
+pub use pipeline::{import_transcript, import_transcripts, run_import, ImportTarget};
 
 /// Importing one agent's native transcripts. Implemented in each agent's
 /// module here and registered in [`crate::agents`].

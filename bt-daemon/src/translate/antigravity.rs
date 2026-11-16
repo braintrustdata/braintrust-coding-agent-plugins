@@ -12,6 +12,7 @@ use super::{
 };
 use crate::ids;
 use crate::wire::Envelope;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Seek, SeekFrom};
@@ -26,27 +27,27 @@ impl TranslatorFactory for crate::agents::Antigravity {
         ))
     }
 }
-
+#[derive(Serialize, Deserialize)]
 struct Turn {
     span_id: String,
     number: u32,
     start_ms: i64,
     last_output: Option<Value>,
 }
-
+#[derive(Serialize, Deserialize)]
 struct Invocation {
     span_id: String,
     parent_span_id: String,
     history_start: usize,
     record_start: usize,
 }
-
+#[derive(Serialize, Deserialize)]
 struct PendingTool {
     span_id: String,
     parent_span_id: String,
     name: String,
 }
-
+#[derive(Serialize, Deserialize)]
 struct AntigravityTranslator {
     session_id: String,
     session_span_id: String,
@@ -63,6 +64,7 @@ struct AntigravityTranslator {
     invocations: HashMap<i64, Invocation>,
     tools: HashMap<i64, PendingTool>,
     last_ts_ms: i64,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 
@@ -699,7 +701,7 @@ fn clean_user_input(content: Value) -> Value {
     )
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct ToolDetails {
     name: Option<String>,
     input: Option<Value>,

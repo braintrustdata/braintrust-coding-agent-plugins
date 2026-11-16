@@ -280,7 +280,7 @@ impl Producer {
             .take()
             .ok_or_else(|| anyhow::anyhow!("translator is missing"))?;
         let ctx = SessionCtx {
-            session_id: self.options.session_id.clone(),
+            session_id: crate::ids::native_session_id(&self.options.session_id).to_owned(),
             config: None,
         };
         let (translator, result) = tokio::task::spawn_blocking(move || {
@@ -507,6 +507,21 @@ impl Producer {
         Ok(Some(through))
     }
 
+    fn new_translator(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Box<dyn AgentTranslator>>> + Send + 'static
+    {
+        let registry = self.options.registry.clone();
+        let source = self.options.source.clone();
+        let namespace = self.options.namespace.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                registry.create_checked_with_session_namespace(&source, &namespace)
+            })
+            .await?
+        }
+    }
+
     async fn initialize(&mut self) -> anyhow::Result<()> {
         if self.translator.is_some() {
             return Ok(());
@@ -521,15 +536,7 @@ impl Producer {
                 }
             }
         }
-        let registry = self.options.registry.clone();
-        let source = self.options.source.clone();
-        let namespace = self.options.namespace.clone();
-        self.translator = Some(
-            tokio::task::spawn_blocking(move || {
-                registry.create_checked_with_session_namespace(&source, &namespace)
-            })
-            .await??,
-        );
+        self.translator = Some(self.new_translator().await?);
         self.position = 0;
         self.reader = if self.committed > 0 {
             JournalReader::open(&self.options.event_path, self.committed).await?
@@ -567,7 +574,12 @@ impl Producer {
                 SourceEvent::Event(Box::new(crate::journal::envelope_from_redacted(event)))
             }
             JournalRecord::Control(control) => SourceEvent::Control(control),
-            JournalRecord::DeliveryCheckpoint { .. } => SourceEvent::LegacyDeliveryCheckpoint,
+            JournalRecord::DeliveryCheckpoint { route, through } => {
+                SourceEvent::LegacyDeliveryCheckpoint {
+                    route: Box::new(route),
+                    through,
+                }
+            }
         };
         Ok(Some(SourceRecord {
             event,
@@ -644,18 +656,23 @@ impl Producer {
                         continue;
                     }
                     self.phase = Boundary::Translation;
-                    let ops = self
-                        .translate(move |translator, ctx| {
+                    let ops = if matches!(control.kind, ControlKind::Reset) {
+                        self.translator = Some(self.new_translator().await?);
+                        Vec::new()
+                    } else {
+                        self.translate(move |translator, ctx| {
                             if !matches!(control.kind, ControlKind::Checkpoint) {
                                 translator.finalize_at(ctx, &control.bounds)
                             } else {
                                 translator.checkpoint_at(ctx, &control.bounds)
                             }
                         })
-                        .await?;
+                        .await?
+                    };
                     (ops, self.capture.clone())
                 }
-                SourceEvent::LegacyDeliveryCheckpoint => {
+                SourceEvent::LegacyDeliveryCheckpoint { route, through } => {
+                    self.journal.acknowledge_legacy(&route, through).await?;
                     if input > self.committed {
                         self.journal.begin(input, observation).await?;
                         self.journal.commit(input).await?;
@@ -929,6 +946,43 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn every_agent_resumes_from_saved_state_at_every_native_boundary() {
+        let registry = crate::translate::Registry::default_agents();
+        let mut covered = Vec::new();
+        for (agent, events, _files) in streams::native_streams() {
+            covered.push(agent.clone());
+            let ctx = crate::translate::SessionCtx {
+                session_id: "checkpoint".into(),
+                config: None,
+            };
+            let translate = |split: Option<usize>| {
+                let mut translator = registry.create(&agent, "checkpoint");
+                let mut ops = Vec::new();
+                for (index, event) in events.iter().enumerate() {
+                    if split == Some(index) {
+                        let state = translator.save_state().unwrap();
+                        translator = registry.create(&agent, "checkpoint");
+                        translator.restore_state(&state).unwrap();
+                    }
+                    ops.extend(translator.handle(event, &ctx).unwrap());
+                }
+                ops.extend(translator.flush(&ctx).unwrap());
+                serde_json::to_value(ops).unwrap()
+            };
+            let expected = translate(None);
+            for split in 1..events.len() {
+                assert_eq!(translate(Some(split)), expected, "{agent} split {split}");
+            }
+        }
+        covered.sort();
+        covered.dedup();
+        assert_eq!(
+            covered,
+            crate::translate::Registry::default_agents().sources()
+        );
+    }
+
     #[tokio::test]
     async fn every_agent_recovers_equivalent_spans_at_every_native_boundary() {
         let mut covered = Vec::new();
@@ -1002,6 +1056,7 @@ pub(crate) mod tests {
             }
         }
         covered.sort();
+        covered.dedup();
         assert_eq!(covered, Registry::default_agents().sources());
     }
 
@@ -1015,6 +1070,14 @@ pub(crate) mod tests {
             self.release
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
+        }
+    }
+    impl crate::translate::TranslatorState for BlockedTranslator {
+        fn save_state(&self) -> anyhow::Result<Box<crate::translate::RawValue>> {
+            Ok(serde_json::value::to_raw_value(&())?)
+        }
+        fn restore_state(&mut self, _: &crate::translate::RawValue) -> anyhow::Result<()> {
+            Ok(())
         }
     }
     impl AgentTranslator for BlockedTranslator {
@@ -1198,6 +1261,14 @@ pub(crate) mod tests {
         assert_eq!(route.completed_position(), tail);
     }
     struct CountedTranslation(Arc<AtomicU64>);
+    impl crate::translate::TranslatorState for CountedTranslation {
+        fn save_state(&self) -> anyhow::Result<Box<crate::translate::RawValue>> {
+            Ok(serde_json::value::to_raw_value(&())?)
+        }
+        fn restore_state(&mut self, _: &crate::translate::RawValue) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
     impl AgentTranslator for CountedTranslation {
         fn handle(
             &mut self,

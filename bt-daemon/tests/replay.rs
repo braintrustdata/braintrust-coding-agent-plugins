@@ -6,12 +6,16 @@
 
 use braintrust_sdk_rust::{SpanComponents, SpanObjectType};
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig, TraceDestination};
-use bt_daemon::{
-    import_transcript, import_transcripts, DebugSinkFactory, ImportSource, Registry, ServeOptions,
-};
+use bt_daemon::{import_transcript, import_transcripts, ImportSource};
+
+#[allow(
+    dead_code,
+    reason = "Shared import helpers are used by different suites."
+)]
+#[path = "support/import_daemon.rs"]
+mod import_daemon;
 use serde_json::{json, Value};
 use std::io::Write;
-use std::sync::Arc;
 
 fn write_jsonl(path: &std::path::Path, records: &[Value]) {
     let mut file = std::fs::File::create(path).unwrap();
@@ -43,9 +47,14 @@ async fn importing_muse_export_uses_the_production_translator() {
         ]
     })).unwrap()).unwrap();
     let output = tmp.path().join("spans");
-    import_transcript(&export, ImportSource::Muse, options(&output), None, false)
-        .await
-        .unwrap();
+    import_transcript(
+        &export,
+        ImportSource::Muse,
+        import_daemon::target(&output, None).await,
+        false,
+    )
+    .await
+    .unwrap();
     let output_rows = rows(&output.join("muse-import.ndjson"));
     assert_eq!(inserted(&output_rows, "llm"), 1);
     assert!(output_rows
@@ -83,8 +92,7 @@ async fn attaching_muse_export_waits_for_native_end_without_reinserting_root() {
         import_transcript(
             &export_for_attach,
             ImportSource::Muse,
-            options(&output_for_attach),
-            None,
+            import_daemon::target(&output_for_attach, None).await,
             true,
         )
         .await
@@ -148,9 +156,14 @@ async fn importing_sparse_failed_muse_export_preserves_model_and_error() {
         ]
     })).unwrap()).unwrap();
     let output = tmp.path().join("spans");
-    import_transcript(&export, ImportSource::Muse, options(&output), None, false)
-        .await
-        .unwrap();
+    import_transcript(
+        &export,
+        ImportSource::Muse,
+        import_daemon::target(&output, None).await,
+        false,
+    )
+    .await
+    .unwrap();
     let output_rows = rows(&output.join("muse-sparse.ndjson"));
     assert_eq!(inserted(&output_rows, "llm"), 1);
     assert!(output_rows.iter().any(|row| {
@@ -185,8 +198,7 @@ async fn importing_large_codex_rollout_drains_translator_continuations() {
     import_transcript(
         &transcript,
         ImportSource::Codex,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -216,8 +228,7 @@ async fn importing_antigravity_transcript_uses_the_production_translator() {
     import_transcript(
         &transcript,
         ImportSource::Antigravity,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -262,8 +273,7 @@ async fn antigravity_import_applies_checkpoint_only_to_following_llms() {
     import_transcript(
         &transcript,
         ImportSource::Antigravity,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -309,15 +319,6 @@ async fn antigravity_import_applies_checkpoint_only_to_following_llms() {
             .and_then(Value::as_str)
             == Some("newest response")
     }));
-}
-
-fn options(output: &std::path::Path) -> ServeOptions {
-    ServeOptions {
-        version: "test".into(),
-        translators: Arc::new(Registry::default_agents()),
-        sink_factory: Arc::new(DebugSinkFactory { dir: output.into() }),
-        auth_provider: None,
-    }
 }
 
 fn rows(path: &std::path::Path) -> Vec<Value> {
@@ -377,8 +378,7 @@ async fn attached_import_summary_reports_the_effective_parent_root() {
     let summaries = import_transcript(
         &transcript,
         ImportSource::Codex,
-        options(&tmp.path().join("spans")),
-        Some(config),
+        import_daemon::target(&tmp.path().join("spans"), Some(config)).await,
         false,
     )
     .await
@@ -410,21 +410,24 @@ async fn import_uses_the_same_span_plugin_stage() {
     import_transcript(
         &transcript,
         ImportSource::Codex,
-        options(&output),
-        Some(SessionConfig {
-            auth: BackendAuth {
-                token: String::new(),
-                api_url: None,
-                app_url: None,
-                org_name: None,
-                org_id: None,
-            },
-            destination: None,
-            flush_mode: FlushMode::FireAndForget,
-            additional_metadata: None,
-            tags: Default::default(),
-            span_plugins: vec![plugin],
-        }),
+        import_daemon::target(
+            &output,
+            Some(SessionConfig {
+                auth: BackendAuth {
+                    token: String::new(),
+                    api_url: None,
+                    app_url: None,
+                    org_name: None,
+                    org_id: None,
+                },
+                destination: None,
+                flush_mode: FlushMode::FireAndForget,
+                additional_metadata: None,
+                tags: Default::default(),
+                span_plugins: vec![plugin],
+            }),
+        )
+        .await,
         false,
     )
     .await
@@ -458,8 +461,7 @@ async fn imports_multiple_transcripts_in_one_invocation() {
     let summaries = import_transcripts(
         &[first, second],
         ImportSource::Claude,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
     )
     .await
     .unwrap();
@@ -512,8 +514,7 @@ async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace()
     import_transcript(
         &transcript,
         ImportSource::Claude,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -521,7 +522,9 @@ async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace()
 
     let rows = rows(&output.join("claude-parent.ndjson"));
     assert_eq!(inserted(&rows, "task"), 3, "session, turn, and subagent");
-    assert_eq!(inserted(&rows, "llm"), 3, "parent and child model calls");
+    // The subagent transcript is read in full: its handback and final reply
+    // are both model calls, alongside the parent's two.
+    assert_eq!(inserted(&rows, "llm"), 4, "parent and child model calls");
     assert_eq!(
         inserted(&rows, "tool"),
         2,
@@ -596,8 +599,7 @@ async fn importing_codex_parent_also_imports_its_subagent_into_the_same_trace() 
     import_transcript(
         &transcript,
         ImportSource::Codex,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -655,8 +657,7 @@ async fn imports_native_codex_rollout_through_codex_translator() {
     import_transcript(
         &transcript,
         ImportSource::Codex,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -752,15 +753,13 @@ async fn concurrent_imports_of_the_same_session_reach_independent_destinations()
         import_transcript(
             &transcript,
             ImportSource::Codex,
-            options(&project_a),
-            None,
+            import_daemon::target(&project_a, None).await,
             false
         ),
         import_transcript(
             &transcript,
             ImportSource::Codex,
-            options(&project_b),
-            None,
+            import_daemon::target(&project_b, None).await,
             false
         ),
     );
@@ -794,8 +793,7 @@ async fn imports_native_claude_transcript_with_multiple_turns_and_tools() {
     import_transcript(
         &transcript,
         ImportSource::Claude,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -847,8 +845,7 @@ async fn imports_claude_followups_as_sequential_turns_after_a_compact_summary() 
     import_transcript(
         &transcript,
         ImportSource::Claude,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -897,8 +894,7 @@ async fn imports_non_monotonic_claude_records_into_their_native_turns() {
     import_transcript(
         &transcript,
         ImportSource::Claude,
-        options(&output),
-        None,
+        import_daemon::target(&output, None).await,
         false,
     )
     .await
@@ -971,4 +967,118 @@ async fn imports_non_monotonic_claude_records_into_their_native_turns() {
         llm("msg-3").get("error").and_then(Value::as_str),
         Some("rate_limit_error")
     );
+}
+
+fn project(id: &str) -> SessionConfig {
+    SessionConfig {
+        auth: BackendAuth {
+            token: "test-token".into(),
+            api_url: None,
+            app_url: None,
+            org_name: None,
+            org_id: None,
+        },
+        destination: Some(TraceDestination::ProjectLogs {
+            project_id: Some(id.into()),
+            project_name: None,
+        }),
+        flush_mode: FlushMode::FireAndForget,
+        additional_metadata: None,
+        tags: Default::default(),
+        span_plugins: Vec::new(),
+    }
+}
+
+/// Span and trace ids of every delivered row.
+fn identities(rows: &[Value]) -> std::collections::BTreeSet<(String, String)> {
+    rows.iter()
+        .filter_map(|row| {
+            let row = row.get("Insert").or_else(|| row.get("Merge"))?;
+            Some((
+                row["span_id"].as_str()?.to_string(),
+                row["root_span_id"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// A session already imported into one destination is translated again from
+/// its start for another, so the second destination receives every span
+/// rather than only what the first import left undelivered.
+#[tokio::test]
+async fn importing_into_another_destination_delivers_the_whole_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"codex-second-destination","cwd":"/tmp/demo","cli_version":"1.2.3"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-test"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"list files"}}),
+            json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"command\":\"ls\"}"}}),
+            json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"README.md"}}),
+            json!({"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done"}}),
+        ],
+    );
+    // One daemon serves both imports.
+    let output = tmp.path().join("spans");
+    let path = output.join("codex-second-destination.ndjson");
+    import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        import_daemon::target(&output, Some(project("project-a"))).await,
+        false,
+    )
+    .await
+    .unwrap();
+    let first = rows(&path);
+    import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        import_daemon::target(&output, Some(project("project-b"))).await,
+        false,
+    )
+    .await
+    .unwrap();
+    let second = rows(&path)[first.len()..].to_vec();
+    assert_eq!(inserted(&second, "task"), 2, "session and one turn");
+    assert_eq!(inserted(&second, "tool"), 1);
+    assert_eq!(identities(&second), identities(&first));
+}
+
+/// Repeating a completed import translates it from fresh state again, so it
+/// reproduces the original span ids instead of opening new turns and a new
+/// trace for the same work.
+#[tokio::test]
+async fn repeating_a_claude_import_reuses_its_span_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("claude.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"type":"user","timestamp":"2026-01-01T00:00:01Z","sessionId":"claude-repeat","cwd":"/tmp/demo","version":"2.0.0","message":{"role":"user","content":"run it"}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:02Z","sessionId":"claude-repeat","requestId":"req-1","message":{"id":"msg-1","model":"claude-test","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":3}}}),
+            json!({"type":"user","timestamp":"2026-01-01T00:00:03Z","sessionId":"claude-repeat","message":{"role":"user","content":"again"}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:04Z","sessionId":"claude-repeat","requestId":"req-2","message":{"id":"msg-2","model":"claude-test","role":"assistant","content":[{"type":"text","text":"again done"}],"usage":{"input_tokens":12,"output_tokens":2}}}),
+        ],
+    );
+    let output = tmp.path().join("spans");
+    let path = output.join("claude-repeat.ndjson");
+    let import = || async {
+        import_transcript(
+            &transcript,
+            ImportSource::Claude,
+            import_daemon::target(&output, None).await,
+            false,
+        )
+        .await
+        .unwrap()
+    };
+    import().await;
+    let first = rows(&path);
+    import().await;
+    let second = rows(&path)[first.len()..].to_vec();
+    assert_eq!(inserted(&second, "task"), 3, "session and two turns");
+    assert_eq!(identities(&second), identities(&first));
 }

@@ -11,6 +11,13 @@ pub(super) const GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub(super) async fn collect_garbage(daemon: &Daemon) {
     collect_partitions(daemon, RETENTION).await;
+    // Imports deliver through the daemon, so ledgers written by earlier
+    // in-process imports hold nothing a current pipeline reads.
+    match tokio::fs::remove_dir_all(daemon.data_dir.join("delivery-ledger")).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(%error, "legacy delivery ledger cleanup failed"),
+    }
     journal::gc_old_journals(&daemon.data_dir, RETENTION).await;
     journal::gc_old_managed_runs(&daemon.data_dir, RETENTION).await;
     // Protect references from every retained input log, including completed

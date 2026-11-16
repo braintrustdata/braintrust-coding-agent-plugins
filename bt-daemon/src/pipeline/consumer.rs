@@ -6,7 +6,6 @@ use super::{
     Delivery, Stage,
 };
 use crate::{
-    delivery_ledger::{CommitFailure, LedgerSink},
     dispatch::Counters,
     sink::{Sink, SinkFactory},
     wire::{RecoveryInfo, SessionConfig, SessionRoute},
@@ -50,17 +49,8 @@ pub(crate) struct ConsumerOptions {
 impl ConsumerOptions {
     async fn sink(&self, config: &SessionConfig) -> anyhow::Result<RoutingSink> {
         let inner = self.factory.create(&self.session_id, &self.source)?;
-        let ledger = LedgerSink::new(
-            inner,
-            Some(&self.data_dir),
-            &self.source,
-            &self.session_id,
-            Some(config),
-            &self.version,
-        )
-        .await?;
         let mut sink = RoutingSink::spawn(
-            Box::new(ledger),
+            inner,
             self.source.clone(),
             self.session_id.clone(),
             self.data_dir.clone(),
@@ -149,7 +139,7 @@ impl ConsumerOptions {
         match work {
             Work::Resubmit => {
                 // Dropping unresolved obligations asks their source to replay.
-                // Recreate the consumed SDK batch and its in-memory ledger too.
+                // Recreate the consumed SDK batch too.
                 if let Some(previous) = sink.take() {
                     previous.shutdown().await;
                 }
@@ -164,13 +154,9 @@ impl ConsumerOptions {
                         Work::Flush,
                     )
                 })?;
-                sink.flush().await.map_err(|error| {
-                    if error.chain().any(|cause| cause.is::<CommitFailure>()) {
-                        self.storage(&error, attempt, Work::Flush)
-                    } else {
-                        self.routing(&error, config, attempt)
-                    }
-                })?;
+                sink.flush()
+                    .await
+                    .map_err(|error| self.routing(&error, config, attempt))?;
                 *self.permalink.lock() = sink.permalink();
                 if sink.has_pending_delivery() {
                     return Ok(false);
@@ -288,18 +274,10 @@ impl Consumer {
                     let mut stopped = false;
                     let result = async {
                         if sink.is_none() {
-                            sink = Some(options.sink(&current).await.map_err(|error| {
-                                if error.downcast_ref::<std::io::Error>().is_some()
-                                    || error.downcast_ref::<serde_json::Error>().is_some()
-                                {
-                                    let mut failure =
-                                        options.storage(&error, attempts, Work::Resubmit);
-                                    failure.0.boundary = Boundary::Ledger;
-                                    failure
-                                } else {
+                            sink =
+                                Some(options.sink(&current).await.map_err(|error| {
                                     options.routing(&error, &current, attempts)
-                                }
-                            })?);
+                                })?);
                         }
                         let routing = sink.as_mut().ok_or_else(|| {
                             options.storage(
@@ -327,6 +305,9 @@ impl Consumer {
                         }
                     }
                     .await;
+                    if result.is_ok() {
+                        options.counters.record(ops.iter().map(|op| op.as_ref()));
+                    }
                     pending.push_back(delivery.map(|_| ()));
                     if stopped {
                         pending.clear();
@@ -399,7 +380,6 @@ mod tests {
         accepted: AtomicU64,
         reject: AtomicBool,
         unauthorized: AtomicBool,
-        commit_fail: AtomicBool,
         defer_until: AtomicU64,
     }
     struct Factory(Arc<Recording>);
@@ -442,9 +422,6 @@ mod tests {
                 .into());
             }
             self.record.accepted.fetch_add(pending, Ordering::SeqCst);
-            if self.record.commit_fail.swap(false, Ordering::SeqCst) {
-                return Err(CommitFailure(anyhow::anyhow!("injected ledger failure")).into());
-            }
             Ok(())
         }
         fn has_pending_delivery(&self) -> bool {
@@ -669,29 +646,6 @@ mod tests {
         assert_eq!(record.submitted.load(Ordering::SeqCst), 129);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 129);
         assert_eq!(progress.pending(), 0);
-        consumer.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn ledger_recovery_does_not_resubmit_accepted_work() {
-        let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
-            .await
-            .unwrap();
-        stored(&journal).await;
-        let route = SessionRoute::default();
-        let record = Arc::new(Recording::default());
-        record.commit_fail.store(true, Ordering::SeqCst);
-        let (consumer, progress, error) = spawn(
-            journal.subscribe(&route, 0).await.unwrap(),
-            options(tmp.path(), &route, record.clone()),
-        );
-        wait_for(|| error.lock().is_some()).await;
-        assert_eq!(progress.completed(), 0);
-        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
-        wait_for(|| progress.completed() == 1).await;
-        assert_eq!(record.submitted.load(Ordering::SeqCst), 1);
-        assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
         consumer.shutdown().await;
     }
 

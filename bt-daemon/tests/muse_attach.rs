@@ -286,7 +286,6 @@ async fn native_active_session_detach_reattach_preserves_authoritative_completio
         "final import: {}",
         String::from_utf8_lossy(&imported.stderr)
     );
-    // The standalone debug importer has no destination-scoped delivery ledger.
     // Replays may emit identical upserts; they must retain their span identities.
     let identities = |rows: &[Value]| -> std::collections::BTreeSet<String> {
         rows.iter()

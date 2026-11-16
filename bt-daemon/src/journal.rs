@@ -305,6 +305,8 @@ pub enum ControlKind {
     Checkpoint,
     Finalize,
     Retire,
+    /// Discard translator state: the native source was rewritten.
+    Reset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

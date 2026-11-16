@@ -110,7 +110,7 @@ pub(super) enum InboxItem {
     #[serde(other)]
     Other,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub(super) struct Prompt {
     #[serde(default)]
     pub text: String,
@@ -119,11 +119,11 @@ pub(super) struct Prompt {
     #[serde(default)]
     pub skills: Vec<PromptSkill>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub(super) struct PromptSkill {
     pub name: String,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub(super) struct PromptFile {
     pub mime: String,
     pub data: String,
@@ -325,7 +325,7 @@ pub(super) struct Interrupted {
     pub reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub(super) struct Context {
     #[serde(rename = "sessionID")]
     pub session_id: String,
@@ -334,19 +334,19 @@ pub(super) struct Context {
     #[serde(default)]
     pub messages: Vec<ContextMessage>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub(super) struct ContextMessage {
     pub role: String,
     pub content: MessageContent,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 pub(super) enum MessageContent {
     Text(String),
     Parts(Vec<ContextPart>),
     Other(Value),
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 pub(super) enum ContextPart {
     Known(KnownContextPart),

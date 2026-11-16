@@ -31,7 +31,7 @@ use crate::ids;
 use crate::wire::Envelope;
 use regex::Regex;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -48,7 +48,7 @@ const CATCH_UP_BYTE_BUDGET: usize = 64 * 1024;
 // Codex hooks are triggers for the rollout reader. These partial types cover
 // the hook-owned correlation fields while preserving raw rollout JSON for the
 // separately bounded transcript reducer.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct SessionStartHook {
     #[serde(default)]
     source: Option<String>,
@@ -56,14 +56,14 @@ struct SessionStartHook {
     permission_mode: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CompactHook {
     turn_id: String,
     #[serde(default)]
     trigger: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct SubagentStartHook {
     agent_id: String,
     #[serde(default)]
@@ -73,7 +73,7 @@ struct SubagentStartHook {
 /// The stable outer shape of a rollout JSONL row. The payload deliberately
 /// stays untyped here: Codex adds response-item fields regularly and several
 /// handlers preserve those native objects in span input/output.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct RolloutRecord {
     #[serde(
         rename = "timestamp",
@@ -88,19 +88,19 @@ struct RolloutRecord {
 }
 
 /// Event and response rows use a second discriminator inside their payload.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct PayloadKind {
     #[serde(rename = "type", default)]
     kind: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct WorkingDirectoryPayload {
     #[serde(default)]
     cwd: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TurnContextPayload {
     #[serde(default)]
     model: Option<String>,
@@ -140,12 +140,12 @@ impl TranslatorFactory for crate::agents::Codex {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 enum ScopeKind {
     Main,
     Subagent,
 }
-
+#[derive(Serialize, Deserialize)]
 struct OpenTurn {
     turn_id: String,
     span_id: String,
@@ -157,12 +157,12 @@ struct OpenTurn {
     native_prompt_seen: bool,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 enum TurnInputSource {
     Native,
     Authoritative,
 }
-
+#[derive(Serialize, Deserialize)]
 struct OpenLlm {
     span_id: String,
     turn_id: String,
@@ -171,14 +171,14 @@ struct OpenLlm {
     output: Vec<Value>,
     output_preset: bool,
 }
-
+#[derive(Serialize, Deserialize)]
 struct OpenTool {
     span_id: String,
     turn_id: String,
     start_ms: i64,
     name: String,
 }
-
+#[derive(Serialize, Deserialize)]
 struct Scope {
     path: String,
     kind: ScopeKind,
@@ -212,7 +212,7 @@ impl Scope {
             .unwrap_or_else(|| turn_span_id.to_owned())
     }
 }
-
+#[derive(Serialize, Deserialize)]
 enum DeferredHook {
     None,
     PostToolUse(Value),
@@ -230,7 +230,7 @@ enum DeferredHook {
         ts: i64,
     },
 }
-
+#[derive(Serialize, Deserialize)]
 enum PendingWork {
     Hook {
         path: String,
@@ -246,7 +246,7 @@ enum PendingWork {
         finalize: bool,
     },
 }
-
+#[derive(Serialize, Deserialize)]
 struct CodexTranslator {
     session_id: String,
     /// The daemon-owned session row. Child spans always parent to this id.
@@ -268,6 +268,7 @@ struct CodexTranslator {
     compaction_trigger_by_turn: RecentMap<String, String>,
     compaction_spans: RecentSet<String>,
     pending: Option<PendingWork>,
+    #[serde(skip, default = "GitMetadataCache::shared")]
     git: Arc<GitMetadataCache>,
 }
 
@@ -2157,7 +2158,7 @@ fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
         .ok()
         .map(|dt| dt.timestamp_millis())
 }
-
+#[derive(Serialize, Deserialize)]
 struct ReadLines {
     lines: Vec<String>,
     complete: bool,

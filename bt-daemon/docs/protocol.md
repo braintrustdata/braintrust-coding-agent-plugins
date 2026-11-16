@@ -162,6 +162,35 @@ The result has the same shape as `session.flush`. The managed-run identifier is
 invocation-local and prevents the shared daemon from flushing unrelated agent
 sessions.
 
+### `import.finish` (request)
+
+Transcript import is a daemon client. It starts or upgrades the daemon exactly
+as hook capture does, sends every synthesized lifecycle event with `event.log`
+over one connection, then finishes each imported session with this request.
+`session_id` is the import run's daemon-side session (see Durability &
+idempotence), not the native session id.
+The daemon waits for those captures to reach every delivery route of the
+session matching `route`. With `finalize: true` it first closes the session's
+open spans, as a completed transcript does; `false` only flushes, as when
+`--attach` detaches. Params:
+```json
+{ "source": "codex", "session_id": "…", "route": { … }, "finalize": true, "timeout_ms": 120000 }
+```
+Result:
+```json
+{ "flushed": true, "pending": 0, "root_span_id": "…", "span_count": 12 }
+```
+`span_count` counts distinct spans the route has delivered since its actor
+started. An attached import reports its parent's root span. A session that
+was never accepted for delivery, for example because its credentials could not
+be resolved, is an error.
+
+### `import.reset` (request)
+
+`{ "source": "…", "session_id": "…" }`. The native transcript was rewritten
+rather than appended. After every earlier capture, translation for the source
+session restarts from fresh state; output already delivered is unaffected.
+
 ### `status.get` (request)
 
 Params: `{ "session_id": "…" }` (omit `session_id` for daemon-wide status).
@@ -258,14 +287,10 @@ version, `context.span_origin.<source>.version` is its coding-agent
 `source_version`, and `context.span_origin.bt.version` is the daemon version at
 span creation. `<source>` is the canonical name, such as `codex` or `claude-code`,
 not a literal `agent` key. Unknown plugin and agent versions are explicit JSON
-`null`; they never fall back to another component's version. The
-destination-scoped delivery ledger persists each snapshot before export; later
-updates, resume, and replay reuse it unchanged, even across upgrades.
-New snapshots and delivery acknowledgements are appended as NDJSON records,
-without rewriting prior entries. Recovery combines any legacy JSON checkpoint
-with those records and discards an incomplete final record from an interrupted write.
-A per-ledger OS file lock serializes state refresh, origin selection, tail repair,
-and append across daemon and import processes. SDK delivery runs outside the lock.
+`null`; they never fall back to another component's version. Translation
+records each snapshot in the session's SpanOp storage when its span is created,
+before delivery; later updates, resume, and replay reuse it unchanged, even
+across upgrades.
 New spans capture new snapshots instead of inheriting the root's versions.
 Provisional roots retain their original snapshot while waiting for work.
 An unmaterialized span replayed for a new destination uses its
@@ -279,7 +304,7 @@ translator. The Pi extension sends the running host package's version as
 `source_version` and its package name as `payload.host_name`. The translator records
 `metadata.host_name`; the session-root label remains `Pi` for every Pi-compatible host.
 
-For acknowledged spans from legacy ledgers without saved snapshots, stateless
+For spans an earlier daemon acknowledged without saving snapshots, stateless
 updates omit `context.span_origin` entirely, including SDK defaults and inherited
 parent origin fields. This preserves existing backend provenance without guessing
 historical versions; output, timing, and unrelated propagated context still merge
@@ -406,18 +431,26 @@ part of the envelope or journal schema.
 
 ## Durability & idempotence
 
-Journal recovery and explicit transcript import are separate operations.
-Recovery consumes the daemon's auth-redacted event WAL to rebuild state and
-may idempotently re-emit rows under their original deterministic ids. The
+Transcript import and hook capture share one pipeline. The
 `import <codex|claude> <session-id> [project_logs:<project-id> |
-experiment:<experiment-id>]` command instead locates the selected agent's
-native transcript and creates a trace for that past coding-agent session by
-routing synthetic lifecycle events through the regular translator. `--parent
+experiment:<experiment-id>]` command locates the selected agent's native
+transcript and captures synthetic lifecycle events with the daemon, which
+journals, translates and delivers them like hook events (see `import.finish`).
+Each import run captures into its own daemon-side session, separate from the
+native session's live capture and from earlier imports, and translates the
+native session from fresh state under the native session's identity. It
+therefore reproduces the native session's deterministic span ids and delivers
+every span to its destination, including one that already received the session
+elsewhere. Importing a session again re-delivers its rows under the same ids;
+an import older than what a destination already holds may replace newer
+content on the spans they share. Recovery replays the journal to rebuild state
+and may idempotently re-emit rows under their original deterministic ids.
+`--parent
 <SpanComponents>` attaches it below an exported span and is mutually exclusive
 with an object destination.
 
-`--attach` keeps a single translator and sink alive, tails new native records,
-and finalizes the active turn on Ctrl-C.
+`--attach` keeps capturing new native records as the transcript grows, and
+detaches on Ctrl-C without closing the native session's open spans.
 `run <codex|claude|opencode|pi> [ARGS...]` launches the selected agent with
 inherited stdio and injects its tracing integration for that invocation, so it
 works without plugin setup. Codex and Claude receive live hook configuration;
