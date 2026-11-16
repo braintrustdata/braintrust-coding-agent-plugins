@@ -334,6 +334,7 @@ dependencies = [
  "clap",
  "fs2",
  "libc",
+ "mime_guess",
  "muse-code-sdk",
  "parking_lot",
  "regex",

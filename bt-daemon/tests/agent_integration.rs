@@ -46,6 +46,17 @@ fn tool_command(marker: &str) -> String {
     }
 }
 
+fn image_attachment(value: &Value) -> Option<&Value> {
+    if value["type"] == "braintrust_attachment" && value["content_type"] == "image/png" {
+        return Some(value);
+    }
+    match value {
+        Value::Array(items) => items.iter().find_map(image_attachment),
+        Value::Object(fields) => fields.values().find_map(image_attachment),
+        _ => None,
+    }
+}
+
 fn row_contains(row: &Value, fragments: &[&str]) -> bool {
     let serialized = serde_json::to_string(row).expect("serialize trace row");
     fragments
@@ -419,17 +430,6 @@ async fn pi_session_emits_traces() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Pi 1.0.4+ and the packed Pi extension"]
 async fn pi_codemode_traces_nested_tools_and_images() {
-    fn image_attachment(value: &Value) -> Option<&Value> {
-        if value["type"] == "braintrust_attachment" && value["content_type"] == "image/png" {
-            return Some(value);
-        }
-        match value {
-            Value::Array(items) => items.iter().find_map(image_attachment),
-            Value::Object(fields) => fields.values().find_map(image_attachment),
-            _ => None,
-        }
-    }
-
     let inference = OpenAiMock::new(|_context, request| {
         if request.has_function_output("call_pi_cm") {
             return MockReply::response(OpenAiTurn::text("PI_MOCK_OK"));
@@ -535,6 +535,112 @@ async fn pi_codemode_traces_nested_tools_and_images() {
                     .is_some_and(|image| image["key"] == attachment["key"])
         }),
         "the following LLM span should retain the image attached by codemode"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the Codex CLI installed on PATH"]
+async fn codex_prompt_attachment_uploads() {
+    let inference = OpenAiMock::new(|_, _| MockReply::response(OpenAiTurn::text("CODEX_IMAGE_OK")));
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let image_path = world.workspace().join("tiny.png");
+    std::fs::write(&image_path, include_bytes!("fixtures/images/tiny.png")).unwrap();
+    let codex = CodexAgent::install(&world).await;
+    let output = codex
+        .run(
+            &world,
+            CodexRun::new("Describe the attached image.")
+                .mock_inference(inference_server.uri())
+                .arg("--image")
+                .arg(image_path)
+                .arg("--"),
+        )
+        .await;
+    output.assert_success();
+    if !world.uses_mock_inference() || !world.uses_mock_ingest() {
+        return;
+    }
+    let rows = world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new()
+                .expect("Codex turn image", |row| {
+                    row["span_attributes"]["type"] == "task"
+                        && image_attachment(&row["input"]).is_some()
+                })
+                .expect("Codex model image", |row| {
+                    row["span_attributes"]["type"] == "llm"
+                        && image_attachment(&row["input"]).is_some()
+                }),
+        )
+        .await;
+    let attachment = rows
+        .iter()
+        .find_map(|row| image_attachment(&row["input"]))
+        .unwrap();
+    assert_eq!(
+        world
+            .uploaded_attachment(attachment["key"].as_str().unwrap())
+            .as_deref(),
+        Some(include_bytes!("fixtures/images/tiny.png").as_slice())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the Claude Code CLI installed on PATH"]
+async fn claude_tool_attachment_uploads() {
+    let inference = AnthropicMock::new(|context, request| {
+        if context.request_index == 0 {
+            MockReply::response(AnthropicTurn::tool_use(
+                "image-read",
+                "Read",
+                json!({"file_path":"tiny.png"}),
+            ))
+        } else {
+            assert!(request.has_tool_result("image-read"));
+            MockReply::response(AnthropicTurn::text("CLAUDE_IMAGE_OK"))
+        }
+    });
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    std::fs::write(
+        world.workspace().join("tiny.png"),
+        include_bytes!("fixtures/images/tiny.png"),
+    )
+    .unwrap();
+    let output = ClaudeAgent::new(&world)
+        .run(
+            &world,
+            ClaudeRun::new("Read tiny.png and describe the image.")
+                .mock_inference(inference_server.uri()),
+        )
+        .await;
+    output.assert_success();
+    if !world.uses_mock_inference() || !world.uses_mock_ingest() {
+        return;
+    }
+    let rows = world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new()
+                .expect("Claude tool image", |row| {
+                    row["span_attributes"]["type"] == "tool"
+                        && image_attachment(&row["output"]).is_some()
+                })
+                .expect("Claude model image", |row| {
+                    row["span_attributes"]["type"] == "llm"
+                        && image_attachment(&row["input"]).is_some()
+                }),
+        )
+        .await;
+    let attachment = rows
+        .iter()
+        .find_map(|row| image_attachment(&row["output"]))
+        .unwrap();
+    assert_eq!(
+        world
+            .uploaded_attachment(attachment["key"].as_str().unwrap())
+            .as_deref(),
+        Some(include_bytes!("fixtures/images/tiny.png").as_slice())
     );
 }
 

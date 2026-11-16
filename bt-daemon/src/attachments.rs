@@ -24,6 +24,30 @@ impl Attachment {
     }
 }
 
+/// Recognize native attachment-bearing content without opening files or fetching URLs.
+pub(crate) fn contains(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.starts_with("data:") && text.contains(";base64,"),
+        Value::Array(items) => items.iter().any(contains),
+        Value::Object(fields) => {
+            matches!(
+                fields.get("type").and_then(Value::as_str),
+                Some(
+                    "image"
+                        | "document"
+                        | "file"
+                        | "input_file"
+                        | "input_image"
+                        | "image_url"
+                        | "audio"
+                        | "video"
+                )
+            ) || fields.values().any(contains)
+        }
+        _ => false,
+    }
+}
+
 /// Extract explicit inline media and native file blocks, preserving their position.
 /// Ordinary path strings and remote URLs are never dereferenced.
 pub(crate) fn capture(value: &mut Value, attachments: &mut Vec<Attachment>) {
@@ -31,18 +55,59 @@ pub(crate) fn capture(value: &mut Value, attachments: &mut Vec<Attachment>) {
         Value::String(url) if url.starts_with("data:") => decode_url(url),
         Value::Object(map) => {
             let kind = map.get("type").and_then(Value::as_str).unwrap_or_default();
-            if matches!(kind, "image" | "document") && map.get("source").is_some() {
-                let source = &map["source"];
-                source.get("data").and_then(Value::as_str).and_then(|data| {
-                    let mime = source.get("media_type")?.as_str()?;
+            if kind == "image" && map.get("file").is_some() {
+                let file = &map["file"];
+                file.get("base64").and_then(Value::as_str).and_then(|data| {
                     Some((
-                        mime.to_owned(),
+                        file.get("type")?.as_str()?.to_owned(),
                         base64::engine::general_purpose::STANDARD
                             .decode(data)
                             .ok()?,
                     ))
                 })
-            } else if matches!(kind, "image" | "file" | "audio" | "video" | "image_url") {
+            } else if kind == "input_file" {
+                map.get("file_data")
+                    .and_then(Value::as_str)
+                    .and_then(|data| {
+                        decode_url(data).or_else(|| {
+                            let mime = map
+                                .get("content_type")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| {
+                                    mime_guess::from_path(
+                                        map.get("filename")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default(),
+                                    )
+                                    .first_or_octet_stream()
+                                    .to_string()
+                                });
+                            Some((
+                                mime,
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(data)
+                                    .ok()?,
+                            ))
+                        })
+                    })
+            } else if matches!(kind, "image" | "document") && map.get("source").is_some() {
+                let source = &map["source"];
+                source.get("data").and_then(Value::as_str).and_then(|data| {
+                    let mime = source.get("media_type")?.as_str()?;
+                    let bytes = if source.get("type").and_then(Value::as_str) == Some("text") {
+                        data.as_bytes().to_vec()
+                    } else {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .ok()?
+                    };
+                    Some((mime.to_owned(), bytes))
+                })
+            } else if matches!(
+                kind,
+                "image" | "file" | "audio" | "video" | "image_url" | "input_image"
+            ) {
                 let mime = map
                     .get("mimeType")
                     .or_else(|| map.get("mime"))
@@ -80,6 +145,7 @@ pub(crate) fn capture(value: &mut Value, attachments: &mut Vec<Attachment>) {
         let filename = value
             .get("filename")
             .or_else(|| value.get("name"))
+            .or_else(|| value.get("title"))
             .and_then(Value::as_str)
             .unwrap_or("attachment")
             .to_owned();
@@ -168,6 +234,49 @@ mod tests {
         assert_eq!(value[0]["type"], "braintrust_attachment");
         assert_eq!(value[1]["content_type"], "image/png");
     }
+    #[test]
+    fn captures_native_documents_and_retains_unavailable_file_ids() {
+        for (mut value, mime, filename, bytes) in [
+            (
+                json!({"type":"image","file":{"type":"image/png","base64":"aW1hZ2UgYnl0ZXM="}}),
+                "image/png",
+                "attachment",
+                b"image bytes".to_vec(),
+            ),
+            (
+                json!({"type":"input_file","filename":"report.pdf","file_data":"cGRmIGJ5dGVz"}),
+                "application/pdf",
+                "report.pdf",
+                b"pdf bytes".to_vec(),
+            ),
+            (
+                json!({"type":"input_file","filename":"binary.custom","content_type":"application/x-custom","file_data":"AAEC/w=="}),
+                "application/x-custom",
+                "binary.custom",
+                vec![0, 1, 2, 255],
+            ),
+            (
+                json!({"type":"document","title":"notes.txt","source":{"type":"text","media_type":"text/plain","data":"raw notes"}}),
+                "text/plain",
+                "notes.txt",
+                b"raw notes".to_vec(),
+            ),
+        ] {
+            let mut attachments = Vec::new();
+            capture(&mut value, &mut attachments);
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].content_type, mime);
+            assert_eq!(attachments[0].filename, filename);
+            assert_eq!(attachments[0].data, bytes);
+        }
+        let mut opaque = json!({"type":"input_file","file_id":"hosted-file"});
+        let original = opaque.clone();
+        let mut attachments = Vec::new();
+        capture(&mut opaque, &mut attachments);
+        assert_eq!(opaque, original);
+        assert!(attachments.is_empty());
+    }
+
     #[test]
     fn local_image_urls_keep_the_native_content_type() {
         let dir = tempfile::tempdir().unwrap();

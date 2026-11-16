@@ -988,7 +988,7 @@ impl CodexTranslator {
         }));
     }
 
-    fn set_turn_input_image_message(
+    fn set_turn_input_message(
         &mut self,
         scope: &mut Scope,
         text: &str,
@@ -1091,7 +1091,7 @@ impl CodexTranslator {
             // response item, without the older `event_msg.user_message` row.
             // The task span must remain readable independently of its LLM input.
             if let Some(content) = multimodal_content {
-                self.set_turn_input_image_message(scope, &text, content, ops);
+                self.set_turn_input_message(scope, &text, content, ops);
             } else {
                 self.set_turn_input_text(scope, text.clone(), TurnInputSource::Native, ops);
             }
@@ -1259,6 +1259,7 @@ impl CodexTranslator {
             .get("output")
             .or_else(|| payload.get("result"))
             .cloned();
+        let output = output.map(structured_tool_output);
         let mut outcome = output
             .as_ref()
             .map(|output| tool_output::classify(&tool.name, output))
@@ -1737,13 +1738,8 @@ fn message_content(payload: &Value) -> (String, Option<Value>) {
     let Some(parts) = payload.get("content").and_then(Value::as_array) else {
         return (String::new(), None);
     };
-    let has_image = parts.iter().any(|part| {
-        matches!(
-            str_field(part, "type").as_deref(),
-            Some("input_image" | "image_url")
-        )
-    });
-    if !has_image {
+    let has_attachments = parts.iter().any(crate::attachments::contains);
+    if !has_attachments {
         return (
             parts
                 .iter()
@@ -1760,7 +1756,7 @@ fn message_content(payload: &Value) -> (String, Option<Value>) {
         .filter_map(|part| {
             let kind = str_field(part, "type");
             match kind.as_deref() {
-                Some("input_text") | Some("text") => {
+                Some("input_text") | Some("output_text") | Some("text") => {
                     let value = str_field(part, "text")?;
                     text.push_str(&value);
                     Some(json!({ "type": "text", "text": value }))
@@ -1787,7 +1783,7 @@ fn message_content(payload: &Value) -> (String, Option<Value>) {
                     }
                     Some(normalized)
                 }
-                _ => None,
+                _ => Some(part.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -1803,17 +1799,17 @@ fn llm_output(items: &[Value]) -> Value {
 }
 
 fn push_tool_result(scope: &mut Scope, call_id: Option<&str>, payload: &Value) {
-    let output = payload
-        .get("output")
-        .or_else(|| payload.get("result"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let content = match &output {
-        Value::String(text) => serde_json::from_str::<Value>(text)
-            .ok()
-            .filter(contains_image_data_url)
-            .unwrap_or_else(|| Value::String(text.clone())),
-        _ => Value::String(serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string())),
+    let output = structured_tool_output(
+        payload
+            .get("output")
+            .or_else(|| payload.get("result"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    let content = if output.is_string() || crate::attachments::contains(&output) {
+        output
+    } else {
+        Value::String(serde_json::to_string(&output).unwrap_or_else(|_| "null".to_string()))
     };
     scope.message_history.push(json!({
         "role": "tool",
@@ -1822,12 +1818,13 @@ fn push_tool_result(scope: &mut Scope, call_id: Option<&str>, payload: &Value) {
     }));
 }
 
-fn contains_image_data_url(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text.starts_with("data:image/") && text.contains(","),
-        Value::Array(values) => values.iter().any(contains_image_data_url),
-        Value::Object(values) => values.values().any(contains_image_data_url),
-        _ => false,
+fn structured_tool_output(output: Value) -> Value {
+    match &output {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(crate::attachments::contains)
+            .unwrap_or(output),
+        _ => output,
     }
 }
 

@@ -284,6 +284,9 @@ struct ClaudeTranslator {
     agent_origins: RecentMap<String, AgentOrigin>,
     /// User turn owning each turn or subagent span that can parent other spans.
     span_owners: RecentMap<String, String>,
+    /// Hierarchy for enriching earlier turns when their native attachments arrive late.
+    #[serde(default)]
+    turn_identities: RecentMap<String, (String, String)>,
     user_turn_ends: RecentMap<String, i64>,
     prompt_turns: RecentMap<String, Arc<String>>,
     pending_prompts: VecDeque<PendingPrompt>,
@@ -340,6 +343,7 @@ impl ClaudeTranslator {
             last_user_turn_id: None,
             agent_origins: RecentMap::default(),
             span_owners: RecentMap::default(),
+            turn_identities: RecentMap::default(),
             user_turn_ends: RecentMap::default(),
             tool_seq: 0,
             prompt_turns: RecentMap::default(),
@@ -579,6 +583,8 @@ impl ClaudeTranslator {
             turn_span_id: Some(owner.clone()),
             ..Default::default()
         }));
+        self.turn_identities
+            .insert(id.clone(), (self.root_span_id.clone(), parent_id.clone()));
         self.span_owners.insert(id.clone(), owner);
         let turn_id = Arc::new(id.clone());
         if let Some(prompt_id) = event.payload.get("prompt_id").and_then(Value::as_str) {
@@ -1045,7 +1051,7 @@ impl ClaudeTranslator {
             return None;
         };
         if matches!(pending.history, PendingHistory::Main) {
-            self.observe_record_turns(&records);
+            self.observe_record_turns(&records, ops);
         }
         let history = match &mut pending.history {
             PendingHistory::Main => std::mem::take(&mut self.main_history),
@@ -1130,7 +1136,7 @@ impl ClaudeTranslator {
 
     // Hooks may precede their native records by an entire execution. Resolve
     // each user record before propagating its owner through record ancestry.
-    fn observe_record_turns(&mut self, records: &[Value]) {
+    fn observe_record_turns(&mut self, records: &[Value], ops: &mut Vec<SpanOp>) {
         for record in records {
             let user_prompt = is_real_user_record(record)
                 && record.get("queueTranscriptOnly").and_then(Value::as_bool) != Some(true);
@@ -1148,6 +1154,34 @@ impl ClaudeTranslator {
                     .or_else(|| self.main_record_turn.clone())
             };
             let Some(owner) = owner else { continue };
+            if user_prompt {
+                if let Some(content) = record
+                    .pointer("/message/content")
+                    .filter(|content| crate::attachments::contains(content))
+                {
+                    let identity =
+                        self.turn_identities
+                            .get(owner.as_str())
+                            .cloned()
+                            .or_else(|| {
+                                self.turn
+                                    .as_ref()
+                                    .filter(|turn| turn.id == owner.as_str())
+                                    .map(|turn| (self.root_span_id.clone(), turn.parent_id.clone()))
+                            });
+                    if let Some((root_span_id, parent_id)) = identity {
+                        ops.push(SpanOp::Merge(SpanRow {
+                            span_id: owner.to_string(),
+                            root_span_id,
+                            parent_span_ids: vec![parent_id],
+                            input: Some(content.clone()),
+                            turn_span_id: self.owner_of(owner.as_str()),
+                            ..Default::default()
+                        }));
+                    }
+                }
+            }
+
             if let Some(uuid) = record.get("uuid").and_then(Value::as_str) {
                 self.record_turns.insert(uuid.to_owned(), owner.clone());
             }
@@ -1900,7 +1934,7 @@ fn prompt_matches(prompt: &Value, content: &Value) -> bool {
         };
         remaining = rest;
     }
-    has_text && remaining.is_empty()
+    remaining.is_empty() && (has_text || crate::attachments::contains(content))
 }
 
 fn is_real_user_record(record: &Value) -> bool {

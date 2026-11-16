@@ -26,6 +26,7 @@ expect_used = "deny"
 braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "27f6721e56611d776e12e4cfc81dd1ad5ecd7af4" }
 braintrust-api-client = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "7bce1223fd46bbfc7993fdd38558ed8f05d9782f" }
 base64 = "0.22"
+mime_guess = "2"
 anyhow = "1"
 muse-code-sdk = "=1.4.12"
 parking_lot = "0.12"
