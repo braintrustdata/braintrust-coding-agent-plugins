@@ -1,6 +1,7 @@
 //! Startup recovery of journaled events the previous daemon did not finish.
 
 use super::*;
+use futures::TryStreamExt;
 
 pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<PendingEvent> {
     let pending: Vec<PendingEvent> = daemon
@@ -59,7 +60,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
                 );
             }
         }
-        while let Ok(Some(entry)) = reader.next().await {
+        while let Ok(Some(entry)) = reader.try_next().await {
             let through = entry.id;
             match entry.record {
                 EventRecord::Event(redacted) => {

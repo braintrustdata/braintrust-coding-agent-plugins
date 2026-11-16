@@ -24,7 +24,7 @@ static CLOSING: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Default
 
 struct Inner {
     path: PathBuf,
-    connection: std::sync::Mutex<Option<Connection>>,
+    connection: Mutex<Option<Connection>>,
     channel: super::span_ops::Channel,
 }
 
@@ -44,11 +44,7 @@ impl Drop for Inner {
 
 impl Inner {
     fn close(&mut self) {
-        let connection = match self.connection.get_mut() {
-            Ok(connection) => connection.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some(connection) = connection {
+        if let Some(connection) = self.connection.get_mut().take() {
             // Reclaim a bounded number of free pages and leave no WAL behind.
             if let Err(error) = connection
                 .execute_batch("PRAGMA incremental_vacuum(256); PRAGMA wal_checkpoint(TRUNCATE)")
@@ -91,7 +87,7 @@ impl SessionStorage {
         }
         let inner = Arc::new(Inner {
             path: path.clone(),
-            connection: std::sync::Mutex::new(Some(connection)),
+            connection: Mutex::new(Some(connection)),
             channel: super::span_ops::Channel::new(tail),
         });
         open.retain(|_, inner| inner.strong_count() > 0);
@@ -114,10 +110,7 @@ impl SessionStorage {
     ) -> anyhow::Result<R> {
         let inner = self.0.clone();
         tokio::task::spawn_blocking(move || {
-            let mut connection = inner
-                .connection
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session storage lock poisoned"))?;
+            let mut connection = inner.connection.lock();
             operation(
                 connection
                     .as_mut()
@@ -130,10 +123,7 @@ impl SessionStorage {
     /// Hold the storage lock, blocking every operation until released.
     #[cfg(test)]
     pub fn lock_storage(&self) -> impl Drop + '_ {
-        match self.0.connection.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        self.0.connection.lock()
     }
 
     /// One immediate transaction: writers acquire the lock before reading.

@@ -2,6 +2,7 @@
 //! watchdog, and draining on shutdown.
 
 use super::*;
+use futures::TryStreamExt;
 
 /// How long recovery state is kept on disk.
 pub(super) const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -173,8 +174,9 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
             continue;
         };
         mirrors(&identity.payload, &mut protected);
-        let mut reader = session.read(0, session.status().await?.event_tail);
-        while let Some(event) = reader.next_event().await? {
+        let tail = session.status().await?.event_tail;
+        let mut events = std::pin::pin!(session.read(0, tail).events());
+        while let Some(event) = events.try_next().await? {
             mirrors(&event.payload, &mut protected);
         }
         let env = journal::envelope_from_redacted(identity);
@@ -473,11 +475,14 @@ mod tests {
                 .unwrap()
                 .unwrap()
         );
-        let mut reader = events.read(0, events.status().await.unwrap().event_tail);
-        let mut captured = Vec::new();
-        while let Some(event) = reader.next_event().await.unwrap() {
-            captured.push(event.event);
-        }
+        let tail = events.status().await.unwrap().event_tail;
+        let captured: Vec<_> = events
+            .read(0, tail)
+            .events()
+            .map_ok(|event| event.event)
+            .try_collect()
+            .await
+            .unwrap();
         assert!(captured.iter().any(|event| event == "next"));
         assert!(daemon.translations.lock().is_empty());
         assert!(

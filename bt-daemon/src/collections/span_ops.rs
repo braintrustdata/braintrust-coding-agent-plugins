@@ -173,14 +173,12 @@ pub(super) fn prune(db: &Connection) -> anyhow::Result<()> {
 /// Heads selected by `filter` that are the same route as `route`, by key.
 fn same_heads(db: &Connection, filter: &str, route: &SessionRoute) -> anyhow::Result<Vec<String>> {
     let mut query = db.prepare(&format!("SELECT route FROM heads WHERE {filter}"))?;
-    let mut matching = Vec::new();
-    for key in query.query_map([], |r| r.get::<_, String>(0))? {
-        let key = key?;
-        if serde_json::from_str::<SessionRoute>(&key)?.same_route(route) {
-            matching.push(key);
-        }
-    }
-    Ok(matching)
+    let matching = query.query_and_then([], |r| {
+        let key: String = r.get(0)?;
+        let head: SessionRoute = serde_json::from_str(&key)?;
+        anyhow::Ok(head.same_route(route).then_some(key))
+    })?;
+    matching.filter_map(Result::transpose).collect()
 }
 
 /// One input event's complete translation.

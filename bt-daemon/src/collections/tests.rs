@@ -5,6 +5,7 @@ use super::*;
 use crate::journal::{journal_path, source_journal_path};
 use crate::translate::{SpanOp, SpanRow};
 use crate::wire::Envelope;
+use futures::TryStreamExt;
 use serde_json::json;
 
 fn event(source: &str, session: &str, name: &str, payload: serde_json::Value) -> Envelope {
@@ -84,13 +85,14 @@ async fn capture_stores_only_the_pi_fields_translation_reads() {
     ] {
         assert!(!text.contains(marker), "{marker} reached storage");
     }
-    let mut reader = events.read(0, events.status().await.unwrap().event_tail);
-    let update = reader.next_event().await.unwrap().unwrap();
+    let tail = events.status().await.unwrap().event_tail;
+    let mut reader = std::pin::pin!(events.read(0, tail).events());
+    let update = reader.try_next().await.unwrap().unwrap();
     assert_eq!(
         update.payload.pointer("/event/assistantMessageEvent/type"),
         Some(&json!("text_delta"))
     );
-    let request = reader.next_event().await.unwrap().unwrap();
+    let request = reader.try_next().await.unwrap().unwrap();
     assert_eq!(
         request.payload.pointer("/event/payload"),
         Some(&json!({
@@ -124,9 +126,9 @@ async fn legacy_import_keeps_byte_positions_expands_pi_history_and_deletes_the_f
     let through = events.status().await.unwrap().event_tail;
     assert_eq!(through, bytes.len() as u64 - 11);
     let mut reader = events.read(0, through);
-    let entry = reader.next().await.unwrap().unwrap();
+    let entry = reader.try_next().await.unwrap().unwrap();
     assert_eq!(entry.id, boundary);
-    let entry = reader.next().await.unwrap().unwrap();
+    let entry = reader.try_next().await.unwrap().unwrap();
     let EventRecord::Event(context) = entry.record else {
         panic!("expected an event")
     };
@@ -134,7 +136,7 @@ async fn legacy_import_keeps_byte_positions_expands_pi_history_and_deletes_the_f
         context.payload.pointer("/event/messages"),
         Some(&json!([{"role":"user","content":"a"},{"role":"user","content":"b"}]))
     );
-    assert!(reader.next().await.unwrap().is_none());
+    assert!(reader.try_next().await.unwrap().is_none());
     let appended = events
         .append(&event("pi", "session", "context", json!({})), None)
         .await
@@ -186,9 +188,15 @@ async fn a_session_only_journal_splits_by_source_and_keeps_its_namespace_owner()
         .unwrap();
     for (events, source, owner) in [(&codex, "codex", true), (&claude, "claude", false)] {
         assert_eq!(events.status().await.unwrap().legacy_namespace, owner);
-        let mut reader = events.read(0, events.status().await.unwrap().event_tail);
-        assert_eq!(reader.next_event().await.unwrap().unwrap().source, source);
-        assert!(reader.next_event().await.unwrap().is_none());
+        let tail = events.status().await.unwrap().event_tail;
+        let sources: Vec<_> = events
+            .read(0, tail)
+            .events()
+            .map_ok(|event| event.source)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(sources, [source]);
     }
 }
 

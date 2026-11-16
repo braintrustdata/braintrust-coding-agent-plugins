@@ -8,9 +8,14 @@
 use super::store::{read_batch, Json, One, SessionStorage, NOW_MS};
 use crate::pipeline::input::{PipelineControl, SourcePosition};
 use crate::wire::RedactedEnvelope;
+use futures::{future::BoxFuture, ready, Stream, TryStreamExt};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 const READ_RECORDS: usize = 32;
 const READ_BYTES: usize = 256 * 1024;
@@ -155,10 +160,11 @@ impl SessionStorage {
     /// changes membership; only a committed translation removes records.
     pub fn read(&self, after: u64, through: u64) -> EventReader {
         EventReader {
-            session: self.clone(),
+            storage: self.clone(),
             position: after,
             through,
             buffer: VecDeque::new(),
+            fetch: None,
         }
     }
 }
@@ -225,16 +231,22 @@ fn insert(tx: &rusqlite::Transaction<'_>, stored: Stored) -> anyhow::Result<Sour
     Ok(SourcePosition { before, through })
 }
 
-/// Ordered, batched reader over a range of event records.
+type Batch = VecDeque<(u64, serde_json::Result<EventRecord>)>;
+
+/// An ordered stream of the event records in a range, fetched in batches.
+/// It ends at the end of the range; [`extend`](Self::extend) lets it
+/// continue as later records arrive.
 pub(crate) struct EventReader {
-    session: SessionStorage,
+    storage: SessionStorage,
     position: u64,
     through: u64,
-    /// Each record decoded, or why it could not be.
-    buffer: VecDeque<(u64, serde_json::Result<EventRecord>)>,
+    /// Each fetched record decoded, or why it could not be.
+    buffer: Batch,
+    fetch: Option<BoxFuture<'static, anyhow::Result<Batch>>>,
 }
 
 impl EventReader {
+    /// The ID of the last record read.
     pub fn position(&self) -> u64 {
         self.position
     }
@@ -243,11 +255,21 @@ impl EventReader {
         self.through = self.through.max(through);
     }
 
-    pub async fn next(&mut self) -> anyhow::Result<Option<EventEntry>> {
-        if self.buffer.is_empty() && self.position < self.through {
-            let (after, through) = (self.position, self.through);
-            self.buffer = self
-                .session.run(move |db| {
+    /// The native events, skipping controls.
+    pub fn events(self) -> impl Stream<Item = anyhow::Result<RedactedEnvelope>> {
+        self.try_filter_map(|entry| async move {
+            Ok(match entry.record {
+                EventRecord::Event(event) => Some(event),
+                EventRecord::Control(_) => None,
+            })
+        })
+    }
+
+    fn fetch(&self) -> BoxFuture<'static, anyhow::Result<Batch>> {
+        let (storage, after, through) = (self.storage.clone(), self.position, self.through);
+        Box::pin(async move {
+            let batch = storage
+                .run(move |db| {
                     read_batch(
                         db,
                         "SELECT id,control,value FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
@@ -264,31 +286,45 @@ impl EventReader {
                         },
                     )
                 })
-                .await?
-                .into();
-        }
-        let Some((id, record)) = self.buffer.pop_front() else {
-            return Ok(None);
-        };
-        let record = match record {
-            Ok(record) => record,
-            Err(error) => {
-                self.buffer.clear();
-                return Err(anyhow::Error::new(error).context(format!("event record {id}")));
-            }
-        };
-        self.position = id;
-        Ok(Some(EventEntry { id, record }))
+                .await?;
+            Ok(batch.into())
+        })
     }
+}
 
-    /// The next native event, skipping controls.
-    pub async fn next_event(&mut self) -> anyhow::Result<Option<RedactedEnvelope>> {
-        while let Some(entry) = self.next().await? {
-            if let EventRecord::Event(event) = entry.record {
-                return Ok(Some(event));
-            }
+impl Stream for EventReader {
+    type Item = anyhow::Result<EventEntry>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.buffer.is_empty() && this.position < this.through {
+            let fetch = match this.fetch.take() {
+                Some(fetch) => fetch,
+                None => this.fetch(),
+            };
+            let fetch = this.fetch.insert(fetch);
+            let batch = ready!(fetch.as_mut().poll(cx));
+            this.fetch = None;
+            this.buffer = match batch {
+                Ok(batch) => batch,
+                Err(error) => return Poll::Ready(Some(Err(error))),
+            };
         }
-        Ok(None)
+        let Some((id, record)) = this.buffer.pop_front() else {
+            return Poll::Ready(None);
+        };
+        Poll::Ready(Some(match record {
+            Ok(record) => {
+                this.position = id;
+                Ok(EventEntry { id, record })
+            }
+            Err(error) => {
+                // Leave the position at the last good record, so a retry
+                // reads the undecodable record again.
+                this.buffer.clear();
+                Err(anyhow::Error::new(error).context(format!("event record {id}")))
+            }
+        }))
     }
 }
 

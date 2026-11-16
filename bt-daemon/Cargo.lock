@@ -307,6 +307,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
+ "futures",
  "libc",
  "muse-code-sdk",
  "parking_lot",

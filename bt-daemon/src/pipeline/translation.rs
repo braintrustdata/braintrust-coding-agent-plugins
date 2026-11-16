@@ -14,6 +14,7 @@ use crate::{
     translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, WeakOrigins},
     wire::{SessionConfig, SessionRoute},
 };
+use futures::TryStreamExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -580,7 +581,7 @@ impl Producer {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("recovery reader is missing"))?;
         reader.extend(through);
-        let Some(entry) = reader.next().await? else {
+        let Some(entry) = reader.try_next().await? else {
             return Ok(None);
         };
         let event = match entry.record {

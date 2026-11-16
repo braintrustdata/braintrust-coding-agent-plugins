@@ -3,6 +3,7 @@
 //! the journals as overflow when the queue is full.
 
 use super::*;
+use futures::TryStreamExt;
 use std::collections::VecDeque;
 /// Captures remain ordered and bounded. Evicted entries are
 /// already durable; their source journal's high-water mark is replayed first.
@@ -116,7 +117,7 @@ async fn next_evicted_event(
     while reader.position() < through {
         let before = reader.position();
         let entry = reader
-            .next()
+            .try_next()
             .await?
             .ok_or_else(|| anyhow::anyhow!("replay range ends inside a record"))?;
         anyhow::ensure!(entry.id <= through, "invalid replay end boundary");
