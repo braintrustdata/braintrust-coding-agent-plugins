@@ -322,6 +322,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+      # Keep Windows PDBs below MSVC's size limit while retaining source
+      # locations for test failure backtraces.
+      - name: Limit Windows debug information
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_TEST_DEBUG=line-tables-only" >> "$GITHUB_ENV"
       - name: Install Rust
         uses: ./.github/actions/setup-rust
         with:
