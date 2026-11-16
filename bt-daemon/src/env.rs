@@ -30,7 +30,11 @@ pub(crate) const DEPRECATED_BT_ENV_VARS: &[&str] = &[
 /// Variables that tune the trace daemon itself rather than what it traces.
 /// The prefix test below holds every `BT_*` name to this list.
 #[cfg(test)]
-pub(crate) const DAEMON_TUNING_ENV_VARS: &[&str] = &[crate::serve_log::MAX_MB_ENV];
+pub(crate) const DAEMON_TUNING_ENV_VARS: &[&str] = &[
+    crate::daemon_log::MAX_MB_ENV,
+    crate::daemon_log::LEVEL_ENV,
+    crate::daemon_log::STDERR_LEVEL_ENV,
+];
 
 pub(crate) fn canonical_env_name(deprecated: &str) -> String {
     let name = deprecated.strip_prefix("BT_").unwrap_or(deprecated);

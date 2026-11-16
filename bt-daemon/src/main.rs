@@ -229,15 +229,18 @@ fn host_info() -> HostInfo {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+    // `serve` logs as the embedded daemon does; other development commands
+    // log to standard error.
+    if !matches!(cli.command, Command::Serve { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
     match cli.command {
         Command::Serve {
             args,
@@ -246,6 +249,7 @@ async fn main() {
             app_url,
         } => {
             let data_dir = paths::data_dir(args.data_dir.as_deref());
+            bt_daemon::init_daemon_logging(&data_dir, false);
             let mut opts = if debug_sink {
                 debug_serve_options(VERSION, &data_dir)
             } else {

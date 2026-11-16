@@ -211,15 +211,12 @@ fn host_info(host: &TraceHostContext) -> HostInfo {
     }
 }
 
-fn init_daemon_logging(verbose: bool) {
-    let fallback = if verbose { "debug" } else { "info" };
-    let filter = tracing_subscriber::EnvFilter::new(fallback);
-    if let Err(error) = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init()
-    {
-        eprintln!("bt trace daemon logging unavailable: {error}");
+fn init_daemon_logging(data_dir: Option<&std::path::Path>, verbose: bool) {
+    let data_dir = paths::data_dir(data_dir);
+    if !crate::daemon_log::init(&data_dir, verbose) {
+        // A host installed a process-wide subscriber first; it can only be
+        // set once, so the daemon's events stay with the host's.
+        tracing::warn!("a logging subscriber is already installed; daemon logs go to it");
     }
 }
 
@@ -688,7 +685,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             print_output(output, host.output_format)
         }
         TraceCommand::Daemon(serve_args) => {
-            init_daemon_logging(host.verbose);
+            init_daemon_logging(serve_args.data_dir.as_deref(), host.verbose);
             run_serve(serve_args, serve_options(&host)).await
         }
         TraceCommand::Hook(hook_args) => {
