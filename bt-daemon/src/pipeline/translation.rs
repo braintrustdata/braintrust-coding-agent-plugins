@@ -980,6 +980,43 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn every_agent_resumes_from_saved_state_at_every_native_boundary() {
+        let registry = crate::translate::Registry::default_agents();
+        let mut covered = Vec::new();
+        for (agent, events, _files) in streams::native_streams() {
+            covered.push(agent.clone());
+            let ctx = crate::translate::SessionCtx {
+                session_id: "checkpoint".into(),
+                config: None,
+            };
+            let translate = |split: Option<usize>| {
+                let mut translator = registry.create(&agent, "checkpoint");
+                let mut ops = Vec::new();
+                for (index, event) in events.iter().enumerate() {
+                    if split == Some(index) {
+                        let state = translator.save_state().unwrap();
+                        translator = registry.create(&agent, "checkpoint");
+                        translator.restore_state(&state).unwrap();
+                    }
+                    ops.extend(translator.handle(event, &ctx).unwrap());
+                }
+                ops.extend(translator.flush(&ctx).unwrap());
+                serde_json::to_value(ops).unwrap()
+            };
+            let expected = translate(None);
+            for split in 1..events.len() {
+                assert_eq!(translate(Some(split)), expected, "{agent} split {split}");
+            }
+        }
+        covered.sort();
+        covered.dedup();
+        assert_eq!(
+            covered,
+            crate::translate::Registry::default_agents().sources()
+        );
+    }
+
     #[tokio::test]
     async fn every_agent_recovers_equivalent_spans_at_every_native_boundary() {
         let mut covered = Vec::new();
