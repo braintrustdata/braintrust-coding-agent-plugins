@@ -296,6 +296,14 @@ echo '{"session_id":"s1","hook_event_name":"Stop"}'         | ./bt-daemon/target
 ```
 
 The first `hook` spawns the daemon detached; it idles out after 5 minutes.
+The daemon logs newline-delimited JSON to `daemon.log` in the data directory
+at `debug`, and plain text to standard error at `warn` (`debug` with
+`--verbose`). A spawned daemon's standard error is `serve.log`, so that file
+holds only warnings and anything printed before logging starts.
+`BT_TRACE_LOG_LEVEL` and `BT_TRACE_STDERR_LEVEL` override either filter in
+`RUST_LOG` syntax. Each file is renamed to `<name>.1`, replacing the previous
+generation, once it would pass 10 MiB (`BT_TRACE_LOG_MAX_MB`), so the two
+together hold the latest log in order.
 
 `import <codex|claude|antigravity|muse> <session-id>` has a different purpose from restart
 recovery. It locates the native transcript in the selected agent's standard
