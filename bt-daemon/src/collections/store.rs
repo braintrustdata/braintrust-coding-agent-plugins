@@ -1,6 +1,4 @@
-//! The only owner of SQLite connections. Every collection stored in one session
-//! database shares one connection, so a multi-collection transfer is a single
-//! local transaction and closing the last handle releases the file.
+//! The only owner of SQLite connections.
 use parking_lot::Mutex;
 use rusqlite::{
     types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef},
@@ -64,15 +62,19 @@ impl Inner {
     }
 }
 
+/// One source session's database. Every handle on the same file shares one
+/// connection, so a transfer between its collections is a single local
+/// transaction and closing the last handle releases the file.
 #[derive(Clone)]
-pub(super) struct Store(Arc<Inner>);
+pub(crate) struct SessionStorage(Arc<Inner>);
 
-impl Store {
-    /// Open (or share) the database at `path`, creating and upgrading its schema.
-    pub async fn open(path: &Path) -> anyhow::Result<Self> {
+impl SessionStorage {
+    /// Open (or share) the database at `path`, creating and upgrading its
+    /// schema, without claiming it for a source session.
+    pub async fn at(path: &Path) -> anyhow::Result<Self> {
         let path = normalize(path).await?;
-        if let Some(store) = Self::shared(&path) {
-            return Ok(store);
+        if let Some(storage) = Self::shared(&path) {
+            return Ok(storage);
         }
         let opened = path.clone();
         let (connection, tail) = tokio::task::spawn_blocking(move || {
@@ -98,7 +100,7 @@ impl Store {
     }
 
     /// Live delivery state shared by every handle on this database.
-    pub fn channel(&self) -> &super::span_ops::Channel {
+    pub(super) fn channel(&self) -> &super::span_ops::Channel {
         &self.0.channel
     }
 
@@ -106,7 +108,7 @@ impl Store {
         OPEN.lock().get(path).and_then(Weak::upgrade).map(Self)
     }
 
-    pub async fn run<R: Send + 'static>(
+    pub(super) async fn run<R: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Connection) -> anyhow::Result<R> + Send + 'static,
     ) -> anyhow::Result<R> {
@@ -125,8 +127,9 @@ impl Store {
         .await?
     }
 
+    /// Hold the storage lock, blocking every operation until released.
     #[cfg(test)]
-    pub fn lock(&self) -> std::sync::MutexGuard<'_, Option<Connection>> {
+    pub fn lock_storage(&self) -> impl Drop + '_ {
         match self.0.connection.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -134,7 +137,7 @@ impl Store {
     }
 
     /// One immediate transaction: writers acquire the lock before reading.
-    pub async fn write<R: Send + 'static>(
+    pub(super) async fn write<R: Send + 'static>(
         &self,
         operation: impl FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<R> + Send + 'static,
     ) -> anyhow::Result<R> {
@@ -146,30 +149,31 @@ impl Store {
         })
         .await
     }
-}
 
-/// Delete a database and its sidecars only if no handle is open in this
-/// process. Holding the registry lock keeps a concurrent open from racing it.
-pub(super) async fn remove(path: &Path) -> anyhow::Result<bool> {
-    let path = normalize(path).await?;
-    let open = OPEN.lock();
-    if open
-        .get(&path)
-        .is_some_and(|inner| inner.strong_count() > 0)
-        || CLOSING.lock().contains_key(&path)
-    {
-        return Ok(false);
-    }
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = path.clone().into_os_string();
-        file.push(suffix);
-        match std::fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+    /// Delete a session database and its sidecars only if no handle is open
+    /// in this process. Holding the registry lock keeps a concurrent open
+    /// from racing it.
+    pub async fn remove(path: &Path) -> anyhow::Result<bool> {
+        let path = normalize(path).await?;
+        let open = OPEN.lock();
+        if open
+            .get(&path)
+            .is_some_and(|inner| inner.strong_count() > 0)
+            || CLOSING.lock().contains_key(&path)
+        {
+            return Ok(false);
         }
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(true)
     }
-    Ok(true)
 }
 
 async fn normalize(path: &Path) -> anyhow::Result<PathBuf> {

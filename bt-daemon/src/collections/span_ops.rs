@@ -3,8 +3,7 @@
 //! Routes receive ops live, or read them back after a gap. A route removes
 //! ops from its view by advancing its head once a destination accepts them,
 //! and an op is deleted when every route has passed it.
-use super::session::SessionStorage;
-use super::store::{read_batch, Json, One, NOW_MS};
+use super::store::{read_batch, Json, One, SessionStorage, NOW_MS};
 use crate::{
     pipeline::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW},
     translate::{OriginSnapshot, SinkFields, SpanOp, SpanRow, SpanType},
@@ -197,13 +196,6 @@ pub(crate) struct Translated {
     pub state: Option<Vec<u8>>,
 }
 
-/// One stored op read back for delivery.
-pub(crate) struct StoredRecord {
-    pub position: u64,
-    pub op: SpanOp,
-    pub bytes: usize,
-}
-
 /// A head that is held by a failure and may accept corrected settings.
 pub(crate) struct HeldRoute {
     pub route: SessionRoute,
@@ -260,36 +252,31 @@ impl Channel {
 }
 
 impl SessionStorage {
-    fn channel(&self) -> &Channel {
-        self.store.channel()
-    }
-
     /// Stored ops after `after`, bounded by bytes and elapsed decode time.
     pub async fn read_after(
         &self,
         after: u64,
         budget: usize,
         window: std::time::Duration,
-    ) -> anyhow::Result<Vec<StoredRecord>> {
-        self.store
-            .run(move |db| {
-                read_batch(
-                    db,
-                    "SELECT position,value FROM ops WHERE position>? ORDER BY position",
-                    [after],
-                    1,
-                    budget,
-                    window,
-                    |row, value| {
-                        Ok(StoredRecord {
-                            position: row.get(0)?,
-                            op: StoredOp::decode(value)?,
-                            bytes: value.len(),
-                        })
-                    },
-                )
-            })
-            .await
+    ) -> anyhow::Result<Vec<Record>> {
+        self.run(move |db| {
+            read_batch(
+                db,
+                "SELECT position,value FROM ops WHERE position>? ORDER BY position",
+                [after],
+                1,
+                budget,
+                window,
+                |row, value| {
+                    Ok(Record {
+                        position: row.get(0)?,
+                        op: SharedOp::new(StoredOp::decode(value)?),
+                        bytes: value.len(),
+                    })
+                },
+            )
+        })
+        .await
     }
 
     /// Ops after `after` for a route that fell behind the live feed. One
@@ -319,16 +306,7 @@ impl SessionStorage {
                 return Ok(shared);
             }
         }
-        let records: Vec<Record> = self
-            .read_after(after, BYTE_BUDGET, WINDOW)
-            .await?
-            .into_iter()
-            .map(|record| Record {
-                position: record.position,
-                op: SharedOp::new(record.op),
-                bytes: record.bytes,
-            })
-            .collect();
+        let records = self.read_after(after, BYTE_BUDGET, WINDOW).await?;
         #[cfg(test)]
         self.channel()
             .payload_reads
@@ -347,7 +325,6 @@ impl SessionStorage {
         let key = serde_json::to_string(route)?;
         let candidate = route.clone();
         let position = self
-            .store
             .write(move |tx| {
                 // Auth can register a named-profile obligation before learning
                 // its stable ID. Move that unresolved placeholder to the resolved
@@ -387,37 +364,35 @@ impl SessionStorage {
     pub async fn register(&self, route: &SessionRoute) -> anyhow::Result<()> {
         let key = serde_json::to_string(route)?;
         let candidate = route.clone();
-        self.store
-            .write(move |tx| {
-                if same_heads(tx, "1", &candidate)?.is_empty() {
-                    tx.execute(
-                        &format!(
-                            "INSERT OR IGNORE INTO heads(route,position,progress_ms)
+        self.write(move |tx| {
+            if same_heads(tx, "1", &candidate)?.is_empty() {
+                tx.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO heads(route,position,progress_ms)
                              VALUES (?,(SELECT op_tail FROM session WHERE id=1),{NOW_MS})"
-                        ),
-                        [key],
-                    )?;
-                }
-                Ok(())
-            })
-            .await
+                    ),
+                    [key],
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Whether `route` has delivered every op translated from input through `input`.
     pub async fn route_complete(&self, route: &SessionRoute, input: u64) -> anyhow::Result<bool> {
         let route = route.clone();
-        self.store
-            .run(move |db| {
-                let through: u64 = db.one("SELECT through FROM session WHERE id=1", [])?;
-                Ok(through >= input
-                    && !same_heads(
-                        db,
-                        "failure IS NULL AND position>=(SELECT op_tail FROM session WHERE id=1)",
-                        &route,
-                    )?
-                    .is_empty())
-            })
-            .await
+        self.run(move |db| {
+            let through: u64 = db.one("SELECT through FROM session WHERE id=1", [])?;
+            Ok(through >= input
+                && !same_heads(
+                    db,
+                    "failure IS NULL AND position>=(SELECT op_tail FROM session WHERE id=1)",
+                    &route,
+                )?
+                .is_empty())
+        })
+        .await
     }
 
     pub async fn origins_for(
@@ -427,79 +402,75 @@ impl SessionStorage {
         if spans.is_empty() {
             return Ok(BTreeMap::new());
         }
-        self.store
-            .run(move |db| {
-                let mut query = db.prepare_cached("SELECT value FROM origins WHERE span_id=?")?;
-                let mut origins = BTreeMap::new();
-                for span in spans {
-                    if let Some(Json(origin)) = query.query_row([&span], |r| r.get(0)).optional()? {
-                        origins.insert(span, origin);
-                    }
+        self.run(move |db| {
+            let mut query = db.prepare_cached("SELECT value FROM origins WHERE span_id=?")?;
+            let mut origins = BTreeMap::new();
+            for span in spans {
+                if let Some(Json(origin)) = query.query_row([&span], |r| r.get(0)).optional()? {
+                    origins.insert(span, origin);
                 }
-                Ok(origins)
-            })
-            .await
+            }
+            Ok(origins)
+        })
+        .await
     }
 
     /// Births of open tools and roots, each followed by its terminal update.
     pub async fn observations(&self) -> anyhow::Result<Vec<SpanOp>> {
-        self.store
-            .run(|db| {
-                let mut query = db.prepare("SELECT value,end_ms FROM span_state ORDER BY rowid")?;
-                let rows = query.query_map([], |r| {
-                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<i64>>(1)?))
-                })?;
-                let mut result = Vec::new();
-                for row in rows {
-                    let (bytes, end) = row?;
-                    let op = StoredOp::decode(&bytes)?;
-                    let terminal = end.map(|end_ms| {
-                        let mut terminal = op.row().clone();
-                        terminal.end_ms = Some(end_ms);
-                        SpanOp::Merge(terminal)
-                    });
-                    result.push(op);
-                    result.extend(terminal);
-                }
-                Ok(result)
-            })
-            .await
+        self.run(|db| {
+            let mut query = db.prepare("SELECT value,end_ms FROM span_state ORDER BY rowid")?;
+            let rows = query.query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<i64>>(1)?))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                let (bytes, end) = row?;
+                let op = StoredOp::decode(&bytes)?;
+                let terminal = end.map(|end_ms| {
+                    let mut terminal = op.row().clone();
+                    terminal.end_ms = Some(end_ms);
+                    SpanOp::Merge(terminal)
+                });
+                result.push(op);
+                result.extend(terminal);
+            }
+            Ok(result)
+        })
+        .await
     }
 
     pub async fn routes(&self) -> anyhow::Result<Vec<SessionRoute>> {
-        self.store
-            .run(|db| {
-                let mut query = db.prepare("SELECT route FROM heads ORDER BY route")?;
-                let routes = query
-                    .query_map([], |r| r.get::<_, Json<SessionRoute>>(0))?
-                    .map(|route| Ok(route?.0))
-                    .collect();
-                routes
-            })
-            .await
+        self.run(|db| {
+            let mut query = db.prepare("SELECT route FROM heads ORDER BY route")?;
+            let routes = query
+                .query_map([], |r| r.get::<_, Json<SessionRoute>>(0))?
+                .map(|route| Ok(route?.0))
+                .collect();
+            routes
+        })
+        .await
     }
 
     pub async fn head(&self, route: &str) -> anyhow::Result<Option<Head>> {
         let route = route.to_owned();
-        self.store
-            .run(move |db| {
-                Ok(db
-                    .query_row(
-                        "SELECT position,failure,settings FROM heads WHERE route=?",
-                        [route],
-                        |r| {
-                            Ok(Head {
-                                position: r.get(0)?,
-                                failure: r.get(1)?,
-                                settings: r
-                                    .get::<_, Option<Json<_>>>(2)?
-                                    .map(|Json(settings)| settings),
-                            })
-                        },
-                    )
-                    .optional()?)
-            })
-            .await
+        self.run(move |db| {
+            Ok(db
+                .query_row(
+                    "SELECT position,failure,settings FROM heads WHERE route=?",
+                    [route],
+                    |r| {
+                        Ok(Head {
+                            position: r.get(0)?,
+                            failure: r.get(1)?,
+                            settings: r
+                                .get::<_, Option<Json<_>>>(2)?
+                                .map(|Json(settings)| settings),
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
     }
 
     /// The route's corrected settings, or the route itself if it has none.
@@ -512,15 +483,14 @@ impl SessionStorage {
 
     pub async fn set_failure(&self, route: &str, failure: Option<String>) -> anyhow::Result<()> {
         let route = route.to_owned();
-        self.store
-            .write(move |tx| {
-                tx.execute(
-                    "UPDATE heads SET failure=? WHERE route=?",
-                    params![failure, route],
-                )?;
-                Ok(())
-            })
-            .await
+        self.write(move |tx| {
+            tx.execute(
+                "UPDATE heads SET failure=? WHERE route=?",
+                params![failure, route],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     /// Tokens can change; a durable head's backend and organization cannot.
@@ -530,22 +500,21 @@ impl SessionStorage {
             "api_url": config.auth.api_url.as_deref().unwrap_or("https://api.braintrust.dev"),
             "org_id":config.auth.org_id,"org_name":config.auth.org_name,
         }))?;
-        self.store
-            .write(move |tx| {
-                let previous: Option<String> =
-                    tx.one("SELECT binding FROM heads WHERE route=?", [&route])?;
-                match previous {
-                    Some(previous) => anyhow::ensure!(previous == binding, BindingChanged),
-                    None => {
-                        tx.execute(
-                            "UPDATE heads SET binding=? WHERE route=?",
-                            params![binding, route],
-                        )?;
-                    }
+        self.write(move |tx| {
+            let previous: Option<String> =
+                tx.one("SELECT binding FROM heads WHERE route=?", [&route])?;
+            match previous {
+                Some(previous) => anyhow::ensure!(previous == binding, BindingChanged),
+                None => {
+                    tx.execute(
+                        "UPDATE heads SET binding=? WHERE route=?",
+                        params![binding, route],
+                    )?;
                 }
-                Ok(())
-            })
-            .await
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Atomically replace settings of held heads selected by `correct`, which
@@ -555,8 +524,7 @@ impl SessionStorage {
         through: u64,
         correct: impl Fn(&HeldRoute) -> Option<SessionRoute> + Send + 'static,
     ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
-        self.store
-            .write(move |tx| {
+        self.write(move |tx| {
                 let held = {
                     let mut query = tx.prepare(
                         "SELECT route,failure,settings FROM heads WHERE failure IS NOT NULL AND settings_through<?",
@@ -594,15 +562,14 @@ impl SessionStorage {
     /// nothing from now on and never resumes, even after a restart.
     pub async fn detach(&self, route: &str) -> anyhow::Result<()> {
         let route = route.to_string();
-        self.store
-            .write(move |tx| {
-                tx.execute(
-                    "UPDATE heads SET position=?, failure=NULL WHERE route=?",
-                    params![DETACHED, route],
-                )?;
-                prune(tx)
-            })
-            .await
+        self.write(move |tx| {
+            tx.execute(
+                "UPDATE heads SET position=?, failure=NULL WHERE route=?",
+                params![DETACHED, route],
+            )?;
+            prune(tx)
+        })
+        .await
     }
 
     /// Remove ops through `through` from the route's view. The head must not
@@ -615,25 +582,23 @@ impl SessionStorage {
         through: u64,
     ) -> anyhow::Result<u64> {
         let route = route.to_owned();
-        self.store
-            .write(move |tx| {
-                let head: u64 =
-                    tx.one("SELECT position FROM heads WHERE route=?", [&route])?;
-                if head >= through {
-                    return Ok(head);
-                }
-                anyhow::ensure!(head >= expected, "completion cannot skip unresolved input");
-                tx.execute(
-                    &format!(
-                        "UPDATE heads SET position=?, failure=NULL, progress_ms={NOW_MS} WHERE route=?"
-                    ),
-                    params![through, route],
-                )?;
-                prune(tx)?;
-                super::store::touch(tx)?;
-                Ok(through)
-            })
-            .await
+        self.write(move |tx| {
+            let head: u64 = tx.one("SELECT position FROM heads WHERE route=?", [&route])?;
+            if head >= through {
+                return Ok(head);
+            }
+            anyhow::ensure!(head >= expected, "completion cannot skip unresolved input");
+            tx.execute(
+                &format!(
+                    "UPDATE heads SET position=?, failure=NULL, progress_ms={NOW_MS} WHERE route=?"
+                ),
+                params![through, route],
+            )?;
+            prune(tx)?;
+            super::store::touch(tx)?;
+            Ok(through)
+        })
+        .await
     }
 }
 
@@ -645,7 +610,7 @@ impl SessionStorage {
             .await
             .unwrap()
             .into_iter()
-            .map(|record| record.op)
+            .map(|record| record.op.as_ref().clone())
             .collect()
     }
 

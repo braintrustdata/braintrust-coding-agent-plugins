@@ -287,7 +287,7 @@ mod tests {
             roots["root"][0].row().late_merge_key.as_deref(),
             Some("late")
         );
-        assert!(upgraded.checkpoint().await.unwrap().is_none());
+        assert!(upgraded.continuation().await.unwrap().is_none());
     }
 
     #[tokio::test]

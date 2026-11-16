@@ -122,7 +122,10 @@ pub async fn legacy_journal_source(
     route: &SessionRoute,
 ) -> Option<String> {
     let mut found = None;
-    for path in crate::collections::sessions(data_dir).await.ok()? {
+    for path in crate::collections::SessionStorage::all(data_dir)
+        .await
+        .ok()?
+    {
         let Ok(storage) = crate::collections::SessionStorage::at(&path).await else {
             continue;
         };

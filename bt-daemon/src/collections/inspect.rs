@@ -114,7 +114,7 @@ impl Inspector {
         rows.filter_map(Result::ok).collect()
     }
 
-    pub fn event_tail(&self) -> u64 {
+    fn event_tail(&self) -> u64 {
         self.0
             .one("SELECT event_tail FROM session WHERE id=1", [])
             .unwrap_or(0)

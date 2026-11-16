@@ -7,8 +7,7 @@
 //! journal file is deleted only after every record it contributes has been
 //! committed.
 use super::events::{EventRecord, Stored};
-use super::session::SessionStorage;
-use super::store::Json;
+use super::store::{Json, SessionStorage};
 use crate::journal::{journal_dir, journal_path, source_journal_path};
 use crate::wire::{RedactedEnvelope, SessionRoute};
 use anyhow::Context;
@@ -230,61 +229,59 @@ impl SessionStorage {
         records: Vec<(u64, Stored)>,
         finished: Option<Imported>,
     ) -> anyhow::Result<()> {
-        self.store
-            .write(move |tx| {
-                let mut tail = 0;
-                for (id, stored) in records {
-                    anyhow::ensure!(
-                        id <= i64::MAX as u64,
-                        "legacy position exceeds storage range"
-                    );
-                    let prior = tx
-                        .query_row("SELECT control,value FROM events WHERE id=?", [id], |r| {
-                            Ok(Stored {
-                                control: r.get(0)?,
-                                value: r.get(1)?,
-                            })
+        self.write(move |tx| {
+            let mut tail = 0;
+            for (id, stored) in records {
+                anyhow::ensure!(
+                    id <= i64::MAX as u64,
+                    "legacy position exceeds storage range"
+                );
+                let prior = tx
+                    .query_row("SELECT control,value FROM events WHERE id=?", [id], |r| {
+                        Ok(Stored {
+                            control: r.get(0)?,
+                            value: r.get(1)?,
                         })
-                        .optional()?;
-                    match prior {
-                        Some(prior) => anyhow::ensure!(
-                            prior == stored,
-                            "legacy record changed during migration"
-                        ),
-                        None => {
-                            tx.execute(
-                                "INSERT INTO events(id,control,value) VALUES(?,?,?)",
-                                params![id, stored.control, stored.value],
-                            )?;
-                        }
+                    })
+                    .optional()?;
+                match prior {
+                    Some(prior) => {
+                        anyhow::ensure!(prior == stored, "legacy record changed during migration")
                     }
-                    tail = tail.max(id);
+                    None => {
+                        tx.execute(
+                            "INSERT INTO events(id,control,value) VALUES(?,?,?)",
+                            params![id, stored.control, stored.value],
+                        )?;
+                    }
                 }
-                if let Some(finished) = &finished {
-                    tail = tail.max(finished.through);
-                }
-                tx.execute(
-                    "UPDATE session SET event_tail=max(event_tail,?) WHERE id=1",
-                    [tail],
-                )?;
-                let Some(finished) = finished else {
-                    return Ok(());
-                };
-                tx.execute(
-                    "UPDATE session SET identity=coalesce(?,identity),
+                tail = tail.max(id);
+            }
+            if let Some(finished) = &finished {
+                tail = tail.max(finished.through);
+            }
+            tx.execute(
+                "UPDATE session SET event_tail=max(event_tail,?) WHERE id=1",
+                [tail],
+            )?;
+            let Some(finished) = finished else {
+                return Ok(());
+            };
+            tx.execute(
+                "UPDATE session SET identity=coalesce(?,identity),
                      legacy_namespace=coalesce(?,legacy_namespace) WHERE id=1",
-                    params![finished.identity.as_ref().map(Json), finished.namespace],
-                )?;
-                // Input every route had delivered is translated, unless this
-                // session already has SpanOp history. The translator rebuilds
-                // its state from it without publishing it.
-                tx.execute(
-                    "UPDATE session SET through=? WHERE id=1 AND through=0 AND op_tail=0",
-                    [finished.delivered],
-                )?;
-                Ok(())
-            })
-            .await
+                params![finished.identity.as_ref().map(Json), finished.namespace],
+            )?;
+            // Input every route had delivered is translated, unless this
+            // session already has SpanOp history. The translator rebuilds
+            // its state from it without publishing it.
+            tx.execute(
+                "UPDATE session SET through=? WHERE id=1 AND through=0 AND op_tail=0",
+                [finished.delivered],
+            )?;
+            Ok(())
+        })
+        .await
     }
 }
 

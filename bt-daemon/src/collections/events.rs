@@ -5,8 +5,7 @@
 //! Record IDs grow by each record's encoded size, so IDs imported from a legacy
 //! NDJSON journal keep their original byte boundaries and input budgets still
 //! measure bytes. Removal never renumbers later records.
-use super::session::SessionStorage;
-use super::store::{read_batch, Json, One, NOW_MS};
+use super::store::{read_batch, Json, One, SessionStorage, NOW_MS};
 use crate::pipeline::input::{PipelineControl, SourcePosition};
 use crate::wire::RedactedEnvelope;
 use rusqlite::params;
@@ -112,46 +111,44 @@ impl SessionStorage {
             EventRecord::Control(_) => None,
         };
         let stored = Stored::try_from(&record)?;
-        self.store
-            .write(move |tx| {
-                let tail: u64 = tx.one("SELECT event_tail FROM session WHERE id=1", [])?;
-                if after.is_some_and(|after| tail > after) {
-                    return Ok(None);
-                }
-                let Some((digest, mut identity)) = capture else {
-                    return insert(tx, stored).map(Some);
-                };
-                if tx.execute(
-                    &format!("INSERT OR IGNORE INTO captured(digest,at_ms) VALUES(?,{NOW_MS})"),
-                    [digest],
-                )? == 0
-                {
-                    return Ok(None);
-                }
-                let previous: Option<Json<RedactedEnvelope>> =
-                    tx.one("SELECT identity FROM session WHERE id=1", [])?;
-                if let Some(Json(previous)) = previous {
-                    retain_references(&mut identity, &previous);
-                }
-                let appended = insert(tx, stored)?;
-                tx.execute(
-                    "UPDATE session SET identity=? WHERE id=1",
-                    [Json(&identity)],
-                )?;
-                Ok(Some(appended))
-            })
-            .await
+        self.write(move |tx| {
+            let tail: u64 = tx.one("SELECT event_tail FROM session WHERE id=1", [])?;
+            if after.is_some_and(|after| tail > after) {
+                return Ok(None);
+            }
+            let Some((digest, mut identity)) = capture else {
+                return insert(tx, stored).map(Some);
+            };
+            if tx.execute(
+                &format!("INSERT OR IGNORE INTO captured(digest,at_ms) VALUES(?,{NOW_MS})"),
+                [digest],
+            )? == 0
+            {
+                return Ok(None);
+            }
+            let previous: Option<Json<RedactedEnvelope>> =
+                tx.one("SELECT identity FROM session WHERE id=1", [])?;
+            if let Some(Json(previous)) = previous {
+                retain_references(&mut identity, &previous);
+            }
+            let appended = insert(tx, stored)?;
+            tx.execute(
+                "UPDATE session SET identity=? WHERE id=1",
+                [Json(&identity)],
+            )?;
+            Ok(Some(appended))
+        })
+        .await
     }
 
     /// The latest captured event with only state-referencing payload fields.
     pub async fn identity(&self) -> anyhow::Result<Option<RedactedEnvelope>> {
-        self.store
-            .run(|db| {
-                let identity: Option<Json<_>> =
-                    db.one("SELECT identity FROM session WHERE id=1", [])?;
-                Ok(identity.map(|Json(identity)| identity))
-            })
-            .await
+        self.run(|db| {
+            let identity: Option<Json<_>> =
+                db.one("SELECT identity FROM session WHERE id=1", [])?;
+            Ok(identity.map(|Json(identity)| identity))
+        })
+        .await
     }
 
     /// Lazily read records with IDs in `(after, through]`. Reading never
@@ -250,9 +247,7 @@ impl EventReader {
         if self.buffer.is_empty() && self.position < self.through {
             let (after, through) = (self.position, self.through);
             self.buffer = self
-                .session
-                .store
-                .run(move |db| {
+                .session.run(move |db| {
                     read_batch(
                         db,
                         "SELECT id,control,value FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",

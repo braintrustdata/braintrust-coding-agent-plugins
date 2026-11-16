@@ -206,10 +206,10 @@ async fn storage_is_removed_only_after_its_last_handle_closes() {
     let path = super::inspect::session_path(temp.path(), "debug", "session");
     let ops = events.clone();
     drop(events);
-    assert!(!remove_session(&path).await.unwrap());
+    assert!(!SessionStorage::remove(&path).await.unwrap());
     assert!(path.exists());
     drop(ops);
-    assert!(remove_session(&path).await.unwrap());
+    assert!(SessionStorage::remove(&path).await.unwrap());
     for suffix in ["", "-wal", "-shm"] {
         let mut file = path.clone().into_os_string();
         file.push(suffix);
@@ -229,7 +229,6 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
         .unwrap()
         .unwrap()
         .through;
-    let ops = events.clone();
     let translated = Translated {
         input,
         observation: true,
@@ -242,21 +241,21 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
     };
     let db = Inspector::session(temp.path(), "debug", "session").unwrap();
     db.inject(Fault::RemoveEvents).unwrap();
-    assert!(ops.commit_translation(translated.clone()).await.is_err());
+    assert!(events.commit_translation(translated.clone()).await.is_err());
     // Neither stage changed: the event remains and no output is visible.
-    let status = ops.status().await.unwrap();
+    let status = events.status().await.unwrap();
     assert_eq!(status.translated_through, 0);
     assert_eq!(db.count(Table::Events), 1);
     assert_eq!(db.count(Table::Ops), 0);
     assert_eq!(status.op_tail, 0);
-    assert!(ops.checkpoint().await.unwrap().is_none());
+    assert!(events.continuation().await.unwrap().is_none());
     db.clear(Fault::RemoveEvents).unwrap();
-    let committed = ops.commit_translation(translated.clone()).await.unwrap();
+    let committed = events.commit_translation(translated.clone()).await.unwrap();
     assert_eq!(committed, 1);
     assert_eq!(db.count(Table::Ops), 1);
-    assert_eq!(ops.status().await.unwrap().translated_through, input);
+    assert_eq!(events.status().await.unwrap().translated_through, input);
     assert_eq!(db.count(Table::Events), 0);
-    assert_eq!(ops.checkpoint().await.unwrap().unwrap().0, input);
+    assert!(events.continuation().await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -305,14 +304,17 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
         .unwrap()
         .through;
     assert!(events.append(&captured, None).await.unwrap().is_none());
-    let ops = events.clone();
     let route = |name: &str| crate::wire::SessionRoute {
         tags: [name.into()].into_iter().collect(),
         ..Default::default()
     };
-    let delivered = ops.subscribe(&route("delivered")).await.unwrap().position;
+    let delivered = events
+        .subscribe(&route("delivered"))
+        .await
+        .unwrap()
+        .position;
     // A route registered for output whose delivery never starts.
-    ops.register(&route("unsubscribed")).await.unwrap();
+    events.register(&route("unsubscribed")).await.unwrap();
     let span = |id: &str, end_ms: Option<i64>| {
         SpanOp::Insert(SpanRow {
             span_id: id.into(),
@@ -330,7 +332,7 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
             ..Default::default()
         })
     };
-    let tail = ops
+    let tail = events
         .commit_translation(Translated {
             input,
             observation: true,
@@ -341,7 +343,7 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
         .await
         .unwrap();
     let key = serde_json::to_string(&route("delivered")).unwrap();
-    ops.remove_through(&key, delivered, tail).await.unwrap();
+    events.remove_through(&key, delivered, tail).await.unwrap();
     let db = Inspector::session(temp.path(), "debug", "session").unwrap();
     assert_eq!(
         db.count(Table::Ops),
@@ -352,14 +354,14 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
     db.age(retention + std::time::Duration::from_secs(60))
         .unwrap();
     let unsubscribed = serde_json::to_string(&route("unsubscribed")).unwrap();
-    ops.expire(retention, vec![unsubscribed]).await.unwrap();
+    events.expire(retention, vec![unsubscribed]).await.unwrap();
     assert_eq!(db.count(Table::Heads), 2, "a live route is never expired");
 
-    ops.expire(retention, Vec::new()).await.unwrap();
+    events.expire(retention, Vec::new()).await.unwrap();
     assert_eq!(db.count(Table::Heads), 1);
     assert_eq!(db.count(Table::Ops), 0);
     assert_eq!(db.count(Table::Origins), 1, "an open span keeps its origin");
-    assert!(ops.observations().await.unwrap().is_empty());
+    assert!(events.observations().await.unwrap().is_empty());
     assert!(
         events.append(&captured, None).await.unwrap().is_some(),
         "an expired capture identity is recorded again"

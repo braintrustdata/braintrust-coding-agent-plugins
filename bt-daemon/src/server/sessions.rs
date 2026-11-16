@@ -47,7 +47,7 @@ impl Daemon {
         if let Some(source) = self.translations.lock().get(&storage_key).cloned() {
             return Ok(source);
         }
-        let events = self.events_for(&env.source, &env.session_id).await?;
+        let events = self.storage_for(&env.source, &env.session_id).await?;
         let native = crate::ids::native_session_id(&env.session_id);
         let namespace = if events.status().await?.legacy_namespace {
             env.session_id.clone()
@@ -211,7 +211,7 @@ impl Daemon {
             self.claude_transcripts.lock().retain(|candidate, _| {
                 candidate.source != key.source || candidate.session_id != key.session_id
             });
-            self.journals.lock().remove(&storage_key);
+            self.open_storage.lock().remove(&storage_key);
             let mut inputs = self.source_inputs.lock();
             if inputs
                 .get(&storage_key)
@@ -246,23 +246,22 @@ impl Daemon {
             .collect()
     }
 
-    /// The shared input collection for a source session. Opening it imports
-    /// any legacy journal once, before capture or recovery can use it.
-    pub(super) async fn events_for(
+    /// The shared storage for a source session. Opening it imports any
+    /// legacy journal once, before capture or recovery can use it.
+    pub(super) async fn storage_for(
         &self,
         source: &str,
         session_id: &str,
     ) -> anyhow::Result<SessionStorage> {
         let slot = self
-            .journals
+            .open_storage
             .lock()
             .entry(crate::ids::session_namespace(source, session_id))
             .or_default()
             .clone();
-        let events = slot
-            .get_or_try_init(|| SessionStorage::open(&self.data_dir, source, session_id))
-            .await?;
-        Ok(events.clone())
+        slot.get_or_try_init(|| SessionStorage::open(&self.data_dir, source, session_id))
+            .await
+            .cloned()
     }
 
     pub(super) fn source_input_for(

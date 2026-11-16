@@ -9,7 +9,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         .values()
         .flat_map(|state| state.events.iter().cloned())
         .collect();
-    let Ok(sessions) = crate::collections::sessions(&daemon.data_dir).await else {
+    let Ok(sessions) = crate::collections::SessionStorage::all(&daemon.data_dir).await else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
@@ -24,7 +24,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         let Ok(Some((source, session_id))) = owner else {
             continue;
         };
-        let Ok(events) = daemon.events_for(&source, &session_id).await else {
+        let Ok(events) = daemon.storage_for(&source, &session_id).await else {
             continue;
         };
         let Ok(status) = events.status().await else {
@@ -97,16 +97,9 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         }
         // Heads are the authoritative subscriptions, including dormant routes
         // and canonical profile IDs absent from older captured envelopes.
-        let templates: Vec<_> = latest_by_route.values().cloned().collect();
-        let mut sources = HashSet::new();
-        for template in templates {
-            if !sources.insert((template.env.source.clone(), template.env.session_id.clone())) {
-                continue;
-            }
-            let Ok(routes) = events.routes().await else {
-                continue;
-            };
-            for route in routes {
+        // Every record in one session's storage belongs to that session.
+        if let Some(template) = latest_by_route.values().next().cloned() {
+            for route in events.routes().await.unwrap_or_default() {
                 let route_key = match serde_json::to_string(&route) {
                     Ok(key) => key,
                     Err(error) => {
@@ -117,13 +110,11 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
                 let matching = latest_by_route
                     .iter()
                     .find(|(_, event)| {
-                        event.env.source == template.env.source
-                            && event.env.session_id == template.env.session_id
-                            && event
-                                .env
-                                .route
-                                .as_ref()
-                                .is_some_and(|recorded| recorded.same_route(&route))
+                        event
+                            .env
+                            .route
+                            .as_ref()
+                            .is_some_and(|recorded| recorded.same_route(&route))
                     })
                     .map(|(key, _)| key.clone());
                 let mut event = matching
@@ -134,7 +125,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
                         event.settings_through = Some(0);
                         event
                     });
-                event.env.route = Some(route.clone());
+                event.env.route = Some(route);
                 latest_by_route.insert(route_key, event);
             }
         }
@@ -272,9 +263,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         let through = writer.append(&env, None).await.unwrap().unwrap().through;
-        let spans = writer.clone();
-        drop(writer);
-        spans
+        writer
             .translated(
                 through,
                 vec![SpanOp::Insert(SpanRow {
@@ -287,10 +276,10 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        Cursor::open(&spans, &route).await.unwrap();
+        Cursor::open(&writer, &route).await.unwrap();
         let mut dormant = route.clone();
         dormant.tags.insert("dormant".into());
-        Cursor::open(&spans, &dormant).await.unwrap();
+        Cursor::open(&writer, &dormant).await.unwrap();
 
         let mut options = debug_serve_options("test", tmp.path());
         options.auth_provider = Some(Arc::new(TestAuth));
@@ -312,13 +301,13 @@ pub(super) mod tests {
         recover_unprocessed_journals(&daemon).await;
         daemon.ingress_barrier().await;
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !spans.route_complete(&dormant, through).await.unwrap() {
+            while !writer.route_complete(&dormant, through).await.unwrap() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        assert!(!spans.route_complete(&route, through).await.unwrap());
+        assert!(!writer.route_complete(&route, through).await.unwrap());
         assert_eq!(daemon.pending_sessions.lock()[&pending_key].events.len(), 1);
         assert!(daemon
             .sessions
@@ -366,9 +355,7 @@ pub(super) mod tests {
             .unwrap()
             .through;
         let path = crate::collections::inspect::session_path(tmp.path(), "debug", &env.session_id);
-        let spans = writer.clone();
-        drop(writer);
-        spans
+        writer
             .translated(
                 first,
                 vec![SpanOp::Insert(SpanRow {
@@ -381,24 +368,24 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        Cursor::open(&spans, &original).await.unwrap();
+        Cursor::open(&writer, &original).await.unwrap();
         let lease = TestAuth
             .resolve(&original.auth, AuthResolveReason::Initial)
             .await
             .unwrap();
         let failure = Failure::legacy("rejected row".into(), 1, &original.with_auth(lease.auth));
-        spans
+        writer
             .set_failure(
                 &serde_json::to_string(&original).unwrap(),
                 Some(serde_json::to_string(&failure).unwrap()),
             )
             .await
             .unwrap();
-        crate::pipeline::cursor::reconfigure_held(&spans, &corrected, settings_through)
+        crate::pipeline::cursor::reconfigure_held(&writer, &corrected, settings_through)
             .await
             .unwrap();
         // Crash window: the correction is durable, but no consumer has retried it.
-        drop(spans);
+        drop(writer);
         let mut options = debug_serve_options("test", tmp.path());
         options.auth_provider = Some(Arc::new(TestAuth));
         let daemon = Daemon::new(options, tmp.path().into());

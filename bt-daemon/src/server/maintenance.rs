@@ -44,7 +44,7 @@ async fn old(path: &std::path::Path, age: Duration) -> bool {
 }
 
 async fn collect_sessions(daemon: &Daemon) {
-    let Ok(sessions) = crate::collections::sessions(&daemon.data_dir).await else {
+    let Ok(sessions) = crate::collections::SessionStorage::all(&daemon.data_dir).await else {
         return;
     };
     for path in sessions {
@@ -68,7 +68,7 @@ pub(super) async fn collect_session(daemon: &Daemon, path: &std::path::Path) -> 
         // complete it. Keep it only while it may still be in use.
         drop(session);
         if old(path, RETENTION).await {
-            crate::collections::remove_session(path).await?;
+            crate::collections::SessionStorage::remove(path).await?;
         }
         return Ok(());
     };
@@ -95,7 +95,7 @@ pub(super) async fn collect_session(daemon: &Daemon, path: &std::path::Path) -> 
         .map(|key| key.route.clone())
         .collect();
     session.expire(RETENTION, live).await?;
-    if daemon.journals.lock().contains_key(&namespace)
+    if daemon.open_storage.lock().contains_key(&namespace)
         || daemon.translations.lock().contains_key(&namespace)
     {
         return Ok(());
@@ -116,7 +116,7 @@ pub(super) async fn collect_session(daemon: &Daemon, path: &std::path::Path) -> 
         return Ok(());
     }
     drop(session);
-    if crate::collections::remove_session(path).await? {
+    if crate::collections::SessionStorage::remove(path).await? {
         tracing::debug!(session_id = %session_id, "completed session storage removed");
     }
     Ok(())
@@ -167,7 +167,7 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
         }
     }
     let mut protected = HashSet::new();
-    for path in crate::collections::sessions(data_dir).await? {
+    for path in crate::collections::SessionStorage::all(data_dir).await? {
         let session = crate::collections::SessionStorage::at(&path).await?;
         let Some(identity) = session.identity().await? else {
             continue;
@@ -181,7 +181,7 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
         let key = automatic_link_key(&env);
         protected.insert(correlation_state_path(data_dir, &key));
         protected.insert(active_parent_snapshot_path(data_dir, &key));
-        if let Some((_, bytes)) = session.checkpoint().await? {
+        if let Some(bytes) = session.continuation().await? {
             checkpoint_paths(
                 &serde_json::from_slice(&bytes)?,
                 &data_dir.join("transcripts"),
@@ -335,7 +335,7 @@ pub(super) async fn drain_all(daemon: &Arc<Daemon>) {
     }
     daemon.sessions.lock().clear();
     daemon.translations.lock().clear();
-    daemon.journals.lock().clear();
+    daemon.open_storage.lock().clear();
     daemon.source_inputs.lock().clear();
     let (reply, done) = oneshot::channel();
     if daemon
@@ -495,9 +495,8 @@ mod tests {
         daemon.settle_ingress().await;
         let source = daemon.translations.lock().values().next().unwrap().clone();
         assert!(source.barrier().await.unwrap() > 0);
-        let partition = events.clone();
         assert_eq!(
-            partition.status().await.unwrap().translated_through,
+            events.status().await.unwrap().translated_through,
             events.status().await.unwrap().event_tail
         );
         drain_all(&daemon).await;
@@ -559,20 +558,19 @@ mod tests {
                 .await
                 .unwrap();
             let events = daemon
-                .events_for(&env.source, &env.session_id)
+                .storage_for(&env.source, &env.session_id)
                 .await
                 .unwrap();
-            let partition = events.clone();
             assert_eq!(
-                partition.status().await.unwrap().translated_through,
+                events.status().await.unwrap().translated_through,
                 events.status().await.unwrap().event_tail
             );
             let expected: Vec<_> = (slot..total).step_by(envs.len()).collect();
-            let (_, state) = partition.checkpoint().await.unwrap().unwrap();
+            let state = events.continuation().await.unwrap().unwrap();
             let state: Value = serde_json::from_slice(&state).unwrap();
             if env.source == "debug" {
                 assert_eq!(state["native"]["event_seq"], expected.len() as u64);
-                let actual: Vec<_> = partition
+                let actual: Vec<_> = events
                     .stored()
                     .await
                     .into_iter()
@@ -616,7 +614,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let identity = daemon
-            .events_for(&env.source, &env.session_id)
+            .storage_for(&env.source, &env.session_id)
             .await
             .unwrap()
             .identity()
@@ -712,8 +710,7 @@ mod tests {
                     .await
                     .unwrap();
             let through = events.append(&env, None).await.unwrap().unwrap().through;
-            let partition = events.clone();
-            partition
+            events
                 .commit_translation(crate::collections::Translated {
                     input: through,
                     observation: true,
@@ -732,13 +729,13 @@ mod tests {
                 events.append(&later, None).await.unwrap().unwrap();
             }
             if scenario != "no_heads" {
-                let mut head = Cursor::open(&partition, env.route.as_ref().unwrap())
+                let mut head = Cursor::open(&events, env.route.as_ref().unwrap())
                     .await
                     .unwrap();
                 if scenario == "second_unresolved" {
                     let mut second = env.route.clone().unwrap();
                     second.tags.insert("second".into());
-                    Cursor::open(&partition, &second).await.unwrap();
+                    Cursor::open(&events, &second).await.unwrap();
                 }
                 if scenario != "unresolved" {
                     head.next_batch(8)
@@ -751,26 +748,26 @@ mod tests {
                         .unwrap();
                 }
                 if scenario == "held" {
-                    partition
+                    events
                         .set_failure(&head.route, Some("held".into()))
                         .await
                         .unwrap();
                 }
             }
             if scenario == "source_held" {
-                partition
+                events
                     .set_source_failure(Some("held".into()))
                     .await
                     .unwrap();
             }
-            drop((partition, events));
+            drop(events);
             let daemon = Daemon::new(
                 super::super::debug_serve_options("test", tmp.path()),
                 tmp.path().into(),
             );
             if scenario == "active" {
                 daemon
-                    .events_for(&env.source, &env.session_id)
+                    .storage_for(&env.source, &env.session_id)
                     .await
                     .unwrap();
             }

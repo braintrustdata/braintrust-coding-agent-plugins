@@ -527,7 +527,7 @@ impl Producer {
         if self.translator.is_some() {
             return Ok(());
         }
-        let checkpoint = self.options.storage.checkpoint().await?;
+        let continuation = self.options.storage.continuation().await?;
         self.committed = self.options.storage.status().await?.translated_through;
         self.roots = Roots::restore(self.options.storage.root_candidates().await?);
         for ops in self.roots.pending().values() {
@@ -538,7 +538,7 @@ impl Producer {
             }
         }
         self.translator = Some(self.new_translator().await?);
-        if let Some((through, bytes)) = checkpoint {
+        if let Some(bytes) = continuation {
             let source = self.options.source.clone();
             let saved = self
                 .translate(move |translator, _| {
@@ -551,8 +551,7 @@ impl Producer {
             self.bounds = saved.bounds;
             self.last_control = saved.last_control;
             self.capture = saved.capture;
-            self.position = through;
-            self.committed = through;
+            self.position = self.committed;
             self.reader = None;
             return Ok(());
         }
@@ -1139,7 +1138,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(f.source.storage.status().await.unwrap().op_tail, 2);
         assert_eq!(f.source.storage.stored().await.len(), 2);
-        let (_, bytes) = f.source.storage.checkpoint().await.unwrap().unwrap();
+        let bytes = f.source.storage.continuation().await.unwrap().unwrap();
         let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(state["native"]["event_seq"], 1);
         assert_eq!(db.count(Table::Events), 0);
@@ -1251,7 +1250,9 @@ pub(crate) mod tests {
         db.add_head(&SessionRoute::default()).unwrap();
         db.set_translated(bytes.len() as u64).unwrap();
         drop(db);
-        let sessions = crate::collections::sessions(tmp.path()).await.unwrap();
+        let sessions = crate::collections::SessionStorage::all(tmp.path())
+            .await
+            .unwrap();
         let session = SessionStorage::at(&sessions[0]).await.unwrap();
         // The imported input only rebuilds translator state if the session
         // resumes; it does not keep a delivered session from collection.
@@ -1434,8 +1435,7 @@ pub(crate) mod tests {
             .unwrap()
             .corrupt_events(0, input)
             .unwrap();
-        let journal = events.clone();
-        let tail = journal
+        let tail = events
             .translated(
                 input,
                 vec![SpanOp::Insert(SpanRow {

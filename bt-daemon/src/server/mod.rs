@@ -103,7 +103,7 @@ struct SessionAuthState {
     lease: AuthLease,
 }
 
-type EventSlot = Arc<tokio::sync::OnceCell<SessionStorage>>;
+type StorageSlot = Arc<tokio::sync::OnceCell<SessionStorage>>;
 
 pub struct Daemon {
     version: String,
@@ -118,8 +118,8 @@ pub struct Daemon {
     /// Serializes daemon-side routing and actor creation independently of
     /// capture, which must never inherit actor or sink backpressure.
     dispatch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Open input collections by source-session namespace.
-    journals: Mutex<HashMap<String, EventSlot>>,
+    /// Open session storage by source-session namespace.
+    open_storage: Mutex<HashMap<String, StorageSlot>>,
     source_inputs: Mutex<HashMap<String, crate::pipeline::input::SourceInput>>,
     claude_transcripts: Mutex<HashMap<DeliveryKey, ClaudeTranscriptObservation>>,
     managed_run_sessions: Mutex<HashMap<String, HashSet<DeliveryKey>>>,
@@ -173,7 +173,7 @@ impl Daemon {
             route_aliases: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
             dispatch_locks: Mutex::new(HashMap::new()),
-            journals: Mutex::new(HashMap::new()),
+            open_storage: Mutex::new(HashMap::new()),
             source_inputs: Mutex::new(HashMap::new()),
             claude_transcripts: Mutex::new(HashMap::new()),
             managed_run_sessions: Mutex::new(HashMap::new()),

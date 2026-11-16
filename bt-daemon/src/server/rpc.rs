@@ -466,9 +466,7 @@ impl Daemon {
             sessions,
         }
     }
-}
 
-impl Daemon {
     /// Imports are captured like hooks. Finishing one waits for its captured
     /// events to reach every matching delivery route and reports what they sent.
     async fn finish_import(

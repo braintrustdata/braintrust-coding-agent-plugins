@@ -184,7 +184,10 @@ impl Cursor {
         let Some(through) = rows.last().map(|row| row.position) else {
             return Ok(None);
         };
-        let ops = rows.into_iter().map(|row| row.op).collect::<Vec<_>>();
+        let ops = rows
+            .into_iter()
+            .map(|row| row.op.as_ref().clone())
+            .collect::<Vec<_>>();
         self.read = through;
         Ok(Some(Delivery::new(ops, self.completion(after, through))))
     }

@@ -84,7 +84,7 @@ pub(super) async fn replay_evicted(
     let mut ready = Vec::new();
     for ((source, session_id), range) in bounds {
         let mut reader = daemon
-            .events_for(source, session_id)
+            .storage_for(source, session_id)
             .await?
             .read(range.from, range.through);
         if let Some((timestamp, event)) =
@@ -355,7 +355,7 @@ impl Daemon {
     /// the same durable queue as hooks without reacquiring that lock.
     pub(super) async fn journal_and_enqueue(&self, env: Envelope) -> Result<bool, String> {
         let events = self
-            .events_for(&env.source, &env.session_id)
+            .storage_for(&env.source, &env.session_id)
             .await
             .map_err(|error| format!("capture storage failed: {error}"))?;
         let Some(appended) = self

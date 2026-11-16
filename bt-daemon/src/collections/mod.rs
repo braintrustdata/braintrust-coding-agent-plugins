@@ -18,6 +18,6 @@ mod tests;
 mod upgrade;
 
 pub(crate) use events::{EventReader, EventRecord};
-pub(crate) use session::{remove_session, sessions, SessionStorage};
 pub(crate) use span_ops::{metadata_only, BindingChanged, HeldRoute, Translated, DETACHED};
 pub(crate) use store::is_corruption;
+pub(crate) use store::SessionStorage;
