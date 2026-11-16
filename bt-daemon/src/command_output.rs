@@ -572,6 +572,7 @@ mod tests {
                     route: None,
                     recovery: Some(crate::wire::RecoveryInfo {
                         stage: "plugin".into(),
+                        recovering_plugin_hold: true,
                         position: 1,
                         reason: "deadline".into(),
                         retry: "bounded retry".into(),

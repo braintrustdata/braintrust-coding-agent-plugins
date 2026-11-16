@@ -14,6 +14,7 @@ pub(crate) struct Plugins {
     paths: Vec<PathBuf>,
     pub source: String,
     pub session_id: String,
+    pub recovering_plugin_hold: bool,
     blocked: Option<(Vec<PathBuf>, PluginRejected)>,
 }
 
@@ -40,6 +41,7 @@ impl Plugins {
         Self {
             paths: Vec::new(),
             source: source.into(),
+            recovering_plugin_hold: false,
             session_id: session_id.into(),
             blocked: None,
         }
@@ -80,7 +82,13 @@ impl Stage for Plugins {
             }
         }
         self.blocked = None;
-        match span_processor::process_isolated(&self.paths, input, &self.source, &self.session_id) {
+        match span_processor::process_isolated(
+            &self.paths,
+            input,
+            &self.source,
+            &self.session_id,
+            self.recovering_plugin_hold,
+        ) {
             Ok(result) => match (result.op, result.failure) {
                 (_, Some(failure)) => {
                     let digest = span_processor::failed_digest(&failure.path);

@@ -60,6 +60,11 @@ impl ConsumerOptions {
         Ok(sink)
     }
     async fn hold(&self, pending: &mut VecDeque<Delivery<()>>, failure: &mut Failure) -> bool {
+        failure.recovering_plugin_hold |= self
+            .recovery
+            .lock()
+            .as_ref()
+            .is_some_and(|recovery| recovery.recovering_plugin_hold);
         let result = match pending.front_mut() {
             Some(delivery) => delivery.failed(failure).await,
             None => Ok(()), // Input errors are reported by the source itself.
@@ -287,6 +292,13 @@ impl Consumer {
                             )
                         })?;
                         routing.configure(&current);
+                        routing.set_recovering_plugin_hold(
+                            options
+                                .recovery
+                                .lock()
+                                .as_ref()
+                                .is_some_and(|recovery| recovery.recovering_plugin_hold),
+                        );
                         match routing.emit_shared(ops).await {
                             Err(error) if error.is::<crate::span_processor::StopTracing>() => {
                                 // Never resubmit after the signal, including when
@@ -296,6 +308,7 @@ impl Consumer {
                                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                 }
                                 *options.error.lock() = None;
+                                *options.recovery.lock() = None;
                                 stopped = true;
                                 Ok(0)
                             }
@@ -792,6 +805,80 @@ mod tests {
             .is_none());
         stopped.shutdown().await;
         healthy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prior_plugin_hold_is_visible_on_restart_and_can_be_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spans.sqlite");
+        let plugin = tmp.path().join("guard.mjs");
+        std::fs::write(&plugin, "export default () => { throw new Error('held'); }").unwrap();
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let route = SessionRoute {
+            span_plugins: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let healthy_route = SessionRoute::default();
+        let stopped_cursor = journal.subscribe(&route, 0).await.unwrap();
+        journal.subscribe(&healthy_route, 0).await.unwrap();
+        stored(&journal).await;
+        let record = Arc::new(Recording::default());
+        let (consumer, _, error) =
+            spawn(stopped_cursor, options(tmp.path(), &route, record.clone()));
+        wait_for(|| error.lock().is_some()).await;
+        consumer.shutdown().await;
+        journal.close().await.unwrap();
+
+        std::fs::write(&plugin, "export default (span, context) => { if (context.recovering_plugin_hold) throw new StopTracingError(); return span; }").unwrap();
+        let journal = SpanJournal::open(&path).await.unwrap();
+        let opts = options(tmp.path(), &route, record.clone());
+        let recovery = opts.recovery.clone();
+        let (consumer, progress, _) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        let healthy_record = Arc::new(Recording::default());
+        let (healthy, healthy_progress, _) = spawn(
+            journal.subscribe(&healthy_route, 0).await.unwrap(),
+            options(tmp.path(), &healthy_route, healthy_record.clone()),
+        );
+        wait_for(|| progress.completed() == i64::MAX as u64 && healthy_progress.completed() == 1)
+            .await;
+        assert_eq!(record.submitted.load(Ordering::SeqCst), 0);
+        assert_eq!(healthy_record.accepted.load(Ordering::SeqCst), 1);
+        assert!(recovery.lock().is_none());
+        journal.begin(11, true).await.unwrap();
+        journal
+            .append(
+                11,
+                &[SpanOp::Insert(SpanRow {
+                    span_id: "later".into(),
+                    root_span_id: "later".into(),
+                    name: "later".into(),
+                    end_ms: Some(2),
+                    ..Default::default()
+                })],
+            )
+            .await
+            .unwrap();
+        journal.commit(11).await.unwrap();
+        wait_for(|| healthy_progress.completed() == 2).await;
+        assert_eq!(record.submitted.load(Ordering::SeqCst), 0);
+        assert_eq!(healthy_record.accepted.load(Ordering::SeqCst), 2);
+        assert_eq!(progress.pending(), 0);
+        consumer.shutdown().await;
+        healthy.shutdown().await;
+        std::fs::write(&plugin, "export default span => span").unwrap();
+        let opts = options(tmp.path(), &route, record.clone());
+        let mut input = journal
+            .subscribe(&route, 0)
+            .await
+            .unwrap()
+            .into_input(
+                opts.config.subscribe(),
+                "test".into(),
+                opts.error,
+                opts.recovery,
+            )
+            .input;
+        assert!(input.receive().await.unwrap().is_none());
     }
 
     #[tokio::test]

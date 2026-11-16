@@ -52,12 +52,14 @@ struct PluginContext<'a> {
     source: &'a str,
     session_id: &'a str,
     env: &'a BTreeMap<String, String>,
+    recovering_plugin_hold: bool,
 }
 
 struct Engine {
     modules: HashMap<PathBuf, CachedModule>,
     failed_plugins: HashMap<PathBuf, FailedPlugin>,
     env: BTreeMap<String, String>,
+    recovering_plugin_hold: bool,
     last_fingerprint: Option<PluginFingerprint>,
     context: Context,
     started: Instant,
@@ -112,6 +114,7 @@ impl Engine {
             modules: HashMap::new(),
             failed_plugins: HashMap::new(),
             env: environment(),
+            recovering_plugin_hold: false,
             last_fingerprint: None,
             context,
             started,
@@ -208,6 +211,7 @@ impl Engine {
             source,
             session_id,
             env: &self.env,
+            recovering_plugin_hold: self.recovering_plugin_hold,
         };
         self.arm_deadline(budget);
         let started = Instant::now();
@@ -306,7 +310,7 @@ pub fn process(
     source: &str,
     session_id: &str,
 ) -> anyhow::Result<ProcessResult> {
-    process_inner(plugins, op, source, session_id, true)
+    process_inner(plugins, op, source, session_id, false, true)
 }
 
 pub(crate) fn process_isolated(
@@ -314,8 +318,16 @@ pub(crate) fn process_isolated(
     op: &SpanOp,
     source: &str,
     session_id: &str,
+    recovering_plugin_hold: bool,
 ) -> anyhow::Result<ProcessResult> {
-    process_inner(plugins, op, source, session_id, false)
+    process_inner(
+        plugins,
+        op,
+        source,
+        session_id,
+        recovering_plugin_hold,
+        false,
+    )
 }
 
 fn process_inner(
@@ -323,6 +335,7 @@ fn process_inner(
     op: &SpanOp,
     source: &str,
     session_id: &str,
+    recovering_plugin_hold: bool,
     use_failed_cache: bool,
 ) -> anyhow::Result<ProcessResult> {
     if plugins.is_empty() {
@@ -348,6 +361,7 @@ fn process_inner(
         let engine = slot
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("span processor engine was not initialized"))?;
+        engine.recovering_plugin_hold = recovering_plugin_hold;
         for plugin in plugins {
             if let Some(failed) = engine
                 .failed_plugins
@@ -562,6 +576,27 @@ mod tests {
                 .op
                 .is_some()
         );
+    }
+
+    #[test]
+    fn recovery_context_is_explicit_for_each_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("guard.mjs");
+        std::fs::write(&plugin, "export default (span, context) => ({...span, name: String(context.recovering_plugin_hold)})").unwrap();
+        for held in [true, false] {
+            let result = process_isolated(
+                std::slice::from_ref(&plugin),
+                &SpanOp::Insert(row()),
+                "debug",
+                "session",
+                held,
+            )
+            .unwrap();
+            let Some(SpanOp::Insert(span)) = result.op else {
+                panic!("expected insert");
+            };
+            assert_eq!(span.name, held.to_string());
+        }
     }
 
     #[test]

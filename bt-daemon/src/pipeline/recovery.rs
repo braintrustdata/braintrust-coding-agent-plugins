@@ -111,6 +111,8 @@ impl std::error::Error for RouteFailure {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Failure {
     pub boundary: Boundary,
+    #[serde(default)]
+    pub recovering_plugin_hold: bool,
     pub position: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub through: Option<u64>,
@@ -161,6 +163,7 @@ impl Failure {
         let delay = 250i64.saturating_mul(1i64 << attempt.min(8)).min(30_000);
         Self {
             boundary,
+            recovering_plugin_hold: false,
             position,
             through: None,
             reason,
@@ -173,6 +176,7 @@ impl Failure {
     pub fn revision(boundary: Boundary, position: u64, reason: String, version: &str) -> Self {
         Self {
             boundary,
+            recovering_plugin_hold: false,
             position,
             through: None,
             reason,
@@ -242,6 +246,7 @@ impl Failure {
     pub fn legacy(reason: String, position: u64, config: &SessionConfig) -> Self {
         Self {
             boundary: Boundary::Sink,
+            recovering_plugin_hold: false,
             position,
             through: None,
             reason,
@@ -289,6 +294,8 @@ impl Failure {
         };
         RecoveryInfo {
             stage: self.boundary.to_string(),
+            recovering_plugin_hold: self.recovering_plugin_hold
+                || self.boundary == Boundary::Plugin,
             position: self.position,
             reason: self.reason.clone(),
             retry,

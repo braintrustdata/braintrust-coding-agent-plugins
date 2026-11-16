@@ -132,6 +132,8 @@ pub struct RecoveryInfo {
     #[serde(default)]
     pub attempt: u32,
     pub stage: String,
+    #[serde(default)]
+    pub recovering_plugin_hold: bool,
     pub position: u64,
     pub reason: String,
     pub retry: String,

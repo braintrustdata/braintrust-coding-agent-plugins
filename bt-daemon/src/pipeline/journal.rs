@@ -2241,6 +2241,7 @@ mod tests {
         let cursor = journal.subscribe(&original, 0).await.unwrap();
         let failure = Failure {
             boundary: Boundary::Sink,
+            recovering_plugin_hold: false,
             position: 1,
             through: None,
             reason: "rejected row".into(),

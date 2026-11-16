@@ -96,7 +96,7 @@ list and use only the `--plugin` flags passed to their command. Each path is
 canonicalized to an absolute path before it is validated or stored.
 
 Each module must default-export a synchronous function. It receives a span and
-`{ operation, source, session_id, env }`, and must return a JSON-compatible span
+`{ operation, source, session_id, env, recovering_plugin_hold }`, and must return a JSON-compatible span
 object. Span, root, and parent identities cannot be changed:
 
 ```js
@@ -201,6 +201,17 @@ export default function guard(span) {
   return span;
 }
 ```
+
+`context.recovering_plugin_hold` is a boolean indicating that the current
+batch is being retried after a durable plugin failure, including timeouts.
+It is false for ordinary delivery and remains true until the held work is
+resolved. Older runtimes omit this field. To migrate a privacy filter without
+releasing previously held operations, deploy a runtime supporting this field
+first, then update the filter to throw `StopTracingError` immediately when it
+is true, before evaluating any relaxed rules. Keep the old strict rules when
+the field is absent. This conservatively discards every previously held route,
+including holds caused by unrelated plugin errors or timeouts; it does not
+retract already delivered spans or erase native transcripts.
 
 Plugin failures are deduplicated in the daemon's private local state, including
 the raw QuickJS exception and stack. Inspect them with:

@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 struct Request {
     config: SessionConfig,
     operation: Operation,
+    recovering_plugin_hold: bool,
     reply: oneshot::Sender<Response>,
 }
 struct Response {
@@ -37,6 +38,7 @@ pub(crate) struct RoutingSink {
     config: Option<SessionConfig>,
     pending: bool,
     permalink: Option<String>,
+    recovering_plugin_hold: bool,
 }
 
 impl RoutingSink {
@@ -60,6 +62,7 @@ impl RoutingSink {
                         let mut ops = ops.clone();
                         prepare.apply_shared(&mut ops, &request.config);
                         plugins.configure(&request.config.span_plugins);
+                        plugins.recovering_plugin_hold = request.recovering_plugin_hold;
                         let mut prepared = Vec::with_capacity(ops.len());
                         let mut failure = None;
                         let mut report = false;
@@ -199,8 +202,13 @@ impl RoutingSink {
             task,
             config: None,
             pending: false,
+            recovering_plugin_hold: false,
             permalink: None,
         }
+    }
+
+    pub fn set_recovering_plugin_hold(&mut self, recovering: bool) {
+        self.recovering_plugin_hold = recovering;
     }
 
     pub async fn shutdown(self) {
@@ -227,6 +235,7 @@ impl RoutingSink {
             config,
             operation,
             reply,
+            recovering_plugin_hold: self.recovering_plugin_hold,
         });
         // Retain ownership on a failed send; no upstream completion is implied.
         if let Err(undelivered) = OutputPort::send(&mut self.tx, delivery).await {
