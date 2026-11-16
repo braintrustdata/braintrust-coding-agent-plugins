@@ -15,9 +15,7 @@ fn existing(data: &Path, source: &str, session: &str) -> Option<Inspector> {
 }
 /// The translator continuation for a session, if one has been saved.
 pub fn checkpoint(data: &Path, source: &str, session: &str) -> Option<Value> {
-    existing(data, source, session)?
-        .checkpoint()
-        .map(|(_, value)| value)
+    existing(data, source, session)?.continuation()
 }
 pub fn identity(data: &Path, source: &str, session: &str) -> Value {
     existing(data, source, session)
@@ -36,8 +34,8 @@ pub fn accepted(data: &Path, source: &str, session: &str) -> u64 {
         return 0;
     };
     let count = db
-        .checkpoint()
-        .and_then(|(_, s)| s["native"]["event_seq"].as_u64())
+        .continuation()
+        .and_then(|state| state["native"]["event_seq"].as_u64())
         .unwrap_or(0);
     count
         + db.events()
@@ -77,7 +75,7 @@ pub fn has_completed_opencode_capture(data: &Path) -> bool {
         if db.events().iter().any(succeeded) || db.identity().is_some_and(|v| succeeded(&v)) {
             return true;
         }
-        if db.checkpoint().is_some_and(|(_, value)| {
+        if db.continuation().is_some_and(|value| {
             value["source"] == "opencode"
                 && value["native"]["v2"]["sessions"]
                     .as_object()

@@ -2,7 +2,7 @@
 //! typed interface, so tests outside this module never contain SQL.
 #![allow(dead_code, reason = "Different test suites use different inspectors.")]
 use super::store::{Json, One};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -114,12 +114,6 @@ impl Inspector {
         rows.filter_map(Result::ok).collect()
     }
 
-    fn event_tail(&self) -> u64 {
-        self.0
-            .one("SELECT event_tail FROM session WHERE id=1", [])
-            .unwrap_or(0)
-    }
-
     pub fn identity(&self) -> Option<Value> {
         let Json(identity) = self
             .0
@@ -128,18 +122,13 @@ impl Inspector {
         Some(identity)
     }
 
-    /// The translator continuation and the event ID it covers.
-    pub fn checkpoint(&self) -> Option<(u64, Value)> {
-        let (through, Json(continuation)) = self
+    /// The translator continuation saved with the last handed-over input.
+    pub fn continuation(&self) -> Option<Value> {
+        let Json(continuation) = self
             .0
-            .query_row(
-                "SELECT through,continuation FROM session WHERE id=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .ok()??;
-        Some((through, continuation))
+            .one("SELECT continuation FROM session WHERE id=1", [])
+            .ok()?;
+        Some(continuation)
     }
 
     pub fn heads(&self) -> Vec<Head> {
@@ -183,8 +172,12 @@ impl Inspector {
 
     /// All captured input is translated and every head has delivered.
     pub fn delivered(&self) -> bool {
-        self.checkpoint()
-            .is_some_and(|(through, _)| through >= self.event_tail())
+        self.0
+            .one(
+                "SELECT continuation IS NOT NULL AND through>=event_tail FROM session WHERE id=1",
+                [],
+            )
+            .unwrap_or(false)
             && self.held_heads() == 0
     }
 
