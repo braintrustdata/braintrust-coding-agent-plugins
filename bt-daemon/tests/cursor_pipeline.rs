@@ -544,7 +544,7 @@ async fn repeated_transcript_prompt_is_delivered_as_a_second_turn_after_checkpoi
     assert_eq!(
         turns.len(),
         2,
-        "the delivery ledger must accept a distinct second turn"
+        "delivery must accept a distinct second turn"
     );
     assert_ne!(turns[0]["span_id"], turns[1]["span_id"]);
     for (turn, answer) in turns.iter().zip(["first answer", "second answer"]) {
@@ -716,7 +716,6 @@ async fn cursor_mirror_generations_and_capture_bounds_survive_deleted_native_rec
     span_journal(&data)
         .execute("UPDATE heads SET position=0,failure=NULL", [])
         .unwrap();
-    std::fs::remove_dir_all(data.join("delivery-ledger")).unwrap();
     std::fs::remove_file(&native).unwrap();
     std::fs::remove_file(&output).unwrap();
     let recovered_daemon = start(&data, &socket).await;

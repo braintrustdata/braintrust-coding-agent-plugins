@@ -112,6 +112,7 @@ impl RoutingSink {
                                 }
                             }
                         }
+                        super::prepare::unique_tags(&mut prepared);
                         let submit_input = SubmissionInput {
                             config: request.config.clone(),
                             operation: Operation::Emit(prepared),
@@ -205,7 +206,7 @@ impl RoutingSink {
     pub async fn shutdown(self) {
         let Self { tx, mut task, .. } = self;
         drop(tx);
-        // Join the sink owner so completed shutdown also releases ledger files.
+        // Join the sink owner so completed shutdown also releases its handles.
         // A stalled backend cannot keep daemon shutdown waiting indefinitely.
         if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
             .await

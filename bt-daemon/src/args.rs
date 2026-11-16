@@ -177,6 +177,12 @@ pub struct ImportArgs {
     /// transform chain; persistent setup plugins are not included.
     #[arg(long, value_name = "PATH")]
     pub plugin: Vec<PathBuf>,
+    /// Socket path override.
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+    /// Fail instead of spawning a daemon if none is running.
+    #[arg(long)]
+    pub no_spawn: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

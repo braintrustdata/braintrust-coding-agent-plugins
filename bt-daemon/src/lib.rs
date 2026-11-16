@@ -18,7 +18,6 @@ mod client;
 mod codex_hooks;
 mod command_output;
 mod correlation;
-mod delivery_ledger;
 mod dispatch;
 mod env;
 mod hook;
@@ -77,7 +76,7 @@ pub use trace_command::{
 pub use trace_runtime::{
     run_trace, HostRouteSelection, RouteRequirements, TraceHostContext, TraceHostServices,
 };
-pub use transcript_import::{import_transcript, import_transcripts, run_import};
+pub use transcript_import::{import_transcript, import_transcripts, run_import, ImportTarget};
 pub use translate::{
     AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, SpanRow, SpanType,
     TURN_SPAN_ID_KEY,

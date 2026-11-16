@@ -507,6 +507,21 @@ impl Producer {
         Ok(Some(through))
     }
 
+    fn new_translator(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Box<dyn AgentTranslator>>> + Send + 'static
+    {
+        let registry = self.options.registry.clone();
+        let source = self.options.source.clone();
+        let namespace = self.options.namespace.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                registry.create_checked_with_session_namespace(&source, &namespace)
+            })
+            .await?
+        }
+    }
+
     async fn initialize(&mut self) -> anyhow::Result<()> {
         if self.translator.is_some() {
             return Ok(());
@@ -521,15 +536,7 @@ impl Producer {
                 }
             }
         }
-        let registry = self.options.registry.clone();
-        let source = self.options.source.clone();
-        let namespace = self.options.namespace.clone();
-        self.translator = Some(
-            tokio::task::spawn_blocking(move || {
-                registry.create_checked_with_session_namespace(&source, &namespace)
-            })
-            .await??,
-        );
+        self.translator = Some(self.new_translator().await?);
         self.position = 0;
         self.reader = if self.committed > 0 {
             JournalReader::open(&self.options.event_path, self.committed).await?
@@ -567,7 +574,12 @@ impl Producer {
                 SourceEvent::Event(Box::new(crate::journal::envelope_from_redacted(event)))
             }
             JournalRecord::Control(control) => SourceEvent::Control(control),
-            JournalRecord::DeliveryCheckpoint { .. } => SourceEvent::LegacyDeliveryCheckpoint,
+            JournalRecord::DeliveryCheckpoint { route, through } => {
+                SourceEvent::LegacyDeliveryCheckpoint {
+                    route: Box::new(route),
+                    through,
+                }
+            }
         };
         Ok(Some(SourceRecord {
             event,
@@ -644,18 +656,23 @@ impl Producer {
                         continue;
                     }
                     self.phase = Boundary::Translation;
-                    let ops = self
-                        .translate(move |translator, ctx| {
+                    let ops = if matches!(control.kind, ControlKind::Reset) {
+                        self.translator = Some(self.new_translator().await?);
+                        Vec::new()
+                    } else {
+                        self.translate(move |translator, ctx| {
                             if !matches!(control.kind, ControlKind::Checkpoint) {
                                 translator.finalize_at(ctx, &control.bounds)
                             } else {
                                 translator.checkpoint_at(ctx, &control.bounds)
                             }
                         })
-                        .await?;
+                        .await?
+                    };
                     (ops, self.capture.clone())
                 }
-                SourceEvent::LegacyDeliveryCheckpoint => {
+                SourceEvent::LegacyDeliveryCheckpoint { route, through } => {
+                    self.journal.acknowledge_legacy(&route, through).await?;
                     if input > self.committed {
                         self.journal.begin(input, observation).await?;
                         self.journal.commit(input).await?;

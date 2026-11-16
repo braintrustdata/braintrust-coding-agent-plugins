@@ -673,7 +673,7 @@ fn ms_to_secs(ms: i64) -> f64 {
 fn build_log(row: &SpanRow, source: &str, is_merge: bool) -> anyhow::Result<SpanLog> {
     let mut builder = SpanLog::builder();
     if let Some(origin) = &row.origin {
-        // The ledger supplies the immutable birth snapshot on every span op.
+        // Translation supplies the immutable birth snapshot on every span op.
         // Explicit null prevents SDK version defaults on spans with unknown
         // plugin versions, including stateless merges after close or recovery.
         builder = builder.context(json!({
