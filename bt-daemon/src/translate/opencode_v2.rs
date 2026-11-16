@@ -13,7 +13,7 @@ use super::{
     AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
 };
 use crate::{ids, wire::Envelope};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -32,7 +32,7 @@ fn span_value(value: impl Serialize) -> Value {
     }
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct SessionState {
     root: String,
     trace_root: String,
@@ -53,7 +53,7 @@ struct SessionState {
     denied_tools: HashSet<(String, String)>,
     completed_messages: RecentSet<String>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ToolState {
     name: String,
     skill: Option<SkillLoad>,
@@ -62,25 +62,25 @@ struct ToolState {
     parent: String,
     denied: bool,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Step {
     started: i64,
     model: Option<Model>,
     context: Option<Context>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Permission {
     session_id: String,
     call_id: Option<String>,
     message_id: Option<String>,
     action: String,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct HistoryEntry {
     id: String,
     messages: Vec<Message>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct NativeWindow {
     model: Option<Model>,
     messages: Vec<Message>,
@@ -95,7 +95,7 @@ impl NativeWindow {
         )
     }
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Compaction {
     started: i64,
     input_id: Option<String>,
@@ -114,7 +114,7 @@ struct CompactionResult<'a> {
     native_messages: Option<NativeMessages>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub(super) struct OpenCodeV2Translator {
     daemon_session_id: String,
     sessions: HashMap<String, SessionState>,
