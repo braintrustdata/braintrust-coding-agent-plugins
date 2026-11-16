@@ -9,12 +9,12 @@ use rusqlite::{
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, OnceLock, Weak},
+    sync::{Arc, LazyLock, Weak},
 };
 
 /// Schema 1-6 belong to the original SpanOp channel. Schema 7 adds the event
-/// collection, replacing NDJSON capture, and the translation state that makes
-/// each event-to-SpanOp handoff a single transaction.
+/// collection, replacing NDJSON capture, and one session row that makes each
+/// event-to-SpanOp handoff a single transaction.
 pub(super) const SCHEMA: u32 = 7;
 
 /// The current time in milliseconds, as SQL.
@@ -27,7 +27,7 @@ static CLOSING: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Default
 struct Inner {
     path: PathBuf,
     connection: std::sync::Mutex<Option<Connection>>,
-    channel: OnceLock<Arc<super::span_ops::Channel>>,
+    channel: super::span_ops::Channel,
 }
 
 impl Drop for Inner {
@@ -75,7 +75,12 @@ impl Store {
             return Ok(store);
         }
         let opened = path.clone();
-        let connection = tokio::task::spawn_blocking(move || open_connection(&opened)).await??;
+        let (connection, tail) = tokio::task::spawn_blocking(move || {
+            let db = open_connection(&opened)?;
+            let tail = db.one("SELECT op_tail FROM session WHERE id=1", [])?;
+            anyhow::Ok((db, tail))
+        })
+        .await??;
         let mut open = OPEN.lock();
         // A concurrent opener may have published the same file meanwhile.
         if let Some(inner) = open.get(&path).and_then(Weak::upgrade) {
@@ -85,7 +90,7 @@ impl Store {
         let inner = Arc::new(Inner {
             path: path.clone(),
             connection: std::sync::Mutex::new(Some(connection)),
-            channel: OnceLock::new(),
+            channel: super::span_ops::Channel::new(tail),
         });
         open.retain(|_, inner| inner.strong_count() > 0);
         open.insert(path, Arc::downgrade(&inner));
@@ -93,7 +98,7 @@ impl Store {
     }
 
     /// Live delivery state shared by every handle on this database.
-    pub fn channel(&self) -> &OnceLock<Arc<super::span_ops::Channel>> {
+    pub fn channel(&self) -> &super::span_ops::Channel {
         &self.0.channel
     }
 
@@ -199,7 +204,7 @@ pub(super) fn open_connection(path: &Path) -> anyhow::Result<Connection> {
             Err(error) => return Err(error.into()),
         }
     }
-    match migrate(&db) {
+    match super::upgrade::migrate(&db) {
         Ok(()) => db.execute_batch("COMMIT")?,
         Err(error) => {
             let _ = db.execute_batch("ROLLBACK");
@@ -207,107 +212,6 @@ pub(super) fn open_connection(path: &Path) -> anyhow::Result<Connection> {
         }
     }
     Ok(db)
-}
-
-// Read the version under the same write transaction as every upgrade, so a
-// concurrent opener cannot run a stale migration plan.
-fn migrate(db: &Connection) -> anyhow::Result<()> {
-    let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    anyhow::ensure!(
-        version <= SCHEMA,
-        "unsupported session storage schema {version}"
-    );
-    if version < 3 {
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS batches (
-                input INTEGER PRIMARY KEY, committed INTEGER NOT NULL DEFAULT 0,
-                observation INTEGER NOT NULL DEFAULT 1);
-            CREATE TABLE IF NOT EXISTS ops (
-                position INTEGER PRIMARY KEY AUTOINCREMENT,
-                input INTEGER NOT NULL, value BLOB NOT NULL);
-            CREATE INDEX IF NOT EXISTS ops_input ON ops(input);
-            CREATE TABLE IF NOT EXISTS heads (
-                route TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
-                failure TEXT);
-            CREATE TABLE IF NOT EXISTS recovery (id INTEGER PRIMARY KEY CHECK(id=1),failure TEXT);",
-        )?;
-        if version == 1 {
-            db.execute_batch(
-                "ALTER TABLE batches ADD COLUMN observation INTEGER NOT NULL DEFAULT 1",
-            )?;
-        }
-        db.execute_batch("ALTER TABLE heads ADD COLUMN binding TEXT")?;
-    }
-    if version < 4 {
-        db.execute_batch(
-            "CREATE TABLE root_candidates (span_id TEXT PRIMARY KEY, value BLOB NOT NULL)",
-        )?;
-    }
-    if version < 5 {
-        db.execute_batch(
-            "ALTER TABLE heads ADD COLUMN settings TEXT;
-             ALTER TABLE heads ADD COLUMN settings_through INTEGER NOT NULL DEFAULT 0",
-        )?;
-    }
-    if version < 6 {
-        db.execute_batch(
-            "DELETE FROM ops WHERE input IN (SELECT input FROM batches WHERE committed=0);
-            CREATE TABLE receipts (input INTEGER NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(input,ordinal));
-            CREATE TABLE publication (id INTEGER PRIMARY KEY CHECK(id=1), tail INTEGER NOT NULL, floor INTEGER NOT NULL);
-            INSERT INTO publication VALUES(1,(SELECT coalesce(max(position),0) FROM ops),0);
-            CREATE TABLE origins (span_id TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE span_state (span_id TEXT PRIMARY KEY, kind TEXT NOT NULL, value BLOB NOT NULL, end_ms INTEGER);",
-        )?;
-    }
-    if version < 7 {
-        // Translation state replaces per-input batches: an input is handed
-        // over in one transaction, so only ops a route could already see
-        // survive. A partly published input is translated again.
-        db.execute_batch(
-            "CREATE TABLE translation(id INTEGER PRIMARY KEY CHECK(id=1),
-                through INTEGER NOT NULL DEFAULT 0, tail INTEGER NOT NULL DEFAULT 0,
-                continuation BLOB, roots BLOB, failure TEXT);
-            INSERT INTO translation(id,through,tail,failure) VALUES(1,
-                (SELECT coalesce(max(input),0) FROM batches WHERE committed=1),
-                (SELECT tail FROM publication WHERE id=1),
-                (SELECT failure FROM recovery WHERE id=1));
-            DELETE FROM ops WHERE position>(SELECT tail FROM translation);",
-        )?;
-        super::span_ops::migrate_roots(db)?;
-        // Metadata kept for a live session expires once it goes unused.
-        db.execute_batch(&format!(
-            "ALTER TABLE origins ADD COLUMN ended_ms INTEGER;
-            CREATE INDEX origins_ended ON origins(ended_ms);
-            ALTER TABLE span_state ADD COLUMN touched_ms INTEGER NOT NULL DEFAULT 0;
-            UPDATE span_state SET touched_ms={NOW_MS};
-            ALTER TABLE heads ADD COLUMN progress_ms INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE heads ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 0;
-            UPDATE heads SET progress_ms={NOW_MS}, subscribed=1;"
-        ))?;
-        if version < 6 {
-            // One bounded pass extracts the metadata a schema-5 channel kept
-            // only inside its stored ops.
-            super::span_ops::extract_metadata(db)?;
-        }
-        db.execute_batch(
-            "DROP TABLE batches; DROP TABLE receipts; DROP TABLE root_candidates;
-            DROP TABLE publication; DROP TABLE recovery;
-            DROP INDEX ops_input; ALTER TABLE ops DROP COLUMN input;
-            CREATE TABLE events (id INTEGER PRIMARY KEY, control INTEGER NOT NULL, value BLOB NOT NULL);
-            CREATE TABLE captured (digest BLOB PRIMARY KEY, at_ms INTEGER NOT NULL) WITHOUT ROWID;
-            CREATE INDEX captured_at ON captured(at_ms);
-            CREATE TABLE event_state (id INTEGER PRIMARY KEY CHECK(id=1),
-                source TEXT, session_id TEXT, tail INTEGER NOT NULL DEFAULT 0,
-                identity BLOB, legacy_namespace INTEGER NOT NULL DEFAULT 0,
-                active_ms INTEGER NOT NULL DEFAULT 0);
-            INSERT INTO event_state(id, active_ms) VALUES(1, CAST(unixepoch('subsec') * 1000 AS INTEGER));",
-        )?;
-    }
-    if version < SCHEMA {
-        // Opening an up-to-date store writes nothing, so it keeps its age.
-        db.execute_batch(&format!("PRAGMA user_version={SCHEMA}"))?;
-    }
-    Ok(())
 }
 
 /// A column holding a JSON-encoded value, stored as text.
@@ -352,8 +256,39 @@ pub(crate) fn is_corruption(error: &anyhow::Error) -> bool {
 /// activity, so retention measures how long the session has been cold.
 pub(super) fn touch(tx: &Connection) -> rusqlite::Result<()> {
     tx.execute(
-        &format!("UPDATE event_state SET active_ms={NOW_MS} WHERE id=1"),
+        &format!("UPDATE session SET active_ms={NOW_MS} WHERE id=1"),
         [],
     )
     .map(|_| ())
+}
+
+/// Read records in order until they reach `budget` bytes or `window` elapses,
+/// always returning at least one. Column `value` of `sql` holds each record's
+/// encoded bytes; `decode` builds the record from its row.
+pub(super) fn read_batch<R>(
+    db: &Connection,
+    sql: &str,
+    params: impl Params,
+    value: usize,
+    budget: usize,
+    window: std::time::Duration,
+    mut decode: impl FnMut(&rusqlite::Row<'_>, &[u8]) -> anyhow::Result<R>,
+) -> anyhow::Result<Vec<R>> {
+    let mut statement = db.prepare_cached(sql)?;
+    let mut rows = statement.query(params)?;
+    let started = std::time::Instant::now();
+    let mut records = Vec::new();
+    let mut bytes = 0;
+    while let Some(row) = rows.next()? {
+        let encoded = row.get_ref(value)?.as_blob()?;
+        if !records.is_empty() && bytes + encoded.len() > budget {
+            break;
+        }
+        bytes += encoded.len();
+        records.push(decode(row, encoded)?);
+        if bytes >= budget || started.elapsed() >= window {
+            break;
+        }
+    }
+    Ok(records)
 }

@@ -1,8 +1,8 @@
 //! One ordered source consumer. Output publication is independent of route delivery.
+use super::cursor::Cursor;
 use super::input::{
     ControlKind, PipelineControl, SourceEvent, SourceInput, SourcePosition, SourceRecord,
 };
-use super::journal::Cursor;
 use super::prepare::Prepare;
 use super::roots::Roots;
 use super::{
@@ -10,7 +10,7 @@ use super::{
     Stage,
 };
 use crate::{
-    collections::{EventCollection, EventReader, EventRecord, SpanOps, Translated},
+    collections::{EventReader, EventRecord, SessionStorage, Translated},
     translate::{AgentTranslator, OriginSnapshot, Registry, SessionCtx, SpanOp, WeakOrigins},
     wire::{SessionConfig, SessionRoute},
 };
@@ -62,7 +62,7 @@ struct RouteLifetimes {
 pub(crate) struct Translation {
     tx: mpsc::Sender<Command>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    ops: SpanOps,
+    storage: SessionStorage,
     pub error: Arc<Mutex<Option<String>>>,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     routes: Mutex<RouteLifetimes>,
@@ -76,7 +76,7 @@ pub(crate) struct TranslationOptions {
     pub namespace: String,
     pub version: String,
     pub data_dir: PathBuf,
-    pub events: EventCollection,
+    pub storage: SessionStorage,
     pub input: SourceInput,
     pub registry: Arc<Registry>,
     pub correlation: Arc<crate::correlation::CorrelationRegistry>,
@@ -86,7 +86,7 @@ pub(crate) struct TranslationOptions {
 impl Translation {
     pub async fn spawn(options: TranslationOptions) -> anyhow::Result<Arc<Self>> {
         let actor = Producer::open(options).await?;
-        let ops = actor.ops.clone();
+        let storage = actor.options.storage.clone();
         let progress = actor.progress.clone();
         let error = actor.error.clone();
         let recovery = actor.recovery.clone();
@@ -95,7 +95,7 @@ impl Translation {
         Ok(Arc::new(Self {
             tx,
             task: tokio::sync::Mutex::new(Some(task)),
-            ops,
+            storage,
             error,
             recovery,
             routes: Mutex::new(RouteLifetimes::default()),
@@ -170,17 +170,17 @@ impl Translation {
         route: &SessionRoute,
         through: u64,
     ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
-        super::journal::reconfigure_held(&self.ops, route, through).await
+        super::cursor::reconfigure_held(&self.storage, route, through).await
     }
 
     pub async fn route_settings(&self, route: &SessionRoute) -> anyhow::Result<SessionRoute> {
-        self.ops.route_settings(route).await
+        self.storage.route_settings(route).await
     }
 
     /// Connect a route to the committed SpanOp stream without exposing its
     /// storage adapter to the route actor.
     pub async fn subscribe(&self, route: &SessionRoute) -> anyhow::Result<Cursor> {
-        Cursor::open(&self.ops, route).await
+        Cursor::open(&self.storage, route).await
     }
 }
 
@@ -215,7 +215,6 @@ struct Publication {
 struct Producer {
     options: TranslationOptions,
     progress: Arc<Progress>,
-    ops: SpanOps,
     error: Arc<Mutex<Option<String>>>,
     recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     translator: Option<Box<dyn AgentTranslator>>,
@@ -236,15 +235,15 @@ struct Producer {
 
 impl Producer {
     async fn open(options: TranslationOptions) -> anyhow::Result<Self> {
-        let ops = SpanOps::for_events(&options.events).await?;
-        let committed = ops.translated_through().await?;
+        let status = options.storage.status().await?;
+        let committed = status.translated_through;
         let progress = Arc::new(Progress {
             requested: AtomicU64::new(committed),
             committed: AtomicU64::new(committed),
         });
         let recovery = Arc::new(Mutex::new(None));
         let error = Arc::new(Mutex::new(None));
-        let state = match ops.source_failure().await? {
+        let state = match status.source_failure {
             Some(raw) => State::Recovering(serde_json::from_str(&raw).unwrap_or_else(|_| {
                 Failure::revision(Boundary::Journal, committed + 1, raw, &options.version)
             })),
@@ -253,7 +252,6 @@ impl Producer {
         Ok(Self {
             options,
             progress,
-            ops,
             error,
             recovery,
             translator: None,
@@ -323,7 +321,12 @@ impl Producer {
                 };
                 if recorded.as_ref() != Some(&encoded) && super::recovery::now_ms() >= record_retry
                 {
-                    match self.ops.set_source_failure(Some(encoded.clone())).await {
+                    match self
+                        .options
+                        .storage
+                        .set_source_failure(Some(encoded.clone()))
+                        .await
+                    {
                         Ok(()) => recorded = Some(encoded.clone()),
                         Err(error) => {
                             record_retry = super::recovery::now_ms().saturating_add(1_000);
@@ -397,7 +400,7 @@ impl Producer {
                     self.state = State::Recovering(failure);
                     continue;
                 }
-                if let Err(error) = self.ops.set_source_failure(None).await {
+                if let Err(error) = self.options.storage.set_source_failure(None).await {
                     self.phase = Boundary::Journal;
                     self.state = State::Recovering(self.failure(error, attempts));
                     continue;
@@ -463,7 +466,12 @@ impl Producer {
         if let State::Recovering(failure) = &self.state {
             return Err(failure.message());
         }
-        self.ops.tail().await.map_err(|error| error.to_string())
+        self.options
+            .storage
+            .status()
+            .await
+            .map(|status| status.op_tail)
+            .map_err(|error| error.to_string())
     }
 
     async fn control(&mut self, kind: ControlKind) -> anyhow::Result<u64> {
@@ -477,7 +485,7 @@ impl Producer {
         if let Some(through) = self.append_control(kind).await? {
             self.advance(through).await?;
         }
-        self.ops.tail().await
+        Ok(self.options.storage.status().await?.op_tail)
     }
     async fn append_control(&mut self, kind: ControlKind) -> anyhow::Result<Option<u64>> {
         self.phase = Boundary::Journal;
@@ -498,7 +506,7 @@ impl Producer {
         // here can reorder parent/child processing.
         let Some(appended) = self
             .options
-            .events
+            .storage
             .append(control.clone(), Some(self.position))
             .await?
         else {
@@ -519,12 +527,11 @@ impl Producer {
         if self.translator.is_some() {
             return Ok(());
         }
-        let checkpoint = self.ops.checkpoint().await?;
-        self.committed = self.ops.translated_through().await?;
-        self.roots = Roots::restore(self.ops.root_candidates().await?);
+        let checkpoint = self.options.storage.checkpoint().await?;
+        self.committed = self.options.storage.status().await?.translated_through;
+        self.roots = Roots::restore(self.options.storage.root_candidates().await?);
         for ops in self.roots.pending().values() {
-            for op in ops {
-                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            for row in ops.iter().map(SpanOp::row) {
                 if let Some(origin) = &row.origin {
                     self.origins.insert(row.span_id.clone(), origin);
                 }
@@ -552,7 +559,7 @@ impl Producer {
         self.position = 0;
         // Storage without a continuation predates checkpoints: rebuild
         // translator state from the retained input it already translated.
-        self.reader = (self.committed > 0).then(|| self.options.events.read(0, self.committed));
+        self.reader = (self.committed > 0).then(|| self.options.storage.read(0, self.committed));
         Ok(())
     }
 
@@ -567,7 +574,7 @@ impl Producer {
             return Ok(None);
         }
         if self.reader.is_none() {
-            self.reader = Some(self.options.events.read(self.position, through));
+            self.reader = Some(self.options.storage.read(self.position, through));
         }
         let reader = self
             .reader
@@ -615,7 +622,7 @@ impl Producer {
                 SourceEvent::Event(mut env) => {
                     self.last_control = None;
                     if let Some(route) = &env.route {
-                        self.ops.register(route).await?;
+                        self.options.storage.register(route).await?;
                     }
                     if crate::translate::canonical_source_name(&env.source) != self.options.source {
                         self.position = input;
@@ -699,7 +706,8 @@ impl Producer {
             // record (such as a delivery checkpoint): input with no output.
             if through > self.committed {
                 let state = self.continuation().await?;
-                self.ops
+                self.options
+                    .storage
                     .commit_translation(Translated {
                         input: through,
                         observation: true,
@@ -781,7 +789,8 @@ impl Producer {
                     None => self.continuation().await?,
                 };
                 pending.continuation = Some(state.clone());
-                self.ops
+                self.options
+                    .storage
                     .commit_translation(Translated {
                         input: pending.input,
                         observation: pending.observation,
@@ -809,18 +818,14 @@ impl Producer {
     async fn prepare(&mut self, pending: &Publication, ops: &mut [SpanOp]) -> anyhow::Result<()> {
         let missing = ops
             .iter()
-            .filter_map(|op| {
-                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                self.origins
-                    .get(&row.span_id)
-                    .is_none()
-                    .then(|| row.span_id.clone())
-            })
+            .map(|op| &op.row().span_id)
+            .filter(|span| self.origins.get(span).is_none())
+            .cloned()
             .collect();
-        let mut saved = self.ops.origins_for(missing).await?;
+        let mut saved = self.options.storage.origins_for(missing).await?;
         for op in ops.iter_mut() {
             let insert = matches!(op, SpanOp::Insert(_));
-            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            let row = op.row_mut();
             let origin = self
                 .origins
                 .get(&row.span_id)
@@ -854,7 +859,7 @@ impl Producer {
         // Candidates have no delivery position yet, but their birth records
         // identify the session for correlation. Defensive retirement updates
         // are not native observations and must not close a recreated observer.
-        for ops in self.ops.root_candidates().await?.into_values() {
+        for ops in self.options.storage.root_candidates().await?.into_values() {
             let births = ops
                 .into_iter()
                 .filter(|op| matches!(op, SpanOp::Insert(_)))
@@ -867,7 +872,7 @@ impl Producer {
             )
             .await?;
         }
-        let ops = self.ops.observations().await?;
+        let ops = self.options.storage.observations().await?;
         Self::observe(&self.options, &mut self.pending_snapshots, &ops, observer).await?;
         Ok(())
     }
@@ -930,7 +935,7 @@ pub(crate) mod tests {
                 namespace: crate::ids::session_namespace(agent, "checkpoint"),
                 version: "test".into(),
                 data_dir: dir.path().into(),
-                events: EventCollection::open(dir.path(), agent, "checkpoint")
+                storage: SessionStorage::open(dir.path(), agent, "checkpoint")
                     .await
                     .unwrap(),
                 input: SourceInput::default(),
@@ -948,7 +953,7 @@ pub(crate) mod tests {
         pub(crate) async fn write(&self, event: &crate::wire::Envelope, live: bool) -> u64 {
             let appended = self
                 .options
-                .events
+                .storage
                 .append(event, None)
                 .await
                 .unwrap()
@@ -961,7 +966,15 @@ pub(crate) mod tests {
         pub(crate) async fn process(&self, through: u64) {
             self.source.advance(through).await.unwrap();
             self.source.barrier().await.unwrap();
-            assert_eq!(self.source.ops.translated_through().await.unwrap(), through);
+            assert_eq!(
+                self.source
+                    .storage
+                    .status()
+                    .await
+                    .unwrap()
+                    .translated_through,
+                through
+            );
         }
         async fn reopen(&mut self) {
             self.source.shutdown().await;
@@ -1048,10 +1061,10 @@ pub(crate) mod tests {
                         f.process(positions[1]).await;
                         f.source.control(ControlKind::Checkpoint).await.unwrap();
                         assert_eq!(
-                            f.source.ops.translated_through().await.unwrap(),
+                            f.source.storage.status().await.unwrap().translated_through,
                             positions[1]
                         );
-                        assert_eq!(f.options.events.tail().await.unwrap(), tail);
+                        assert_eq!(f.options.storage.status().await.unwrap().event_tail, tail);
                         f.poison(0..tail).await;
                     }
                     "overflow" => {
@@ -1072,7 +1085,7 @@ pub(crate) mod tests {
                 }
                 f.process(tail).await;
                 f.source.control(ControlKind::Finalize).await.unwrap();
-                assert!(f.source.ops.translated_through().await.unwrap() > tail);
+                assert!(f.source.storage.status().await.unwrap().translated_through > tail);
                 // StoredOp already includes the private correlation fields;
                 // compare its complete encoding rather than duplicate its codec.
                 let rows: Vec<Vec<u8>> = f.db().op_records();
@@ -1124,9 +1137,9 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(f.source.ops.tail().await.unwrap(), 2);
-        assert_eq!(f.source.ops.stored().await.len(), 2);
-        let (_, bytes) = f.source.ops.checkpoint().await.unwrap().unwrap();
+        assert_eq!(f.source.storage.status().await.unwrap().op_tail, 2);
+        assert_eq!(f.source.storage.stored().await.len(), 2);
+        let (_, bytes) = f.source.storage.checkpoint().await.unwrap().unwrap();
         let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(state["native"]["event_seq"], 1);
         assert_eq!(db.count(Table::Events), 0);
@@ -1144,13 +1157,16 @@ pub(crate) mod tests {
         let through = f.write(&event, true).await;
         f.process(through).await;
         f.source.control(ControlKind::Retire).await.unwrap();
-        let through = f.options.events.tail().await.unwrap();
-        let tail = f.source.ops.tail().await.unwrap();
+        let through = f.options.storage.status().await.unwrap().event_tail;
+        let tail = f.source.storage.status().await.unwrap().op_tail;
         for _ in 0..3 {
             f.reopen().await;
             f.source.control(ControlKind::Retire).await.unwrap();
-            assert_eq!(f.options.events.tail().await.unwrap(), through);
-            assert_eq!(f.source.ops.tail().await.unwrap(), tail);
+            assert_eq!(
+                f.options.storage.status().await.unwrap().event_tail,
+                through
+            );
+            assert_eq!(f.source.storage.status().await.unwrap().op_tail, tail);
             assert_eq!(f.db().count(Table::Events), 0);
         }
         f.source.shutdown().await;
@@ -1162,14 +1178,14 @@ pub(crate) mod tests {
         line
     }
 
-    fn legacy_options(dir: &std::path::Path, events: EventCollection) -> TranslationOptions {
+    fn legacy_options(dir: &std::path::Path, storage: SessionStorage) -> TranslationOptions {
         TranslationOptions {
             source: "debug".into(),
             session_id: "s".into(),
             namespace: crate::ids::session_namespace("debug", "s"),
             version: "test".into(),
             data_dir: dir.into(),
-            events,
+            storage,
             input: SourceInput::default(),
             registry: Arc::new(Registry::default_agents()),
             correlation: Arc::default(),
@@ -1194,21 +1210,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         tokio::fs::write(&path, &bytes).await.unwrap();
-        let events = EventCollection::open(tmp.path(), "debug", "s")
+        let events = SessionStorage::open(tmp.path(), "debug", "s")
             .await
             .unwrap();
-        let tail = events.tail().await.unwrap();
+        let tail = events.status().await.unwrap().event_tail;
         assert_eq!(tail, bytes.len() as u64);
         let translation = Translation::spawn(legacy_options(tmp.path(), events.clone()))
             .await
             .unwrap();
         translation.advance(tail).await.unwrap();
         translation.barrier().await.unwrap();
-        let ops = SpanOps::for_events(&events).await.unwrap();
-        assert_eq!(ops.translated_through().await.unwrap(), tail);
+        assert_eq!(events.status().await.unwrap().translated_through, tail);
         // Lifecycle controls can be ordered after the reserved range again.
         translation.control(ControlKind::Retire).await.unwrap();
-        assert!(events.tail().await.unwrap() > tail);
+        assert!(events.status().await.unwrap().event_tail > tail);
         let mut route = translation
             .subscribe(&serde_json::from_value(route).unwrap())
             .await
@@ -1216,7 +1231,7 @@ pub(crate) mod tests {
         while let Some(delivery) = route.next_batch(100).await.unwrap() {
             delivery.into_completed().await.ok().unwrap();
         }
-        assert!(ops.complete(events.tail().await.unwrap()).await.unwrap());
+        assert!(events.complete().await.unwrap());
         translation.shutdown().await;
     }
 
@@ -1237,11 +1252,10 @@ pub(crate) mod tests {
         db.set_translated(bytes.len() as u64).unwrap();
         drop(db);
         let sessions = crate::collections::sessions(tmp.path()).await.unwrap();
-        let events = sessions[0].events().await.unwrap();
-        let ops = sessions[0].span_ops().await.unwrap();
+        let session = SessionStorage::at(&sessions[0]).await.unwrap();
         // The imported input only rebuilds translator state if the session
         // resumes; it does not keep a delivered session from collection.
-        assert!(ops.complete(events.tail().await.unwrap()).await.unwrap());
+        assert!(session.complete().await.unwrap());
     }
 
     struct BlockedTranslator {
@@ -1309,7 +1323,16 @@ pub(crate) mod tests {
         release.send(()).unwrap();
         let (producer, result) = work.await.unwrap();
         result.unwrap();
-        assert_eq!(producer.ops.translated_through().await.unwrap(), through);
+        assert_eq!(
+            producer
+                .options
+                .storage
+                .status()
+                .await
+                .unwrap()
+                .translated_through,
+            through
+        );
         f.source.shutdown().await;
     }
 
@@ -1348,7 +1371,7 @@ pub(crate) mod tests {
             ])
             .await;
         translation
-            .ops
+            .storage
             .commit_translation(Translated {
                 input: 10,
                 observation: false,
@@ -1390,7 +1413,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let source = "debug";
         let session = "stored";
-        let events = EventCollection::open(tmp.path(), source, session)
+        let events = SessionStorage::open(tmp.path(), source, session)
             .await
             .unwrap();
         let input = events
@@ -1411,7 +1434,7 @@ pub(crate) mod tests {
             .unwrap()
             .corrupt_events(0, input)
             .unwrap();
-        let journal = SpanOps::for_events(&events).await.unwrap();
+        let journal = events.clone();
         let tail = journal
             .translated(
                 input,
@@ -1430,7 +1453,7 @@ pub(crate) mod tests {
             namespace: crate::ids::session_namespace(source, session),
             version: "test".into(),
             data_dir: tmp.path().into(),
-            events,
+            storage: events,
             input: SourceInput::default(),
             registry: Arc::new(Registry::default_agents()),
             correlation: Arc::new(crate::correlation::CorrelationRegistry::default()),
@@ -1480,7 +1503,7 @@ pub(crate) mod tests {
         let f = SourceFixture::new("debug").await;
         f.source.shutdown().await;
         let mut producer = Producer::open(f.options.clone()).await.unwrap();
-        let journal = producer.ops.clone();
+        let journal = producer.options.storage.clone();
         let db = f.db();
         let drains = Arc::new(AtomicU64::new(0));
         producer.translator = Some(Box::new(CountedTranslation(drains.clone())));
@@ -1507,17 +1530,17 @@ pub(crate) mod tests {
         db.inject(Fault::InsertOps).unwrap();
         assert!(producer.publish().await.is_err());
         assert_eq!(drains.load(Ordering::Relaxed), 1);
-        assert_eq!(journal.translated_through().await.unwrap(), 0);
-        assert_eq!(journal.tail().await.unwrap(), 0);
+        assert_eq!(journal.status().await.unwrap().translated_through, 0);
+        assert_eq!(journal.status().await.unwrap().op_tail, 0);
         db.clear(Fault::InsertOps).unwrap();
         db.inject(Fault::Handoff).unwrap();
         assert!(producer.publish().await.is_err());
-        assert_eq!(journal.tail().await.unwrap(), 0);
+        assert_eq!(journal.status().await.unwrap().op_tail, 0);
         db.clear(Fault::Handoff).unwrap();
         producer.publish().await.unwrap();
         assert_eq!(drains.load(Ordering::Relaxed), 1);
-        assert_eq!(journal.translated_through().await.unwrap(), 10);
-        assert_eq!(journal.tail().await.unwrap(), 1);
+        assert_eq!(journal.status().await.unwrap().translated_through, 10);
+        assert_eq!(journal.status().await.unwrap().op_tail, 1);
         let roots = journal.root_candidates().await.unwrap();
         assert_eq!(
             roots["unused-root"].len(),

@@ -19,7 +19,7 @@ pub enum Fault {
 impl Fault {
     fn trigger(self) -> (&'static str, &'static str) {
         match self {
-            Self::Handoff => ("fault_handoff", "BEFORE UPDATE ON translation"),
+            Self::Handoff => ("fault_handoff", "BEFORE UPDATE OF through ON session"),
             Self::InsertOps => ("fault_insert_ops", "BEFORE INSERT ON ops"),
             Self::AdvanceHead => ("fault_head", "BEFORE UPDATE OF position ON heads"),
             Self::RemoveEvents => ("fault_remove_events", "BEFORE DELETE ON events"),
@@ -58,7 +58,7 @@ pub struct Head {
 
 /// The database file holding one source session.
 pub fn session_path(data_dir: &Path, source: &str, session_id: &str) -> PathBuf {
-    super::events::session_path(data_dir, source, session_id)
+    super::session::session_path(data_dir, source, session_id)
 }
 
 /// A separate connection to a session database, independent of the daemon's.
@@ -116,14 +116,14 @@ impl Inspector {
 
     pub fn event_tail(&self) -> u64 {
         self.0
-            .one("SELECT tail FROM event_state WHERE id=1", [])
+            .one("SELECT event_tail FROM session WHERE id=1", [])
             .unwrap_or(0)
     }
 
     pub fn identity(&self) -> Option<Value> {
         let Json(identity) = self
             .0
-            .one("SELECT identity FROM event_state WHERE id=1", [])
+            .one("SELECT identity FROM session WHERE id=1", [])
             .ok()?;
         Some(identity)
     }
@@ -133,7 +133,7 @@ impl Inspector {
         let (through, Json(continuation)) = self
             .0
             .query_row(
-                "SELECT through,continuation FROM translation WHERE id=1",
+                "SELECT through,continuation FROM session WHERE id=1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -166,7 +166,7 @@ impl Inspector {
     /// The position of the last published SpanOp.
     pub fn published_tail(&self) -> u64 {
         self.0
-            .one("SELECT tail FROM translation WHERE id=1", [])
+            .one("SELECT op_tail FROM session WHERE id=1", [])
             .unwrap_or(0)
     }
 
@@ -175,7 +175,7 @@ impl Inspector {
         self.0
             .one(
                 "SELECT count(*) FROM heads WHERE failure IS NOT NULL
-                 OR position<(SELECT tail FROM translation WHERE id=1)",
+                 OR position<(SELECT op_tail FROM session WHERE id=1)",
                 [],
             )
             .unwrap_or(0)
@@ -213,7 +213,7 @@ impl Inspector {
 
     pub fn corrupt_checkpoint(&self) -> anyhow::Result<()> {
         self.0
-            .execute_batch("UPDATE translation SET continuation=x'78' WHERE id=1")?;
+            .execute_batch("UPDATE session SET continuation=x'78' WHERE id=1")?;
         Ok(())
     }
 
@@ -221,7 +221,7 @@ impl Inspector {
     pub fn age(&self, by: std::time::Duration) -> anyhow::Result<()> {
         let by = i64::try_from(by.as_millis())?;
         for statement in [
-            "UPDATE event_state SET active_ms=active_ms-?",
+            "UPDATE session SET active_ms=active_ms-?",
             "UPDATE captured SET at_ms=at_ms-?",
             "UPDATE origins SET ended_ms=ended_ms-?",
             "UPDATE span_state SET touched_ms=touched_ms-?",
@@ -249,7 +249,7 @@ impl Inspector {
     /// left it, without a continuation.
     pub fn set_translated(&self, through: u64) -> anyhow::Result<()> {
         self.0
-            .execute("UPDATE translation SET through=? WHERE id=1", [through])?;
+            .execute("UPDATE session SET through=? WHERE id=1", [through])?;
         Ok(())
     }
 

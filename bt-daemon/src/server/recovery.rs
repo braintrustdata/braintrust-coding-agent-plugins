@@ -13,22 +13,24 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         return Vec::new();
     };
     let mut candidates = Vec::new();
-    for storage in sessions {
-        let Ok(Some((source, session_id))) = (match storage.events().await {
-            Ok(events) => events.owner().await,
+    for path in sessions {
+        let owner = match crate::collections::SessionStorage::at(&path).await {
+            Ok(storage) => storage.status().await.map(|status| status.owner),
             Err(error) => {
-                tracing::warn!(%error, path = %storage.path.display(), "session storage cannot be recovered");
+                tracing::warn!(%error, path = %path.display(), "session storage cannot be recovered");
                 continue;
             }
-        }) else {
+        };
+        let Ok(Some((source, session_id))) = owner else {
             continue;
         };
         let Ok(events) = daemon.events_for(&source, &session_id).await else {
             continue;
         };
-        let Ok(tail) = events.tail().await else {
+        let Ok(status) = events.status().await else {
             continue;
         };
+        let tail = status.event_tail;
         let namespace = crate::ids::session_namespace(&source, &session_id);
         let recorded_len = daemon
             .startup_cutoffs
@@ -101,10 +103,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
             if !sources.insert((template.env.source.clone(), template.env.session_id.clone())) {
                 continue;
             }
-            let Ok(journal) = crate::collections::SpanOps::for_events(&events).await else {
-                continue;
-            };
-            let Ok(routes) = journal.routes().await else {
+            let Ok(routes) = events.routes().await else {
                 continue;
             };
             for route in routes {
@@ -153,28 +152,24 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
                 continue;
             }
             let recovered_route = recovered_delivery_route(daemon, &event.env).await;
-            let completed = {
-                match (
-                    crate::collections::SpanOps::for_events(&events).await,
-                    recovered_route.as_ref(),
-                ) {
-                    (Ok(journal), Some(route)) => {
-                        let routes = journal.routes().await.unwrap_or_default();
-                        if routes.iter().any(|head| head.same_route(route)) {
-                            journal
-                                .route_complete(route, recorded_len)
-                                .await
-                                .unwrap_or(false)
-                        } else {
-                            // Only migrated input an earlier daemon delivered
-                            // is translated before any route subscribes.
-                            routes.is_empty()
-                                && journal.translated_through().await.unwrap_or(0)
-                                    >= event.journal_through
-                        }
+            let completed = match recovered_route.as_ref() {
+                Some(route) => {
+                    let routes = events.routes().await.unwrap_or_default();
+                    if routes.iter().any(|head| head.same_route(route)) {
+                        events
+                            .route_complete(route, recorded_len)
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        // Only migrated input an earlier daemon delivered
+                        // is translated before any route subscribes.
+                        routes.is_empty()
+                            && events.status().await.is_ok_and(|status| {
+                                status.translated_through >= event.journal_through
+                            })
                     }
-                    _ => false,
                 }
+                None => false,
             };
             if !completed {
                 // Ordered controls after the final native event also belong to recovery.
@@ -233,7 +228,7 @@ pub(super) async fn recover_unprocessed_journals(daemon: &Arc<Daemon>) {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::pipeline::journal::Cursor;
+    use crate::pipeline::cursor::Cursor;
     use crate::translate::{SpanOp, SpanRow};
 
     pub(crate) struct TestAuth;
@@ -273,13 +268,11 @@ pub(super) mod tests {
             "payload":{}, "route":route,
         }))
         .unwrap();
-        let writer = crate::collections::EventCollection::open(tmp.path(), "debug", "test")
+        let writer = crate::collections::SessionStorage::open(tmp.path(), "debug", "test")
             .await
             .unwrap();
         let through = writer.append(&env, None).await.unwrap().unwrap().through;
-        let spans = crate::collections::SpanOps::for_events(&writer)
-            .await
-            .unwrap();
+        let spans = writer.clone();
         drop(writer);
         spans
             .translated(
@@ -335,8 +328,8 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn startup_preserves_corrected_settings_before_a_held_head_completes() {
-        use crate::collections::SpanOps;
-        use crate::pipeline::{journal::Cursor, recovery::Failure};
+        use crate::collections::SessionStorage;
+        use crate::pipeline::{cursor::Cursor, recovery::Failure};
         let tmp = tempfile::tempdir().unwrap();
         let original = SessionRoute {
             destination: Some(crate::wire::TraceDestination::ProjectLogs {
@@ -352,10 +345,9 @@ pub(super) mod tests {
             "payload":{}, "route":original
         }))
         .unwrap();
-        let writer =
-            crate::collections::EventCollection::open(tmp.path(), "debug", &env.session_id)
-                .await
-                .unwrap();
+        let writer = crate::collections::SessionStorage::open(tmp.path(), "debug", &env.session_id)
+            .await
+            .unwrap();
         let first = writer.append(&env, None).await.unwrap().unwrap().through;
         env.route = Some(corrected.clone());
         env.event = "Stop".into();
@@ -374,7 +366,7 @@ pub(super) mod tests {
             .unwrap()
             .through;
         let path = crate::collections::inspect::session_path(tmp.path(), "debug", &env.session_id);
-        let spans = SpanOps::for_events(&writer).await.unwrap();
+        let spans = writer.clone();
         drop(writer);
         spans
             .translated(
@@ -402,7 +394,7 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        crate::pipeline::journal::reconfigure_held(&spans, &corrected, settings_through)
+        crate::pipeline::cursor::reconfigure_held(&spans, &corrected, settings_through)
             .await
             .unwrap();
         // Crash window: the correction is durable, but no consumer has retried it.
@@ -412,7 +404,7 @@ pub(super) mod tests {
         let daemon = Daemon::new(options, tmp.path().into());
         recover_unprocessed_journals(&daemon).await;
         daemon.ingress_barrier().await;
-        let restored = SpanOps::open(&path).await.unwrap();
+        let restored = SessionStorage::at(&path).await.unwrap();
         assert_eq!(
             restored.route_settings(&original).await.unwrap().tags,
             corrected.tags
@@ -448,10 +440,9 @@ pub(super) mod tests {
             "payload":{}, "route":original
         }))
         .unwrap();
-        let writer =
-            crate::collections::EventCollection::open(tmp.path(), "debug", &env.session_id)
-                .await
-                .unwrap();
+        let writer = crate::collections::SessionStorage::open(tmp.path(), "debug", &env.session_id)
+            .await
+            .unwrap();
         let through = writer.append(&env, None).await.unwrap().unwrap().through;
         drop(writer);
         let mut options = debug_serve_options("test", tmp.path());

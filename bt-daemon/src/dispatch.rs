@@ -76,7 +76,7 @@ pub(crate) struct SessionOptions {
     pub route: crate::wire::SessionRoute,
     pub data_dir: PathBuf,
     pub translation: Arc<Translation>,
-    pub input: crate::pipeline::journal::Cursor,
+    pub input: crate::pipeline::cursor::Cursor,
     pub auth_provider: Option<Arc<dyn crate::AuthProvider>>,
 }
 
@@ -87,7 +87,7 @@ pub struct Session {
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
     source_progress: Arc<crate::pipeline::translation::Progress>,
-    route_progress: crate::pipeline::journal::Progress,
+    route_progress: crate::pipeline::cursor::Progress,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub source_recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub source_error: Arc<Mutex<Option<String>>>,
@@ -626,7 +626,7 @@ mod tests {
             recovery: Arc::new(Mutex::new(None)),
             source_recovery: Arc::new(Mutex::new(None)),
             source_progress: Arc::new(crate::pipeline::translation::Progress::default()),
-            route_progress: crate::pipeline::journal::Progress::default(),
+            route_progress: crate::pipeline::cursor::Progress::default(),
             permalink: Arc::new(Mutex::new(None)),
             last_activity: Mutex::new(Instant::now()),
         };

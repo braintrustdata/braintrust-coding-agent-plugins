@@ -22,7 +22,7 @@ use recovery::*;
 use rpc::*;
 use sessions::*;
 
-use crate::collections::{EventCollection, EventRecord};
+use crate::collections::{EventRecord, SessionStorage};
 use crate::dispatch::{hydrate_transcript_reference, Session, SessionOptions};
 use crate::journal;
 use crate::sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, SinkFactory};
@@ -103,7 +103,7 @@ struct SessionAuthState {
     lease: AuthLease,
 }
 
-type EventSlot = Arc<tokio::sync::OnceCell<EventCollection>>;
+type EventSlot = Arc<tokio::sync::OnceCell<SessionStorage>>;
 
 pub struct Daemon {
     version: String,

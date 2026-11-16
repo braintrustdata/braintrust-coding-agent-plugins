@@ -370,7 +370,7 @@ mod tests {
     use crate::{
         translate::{SpanOp, SpanRow},
         wire::BackendAuth,
-        {collections::SpanOps, pipeline::journal::Cursor},
+        {collections::SessionStorage, pipeline::cursor::Cursor},
     };
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -456,11 +456,11 @@ mod tests {
         }
     }
     fn spawn(
-        cursor: crate::pipeline::journal::Cursor,
+        cursor: crate::pipeline::cursor::Cursor,
         options: ConsumerOptions,
     ) -> (
         Arc<Consumer>,
-        crate::pipeline::journal::Progress,
+        crate::pipeline::cursor::Progress,
         Arc<Mutex<Option<String>>>,
     ) {
         let subscription = cursor.into_input(
@@ -485,7 +485,7 @@ mod tests {
         .await
         .unwrap();
     }
-    async fn stored(journal: &SpanOps) {
+    async fn stored(journal: &SessionStorage) {
         journal
             .translated(
                 10,
@@ -503,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn transient_rejection_resubmits_consumed_batch_before_completing() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -535,9 +535,10 @@ mod tests {
         assert_eq!(record.submitted.load(Ordering::SeqCst), 2);
         assert!(error.lock().is_none());
         assert!(journal
-            .failure(&serde_json::to_string(&route).unwrap())
+            .head(&serde_json::to_string(&route).unwrap())
             .await
             .unwrap()
+            .and_then(|head| head.failure)
             .is_none());
         consumer.shutdown().await;
         forward.abort();
@@ -550,7 +551,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let plugin = tmp.path().join("redact.mjs");
         std::fs::write(&plugin, "let calls=0; export default span => {if(calls++===0) {while(true){}} return {...span,name:'redacted'};}").unwrap();
-        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -572,9 +573,10 @@ mod tests {
         assert!(error.lock().is_none());
         assert!(recovery.lock().is_none());
         assert!(journal
-            .failure(&serde_json::to_string(&route).unwrap())
+            .head(&serde_json::to_string(&route).unwrap())
             .await
             .unwrap()
+            .and_then(|head| head.failure)
             .is_none());
         consumer.shutdown().await;
         drop(journal);
@@ -617,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_delivery_can_read_ahead_and_acknowledge_original_receipts() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         let ops: Vec<_> = (0..129)
@@ -650,7 +652,7 @@ mod tests {
     async fn head_write_recovery_retries_only_completion() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
-        let journal = SpanOps::open(&path).await.unwrap();
+        let journal = SessionStorage::at(&path).await.unwrap();
         stored(&journal).await;
         let route = SessionRoute::default();
         let cursor = Cursor::open(&journal, &route).await.unwrap();
@@ -675,7 +677,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let plugin = tmp.path().join("plugin.mjs");
         std::fs::write(&plugin, "export default () => {throw new Error('bad')}").unwrap();
-        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -691,7 +693,12 @@ mod tests {
         );
         wait_for(|| error.lock().is_some()).await;
         consumer.shutdown().await;
-        let evidence = journal.failure(&key).await.unwrap().unwrap();
+        let evidence = journal
+            .head(&key)
+            .await
+            .unwrap()
+            .and_then(|head| head.failure)
+            .unwrap();
         assert!(!evidence.contains("never-persist-this"));
         // Restart with an ordinary channel between the durable source and the
         // same consumer. Historical failure gating belongs to the source.
@@ -718,7 +725,12 @@ mod tests {
         std::fs::write(&plugin, "export default span => span").unwrap();
         wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
-        assert!(journal.failure(&key).await.unwrap().is_none());
+        assert!(journal
+            .head(&key)
+            .await
+            .unwrap()
+            .and_then(|head| head.failure)
+            .is_none());
         consumer.shutdown().await;
         forward.abort();
         let _ = forward.await;
@@ -750,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn stop_signal_detaches_only_its_route_without_reporting_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         let plugin = tmp.path().join("stop.mjs");
@@ -786,9 +798,10 @@ mod tests {
         assert_eq!(stopped_record.submitted.load(Ordering::SeqCst), 0);
         assert_eq!(healthy_record.submitted.load(Ordering::SeqCst), 1);
         assert!(journal
-            .failure(&serde_json::to_string(&stopped_route).unwrap())
+            .head(&serde_json::to_string(&stopped_route).unwrap())
             .await
             .unwrap()
+            .and_then(|head| head.failure)
             .is_none());
         stopped.shutdown().await;
         healthy.shutdown().await;
@@ -797,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn unauthorized_delivery_refreshes_credentials_at_the_same_head() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -835,7 +848,7 @@ mod tests {
             .mount_as_scoped(&server)
             .await;
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -886,7 +899,7 @@ mod tests {
         std::fs::write(&first, "export default span => ({...span,name:'bad'})").unwrap();
         std::fs::write(&last,"export default span => {if(span.name==='bad') throw new Error('bad input'); return span}").unwrap();
         let last_digest = crate::span_processor::file_digest(&last);
-        let journal = SpanOps::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -902,9 +915,10 @@ mod tests {
         wait_for(|| error.lock().is_some()).await;
         let failure: Failure = serde_json::from_str(
             &journal
-                .failure(&serde_json::to_string(&route).unwrap())
+                .head(&serde_json::to_string(&route).unwrap())
                 .await
                 .unwrap()
+                .and_then(|head| head.failure)
                 .unwrap(),
         )
         .unwrap();

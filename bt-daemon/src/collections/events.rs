@@ -5,26 +5,22 @@
 //! Record IDs grow by each record's encoded size, so IDs imported from a legacy
 //! NDJSON journal keep their original byte boundaries and input budgets still
 //! measure bytes. Removal never renumbers later records.
-use super::store::One;
-use super::store::{Json, Store, NOW_MS};
+use super::session::SessionStorage;
+use super::store::{read_batch, Json, One, NOW_MS};
 use crate::pipeline::input::{PipelineControl, SourcePosition};
 use crate::wire::RedactedEnvelope;
-use rusqlite::{params, OptionalExtension};
-use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
-};
-
+use rusqlite::params;
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 
 const READ_RECORDS: usize = 32;
+const READ_BYTES: usize = 256 * 1024;
 /// Payload fields the daemon adds to record what it captured alongside an event.
 const CAPTURE_REFERENCES: [&str; 3] = [
     "_bt_claude_transcript_mirrors",
     "_bt_transcript_mirror",
     "_bt_transcript_replay",
 ];
-const READ_BYTES: usize = 256 * 1024;
 /// Payload fields that identify on-disk state the session still references.
 const IDENTITY_PAYLOAD: [&str; 3] = [
     "transcript_path",
@@ -57,18 +53,6 @@ impl From<PipelineControl> for EventRecord {
 pub(crate) struct EventEntry {
     pub id: u64,
     pub record: EventRecord,
-}
-
-/// What a fully imported legacy file implies about its session.
-pub(super) struct Imported {
-    /// The latest event, with only state-referencing payload fields.
-    pub identity: Option<RedactedEnvelope>,
-    /// Whether this source keeps the pre-qualification span-id namespace.
-    pub namespace: Option<bool>,
-    /// The file's length, the boundary for new records.
-    pub through: u64,
-    /// Input every route had delivered, already translated.
-    pub delivered: u64,
 }
 
 /// A record as stored: its kind, and the event or control as JSON.
@@ -105,82 +89,7 @@ impl TryFrom<&Stored> for EventRecord {
     }
 }
 
-/// The database file for one source session.
-pub(crate) fn session_path(data_dir: &Path, source: &str, session_id: &str) -> PathBuf {
-    data_dir.join("pipeline").join(format!(
-        "{}.sqlite",
-        crate::ids::session_storage_id(source, session_id)
-    ))
-}
-
-#[derive(Clone)]
-pub(crate) struct EventCollection {
-    store: Store,
-}
-
-impl EventCollection {
-    /// Open the session's input, first importing any legacy NDJSON journal for
-    /// it. A legacy file is deleted only after its records are committed here.
-    pub async fn open(data_dir: &Path, source: &str, session_id: &str) -> anyhow::Result<Self> {
-        let source = crate::translate::canonical_source_name(source).to_owned();
-        let events = Self::claim(data_dir, &source, session_id).await?;
-        super::legacy::import_session(data_dir, &source, session_id, &events).await?;
-        Ok(events)
-    }
-
-    /// Open the session database without legacy import, recording its owner.
-    pub(super) async fn claim(
-        data_dir: &Path,
-        source: &str,
-        session_id: &str,
-    ) -> anyhow::Result<Self> {
-        let events = Self::open_path(&session_path(data_dir, source, session_id)).await?;
-        let (source, session_id) = (source.to_owned(), session_id.to_owned());
-        events
-            .store
-            .write(move |tx| {
-                tx.execute(
-                    "UPDATE event_state SET source=?, session_id=? WHERE id=1 AND source IS NULL",
-                    params![source, session_id],
-                )?;
-                Ok(())
-            })
-            .await?;
-        Ok(events)
-    }
-
-    pub(super) async fn open_path(path: &Path) -> anyhow::Result<Self> {
-        Ok(Self {
-            store: Store::open(path).await?,
-        })
-    }
-
-    pub(super) fn store(&self) -> &Store {
-        &self.store
-    }
-
-    /// The ID of the last record ever inserted, including removed records.
-    pub async fn tail(&self) -> anyhow::Result<u64> {
-        self.store
-            .run(|db| Ok(db.one("SELECT tail FROM event_state WHERE id=1", [])?))
-            .await
-    }
-
-    /// The source and native session this database belongs to.
-    pub async fn owner(&self) -> anyhow::Result<Option<(String, String)>> {
-        self.store
-            .run(|db| {
-                Ok(db
-                    .query_row(
-                        "SELECT source, session_id FROM event_state WHERE id=1 AND source IS NOT NULL",
-                        [],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?)
-            })
-            .await
-    }
-
+impl SessionStorage {
     /// Append a record and return the ID range it occupies. The caller may
     /// acknowledge it once this returns: it is durable and visible to
     /// translation. Returns `None` when nothing was appended:
@@ -205,7 +114,7 @@ impl EventCollection {
         let stored = Stored::try_from(&record)?;
         self.store
             .write(move |tx| {
-                let tail: u64 = tx.one("SELECT tail FROM event_state WHERE id=1", [])?;
+                let tail: u64 = tx.one("SELECT event_tail FROM session WHERE id=1", [])?;
                 if after.is_some_and(|after| tail > after) {
                     return Ok(None);
                 }
@@ -220,13 +129,13 @@ impl EventCollection {
                     return Ok(None);
                 }
                 let previous: Option<Json<RedactedEnvelope>> =
-                    tx.one("SELECT identity FROM event_state WHERE id=1", [])?;
+                    tx.one("SELECT identity FROM session WHERE id=1", [])?;
                 if let Some(Json(previous)) = previous {
                     retain_references(&mut identity, &previous);
                 }
                 let appended = insert(tx, stored)?;
                 tx.execute(
-                    "UPDATE event_state SET identity=? WHERE id=1",
+                    "UPDATE session SET identity=? WHERE id=1",
                     [Json(&identity)],
                 )?;
                 Ok(Some(appended))
@@ -239,28 +148,9 @@ impl EventCollection {
         self.store
             .run(|db| {
                 let identity: Option<Json<_>> =
-                    db.one("SELECT identity FROM event_state WHERE id=1", [])?;
+                    db.one("SELECT identity FROM session WHERE id=1", [])?;
                 Ok(identity.map(|Json(identity)| identity))
             })
-            .await
-    }
-
-    /// Time since capture, translation or delivery last made progress.
-    pub async fn idle_for(&self) -> anyhow::Result<std::time::Duration> {
-        let active: i64 = self
-            .store
-            .run(|db| Ok(db.one("SELECT active_ms FROM event_state WHERE id=1", [])?))
-            .await?;
-        let now = chrono::Utc::now().timestamp_millis();
-        Ok(std::time::Duration::from_millis(
-            u64::try_from(now.saturating_sub(active)).unwrap_or(0),
-        ))
-    }
-
-    /// Whether this source kept the pre-qualification span-id namespace.
-    pub async fn legacy_namespace(&self) -> anyhow::Result<bool> {
-        self.store
-            .run(|db| Ok(db.one("SELECT legacy_namespace FROM event_state WHERE id=1", [])?))
             .await
     }
 
@@ -268,98 +158,12 @@ impl EventCollection {
     /// changes membership; only a committed translation removes records.
     pub fn read(&self, after: u64, through: u64) -> EventReader {
         EventReader {
-            events: self.clone(),
+            session: self.clone(),
             position: after,
             through,
             buffer: VecDeque::new(),
         }
     }
-
-    /// Import legacy records at their original byte boundaries. Retrying is
-    /// idempotent. The last batch of a file carries what the file implies
-    /// about the session as a whole.
-    pub(super) async fn import(
-        &self,
-        records: Vec<(u64, Stored)>,
-        finished: Option<Imported>,
-    ) -> anyhow::Result<()> {
-        self.store
-            .write(move |tx| {
-                for (id, stored) in records {
-                    anyhow::ensure!(
-                        id <= i64::MAX as u64,
-                        "legacy position exceeds storage range"
-                    );
-                    let prior = tx
-                        .query_row("SELECT control,value FROM events WHERE id=?", [id], |r| {
-                            Ok(Stored {
-                                control: r.get(0)?,
-                                value: r.get(1)?,
-                            })
-                        })
-                        .optional()?;
-                    match prior {
-                        Some(prior) => anyhow::ensure!(
-                            prior == stored,
-                            "legacy record changed during migration"
-                        ),
-                        None => {
-                            tx.execute(
-                                "INSERT INTO events(id,control,value) VALUES(?,?,?)",
-                                params![id, stored.control, stored.value],
-                            )?;
-                        }
-                    }
-                    tx.execute("UPDATE event_state SET tail=max(tail,?) WHERE id=1", [id])?;
-                }
-                let Some(finished) = finished else {
-                    return Ok(());
-                };
-                if let Some(identity) = &finished.identity {
-                    tx.execute(
-                        "UPDATE event_state SET identity=? WHERE id=1",
-                        [Json(identity)],
-                    )?;
-                }
-                if let Some(namespace) = finished.namespace {
-                    tx.execute(
-                        "UPDATE event_state SET legacy_namespace=? WHERE id=1",
-                        [namespace],
-                    )?;
-                }
-                tx.execute(
-                    "UPDATE event_state SET tail=max(tail,?) WHERE id=1",
-                    [finished.through],
-                )?;
-                super::span_ops::seed_delivered(tx, finished.delivered)
-            })
-            .await
-    }
-
-    /// Forget capture identities older than `retention`: a capture repeated
-    /// after that is recorded again.
-    pub async fn expire(&self, retention: std::time::Duration) -> anyhow::Result<()> {
-        let cutoff = cutoff_ms(retention);
-        self.store
-            .write(move |tx| {
-                tx.execute("DELETE FROM captured WHERE at_ms<?", [cutoff])?;
-                Ok(())
-            })
-            .await
-    }
-
-    pub(super) fn remove_through(
-        tx: &rusqlite::Transaction<'_>,
-        through: u64,
-    ) -> anyhow::Result<()> {
-        tx.execute("DELETE FROM events WHERE id<=?", [through])?;
-        Ok(())
-    }
-}
-
-/// The wall-clock time `retention` ago, in milliseconds.
-pub(super) fn cutoff_ms(retention: std::time::Duration) -> i64 {
-    chrono::Utc::now().timestamp_millis() - i64::try_from(retention.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// What identifies one capture of a native event. Route and capture context
@@ -410,7 +214,7 @@ pub(super) fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
 }
 
 fn insert(tx: &rusqlite::Transaction<'_>, stored: Stored) -> anyhow::Result<SourcePosition> {
-    let before: u64 = tx.one("SELECT tail FROM event_state WHERE id=1", [])?;
+    let before: u64 = tx.one("SELECT event_tail FROM session WHERE id=1", [])?;
     let through = before
         .checked_add(stored.value.len() as u64 + 1)
         .filter(|id| *id <= i64::MAX as u64)
@@ -419,17 +223,18 @@ fn insert(tx: &rusqlite::Transaction<'_>, stored: Stored) -> anyhow::Result<Sour
         "INSERT INTO events(id,control,value) VALUES(?,?,?)",
         params![through, stored.control, stored.value],
     )?;
-    tx.execute("UPDATE event_state SET tail=? WHERE id=1", [through])?;
+    tx.execute("UPDATE session SET event_tail=? WHERE id=1", [through])?;
     super::store::touch(tx)?;
     Ok(SourcePosition { before, through })
 }
 
 /// Ordered, batched reader over a range of event records.
 pub(crate) struct EventReader {
-    events: EventCollection,
+    session: SessionStorage,
     position: u64,
     through: u64,
-    buffer: VecDeque<(u64, Stored)>,
+    /// Each record decoded, or why it could not be.
+    buffer: VecDeque<(u64, serde_json::Result<EventRecord>)>,
 }
 
 impl EventReader {
@@ -445,41 +250,38 @@ impl EventReader {
         if self.buffer.is_empty() && self.position < self.through {
             let (after, through) = (self.position, self.through);
             self.buffer = self
-                .events
+                .session
                 .store
                 .run(move |db| {
-                    let mut query = db.prepare_cached(
+                    read_batch(
+                        db,
                         "SELECT id,control,value FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
-                    )?;
-                    let mut rows = query.query(params![after, through, READ_RECORDS])?;
-                    let mut records = VecDeque::new();
-                    let mut bytes = 0;
-                    while let Some(row) = rows.next()? {
-                        let stored = Stored {
-                            control: row.get(1)?,
-                            value: row.get(2)?,
-                        };
-                        if !records.is_empty() && bytes + stored.value.len() > READ_BYTES {
-                            break;
-                        }
-                        bytes += stored.value.len();
-                        records.push_back((row.get(0)?, stored));
-                    }
-                    Ok(records)
+                        params![after, through, READ_RECORDS],
+                        2,
+                        READ_BYTES,
+                        std::time::Duration::MAX,
+                        |row, value| {
+                            let stored = Stored {
+                                control: row.get(1)?,
+                                value: value.to_vec(),
+                            };
+                            Ok((row.get(0)?, EventRecord::try_from(&stored)))
+                        },
+                    )
                 })
-                .await?;
+                .await?
+                .into();
         }
-        let Some((id, stored)) = self.buffer.pop_front() else {
+        let Some((id, record)) = self.buffer.pop_front() else {
             return Ok(None);
         };
-        let record =
-            match tokio::task::spawn_blocking(move || EventRecord::try_from(&stored)).await? {
-                Ok(record) => record,
-                Err(error) => {
-                    self.buffer.clear();
-                    return Err(anyhow::Error::new(error).context(format!("event record {id}")));
-                }
-            };
+        let record = match record {
+            Ok(record) => record,
+            Err(error) => {
+                self.buffer.clear();
+                return Err(anyhow::Error::new(error).context(format!("event record {id}")));
+            }
+        };
         self.position = id;
         Ok(Some(EventEntry { id, record }))
     }

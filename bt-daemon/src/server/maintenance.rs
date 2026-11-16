@@ -47,9 +47,9 @@ async fn collect_sessions(daemon: &Daemon) {
     let Ok(sessions) = crate::collections::sessions(&daemon.data_dir).await else {
         return;
     };
-    for storage in sessions {
-        if let Err(error) = collect_session(daemon, &storage).await {
-            tracing::warn!(%error, path = %storage.path.display(), "session storage cleanup failed");
+    for path in sessions {
+        if let Err(error) = collect_session(daemon, &path).await {
+            tracing::warn!(%error, path = %path.display(), "session storage cleanup failed");
         }
     }
 }
@@ -57,25 +57,18 @@ async fn collect_sessions(daemon: &Daemon) {
 /// Remove the storage of a cold source session that owes nothing: every
 /// captured event is translated and every route has delivered every SpanOp.
 /// A session with live actors, queued captures or active tools is retained.
-pub(super) async fn collect_session(
-    daemon: &Daemon,
-    storage: &crate::collections::SessionStorage,
-) -> anyhow::Result<()> {
+pub(super) async fn collect_session(daemon: &Daemon, path: &std::path::Path) -> anyhow::Result<()> {
     // Inspection must never create storage for a session that has none.
-    if !tokio::fs::try_exists(&storage.path).await? {
+    if !tokio::fs::try_exists(path).await? {
         return Ok(());
     }
-    let events = storage.events().await?;
-    let Some((source, session_id)) = events.owner().await? else {
+    let session = crate::collections::SessionStorage::at(path).await?;
+    let Some((source, session_id)) = session.status().await?.owner else {
         // Output storage that no captured input ever claimed has no owner to
         // complete it. Keep it only while it may still be in use.
-        drop(events);
-        if storage
-            .modified_ago()
-            .await
-            .is_some_and(|idle| idle > RETENTION)
-        {
-            crate::collections::remove_session(&storage.path).await?;
+        drop(session);
+        if old(path, RETENTION).await {
+            crate::collections::remove_session(path).await?;
         }
         return Ok(());
     };
@@ -101,15 +94,13 @@ pub(super) async fn collect_session(
         .filter(|key| key.source == source && key.session_id == session_id)
         .map(|key| key.route.clone())
         .collect();
-    events.expire(RETENTION).await?;
-    let ops = storage.span_ops().await?;
-    ops.expire(RETENTION, live).await?;
+    session.expire(RETENTION, live).await?;
     if daemon.journals.lock().contains_key(&namespace)
         || daemon.translations.lock().contains_key(&namespace)
     {
         return Ok(());
     }
-    let routes = ops.routes().await?;
+    let routes = session.routes().await?;
     if routes.iter().any(|route| {
         DeliveryKey::new(&source, &session_id, route)
             .is_ok_and(|key| daemon.correlation.has_active_tools(&key.correlation_key()))
@@ -120,12 +111,12 @@ pub(super) async fn collect_session(
     // continuation and span metadata a resumed session needs to extend its
     // trace instead of re-creating it, so keep it until the session goes cold.
     // Output that no destination ever subscribed to can never be delivered.
-    let complete = routes.is_empty() || ops.complete(events.tail().await?).await?;
-    if !complete || events.idle_for().await? <= RETENTION {
+    let complete = routes.is_empty() || session.complete().await?;
+    if !complete || session.status().await?.idle_for <= RETENTION {
         return Ok(());
     }
-    drop((ops, events));
-    if crate::collections::remove_session(&storage.path).await? {
+    drop(session);
+    if crate::collections::remove_session(path).await? {
         tracing::debug!(session_id = %session_id, "completed session storage removed");
     }
     Ok(())
@@ -176,13 +167,13 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
         }
     }
     let mut protected = HashSet::new();
-    for storage in crate::collections::sessions(data_dir).await? {
-        let events = storage.events().await?;
-        let Some(identity) = events.identity().await? else {
+    for path in crate::collections::sessions(data_dir).await? {
+        let session = crate::collections::SessionStorage::at(&path).await?;
+        let Some(identity) = session.identity().await? else {
             continue;
         };
         mirrors(&identity.payload, &mut protected);
-        let mut reader = events.read(0, events.tail().await?);
+        let mut reader = session.read(0, session.status().await?.event_tail);
         while let Some(event) = reader.next_event().await? {
             mirrors(&event.payload, &mut protected);
         }
@@ -190,15 +181,14 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
         let key = automatic_link_key(&env);
         protected.insert(correlation_state_path(data_dir, &key));
         protected.insert(active_parent_snapshot_path(data_dir, &key));
-        let ops = storage.span_ops().await?;
-        if let Some((_, bytes)) = ops.checkpoint().await? {
+        if let Some((_, bytes)) = session.checkpoint().await? {
             checkpoint_paths(
                 &serde_json::from_slice(&bytes)?,
                 &data_dir.join("transcripts"),
                 &mut protected,
             );
         }
-        for route in ops.routes().await? {
+        for route in session.routes().await? {
             let key = DeliveryKey::new(&env.source, &env.session_id, &route)?.correlation_key();
             protected.insert(correlation_state_path(data_dir, &key));
             protected.insert(active_parent_snapshot_path(data_dir, &key));
@@ -391,7 +381,7 @@ pub(super) async fn probe_alive(endpoint: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::journal::Cursor;
+    use crate::pipeline::cursor::Cursor;
     use crate::{
         translate::{SpanOp, SpanRow},
         wire::Envelope,
@@ -470,7 +460,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut env = event("resuming", SessionRoute::default());
         let events =
-            crate::collections::EventCollection::open(tmp.path(), &env.source, &env.session_id)
+            crate::collections::SessionStorage::open(tmp.path(), &env.source, &env.session_id)
                 .await
                 .unwrap();
         let old_end = events.append(&env, None).await.unwrap().unwrap().through;
@@ -483,7 +473,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
         );
-        let mut reader = events.read(0, events.tail().await.unwrap());
+        let mut reader = events.read(0, events.status().await.unwrap().event_tail);
         let mut captured = Vec::new();
         while let Some(event) = reader.next_event().await.unwrap() {
             captured.push(event.event);
@@ -505,12 +495,10 @@ mod tests {
         daemon.settle_ingress().await;
         let source = daemon.translations.lock().values().next().unwrap().clone();
         assert!(source.barrier().await.unwrap() > 0);
-        let partition = crate::collections::SpanOps::for_events(&events)
-            .await
-            .unwrap();
+        let partition = events.clone();
         assert_eq!(
-            partition.translated_through().await.unwrap(),
-            events.tail().await.unwrap()
+            partition.status().await.unwrap().translated_through,
+            events.status().await.unwrap().event_tail
         );
         drain_all(&daemon).await;
     }
@@ -574,12 +562,10 @@ mod tests {
                 .events_for(&env.source, &env.session_id)
                 .await
                 .unwrap();
-            let partition = crate::collections::SpanOps::for_events(&events)
-                .await
-                .unwrap();
+            let partition = events.clone();
             assert_eq!(
-                partition.translated_through().await.unwrap(),
-                events.tail().await.unwrap()
+                partition.status().await.unwrap().translated_through,
+                events.status().await.unwrap().event_tail
             );
             let expected: Vec<_> = (slot..total).step_by(envs.len()).collect();
             let (_, state) = partition.checkpoint().await.unwrap().unwrap();
@@ -722,13 +708,11 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let env = event(scenario, SessionRoute::default());
             let events =
-                crate::collections::EventCollection::open(tmp.path(), &env.source, &env.session_id)
+                crate::collections::SessionStorage::open(tmp.path(), &env.source, &env.session_id)
                     .await
                     .unwrap();
             let through = events.append(&env, None).await.unwrap().unwrap().through;
-            let partition = crate::collections::SpanOps::for_events(&events)
-                .await
-                .unwrap();
+            let partition = events.clone();
             partition
                 .commit_translation(crate::collections::Translated {
                     input: through,
@@ -828,7 +812,7 @@ mod tests {
             }
             env.payload =
                 serde_json::json!({"_bt_transcript_mirror":{"mirror": retained,"through":8}});
-            crate::collections::EventCollection::open(tmp.path(), "debug", "test")
+            crate::collections::SessionStorage::open(tmp.path(), "debug", "test")
                 .await
                 .unwrap()
                 .append(&env, None)

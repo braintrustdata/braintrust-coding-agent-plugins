@@ -49,7 +49,7 @@ impl Daemon {
         }
         let events = self.events_for(&env.source, &env.session_id).await?;
         let native = crate::ids::native_session_id(&env.session_id);
-        let namespace = if events.legacy_namespace().await? {
+        let namespace = if events.status().await?.legacy_namespace {
             env.session_id.clone()
         } else {
             crate::ids::session_namespace(&env.source, native)
@@ -61,7 +61,7 @@ impl Daemon {
                 namespace,
                 version: self.version.clone(),
                 data_dir: self.data_dir.clone(),
-                events,
+                storage: events,
                 input: self.source_input_for(&env.source, &env.session_id),
                 registry: self.translators.clone(),
                 correlation: self.correlation.clone(),
@@ -252,7 +252,7 @@ impl Daemon {
         &self,
         source: &str,
         session_id: &str,
-    ) -> anyhow::Result<EventCollection> {
+    ) -> anyhow::Result<SessionStorage> {
         let slot = self
             .journals
             .lock()
@@ -260,7 +260,7 @@ impl Daemon {
             .or_default()
             .clone();
         let events = slot
-            .get_or_try_init(|| EventCollection::open(&self.data_dir, source, session_id))
+            .get_or_try_init(|| SessionStorage::open(&self.data_dir, source, session_id))
             .await?;
         Ok(events.clone())
     }
@@ -280,7 +280,7 @@ impl Daemon {
     pub(super) async fn append_event(
         &self,
         env: &Envelope,
-        events: &EventCollection,
+        events: &SessionStorage,
     ) -> anyhow::Result<Option<crate::pipeline::input::SourcePosition>> {
         let Some(appended) = events.append(env, None).await? else {
             return Ok(None);

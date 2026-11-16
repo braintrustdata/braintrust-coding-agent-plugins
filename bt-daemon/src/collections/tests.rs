@@ -31,7 +31,7 @@ async fn write_legacy(path: &std::path::Path, bytes: &[u8]) {
 #[tokio::test]
 async fn capture_stores_only_the_pi_fields_translation_reads() {
     let temp = tempfile::tempdir().unwrap();
-    let events = EventCollection::open(temp.path(), "pi", "session")
+    let events = SessionStorage::open(temp.path(), "pi", "session")
         .await
         .unwrap();
     let marker = "growing-partial-marker".repeat(64);
@@ -84,7 +84,7 @@ async fn capture_stores_only_the_pi_fields_translation_reads() {
     ] {
         assert!(!text.contains(marker), "{marker} reached storage");
     }
-    let mut reader = events.read(0, events.tail().await.unwrap());
+    let mut reader = events.read(0, events.status().await.unwrap().event_tail);
     let update = reader.next_event().await.unwrap().unwrap();
     assert_eq!(
         update.payload.pointer("/event/assistantMessageEvent/type"),
@@ -117,11 +117,11 @@ async fn legacy_import_keeps_byte_positions_expands_pi_history_and_deletes_the_f
     // An unacknowledged partial append at the tail is not imported.
     bytes.extend(b"{\"partial\":");
     write_legacy(&path, &bytes).await;
-    let events = EventCollection::open(temp.path(), "pi", "session")
+    let events = SessionStorage::open(temp.path(), "pi", "session")
         .await
         .unwrap();
     assert!(!path.exists());
-    let through = events.tail().await.unwrap();
+    let through = events.status().await.unwrap().event_tail;
     assert_eq!(through, bytes.len() as u64 - 11);
     let mut reader = events.read(0, through);
     let entry = reader.next().await.unwrap().unwrap();
@@ -150,16 +150,19 @@ async fn an_unreadable_legacy_journal_is_retained_until_it_can_be_imported() {
     let valid =
         line(&json!({"source":"debug","session_id":"session","event":"e","ts_ms":1,"payload":{}}));
     write_legacy(&path, &[valid.as_slice(), b"{broken}\n"].concat()).await;
-    assert!(EventCollection::open(temp.path(), "debug", "session")
+    assert!(SessionStorage::open(temp.path(), "debug", "session")
         .await
         .is_err());
     assert!(path.exists(), "a failed import keeps its source");
     write_legacy(&path, &valid).await;
-    let events = EventCollection::open(temp.path(), "debug", "session")
+    let events = SessionStorage::open(temp.path(), "debug", "session")
         .await
         .unwrap();
     assert!(!path.exists());
-    assert_eq!(events.tail().await.unwrap(), valid.len() as u64);
+    assert_eq!(
+        events.status().await.unwrap().event_tail,
+        valid.len() as u64
+    );
 }
 
 #[tokio::test]
@@ -174,16 +177,16 @@ async fn a_session_only_journal_splits_by_source_and_keeps_its_namespace_owner()
         ));
     }
     write_legacy(&path, &bytes).await;
-    let codex = EventCollection::open(temp.path(), "codex", "shared")
+    let codex = SessionStorage::open(temp.path(), "codex", "shared")
         .await
         .unwrap();
     assert!(!path.exists());
-    let claude = EventCollection::open(temp.path(), "claude-code", "shared")
+    let claude = SessionStorage::open(temp.path(), "claude-code", "shared")
         .await
         .unwrap();
     for (events, source, owner) in [(&codex, "codex", true), (&claude, "claude", false)] {
-        assert_eq!(events.legacy_namespace().await.unwrap(), owner);
-        let mut reader = events.read(0, events.tail().await.unwrap());
+        assert_eq!(events.status().await.unwrap().legacy_namespace, owner);
+        let mut reader = events.read(0, events.status().await.unwrap().event_tail);
         assert_eq!(reader.next_event().await.unwrap().unwrap().source, source);
         assert!(reader.next_event().await.unwrap().is_none());
     }
@@ -192,7 +195,7 @@ async fn a_session_only_journal_splits_by_source_and_keeps_its_namespace_owner()
 #[tokio::test]
 async fn storage_is_removed_only_after_its_last_handle_closes() {
     let temp = tempfile::tempdir().unwrap();
-    let events = EventCollection::open(temp.path(), "debug", "session")
+    let events = SessionStorage::open(temp.path(), "debug", "session")
         .await
         .unwrap();
     events
@@ -201,7 +204,7 @@ async fn storage_is_removed_only_after_its_last_handle_closes() {
         .unwrap()
         .unwrap();
     let path = super::inspect::session_path(temp.path(), "debug", "session");
-    let ops = SpanOps::for_events(&events).await.unwrap();
+    let ops = events.clone();
     drop(events);
     assert!(!remove_session(&path).await.unwrap());
     assert!(path.exists());
@@ -217,7 +220,7 @@ async fn storage_is_removed_only_after_its_last_handle_closes() {
 #[tokio::test]
 async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
     let temp = tempfile::tempdir().unwrap();
-    let events = EventCollection::open(temp.path(), "debug", "session")
+    let events = SessionStorage::open(temp.path(), "debug", "session")
         .await
         .unwrap();
     let input = events
@@ -226,7 +229,7 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
         .unwrap()
         .unwrap()
         .through;
-    let ops = SpanOps::for_events(&events).await.unwrap();
+    let ops = events.clone();
     let translated = Translated {
         input,
         observation: true,
@@ -241,16 +244,17 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
     db.inject(Fault::RemoveEvents).unwrap();
     assert!(ops.commit_translation(translated.clone()).await.is_err());
     // Neither stage changed: the event remains and no output is visible.
-    assert_eq!(ops.translated_through().await.unwrap(), 0);
+    let status = ops.status().await.unwrap();
+    assert_eq!(status.translated_through, 0);
     assert_eq!(db.count(Table::Events), 1);
     assert_eq!(db.count(Table::Ops), 0);
-    assert_eq!(ops.tail().await.unwrap(), 0);
+    assert_eq!(status.op_tail, 0);
     assert!(ops.checkpoint().await.unwrap().is_none());
     db.clear(Fault::RemoveEvents).unwrap();
     let committed = ops.commit_translation(translated.clone()).await.unwrap();
     assert_eq!(committed, 1);
     assert_eq!(db.count(Table::Ops), 1);
-    assert_eq!(ops.translated_through().await.unwrap(), input);
+    assert_eq!(ops.status().await.unwrap().translated_through, input);
     assert_eq!(db.count(Table::Events), 0);
     assert_eq!(ops.checkpoint().await.unwrap().unwrap().0, input);
 }
@@ -258,7 +262,7 @@ async fn input_is_removed_only_in_the_transaction_that_stores_its_output() {
 #[tokio::test]
 async fn reopening_storage_does_not_count_as_activity() {
     let temp = tempfile::tempdir().unwrap();
-    let events = EventCollection::open(temp.path(), "debug", "session")
+    let events = SessionStorage::open(temp.path(), "debug", "session")
         .await
         .unwrap();
     events
@@ -273,23 +277,23 @@ async fn reopening_storage_does_not_count_as_activity() {
         .age(day)
         .unwrap();
     // Restart recovery reopens every session database.
-    let events = EventCollection::open(temp.path(), "debug", "session")
+    let events = SessionStorage::open(temp.path(), "debug", "session")
         .await
         .unwrap();
-    assert!(events.idle_for().await.unwrap() >= day);
+    assert!(events.status().await.unwrap().idle_for >= day);
     events
         .append(&event("debug", "session", "later", json!({})), None)
         .await
         .unwrap()
         .unwrap();
-    assert!(events.idle_for().await.unwrap() < day);
+    assert!(events.status().await.unwrap().idle_for < day);
 }
 
 #[tokio::test]
 async fn a_live_session_expires_only_what_it_no_longer_uses() {
     let retention = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     let temp = tempfile::tempdir().unwrap();
-    let events = EventCollection::open(temp.path(), "debug", "session")
+    let events = SessionStorage::open(temp.path(), "debug", "session")
         .await
         .unwrap();
     let mut captured = event("debug", "session", "e", json!({}));
@@ -301,7 +305,7 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
         .unwrap()
         .through;
     assert!(events.append(&captured, None).await.unwrap().is_none());
-    let ops = SpanOps::for_events(&events).await.unwrap();
+    let ops = events.clone();
     let route = |name: &str| crate::wire::SessionRoute {
         tags: [name.into()].into_iter().collect(),
         ..Default::default()
@@ -351,7 +355,6 @@ async fn a_live_session_expires_only_what_it_no_longer_uses() {
     ops.expire(retention, vec![unsubscribed]).await.unwrap();
     assert_eq!(db.count(Table::Heads), 2, "a live route is never expired");
 
-    events.expire(retention).await.unwrap();
     ops.expire(retention, Vec::new()).await.unwrap();
     assert_eq!(db.count(Table::Heads), 1);
     assert_eq!(db.count(Table::Ops), 0);

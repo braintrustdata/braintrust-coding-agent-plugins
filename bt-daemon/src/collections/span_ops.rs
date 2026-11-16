@@ -1,17 +1,10 @@
 //! Translated SpanOps for one source session, with one durable head per route.
 //!
-//! Translation hands each input event's ops, correlation metadata and
-//! translator continuation over in the same transaction that removes the
-//! event. Routes then receive the ops live, or read them back after a gap. A
-//! route removes ops from its view by advancing its head once a destination
-//! accepts them, and an op is deleted when every route has passed it.
-//! Writers acquire the write lock before reading, so read-to-write upgrades
-//! cannot fail mid-way.
-use super::store::One;
-use super::{
-    events::{cutoff_ms, EventCollection},
-    store::{Json, Store, NOW_MS},
-};
+//! Routes receive ops live, or read them back after a gap. A route removes
+//! ops from its view by advancing its head once a destination accepts them,
+//! and an op is deleted when every route has passed it.
+use super::session::SessionStorage;
+use super::store::{read_batch, Json, One, NOW_MS};
 use crate::{
     pipeline::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW},
     translate::{OriginSnapshot, SinkFields, SpanOp, SpanRow, SpanType},
@@ -19,17 +12,20 @@ use crate::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::watch;
 
 #[derive(Debug, thiserror::Error)]
 #[error("credential resolution changed the durable head's pinned backend or organization")]
 pub(crate) struct BindingChanged;
 
+/// The head position of a detached route. SQLite integers are signed, so this
+/// is the largest position a head can hold; it is past every SpanOp.
+pub(crate) const DETACHED: u64 = i64::MAX as u64;
+
 /// Explicit codec preserves fields intentionally omitted from wire/plugin JSON.
 #[derive(Serialize, Deserialize)]
-struct StoredOp<Op> {
+pub(super) struct StoredOp<Op> {
     version: u32,
     op: Op,
     #[serde(flatten)]
@@ -38,11 +34,10 @@ struct StoredOp<Op> {
 
 impl<'a> From<&'a SpanOp> for StoredOp<&'a SpanOp> {
     fn from(op: &'a SpanOp) -> Self {
-        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
         Self {
             version: 1,
             op,
-            fields: SinkFields::of(row),
+            fields: SinkFields::of(op.row()),
         }
     }
 }
@@ -55,25 +50,47 @@ impl TryFrom<StoredOp<SpanOp>> for SpanOp {
             "unsupported SpanOp codec {}",
             stored.version
         );
-        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &mut stored.op;
-        stored.fields.restore(row);
+        stored.fields.restore(stored.op.row_mut());
         Ok(stored.op)
     }
 }
 
 impl StoredOp<SpanOp> {
-    fn encode(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
+    pub(super) fn encode(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
         Ok(serde_json::to_vec(&StoredOp::from(op))?)
     }
-    fn decode(bytes: &[u8]) -> anyhow::Result<SpanOp> {
+    pub(super) fn decode(bytes: &[u8]) -> anyhow::Result<SpanOp> {
         serde_json::from_slice::<Self>(bytes)?.try_into()
     }
+}
+
+pub(super) fn encode_roots(
+    roots: &BTreeMap<String, Vec<SpanOp>>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let roots: BTreeMap<_, Vec<StoredOp<&SpanOp>>> = roots
+        .iter()
+        .map(|(id, ops)| (id, ops.iter().map(StoredOp::from).collect()))
+        .collect();
+    Ok(Some(serde_json::to_vec(&roots)?))
+}
+
+pub(super) fn decode_roots(bytes: &[u8]) -> anyhow::Result<BTreeMap<String, Vec<SpanOp>>> {
+    serde_json::from_slice::<BTreeMap<String, Vec<StoredOp<SpanOp>>>>(bytes)?
+        .into_iter()
+        .map(|(id, ops)| {
+            let ops = ops.into_iter().map(SpanOp::try_from);
+            Ok((id, ops.collect::<anyhow::Result<_>>()?))
+        })
+        .collect()
 }
 
 /// Metadata needed to restore correlation and provenance without retaining
 /// conversation input/output after all delivery obligations are complete.
 pub(crate) fn metadata_only(op: &SpanOp) -> SpanOp {
-    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+    let row = op.row();
     let row = SpanRow {
         span_id: row.span_id.clone(),
         root_span_id: row.root_span_id.clone(),
@@ -93,8 +110,8 @@ pub(crate) fn metadata_only(op: &SpanOp) -> SpanOp {
     }
 }
 
-fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Result<()> {
-    let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+pub(super) fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Result<()> {
+    let row = op.row();
     if let Some(origin) = &row.origin {
         db.execute(
             "INSERT OR IGNORE INTO origins(span_id,value) VALUES (?,?)",
@@ -115,8 +132,7 @@ fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Res
             || (row.span_type == SpanType::Task && row.span_id == row.root_span_id))
     {
         let mut birth = metadata_only(op);
-        let (SpanOp::Insert(birth_row) | SpanOp::Merge(birth_row)) = &mut birth;
-        birth_row.end_ms = None;
+        birth.row_mut().end_ms = None;
         db.execute(
             &format!(
                 "INSERT OR REPLACE INTO span_state(span_id,kind,value,end_ms,touched_ms)
@@ -146,32 +162,8 @@ fn save_metadata(db: &Connection, op: &SpanOp, observation: bool) -> anyhow::Res
     Ok(())
 }
 
-/// Schema 6 upgrade: one bounded pass extracts small recovery metadata.
-pub(super) fn extract_metadata(db: &Connection) -> anyhow::Result<()> {
-    let mut after = 0;
-    loop {
-        let record: Option<(u64, Vec<u8>, bool)> = db
-            .query_row(
-                "SELECT position,value,observation FROM ops JOIN batches USING(input)
-                 WHERE position>? ORDER BY position LIMIT 1",
-                [after],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let Some((position, value, observation)) = record else {
-            break;
-        };
-        save_metadata(db, &StoredOp::decode(&value)?, observation)?;
-        after = position;
-    }
-    prune(db)
-}
-
-/// The head position of a detached route. SQLite integers are signed, so this
-/// is the largest position a head can hold; it is past every SpanOp.
-pub(crate) const DETACHED: u64 = i64::MAX as u64;
-
-fn prune(db: &Connection) -> anyhow::Result<()> {
+/// Delete ops every head has passed.
+pub(super) fn prune(db: &Connection) -> anyhow::Result<()> {
     db.execute(
         "DELETE FROM ops WHERE position<=(SELECT min(position) FROM heads)",
         [],
@@ -179,63 +171,21 @@ fn prune(db: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn tail(db: &Connection) -> rusqlite::Result<u64> {
-    db.one("SELECT tail FROM translation WHERE id=1", [])
-}
-
-fn translated_through(db: &Connection) -> rusqlite::Result<u64> {
-    db.one("SELECT through FROM translation WHERE id=1", [])
-}
-
-fn encode_roots(roots: &BTreeMap<String, Vec<SpanOp>>) -> anyhow::Result<Option<Vec<u8>>> {
-    if roots.is_empty() {
-        return Ok(None);
+/// Heads selected by `filter` that are the same route as `route`, by key.
+fn same_heads(db: &Connection, filter: &str, route: &SessionRoute) -> anyhow::Result<Vec<String>> {
+    let mut query = db.prepare(&format!("SELECT route FROM heads WHERE {filter}"))?;
+    let mut matching = Vec::new();
+    for key in query.query_map([], |r| r.get::<_, String>(0))? {
+        let key = key?;
+        if serde_json::from_str::<SessionRoute>(&key)?.same_route(route) {
+            matching.push(key);
+        }
     }
-    let roots: BTreeMap<_, Vec<StoredOp<&SpanOp>>> = roots
-        .iter()
-        .map(|(id, ops)| (id, ops.iter().map(StoredOp::from).collect()))
-        .collect();
-    Ok(Some(serde_json::to_vec(&roots)?))
-}
-
-/// Schema 7 upgrade: a pre-collection channel stored each root candidate in
-/// its own row. Translation now replaces them all in one value.
-pub(super) fn migrate_roots(db: &Connection) -> anyhow::Result<()> {
-    let mut roots = BTreeMap::<String, Vec<Box<RawValue>>>::new();
-    let mut query = db.prepare("SELECT span_id,value FROM root_candidates")?;
-    for row in query.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-    })? {
-        let (id, value) = row?;
-        let ops: Vec<Vec<u8>> = serde_json::from_slice(&value)?;
-        let ops = ops
-            .into_iter()
-            .map(|op| Ok(RawValue::from_string(String::from_utf8(op)?)?))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        roots.insert(id, ops);
-    }
-    if !roots.is_empty() {
-        db.execute(
-            "UPDATE translation SET roots=? WHERE id=1",
-            [serde_json::to_vec(&roots)?],
-        )?;
-    }
-    Ok(())
-}
-
-/// Mark legacy input through `through` as translated and delivered by an
-/// earlier daemon, unless this session already has SpanOp history. The
-/// translator rebuilds its state from that input without publishing it.
-pub(super) fn seed_delivered(tx: &Connection, through: u64) -> anyhow::Result<()> {
-    tx.execute(
-        "UPDATE translation SET through=? WHERE id=1 AND through=0 AND tail=0",
-        [through],
-    )?;
-    Ok(())
+    Ok(matching)
 }
 
 /// One input event's complete translation.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct Translated {
     pub input: u64,
     /// Whether the ops are native observations; retirement output is not.
@@ -261,6 +211,14 @@ pub(crate) struct HeldRoute {
     pub settings: Option<SessionRoute>,
 }
 
+/// One route's durable delivery head.
+pub(crate) struct Head {
+    pub position: u64,
+    pub failure: Option<String>,
+    /// Corrected settings recorded for a held head.
+    pub settings: Option<SessionRoute>,
+}
+
 /// A route's head and its feed of ops committed after subscribing.
 pub(crate) struct Subscriber {
     pub position: u64,
@@ -280,52 +238,30 @@ pub(super) struct Channel {
     payload_reads: std::sync::atomic::AtomicU64,
 }
 
-#[derive(Clone)]
-pub(crate) struct SpanOps {
-    store: Store,
-    channel: Arc<Channel>,
+impl Channel {
+    pub fn new(tail: u64) -> Self {
+        Self {
+            published: watch::channel(tail).0,
+            live: Multiplexer::default(),
+            replay: Default::default(),
+            #[cfg(test)]
+            payload_reads: Default::default(),
+        }
+    }
+
+    /// Advertise durable ops to routes: the tail first, so routes can drain
+    /// the bounded live feed (or read storage) while it is being filled.
+    pub async fn publish(&self, tail: u64, records: impl IntoIterator<Item = Record>) {
+        self.published.send_replace(tail);
+        for record in records {
+            self.live.publish(record).await;
+        }
+    }
 }
 
-impl SpanOps {
-    pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        Self::new(Store::open(path).await?).await
-    }
-
-    /// The SpanOps stored in the same session database as `events`.
-    pub async fn for_events(events: &EventCollection) -> anyhow::Result<Self> {
-        Self::new(events.store().clone()).await
-    }
-
-    async fn new(store: Store) -> anyhow::Result<Self> {
-        let channel = match store.channel().get() {
-            Some(channel) => channel.clone(),
-            None => {
-                let tail = store.run(|db| Ok(tail(db)?)).await?;
-                store
-                    .channel()
-                    .get_or_init(|| {
-                        Arc::new(Channel {
-                            published: watch::channel(tail).0,
-                            live: Multiplexer::default(),
-                            replay: Default::default(),
-                            #[cfg(test)]
-                            payload_reads: Default::default(),
-                        })
-                    })
-                    .clone()
-            }
-        };
-        Ok(Self { store, channel })
-    }
-
-    /// The last input whose translation has been handed over.
-    pub async fn translated_through(&self) -> anyhow::Result<u64> {
-        self.store.run(|db| Ok(translated_through(db)?)).await
-    }
-
-    /// The position of the last committed op.
-    pub async fn tail(&self) -> anyhow::Result<u64> {
-        self.store.run(|db| Ok(tail(db)?)).await
+impl SessionStorage {
+    fn channel(&self) -> &Channel {
+        self.store.channel()
     }
 
     /// Stored ops after `after`, bounded by bytes and elapsed decode time.
@@ -337,29 +273,21 @@ impl SpanOps {
     ) -> anyhow::Result<Vec<StoredRecord>> {
         self.store
             .run(move |db| {
-                let mut statement = db.prepare_cached(
+                read_batch(
+                    db,
                     "SELECT position,value FROM ops WHERE position>? ORDER BY position",
-                )?;
-                let mut rows = statement.query([after])?;
-                let started = std::time::Instant::now();
-                let mut records = Vec::new();
-                let mut bytes = 0;
-                while let Some(row) = rows.next()? {
-                    let value = row.get_ref(1)?.as_blob()?;
-                    if !records.is_empty() && bytes + value.len() > budget {
-                        break;
-                    }
-                    bytes += value.len();
-                    records.push(StoredRecord {
-                        position: row.get(0)?,
-                        op: StoredOp::decode(value)?,
-                        bytes: value.len(),
-                    });
-                    if bytes >= budget || started.elapsed() >= window {
-                        break;
-                    }
-                }
-                Ok(records)
+                    [after],
+                    1,
+                    budget,
+                    window,
+                    |row, value| {
+                        Ok(StoredRecord {
+                            position: row.get(0)?,
+                            op: StoredOp::decode(value)?,
+                            bytes: value.len(),
+                        })
+                    },
+                )
             })
             .await
     }
@@ -368,7 +296,7 @@ impl SpanOps {
     /// weakly held window is shared by all routes, so no decoded payload
     /// stays alive solely because of this cache.
     pub async fn recover_after(&self, after: u64) -> anyhow::Result<Vec<Record>> {
-        let mut cache = self.channel.replay.lock().await;
+        let mut cache = self.channel().replay.lock().await;
         if cache
             .first()
             .is_some_and(|(position, _, _)| *position <= after + 1)
@@ -402,7 +330,7 @@ impl SpanOps {
             })
             .collect();
         #[cfg(test)]
-        self.channel
+        self.channel()
             .payload_reads
             .fetch_add(records.len() as u64, std::sync::atomic::Ordering::Relaxed);
         *cache = records
@@ -412,110 +340,10 @@ impl SpanOps {
         Ok(records)
     }
 
-    /// The saved translator continuation and the input it covers.
-    pub async fn checkpoint(&self) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
-        self.store
-            .run(|db| {
-                Ok(db
-                    .query_row(
-                        "SELECT through,continuation FROM translation WHERE id=1 AND continuation IS NOT NULL",
-                        [],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?)
-            })
-            .await
-    }
-
-    /// Root candidates still waiting for work.
-    pub async fn root_candidates(&self) -> anyhow::Result<BTreeMap<String, Vec<SpanOp>>> {
-        self.store
-            .run(|db| {
-                let bytes: Option<Vec<u8>> =
-                    db.one("SELECT roots FROM translation WHERE id=1", [])?;
-                let Some(bytes) = bytes else {
-                    return Ok(BTreeMap::new());
-                };
-                serde_json::from_slice::<BTreeMap<String, Vec<StoredOp<SpanOp>>>>(&bytes)?
-                    .into_iter()
-                    .map(|(id, ops)| {
-                        let ops = ops.into_iter().map(SpanOp::try_from);
-                        Ok((id, ops.collect::<anyhow::Result<_>>()?))
-                    })
-                    .collect()
-            })
-            .await
-    }
-
-    /// Hand one input event's complete translation to delivery in a single
-    /// transaction: store its ops, metadata, root candidates and translator
-    /// continuation, and remove the consumed events through `input`. Routes
-    /// then receive the original op instances. An input that is already
-    /// handed over is left unchanged. Returns the published tail.
-    pub async fn commit_translation(&self, translated: Translated) -> anyhow::Result<u64> {
-        let encoded = translated
-            .ops
-            .iter()
-            .map(|op| Ok((StoredOp::encode(op)?, metadata_only(op))))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let roots = encode_roots(&translated.roots)?;
-        let (input, observation, state) =
-            (translated.input, translated.observation, translated.state);
-        let (tail, positions) = self
-            .store
-            .write(move |tx| {
-                if input <= translated_through(tx)? {
-                    return Ok((tail(tx)?, Vec::new()));
-                }
-                let mut positions = Vec::with_capacity(encoded.len());
-                for (value, metadata) in encoded {
-                    save_metadata(tx, &metadata, observation)?;
-                    let bytes = value.len();
-                    tx.execute("INSERT INTO ops(value) VALUES (?)", [value])?;
-                    positions.push((tx.last_insert_rowid() as u64, bytes));
-                }
-                let tail = positions.last().map(|(position, _)| *position);
-                if tail.is_some() {
-                    // Heads that had caught up start waiting for this output now.
-                    tx.execute(
-                        &format!(
-                            "UPDATE heads SET progress_ms={NOW_MS}
-                             WHERE position>=(SELECT tail FROM translation WHERE id=1)"
-                        ),
-                        [],
-                    )?;
-                }
-                tx.execute(
-                    "UPDATE translation SET through=?, tail=coalesce(?,tail), roots=?,
-                     continuation=coalesce(?,continuation) WHERE id=1",
-                    params![input, tail, roots, state],
-                )?;
-                EventCollection::remove_through(tx, input)?;
-                prune(tx)?;
-                super::store::touch(tx)?;
-                Ok((self::tail(tx)?, positions))
-            })
-            .await?;
-        // Every op is durable: advertise the tail first, so routes can drain
-        // the bounded live feed (or read storage) while it is being filled.
-        self.channel.published.send_replace(tail);
-        for ((position, bytes), op) in positions.into_iter().zip(translated.ops) {
-            self.channel
-                .live
-                .publish(Record {
-                    position,
-                    bytes,
-                    op: SharedOp::new(op),
-                })
-                .await;
-        }
-        Ok(tail)
-    }
-
     /// Create the route's head if needed. A new head starts after ops that
     /// every existing route has already removed.
     pub async fn subscribe(&self, route: &SessionRoute) -> anyhow::Result<Subscriber> {
-        let live = self.channel.live.subscribe();
+        let live = self.channel().live.subscribe();
         let key = serde_json::to_string(route)?;
         let candidate = route.clone();
         let position = self
@@ -525,15 +353,9 @@ impl SpanOps {
                 // its stable ID. Move that unresolved placeholder to the resolved
                 // identity instead of leaving a second head that can never run.
                 if candidate.auth.profile_id.is_some() {
-                    let aliases = {
-                        let mut query =
-                            tx.prepare("SELECT route FROM heads WHERE binding IS NULL AND route<>?")?;
-                        let rows = query.query_map([&key], |r| r.get::<_, String>(0))?;
-                        rows.collect::<Result<Vec<_>, _>>()?
-                    };
-                    for alias in aliases {
+                    for alias in same_heads(tx, "binding IS NULL", &candidate)? {
                         let previous: SessionRoute = serde_json::from_str(&alias)?;
-                        if previous.auth.profile_id.is_none() && previous.same_route(&candidate) {
+                        if alias != key && previous.auth.profile_id.is_none() {
                             tx.execute(
                                 "UPDATE OR IGNORE heads SET route=? WHERE route=?",
                                 params![key, alias],
@@ -545,7 +367,7 @@ impl SpanOps {
                 tx.execute(
                     &format!(
                         "INSERT OR IGNORE INTO heads(route,position,progress_ms) VALUES (?,coalesce(
-                        (SELECT min(position)-1 FROM ops),(SELECT tail FROM translation WHERE id=1)),
+                        (SELECT min(position)-1 FROM ops),(SELECT op_tail FROM session WHERE id=1)),
                         {NOW_MS})"
                     ),
                     [&key],
@@ -557,8 +379,45 @@ impl SpanOps {
         Ok(Subscriber {
             position,
             live,
-            published: self.channel.published.subscribe(),
+            published: self.channel().published.subscribe(),
         })
+    }
+
+    /// Register a delivery obligation for new output without backfilling.
+    pub async fn register(&self, route: &SessionRoute) -> anyhow::Result<()> {
+        let key = serde_json::to_string(route)?;
+        let candidate = route.clone();
+        self.store
+            .write(move |tx| {
+                if same_heads(tx, "1", &candidate)?.is_empty() {
+                    tx.execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO heads(route,position,progress_ms)
+                             VALUES (?,(SELECT op_tail FROM session WHERE id=1),{NOW_MS})"
+                        ),
+                        [key],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Whether `route` has delivered every op translated from input through `input`.
+    pub async fn route_complete(&self, route: &SessionRoute, input: u64) -> anyhow::Result<bool> {
+        let route = route.clone();
+        self.store
+            .run(move |db| {
+                let through: u64 = db.one("SELECT through FROM session WHERE id=1", [])?;
+                Ok(through >= input
+                    && !same_heads(
+                        db,
+                        "failure IS NULL AND position>=(SELECT op_tail FROM session WHERE id=1)",
+                        &route,
+                    )?
+                    .is_empty())
+            })
+            .await
     }
 
     pub async fn origins_for(
@@ -594,135 +453,71 @@ impl SpanOps {
                 for row in rows {
                     let (bytes, end) = row?;
                     let op = StoredOp::decode(&bytes)?;
-                    let (SpanOp::Insert(birth) | SpanOp::Merge(birth)) = &op;
-                    if let Some(end_ms) = end {
-                        let mut terminal = birth.clone();
+                    let terminal = end.map(|end_ms| {
+                        let mut terminal = op.row().clone();
                         terminal.end_ms = Some(end_ms);
-                        result.push(op);
-                        result.push(SpanOp::Merge(terminal));
-                    } else {
-                        result.push(op);
-                    }
+                        SpanOp::Merge(terminal)
+                    });
+                    result.push(op);
+                    result.extend(terminal);
                 }
                 Ok(result)
             })
             .await
     }
 
-    /// Register a delivery obligation for new output without backfilling.
-    pub async fn register(&self, route: &SessionRoute) -> anyhow::Result<()> {
-        let key = serde_json::to_string(route)?;
-        let candidate = route.clone();
+    pub async fn routes(&self) -> anyhow::Result<Vec<SessionRoute>> {
         self.store
-            .write(move |tx| {
-                let existing = {
-                    let mut query = tx.prepare("SELECT route FROM heads")?;
-                    let mut routes = query.query_map([], |r| r.get::<_, Json<SessionRoute>>(0))?;
-                    routes.try_fold(false, |found, route| {
-                        Ok::<_, rusqlite::Error>(found || route?.0.same_route(&candidate))
-                    })?
-                };
-                if !existing {
-                    tx.execute(
-                        &format!(
-                            "INSERT OR IGNORE INTO heads(route,position,progress_ms)
-                             VALUES (?,(SELECT tail FROM translation WHERE id=1),{NOW_MS})"
-                        ),
-                        [key],
-                    )?;
-                }
-                Ok(())
+            .run(|db| {
+                let mut query = db.prepare("SELECT route FROM heads ORDER BY route")?;
+                let routes = query
+                    .query_map([], |r| r.get::<_, Json<SessionRoute>>(0))?
+                    .map(|route| Ok(route?.0))
+                    .collect();
+                routes
             })
             .await
     }
 
-    /// Whether `route` has delivered every op translated from input through `input`.
-    pub async fn route_complete(&self, route: &SessionRoute, input: u64) -> anyhow::Result<bool> {
-        let route = route.clone();
+    pub async fn head(&self, route: &str) -> anyhow::Result<Option<Head>> {
+        let route = route.to_owned();
         self.store
             .run(move |db| {
-                if translated_through(db)? < input {
-                    return Ok(false);
-                }
-                let mut query = db.prepare(
-                    "SELECT route FROM heads WHERE failure IS NULL
-                     AND position>=(SELECT tail FROM translation WHERE id=1)",
-                )?;
-                for stored in query.query_map([], |r| r.get::<_, Json<SessionRoute>>(0))? {
-                    if stored?.0.same_route(&route) {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
+                Ok(db
+                    .query_row(
+                        "SELECT position,failure,settings FROM heads WHERE route=?",
+                        [route],
+                        |r| {
+                            Ok(Head {
+                                position: r.get(0)?,
+                                failure: r.get(1)?,
+                                settings: r
+                                    .get::<_, Option<Json<_>>>(2)?
+                                    .map(|Json(settings)| settings),
+                            })
+                        },
+                    )
+                    .optional()?)
             })
             .await
     }
 
-    /// Every obligation is met: all input through `input` is translated and
-    /// every route has delivered every op. An empty route set is not completion.
-    /// Root candidates still waiting for work and input retained only to
-    /// rebuild translator state are not owed to any route.
-    pub async fn complete(&self, input: u64) -> anyhow::Result<bool> {
-        self.store
-            .run(move |db| {
-                Ok(db.one("SELECT EXISTS(SELECT 1 FROM heads)
-                     AND NOT EXISTS(SELECT 1 FROM heads WHERE failure IS NOT NULL OR position<t.tail)
-                     AND t.failure IS NULL AND t.through>=?
-                     AND NOT EXISTS(SELECT 1 FROM events WHERE id>t.through)
-                     FROM translation t WHERE id=1", [input])?)
-            })
-            .await
+    /// The route's corrected settings, or the route itself if it has none.
+    pub async fn route_settings(&self, route: &SessionRoute) -> anyhow::Result<SessionRoute> {
+        let head = self.head(&serde_json::to_string(route)?).await?;
+        Ok(head
+            .and_then(|head| head.settings)
+            .unwrap_or_else(|| route.clone()))
     }
 
-    /// A translation failure recorded for recovery.
-    pub async fn source_failure(&self) -> anyhow::Result<Option<String>> {
-        self.store
-            .run(|db| Ok(db.one("SELECT failure FROM translation WHERE id=1", [])?))
-            .await
-    }
-
-    /// Expire what a live session no longer uses once `retention` passes:
-    /// metadata of spans that ended or were never completed, and heads that
-    /// were registered for output but never subscribed (such as a route whose
-    /// credentials never resolved) and have owed it that long. Ops no
-    /// remaining head needs are then deleted. A subscribed head held by a
-    /// failure is kept for recovery.
-    ///
-    /// `live` names routes with an active delivery that must be kept.
-    pub async fn expire(
-        &self,
-        retention: std::time::Duration,
-        live: Vec<String>,
-    ) -> anyhow::Result<()> {
-        let cutoff = cutoff_ms(retention);
+    pub async fn set_failure(&self, route: &str, failure: Option<String>) -> anyhow::Result<()> {
+        let route = route.to_owned();
         self.store
             .write(move |tx| {
-                tx.execute("DELETE FROM origins WHERE ended_ms<?", [cutoff])?;
                 tx.execute(
-                    "DELETE FROM span_state WHERE touched_ms<? AND (kind='tool' OR end_ms IS NOT NULL)",
-                    [cutoff],
+                    "UPDATE heads SET failure=? WHERE route=?",
+                    params![failure, route],
                 )?;
-                let stuck = {
-                    let mut query = tx.prepare(
-                        "SELECT route FROM heads WHERE subscribed=0 AND progress_ms<?
-                         AND position<(SELECT tail FROM translation WHERE id=1)",
-                    )?;
-                    let rows = query.query_map([cutoff], |r| r.get::<_, String>(0))?;
-                    rows.collect::<Result<Vec<_>, _>>()?
-                };
-                for route in stuck.into_iter().filter(|route| !live.contains(route)) {
-                    tracing::warn!(%route, "undelivered output expired for a route that never subscribed");
-                    tx.execute("DELETE FROM heads WHERE route=?", [route])?;
-                }
-                prune(tx)
-            })
-            .await
-    }
-
-    pub async fn set_source_failure(&self, failure: Option<String>) -> anyhow::Result<()> {
-        self.store
-            .run(move |db| {
-                db.execute("UPDATE translation SET failure=? WHERE id=1", [failure])?;
                 Ok(())
             })
             .await
@@ -736,20 +531,17 @@ impl SpanOps {
             "org_id":config.auth.org_id,"org_name":config.auth.org_name,
         }))?;
         self.store
-            .run(move |db| {
+            .write(move |tx| {
                 let previous: Option<String> =
-                    db.one("SELECT binding FROM heads WHERE route=?", [&route])?;
-                anyhow::ensure!(
-                    previous
-                        .as_ref()
-                        .is_none_or(|previous| previous == &binding),
-                    BindingChanged
-                );
-                if previous.is_none() {
-                    db.execute(
-                        "UPDATE heads SET binding=? WHERE route=?",
-                        params![binding, route],
-                    )?;
+                    tx.one("SELECT binding FROM heads WHERE route=?", [&route])?;
+                match previous {
+                    Some(previous) => anyhow::ensure!(previous == binding, BindingChanged),
+                    None => {
+                        tx.execute(
+                            "UPDATE heads SET binding=? WHERE route=?",
+                            params![binding, route],
+                        )?;
+                    }
                 }
                 Ok(())
             })
@@ -772,20 +564,19 @@ impl SpanOps {
                     let rows = query.query_map([through], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
-                            row.get::<_, Json<SessionRoute>>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<Json<SessionRoute>>>(2)?,
+                            HeldRoute {
+                                route: row.get::<_, Json<SessionRoute>>(0)?.0,
+                                failure: row.get(1)?,
+                                settings: row
+                                    .get::<_, Option<Json<SessionRoute>>>(2)?
+                                    .map(|Json(settings)| settings),
+                            },
                         ))
                     })?;
                     rows.collect::<Result<Vec<_>, _>>()?
                 };
                 let mut updates = Vec::new();
-                for (key, Json(route), failure, settings) in held {
-                    let held = HeldRoute {
-                        route,
-                        failure,
-                        settings: settings.map(|Json(settings)| settings),
-                    };
+                for (key, held) in held {
                     if let Some(corrected) = correct(&held) {
                         tx.execute(
                             "UPDATE heads SET settings=?, settings_through=? WHERE route=?",
@@ -796,40 +587,6 @@ impl SpanOps {
                 }
                 Ok(updates)
             })
-            .await
-    }
-
-    pub async fn route_settings(&self, route: &SessionRoute) -> anyhow::Result<SessionRoute> {
-        let fallback = route.clone();
-        let key = serde_json::to_string(route)?;
-        self.store
-            .run(move |db| {
-                let settings: Option<Json<SessionRoute>> = db
-                    .one("SELECT settings FROM heads WHERE route=?", [key])
-                    .optional()?
-                    .flatten();
-                Ok(settings.map_or(fallback, |Json(settings)| settings))
-            })
-            .await
-    }
-
-    pub async fn routes(&self) -> anyhow::Result<Vec<SessionRoute>> {
-        self.store
-            .run(|db| {
-                let mut query = db.prepare("SELECT route FROM heads ORDER BY route")?;
-                let routes = query
-                    .query_map([], |r| r.get::<_, Json<SessionRoute>>(0))?
-                    .map(|route| Ok(route?.0))
-                    .collect();
-                routes
-            })
-            .await
-    }
-
-    pub async fn failure(&self, route: &str) -> anyhow::Result<Option<String>> {
-        let route = route.to_owned();
-        self.store
-            .run(move |db| Ok(db.one("SELECT failure FROM heads WHERE route=?", [route])?))
             .await
     }
 
@@ -845,26 +602,6 @@ impl SpanOps {
                 )?;
                 prune(tx)
             })
-            .await
-    }
-
-    pub async fn set_failure(&self, route: &str, failure: Option<String>) -> anyhow::Result<()> {
-        let route = route.to_owned();
-        self.store
-            .run(move |db| {
-                db.execute(
-                    "UPDATE heads SET failure=? WHERE route=?",
-                    params![failure, route],
-                )?;
-                Ok(())
-            })
-            .await
-    }
-
-    pub async fn head(&self, route: &str) -> anyhow::Result<u64> {
-        let route = route.to_owned();
-        self.store
-            .run(move |db| Ok(db.one("SELECT position FROM heads WHERE route=?", [route])?))
             .await
     }
 
@@ -901,14 +638,7 @@ impl SpanOps {
 }
 
 #[cfg(test)]
-impl SpanOps {
-    pub async fn stored_ops(&self) -> u64 {
-        self.store
-            .run(|db| Ok(db.one("SELECT count(*) FROM ops", [])?))
-            .await
-            .unwrap_or(u64::MAX)
-    }
-
+impl SessionStorage {
     /// Stored ops decoded for assertions.
     pub async fn stored(&self) -> Vec<SpanOp> {
         self.read_after(0, usize::MAX, std::time::Duration::MAX)
@@ -920,314 +650,48 @@ impl SpanOps {
     }
 
     pub fn payload_reads(&self) -> u64 {
-        self.channel
+        self.channel()
             .payload_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Hold the storage lock, blocking every operation until released.
-    pub fn lock_storage(&self) -> impl Drop + '_ {
-        self.store.lock()
-    }
-
-    pub fn encode_op(op: &SpanOp) -> anyhow::Result<Vec<u8>> {
-        StoredOp::encode(op)
-    }
-    pub fn decode_op(bytes: &[u8]) -> anyhow::Result<SpanOp> {
-        StoredOp::decode(bytes)
-    }
-
-    pub async fn origins(&self) -> anyhow::Result<BTreeMap<String, OriginSnapshot>> {
-        self.store
-            .run(|db| {
-                let mut query = db.prepare("SELECT span_id,value FROM origins")?;
-                let origins = query
-                    .query_map([], |r| Ok((r.get(0)?, r.get::<_, Json<_>>(1)?.0)))?
-                    .collect::<rusqlite::Result<_>>()?;
-                Ok(origins)
-            })
-            .await
-    }
-
     /// Commit native output for `input` with no continuation.
     pub async fn translated(&self, input: u64, ops: Vec<SpanOp>) -> anyhow::Result<u64> {
-        self.translated_with_roots(input, ops, &BTreeMap::new())
-            .await
-    }
-
-    pub async fn translated_with_roots(
-        &self,
-        input: u64,
-        ops: Vec<SpanOp>,
-        roots: &BTreeMap<String, Vec<SpanOp>>,
-    ) -> anyhow::Result<u64> {
         self.commit_translation(Translated {
             input,
             observation: true,
             ops,
-            roots: roots.clone(),
-            state: None,
+            ..Default::default()
         })
         .await
     }
 }
 
-/// Upgrades from SpanOp channel schemas that predate collections.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::journal::Cursor;
 
-    fn op(name: &str) -> SpanOp {
-        SpanOp::Insert(SpanRow {
-            span_id: name.into(),
-            name: name.into(),
+    #[test]
+    fn codec_preserves_aggregate_watermarks_and_reads_older_records() {
+        let mut op = SpanOp::Insert(SpanRow {
+            span_id: "root".into(),
             late_merge_key: Some("late".into()),
-            turn_span_id: Some("turn".into()),
-            is_turn: true,
-            origin: Some(
-                OriginSnapshot {
-                    plugin_version: Some("capture".into()),
-                    source_version: None,
-                    bt_version: "test".into(),
-                }
-                .into(),
-            ),
             ..SpanRow::default()
-        })
-    }
-
-    fn route(name: &str) -> SessionRoute {
-        SessionRoute {
-            tags: [name.into()].into_iter().collect(),
-            ..SessionRoute::default()
-        }
-    }
-
-    /// The SpanOp channel schema written by the last pre-collection release.
-    const SCHEMA_FIVE: &str = "CREATE TABLE batches(input INTEGER PRIMARY KEY,
-            committed INTEGER NOT NULL DEFAULT 0, observation INTEGER NOT NULL DEFAULT 1);
-        CREATE TABLE ops(position INTEGER PRIMARY KEY AUTOINCREMENT,
-            input INTEGER NOT NULL, value BLOB NOT NULL);
-        CREATE INDEX ops_input ON ops(input);
-        CREATE TABLE heads(route TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0,
-            failure TEXT, binding TEXT, settings TEXT, settings_through INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE recovery(id INTEGER PRIMARY KEY CHECK(id=1), failure TEXT);
-        CREATE TABLE root_candidates(span_id TEXT PRIMARY KEY, value BLOB NOT NULL);
-        PRAGMA user_version=5;";
-
-    const SCHEMA_SIX: &str = "CREATE TABLE receipts(input INTEGER NOT NULL,
-            ordinal INTEGER NOT NULL, PRIMARY KEY(input,ordinal));
-        CREATE TABLE publication(id INTEGER PRIMARY KEY CHECK(id=1),
-            tail INTEGER NOT NULL, floor INTEGER NOT NULL);
-        CREATE TABLE origins(span_id TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE span_state(span_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
-            value BLOB NOT NULL, end_ms INTEGER);
-        PRAGMA user_version=6;";
-
-    #[tokio::test]
-    async fn schema_five_upgrade_reclaims_acknowledged_payloads_without_losing_provenance() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("upgrade.sqlite");
-        let db = Connection::open(&path).unwrap();
-        db.execute_batch(SCHEMA_FIVE).unwrap();
-        db.execute(
-            "INSERT INTO heads(route,position) VALUES(?,1)",
-            [serde_json::to_string(&route("old")).unwrap()],
-        )
-        .unwrap();
-        db.execute_batch("INSERT INTO batches(input,committed) VALUES(10,1)")
-            .unwrap();
-        db.execute(
-            "INSERT INTO ops(input,value) VALUES(10,?)",
-            [StoredOp::encode(&op("old")).unwrap()],
-        )
-        .unwrap();
-        drop(db);
-        let upgraded = SpanOps::open(&path).await.unwrap();
-        assert_eq!(upgraded.tail().await.unwrap(), 1);
-        assert_eq!(upgraded.origins().await.unwrap()["old"].bt_version, "test");
-        assert_eq!(upgraded.stored_ops().await, 0);
-        assert!(upgraded.complete(10).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn schema_six_upgrade_keeps_only_published_ops_and_translation_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("upgrade.sqlite");
-        let db = Connection::open(&path).unwrap();
-        db.execute_batch(SCHEMA_FIVE).unwrap();
-        db.execute_batch(SCHEMA_SIX).unwrap();
-        db.execute(
-            "INSERT INTO heads(route,position) VALUES(?,0)",
-            [serde_json::to_string(&route("a")).unwrap()],
-        )
-        .unwrap();
-        // Input 10 committed; input 20 published one op, then the daemon
-        // stopped before storing or publishing the rest.
-        db.execute_batch(
-            "INSERT INTO batches(input,committed) VALUES(10,1),(20,0);
-             INSERT INTO receipts VALUES(20,0);
-             INSERT INTO publication VALUES(1,2,0);
-             INSERT INTO recovery VALUES(1,'held');",
-        )
-        .unwrap();
-        for (input, name) in [(10, "committed"), (20, "published"), (20, "unpublished")] {
-            db.execute(
-                "INSERT INTO ops(input,value) VALUES(?,?)",
-                params![input, StoredOp::encode(&op(name)).unwrap()],
-            )
-            .unwrap();
-        }
-        let root = serde_json::to_vec(&[StoredOp::encode(&op("root")).unwrap()]).unwrap();
-        db.execute("INSERT INTO root_candidates VALUES('root',?)", [root])
-            .unwrap();
-        drop(db);
-        let upgraded = SpanOps::open(&path).await.unwrap();
-        assert_eq!(upgraded.translated_through().await.unwrap(), 10);
-        assert_eq!(upgraded.tail().await.unwrap(), 2);
-        let names: Vec<_> = upgraded
-            .stored()
-            .await
-            .into_iter()
-            .map(|op| {
-                let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
-                row.span_id
-            })
-            .collect();
-        assert_eq!(names, ["committed", "published"]);
-        assert_eq!(
-            upgraded.source_failure().await.unwrap().as_deref(),
-            Some("held")
-        );
-        let roots = upgraded.root_candidates().await.unwrap();
-        let (SpanOp::Insert(row) | SpanOp::Merge(row)) = &roots["root"][0];
-        assert_eq!(row.late_merge_key.as_deref(), Some("late"));
-        assert!(upgraded.checkpoint().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn concurrent_opens_upgrade_one_schema_atomically() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("concurrent-upgrade.sqlite");
-        let db = Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0); PRAGMA user_version=1;").unwrap();
-        drop(db);
-        let ready = Arc::new(tokio::sync::Barrier::new(8));
-        let mut tasks = Vec::new();
-        for _ in 0..8 {
-            let path = path.clone();
-            let ready = ready.clone();
-            tasks.push(tokio::spawn(async move {
-                ready.wait().await;
-                SpanOps::open(&path).await
-            }));
-        }
-        let mut opened = Vec::new();
-        for task in tasks {
-            opened.push(task.await.unwrap().unwrap());
-        }
-        for journal in opened {
-            assert_eq!(journal.tail().await.unwrap(), 0);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn translation_begin_waits_for_a_concurrent_writer_before_reading() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("concurrent.sqlite");
-        let journal = SpanOps::open(&path).await.unwrap();
-        let mut peer = Connection::open(&path).unwrap();
-        let transaction = peer
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
-        transaction
-            .execute("UPDATE translation SET through=10", [])
-            .unwrap();
-        let begin = tokio::spawn(async move {
-            journal.translated(10, vec![op("late")]).await.unwrap();
-            journal
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let failed_early = begin.is_finished();
-        transaction.commit().unwrap();
-        assert_eq!(
-            begin.await.unwrap().stored_ops().await,
-            0,
-            "a committed input must remain committed after waiting for its writer"
-        );
-        assert!(
-            !failed_early,
-            "a read-before-write transaction must wait rather than fail to upgrade its snapshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn preparatory_schema_upgrades_without_changing_committed_positions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("old.sqlite");
-        let db = Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TABLE batches(input INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0); INSERT INTO batches VALUES(10,1); PRAGMA user_version=1;").unwrap();
-        drop(db);
-        let journal = SpanOps::open(&path).await.unwrap();
-        assert_eq!(journal.translated_through().await.unwrap(), 10);
-        journal
-            .commit_translation(Translated {
-                input: 20,
-                observation: false,
-                ops: vec![op("retirement")],
-                roots: BTreeMap::new(),
-                state: None,
-            })
-            .await
-            .unwrap();
-        assert!(
-            journal.observations().await.unwrap().is_empty(),
-            "retirement output is not a native correlation observation"
-        );
-        let mut route = Cursor::open(&journal, &route("a")).await.unwrap();
-        assert_eq!(
-            route.next_batch(8).await.unwrap().unwrap().value().len(),
-            1,
-            "all published output still reaches durable delivery subscribers"
-        );
-    }
-
-    #[tokio::test]
-    async fn schema_two_heads_upgrade_and_keep_a_nonsecret_backend_binding() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("old.sqlite");
-        let db = Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TABLE heads(route TEXT PRIMARY KEY,position INTEGER NOT NULL DEFAULT 0,failure TEXT); PRAGMA user_version=2;").unwrap();
-        let route = route("canonical");
-        let key = serde_json::to_string(&route).unwrap();
-        db.execute("INSERT INTO heads(route,position) VALUES(?,7)", [&key])
-            .unwrap();
-        drop(db);
-        let journal = SpanOps::open(&path).await.unwrap();
-        let mut config = route.with_auth(crate::wire::BackendAuth {
-            token: "secret-a".into(),
-            api_url: Some("https://one.test".into()),
-            app_url: None,
-            org_id: Some("org".into()),
-            org_name: None,
-        });
-        journal.bind(&key, &config).await.unwrap();
-        config.auth.token = "secret-b".into();
-        journal.bind(&key, &config).await.unwrap();
-        config.auth.api_url = Some("https://other.test".into());
-        assert!(journal
-            .bind(&key, &config)
-            .await
-            .unwrap_err()
-            .downcast_ref::<BindingChanged>()
-            .is_some());
-        let restored = Cursor::open(&journal, &route).await.unwrap();
-        assert_eq!(restored.completed_position(), 7);
-        let binding: String = Connection::open(&path)
-            .unwrap()
-            .query_row("SELECT binding FROM heads", [], |r| r.get(0))
-            .unwrap();
-        assert!(!binding.contains("secret-"));
+        let version = crate::translate::LateMergeVersion {
+            ts_ms: 123,
+            native_id: Some("turn".into()),
+        };
+        op.row_mut().late_merge_version = Some(version.clone());
+        let encoded = StoredOp::encode(&op).unwrap();
+        let decoded = StoredOp::decode(&encoded).unwrap();
+        assert_eq!(decoded.row().late_merge_version, Some(version));
+        let mut legacy: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        legacy.as_object_mut().unwrap().remove("late_merge_version");
+        let decoded = StoredOp::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(decoded.row().late_merge_version.is_none());
+        assert!(serde_json::to_value(&op).unwrap()["Insert"]
+            .get("late_merge_version")
+            .is_none());
     }
 }

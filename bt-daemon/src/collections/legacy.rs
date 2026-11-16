@@ -6,10 +6,13 @@
 //! so the translator rebuilds its state from it without publishing it again. A
 //! journal file is deleted only after every record it contributes has been
 //! committed.
-use super::events::{EventCollection, EventRecord, Imported, Stored};
+use super::events::{EventRecord, Stored};
+use super::session::SessionStorage;
+use super::store::Json;
 use crate::journal::{journal_dir, journal_path, source_journal_path};
 use crate::wire::{RedactedEnvelope, SessionRoute};
 use anyhow::Context;
+use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -25,7 +28,7 @@ pub(super) async fn import_session(
     data_dir: &Path,
     source: &str,
     session_id: &str,
-    events: &EventCollection,
+    events: &SessionStorage,
 ) -> anyhow::Result<()> {
     let unqualified = journal_path(data_dir, session_id);
     if unqualified
@@ -61,7 +64,7 @@ pub(crate) async fn import_all(data_dir: &Path) {
                 tokio::fs::remove_file(&path).await?;
             }
             for (source, session_id) in owners {
-                EventCollection::open(data_dir, &source, &session_id).await?;
+                SessionStorage::open(data_dir, &source, &session_id).await?;
             }
             anyhow::Ok(())
         }
@@ -92,7 +95,7 @@ async fn import_unqualified(data_dir: &Path, path: &Path) -> anyhow::Result<()> 
         // An older daemon copied this file into a qualified journal on first
         // use and appended there. That copy is the authoritative superset.
         if tokio::fs::try_exists(source_journal_path(data_dir, &source, &session_id)).await? {
-            let events = EventCollection::claim(data_dir, &source, &session_id).await?;
+            let events = SessionStorage::claim(data_dir, &source, &session_id).await?;
             events
                 .import(
                     Vec::new(),
@@ -106,7 +109,7 @@ async fn import_unqualified(data_dir: &Path, path: &Path) -> anyhow::Result<()> 
                 .await?;
             continue;
         }
-        let events = EventCollection::claim(data_dir, &source, &session_id).await?;
+        let events = SessionStorage::claim(data_dir, &source, &session_id).await?;
         import_file(
             path,
             &source,
@@ -136,7 +139,7 @@ async fn sessions(path: &Path) -> anyhow::Result<BTreeSet<(String, String)>> {
 async fn import_file(
     path: &Path,
     source: &str,
-    events: &EventCollection,
+    events: &SessionStorage,
     namespace: Option<bool>,
 ) -> anyhow::Result<()> {
     let mut reader = Reader::open(path).await?;
@@ -204,6 +207,85 @@ async fn import_file(
             }),
         )
         .await
+}
+
+/// What a fully imported legacy file implies about its session.
+struct Imported {
+    /// The latest event, with only state-referencing payload fields.
+    identity: Option<RedactedEnvelope>,
+    /// Whether this source keeps the pre-qualification span-id namespace.
+    namespace: Option<bool>,
+    /// The file's length, the boundary for new records.
+    through: u64,
+    /// Input every route had delivered, already translated.
+    delivered: u64,
+}
+
+impl SessionStorage {
+    /// Import legacy records at their original byte boundaries. Retrying is
+    /// idempotent. The last batch of a file carries what the file implies
+    /// about the session as a whole.
+    async fn import(
+        &self,
+        records: Vec<(u64, Stored)>,
+        finished: Option<Imported>,
+    ) -> anyhow::Result<()> {
+        self.store
+            .write(move |tx| {
+                let mut tail = 0;
+                for (id, stored) in records {
+                    anyhow::ensure!(
+                        id <= i64::MAX as u64,
+                        "legacy position exceeds storage range"
+                    );
+                    let prior = tx
+                        .query_row("SELECT control,value FROM events WHERE id=?", [id], |r| {
+                            Ok(Stored {
+                                control: r.get(0)?,
+                                value: r.get(1)?,
+                            })
+                        })
+                        .optional()?;
+                    match prior {
+                        Some(prior) => anyhow::ensure!(
+                            prior == stored,
+                            "legacy record changed during migration"
+                        ),
+                        None => {
+                            tx.execute(
+                                "INSERT INTO events(id,control,value) VALUES(?,?,?)",
+                                params![id, stored.control, stored.value],
+                            )?;
+                        }
+                    }
+                    tail = tail.max(id);
+                }
+                if let Some(finished) = &finished {
+                    tail = tail.max(finished.through);
+                }
+                tx.execute(
+                    "UPDATE session SET event_tail=max(event_tail,?) WHERE id=1",
+                    [tail],
+                )?;
+                let Some(finished) = finished else {
+                    return Ok(());
+                };
+                tx.execute(
+                    "UPDATE session SET identity=coalesce(?,identity),
+                     legacy_namespace=coalesce(?,legacy_namespace) WHERE id=1",
+                    params![finished.identity.as_ref().map(Json), finished.namespace],
+                )?;
+                // Input every route had delivered is translated, unless this
+                // session already has SpanOp history. The translator rebuilds
+                // its state from it without publishing it.
+                tx.execute(
+                    "UPDATE session SET through=? WHERE id=1 AND through=0 AND op_tail=0",
+                    [finished.delivered],
+                )?;
+                Ok(())
+            })
+            .await
+    }
 }
 
 /// A delivery acknowledgement written by a daemon before SpanOp storage.

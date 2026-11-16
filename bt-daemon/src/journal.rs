@@ -122,34 +122,34 @@ pub async fn legacy_journal_source(
     route: &SessionRoute,
 ) -> Option<String> {
     let mut found = None;
-    for storage in crate::collections::sessions(data_dir).await.ok()? {
-        let Ok(events) = storage.events().await else {
+    for path in crate::collections::sessions(data_dir).await.ok()? {
+        let Ok(storage) = crate::collections::SessionStorage::at(&path).await else {
             continue;
         };
-        let Ok(Some((source, session))) = events.owner().await else {
+        let Ok(status) = storage.status().await else {
+            continue;
+        };
+        let Some((source, session)) = status.owner else {
             continue;
         };
         if session != session_id {
             continue;
         }
-        let recorded = events
+        let recorded = storage
             .identity()
             .await
             .ok()
             .flatten()
             .and_then(|identity| identity.route)
             .is_some_and(|candidate| candidate.same_route(route));
-        let registered = match storage.span_ops().await {
-            Ok(ops) => ops
-                .routes()
-                .await
-                .unwrap_or_default()
-                .iter()
-                .any(|candidate| candidate.same_route(route)),
-            Err(_) => false,
-        };
+        let registered = storage
+            .routes()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|candidate| candidate.same_route(route));
         if recorded || registered {
-            if events.legacy_namespace().await.unwrap_or(false) {
+            if status.legacy_namespace {
                 return Some(source);
             }
             found.get_or_insert(source);
@@ -303,10 +303,10 @@ mod tests {
         );
         assert!(!path.exists());
         for (source, owner) in [("codex", true), ("claude-code", false)] {
-            let events = crate::collections::EventCollection::open(temp.path(), source, "legacy")
+            let events = crate::collections::SessionStorage::open(temp.path(), source, "legacy")
                 .await
                 .unwrap();
-            assert_eq!(events.legacy_namespace().await.unwrap(), owner);
+            assert_eq!(events.status().await.unwrap().legacy_namespace, owner);
         }
     }
 }
