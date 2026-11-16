@@ -419,6 +419,17 @@ async fn pi_session_emits_traces() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Pi 1.0.4+ and the packed Pi extension"]
 async fn pi_codemode_traces_nested_tools_and_images() {
+    fn image_attachment(value: &Value) -> Option<&Value> {
+        if value["type"] == "braintrust_attachment" && value["content_type"] == "image/png" {
+            return Some(value);
+        }
+        match value {
+            Value::Array(items) => items.iter().find_map(image_attachment),
+            Value::Object(fields) => fields.values().find_map(image_attachment),
+            _ => None,
+        }
+    }
+
     let inference = OpenAiMock::new(|_context, request| {
         if request.has_function_output("call_pi_cm") {
             return MockReply::response(OpenAiTurn::text("PI_MOCK_OK"));
@@ -464,8 +475,8 @@ async fn pi_codemode_traces_nested_tools_and_images() {
     output.assert_contains("PI_MOCK_OK");
 
     // Codemode runs nested tools through ctx.executeTool(). Both calls should
-    // have child spans under the codemode span, and image blocks should remain
-    // available on the nested read span and the following LLM input.
+    // have child spans under the codemode span, with uploaded image references
+    // on the nested read span and the following LLM input.
     let scenario = IngestScenario::new()
         .expect("Pi codemode span", |row| {
             row_contains(row, &[r#""type":"tool""#, r#""name":"codemode""#])
@@ -479,10 +490,10 @@ async fn pi_codemode_traces_nested_tools_and_images() {
                 &[
                     r#""type":"tool""#,
                     r#""name":"read""#,
-                    r#""type":"image""#,
+                    r#""type":"braintrust_attachment""#,
                     "image/png",
                 ],
-            )
+            ) && image_attachment(&row["output"]).is_some()
         });
     let rows = world.wait_for_mock_ingest_scenario(&scenario).await;
     let span_named = |name: &str| {
@@ -504,17 +515,24 @@ async fn pi_codemode_traces_nested_tools_and_images() {
         .find(|row| {
             row["span_attributes"]["type"] == "tool"
                 && row["span_attributes"]["name"] == "read"
-                && row.to_string().contains(r#""type":"image""#)
+                && image_attachment(&row["output"]).is_some()
         })
-        .expect("read span should preserve Pi's image block");
+        .expect("read span should reference the uploaded Pi image");
     assert_eq!(image_read["span_parents"], json!([codemode["span_id"]]));
     assert!(image_read.to_string().contains("image/png"));
-    assert!(image_read.to_string().contains("iVBORw0KGgo"));
+    let attachment = image_attachment(&image_read["output"]).unwrap();
+    assert_eq!(
+        world
+            .uploaded_attachment(attachment["key"].as_str().unwrap())
+            .as_deref(),
+        Some(include_bytes!("fixtures/images/tiny.png").as_slice()),
+        "uploaded Pi image differs from the native image fixture"
+    );
     assert!(
         rows.iter().any(|row| {
             row["span_attributes"]["type"] == "llm"
-                && row.to_string().contains(r#""type":"image""#)
-                && row.to_string().contains("image/png")
+                && image_attachment(&row["input"])
+                    .is_some_and(|image| image["key"] == attachment["key"])
         }),
         "the following LLM span should retain the image attached by codemode"
     );
