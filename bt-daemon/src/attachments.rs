@@ -169,6 +169,19 @@ mod tests {
         assert_eq!(value[1]["content_type"], "image/png");
     }
     #[test]
+    fn local_image_urls_keep_the_native_content_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        std::fs::write(&path, b"image bytes").unwrap();
+        let mut value = json!({"type":"image_url","mime":"image/png","image_url":{"url":url::Url::from_file_path(&path).unwrap().as_str()}});
+        let mut attachments = Vec::new();
+        capture(&mut value, &mut attachments);
+        assert_eq!(attachments[0].content_type, "image/png");
+        assert_eq!(value["content_type"], "image/png");
+        assert_eq!(attachments[0].data, b"image bytes");
+    }
+
+    #[test]
     fn snapshots_native_local_file_urls() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("artifact.bin");

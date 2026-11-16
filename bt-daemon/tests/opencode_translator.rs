@@ -134,8 +134,7 @@ fn opencode_builds_turn_llm_tool_and_closes_the_session() {
         .all(|r| r.end_ms.is_some()));
 }
 
-#[test]
-fn opencode_merges_late_tool_result_attachments_into_closed_tool_span() {
+fn late_tool_attachment(mime: &str) -> SpanRow {
     let mut translator = Registry::default_agents().create("opencode", "root-session");
     let ctx = SessionCtx {
         session_id: "root-session".into(),
@@ -165,7 +164,7 @@ fn opencode_merges_late_tool_result_attachments_into_closed_tool_span() {
         event(
             "message.part.updated",
             5,
-            json!({"properties":{"part":{"sessionID":"native","messageID":"assistant-1","type":"tool","callID":"call-1","tool":"read","state":{"status":"completed","input":{"path":"image.png"},"output":"image contents","attachments":[{"mime":"image/png","url":"file:///tmp/image.png"}]}}}}),
+            json!({"properties":{"part":{"sessionID":"native","messageID":"assistant-1","type":"tool","callID":"call-1","tool":"read","state":{"status":"completed","input":{"path":"image.png"},"output":"image contents","attachments":[{"mime":mime,"url":"file:///tmp/image.png"}]}}}}),
         ),
     ];
 
@@ -180,20 +179,33 @@ fn opencode_merges_late_tool_result_attachments_into_closed_tool_span() {
             _ => None,
         })
         .unwrap();
-    let late_attachment_merge = ops.iter().find(|op| {
-        matches!(op, SpanOp::Merge(row) if row.span_id == tool_id && row.output.as_ref().is_some_and(|output| output.to_string().contains("image_url")))
-    });
-    assert!(late_attachment_merge.is_some());
+    reduce(ops).remove(&tool_id).unwrap()
+}
 
-    let rows = reduce(ops);
+#[test]
+fn opencode_merges_late_tool_result_attachments_into_closed_tool_span() {
+    let row = late_tool_attachment("image/png");
     assert_eq!(
-        rows[&tool_id].output,
+        row.output,
         Some(json!([
             {"type":"text","text":"image contents"},
-            {"type":"image_url","image_url":{"url":"file:///tmp/image.png"}}
+            {"type":"image_url","mime":"image/png","image_url":{"url":"file:///tmp/image.png"}}
         ]))
     );
-    assert_eq!(rows[&tool_id].end_ms, Some(4));
+    assert_eq!(row.end_ms, Some(4));
+}
+
+#[test]
+fn opencode_merges_late_pdf_attachments_into_closed_tool_span() {
+    let row = late_tool_attachment("application/pdf");
+    assert_eq!(
+        row.output,
+        Some(json!([
+            {"type":"text","text":"image contents"},
+            {"type":"file","mime":"application/pdf","url":"file:///tmp/image.png"}
+        ]))
+    );
+    assert_eq!(row.end_ms, Some(4));
 }
 
 #[test]

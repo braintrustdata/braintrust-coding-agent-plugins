@@ -993,7 +993,7 @@ impl OpenCodeTranslator {
                             )
                         }) {
                             if let Some(closed) = state.closed_tool_spans.get(call_id) {
-                                if contains_image_attachment(&v) {
+                                if contains_attachment(&v) {
                                     ops.push(SpanOp::Merge(SpanRow {
                                         span_id: closed.span_id.clone(),
                                         root_span_id: closed.root_span_id.clone(),
@@ -1502,7 +1502,7 @@ fn tool_result_content(output: Value, attachments: Vec<ToolAttachment>) -> Value
                 .mime
                 .unwrap_or_else(|| "application/octet-stream".into());
             Some(if mime.starts_with("image/") {
-                json!({"type":"image_url","image_url":{"url":url}})
+                json!({"type":"image_url","mime":mime,"image_url":{"url":url}})
             } else {
                 json!({"type":"file", "mime":mime, "url":url})
             })
@@ -1522,12 +1522,14 @@ fn tool_result_content(output: Value, attachments: Vec<ToolAttachment>) -> Value
     Value::Array(content)
 }
 
-fn contains_image_attachment(value: &Value) -> bool {
+fn contains_attachment(value: &Value) -> bool {
     match value {
-        Value::Array(values) => values.iter().any(contains_image_attachment),
+        Value::Array(values) => values.iter().any(contains_attachment),
         Value::Object(fields) => {
-            fields.get("type").and_then(Value::as_str) == Some("image_url")
-                || fields.values().any(contains_image_attachment)
+            matches!(
+                fields.get("type").and_then(Value::as_str),
+                Some("image_url" | "file")
+            ) || fields.values().any(contains_attachment)
         }
         _ => false,
     }
