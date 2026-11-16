@@ -13,7 +13,7 @@ use super::{
 use crate::ids;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -45,7 +45,7 @@ struct OpenCodeVersionedTranslator {
 }
 
 /// The selected protocol and both translators' states.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Saved {
     version: Option<bool>,
     v1: Box<super::RawValue>,
@@ -116,7 +116,7 @@ impl AgentTranslator for OpenCodeVersionedTranslator {
 // content remain raw JSON where Braintrust preserves the native representation.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 struct ToolInput {
     #[serde(rename = "sessionID")]
     session_id: String,
@@ -126,13 +126,13 @@ struct ToolInput {
     tool: Option<String>,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolBeforeOutput {
     #[serde(default)]
     args: Option<Value>,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolAfterResult {
     #[serde(default)]
     title: Option<String>,
@@ -142,7 +142,7 @@ struct ToolAfterResult {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 enum ToolBeforePayload {
     Wrapped {
         input: ToolInput,
@@ -156,7 +156,7 @@ enum ToolBeforePayload {
         output: Option<ToolBeforeOutput>,
     },
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ToolBefore {
     input: ToolInput,
     output: Option<ToolBeforeOutput>,
@@ -164,7 +164,7 @@ struct ToolBefore {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 enum ToolAfterPayload {
     Wrapped {
         input: ToolInput,
@@ -182,7 +182,7 @@ enum ToolAfterPayload {
         output: Option<Value>,
     },
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ToolAfter {
     input: ToolInput,
     result: Option<ToolAfterResult>,
@@ -219,7 +219,7 @@ impl From<ToolAfterPayload> for ToolAfter {
     }
 }
 
-#[derive(Clone, Default, Deserialize, serde::Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct PermissionToolRecord {
     #[serde(default, rename = "sessionID")]
     session_id: Option<String>,
@@ -235,13 +235,13 @@ struct PermissionToolRecord {
 
 #[derive(Clone, Deserialize)]
 #[serde(untagged)]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 enum PermissionTool {
     Name(String),
     Record(PermissionToolRecord),
 }
 
-#[derive(Clone, Default, Deserialize, serde::Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct PermissionFields {
     #[serde(default)]
     id: Option<String>,
@@ -267,13 +267,13 @@ struct PermissionFields {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 enum PermissionPayload {
     Record(Box<PermissionFields>),
     Kind(String),
 }
 
-#[derive(Default, Deserialize, serde::Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 struct PermissionProperties {
     #[serde(default)]
     permission: Option<PermissionPayload>,
@@ -315,7 +315,7 @@ fn permission_properties(payload: &Value) -> Option<PermissionProperties> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 struct PartEvent {
     #[serde(rename = "sessionID")]
     session_id: String,
@@ -339,13 +339,13 @@ struct PartEvent {
     tail_start_id: Option<String>,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 struct PartTime {
     #[serde(default)]
     end: Option<Value>,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolPartState {
     #[serde(default)]
     status: Option<String>,
@@ -359,7 +359,7 @@ struct ToolPartState {
     error: Option<Value>,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 struct ToolAttachment {
     #[serde(default)]
     mime: Option<String>,
@@ -369,7 +369,7 @@ struct ToolAttachment {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 struct MessageInfo {
     id: String,
     #[serde(rename = "sessionID")]
@@ -393,7 +393,7 @@ struct MessageInfo {
     error: Option<Value>,
 }
 
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Deserialize, Serialize)]
 struct MessageTime {
     #[serde(default)]
     created: Option<i64>,
@@ -401,7 +401,7 @@ struct MessageTime {
     completed: Option<i64>,
 }
 
-#[derive(Clone, Default, Deserialize, serde::Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct MessageTokens {
     #[serde(default)]
     input: i64,
@@ -413,7 +413,7 @@ struct MessageTokens {
     cache: MessageCacheTokens,
 }
 
-#[derive(Clone, Default, Deserialize, serde::Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct MessageCacheTokens {
     #[serde(default)]
     read: i64,
@@ -433,7 +433,7 @@ fn properties<T: DeserializeOwned>(payload: &Value, field: &str) -> Option<T> {
         .and_then(decode)
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct NativeSession {
     root_span_id: String,
     effective_root_span_id: String,
@@ -469,7 +469,7 @@ struct NativeSession {
     user_parts: HashMap<String, Vec<(String, String)>>,
     history_tool_results: HashMap<String, HashMap<String, Value>>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ClosedToolSpan {
     span_id: String,
     root_span_id: String,
@@ -485,17 +485,17 @@ impl NativeSession {
     }
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct MessageHistory {
     entries: Vec<HistoryEntry>,
     pending_compaction: Option<CompactionBoundary>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct HistoryEntry {
     message_id: String,
     values: Vec<Value>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct CompactionBoundary {
     tail_start_id: Option<String>,
 }
@@ -589,7 +589,7 @@ impl MessageHistory {
     }
 }
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct PermissionRequest {
     id: Option<String>,
     session_id: Option<String>,
@@ -599,7 +599,7 @@ struct PermissionRequest {
     title: Option<String>,
     permission_type: Option<String>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct OpenCodeTranslator {
     daemon_session_id: String,
     sessions: HashMap<String, NativeSession>,
