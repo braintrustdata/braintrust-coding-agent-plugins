@@ -167,6 +167,8 @@ sessions.
 Transcript import is a daemon client. It starts or upgrades the daemon exactly
 as hook capture does, sends every synthesized lifecycle event with `event.log`
 over one connection, then finishes each imported session with this request.
+`session_id` is the import run's daemon-side session (see Durability &
+idempotence), not the native session id.
 The daemon waits for those captures to reach every delivery route of the
 session matching `route`. With `finalize: true` it first closes the session's
 open spans, as a completed transcript does; `false` only flushes, as when
@@ -433,10 +435,18 @@ Transcript import and hook capture share one pipeline. The
 `import <codex|claude> <session-id> [project_logs:<project-id> |
 experiment:<experiment-id>]` command locates the selected agent's native
 transcript and captures synthetic lifecycle events with the daemon, which
-translates and delivers them like hook events (see `import.finish`). Capture is
-idempotent while a session's storage exists: the same event captured again for
-the same route, such as a repeated import, is acknowledged without being
-recorded twice. `--parent
+translates and delivers them like hook events (see `import.finish`). Each
+import run captures into its own daemon-side session, separate from the native
+session's live capture and from earlier imports, and translates the native
+session from fresh state under the native session's identity. It therefore
+reproduces the native session's deterministic span ids and delivers every span
+to its destination, including one that already received the session elsewhere.
+Importing a session again re-delivers its rows under the same ids; an import
+older than what a destination already holds may replace newer content on the
+spans they share. Within one session, capture is idempotent while its storage
+exists: the same event captured again for the same route, such as a hook
+retried across a daemon handover, is acknowledged without being recorded
+twice. `--parent
 <SpanComponents>` attaches it below an exported span and is mutually exclusive
 with an object destination.
 

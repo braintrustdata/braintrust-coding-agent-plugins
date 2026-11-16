@@ -21,6 +21,25 @@ pub fn session_namespace(source: &str, session_id: &str) -> String {
     format!("{source}{SEP}{session_id}")
 }
 
+const IMPORT: &str = "\u{1f}import\u{1f}";
+
+/// The daemon-side session of one transcript import run. It has its own
+/// journal, storage and delivery actors, so a run translates the native
+/// session from fresh state instead of continuing a live capture or an earlier
+/// import, and every destination receives the whole session.
+pub(crate) fn import_session_id(native: &str, run: &str) -> String {
+    format!("{native}{IMPORT}{run}")
+}
+
+/// The native session a daemon-side session translates. Span ids, span
+/// metadata and sinks use it, so an import reproduces the native session's
+/// deterministic ids.
+pub(crate) fn native_session_id(session_id: &str) -> &str {
+    session_id
+        .split_once(IMPORT)
+        .map_or(session_id, |(native, _)| native)
+}
+
 /// Collision-resistant suffix for source-qualified on-disk session state.
 pub fn session_storage_id(source: &str, session_id: &str) -> String {
     Uuid::new_v5(&NAMESPACE, session_namespace(source, session_id).as_bytes()).to_string()
@@ -36,6 +55,14 @@ pub fn span_id(session_id: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_import_session_translates_its_native_session() {
+        let import = import_session_id("native", "run");
+        assert_ne!(import, "native");
+        assert_eq!(native_session_id(&import), "native");
+        assert_eq!(native_session_id("native"), "native");
+    }
 
     #[test]
     fn stable_and_distinct() {

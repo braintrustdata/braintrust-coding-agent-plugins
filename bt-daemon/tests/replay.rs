@@ -968,3 +968,117 @@ async fn imports_non_monotonic_claude_records_into_their_native_turns() {
         Some("rate_limit_error")
     );
 }
+
+fn project(id: &str) -> SessionConfig {
+    SessionConfig {
+        auth: BackendAuth {
+            token: "test-token".into(),
+            api_url: None,
+            app_url: None,
+            org_name: None,
+            org_id: None,
+        },
+        destination: Some(TraceDestination::ProjectLogs {
+            project_id: Some(id.into()),
+            project_name: None,
+        }),
+        flush_mode: FlushMode::FireAndForget,
+        additional_metadata: None,
+        tags: Default::default(),
+        span_plugins: Vec::new(),
+    }
+}
+
+/// Span and trace ids of every delivered row.
+fn identities(rows: &[Value]) -> std::collections::BTreeSet<(String, String)> {
+    rows.iter()
+        .filter_map(|row| {
+            let row = row.get("Insert").or_else(|| row.get("Merge"))?;
+            Some((
+                row["span_id"].as_str()?.to_string(),
+                row["root_span_id"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// A session already imported into one destination is translated again from
+/// its start for another, so the second destination receives every span
+/// rather than only what the first import left undelivered.
+#[tokio::test]
+async fn importing_into_another_destination_delivers_the_whole_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("rollout.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"timestamp":"2026-01-01T00:00:01Z","type":"session_meta","payload":{"id":"codex-second-destination","cwd":"/tmp/demo","cli_version":"1.2.3"}}),
+            json!({"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"model":"gpt-test"}}),
+            json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"list files"}}),
+            json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"shell","arguments":"{\"command\":\"ls\"}"}}),
+            json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"README.md"}}),
+            json!({"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done"}}),
+        ],
+    );
+    // One daemon serves both imports.
+    let output = tmp.path().join("spans");
+    let path = output.join("codex-second-destination.ndjson");
+    import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        import_daemon::target(&output, Some(project("project-a"))).await,
+        false,
+    )
+    .await
+    .unwrap();
+    let first = rows(&path);
+    import_transcript(
+        &transcript,
+        ImportSource::Codex,
+        import_daemon::target(&output, Some(project("project-b"))).await,
+        false,
+    )
+    .await
+    .unwrap();
+    let second = rows(&path)[first.len()..].to_vec();
+    assert_eq!(inserted(&second, "task"), 2, "session and one turn");
+    assert_eq!(inserted(&second, "tool"), 1);
+    assert_eq!(identities(&second), identities(&first));
+}
+
+/// Repeating a completed import translates it from fresh state again, so it
+/// reproduces the original span ids instead of opening new turns and a new
+/// trace for the same work.
+#[tokio::test]
+async fn repeating_a_claude_import_reuses_its_span_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("claude.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"type":"user","timestamp":"2026-01-01T00:00:01Z","sessionId":"claude-repeat","cwd":"/tmp/demo","version":"2.0.0","message":{"role":"user","content":"run it"}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:02Z","sessionId":"claude-repeat","requestId":"req-1","message":{"id":"msg-1","model":"claude-test","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":3}}}),
+            json!({"type":"user","timestamp":"2026-01-01T00:00:03Z","sessionId":"claude-repeat","message":{"role":"user","content":"again"}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:04Z","sessionId":"claude-repeat","requestId":"req-2","message":{"id":"msg-2","model":"claude-test","role":"assistant","content":[{"type":"text","text":"again done"}],"usage":{"input_tokens":12,"output_tokens":2}}}),
+        ],
+    );
+    let output = tmp.path().join("spans");
+    let path = output.join("claude-repeat.ndjson");
+    let import = || async {
+        import_transcript(
+            &transcript,
+            ImportSource::Claude,
+            import_daemon::target(&output, None).await,
+            false,
+        )
+        .await
+        .unwrap()
+    };
+    import().await;
+    let first = rows(&path);
+    import().await;
+    let second = rows(&path)[first.len()..].to_vec();
+    assert_eq!(inserted(&second, "task"), 3, "session and two turns");
+    assert_eq!(identities(&second), identities(&first));
+}

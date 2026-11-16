@@ -48,10 +48,11 @@ impl Daemon {
             return Ok(source);
         }
         let events = self.events_for(&env.source, &env.session_id).await?;
+        let native = crate::ids::native_session_id(&env.session_id);
         let namespace = if events.legacy_namespace().await? {
             env.session_id.clone()
         } else {
-            storage_key.clone()
+            crate::ids::session_namespace(&env.source, native)
         };
         let source = crate::pipeline::translation::Translation::spawn(
             crate::pipeline::translation::TranslationOptions {
