@@ -688,6 +688,43 @@ impl SpanJournal {
         .await
     }
 
+    /// Apply a legacy delivery checkpoint to the route's head: an earlier
+    /// daemon delivered the output of every input through `input`. It did so
+    /// without recording provenance, so origins rebuilt for those spans are
+    /// discarded rather than attributed to this daemon.
+    pub async fn acknowledge_legacy(&self, route: &SessionRoute, input: u64) -> anyhow::Result<()> {
+        let route = serde_json::to_string(route)?;
+        self.with_db(move |db| {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let position: u64 = tx.query_row(
+                "SELECT coalesce(max(position),0) FROM ops WHERE input<=?",
+                [input],
+                |r| r.get(0),
+            )?;
+            let spans = {
+                let mut query = tx.prepare("SELECT value FROM ops WHERE input<=?")?;
+                let rows = query.query_map([input], |r| r.get::<_, Vec<u8>>(0))?;
+                let mut spans = Vec::new();
+                for row in rows {
+                    let (SpanOp::Insert(op) | SpanOp::Merge(op)) = StoredOp::decode(&row?)?;
+                    spans.push(op.span_id);
+                }
+                spans
+            };
+            for span in spans {
+                tx.execute("DELETE FROM origins WHERE span_id=?", [span])?;
+            }
+            tx.execute(
+                "INSERT INTO heads(route,position) VALUES(?,?) ON CONFLICT(route) DO UPDATE SET position=max(position,excluded.position)",
+                params![route, position],
+            )?;
+            prune(&tx)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn origins_for(
         &self,
         spans: Vec<String>,

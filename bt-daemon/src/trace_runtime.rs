@@ -12,8 +12,8 @@ use crate::{
     braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
     run_traced_with_host, shutdown_daemon, AuthDiagnostic, AuthLease, AuthProvider,
     AuthResolveReason, BraintrustSinkConfig, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput,
-    HostInfo, OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs, TraceArgs,
-    TraceCommandOutput,
+    HostInfo, ImportTarget, OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs,
+    TraceArgs, TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -751,8 +751,16 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             .await?;
             apply_additional_metadata(&mut route, import_args.additional_metadata.as_deref())?;
             apply_tags(&mut route, &import_args.tags)?;
-            let config = session_config(&host, &route).await?;
-            let summaries = run_import(import_args, serve_options(&host), Some(config)).await?;
+            // Resolve credentials up front, interactively if needed, so the
+            // daemon can authenticate this route when it delivers.
+            session_config(&host, &route).await?;
+            let target = ImportTarget {
+                socket: paths::socket_path(import_args.socket.as_deref()),
+                host: host_info(&host),
+                route,
+                no_spawn: import_args.no_spawn,
+            };
+            let summaries = run_import(import_args, target).await?;
             print_output(TraceCommandOutput::import(summaries), host.output_format)
         }
         TraceCommand::Run(run_args) => {
@@ -1138,6 +1146,8 @@ mod tests {
                 additional_metadata: None,
                 tags: Default::default(),
                 plugin: Vec::new(),
+                socket: None,
+                no_spawn: false,
             };
             let error = run_trace(
                 TraceArgs {

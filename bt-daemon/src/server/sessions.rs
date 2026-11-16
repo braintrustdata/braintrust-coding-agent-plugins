@@ -49,13 +49,14 @@ impl Daemon {
         }
         let event_path =
             journal::ensure_source_journal(&self.data_dir, &env.source, &env.session_id).await?;
+        let native = crate::ids::native_session_id(&env.session_id);
         let namespace =
             if journal::legacy_journal_has_session(&self.data_dir, &env.source, &env.session_id)
                 .await
             {
                 env.session_id.clone()
             } else {
-                storage_key.clone()
+                crate::ids::session_namespace(&env.source, native)
             };
         let events = self
             .journal_writer_for(&env.source, &env.session_id)

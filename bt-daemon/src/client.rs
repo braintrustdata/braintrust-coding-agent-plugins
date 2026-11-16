@@ -260,76 +260,147 @@ pub async fn forward_envelope(
     host: &HostInfo,
     no_spawn: bool,
 ) -> anyhow::Result<()> {
-    const MAX_HANDOVER_ATTEMPTS: usize = 3;
-    let mut handover_attempts = 0;
-    let mut capture_retry_deadline = None;
+    DaemonClient::new(socket, host, no_spawn).log(env).await
+}
 
-    loop {
-        if capture_retry_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            anyhow::bail!(
-                "replacement daemon did not accept the event at {}",
-                socket.display()
-            );
+/// One reusable connection to a current daemon. It starts the daemon or hands
+/// over to a newer one exactly as hook capture does, then keeps the connection
+/// for every later request.
+pub(crate) struct DaemonClient {
+    socket: std::path::PathBuf,
+    host: HostInfo,
+    no_spawn: bool,
+    conn: Option<Conn>,
+}
+
+impl DaemonClient {
+    pub(crate) fn new(socket: &Path, host: &HostInfo, no_spawn: bool) -> Self {
+        Self {
+            socket: socket.to_owned(),
+            host: host.clone(),
+            no_spawn,
+            conn: None,
         }
+    }
 
-        let stream = match connect(socket).await {
-            Ok(stream) => stream,
-            Err(_) if capture_retry_deadline.is_some() && no_spawn => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                continue;
+    /// Connect and initialize. `Ok(false)` is a transient failure to retry
+    /// while a replacement daemon takes over.
+    async fn open(&mut self, init: &serde_json::Value, retrying: bool) -> anyhow::Result<bool> {
+        const MAX_HANDOVER_ATTEMPTS: usize = 3;
+        let mut handover_attempts = 0;
+        loop {
+            let stream = match connect(&self.socket).await {
+                Ok(stream) => stream,
+                Err(_) if retrying && self.no_spawn => return Ok(false),
+                Err(_) => ensure_daemon(&self.socket, &self.host, self.no_spawn).await?,
+            };
+            let mut conn = Conn::new(stream);
+            let initialized = match conn.request(method::INITIALIZE, init).await {
+                Ok(initialized) => initialized,
+                Err(_) if retrying => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let initialized: wire::InitializeResult = serde_json::from_value(initialized)?;
+            if !daemon_needs_upgrade(&initialized.daemon_version, &self.host.version) {
+                self.conn = Some(conn);
+                return Ok(true);
             }
-            Err(_) => ensure_daemon(socket, host, no_spawn).await?,
-        };
-        let mut conn = Conn::new(stream);
-        let initialized = match conn
-            .request(method::INITIALIZE, initialize_params(env, &host.version))
-            .await
-        {
-            Ok(initialized) => initialized,
-            Err(_) if capture_retry_deadline.is_some() => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let initialized: wire::InitializeResult = serde_json::from_value(initialized)?;
-        if daemon_needs_upgrade(&initialized.daemon_version, &host.version) {
-            if no_spawn {
+            if self.no_spawn {
                 anyhow::bail!(
                     "daemon version {} is older than client {} and --no-spawn is set",
                     initialized.daemon_version,
-                    host.version
+                    self.host.version
                 );
             }
             if handover_attempts == MAX_HANDOVER_ATTEMPTS {
                 anyhow::bail!(
                     "daemon version {} is still older than client {} after {MAX_HANDOVER_ATTEMPTS} handover attempts",
                     initialized.daemon_version,
-                    host.version
+                    self.host.version
                 );
             }
             conn.request(method::DAEMON_SHUTDOWN, serde_json::json!({}))
                 .await?;
             handover_attempts += 1;
             drop(conn);
-            wait_for_daemon_exit(socket).await;
-            continue;
+            wait_for_daemon_exit(&self.socket).await;
         }
-        let result = match conn.request(method::EVENT_LOG, env).await {
-            Ok(result) => result,
-            Err(_) if capture_retry_deadline.is_some() => {
+    }
+
+    /// Capture one event. Returns once the daemon has durably accepted it.
+    pub(crate) async fn log(&mut self, env: &Envelope) -> anyhow::Result<()> {
+        let init = initialize_params(env, &self.host.version);
+        let mut retry_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            if retry_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                anyhow::bail!(
+                    "replacement daemon did not accept the event at {}",
+                    self.socket.display()
+                );
+            }
+            let reused = self.conn.is_some();
+            if !reused && !self.open(&init, retry_deadline.is_some()).await? {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 continue;
             }
-            Err(error) => return Err(error),
-        };
-        let result: wire::EventLogResult = serde_json::from_value(result)?;
-        if result.accepted {
-            return Ok(());
+            let Some(conn) = self.conn.as_mut() else {
+                continue;
+            };
+            let result = match conn.request(method::EVENT_LOG, env).await {
+                Ok(result) => result,
+                // A reused connection may belong to a daemon that has since
+                // exited; reconnect once before treating this as a failure.
+                Err(_) if reused || retry_deadline.is_some() => {
+                    self.conn = None;
+                    retry_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    self.conn = None;
+                    return Err(error);
+                }
+            };
+            let result: wire::EventLogResult = serde_json::from_value(result)?;
+            if result.accepted {
+                return Ok(());
+            }
+            // A quiescing daemon is handing over; capture with its replacement.
+            self.conn = None;
+            retry_deadline.get_or_insert_with(|| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5)
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        capture_retry_deadline
-            .get_or_insert_with(|| tokio::time::Instant::now() + std::time::Duration::from_secs(5));
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    /// A non-capture request over the same connection.
+    pub(crate) async fn call<R: serde::de::DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: impl serde::Serialize,
+    ) -> anyhow::Result<R> {
+        if self.conn.is_none() {
+            let init = serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "client": {
+                    "source": "import",
+                    "daemon_version": self.host.version,
+                    "pid": std::process::id()
+                }
+            });
+            self.open(&init, false).await?;
+        }
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("daemon connection is unavailable"))?;
+        let result = conn.call(method, params).await;
+        if result.is_err() {
+            self.conn = None;
+        }
+        result
     }
 }
 

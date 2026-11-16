@@ -297,10 +297,9 @@ pub struct ProcessResult {
     pub failure: Option<PluginFailure>,
 }
 
-/// Apply an ordered plugin chain on the worker thread currently executing the
-/// session actor. Every plugin is mandatory: a failure withholds the operation,
-/// and subsequent calls on this worker remain withheld instead of bypassing the
-/// failed transform.
+/// Apply a plugin chain, remembering failed plugins on this worker so later
+/// calls stay withheld instead of bypassing the failed transform.
+#[cfg(test)]
 pub fn process(
     plugins: &[PathBuf],
     op: &SpanOp,
