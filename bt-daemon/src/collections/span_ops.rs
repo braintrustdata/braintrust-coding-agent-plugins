@@ -3,7 +3,7 @@
 //! Routes receive ops live, or read them back after a gap. A route removes
 //! ops from its view by advancing its head once a destination accepts them,
 //! and an op is deleted when every route has passed it.
-use super::store::{read_batch, Json, One, SessionStorage, NOW_MS};
+use super::store::{json, json_or_null, read_batch, select, Json, One, SessionStorage, NOW_MS};
 use crate::{
     pipeline::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW},
     translate::{OriginSnapshot, SinkFields, SpanOp, SpanRow, SpanType},
@@ -195,17 +195,24 @@ pub(crate) struct Translated {
 }
 
 /// A head that is held by a failure and may accept corrected settings.
+#[derive(serde::Deserialize)]
 pub(crate) struct HeldRoute {
+    /// The stored route, exactly as it keys its head.
+    key: String,
+    #[serde(deserialize_with = "json")]
     pub route: SessionRoute,
     pub failure: String,
+    #[serde(deserialize_with = "json_or_null")]
     pub settings: Option<SessionRoute>,
 }
 
 /// One route's durable delivery head.
+#[derive(serde::Deserialize)]
 pub(crate) struct Head {
     pub position: u64,
     pub failure: Option<String>,
     /// Corrected settings recorded for a held head.
+    #[serde(deserialize_with = "json_or_null")]
     pub settings: Option<SessionRoute>,
 }
 
@@ -452,21 +459,12 @@ impl SessionStorage {
     pub async fn head(&self, route: &str) -> anyhow::Result<Option<Head>> {
         let route = route.to_owned();
         self.run(move |db| {
-            Ok(db
-                .query_row(
-                    "SELECT position,failure,settings FROM heads WHERE route=?",
-                    [route],
-                    |r| {
-                        Ok(Head {
-                            position: r.get(0)?,
-                            failure: r.get(1)?,
-                            settings: r
-                                .get::<_, Option<Json<_>>>(2)?
-                                .map(|Json(settings)| settings),
-                        })
-                    },
-                )
-                .optional()?)
+            Ok(select(
+                db,
+                "SELECT position, failure, settings FROM heads WHERE route=?",
+                [route],
+            )?
+            .pop())
         })
         .await
     }
@@ -523,37 +521,25 @@ impl SessionStorage {
         correct: impl Fn(&HeldRoute) -> Option<SessionRoute> + Send + 'static,
     ) -> anyhow::Result<Vec<(SessionRoute, SessionRoute)>> {
         self.write(move |tx| {
-                let held = {
-                    let mut query = tx.prepare(
-                        "SELECT route,failure,settings FROM heads WHERE failure IS NOT NULL AND settings_through<?",
+            let held: Vec<HeldRoute> = select(
+                tx,
+                "SELECT route AS key, route, failure, settings FROM heads
+                     WHERE failure IS NOT NULL AND settings_through<?",
+                [through],
+            )?;
+            let mut updates = Vec::new();
+            for held in held {
+                if let Some(corrected) = correct(&held) {
+                    tx.execute(
+                        "UPDATE heads SET settings=?, settings_through=? WHERE route=?",
+                        params![Json(&corrected), through, held.key],
                     )?;
-                    let rows = query.query_map([through], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            HeldRoute {
-                                route: row.get::<_, Json<SessionRoute>>(0)?.0,
-                                failure: row.get(1)?,
-                                settings: row
-                                    .get::<_, Option<Json<SessionRoute>>>(2)?
-                                    .map(|Json(settings)| settings),
-                            },
-                        ))
-                    })?;
-                    rows.collect::<Result<Vec<_>, _>>()?
-                };
-                let mut updates = Vec::new();
-                for (key, held) in held {
-                    if let Some(corrected) = correct(&held) {
-                        tx.execute(
-                            "UPDATE heads SET settings=?, settings_through=? WHERE route=?",
-                            params![Json(&corrected), through, key],
-                        )?;
-                        updates.push((held.route, corrected));
-                    }
+                    updates.push((held.route, corrected));
                 }
-                Ok(updates)
-            })
-            .await
+            }
+            Ok(updates)
+        })
+        .await
     }
 
     /// Stop a route for good, as when a span plugin stops tracing it: it owes

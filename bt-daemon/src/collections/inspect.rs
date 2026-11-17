@@ -48,11 +48,12 @@ impl Table {
 }
 
 /// One route's durable delivery head.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Head {
     pub position: u64,
     pub failure: Option<String>,
     /// Corrected settings recorded for a held head.
+    #[serde(deserialize_with = "super::store::json_or_null")]
     pub settings: Option<Value>,
 }
 
@@ -132,24 +133,8 @@ impl Inspector {
     }
 
     pub fn heads(&self) -> Vec<Head> {
-        let Ok(mut query) = self
-            .0
-            .prepare("SELECT position,failure,settings FROM heads")
-        else {
-            return Vec::new();
-        };
-        let Ok(rows) = query.query_map([], |r| {
-            Ok(Head {
-                position: r.get(0)?,
-                failure: r.get(1)?,
-                settings: r
-                    .get::<_, Option<Json<_>>>(2)?
-                    .map(|Json(settings)| settings),
-            })
-        }) else {
-            return Vec::new();
-        };
-        rows.filter_map(Result::ok).collect()
+        super::store::select(&self.0, "SELECT position, failure, settings FROM heads", [])
+            .unwrap_or_default()
     }
 
     /// The position of the last published SpanOp.

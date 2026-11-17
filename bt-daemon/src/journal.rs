@@ -132,7 +132,7 @@ pub async fn legacy_journal_source(
         let Ok(status) = storage.status().await else {
             continue;
         };
-        let Some((source, session)) = status.owner else {
+        let Some((source, session)) = status.owner() else {
             continue;
         };
         if session != session_id {

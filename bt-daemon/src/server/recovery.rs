@@ -16,7 +16,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
     let mut candidates = Vec::new();
     for path in sessions {
         let owner = match crate::collections::SessionStorage::at(&path).await {
-            Ok(storage) => storage.status().await.map(|status| status.owner),
+            Ok(storage) => storage.status().await.map(|status| status.owner()),
             Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "session storage cannot be recovered");
                 continue;

@@ -64,7 +64,7 @@ pub(super) async fn collect_session(daemon: &Daemon, path: &std::path::Path) -> 
         return Ok(());
     }
     let session = crate::collections::SessionStorage::at(path).await?;
-    let Some((source, session_id)) = session.status().await?.owner else {
+    let Some((source, session_id)) = session.status().await?.owner() else {
         // Output storage that no captured input ever claimed has no owner to
         // complete it. Keep it only while it may still be in use.
         drop(session);

@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Weak},
 };
+use weak_table::WeakValueHashMap;
 
 /// Schema 1-6 belong to the original SpanOp channel. Schema 7 adds the event
 /// collection, replacing NDJSON capture, and one session row that makes each
@@ -18,7 +19,9 @@ pub(super) const SCHEMA: u32 = 7;
 /// The current time in milliseconds, as SQL.
 pub(super) const NOW_MS: &str = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 
-static OPEN: LazyLock<Mutex<HashMap<PathBuf, Weak<Inner>>>> = LazyLock::new(Default::default);
+/// Databases with a live handle in this process.
+static OPEN: LazyLock<Mutex<WeakValueHashMap<PathBuf, Weak<Inner>>>> =
+    LazyLock::new(Default::default);
 /// Files whose last handle is still compacting and closing its connection.
 static CLOSING: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Default::default);
 
@@ -81,7 +84,7 @@ impl SessionStorage {
         .await??;
         let mut open = OPEN.lock();
         // A concurrent opener may have published the same file meanwhile.
-        if let Some(inner) = open.get(&path).and_then(Weak::upgrade) {
+        if let Some(inner) = open.get(&path) {
             drop(connection);
             return Ok(Self(inner));
         }
@@ -90,8 +93,7 @@ impl SessionStorage {
             connection: Mutex::new(Some(connection)),
             channel: super::span_ops::Channel::new(tail),
         });
-        open.retain(|_, inner| inner.strong_count() > 0);
-        open.insert(path, Arc::downgrade(&inner));
+        open.insert(path, inner.clone());
         Ok(Self(inner))
     }
 
@@ -101,7 +103,7 @@ impl SessionStorage {
     }
 
     fn shared(path: &Path) -> Option<Self> {
-        OPEN.lock().get(path).and_then(Weak::upgrade).map(Self)
+        OPEN.lock().get(path).map(Self)
     }
 
     pub(super) async fn run<R: Send + 'static>(
@@ -146,11 +148,7 @@ impl SessionStorage {
     pub async fn remove(path: &Path) -> anyhow::Result<bool> {
         let path = normalize(path).await?;
         let open = OPEN.lock();
-        if open
-            .get(&path)
-            .is_some_and(|inner| inner.strong_count() > 0)
-            || CLOSING.lock().contains_key(&path)
-        {
+        if open.contains_key(&path) || CLOSING.lock().contains_key(&path) {
             return Ok(false);
         }
         for suffix in ["", "-wal", "-shm"] {
@@ -225,6 +223,34 @@ impl<T: serde::Serialize> ToSql for Json<T> {
             .map(ToSqlOutput::from)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
     }
+}
+
+/// Field deserializer for a JSON-encoded text column.
+pub(super) fn json<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(
+    deserializer: D,
+) -> Result<T, D::Error> {
+    let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+    serde_json::from_str(&text).map_err(serde::de::Error::custom)
+}
+
+/// Field deserializer for a nullable JSON-encoded text column.
+pub(super) fn json_or_null<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    let text = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    text.map(|text| serde_json::from_str(&text).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+/// Every row `sql` selects, deserialized by column name.
+pub(super) fn select<T: serde::de::DeserializeOwned>(
+    db: &Connection,
+    sql: &str,
+    params: impl Params,
+) -> anyhow::Result<Vec<T>> {
+    let mut statement = db.prepare_cached(sql)?;
+    let rows = serde_rusqlite::from_rows::<T>(statement.query(params)?);
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// Read the first column of the one row a query selects.

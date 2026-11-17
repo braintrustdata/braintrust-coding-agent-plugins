@@ -3,7 +3,7 @@
 //! Everything that spans both collections, such as handing an input's
 //! translation over or deciding the session owes nothing, lives here.
 use super::span_ops::{decode_roots, encode_roots, prune, save_metadata, StoredOp, Translated};
-use super::store::{One, SessionStorage, NOW_MS};
+use super::store::{select, One, SessionStorage, NOW_MS};
 use crate::pipeline::live::{Record, SharedOp};
 use crate::translate::SpanOp;
 use rusqlite::params;
@@ -14,10 +14,11 @@ use std::{
 };
 
 /// How far a session has progressed, read in one query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct Status {
-    /// The source and native session this database belongs to.
-    pub owner: Option<(String, String)>,
+    /// The source that owns this database, once claimed.
+    pub source: Option<String>,
+    pub session_id: Option<String>,
     /// The ID of the last event record ever inserted, including removed records.
     pub event_tail: u64,
     /// The last input whose translation has been handed over.
@@ -29,7 +30,19 @@ pub(crate) struct Status {
     /// A translation failure recorded for recovery.
     pub source_failure: Option<String>,
     /// Time since capture, translation or delivery last made progress.
+    #[serde(deserialize_with = "millis")]
     pub idle_for: Duration,
+}
+
+impl Status {
+    /// The source and native session this database belongs to.
+    pub fn owner(&self) -> Option<(String, String)> {
+        self.source.clone().zip(self.session_id.clone())
+    }
+}
+
+fn millis<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+    <u64 as serde::Deserialize>::deserialize(deserializer).map(Duration::from_millis)
 }
 
 /// The database file for one source session.
@@ -96,26 +109,17 @@ impl SessionStorage {
 
     pub async fn status(&self) -> anyhow::Result<Status> {
         self.run(|db| {
-            Ok(db.query_row(
+            select(
+                db,
                 &format!(
-                    "SELECT source,session_id,event_tail,through,op_tail,legacy_namespace,
-                         failure,max(0,{NOW_MS}-active_ms) FROM session WHERE id=1"
+                    "SELECT source, session_id, event_tail, through AS translated_through,
+                     op_tail, legacy_namespace, failure AS source_failure,
+                     max(0,{NOW_MS}-active_ms) AS idle_for FROM session WHERE id=1"
                 ),
                 [],
-                |r| {
-                    let source: Option<String> = r.get(0)?;
-                    let session_id: Option<String> = r.get(1)?;
-                    Ok(Status {
-                        owner: source.zip(session_id),
-                        event_tail: r.get(2)?,
-                        translated_through: r.get(3)?,
-                        op_tail: r.get(4)?,
-                        legacy_namespace: r.get(5)?,
-                        source_failure: r.get(6)?,
-                        idle_for: Duration::from_millis(r.get(7)?),
-                    })
-                },
-            )?)
+            )?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("session row is missing"))
         })
         .await
     }
