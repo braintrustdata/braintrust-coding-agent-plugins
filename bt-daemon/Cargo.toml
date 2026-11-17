@@ -57,6 +57,7 @@ rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 serde_rusqlite = "0.44"
 weak-table = "0.4"
 file-rotate = "0.8"
+humantime = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }

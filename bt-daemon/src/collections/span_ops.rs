@@ -229,6 +229,16 @@ pub(super) fn prune(db: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Heads that have owed output since before `cutoff` without delivering any.
+pub(super) fn stalled(db: &Connection, cutoff: i64) -> anyhow::Result<Vec<String>> {
+    let mut query = db.prepare(
+        "SELECT route FROM heads WHERE progress_ms<?
+         AND position<(SELECT op_tail FROM session WHERE id=1)",
+    )?;
+    let rows = query.query_map([cutoff], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// Heads selected by `filter` that are the same route as `route`, by key.
 fn same_heads(db: &Connection, filter: &str, route: &SessionRoute) -> anyhow::Result<Vec<String>> {
     let mut query = db.prepare(&format!("SELECT route FROM heads WHERE {filter}"))?;
@@ -425,7 +435,6 @@ impl SessionStorage {
                     ),
                     [&key],
                 )?;
-                tx.execute("UPDATE heads SET subscribed=1 WHERE route=?", [&key])?;
                 Ok(tx.one("SELECT position FROM heads WHERE route=?", [key])?)
             })
             .await?;
@@ -513,6 +522,27 @@ impl SessionStorage {
             Ok(result)
         })
         .await
+    }
+
+    /// Routes that have owed output for `retention` without delivering any of
+    /// it: a route whose credentials never resolved, or one held by a failure
+    /// that was never corrected. Their output can no longer be expected to
+    /// arrive.
+    pub async fn stalled(
+        &self,
+        retention: std::time::Duration,
+    ) -> anyhow::Result<Vec<SessionRoute>> {
+        let retention = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
+        let routes = self
+            .run(move |db| {
+                let cutoff: i64 = db.one(&format!("SELECT {NOW_MS}-?"), [retention])?;
+                stalled(db, cutoff)
+            })
+            .await?;
+        Ok(routes
+            .iter()
+            .map(|route| serde_json::from_str(route))
+            .collect::<Result<_, _>>()?)
     }
 
     pub async fn routes(&self) -> anyhow::Result<Vec<SessionRoute>> {

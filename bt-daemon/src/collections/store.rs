@@ -50,8 +50,8 @@ impl Inner {
     fn close(&mut self) {
         if let Some(connection) = self.connection.get_mut().take() {
             // Reclaim a bounded number of free pages and leave no WAL behind.
-            if let Err(error) = connection
-                .execute_batch("PRAGMA incremental_vacuum(256); PRAGMA wal_checkpoint(TRUNCATE)")
+            if let Err(error) = incremental_vacuum(&connection, "PRAGMA incremental_vacuum(256)")
+                .and_then(|()| connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
             {
                 tracing::warn!(%error, path = %self.path.display(), "session storage could not be compacted on close");
             }
@@ -121,6 +121,26 @@ impl SessionStorage {
             )
         })
         .await?
+    }
+
+    /// Return the space of deleted rows to the file system. Deleting rows
+    /// only frees pages inside the file. Databases created before incremental
+    /// auto-vacuum was enabled are rebuilt once to turn it on; afterwards
+    /// free pages are released incrementally.
+    pub async fn compact(&self) -> anyhow::Result<()> {
+        self.run(|db| {
+            if db.one::<i64>("PRAGMA freelist_count", [])? == 0 {
+                return Ok(());
+            }
+            if db.one::<i64>("PRAGMA auto_vacuum", [])? == 0 {
+                db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM")?;
+            } else {
+                incremental_vacuum(db, "PRAGMA incremental_vacuum")?;
+            }
+            db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            Ok(())
+        })
+        .await
     }
 
     /// Hold the storage lock, blocking every operation until released.
@@ -252,6 +272,15 @@ pub(super) fn select<T: serde::de::DeserializeOwned>(
     let mut statement = db.prepare_cached(sql)?;
     let rows = serde_rusqlite::from_rows::<T>(statement.query(params)?);
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Incremental vacuum frees one page per step, so it must be stepped to the
+/// end; `execute_batch` steps each statement only once.
+fn incremental_vacuum(db: &Connection, pragma: &str) -> rusqlite::Result<()> {
+    let mut statement = db.prepare(pragma)?;
+    let mut rows = statement.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
 }
 
 /// Read the first column of the one row a query selects.
