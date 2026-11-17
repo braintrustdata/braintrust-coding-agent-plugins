@@ -76,7 +76,7 @@ pub(crate) struct SessionOptions {
     pub route: crate::wire::SessionRoute,
     pub data_dir: PathBuf,
     pub translation: Arc<Translation>,
-    pub input: crate::pipeline::journal::Cursor,
+    pub input: crate::pipeline::cursor::Cursor,
     pub auth_provider: Option<Arc<dyn crate::AuthProvider>>,
 }
 
@@ -87,7 +87,7 @@ pub struct Session {
     pub counters: Arc<Counters>,
     pub last_error: Arc<Mutex<Option<String>>>,
     source_progress: Arc<crate::pipeline::translation::Progress>,
-    route_progress: crate::pipeline::journal::Progress,
+    route_progress: crate::pipeline::cursor::Progress,
     pub recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub source_recovery: Arc<Mutex<Option<crate::wire::RecoveryInfo>>>,
     pub source_error: Arc<Mutex<Option<String>>>,
@@ -159,9 +159,9 @@ impl Session {
                     }
                     SessionMsg::Flush(reply) | SessionMsg::Finalize(reply) => {
                         let kind = if finalize {
-                            crate::journal::ControlKind::Finalize
+                            crate::pipeline::input::ControlKind::Finalize
                         } else {
-                            crate::journal::ControlKind::Checkpoint
+                            crate::pipeline::input::ControlKind::Checkpoint
                         };
                         let target = producer.control(kind).await;
                         let progress = progress.clone();
@@ -192,7 +192,7 @@ impl Session {
                         let target = match target {
                             Some(tail) => Some(tail),
                             None if last => producer
-                                .control(crate::journal::ControlKind::Retire)
+                                .control(crate::pipeline::input::ControlKind::Retire)
                                 .await
                                 .ok(),
                             None => None,
@@ -626,7 +626,7 @@ mod tests {
             recovery: Arc::new(Mutex::new(None)),
             source_recovery: Arc::new(Mutex::new(None)),
             source_progress: Arc::new(crate::pipeline::translation::Progress::default()),
-            route_progress: crate::pipeline::journal::Progress::default(),
+            route_progress: crate::pipeline::cursor::Progress::default(),
             permalink: Arc::new(Mutex::new(None)),
             last_activity: Mutex::new(Instant::now()),
         };

@@ -13,7 +13,11 @@
     reason = "Test fixtures intentionally launch raw children."
 )]
 
+#[path = "support/journal_store.rs"]
+mod journal_store;
+
 use async_trait::async_trait;
+use bt_daemon::storage_inspect::{Inspector, Table};
 use bt_daemon::wire::{
     AuthSelection, AuthSource, BackendAuth, Envelope, SessionConfig, SessionRoute,
 };
@@ -187,19 +191,10 @@ impl Sink for RouteRecordingSink {
 /// Register a dormant route before any output exists, so completed peers cannot
 /// reclaim the recovery payloads this fixture deliberately leaves unresolved.
 fn seed_dormant_route(data: &Path, source: &str, session: &str, route: &SessionRoute) {
-    let journal = bt_daemon::source_journal_path(data, source, session);
-    let stem = journal.file_stem().unwrap().to_str().unwrap();
-    let id = stem.rsplit("--").next().unwrap();
-    std::fs::create_dir_all(data.join("pipeline")).unwrap();
-    let db =
-        rusqlite::Connection::open(data.join("pipeline").join(format!("{id}.sqlite"))).unwrap();
-    // The daemon upgrades this preparatory schema on first use.
-    db.execute_batch("CREATE TABLE heads(route TEXT PRIMARY KEY,position INTEGER NOT NULL DEFAULT 0,failure TEXT)").unwrap();
-    db.execute(
-        "INSERT INTO heads(route,position) VALUES (?,0)",
-        [serde_json::to_string(route).unwrap()],
-    )
-    .unwrap();
+    Inspector::session(data, source, session)
+        .unwrap()
+        .add_head(route)
+        .unwrap();
 }
 
 fn dummy_host() -> HostInfo {
@@ -394,22 +389,17 @@ async fn start_daemon_at_with(
 }
 
 /// These fixtures contain one source partition. Read its durable progress directly.
-fn pipeline_database(data_dir: &Path) -> rusqlite::Connection {
+fn pipeline_database(data_dir: &Path) -> Inspector {
     let path = std::fs::read_dir(data_dir.join("pipeline"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sqlite"))
         .unwrap();
-    rusqlite::Connection::open(path).unwrap()
+    Inspector::open(&path).unwrap()
 }
 fn head_and_tail(data_dir: &Path) -> (u64, u64) {
-    pipeline_database(data_dir)
-        .query_row(
-            "SELECT position,(SELECT tail FROM publication WHERE id=1) FROM heads",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
+    let db = pipeline_database(data_dir);
+    (db.heads()[0].position, db.published_tail())
 }
 
 async fn wait_for(endpoint: &Path) {
@@ -696,9 +686,8 @@ async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
     shutdown(&socket).await;
     handle.await.unwrap();
 
-    let journal_path = source_journal_path(&data_dir, "debug", session);
-    let journal = std::fs::read_to_string(&journal_path).unwrap();
-    assert!(!journal.contains("delivery_checkpoint"), "{journal}");
+    assert!(journal_store::pending(&data_dir, "debug", session).is_empty());
+    assert!(journal_store::checkpoint(&data_dir, "debug", session).is_some());
     assert!(sink.flushes.load(Ordering::SeqCst) > 1);
     let emitted_before_restart = sink.emitted.load(Ordering::SeqCst);
 
@@ -751,8 +740,7 @@ async fn routed_sessions_resolve_multiple_profiles_without_journaling_credential
     assert_eq!(calls[1].1, AuthResolveReason::Initial);
 
     for session in ["work-session", "personal-session"] {
-        let journal =
-            std::fs::read_to_string(source_journal_path(&data_dir, "debug", session)).unwrap();
+        let journal = journal_store::identity(&data_dir, "debug", session).to_string();
         assert!(journal.contains("\"route\""));
         assert!(!journal.contains("secret-"));
         assert!(!journal.contains("token_sha256_prefix"));
@@ -791,12 +779,7 @@ async fn environment_routes_remain_environment_auth_without_journaling_credentia
     assert_eq!(calls[0].0.profile, None);
     assert_eq!(calls[0].0.org_name.as_deref(), Some("env-org"));
 
-    let journal = std::fs::read_to_string(source_journal_path(
-        &data_dir,
-        "debug",
-        "environment-session",
-    ))
-    .unwrap();
+    let journal = journal_store::identity(&data_dir, "debug", "environment-session").to_string();
     assert!(journal.contains(r#""source":"environment""#));
     assert!(!journal.contains("secret-environment"));
 
@@ -932,7 +915,7 @@ async fn one_session_reports_to_multiple_routes_and_orgs_concurrently() {
 }
 
 #[tokio::test]
-async fn recovery_checkpoints_are_scoped_to_their_delivery_route() {
+async fn legacy_checkpoints_skip_only_input_every_route_delivered() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
     let socket = test_endpoint(tmp.path());
@@ -969,15 +952,16 @@ async fn recovery_checkpoints_are_scoped_to_their_delivery_route() {
         .unwrap();
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
 
+    // Migration keeps one translation boundary for the session: work's later
+    // checkpoint must not suppress personal recovery, so work may see its
+    // delivered spans again (idempotent upserts of the same span IDs).
     let sinks = recording.sinks.lock().unwrap().clone();
-    assert_eq!(sinks.len(), 1, "only the unacknowledged route is recovered");
-    assert_eq!(
-        sinks[0].org.lock().unwrap().as_deref(),
-        Some("personal-org"),
-        "a later checkpoint for work must not suppress personal recovery"
-    );
+    let personal = sinks
+        .iter()
+        .find(|sink| sink.org.lock().unwrap().as_deref() == Some("personal-org"))
+        .expect("the unacknowledged route is recovered");
     assert!(
-        sinks[0].emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        personal.emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "the unacknowledged route must reach its sink"
     );
 
@@ -1206,7 +1190,7 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     assert!(status_error.contains("select a profile explicitly"));
     assert!(!status_error.contains("secret-"));
     assert!(
-        source_journal_path(&data_dir, "debug", "login-needed").exists(),
+        !journal_store::pending(&data_dir, "debug", "login-needed").is_empty(),
         "capture must remain durable even when background auth fails"
     );
     {
@@ -1238,34 +1222,13 @@ async fn events_are_ordered_journaled_and_emitted() {
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
     assert_eq!(flushed.pending, 0);
 
-    // Journal: three events plus a durable delivery checkpoint, with only the
-    // non-secret route. Checkpoints are control records, not agent events.
-    let journal = source_journal_path(&data_dir, "debug", "sess-1");
-    let jtext = std::fs::read_to_string(&journal).unwrap();
-    let jlines: Vec<&str> = jtext.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(
-        jlines.len(),
-        4,
-        "expected 3 event lines plus one checkpoint, got {}",
-        jlines.len()
-    );
-    assert!(
-        !jtext.contains("sk-TOP-SECRET-abc123"),
-        "token leaked into journal!"
-    );
-    assert!(!jtext.contains("token_sha256_prefix"));
-
-    let events: Vec<String> = jlines
-        .iter()
-        .filter(|line| !line.contains("\"_bt_record_type\""))
-        .map(|l| {
-            serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect();
-    assert_eq!(events, vec!["SessionStart", "PostToolUse", "Stop"]);
+    // Translated events are gone; continuation replaces their replay history.
+    assert_eq!(journal_store::accepted(&data_dir, "debug", session), 3);
+    assert!(journal_store::pending(&data_dir, "debug", session).is_empty());
+    assert!(!source_journal_path(&data_dir, "debug", session).exists());
+    let identity = journal_store::identity(&data_dir, "debug", session).to_string();
+    assert!(!identity.contains("sk-TOP-SECRET-abc123"));
+    assert!(!identity.contains("token_sha256_prefix"));
 
     // Spans: debug translator emits a root once + one span per event = 4.
     let spans = data_dir.join("spans").join("sess-1.ndjson");
@@ -1277,6 +1240,16 @@ async fn events_are_ordered_journaled_and_emitted() {
         "expected 4 span rows, got {}: {stext}",
         slines.len()
     );
+    let events: Vec<_> = slines
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter_map(|row| {
+            row["Insert"]["metadata"]["seq"]
+                .as_u64()
+                .map(|_| row["Insert"]["name"].as_str().unwrap().to_owned())
+        })
+        .collect();
+    assert_eq!(events, vec!["SessionStart", "PostToolUse", "Stop"]);
     // The span rows carry the raw payload but never the auth token.
     assert!(
         !stext.contains("sk-TOP-SECRET-abc123"),
@@ -1305,14 +1278,8 @@ async fn session_ids_longer_than_a_file_name_are_journaled_and_emitted() {
     let flushed = flush_session(&session, &socket, 5000).await.unwrap();
     assert!(flushed.flushed, "flush did not complete: {flushed:?}");
 
-    let jtext = std::fs::read_to_string(source_journal_path(&data_dir, "debug", &session)).unwrap();
-    assert_eq!(
-        jtext
-            .lines()
-            .filter(|line| !line.contains("\"_bt_record_type\""))
-            .count(),
-        2
-    );
+    assert_eq!(journal_store::accepted(&data_dir, "debug", &session), 2);
+    assert!(journal_store::pending(&data_dir, "debug", &session).is_empty());
     let spans: Vec<_> = std::fs::read_dir(data_dir.join("spans"))
         .unwrap()
         .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
@@ -1418,18 +1385,16 @@ async fn identical_native_ids_from_different_sources_are_isolated() {
     let claude_journal = source_journal_path(&data_dir, "claude-code", "shared-native-id");
     assert_ne!(codex_journal, claude_journal);
     assert_eq!(
-        std::fs::read_to_string(codex_journal)
-            .unwrap()
-            .lines()
-            .count(),
-        2
+        journal_store::identity(&data_dir, "codex", "shared-native-id")["source"],
+        "codex"
     );
     assert_eq!(
-        std::fs::read_to_string(claude_journal)
-            .unwrap()
-            .lines()
-            .count(),
-        2
+        journal_store::identity(&data_dir, "claude-code", "shared-native-id")["source"],
+        "claude-code"
+    );
+    assert_ne!(
+        journal_store::path(&data_dir, "codex", "shared-native-id"),
+        journal_store::path(&data_dir, "claude-code", "shared-native-id")
     );
 
     let rows = std::fs::read_to_string(data_dir.join("spans/shared-native-id.ndjson")).unwrap();
@@ -1463,10 +1428,10 @@ async fn distinct_sessions_are_isolated() {
     flush_session("a", &socket, 5000).await.unwrap();
     flush_session("b", &socket, 5000).await.unwrap();
 
-    let a = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "a")).unwrap();
-    let b = std::fs::read_to_string(source_journal_path(&data_dir, "debug", "b")).unwrap();
-    assert_eq!(a.lines().filter(|l| !l.trim().is_empty()).count(), 3);
-    assert_eq!(b.lines().filter(|l| !l.trim().is_empty()).count(), 2);
+    assert_eq!(journal_store::accepted(&data_dir, "debug", "a"), 2);
+    assert_eq!(journal_store::accepted(&data_dir, "debug", "b"), 1);
+    assert!(journal_store::pending(&data_dir, "debug", "a").is_empty());
+    assert!(journal_store::pending(&data_dir, "debug", "b").is_empty());
 
     handle.abort();
 }
@@ -1698,16 +1663,10 @@ async fn hook_capture_stops_at_the_durable_journal_boundary() {
         matches!(accepted, Ok(Ok(()))),
         "turn-end capture waited for translation or flushing: {accepted:?}"
     );
-    let journal = std::fs::read_to_string(source_journal_path(
-        &tmp.path().join("data"),
-        "debug",
-        "fast-capture",
-    ))
-    .unwrap();
     assert_eq!(
-        journal.lines().count(),
+        journal_store::accepted(&tmp.path().join("data"), "debug", "fast-capture"),
         2,
-        "hook returned before journaling"
+        "hook returned before durable admission"
     );
     shutdown(&socket).await;
     handle.await.unwrap();
@@ -1740,13 +1699,10 @@ async fn saturated_ingress_uses_the_journal_as_its_bounded_overflow_queue() {
         .unwrap();
     }
 
-    let journal =
-        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "bounded-overflow"))
-            .unwrap();
     assert_eq!(
-        journal.lines().count(),
-        EVENT_COUNT as usize,
-        "every hook returns only after its event reaches the journal"
+        journal_store::accepted(&data_dir, "debug", "bounded-overflow"),
+        EVENT_COUNT as u64,
+        "every accepted event is pending or represented by the continuation"
     );
 
     gate.notify_one();
@@ -1899,15 +1855,11 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
     let shutdown_task = tokio::spawn(async move { shutdown_daemon(&shutdown_socket).await });
     // Wait for proof that the server received shutdown and began draining.
     // A fixed sleep can expire before the client sends its request on busy CI.
-    let journal_path = source_journal_path(&data_dir, "debug", "drained-shutdown");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let journal = tokio::fs::read_to_string(&journal_path).await.unwrap();
-            if journal.lines().any(|line| {
-                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
-                    record["_bt_record_type"] == "pipeline_control" && record["kind"] == "retire"
-                })
-            }) {
+            if journal_store::checkpoint(&data_dir, "debug", "drained-shutdown")
+                .is_some_and(|state| state["last_control"]["kind"] == "retire")
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1942,12 +1894,10 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
     late_event.await.unwrap().unwrap();
     shutdown(&socket).await;
     replacement.await.unwrap();
-    let journal =
-        std::fs::read_to_string(source_journal_path(&data_dir, "debug", "drained-shutdown"))
-            .unwrap();
-    assert!(
-        journal.contains(r#""n":2"#),
-        "replacement daemon did not journal the retried event: {journal}"
+    assert_eq!(
+        journal_store::accepted(&data_dir, "debug", "drained-shutdown"),
+        2,
+        "replacement did not durably process the retried event"
     );
 }
 
@@ -2003,15 +1953,12 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
     shutdown(&socket).await;
     first.await.unwrap();
 
-    // A cold worker receives durable files only: event history plus SpanOps and heads.
+    // A cold worker receives only SQLite: continuation, pending output, and heads.
     let recovered_data_dir = tmp.path().join("recovered-data");
-    let source = source_journal_path(&data_dir, "debug", "resume");
-    let recovered_journal = source_journal_path(&recovered_data_dir, "debug", "resume");
-    std::fs::create_dir_all(recovered_journal.parent().unwrap()).unwrap();
-    std::fs::copy(source, &recovered_journal).unwrap();
+    assert!(!source_journal_path(&data_dir, "debug", "resume").exists());
 
     let db = pipeline_database(&data_dir);
-    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.checkpoint_wal().unwrap();
     std::fs::create_dir_all(recovered_data_dir.join("pipeline")).unwrap();
     for entry in std::fs::read_dir(data_dir.join("pipeline")).unwrap() {
         let path = entry.unwrap().path();
@@ -2032,15 +1979,11 @@ async fn cold_worker_rebuilds_acknowledged_journal_without_redelivery() {
         .unwrap();
     flush_session("resume", &socket, 5000).await.unwrap();
 
-    let journal = std::fs::read_to_string(recovered_journal).unwrap();
     assert_eq!(
-        journal
-            .lines()
-            .filter(|line| !line.contains("\"_bt_record_type\""))
-            .count(),
-        2,
-        "the event history remains separate from ordered pipeline controls"
+        journal_store::accepted(&recovered_data_dir, "debug", "resume"),
+        2
     );
+    assert!(journal_store::pending(&recovered_data_dir, "debug", "resume").is_empty());
     let spans = std::fs::read_to_string(recovered_data_dir.join("spans/resume.ndjson")).unwrap();
     let rows: Vec<serde_json::Value> = spans
         .lines()
@@ -2586,9 +2529,10 @@ async fn claude_journal_does_not_grow_with_the_transcript_on_every_turn() {
     flush_session("grow", &socket, 5000).await.unwrap();
 
     let transcript_len = std::fs::metadata(&transcript).unwrap().len();
-    let journal_len = std::fs::metadata(source_journal_path(&data_dir, "claude-code", "grow"))
-        .unwrap()
-        .len();
+    let journal_len = journal_store::pending(&data_dir, "claude-code", "grow")
+        .iter()
+        .map(|value| value.to_string().len() as u64)
+        .sum::<u64>();
 
     // Re-journaling the transcript every turn would put this near
     // TURNS * transcript_len / 2 (tens of megabytes). References are ~a few
@@ -2725,15 +2669,10 @@ async fn managed_run_flush_is_scoped_to_its_accepted_sessions() {
     assert!(result.flushed, "managed run did not flush: {result:?}");
     assert_eq!(result.pending, 0);
     let controls = |session| {
-        std::fs::read_to_string(source_journal_path(
-            &tmp.path().join("data"),
-            "debug",
-            session,
-        ))
-        .unwrap()
-        .lines()
-        .filter(|line| line.contains("pipeline_control"))
-        .count()
+        usize::from(
+            journal_store::checkpoint(&tmp.path().join("data"), "debug", session)
+                .is_some_and(|state| state["last_control"].is_object()),
+        )
     };
     assert_eq!(controls("run-a-main"), 1);
     assert_eq!(controls("run-a-child"), 1);
@@ -3145,20 +3084,16 @@ async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
     assert!(!flushed.is_empty());
     let mut main_session = false;
     for session in flushed.keys() {
-        let journal = source_journal_path(&daemon_dir.path().join("data"), "muse", session);
-        for line in std::fs::read_to_string(journal).unwrap().lines() {
-            let row: serde_json::Value = serde_json::from_str(line).unwrap();
-            if row["source"] != "muse" {
-                continue;
-            }
-            assert_eq!(
-                row["route"]["destination"]["project_name"],
-                "muse-managed-test"
-            );
-            assert!(row["managed_run_id"].as_str().is_some());
-            assert_eq!(row["source_version"], native_version);
-            main_session |= row["event"] == "SessionStart";
-        }
+        let data = daemon_dir.path().join("data");
+        let row = journal_store::identity(&data, "muse", session);
+        assert_eq!(
+            row["route"]["destination"]["project_name"],
+            "muse-managed-test"
+        );
+        assert!(row["managed_run_id"].as_str().is_some());
+        assert_eq!(row["source_version"], native_version);
+        main_session |= journal_store::checkpoint(&data, "muse", session)
+            .is_some_and(|state| state["native"]["root_created"] == true);
     }
     assert!(main_session);
     assert!(flushed.values().copied().sum::<usize>() >= 1);
@@ -3617,8 +3552,7 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
         1,
         "the native session_end event must trigger one daemon-owned flush"
     );
-    let decoy_journal_text =
-        std::fs::read_to_string(source_journal_path(&data_dir, "grok", "grok-decoy")).unwrap();
+    let decoy_journal_text = journal_store::identity(&data_dir, "grok", "grok-decoy").to_string();
     let decoy_spans_path = data_dir.join("spans/grok-decoy.ndjson");
     let decoy_before_restart = std::fs::read(&decoy_spans_path).unwrap();
     let decoy_text = String::from_utf8(decoy_before_restart.clone()).unwrap();
@@ -3661,96 +3595,26 @@ async fn packaged_grok_hook_replays_bounded_transcripts_to_isolated_debug_routes
         "replaying the primary route must not emit into the decoy debug sink"
     );
 
-    let journal_text =
-        std::fs::read_to_string(source_journal_path(&data_dir, "grok", "grok-primary")).unwrap();
+    let identity = journal_store::identity(&data_dir, "grok", "grok-primary");
+    let journal_text = identity.to_string();
     assert!(!journal_text.contains("secret-environment"));
     assert!(!journal_text.contains("token_sha256_prefix"));
     assert!(!journal_text.contains("decoy-route"));
-    let journal: Vec<serde_json::Value> = journal_text
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|record: &serde_json::Value| record.get("_bt_record_type").is_none())
-        .collect();
-    assert_eq!(journal.len(), 2);
-    assert_eq!(journal[0]["source"], "grok");
-    assert_eq!(journal[1]["source"], "grok");
-    assert_eq!(journal[0]["source_version"], "1.0.13");
-    assert_eq!(journal[1]["source_version"], "1.0.13");
-    assert_eq!(journal[0]["plugin_version"], plugin_version);
-    assert_eq!(journal[1]["plugin_version"], plugin_version);
-    assert_eq!(journal[0]["event"], "stop");
-    assert_eq!(journal[1]["event"], "session_end");
+    assert_eq!(identity["source"], "grok");
+    assert_eq!(identity["source_version"], "1.0.13");
+    assert_eq!(identity["plugin_version"], plugin_version);
+    assert_eq!(identity["event"], "session_end");
+    assert!(journal_store::pending(&data_dir, "grok", "grok-primary").is_empty());
+    let checkpoint = journal_store::checkpoint(&data_dir, "grok", "grok-primary").unwrap();
     assert_eq!(
-        journal[0]["route"]["additional_metadata"]["route_marker"],
-        "primary-route"
-    );
-
-    let first_mirrors = &journal[0]["payload"]["_bt_grok_transcript_mirrors"];
-    let second_mirrors = &journal[1]["payload"]["_bt_grok_transcript_mirrors"];
-    assert_eq!(
-        first_mirrors.as_object().unwrap().len(),
-        2,
-        "the first hook must journal the available updates and system prompt mirrors"
-    );
-    assert!(first_mirrors.get("events").is_none());
-    assert_eq!(
-        first_mirrors["updates"]["through"],
-        first_updates_through as u64
-    );
-    assert_eq!(second_mirrors["updates"]["through"], updates.len() as u64);
-    assert!(
-        first_updates_through < updates.len(),
-        "updates must advance between lifecycle boundaries"
-    );
-    assert_eq!(
-        first_mirrors["updates"]["path"],
-        primary_updates.to_str().unwrap()
-    );
-    assert_eq!(
-        first_mirrors["updates"]["mirror"], second_mirrors["updates"]["mirror"],
-        "updates must append to one stable daemon-owned mirror"
-    );
-    let updates_mirror = PathBuf::from(second_mirrors["updates"]["mirror"].as_str().unwrap());
-    assert!(updates_mirror.starts_with(data_dir.join("transcripts")));
-    assert_eq!(
-        std::fs::metadata(updates_mirror).unwrap().len(),
+        checkpoint["native"]["updates"]["offset"],
         updates.len() as u64
     );
     assert_eq!(
-        first_mirrors["system_prompt"]["through"],
-        system_prompt.len() as u64
-    );
-    assert_eq!(
-        second_mirrors["system_prompt"]["through"],
-        system_prompt.len() as u64
-    );
-    assert_eq!(
-        first_mirrors["system_prompt"]["path"],
-        primary_system_prompt.to_str().unwrap()
-    );
-    assert_eq!(
-        first_mirrors["system_prompt"]["mirror"], second_mirrors["system_prompt"]["mirror"],
-        "the system prompt must retain one stable daemon-owned snapshot"
-    );
-    let system_prompt_mirror =
-        PathBuf::from(second_mirrors["system_prompt"]["mirror"].as_str().unwrap());
-    assert!(system_prompt_mirror.starts_with(data_dir.join("transcripts")));
-    assert_eq!(
-        std::fs::read_to_string(system_prompt_mirror).unwrap(),
-        system_prompt
-    );
-
-    assert_eq!(second_mirrors["events"]["through"], events.len() as u64);
-    assert_eq!(
-        second_mirrors["events"]["path"],
-        primary_events.to_str().unwrap()
-    );
-    let events_mirror = PathBuf::from(second_mirrors["events"]["mirror"].as_str().unwrap());
-    assert!(events_mirror.starts_with(data_dir.join("transcripts")));
-    assert_eq!(
-        std::fs::metadata(events_mirror).unwrap().len(),
+        checkpoint["native"]["events"]["offset"],
         events.len() as u64
     );
+    assert!(first_updates_through < updates.len());
 
     wait_for_grok_enrichment(&primary_spans_path).await;
     let all_ops = read_span_ops(&primary_spans_path);
@@ -4019,14 +3883,7 @@ async fn missing_credentials_recover_without_another_native_event() {
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let db = rusqlite::Connection::open(&db_path).unwrap();
-            let count: u64 = db
-                .query_row(
-                    "SELECT count(*) FROM ops JOIN batches USING(input) WHERE committed=1",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
+            let count = Inspector::open(&db_path).unwrap().count(Table::Ops);
             if count >= 2 {
                 break;
             }
@@ -4228,12 +4085,10 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
     );
     let (head, tail) = head_and_tail(&data_dir);
     let heads = pipeline_database(&data_dir)
-        .prepare("SELECT position FROM heads")
-        .unwrap()
-        .query_map([], |r| r.get::<_, u64>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+        .heads()
+        .into_iter()
+        .map(|head| head.position)
+        .collect::<Vec<_>>();
     assert_eq!(heads.len(), 2);
     assert!(
         heads.iter().all(|position| *position == tail),
@@ -4248,8 +4103,7 @@ async fn clean_shutdown_delivers_the_shared_retirement_tail_to_every_route() {
 #[tokio::test]
 async fn initial_span_storage_failure_reports_journal_and_recovers_without_native_input() {
     let (data, socket, handle, _tmp) = start_daemon().await;
-    let storage = data.join("pipeline");
-    std::fs::write(&storage, "blocked storage path").unwrap();
+    journal_store::block_translation(&data, "debug", "storage-open");
     forward_envelope(
         &envelope("storage-open", "SessionStart", 1),
         &socket,
@@ -4278,7 +4132,7 @@ async fn initial_span_storage_failure_reports_journal_and_recovers_without_nativ
     })
     .await
     .unwrap();
-    std::fs::remove_file(&storage).unwrap();
+    journal_store::unblock_translation(&data, "debug", "storage-open");
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             if std::fs::read_to_string(data.join("spans/storage-open.ndjson"))
@@ -4443,19 +4297,17 @@ async fn changed_settings_resume_the_original_rejected_route_through_ingress() {
     .await
     .unwrap();
     let db = pipeline_database(&data);
-    let held: u64 = db.query_row("SELECT count(*) FROM heads WHERE failure IS NOT NULL OR position<(SELECT max(position) FROM ops JOIN batches USING(input) WHERE committed=1)", [], |r| r.get(0)).unwrap();
+    let held = db.held_heads();
     assert_eq!(
         held, 0,
         "both original and corrected subscriptions must complete"
     );
-    let settings: String = db
-        .query_row(
-            "SELECT settings FROM heads WHERE settings IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
+    let settings = db
+        .heads()
+        .into_iter()
+        .find_map(|head| head.settings)
         .unwrap();
-    assert!(settings.contains("corrected"));
+    assert!(settings.to_string().contains("corrected"));
     drop(db);
     shutdown(&socket).await;
     handle.await.unwrap();
@@ -4540,13 +4392,11 @@ async fn changed_plugin_chain_resumes_the_original_held_route() {
     .await
     .unwrap();
     let db = pipeline_database(&data);
-    let held: u64 = db
-        .query_row(
-            "SELECT count(*) FROM heads WHERE failure IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let held = db
+        .heads()
+        .iter()
+        .filter(|head| head.failure.is_some())
+        .count();
     assert_eq!(held, 0);
     shutdown(&socket).await;
     handle.await.unwrap();
@@ -4586,22 +4436,7 @@ async fn storage_failure_after_retirement_is_reported_and_recovers_without_nativ
     })
     .await
     .unwrap();
-    // Retirement removes the session from status before every storage handle
-    // closes. Windows may still deny renaming that directory briefly.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match std::fs::rename(data.join("pipeline"), data.join("saved-pipeline")) {
-                Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => panic!("move retired storage: {error}"),
-            }
-        }
-    })
-    .await
-    .unwrap();
-    std::fs::write(data.join("pipeline"), "blocked storage path").unwrap();
+    journal_store::block_translation(&data, "debug", "retired-failure");
     forward_envelope(
         &envelope("retired-failure", "Stop", 2),
         &socket,
@@ -4642,8 +4477,7 @@ async fn storage_failure_after_retirement_is_reported_and_recovers_without_nativ
         .sessions
         .iter()
         .any(|session| session.queued > 0 && session.last_error.is_some()));
-    std::fs::remove_file(data.join("pipeline")).unwrap();
-    std::fs::rename(data.join("saved-pipeline"), data.join("pipeline")).unwrap();
+    journal_store::unblock_translation(&data, "debug", "retired-failure");
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             if std::fs::read_to_string(data.join("spans/retired-failure.ndjson"))

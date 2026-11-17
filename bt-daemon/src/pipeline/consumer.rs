@@ -368,9 +368,9 @@ impl Consumer {
 mod tests {
     use super::*;
     use crate::{
-        pipeline::journal::SpanJournal,
         translate::{SpanOp, SpanRow},
         wire::BackendAuth,
+        {collections::SessionStorage, pipeline::cursor::Cursor},
     };
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -456,11 +456,11 @@ mod tests {
         }
     }
     fn spawn(
-        cursor: crate::pipeline::journal::Cursor,
+        cursor: crate::pipeline::cursor::Cursor,
         options: ConsumerOptions,
     ) -> (
         Arc<Consumer>,
-        crate::pipeline::journal::Progress,
+        crate::pipeline::cursor::Progress,
         Arc<Mutex<Option<String>>>,
     ) {
         let subscription = cursor.into_input(
@@ -485,12 +485,11 @@ mod tests {
         .await
         .unwrap();
     }
-    async fn stored(journal: &SpanJournal) {
-        journal.begin(10, true).await.unwrap();
+    async fn stored(journal: &SessionStorage) {
         journal
-            .append(
+            .translated(
                 10,
-                &[SpanOp::Insert(SpanRow {
+                vec![SpanOp::Insert(SpanRow {
                     span_id: "one".into(),
                     name: "one".into(),
                     root_span_id: "one".into(),
@@ -500,19 +499,18 @@ mod tests {
             )
             .await
             .unwrap();
-        journal.commit(10).await.unwrap();
     }
     #[tokio::test]
     async fn transient_rejection_resubmits_consumed_batch_before_completing() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
         let route = SessionRoute::default();
         let record = Arc::new(Recording::default());
         record.reject.store(true, Ordering::SeqCst);
-        let cursor = journal.subscribe(&route, 0).await.unwrap();
+        let cursor = Cursor::open(&journal, &route).await.unwrap();
         let opts = options(tmp.path(), &route, record.clone());
         let subscription = cursor.into_input(
             opts.config.subscribe(),
@@ -537,14 +535,15 @@ mod tests {
         assert_eq!(record.submitted.load(Ordering::SeqCst), 2);
         assert!(error.lock().is_none());
         assert!(journal
-            .failure(&serde_json::to_string(&route).unwrap())
+            .head(&serde_json::to_string(&route).unwrap())
             .await
             .unwrap()
+            .and_then(|head| head.failure)
             .is_none());
         consumer.shutdown().await;
         forward.abort();
         let _ = forward.await;
-        journal.close().await.unwrap();
+        drop(journal);
     }
 
     #[tokio::test]
@@ -552,7 +551,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let plugin = tmp.path().join("redact.mjs");
         std::fs::write(&plugin, "let calls=0; export default span => {if(calls++===0) {while(true){}} return {...span,name:'redacted'};}").unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -563,7 +562,8 @@ mod tests {
         let record = Arc::new(Recording::default());
         let opts = options(tmp.path(), &route, record.clone());
         let recovery = opts.recovery.clone();
-        let (consumer, progress, error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        let (consumer, progress, error) =
+            spawn(Cursor::open(&journal, &route).await.unwrap(), opts);
         wait_for(|| recovery.lock().is_some()).await;
         assert_eq!(progress.completed(), 0);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 0);
@@ -573,12 +573,13 @@ mod tests {
         assert!(error.lock().is_none());
         assert!(recovery.lock().is_none());
         assert!(journal
-            .failure(&serde_json::to_string(&route).unwrap())
+            .head(&serde_json::to_string(&route).unwrap())
             .await
             .unwrap()
+            .and_then(|head| head.failure)
             .is_none());
         consumer.shutdown().await;
-        journal.close().await.unwrap();
+        drop(journal);
     }
     struct Acknowledged(Arc<AtomicU64>);
     #[async_trait::async_trait]
@@ -618,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_delivery_can_read_ahead_and_acknowledge_original_receipts() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         let ops: Vec<_> = (0..129)
@@ -632,14 +633,12 @@ mod tests {
                 })
             })
             .collect();
-        journal.begin(1, true).await.unwrap();
-        journal.append(1, &ops).await.unwrap();
-        journal.commit(1).await.unwrap();
+        journal.translated(1, ops.clone()).await.unwrap();
         let route = SessionRoute::default();
         let record = Arc::new(Recording::default());
         record.defer_until.store(129, Ordering::SeqCst);
         let (consumer, progress, _error) = spawn(
-            journal.subscribe(&route, 0).await.unwrap(),
+            Cursor::open(&journal, &route).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| progress.completed() == 129).await;
@@ -653,19 +652,21 @@ mod tests {
     async fn head_write_recovery_retries_only_completion() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("spans.sqlite");
-        let journal = SpanJournal::open(&path).await.unwrap();
+        let journal = SessionStorage::at(&path).await.unwrap();
         stored(&journal).await;
         let route = SessionRoute::default();
-        let cursor = journal.subscribe(&route, 0).await.unwrap();
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("CREATE TRIGGER fail_head BEFORE UPDATE OF position ON heads BEGIN SELECT RAISE(FAIL,'injected head failure'); END;").unwrap();
+        let cursor = Cursor::open(&journal, &route).await.unwrap();
+        let db = crate::collections::inspect::Inspector::open(&path).unwrap();
+        db.inject(crate::collections::inspect::Fault::AdvanceHead)
+            .unwrap();
         let record = Arc::new(Recording::default());
         let (consumer, progress, error) =
             spawn(cursor, options(tmp.path(), &route, record.clone()));
         wait_for(|| error.lock().is_some()).await;
         assert_eq!(progress.completed(), 0);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
-        db.execute_batch("DROP TRIGGER fail_head").unwrap();
+        db.clear(crate::collections::inspect::Fault::AdvanceHead)
+            .unwrap();
         wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.submitted.load(Ordering::SeqCst), 1);
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
@@ -676,7 +677,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let plugin = tmp.path().join("plugin.mjs");
         std::fs::write(&plugin, "export default () => {throw new Error('bad')}").unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -687,17 +688,22 @@ mod tests {
         let key = serde_json::to_string(&route).unwrap();
         let record = Arc::new(Recording::default());
         let (consumer, _progress, error) = spawn(
-            journal.subscribe(&route, 0).await.unwrap(),
+            Cursor::open(&journal, &route).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| error.lock().is_some()).await;
         consumer.shutdown().await;
-        let evidence = journal.failure(&key).await.unwrap().unwrap();
+        let evidence = journal
+            .head(&key)
+            .await
+            .unwrap()
+            .and_then(|head| head.failure)
+            .unwrap();
         assert!(!evidence.contains("never-persist-this"));
         // Restart with an ordinary channel between the durable source and the
         // same consumer. Historical failure gating belongs to the source.
         let opts = options(tmp.path(), &route, record.clone());
-        let subscription = journal.subscribe(&route, 0).await.unwrap().into_input(
+        let subscription = Cursor::open(&journal, &route).await.unwrap().into_input(
             opts.config.subscribe(),
             opts.version.clone(),
             opts.error.clone(),
@@ -719,11 +725,16 @@ mod tests {
         std::fs::write(&plugin, "export default span => span").unwrap();
         wait_for(|| progress.completed() == 1).await;
         assert_eq!(record.accepted.load(Ordering::SeqCst), 1);
-        assert!(journal.failure(&key).await.unwrap().is_none());
+        assert!(journal
+            .head(&key)
+            .await
+            .unwrap()
+            .and_then(|head| head.failure)
+            .is_none());
         consumer.shutdown().await;
         forward.abort();
         let _ = forward.await;
-        journal.close().await.unwrap();
+        drop(journal);
     }
     struct RefreshAuth(Arc<AtomicU64>);
     #[async_trait::async_trait]
@@ -751,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn stop_signal_detaches_only_its_route_without_reporting_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         let plugin = tmp.path().join("stop.mjs");
@@ -767,9 +778,9 @@ mod tests {
         let healthy_route = SessionRoute::default();
         let stopped_record = Arc::new(Recording::default());
         let healthy_record = Arc::new(Recording::default());
-        let stopped_cursor = journal.subscribe(&stopped_route, 0).await.unwrap();
-        let healthy_cursor = journal.subscribe(&healthy_route, 0).await.unwrap();
         stored(&journal).await;
+        let stopped_cursor = Cursor::open(&journal, &stopped_route).await.unwrap();
+        let healthy_cursor = Cursor::open(&journal, &healthy_route).await.unwrap();
         let (stopped, stopped_progress, error) = spawn(
             stopped_cursor,
             options(tmp.path(), &stopped_route, stopped_record.clone()),
@@ -779,16 +790,18 @@ mod tests {
             options(tmp.path(), &healthy_route, healthy_record.clone()),
         );
         wait_for(|| {
-            stopped_progress.completed() == i64::MAX as u64 && healthy_progress.completed() == 1
+            stopped_progress.completed() == crate::collections::DETACHED
+                && healthy_progress.completed() == 1
         })
         .await;
         assert!(error.lock().is_none());
         assert_eq!(stopped_record.submitted.load(Ordering::SeqCst), 0);
         assert_eq!(healthy_record.submitted.load(Ordering::SeqCst), 1);
         assert!(journal
-            .failure(&serde_json::to_string(&stopped_route).unwrap())
+            .head(&serde_json::to_string(&stopped_route).unwrap())
             .await
             .unwrap()
+            .and_then(|head| head.failure)
             .is_none());
         stopped.shutdown().await;
         healthy.shutdown().await;
@@ -797,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn unauthorized_delivery_refreshes_credentials_at_the_same_head() {
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -808,7 +821,8 @@ mod tests {
         let refreshed = Arc::new(AtomicU64::new(0));
         let mut opts = options(tmp.path(), &route, record.clone());
         opts.auth_provider = Some(Arc::new(RefreshAuth(refreshed.clone())));
-        let (consumer, progress, _error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        let (consumer, progress, _error) =
+            spawn(Cursor::open(&journal, &route).await.unwrap(), opts);
         wait_for(|| progress.completed() == 1).await;
         assert_eq!(refreshed.load(Ordering::SeqCst), 1);
         assert_eq!(consumer.config.borrow().auth.token, "fresh");
@@ -834,7 +848,7 @@ mod tests {
             .mount_as_scoped(&server)
             .await;
         let tmp = tempfile::tempdir().unwrap();
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -854,7 +868,8 @@ mod tests {
             crate::BraintrustSinkConfig::default(),
         ));
         let mut config = opts.config.borrow().clone();
-        let (consumer, progress, error) = spawn(journal.subscribe(&route, 0).await.unwrap(), opts);
+        let (consumer, progress, error) =
+            spawn(Cursor::open(&journal, &route).await.unwrap(), opts);
         wait_for(|| error.lock().is_some()).await;
         assert_eq!(progress.completed(), 0);
         drop(rejection);
@@ -884,7 +899,7 @@ mod tests {
         std::fs::write(&first, "export default span => ({...span,name:'bad'})").unwrap();
         std::fs::write(&last,"export default span => {if(span.name==='bad') throw new Error('bad input'); return span}").unwrap();
         let last_digest = crate::span_processor::file_digest(&last);
-        let journal = SpanJournal::open(&tmp.path().join("spans.sqlite"))
+        let journal = SessionStorage::at(&tmp.path().join("spans.sqlite"))
             .await
             .unwrap();
         stored(&journal).await;
@@ -894,15 +909,16 @@ mod tests {
         };
         let record = Arc::new(Recording::default());
         let (consumer, progress, error) = spawn(
-            journal.subscribe(&route, 0).await.unwrap(),
+            Cursor::open(&journal, &route).await.unwrap(),
             options(tmp.path(), &route, record.clone()),
         );
         wait_for(|| error.lock().is_some()).await;
         let failure: Failure = serde_json::from_str(
             &journal
-                .failure(&serde_json::to_string(&route).unwrap())
+                .head(&serde_json::to_string(&route).unwrap())
                 .await
                 .unwrap()
+                .and_then(|head| head.failure)
                 .unwrap(),
         )
         .unwrap();

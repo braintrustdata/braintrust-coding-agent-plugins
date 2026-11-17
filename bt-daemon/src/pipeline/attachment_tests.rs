@@ -4,7 +4,7 @@
     reason = "Test fixtures and assertions fail immediately on unexpected values."
 )]
 //! Exercise native agent translation through durable attachment capture and upload.
-use super::journal::SpanJournal;
+use crate::collections::SessionStorage;
 use crate::{
     sink::{BraintrustSinkConfig, BraintrustSinkFactory, SinkFactory},
     translate::{Registry, SessionCtx},
@@ -64,10 +64,10 @@ async fn upload(source: &str, events: Vec<Envelope>) -> Vec<Value> {
         .mount(&storage)
         .await;
     let tmp = tempfile::tempdir().unwrap();
-    let journal = SpanJournal::open(&tmp.path().join("attachments.sqlite"))
+    let session = SessionStorage::at(&tmp.path().join("attachments.sqlite"))
         .await
         .unwrap();
-    journal.register(&Default::default()).await.unwrap();
+    session.register(&Default::default()).await.unwrap();
     let mut translator = Registry::default_agents().create(source, "attachments");
     let ctx = SessionCtx {
         session_id: "attachments".into(),
@@ -75,28 +75,24 @@ async fn upload(source: &str, events: Vec<Envelope>) -> Vec<Value> {
     };
     for (i, event) in events.iter().enumerate() {
         let input = i as u64 + 1;
-        journal.begin(input, true).await.unwrap();
         let mut ops = translator.handle(event, &ctx).unwrap();
         while let Some(more) = translator.drain_pending(&ctx).unwrap() {
             ops.extend(more);
         }
-        journal.append_live(input, &mut 0, &mut ops).await.unwrap();
-        journal.commit(input).await.unwrap();
+        session.translated(input, ops).await.unwrap();
     }
     let input = events.len() as u64 + 1;
-    journal.begin(input, true).await.unwrap();
     let mut ops = translator.finalize(&ctx).unwrap();
     while let Some(more) = translator.drain_pending(&ctx).unwrap() {
         ops.extend(more);
     }
-    journal.append_live(input, &mut 0, &mut ops).await.unwrap();
-    journal.commit(input).await.unwrap();
+    session.translated(input, ops).await.unwrap();
     let mut sink = BraintrustSinkFactory::new(BraintrustSinkConfig::default())
         .create("attachments", source)
         .unwrap();
     let config: SessionConfig = serde_json::from_value(json!({"auth":{"token":"test-key","org_id":"org","api_url":server.uri(),"app_url":server.uri()},"destination":{"type":"project_logs","project_name":"attachments"}})).unwrap();
     sink.configure(&config);
-    for (_, op) in journal.read_after(0, 1000).await.unwrap() {
+    for op in session.stored().await {
         sink.emit(&[op]).await.unwrap();
     }
     sink.flush().await.unwrap();

@@ -1497,19 +1497,14 @@ mod tests {
         for corrupt in [false, true] {
             let daemon = TestDaemon::start(Arc::new(OtherProfileDaemonAuth)).await;
             let data = daemon._dir.path().join("data");
-            let storage = data.join("pipeline");
+            let db =
+                crate::collections::inspect::Inspector::session(&data, "codex", "storage-failure")
+                    .unwrap();
             if corrupt {
-                std::fs::create_dir_all(&storage).unwrap();
-                std::fs::write(
-                    storage.join(format!(
-                        "{}.sqlite",
-                        crate::ids::session_storage_id("codex", "storage-failure")
-                    )),
-                    "not a database",
-                )
-                .unwrap();
+                db.corrupt_checkpoint().unwrap();
             } else {
-                std::fs::write(&storage, "blocked storage directory").unwrap();
+                db.inject(crate::collections::inspect::Fault::Handoff)
+                    .unwrap();
             }
             daemon
                 .forward_event("codex", "storage-failure", SessionRoute::default())

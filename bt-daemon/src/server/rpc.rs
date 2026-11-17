@@ -467,6 +467,8 @@ impl Daemon {
         }
     }
 
+    /// Imports are captured like hooks. Finishing one waits for its captured
+    /// events to reach every matching delivery route and reports what they sent.
     async fn finish_import(
         self: &Arc<Self>,
         params: &crate::wire::ImportFinishParams,
@@ -560,7 +562,7 @@ impl Daemon {
             .cloned();
         if let Some(translation) = translation {
             translation
-                .control(crate::journal::ControlKind::Reset)
+                .control(crate::pipeline::input::ControlKind::Reset)
                 .await
                 .map_err(|error| anyhow::anyhow!(error))?;
         }

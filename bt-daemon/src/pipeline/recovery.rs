@@ -253,11 +253,13 @@ impl Failure {
         }
     }
     pub fn storage(error: &anyhow::Error, version: &str, attempt: u32) -> Self {
-        if error.downcast_ref::<serde_json::Error>().is_some() || error.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
-            matches!(error,rusqlite::Error::SqliteFailure(code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseCorrupt|rusqlite::ErrorCode::NotADatabase))
-        }) {
-            Self::revision(Boundary::Journal,0,error.to_string(),version)
-        } else { Self::delay(Boundary::Journal,0,error.to_string(),attempt) }
+        if error.downcast_ref::<serde_json::Error>().is_some()
+            || crate::collections::is_corruption(error)
+        {
+            Self::revision(Boundary::Journal, 0, error.to_string(), version)
+        } else {
+            Self::delay(Boundary::Journal, 0, error.to_string(), attempt)
+        }
     }
     pub fn info(&self, eligible: bool) -> RecoveryInfo {
         let retry = match &self.condition {

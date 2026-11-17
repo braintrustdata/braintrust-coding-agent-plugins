@@ -142,6 +142,19 @@ pub enum SpanOp {
     Merge(SpanRow),
 }
 
+impl SpanOp {
+    /// The row this op inserts or merges.
+    pub fn row(&self) -> &SpanRow {
+        let (Self::Insert(row) | Self::Merge(row)) = self;
+        row
+    }
+
+    pub fn row_mut(&mut self) -> &mut SpanRow {
+        let (Self::Insert(row) | Self::Merge(row)) = self;
+        row
+    }
+}
+
 /// Cross-cutting per-session context handed to the translator on each call.
 /// The translator's own state lives in the translator instance; this carries
 /// only what the dispatcher owns.

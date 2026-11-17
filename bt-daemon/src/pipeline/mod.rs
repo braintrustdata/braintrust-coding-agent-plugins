@@ -21,7 +21,7 @@ pub(crate) trait Stage: Send {
     async fn process(&mut self, input: &Self::Input) -> Self::Outcome;
 }
 
-pub(crate) mod journal;
+pub(crate) mod cursor;
 pub(crate) mod translation;
 
 pub(crate) mod consumer;
