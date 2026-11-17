@@ -25,7 +25,7 @@ expect_used = "deny"
 
 [dependencies]
 # Keep this pinned exactly, matching the dependency policy used by `bt`.
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "27f6721e56611d776e12e4cfc81dd1ad5ecd7af4" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "b47a43cc568d5d837aa74296489eb1a64ef89593" }
 braintrust-api-client = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "cb231d5785987a3143361cc846227f3ac758ba74" }
 base64 = "0.22"
 mime_guess = "2"

@@ -12,8 +12,8 @@ use super::{Sink, SinkFactory};
 use crate::translate::{SpanOp, SpanRow, SpanType};
 use crate::wire::{SessionConfig, TraceDestination};
 use braintrust_sdk_rust::{
-    BraintrustClient, Completion, DeliveryReceipt, ParentSpanInfo, SpanComponents, SpanHandle,
-    SpanLog, SpanObjectType, SpanType as SdkSpanType, WriteError, DEFAULT_API_URL, DEFAULT_APP_URL,
+    BraintrustClient, ParentSpanInfo, SpanComponents, SpanHandle, SpanLog, SpanObjectType,
+    SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
@@ -201,12 +201,13 @@ struct BraintrustSink {
     attachment_uploads: Option<AttachmentUploads>,
     /// Live span handles keyed by deterministic span id, so a later op (e.g.
     /// setting `end`) merges onto the same row the SDK already knows.
-    open: HashMap<String, SpanHandle<BraintrustClient>>,
+    open: HashMap<String, SpanHandle>,
     /// Roots marked by translators as provisional, keyed by their local span
     /// id. Each is exported only once direct descendant work arrives.
     pending_roots: HashMap<String, Vec<SpanOp>>,
     /// Retain acknowledgements even when automatic delivery finishes before flush.
-    pending_completions: Vec<Completion<DeliveryReceipt, WriteError>>,
+    pending_completions:
+        Vec<std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>>,
     /// Root span id of the trace that most recently received a row, which
     /// is also that root's deterministic row id in Braintrust.
     delivered_root: Option<String>,
@@ -296,7 +297,10 @@ impl BraintrustSink {
         if let Err(error) = completion.submission() {
             return Err(anyhow::anyhow!("braintrust span admission failed: {error}"));
         }
-        self.pending_completions.push(completion);
+        self.pending_completions.push(Box::pin(async move {
+            completion.await?;
+            Ok(())
+        }));
         if row.end_ms.is_some() {
             // build_log includes the end metric in this tracked write.
             // SpanHandle retains the complete accumulated input/output. Once a
@@ -326,15 +330,19 @@ impl BraintrustSink {
                 context.remove("span_origin");
             }
         }
-        let completion = client
-            .update_span_with_credentials_tracked(
-                creds.token.clone(),
-                creds.org_id.clone(),
-                &components.to_str(),
-                build_log(row, &self.source, true)?,
-            )
-            .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))?;
-        self.pending_completions.push(completion);
+        let completion = client.update_span_with_credentials(
+            creds.token.clone(),
+            creds.org_id.clone(),
+            &components.to_str(),
+            build_log(row, &self.source, true)?,
+        );
+        if let Err(error) = completion.submission() {
+            return Err(anyhow::anyhow!("braintrust span merge failed: {error}"));
+        }
+        self.pending_completions.push(Box::pin(async move {
+            completion.await?;
+            Ok(())
+        }));
         Ok(())
     }
 
@@ -549,7 +557,7 @@ impl Sink for BraintrustSink {
         for completion in self.pending_completions.drain(..) {
             if let Err(error) = completion.await {
                 if failure.is_none() {
-                    failure = Some(anyhow::Error::new(error));
+                    failure = Some(error);
                 }
             }
         }
@@ -908,9 +916,13 @@ mod tests {
             creds: None,
             urls: None,
             client: Some(cached),
+            attachment_uploads: None,
             open: HashMap::new(),
             pending_roots: HashMap::new(),
-            pending_completions: vec![completion],
+            pending_completions: vec![Box::pin(async move {
+                completion.await?;
+                Ok(())
+            })],
             delivered_root: None,
         };
         assert!(sink.flush().await.is_err());
@@ -975,6 +987,7 @@ mod tests {
                 &components.to_str(),
                 build_log(&row, "codex", true).unwrap(),
             )
+            .await
             .unwrap();
         client.flush().await.unwrap();
 

@@ -54,16 +54,6 @@ impl std::error::Error for Failure {
 
 impl Failure {
     fn classify(cause: anyhow::Error) -> Self {
-        let cause = if let Some(error) =
-            cause.downcast_ref::<braintrust_api_client::backend::HttpError>()
-        {
-            anyhow::Error::new(braintrust_sdk_rust::BraintrustError::Api {
-                status: error.status.as_u16(),
-                message: error.to_string(),
-            })
-        } else {
-            cause
-        };
         let sdk_error = cause
             .downcast_ref::<braintrust_sdk_rust::BraintrustError>()
             .or_else(
@@ -82,22 +72,25 @@ impl Failure {
                     _ => None,
                 },
             );
-        let retry = match sdk_error {
-            Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. }) => {
-                RetryCondition::Credentials
-            }
-            Some(braintrust_sdk_rust::BraintrustError::Api {
-                status: 403 | 404, ..
-            }) => RetryCondition::Configuration { recheck: true },
-            Some(braintrust_sdk_rust::BraintrustError::Api {
-                status: 408 | 429 | 500..=599,
-                ..
+        let status = sdk_error
+            .and_then(|error| match error {
+                braintrust_sdk_rust::BraintrustError::Api { status, .. } => Some(*status),
+                _ => None,
             })
-            | Some(braintrust_sdk_rust::BraintrustError::Http(_))
-            | Some(braintrust_sdk_rust::BraintrustError::Network(_))
-            | Some(braintrust_sdk_rust::BraintrustError::ChannelClosed)
-            | None => RetryCondition::Transient,
-            Some(_) => RetryCondition::Configuration { recheck: false },
+            .or_else(|| {
+                cause
+                    .downcast_ref::<braintrust_api_client::backend::HttpError>()
+                    .map(|error| error.status.as_u16())
+            });
+        let retry = match (status, sdk_error) {
+            (Some(401), _) => RetryCondition::Credentials,
+            (Some(403 | 404), _) => RetryCondition::Configuration { recheck: true },
+            (Some(408 | 429 | 500..=599), _)
+            | (_, Some(braintrust_sdk_rust::BraintrustError::Http(_)))
+            | (_, Some(braintrust_sdk_rust::BraintrustError::Network(_)))
+            | (_, Some(braintrust_sdk_rust::BraintrustError::ChannelClosed))
+            | (None, None) => RetryCondition::Transient,
+            _ => RetryCondition::Configuration { recheck: false },
         };
         Self { cause, retry }
     }
