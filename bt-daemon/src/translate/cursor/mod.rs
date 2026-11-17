@@ -391,6 +391,52 @@ impl CursorTranslator {
         }
     }
     fn prompt(&mut self, e: &Envelope, hook: &Hook, prompt: &PromptHook, ops: &mut Vec<SpanOp>) {
+        let first = ops.len();
+        self.prompt_text(e, hook, prompt, ops);
+        let mut files = Vec::new();
+        for file in &prompt.attachments {
+            if file.get("type").and_then(Value::as_str) != Some("file") {
+                continue;
+            }
+            let Some(path) = file.get("file_path").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(data) = std::fs::read(path) else {
+                continue;
+            };
+            let filename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("attachment")
+                .to_owned();
+            files.push(crate::attachments::Attachment::new(
+                filename,
+                "application/octet-stream".into(),
+                data,
+            ));
+        }
+        for op in &mut ops[first..] {
+            let (SpanOp::Insert(row) | SpanOp::Merge(row)) = op;
+            if row.span_type == SpanType::Task && row.input.is_some() {
+                let mut content = vec![json!({"type":"text","text":prompt.prompt})];
+                for file in &files {
+                    content.push(json!({"type":"_bt_attachment","digest":file.digest,"filename":file.filename,"content_type":file.content_type}));
+                }
+                if !files.is_empty() {
+                    row.input = Some(Value::Array(content));
+                    row.attachments.extend(files.iter().cloned());
+                }
+            }
+        }
+    }
+
+    fn prompt_text(
+        &mut self,
+        e: &Envelope,
+        hook: &Hook,
+        prompt: &PromptHook,
+        ops: &mut Vec<SpanOp>,
+    ) {
         let prompt = prompt.prompt.as_str();
         let generation = hook.generation_id();
         if generation.is_some_and(|g| self.prompt_generations.get(g).is_some()) {

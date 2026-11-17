@@ -15,9 +15,9 @@ and uploads traces. Pi keeps running if tracing fails.
 - **Compaction spans**: one span per session compaction, including trigger/retry metadata when available
 - **Branch summary spans**: one span per summarized `/tree` navigation branch
 
-Images attached to a prompt are included in turn inputs as inline image content.
-LLM inputs and tool outputs retain image blocks supplied by Pi. Images are sent
-inside trace JSON; they are not uploaded as separate Braintrust attachments.
+Images attached to prompts, included in model context, or returned by tools are
+uploaded as Braintrust attachments. Turn inputs, LLM inputs, and tool outputs
+reference the uploaded images.
 
 Trace shape:
 

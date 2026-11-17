@@ -10,6 +10,7 @@
 //! The `cli` feature only gates the standalone binary and its logging
 //! subscriber.
 
+pub mod attachments;
 pub mod paths;
 
 mod agents;

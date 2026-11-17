@@ -152,6 +152,10 @@ impl AgentTestWorld {
         self.inference_mode == TestBackendMode::Live
     }
 
+    pub fn uploaded_attachment(&self, key: &str) -> Option<Vec<u8>> {
+        self.collector.attachment(key)
+    }
+
     pub fn uses_mock_ingest(&self) -> bool {
         self.ingest_mode == TestBackendMode::Mock
     }

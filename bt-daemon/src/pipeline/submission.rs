@@ -54,6 +54,16 @@ impl std::error::Error for Failure {
 
 impl Failure {
     fn classify(cause: anyhow::Error) -> Self {
+        let cause = if let Some(error) =
+            cause.downcast_ref::<braintrust_api_client::backend::HttpError>()
+        {
+            anyhow::Error::new(braintrust_sdk_rust::BraintrustError::Api {
+                status: error.status.as_u16(),
+                message: error.to_string(),
+            })
+        } else {
+            cause
+        };
         let retry = match cause.downcast_ref::<braintrust_sdk_rust::BraintrustError>() {
             Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. }) => {
                 RetryCondition::Credentials

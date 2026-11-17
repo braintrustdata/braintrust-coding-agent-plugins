@@ -27,3 +27,6 @@ pub(crate) mod translation;
 pub(crate) mod consumer;
 
 pub(crate) mod recovery;
+
+#[cfg(test)]
+mod attachment_tests;
