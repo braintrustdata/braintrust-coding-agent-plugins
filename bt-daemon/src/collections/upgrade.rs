@@ -6,6 +6,21 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 
+/// Schema 7: each attachment is stored once, however many ops reference it,
+/// and deleted with the last op that does.
+const ATTACHMENTS: &str =
+    "CREATE TABLE attachment_blobs(digest TEXT PRIMARY KEY, data BLOB NOT NULL,
+                refs INTEGER NOT NULL CHECK(refs>=0));
+            CREATE TABLE operation_attachments(position INTEGER NOT NULL, digest TEXT NOT NULL,
+                PRIMARY KEY(position,digest));
+            CREATE TRIGGER attachment_acquire AFTER INSERT ON operation_attachments BEGIN
+                UPDATE attachment_blobs SET refs=refs+1 WHERE digest=NEW.digest; END;
+            CREATE TRIGGER attachment_release AFTER DELETE ON operation_attachments BEGIN
+                UPDATE attachment_blobs SET refs=refs-1 WHERE digest=OLD.digest;
+                DELETE FROM attachment_blobs WHERE digest=OLD.digest AND refs=0; END;
+            CREATE TRIGGER operation_release AFTER DELETE ON ops BEGIN
+                DELETE FROM operation_attachments WHERE position=OLD.position; END;";
+
 /// Read the version under the same write transaction as every upgrade, so a
 /// concurrent opener cannot run a stale migration plan.
 pub(super) fn migrate(db: &Connection) -> anyhow::Result<()> {
@@ -57,6 +72,9 @@ pub(super) fn migrate(db: &Connection) -> anyhow::Result<()> {
         )?;
     }
     if version < 7 {
+        db.execute_batch(ATTACHMENTS)?;
+    }
+    if version < 8 {
         // One session row replaces per-input batches: an input is handed over
         // in one transaction, so only ops a route could already see survive.
         // A partly published input is translated again.
@@ -210,6 +228,57 @@ mod tests {
         CREATE TABLE span_state(span_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
             value BLOB NOT NULL, end_ms INTEGER);
         PRAGMA user_version=6;";
+
+    #[tokio::test]
+    async fn schema_seven_attachments_survive_the_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("upgrade.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(SCHEMA_FIVE).unwrap();
+        db.execute_batch(SCHEMA_SIX).unwrap();
+        db.execute_batch(ATTACHMENTS).unwrap();
+        db.execute(
+            "INSERT INTO heads(route,position) VALUES(?,0)",
+            [serde_json::to_string(&route("a")).unwrap()],
+        )
+        .unwrap();
+        db.execute_batch(
+            "INSERT INTO batches(input,committed) VALUES(10,1);
+             INSERT INTO publication VALUES(1,1,0);
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+        let attachment = crate::attachments::Attachment::new(
+            "document.pdf".into(),
+            "application/pdf".into(),
+            b"pdf bytes".to_vec(),
+        );
+        let mut stored = op("document");
+        stored.row_mut().attachments = vec![crate::attachments::Attachment {
+            data: Vec::new(),
+            ..attachment.clone()
+        }];
+        db.execute(
+            "INSERT INTO ops(input,value) VALUES(10,?)",
+            [StoredOp::encode(&stored).unwrap()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attachment_blobs(digest,data,refs) VALUES(?,?,0)",
+            params![attachment.digest, attachment.data],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO operation_attachments(position,digest) VALUES(1,?)",
+            [&attachment.digest],
+        )
+        .unwrap();
+        drop(db);
+        let upgraded = SessionStorage::at(&path).await.unwrap();
+        let ops = upgraded.stored().await;
+        assert_eq!(ops[0].row().attachments[0].data, b"pdf bytes");
+        assert_eq!(Inspector::open(&path).unwrap().attachment_refs(), [1]);
+    }
 
     #[tokio::test]
     async fn schema_five_upgrade_reclaims_acknowledged_payloads_without_losing_provenance() {

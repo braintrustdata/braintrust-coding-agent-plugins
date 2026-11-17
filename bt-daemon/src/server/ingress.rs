@@ -267,7 +267,7 @@ pub(super) async fn accept_resolved_event(
     let session_id = env.session_id.clone();
     let managed_run_id = env.managed_run_id.clone();
     let route = env.route.clone();
-    tracing::info!(source, event, session_id, "event received");
+    tracing::debug!(source, event, session_id, "event received");
     let session_lock = daemon.dispatch_lock(&source, &session_id);
     let _session_guard = session_lock.lock().await;
 
@@ -311,7 +311,7 @@ pub(super) async fn accept_resolved_event(
                     .persist_managed_run_session(&managed_run_id, delivery_key, &route)
                     .await;
             }
-            tracing::info!(source, event, session_id, "event accepted")
+            tracing::debug!(source, event, session_id, "event accepted")
         }
         Err(error) => tracing::warn!(source, event, session_id, %error, "event rejected"),
     }

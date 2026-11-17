@@ -26,7 +26,9 @@ expect_used = "deny"
 [dependencies]
 # Keep this pinned exactly, matching the dependency policy used by `bt`.
 braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "27f6721e56611d776e12e4cfc81dd1ad5ecd7af4" }
+braintrust-api-client = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "cb231d5785987a3143361cc846227f3ac758ba74" }
 base64 = "0.22"
+mime_guess = "2"
 anyhow = "1"
 muse-code-sdk = "=1.4.12"
 parking_lot = "0.12"
@@ -48,11 +50,13 @@ thiserror = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal", "fs"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "v5"] }
+url = "2"
 rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 serde_rusqlite = "0.44"
 weak-table = "0.4"
+file-rotate = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }

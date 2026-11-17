@@ -132,6 +132,17 @@ impl Inspector {
         Some(continuation)
     }
 
+    /// The reference count of each stored attachment.
+    pub fn attachment_refs(&self) -> Vec<u64> {
+        super::store::select::<(u64,)>(
+            &self.0,
+            "SELECT refs FROM attachment_blobs ORDER BY digest",
+            [],
+        )
+        .map(|rows| rows.into_iter().map(|(refs,)| refs).collect())
+        .unwrap_or_default()
+    }
+
     pub fn heads(&self) -> Vec<Head> {
         super::store::select(&self.0, "SELECT position, failure, settings FROM heads", [])
             .unwrap_or_default()

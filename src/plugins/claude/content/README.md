@@ -7,6 +7,10 @@
 
 A Claude Code plugin marketplace for tracing Claude Code sessions to [Braintrust](https://braintrust.dev).
 
+Images and documents available in Claude's native transcript are uploaded as
+Braintrust attachments. Prompt attachments appear on their turn and in LLM
+inputs; tool attachments appear in tool outputs and subsequent LLM inputs.
+
 ## Prerequisites
 
 - A [Braintrust account](https://braintrust.dev)

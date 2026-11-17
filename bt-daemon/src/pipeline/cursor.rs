@@ -570,6 +570,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachments_are_stored_once_and_released_after_every_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("attachments.sqlite");
+        let storage = SessionStorage::at(&path).await.unwrap();
+        let mut a = Cursor::open(&storage, &route("a")).await.unwrap();
+        let mut b = Cursor::open(&storage, &route("b")).await.unwrap();
+        let ops: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|name| {
+                let mut op = op(name);
+                op.row_mut().input = Some(
+                    serde_json::json!({"type":"file", "mime":"application/pdf", "data":"YWJj"}),
+                );
+                op
+            })
+            .collect();
+        storage.translated(10, ops.clone()).await.unwrap();
+        // A retried handoff of the same input acquires no other reference.
+        storage.translated(10, ops).await.unwrap();
+        let db = Inspector::open(&path).unwrap();
+        assert_eq!(db.attachment_refs(), [2], "both ops share one stored copy");
+        assert_eq!(storage.stored().await[0].row().attachments[0].data, b"abc");
+        let acknowledge = async |cursor: &mut Cursor| {
+            cursor
+                .next_batch(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_completed()
+                .await
+                .ok()
+                .unwrap();
+        };
+        acknowledge(&mut a).await;
+        assert_eq!(db.attachment_refs(), [2], "route b still owes the first op");
+        acknowledge(&mut b).await;
+        assert_eq!(db.attachment_refs(), [1]);
+        acknowledge(&mut a).await;
+        acknowledge(&mut b).await;
+        assert!(db.attachment_refs().is_empty());
+    }
+
+    #[tokio::test]
     async fn all_route_acknowledgements_reclaim_payloads_and_preserve_watermarks() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cleanup.sqlite");

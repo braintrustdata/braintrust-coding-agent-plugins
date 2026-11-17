@@ -48,6 +48,17 @@ fn tool_command(marker: &str) -> String {
     }
 }
 
+fn image_attachment(value: &Value) -> Option<&Value> {
+    if value["type"] == "braintrust_attachment" && value["content_type"] == "image/png" {
+        return Some(value);
+    }
+    match value {
+        Value::Array(items) => items.iter().find_map(image_attachment),
+        Value::Object(fields) => fields.values().find_map(image_attachment),
+        _ => None,
+    }
+}
+
 fn row_contains(row: &Value, fragments: &[&str]) -> bool {
     let serialized = serde_json::to_string(row).expect("serialize trace row");
     fragments
@@ -466,8 +477,8 @@ async fn pi_codemode_traces_nested_tools_and_images() {
     output.assert_contains("PI_MOCK_OK");
 
     // Codemode runs nested tools through ctx.executeTool(). Both calls should
-    // have child spans under the codemode span, and image blocks should remain
-    // available on the nested read span and the following LLM input.
+    // have child spans under the codemode span, with uploaded image references
+    // on the nested read span and the following LLM input.
     let scenario = IngestScenario::new()
         .expect("Pi codemode span", |row| {
             row_contains(row, &[r#""type":"tool""#, r#""name":"codemode""#])
@@ -481,10 +492,10 @@ async fn pi_codemode_traces_nested_tools_and_images() {
                 &[
                     r#""type":"tool""#,
                     r#""name":"read""#,
-                    r#""type":"image""#,
+                    r#""type":"braintrust_attachment""#,
                     "image/png",
                 ],
-            )
+            ) && image_attachment(&row["output"]).is_some()
         });
     let rows = world.wait_for_mock_ingest_scenario(&scenario).await;
     let span_named = |name: &str| {
@@ -506,19 +517,132 @@ async fn pi_codemode_traces_nested_tools_and_images() {
         .find(|row| {
             row["span_attributes"]["type"] == "tool"
                 && row["span_attributes"]["name"] == "read"
-                && row.to_string().contains(r#""type":"image""#)
+                && image_attachment(&row["output"]).is_some()
         })
-        .expect("read span should preserve Pi's image block");
+        .expect("read span should reference the uploaded Pi image");
     assert_eq!(image_read["span_parents"], json!([codemode["span_id"]]));
     assert!(image_read.to_string().contains("image/png"));
-    assert!(image_read.to_string().contains("iVBORw0KGgo"));
+    let attachment = image_attachment(&image_read["output"]).unwrap();
+    assert_eq!(
+        world
+            .uploaded_attachment(attachment["key"].as_str().unwrap())
+            .as_deref(),
+        Some(include_bytes!("fixtures/images/tiny.png").as_slice()),
+        "uploaded Pi image differs from the native image fixture"
+    );
     assert!(
         rows.iter().any(|row| {
             row["span_attributes"]["type"] == "llm"
-                && row.to_string().contains(r#""type":"image""#)
-                && row.to_string().contains("image/png")
+                && image_attachment(&row["input"])
+                    .is_some_and(|image| image["key"] == attachment["key"])
         }),
         "the following LLM span should retain the image attached by codemode"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the Codex CLI installed on PATH"]
+async fn codex_prompt_attachment_uploads() {
+    let inference = OpenAiMock::new(|_, _| MockReply::response(OpenAiTurn::text("CODEX_IMAGE_OK")));
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    let image_path = world.workspace().join("tiny.png");
+    std::fs::write(&image_path, include_bytes!("fixtures/images/tiny.png")).unwrap();
+    let codex = CodexAgent::install(&world).await;
+    let output = codex
+        .run(
+            &world,
+            CodexRun::new("Describe the attached image.")
+                .mock_inference(inference_server.uri())
+                .arg("--image")
+                .arg(image_path)
+                .arg("--"),
+        )
+        .await;
+    output.assert_success();
+    if !world.uses_mock_inference() || !world.uses_mock_ingest() {
+        return;
+    }
+    let rows = world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new()
+                .expect("Codex turn image", |row| {
+                    row["span_attributes"]["type"] == "task"
+                        && image_attachment(&row["input"]).is_some()
+                })
+                .expect("Codex model image", |row| {
+                    row["span_attributes"]["type"] == "llm"
+                        && image_attachment(&row["input"]).is_some()
+                }),
+        )
+        .await;
+    let attachment = rows
+        .iter()
+        .find_map(|row| image_attachment(&row["input"]))
+        .unwrap();
+    assert_eq!(
+        world
+            .uploaded_attachment(attachment["key"].as_str().unwrap())
+            .as_deref(),
+        Some(include_bytes!("fixtures/images/tiny.png").as_slice())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the Claude Code CLI installed on PATH"]
+async fn claude_tool_attachment_uploads() {
+    let inference = AnthropicMock::new(|context, request| {
+        if context.request_index == 0 {
+            MockReply::response(AnthropicTurn::tool_use(
+                "image-read",
+                "Read",
+                json!({"file_path":"tiny.png"}),
+            ))
+        } else {
+            assert!(request.has_tool_result("image-read"));
+            MockReply::response(AnthropicTurn::text("CLAUDE_IMAGE_OK"))
+        }
+    });
+    let inference_server = TestServer::start(inference.router()).await;
+    let world = AgentTestWorld::start().await;
+    std::fs::write(
+        world.workspace().join("tiny.png"),
+        include_bytes!("fixtures/images/tiny.png"),
+    )
+    .unwrap();
+    let output = ClaudeAgent::new(&world)
+        .run(
+            &world,
+            ClaudeRun::new("Read tiny.png and describe the image.")
+                .mock_inference(inference_server.uri()),
+        )
+        .await;
+    output.assert_success();
+    if !world.uses_mock_inference() || !world.uses_mock_ingest() {
+        return;
+    }
+    let rows = world
+        .wait_for_mock_ingest_scenario(
+            &IngestScenario::new()
+                .expect("Claude tool image", |row| {
+                    row["span_attributes"]["type"] == "tool"
+                        && image_attachment(&row["output"]).is_some()
+                })
+                .expect("Claude model image", |row| {
+                    row["span_attributes"]["type"] == "llm"
+                        && image_attachment(&row["input"]).is_some()
+                }),
+        )
+        .await;
+    let attachment = rows
+        .iter()
+        .find_map(|row| image_attachment(&row["output"]))
+        .unwrap();
+    assert_eq!(
+        world
+            .uploaded_attachment(attachment["key"].as_str().unwrap())
+            .as_deref(),
+        Some(include_bytes!("fixtures/images/tiny.png").as_slice())
     );
 }
 
@@ -606,7 +730,7 @@ async fn opencode_v2_session_emits_traces() {
     let world = AgentTestWorld::start().await;
     let workspace = world.workspace();
     let image = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==").unwrap();
-    std::fs::write(workspace.join("image.png"), image).unwrap();
+    std::fs::write(workspace.join("image.png"), &image).unwrap();
     let home = world.temp_path("opencode-v2-home");
     std::fs::create_dir_all(&home).unwrap();
     let config = json!({
@@ -659,7 +783,7 @@ async fn opencode_v2_session_emits_traces() {
     );
     let scenario = IngestScenario::new()
         .expect("v2 input", |row| {
-            row_contains(row, &["Turn 1", "say hello", "data:image/png;base64,"])
+            row_contains(row, &["Turn 1", "say hello", "braintrust_attachment"])
         })
         .expect("v2 tool", |row| {
             row_contains(row, &[r#""type":"tool""#, "OPENCODE_V2_TOOL_OK"])
@@ -697,9 +821,24 @@ async fn opencode_v2_session_emits_traces() {
         final_llm["input"]
     );
 
+    let attachment = rows
+        .iter()
+        .find_map(|row| {
+            row["metadata"]["braintrust.attachments"]
+                .as_array()
+                .and_then(|items| items.first())
+        })
+        .expect("uploaded prompt image");
+    assert_eq!(
+        world
+            .uploaded_attachment(attachment["key"].as_str().unwrap())
+            .as_deref(),
+        Some(image.as_slice())
+    );
+
     let managed_turn_id = rows
         .iter()
-        .find(|row| row_contains(row, &["Turn 1", "say hello", "data:image/png;base64,"]))
+        .find(|row| row_contains(row, &["Turn 1", "say hello", "braintrust_attachment"]))
         .unwrap()["id"]
         .as_str()
         .unwrap()
@@ -946,14 +1085,14 @@ async fn opencode_v2_session_emits_traces() {
                 })
                 .expect("image tool result", |row| {
                     row["span_attributes"]["type"] == "tool"
-                        && row["output"].to_string().contains("image_url")
+                        && row["output"].to_string().contains("braintrust_attachment")
                         && row["output"].to_string().contains("image/png")
                 })
                 .expect("model input with tool image", |row| {
                     row["span_attributes"]["type"] == "llm"
                         && row["input"].to_string().contains("image tool marker")
                         && row["input"].to_string().contains("image/png")
-                        && row["input"].to_string().contains("image_url")
+                        && row["input"].to_string().contains("braintrust_attachment")
                 }),
         )
         .await;
@@ -963,7 +1102,7 @@ async fn opencode_v2_session_emits_traces() {
             .any(|row| row["span_attributes"]["type"] == "llm"
                 && row["input"].to_string().contains("image tool marker")
                 && row["input"].to_string().contains("image/png")
-                && row["input"].to_string().contains("image_url")),
+                && row["input"].to_string().contains("braintrust_attachment")),
         "model input lost tool image: {image_rows:?}"
     );
 }

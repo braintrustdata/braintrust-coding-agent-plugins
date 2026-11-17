@@ -5,12 +5,14 @@
 //! and an op is deleted when every route has passed it.
 use super::store::{json, json_or_null, read_batch, select, Json, One, SessionStorage, NOW_MS};
 use crate::{
+    attachments::Attachment,
     pipeline::live::{Multiplexer, Receiver, Record, SharedOp, BYTE_BUDGET, WINDOW},
     translate::{OriginSnapshot, SinkFields, SpanOp, SpanRow, SpanType},
     wire::{SessionConfig, SessionRoute},
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::watch;
 
@@ -84,6 +86,63 @@ pub(super) fn decode_roots(bytes: &[u8]) -> anyhow::Result<BTreeMap<String, Vec<
             Ok((id, ops.collect::<anyhow::Result<_>>()?))
         })
         .collect()
+}
+
+/// The op as stored, with its attachments' bytes moved out: storage keeps one
+/// copy of each attachment however many ops reference it. Inline media in the
+/// op's input and output are captured as attachments first.
+pub(super) fn detach_attachments(op: &mut SpanOp) -> anyhow::Result<(Vec<u8>, Vec<Attachment>)> {
+    let row = op.row_mut();
+    for value in [&mut row.input, &mut row.output].into_iter().flatten() {
+        crate::attachments::capture(value, &mut row.attachments);
+    }
+    for attachment in &row.attachments {
+        anyhow::ensure!(
+            format!("{:x}", Sha256::digest(&attachment.data)) == attachment.digest,
+            "attachment digest does not match captured bytes"
+        );
+    }
+    let mut stored = op.clone();
+    let blobs = stored
+        .row_mut()
+        .attachments
+        .iter_mut()
+        .map(|attachment| Attachment {
+            data: std::mem::take(&mut attachment.data),
+            ..attachment.clone()
+        })
+        .collect();
+    Ok((StoredOp::encode(&stored)?, blobs))
+}
+
+/// Record that the op at `position` references each of `blobs`. A blob is
+/// deleted with the last op that references it.
+pub(super) fn store_attachments(
+    db: &Connection,
+    position: u64,
+    blobs: &[Attachment],
+) -> anyhow::Result<()> {
+    for blob in blobs {
+        db.execute(
+            "INSERT OR IGNORE INTO attachment_blobs(digest,data,refs) VALUES (?,?,0)",
+            params![blob.digest, blob.data],
+        )?;
+        db.execute(
+            "INSERT OR IGNORE INTO operation_attachments(position,digest) VALUES (?,?)",
+            params![position, blob.digest],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_attachments(db: &Connection, mut op: SpanOp) -> anyhow::Result<SpanOp> {
+    for attachment in &mut op.row_mut().attachments {
+        attachment.data = db.one(
+            "SELECT data FROM attachment_blobs WHERE digest=?",
+            [&attachment.digest],
+        )?;
+    }
+    Ok(op)
 }
 
 /// Metadata needed to restore correlation and provenance without retaining
@@ -269,15 +328,27 @@ impl SessionStorage {
                 db,
                 "SELECT position,value FROM ops WHERE position>? ORDER BY position",
                 [after],
-                1,
                 budget,
                 window,
-                |row, value| {
-                    Ok(Record {
-                        position: row.get(0)?,
-                        op: SharedOp::new(StoredOp::decode(value)?),
-                        bytes: value.len(),
-                    })
+                |row| {
+                    let value = row.get_ref(1)?.as_blob()?;
+                    let op = load_attachments(db, StoredOp::decode(value)?)?;
+                    let size = op
+                        .row()
+                        .attachments
+                        .iter()
+                        .fold(value.len(), |size, attachment| {
+                            size.saturating_add(attachment.data.len())
+                        });
+                    let position = row.get(0)?;
+                    Ok((
+                        size,
+                        Record {
+                            position,
+                            op: SharedOp::new(op),
+                            bytes: size,
+                        },
+                    ))
                 },
             )
         })

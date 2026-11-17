@@ -2,7 +2,10 @@
 //! collection, and the single row that records how far each has progressed.
 //! Everything that spans both collections, such as handing an input's
 //! translation over or deciding the session owes nothing, lives here.
-use super::span_ops::{decode_roots, encode_roots, prune, save_metadata, StoredOp, Translated};
+use super::span_ops::{
+    decode_roots, detach_attachments, encode_roots, prune, save_metadata, store_attachments,
+    Translated,
+};
 use super::store::{select, One, SessionStorage, NOW_MS};
 use crate::pipeline::live::{Record, SharedOp};
 use crate::translate::SpanOp;
@@ -152,11 +155,17 @@ impl SessionStorage {
     /// continuation, and remove the consumed events through `input`. Routes
     /// then receive the original op instances. An input that is already
     /// handed over is left unchanged. Returns the published tail.
-    pub async fn commit_translation(&self, translated: Translated) -> anyhow::Result<u64> {
+    ///
+    /// Inline media become attachments: routes receive them with their bytes,
+    /// and storage keeps one copy of each until no op references it.
+    pub async fn commit_translation(&self, mut translated: Translated) -> anyhow::Result<u64> {
         let encoded = translated
             .ops
-            .iter()
-            .map(|op| Ok((StoredOp::encode(op)?, super::metadata_only(op))))
+            .iter_mut()
+            .map(|op| {
+                let (value, blobs) = detach_attachments(op)?;
+                Ok((value, blobs, super::metadata_only(op)))
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let roots = encode_roots(&translated.roots)?;
         let (input, observation, state) =
@@ -171,11 +180,15 @@ impl SessionStorage {
                     return Ok((tail, Vec::new()));
                 }
                 let mut positions = Vec::with_capacity(encoded.len());
-                for (value, metadata) in encoded {
+                for (value, blobs, metadata) in encoded {
                     save_metadata(tx, &metadata, observation)?;
-                    let bytes = value.len();
+                    let bytes = blobs.iter().fold(value.len(), |bytes, blob| {
+                        bytes.saturating_add(blob.data.len())
+                    });
                     tx.execute("INSERT INTO ops(value) VALUES (?)", [value])?;
-                    positions.push((tx.last_insert_rowid() as u64, bytes));
+                    let position = tx.last_insert_rowid() as u64;
+                    store_attachments(tx, position, &blobs)?;
+                    positions.push((position, bytes));
                 }
                 let new_tail = positions.last().map_or(tail, |(position, _)| *position);
                 if !positions.is_empty() {

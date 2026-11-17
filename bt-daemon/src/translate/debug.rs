@@ -50,6 +50,7 @@ impl AgentTranslator for DebugTranslator {
         if !self.root_emitted {
             self.root_emitted = true;
             ops.push(SpanOp::Insert(SpanRow {
+                attachments: Vec::new(),
                 span_id: self.root_span_id.clone(),
                 root_span_id: self.root_span_id.clone(),
                 parent_span_ids: Vec::new(),
@@ -75,6 +76,7 @@ impl AgentTranslator for DebugTranslator {
         self.event_seq += 1;
         let span_id = ids::span_id(&ctx.session_id, &format!("event:{seq}"));
         ops.push(SpanOp::Insert(SpanRow {
+            attachments: Vec::new(),
             span_id,
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: vec![self.root_span_id.clone()],

@@ -11,10 +11,11 @@ use std::{
 };
 use weak_table::WeakValueHashMap;
 
-/// Schema 1-6 belong to the original SpanOp channel. Schema 7 adds the event
-/// collection, replacing NDJSON capture, and one session row that makes each
-/// event-to-SpanOp handoff a single transaction.
-pub(super) const SCHEMA: u32 = 7;
+/// Schema 1-7 belong to the original SpanOp channel; 7 added attachment
+/// blobs. Schema 8 adds the event collection, replacing NDJSON capture, and
+/// one session row that makes each event-to-SpanOp handoff a single
+/// transaction.
+pub(super) const SCHEMA: u32 = 8;
 
 /// The current time in milliseconds, as SQL.
 pub(super) const NOW_MS: &str = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
@@ -283,29 +284,28 @@ pub(super) fn touch(tx: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Read records in order until they reach `budget` bytes or `window` elapses,
-/// always returning at least one. Column `value` of `sql` holds each record's
-/// encoded bytes; `decode` builds the record from its row.
+/// always returning at least one. `decode` builds each record from its row
+/// and reports its size in bytes.
 pub(super) fn read_batch<R>(
     db: &Connection,
     sql: &str,
     params: impl Params,
-    value: usize,
     budget: usize,
     window: std::time::Duration,
-    mut decode: impl FnMut(&rusqlite::Row<'_>, &[u8]) -> anyhow::Result<R>,
+    mut decode: impl FnMut(&rusqlite::Row<'_>) -> anyhow::Result<(usize, R)>,
 ) -> anyhow::Result<Vec<R>> {
     let mut statement = db.prepare_cached(sql)?;
     let mut rows = statement.query(params)?;
     let started = std::time::Instant::now();
     let mut records = Vec::new();
-    let mut bytes = 0;
+    let mut bytes: usize = 0;
     while let Some(row) = rows.next()? {
-        let encoded = row.get_ref(value)?.as_blob()?;
-        if !records.is_empty() && bytes + encoded.len() > budget {
+        let (size, record) = decode(row)?;
+        if !records.is_empty() && bytes.saturating_add(size) > budget {
             break;
         }
-        bytes += encoded.len();
-        records.push(decode(row, encoded)?);
+        bytes = bytes.saturating_add(size);
+        records.push(record);
         if bytes >= budget || started.elapsed() >= window {
             break;
         }

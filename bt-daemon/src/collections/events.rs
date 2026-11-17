@@ -274,15 +274,15 @@ impl EventReader {
                         db,
                         "SELECT id,control,value FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
                         params![after, through, READ_RECORDS],
-                        2,
                         READ_BYTES,
                         std::time::Duration::MAX,
-                        |row, value| {
+                        |row| {
                             let stored = Stored {
                                 control: row.get(1)?,
-                                value: value.to_vec(),
+                                value: row.get(2)?,
                             };
-                            Ok((row.get(0)?, EventRecord::try_from(&stored)))
+                            let size = stored.value.len();
+                            Ok((size, (row.get(0)?, EventRecord::try_from(&stored))))
                         },
                     )
                 })

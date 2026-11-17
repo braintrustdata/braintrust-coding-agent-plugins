@@ -27,6 +27,10 @@ review URL is not a verified install-time default.
 
 The sections below describe optional tracing setup only.
 
+Images and inline files available in Codex transcripts are uploaded as Braintrust
+attachments in turn inputs, LLM inputs, and tool outputs. Hosted file IDs remain
+references when the transcript does not include the file bytes.
+
 ## Quickstart
 
 Install Codex and the

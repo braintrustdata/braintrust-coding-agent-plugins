@@ -10,6 +10,7 @@
 //! The `cli` feature only gates the standalone binary and its logging
 //! subscriber.
 
+pub mod attachments;
 pub mod paths;
 
 mod agents;
@@ -19,6 +20,7 @@ mod codex_hooks;
 mod collections;
 mod command_output;
 mod correlation;
+mod daemon_log;
 mod dispatch;
 mod env;
 mod hook;
@@ -51,6 +53,12 @@ pub use args::{
     HookArgs, ImportArgs, ImportSource, ParentObjectType, RunArgs, RunHookCommand, RunSource,
     ServeArgs, StatusArgs,
 };
+/// Install the daemon's logging: JSON to `daemon.log` in `data_dir` and plain
+/// text to standard error, each with its own level and both rotated by size.
+/// Returns `false` if the process already has a global subscriber.
+pub fn init_daemon_logging(data_dir: &std::path::Path, verbose: bool) -> bool {
+    daemon_log::init(data_dir, verbose)
+}
 pub use client::{
     flush_managed_run, flush_session, forward_envelope, run_status, shutdown_daemon, HostInfo,
 };
