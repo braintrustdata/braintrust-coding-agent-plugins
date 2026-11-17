@@ -211,11 +211,18 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b62ddb9cb1ec0a098ad4bbf9344d0713fa193ae1a80af55febcff2627b6a00c1"
 dependencies = [
- "futures-core",
  "getrandom 0.2.17",
  "instant",
- "pin-project-lite",
  "rand 0.8.7",
+]
+
+[[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
  "tokio",
 ]
 
@@ -274,7 +281,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b47a43cc568d5d837aa74296489eb1a64ef89593#b47a43cc568d5d837aa74296489eb1a64ef89593"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=f3afd198a14daa571eae0f16c6dc807c26c078c8#f3afd198a14daa571eae0f16c6dc807c26c078c8"
 dependencies = [
  "anyhow",
  "backoff",
@@ -326,15 +333,15 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b47a43cc568d5d837aa74296489eb1a64ef89593#b47a43cc568d5d837aa74296489eb1a64ef89593"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=f3afd198a14daa571eae0f16c6dc807c26c078c8#f3afd198a14daa571eae0f16c6dc807c26c078c8"
 dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
- "backoff",
+ "backon",
  "base64 0.23.1",
  "bon",
- "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b47a43cc568d5d837aa74296489eb1a64ef89593)",
+ "braintrust-api-client 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=f3afd198a14daa571eae0f16c6dc807c26c078c8)",
  "bytes",
  "chrono",
  "crossbeam-utils",
