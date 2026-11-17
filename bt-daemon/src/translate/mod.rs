@@ -25,7 +25,7 @@ mod pi;
 pub(crate) use claude::successful_subagent_handback_message;
 pub(crate) use pi::request_config as pi_request_config;
 mod origins;
-mod recent;
+pub(crate) mod recent;
 mod state;
 pub(crate) use origins::WeakOrigins;
 pub(crate) use state::SinkFields;

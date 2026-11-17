@@ -17,7 +17,7 @@ pub(super) const RECENT_ID_CAPACITY: usize = 1_024;
     serialize = "K: serde::Serialize",
     deserialize = "K: serde::Deserialize<'de> + Eq + Hash"
 ))]
-pub(super) struct RecentSet<K> {
+pub(crate) struct RecentSet<K> {
     values: HashSet<K>,
     order: VecDeque<K>,
     capacity: usize,
@@ -34,11 +34,11 @@ impl<K> Default for RecentSet<K> {
 }
 
 impl<K: Eq + Hash + Clone> RecentSet<K> {
-    pub(super) fn contains(&self, value: &K) -> bool {
+    pub(crate) fn contains(&self, value: &K) -> bool {
         self.values.contains(value)
     }
 
-    pub(super) fn insert(&mut self, value: K) -> bool {
+    pub(crate) fn insert(&mut self, value: K) -> bool {
         if !self.values.insert(value.clone()) {
             return false;
         }

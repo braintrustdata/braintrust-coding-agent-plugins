@@ -159,6 +159,7 @@ impl SinkFactory for BraintrustSinkFactory {
             creds: None,
             urls: None,
             client: None,
+            attachment_uploads: None,
             open: HashMap::new(),
             pending_roots: HashMap::new(),
             delivered_root: None,
@@ -184,6 +185,13 @@ impl Creds {
     }
 }
 
+/// Only completed keys are retained, never attachment bytes. This bounded
+/// optimization may miss after eviction/restart; re-uploading remains safe.
+struct AttachmentUploads {
+    backend: braintrust_api_client::backend::BackendClient,
+    completed: crate::translate::recent::RecentSet<String>,
+}
+
 struct BraintrustSink {
     cache: Arc<ClientCache>,
     default_api_url: Option<String>,
@@ -194,6 +202,7 @@ struct BraintrustSink {
     urls: Option<(String, String)>,
     /// The client for `urls`, obtained from the cache on first emit.
     client: Option<Arc<CachedClient>>,
+    attachment_uploads: Option<AttachmentUploads>,
     /// Live span handles keyed by deterministic span id, so a later op (e.g.
     /// setting `end`) merges onto the same row the SDK already knows.
     open: HashMap<String, SpanHandle<BraintrustClient>>,
@@ -366,14 +375,23 @@ impl BraintrustSink {
                 .urls
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing attachment backend"))?;
-            let backend = braintrust_api_client::backend::BackendClient::new(
-                api,
-                app,
-                &creds.token,
-                &creds.org_id,
-                creds.org_name.as_deref().unwrap_or_default(),
-                concat!("bt-daemon/", env!("CARGO_PKG_VERSION")),
-            )?;
+            if self.attachment_uploads.is_none() {
+                self.attachment_uploads = Some(AttachmentUploads {
+                    backend: braintrust_api_client::backend::BackendClient::new(
+                        api,
+                        app,
+                        &creds.token,
+                        &creds.org_id,
+                        creds.org_name.as_deref().unwrap_or_default(),
+                        concat!("bt-daemon/", env!("CARGO_PKG_VERSION")),
+                    )?,
+                    completed: Default::default(),
+                });
+            }
+            let uploads = self
+                .attachment_uploads
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("missing attachment upload client"))?;
             use braintrust_api_client::backend::extensions::AttachmentRequest;
             let mut references = HashMap::new();
             for attachment in &row.attachments {
@@ -383,17 +401,22 @@ impl BraintrustSink {
                 )
                 .to_string();
                 let reference = json!({"type":"braintrust_attachment", "key":key, "filename":attachment.filename, "content_type":attachment.content_type});
-                backend
-                    .upload_attachment(
-                        &AttachmentRequest::new(
-                            key,
-                            attachment.filename.clone(),
-                            attachment.content_type.clone(),
-                            creds.org_id.clone(),
-                        ),
-                        attachment.data.clone(),
-                    )
-                    .await?;
+                if !uploads.completed.contains(&key) {
+                    uploads
+                        .backend
+                        .upload_attachment(
+                            &AttachmentRequest::new(
+                                key.clone(),
+                                attachment.filename.clone(),
+                                attachment.content_type.clone(),
+                                creds.org_id.clone(),
+                            ),
+                            attachment.data.clone(),
+                        )
+                        .await?;
+                    // A failed PUT or status acknowledgment must remain retryable.
+                    uploads.completed.insert(key);
+                }
                 references.insert(attachment.digest.clone(), reference);
             }
             let mut row = row.clone();
@@ -474,6 +497,7 @@ impl Sink for BraintrustSink {
                 .is_some_and(|old| !old.same_as(&next_creds))
         {
             self.open.clear();
+            self.attachment_uploads = None;
         }
         self.creds = Some(next_creds);
     }

@@ -268,7 +268,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=7bce1223fd46bbfc7993fdd38558ed8f05d9782f#7bce1223fd46bbfc7993fdd38558ed8f05d9782f"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=cb231d5785987a3143361cc846227f3ac758ba74#cb231d5785987a3143361cc846227f3ac758ba74"
 dependencies = [
  "anyhow",
  "backoff",

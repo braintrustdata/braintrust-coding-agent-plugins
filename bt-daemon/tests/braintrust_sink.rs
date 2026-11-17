@@ -1046,9 +1046,24 @@ async fn attachments_upload_before_span_and_failures_remain_retryable() {
     Mock::given(method("PUT"))
         .and(path("/object"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(1)
+        .expect(2)
         .mount(&storage)
         .await;
+    Mock::given(method("POST"))
+        .and(path("/attachment/status"))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // Successful bytes alone must not populate the cache: a rejected completion
+    // acknowledgment still blocks the operation and must be retried.
+    assert!(sink.emit(std::slice::from_ref(&op)).await.is_err());
+    assert!(logs3_rows(&server).await.is_empty());
+    sink.emit(std::slice::from_ref(&op)).await.unwrap();
+    // Retrying a delivered operation and seeing the same image in later model
+    // history must not transfer its bytes again.
+    sink.configure(&config);
     sink.emit(&[op]).await.unwrap();
     sink.flush().await.unwrap();
     let rows = logs3_rows(&server).await;
@@ -1059,4 +1074,108 @@ async fn attachments_upload_before_span_and_failures_remain_retryable() {
     assert_eq!(requests[0].body, b"pdf-bytes");
     assert!(!requests[0].headers.contains_key("authorization"));
     assert_eq!(requests[0].headers["x-test"], "signed");
+}
+
+#[tokio::test]
+async fn attachment_upload_cache_resets_on_credentials_organization_and_backend_changes() {
+    let first = mock_backend().await;
+    let second = mock_backend().await;
+    let storage = MockServer::start().await;
+    for server in [&first, &second] {
+        Mock::given(method("POST"))
+            .and(path("/attachment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"signedUrl":format!("{}/object",storage.uri()),"headers":{}}),
+            ))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/attachment/status"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+    Mock::given(method("PUT"))
+        .and(path("/object"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(4)
+        .mount(&storage)
+        .await;
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut sink = factory.create("cache", "test").unwrap();
+    let mut config = session_config(&first.uri());
+    config.auth.org_id = Some("org-one".into());
+    let attachment = bt_daemon::attachments::Attachment::new(
+        "first.pdf".into(),
+        "application/pdf".into(),
+        b"bytes".to_vec(),
+    );
+    let mut span = row(
+        "cache-span",
+        "cache-span",
+        &[],
+        "Cache",
+        SpanType::Task,
+        1,
+        Some(2),
+    );
+    span.input = Some(json!({"type":"_bt_attachment","digest":attachment.digest}));
+    span.attachments.push(attachment);
+    let mut op = SpanOp::Insert(span);
+    sink.configure(&config);
+    sink.emit(std::slice::from_ref(&op)).await.unwrap();
+    sink.flush().await.unwrap();
+    // Identical credentials and key retain the successful upload; display
+    // metadata is still taken from this operation rather than from the cache.
+    let (SpanOp::Insert(span) | SpanOp::Merge(span)) = &mut op;
+    span.attachments[0].filename = "second.pdf".into();
+    sink.configure(&config);
+    sink.emit(std::slice::from_ref(&op)).await.unwrap();
+    sink.flush().await.unwrap();
+    assert_eq!(storage.received_requests().await.unwrap().len(), 1);
+    assert!(logs3_rows(&first)
+        .await
+        .iter()
+        .any(|row| row["input"]["filename"] == "second.pdf"));
+    config.auth.token = "rotated-token".into();
+    sink.configure(&config);
+    sink.emit(std::slice::from_ref(&op)).await.unwrap();
+    sink.flush().await.unwrap();
+    config.auth.org_id = Some("org-two".into());
+    sink.configure(&config);
+    sink.emit(std::slice::from_ref(&op)).await.unwrap();
+    sink.flush().await.unwrap();
+    config.auth.api_url = Some(second.uri());
+    config.auth.app_url = Some(second.uri());
+    sink.configure(&config);
+    sink.emit(std::slice::from_ref(&op)).await.unwrap();
+    sink.flush().await.unwrap();
+    let slots = first
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/attachment")
+        .collect::<Vec<_>>();
+    assert_eq!(slots.len(), 3);
+    assert_eq!(slots[1].headers["authorization"], "Bearer rotated-token");
+    let keys = slots
+        .iter()
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap()["key"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(keys[0], keys[1]);
+    assert_ne!(keys[1], keys[2]);
+    let slots = second
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/attachment")
+        .collect::<Vec<_>>();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].headers["authorization"], "Bearer rotated-token");
+    assert_ne!(
+        serde_json::from_slice::<Value>(&slots[0].body).unwrap()["key"],
+        keys[2]
+    );
 }
