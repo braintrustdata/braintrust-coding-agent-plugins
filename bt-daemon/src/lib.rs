@@ -83,8 +83,8 @@ pub use server::{
 pub use setup::{run_disable, run_enable, run_setup, run_uninstall, run_update};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
 pub use trace_command::{
-    DisableArgs, DoctorAgent, DoctorArgs, EnableArgs, SetupAgent, SetupArgs, StopArgs, TraceArgs,
-    TraceCommand, UpdateArgs,
+    DisableArgs, DoctorAgent, DoctorArgs, EnableArgs, SettingsScope, SetupAgent, SetupArgs,
+    StopArgs, TraceArgs, TraceCommand, UpdateArgs,
 };
 pub use trace_runtime::{
     run_trace, HostRouteSelection, RouteRequirements, TraceHostContext, TraceHostServices,

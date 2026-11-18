@@ -124,3 +124,5 @@ bt trace status
 bt trace update cursor
 bt trace disable cursor
 ```
+
+For repository-scoped tracing, see the [daemon configuration guide](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/bt-daemon/README.md#project-scoped-tracing).

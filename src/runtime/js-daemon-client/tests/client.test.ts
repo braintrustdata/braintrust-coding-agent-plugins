@@ -95,15 +95,6 @@ describe("resolveDaemonTraceSettings", () => {
     assert.equal(persistent.route.auth.profile, "global")
   })
 
-  test("applies a persistent pause while letting managed runs override it", () => {
-    const paused = { ...persistent, tracing_disabled: true }
-    assert.equal(resolveDaemonTraceSettings(paused, {}).trace_to_braintrust, false)
-    const invocation = { trace_to_braintrust: true, route: persistent.route }
-    assert.deepEqual(resolveDaemonTraceSettings(paused, { BT_TRACE_INVOCATION_SETTINGS: JSON.stringify(invocation) }), invocation)
-    assert.deepEqual(resolveDaemonTraceSettings(paused, { BT_TRACE_INVOCATION_SETTINGS: "{" }), { trace_to_braintrust: false })
-    assert.equal(persistent.trace_to_braintrust, true)
-  })
-
   test("does not fall back when invocation settings are malformed", () => {
     assert.deepEqual(
       resolveDaemonTraceSettings(persistent, { BT_TRACE_INVOCATION_SETTINGS: "{" }),

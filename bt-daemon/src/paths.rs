@@ -25,6 +25,43 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Locate a repository root from the invocation directory.
+pub(crate) fn repository_root(start: &Path) -> anyhow::Result<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project scope requires a Git repository (starting at {})",
+                start.display()
+            )
+        })
+}
+
+/// Agent-local project configuration directories with supported project capture.
+pub(crate) fn project_config_dir(source: &str) -> Option<&'static str> {
+    match source {
+        "claude" | "claude-code" => Some(".claude"),
+        "cursor" => Some(".cursor"),
+        "opencode" => Some(".opencode"),
+        "pi" => Some(".pi"),
+        "codex" => Some(".codex"),
+        "muse" | "muse-code" => Some(".muse"),
+        "grok" => Some(".grok"),
+        "antigravity" => Some(".gemini"),
+        _ => None,
+    }
+}
+
+pub(crate) fn project_settings_path(source: &str, start: &Path) -> anyhow::Result<PathBuf> {
+    let directory = project_config_dir(source)
+        .ok_or_else(|| anyhow::anyhow!("project scope is not supported for {source}"))?;
+    Ok(repository_root(start)?
+        .join(directory)
+        .join("braintrust.json"))
+}
+
 /// Resolve the socket path: explicit `override` → `$BRAINTRUST_DAEMON_SOCKET` →
 /// `$XDG_RUNTIME_DIR/braintrust/daemon.sock` → `~/.braintrust/run/daemon.sock`.
 pub fn socket_path(explicit: Option<&Path>) -> PathBuf {

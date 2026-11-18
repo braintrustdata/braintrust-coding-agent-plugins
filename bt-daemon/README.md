@@ -58,6 +58,29 @@ or `bt trace doctor <agent>` for configuration, authentication, and recent
 session diagnostics. Hook exit codes can be observed by the caller while the
 coding agent decides whether to continue its turn.
 
+## Project-scoped tracing
+
+First install the integration with `bt trace setup <agent>`. To configure a Git
+repository independently, run these commands from anywhere inside it:
+
+```bash
+bt trace setup claude --scope project
+bt trace disable claude --scope project
+bt trace enable claude --scope project
+```
+
+Project setup writes `.claude/braintrust.json` at the repository root. Other
+agents use their own project configuration directory. The project file initially
+contains only `trace_to_braintrust`; explicitly supplied project, profile,
+organization, tags, and metadata settings are also saved. Missing fields inherit
+the user configuration. Project files cannot select executable span plugins.
+
+A managed `bt trace run` takes precedence over project settings, which take
+precedence over user settings. When no setting enables tracing, it is disabled.
+Project enable and disable change only the project file and do not install an
+adapter. For multi-root Cursor and Antigravity workspaces, the first root with
+a project file supplies the settings. `bt trace doctor` reports user settings.
+
 ## Per-agent plugin settings
 
 Each coding agent reads an independent non-credential `braintrust.json` file:

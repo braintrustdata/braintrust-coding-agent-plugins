@@ -22,10 +22,10 @@ export interface PluginConfig {
   org_name?: string;
   project?: string;
   trace_to_braintrust?: boolean;
-  tracing_disabled?: boolean;
   enable_tools?: boolean;
   debug?: boolean;
   additional_metadata?: Record<string, unknown>;
+  tags?: string[];
   route?: DaemonSessionRoute;
 }
 
@@ -107,14 +107,14 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
       ...(defaults.orgName ? { org_name: defaults.orgName } : {}),
     },
   };
-  if (!pluginConfig?.route || pluginConfig.project !== undefined) {
+  if (!pluginConfig?.route) {
     persistentRoute.destination = { type: "project_logs", project_name: defaults.projectName };
   }
   if (defaults.additionalMetadata)
     persistentRoute.additional_metadata = defaults.additionalMetadata;
+  if (pluginConfig?.tags !== undefined) persistentRoute.tags = pluginConfig.tags;
   const traceSettings = resolveDaemonTraceSettings({
     trace_to_braintrust: defaults.tracingEnabled,
-    tracing_disabled: pluginConfig?.tracing_disabled,
     route: persistentRoute,
   });
   const route = traceSettings.route ?? persistentRoute;

@@ -1,7 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type DaemonSessionRoute, resolveDaemonTraceSettings } from "./runtime/daemon-client.ts";
+import {
+  type DaemonSessionRoute,
+  projectSettingsPath,
+  resolveDaemonTraceSettings,
+} from "./runtime/daemon-client.ts";
 import { runningPiPackage } from "./pi-package.ts";
 
 export interface PiConfig {
@@ -76,6 +80,9 @@ function applyConfig(config: PiConfig, source: ConfigRecord | undefined): void {
   config.showTraceLink = boolean(source.show_trace_link) ?? config.showTraceLink;
 
   const additionalMetadata = record(source.additional_metadata);
+  if (Array.isArray(source.tags) && source.tags.every((tag) => typeof tag === "string")) {
+    config.route.tags = source.tags;
+  }
   if (profile || orgName) {
     config.route.auth = {
       ...config.route.auth,
@@ -103,14 +110,24 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
 
   const userConfig = readConfig(join(homedir(), ".pi", "agent", "braintrust.json"));
   applyConfig(config, userConfig);
-  applyConfig(config, readConfig(join(cwd, PROJECT_CONFIG_DIR_NAME, "braintrust.json")));
+  const projectConfig =
+    readConfig(projectSettingsPath(cwd, PROJECT_CONFIG_DIR_NAME)) ??
+    (PROJECT_CONFIG_DIR_NAME === ".pi" ? undefined : readConfig(projectSettingsPath(cwd, ".pi")));
+  if (projectConfig) {
+    // Repository settings must not select executable span plugins.
+    const { route: _route, ...safeProjectConfig } = projectConfig;
+    if (nonEmptyString(safeProjectConfig.profile) && config.route.auth) {
+      delete config.route.auth.profile_id;
+      config.route.auth.source = "saved_profile";
+    }
+    applyConfig(config, safeProjectConfig);
+  }
 
   config.showUi = boolean(process.env.BRAINTRUST_SHOW_UI) ?? config.showUi;
   config.showTraceLink = boolean(process.env.BRAINTRUST_SHOW_TRACE_LINK) ?? config.showTraceLink;
 
   const traceSettings = resolveDaemonTraceSettings({
     trace_to_braintrust: config.enabled,
-    tracing_disabled: userConfig?.tracing_disabled === true,
     route: config.route,
   });
   config.enabled = traceSettings.trace_to_braintrust === true;

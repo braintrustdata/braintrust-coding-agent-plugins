@@ -97,7 +97,7 @@ describe("loadConfig", () => {
       showUi: true,
       showTraceLink: false,
       route: {
-        auth: { profile: "project", org_name: "global-org" },
+        auth: { profile: "project", org_name: "global-org", source: "saved_profile" },
         destination: { type: "project_logs", project_name: "project-project" },
         flush_mode: "flush_on_turn_end",
         additional_metadata: { source: "global" },
@@ -162,12 +162,12 @@ describe("loadConfig", () => {
     expect(loadConfig(cwd)).toEqual(DEFAULT_CONFIG);
   });
 
-  it("honors an explicit user pause even when a project enables tracing", () => {
-    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
-      trace_to_braintrust: false,
-      tracing_disabled: true,
-    });
+  it("lets project tracing override the user default, and managed runs override both", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), { trace_to_braintrust: false });
     writeJson(join(cwd, ".pi", "braintrust.json"), { trace_to_braintrust: true });
+    expect(loadConfig(cwd).enabled).toBe(true);
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), { trace_to_braintrust: true });
+    writeJson(join(cwd, ".pi", "braintrust.json"), { trace_to_braintrust: false });
     expect(loadConfig(cwd).enabled).toBe(false);
     process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
       trace_to_braintrust: true,

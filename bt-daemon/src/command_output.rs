@@ -61,6 +61,7 @@ pub struct SetupCommandOutput {
     pub restart_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration: Option<&'static str>,
+    pub scope: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -200,6 +201,7 @@ impl TraceCommandOutput {
             settings_path: settings_path.into(),
             restart_required: true,
             configuration: None,
+            scope: "user",
         })
     }
 
@@ -214,7 +216,40 @@ impl TraceCommandOutput {
             settings_path: settings_path.into(),
             restart_required: true,
             configuration: Some("reused"),
+            scope: "user",
         })
+    }
+
+    pub fn project_setup(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::setup(source, display_name, settings_path).with_scope("project")
+    }
+
+    pub(crate) fn with_scope(mut self, scope: &'static str) -> Self {
+        match &mut self {
+            Self::Setup(output)
+            | Self::Enable(output)
+            | Self::Disable(output)
+            | Self::Uninstall(output) => output.scope = scope,
+            _ => {}
+        }
+        self
+    }
+
+    pub(crate) fn into_enable(mut self, configuration: &'static str) -> Self {
+        match &mut self {
+            Self::Setup(output) | Self::Enable(output) => {
+                output.configuration = Some(configuration)
+            }
+            _ => return self,
+        }
+        match self {
+            Self::Setup(output) => Self::Enable(output),
+            _ => self,
+        }
     }
 
     pub fn stop(running: bool, stopped: bool) -> Self {
@@ -236,6 +271,7 @@ impl TraceCommandOutput {
             settings_path: settings_path.into(),
             restart_required: true,
             configuration: None,
+            scope: "user",
         })
     }
 
@@ -250,6 +286,7 @@ impl TraceCommandOutput {
             settings_path: settings_path.into(),
             restart_required: true,
             configuration: None,
+            scope: "user",
         })
     }
 
@@ -336,8 +373,11 @@ impl TraceCommandOutput {
                 Ok(rendered)
             }
             Self::Enable(setup) if setup.configuration.is_some_and(|value| value != "reused") => Ok(format!(
-                "Braintrust tracing configuration {} for {} in {}.\nRestart the coding agent to load the tracing plugin.",
-                setup.configuration.unwrap_or_default(), setup.display_name, setup.settings_path.display()
+                "Braintrust tracing configuration {} for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
+                setup.configuration.unwrap_or_default(), setup.display_name, setup.scope, setup.settings_path.display()
+            )),
+            Self::Setup(setup) if setup.scope == "project" => Ok(format!(
+                "Project tracing settings for {} were written to {}.", setup.display_name, setup.settings_path.display()
             )),
             Self::Setup(setup) => Ok(format!(
                 "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.",
@@ -345,12 +385,13 @@ impl TraceCommandOutput {
                 setup.settings_path.display()
             )),
             Self::Enable(enable) => Ok(format!(
-                "Braintrust tracing is enabled for {} using the existing configuration in {}.\nRestart the coding agent to apply the change.",
-                enable.display_name, enable.settings_path.display()
+                "Braintrust tracing is enabled for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
+                enable.display_name, enable.scope, enable.settings_path.display()
             )),
             Self::Disable(disable) => Ok(format!(
-                "Braintrust tracing is disabled for {} in {}.\nRestart the coding agent to apply the change.",
+                "Braintrust tracing is disabled for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
                 disable.display_name,
+                disable.scope,
                 disable.settings_path.display()
             )),
             Self::Uninstall(uninstall) => Ok(format!(

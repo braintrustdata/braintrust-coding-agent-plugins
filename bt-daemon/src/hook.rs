@@ -105,11 +105,13 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
         if args.managed_context.is_some() {
             return run_hook_with_route(args, route, host).await;
         }
-        let settings = settings::AgentSettings::load_for_hook(&args.source)?;
+        let payload = read_project_hook_payload(&args)?;
+        let settings =
+            settings::AgentSettings::load_for_hook_payload(&args.source, payload.as_ref())?;
         if !settings.tracing_enabled() {
             return Ok(());
         }
-        run_hook_with_route(args, settings.route.unwrap_or(route), host).await
+        run_hook_with_payload(args, settings.route.unwrap_or(route), host, payload).await
     }
     .await;
     if let Some(response) = response {
@@ -172,7 +174,39 @@ pub(crate) async fn run_hook_with_route(
     route: SessionRoute,
     host: HostInfo,
 ) -> anyhow::Result<()> {
-    with_hook_capture_timeout(args.capture_timeout_ms, capture_hook(args, route, host)).await
+    run_hook_with_payload(args, route, host, None).await
+}
+
+pub(crate) fn read_project_hook_payload(
+    args: &HookArgs,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    if crate::paths::project_config_dir(&args.source).is_some() {
+        use std::io::Read;
+        let mut raw = String::new();
+        std::io::stdin().read_to_string(&mut raw)?;
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(parse_hook_payload(
+            &raw,
+            args.transcript_path_field.as_deref(),
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) async fn run_hook_with_payload(
+    args: HookArgs,
+    route: SessionRoute,
+    host: HostInfo,
+    payload: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    with_hook_capture_timeout(
+        args.capture_timeout_ms,
+        capture_hook(args, route, host, payload),
+    )
+    .await
 }
 
 pub(crate) async fn with_hook_capture_timeout<T>(
@@ -193,6 +227,7 @@ async fn capture_hook(
     mut args: HookArgs,
     mut route: SessionRoute,
     host: HostInfo,
+    payload: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
     let managed_context = if let Some(path) = &args.managed_context {
         if crate::translate::canonical_source_name(&args.source) != "muse" || !args.managed_run_hook
@@ -212,7 +247,10 @@ async fn capture_hook(
     } else {
         None
     };
-    let mut payload = read_stdin_json(args.transcript_path_field.as_deref())?;
+    let mut payload = match payload {
+        Some(payload) => payload,
+        None => read_stdin_json(args.transcript_path_field.as_deref())?,
+    };
 
     resolve_dynamic_hook_versions(&mut args, &payload);
 

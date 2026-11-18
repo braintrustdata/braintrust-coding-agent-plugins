@@ -94,20 +94,25 @@ impl DoctorAgent {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum SettingsScope {
+    #[default]
+    User,
+    Project,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct SetupArgs {
+    /// Where the tracing settings are stored.
+    #[arg(long, global = true, value_enum, default_value_t = SettingsScope::User)]
+    pub scope: SettingsScope,
     #[command(subcommand)]
     pub agent: SetupAgent,
     /// JSON object persisted in this agent's tracing route and merged into root-span metadata.
-    #[arg(long, global = true, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    #[arg(long, global = true)]
     pub additional_metadata: Option<String>,
     /// Tag applied to each root span. May be repeated or comma-separated.
-    #[arg(
-        long = "tag",
-        global = true,
-        env = "BRAINTRUST_TAGS",
-        value_delimiter = ','
-    )]
+    #[arg(long = "tag", global = true, value_delimiter = ',')]
     pub tags: Vec<String>,
     /// JavaScript span transform to persist for this agent. Repeat to compose
     /// transforms in order.
@@ -117,6 +122,9 @@ pub struct SetupArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct EnableArgs {
+    /// Where the tracing settings are stored.
+    #[arg(long, global = true, value_enum, default_value_t = SettingsScope::User)]
+    pub scope: SettingsScope,
     #[command(subcommand)]
     pub agent: SetupAgent,
     /// JSON object merged into root-span metadata.
@@ -132,6 +140,9 @@ pub struct EnableArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct DisableArgs {
+    /// Where the tracing settings are stored.
+    #[arg(long, global = true, value_enum, default_value_t = SettingsScope::User)]
+    pub scope: SettingsScope,
     #[command(subcommand)]
     pub agent: SetupAgent,
 }
@@ -381,7 +392,8 @@ mod tests {
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Disable(DisableArgs {
-                agent: SetupAgent::Antigravity
+                agent: SetupAgent::Antigravity,
+                ..
             })
         ));
 
@@ -405,9 +417,29 @@ mod tests {
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Disable(DisableArgs {
-                agent: SetupAgent::Grok
+                agent: SetupAgent::Grok,
+                ..
             })
         ));
+    }
+
+    #[test]
+    fn scoped_commands_accept_project_before_or_after_agent() {
+        for command in ["setup", "enable", "disable"] {
+            for args in [
+                vec!["bt", command, "--scope", "project", "claude"],
+                vec!["bt", command, "claude", "--scope", "project"],
+            ] {
+                let parsed = Cli::try_parse_from(args).unwrap();
+                let scope = match parsed.trace.command {
+                    TraceCommand::Setup(args) => args.scope,
+                    TraceCommand::Enable(args) => args.scope,
+                    TraceCommand::Disable(args) => args.scope,
+                    _ => panic!("wrong command"),
+                };
+                assert_eq!(scope, SettingsScope::Project);
+            }
+        }
     }
 
     #[test]
@@ -429,7 +461,8 @@ mod tests {
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Uninstall(DisableArgs {
-                agent: SetupAgent::Pi
+                agent: SetupAgent::Pi,
+                ..
             })
         ));
     }

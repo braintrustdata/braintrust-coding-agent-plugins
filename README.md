@@ -37,7 +37,10 @@ bt trace setup claude --project my-coding-agent
 ```
 
 Replace `claude` with your agent's CLI name below. Restart the agent after
-setup and follow any plugin or hook trust prompts.
+setup and follow any plugin or hook trust prompts. To opt a Git repository
+in or out independently, run `bt trace enable claude --scope project` or
+`bt trace disable claude --scope project` inside it. Project settings override
+user settings; `bt trace run` overrides both.
 
 ## Supported agents
 

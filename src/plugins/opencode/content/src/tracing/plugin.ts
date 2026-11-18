@@ -1,6 +1,6 @@
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import { loadConfig, type PluginConfig } from "../config";
-import { claimManagedTracingInstance } from "../runtime/daemon-client";
+import { claimManagedTracingInstance, projectSettingsPath } from "../runtime/daemon-client";
 import { createDaemonTracingHooks } from "./daemon";
 
 export async function readPluginConfig(input: {
@@ -14,21 +14,54 @@ export async function readPluginConfig(input: {
     const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
     const configPaths = [
       path.join(configHome, "opencode", "braintrust.json"),
-      path.join(input.directory, ".opencode", "braintrust.json"),
+      projectSettingsPath(input.directory, ".opencode"),
     ];
-    let globallyDisabled = false;
     for (const [index, configPath] of configPaths.entries()) {
       try {
         if (fs.existsSync(configPath)) {
           const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as PluginConfig;
-          if (index === 0) globallyDisabled = parsed.tracing_disabled === true;
-          pluginConfig = pluginConfig ? { ...pluginConfig, ...parsed } : parsed;
+          if (index === 0) {
+            pluginConfig = parsed;
+          } else {
+            // Project files cannot select executable span plugins.
+            const { route: _route, ...safe } = parsed;
+            const userRoute = pluginConfig?.route;
+            const auth = userRoute?.auth;
+            const projectAuth =
+              safe.profile || safe.org_name
+                ? {
+                    ...auth,
+                    ...(safe.profile
+                      ? {
+                          source: "saved_profile" as const,
+                          profile_id: undefined,
+                          profile: safe.profile,
+                        }
+                      : {}),
+                    ...(safe.org_name ? { org_name: safe.org_name } : {}),
+                  }
+                : auth;
+            pluginConfig = {
+              ...pluginConfig,
+              ...safe,
+              ...(userRoute
+                ? {
+                    route: {
+                      ...userRoute,
+                      ...(projectAuth ? { auth: projectAuth } : {}),
+                      ...(safe.project
+                        ? { destination: { type: "project_logs", project_name: safe.project } }
+                        : {}),
+                    },
+                  }
+                : {}),
+            };
+          }
         }
       } catch {
         // Malformed optional config is fail-open; continue to the next layer.
       }
     }
-    if (pluginConfig) pluginConfig.tracing_disabled = globallyDisabled;
   } catch {
     // Config loading failed; invocation settings can still enable tracing.
   }

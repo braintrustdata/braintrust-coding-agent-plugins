@@ -16,7 +16,7 @@ pub(crate) mod pi;
 
 use crate::agents::{registrar, Agent};
 use crate::paths;
-use crate::trace_command::{SetupAgent, SetupArgs};
+use crate::trace_command::{SettingsScope, SetupAgent, SetupArgs};
 use crate::wire::SessionRoute;
 use crate::TraceCommandOutput;
 use anyhow::Context;
@@ -60,6 +60,93 @@ pub(crate) fn update_warning(source: &str) -> Option<String> {
         .get(source)
         .is_some_and(|agent| agent.stale());
     stale.then(|| format!("tracing plugin is out of date; run `bt trace update {source}`"))
+}
+
+fn scoped_path(agent: SetupAgent, scope: SettingsScope) -> anyhow::Result<PathBuf> {
+    let source = agent.identity().id;
+    match scope {
+        SettingsScope::User => Ok(paths::agent_settings_path(source, None)),
+        SettingsScope::Project => paths::project_settings_path(source, &std::env::current_dir()?),
+    }
+}
+
+pub(crate) fn run_scoped_toggle(
+    agent: SetupAgent,
+    scope: SettingsScope,
+    enabled: bool,
+) -> anyhow::Result<TraceCommandOutput> {
+    let path = scoped_path(agent, scope)?;
+    let existed = path.exists();
+    common::edit_object(&path, FileAccess::OwnerOnly, |settings, _| {
+        settings.insert("trace_to_braintrust".into(), Value::Bool(enabled));
+        Ok(())
+    })?;
+    let id = agent.identity();
+    Ok((if enabled {
+        let output = TraceCommandOutput::enable(id.id, id.display_name, path);
+        if existed {
+            output
+        } else {
+            output.into_enable("created")
+        }
+    } else {
+        TraceCommandOutput::disable(id.id, id.display_name, path)
+    })
+    .with_scope(match scope {
+        SettingsScope::User => "user",
+        SettingsScope::Project => "project",
+    }))
+}
+
+pub(crate) fn run_project_setup(
+    args: SetupArgs,
+    selection: crate::HostRouteSelection,
+    as_enable: bool,
+) -> anyhow::Result<TraceCommandOutput> {
+    let path = scoped_path(args.agent, SettingsScope::Project)?;
+    let existed = path.exists();
+    write_project_setup_at(&path, &args, &selection)?;
+    let id = args.agent.identity();
+    let output = TraceCommandOutput::project_setup(id.id, id.display_name, path);
+    Ok(if as_enable {
+        output.into_enable(if existed { "updated" } else { "created" })
+    } else {
+        output
+    })
+}
+
+fn write_project_setup_at(
+    path: &Path,
+    args: &SetupArgs,
+    selection: &crate::HostRouteSelection,
+) -> anyhow::Result<()> {
+    if !args.plugin.is_empty() {
+        anyhow::bail!("project configuration cannot select executable span plugins");
+    }
+    common::edit_object(path, FileAccess::OwnerOnly, |settings, _| {
+        settings.insert("trace_to_braintrust".into(), Value::Bool(true));
+        for (key, value) in [
+            ("project", selection.project_name.as_deref()),
+            ("profile", selection.auth.profile.as_deref()),
+            ("org_name", selection.auth.org_name.as_deref()),
+        ] {
+            if let Some(value) = value {
+                settings.insert(key.into(), Value::String(value.to_owned()));
+            }
+        }
+        if let Some(metadata) = args.additional_metadata.as_deref() {
+            let parsed: Value = serde_json::from_str(metadata)?;
+            if !parsed.is_object() {
+                anyhow::bail!("additional metadata must be a JSON object");
+            }
+            settings.insert("additional_metadata".into(), parsed);
+        }
+        if !args.tags.is_empty() {
+            settings.insert("tags".into(), serde_json::to_value(&args.tags)?);
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Install or refresh one agent's published tracing adapter and persist its
@@ -106,9 +193,7 @@ fn saved_setup_at(path: &Path) -> anyhow::Result<bool> {
         let _: SessionRoute = serde_json::from_value(route.clone())
             .with_context(|| format!("invalid tracing route at {}", path.display()))?;
     }
-    Ok(!(object.len() == 2
-        && object.get("trace_to_braintrust") == Some(&Value::Bool(false))
-        && object.get("tracing_disabled") == Some(&Value::Bool(true))))
+    Ok(!(object.len() == 1 && object.get("trace_to_braintrust") == Some(&Value::Bool(false))))
 }
 
 /// Resume tracing without reinstalling the adapter or replacing its route.
@@ -142,7 +227,6 @@ fn enable_existing_at(path: &Path) -> anyhow::Result<()> {
             );
         }
         settings.insert("trace_to_braintrust".into(), Value::Bool(true));
-        settings.remove("tracing_disabled");
         Ok(())
     })
 }
@@ -162,7 +246,6 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
 fn disable_tracing_at(path: &Path) -> anyhow::Result<()> {
     common::edit_object(path, FileAccess::OwnerOnly, |settings, _| {
         settings.insert("trace_to_braintrust".into(), Value::Bool(false));
-        settings.insert("tracing_disabled".into(), Value::Bool(true));
         Ok(())
     })
 }
@@ -234,7 +317,6 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
             .unwrap_or_default();
     }
     settings.insert("trace_to_braintrust".into(), Value::Bool(true));
-    settings.remove("tracing_disabled");
     settings.insert("route".into(), serde_json::to_value(route)?);
     for key in [
         "traceToBraintrust",
@@ -291,6 +373,40 @@ mod tests {
     }
 
     #[test]
+    fn project_setup_writes_only_explicit_values_and_preserves_existing_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".claude/braintrust.json");
+        let mut args = SetupArgs {
+            scope: SettingsScope::Project,
+            agent: SetupAgent::Claude,
+            additional_metadata: None,
+            tags: vec![],
+            plugin: vec![],
+        };
+        write_project_setup_at(&path, &args, &crate::HostRouteSelection::default()).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"trace_to_braintrust": true}));
+        args.tags = vec!["team".into()];
+        args.additional_metadata = Some(r#"{"ci":true}"#.into());
+        let selection = crate::HostRouteSelection {
+            project_name: Some("project".into()),
+            ..Default::default()
+        };
+        write_project_setup_at(&path, &args, &selection).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"trace_to_braintrust": true,"project":"project","tags":["team"],"additional_metadata":{"ci":true}})
+        );
+        args.plugin.push("bad.js".into());
+        assert!(write_project_setup_at(&path, &args, &selection).is_err());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            value
+        );
+    }
+
+    #[test]
     fn disable_preserves_route_and_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("braintrust.json");
@@ -303,13 +419,11 @@ mod tests {
         disable_tracing_at(&path).unwrap();
         let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["trace_to_braintrust"], false);
-        assert_eq!(value["tracing_disabled"], true);
         assert_eq!(value["route"]["tags"][0], "saved");
         assert_eq!(value["custom"], 1);
         enable_existing_at(&path).unwrap();
         let enabled: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(enabled["trace_to_braintrust"], true);
-        assert!(enabled.get("tracing_disabled").is_none());
         assert_eq!(enabled["route"], value["route"]);
         assert_eq!(enabled["custom"], value["custom"]);
         let missing = temp.path().join("missing/braintrust.json");
@@ -317,7 +431,6 @@ mod tests {
         assert!(!missing.exists());
         disable_tracing_at(&missing).unwrap();
         let created: Value = serde_json::from_slice(&std::fs::read(&missing).unwrap()).unwrap();
-        assert_eq!(created["tracing_disabled"], true);
         assert_eq!(created["trace_to_braintrust"], false);
     }
 

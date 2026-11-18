@@ -6,7 +6,7 @@
 //! the coding-agent integrations.
 
 use crate::route::{apply_additional_metadata, apply_tags, resolve_span_plugin_paths};
-use crate::trace_command::{DoctorAgent, DoctorArgs, SetupAgent, TraceCommand};
+use crate::trace_command::{DoctorAgent, DoctorArgs, SettingsScope, SetupAgent, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
     braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
@@ -114,6 +114,11 @@ pub trait TraceHostServices: Send + Sync {
     /// Whether route flags were explicitly supplied on the command line.
     fn has_explicit_route_selection(&self) -> bool {
         false
+    }
+
+    /// Route values explicitly supplied on the command line, excluding defaults.
+    fn explicit_route_selection(&self) -> HostRouteSelection {
+        HostRouteSelection::default()
     }
 
     /// Resolve only the host-owned auth and default project selections.
@@ -654,10 +659,31 @@ async fn doctor_output_at(
 }
 
 async fn run_setup_command(
-    args: crate::SetupArgs,
+    mut args: crate::SetupArgs,
     host: &TraceHostContext,
     configuration: Option<&'static str>,
 ) -> anyhow::Result<()> {
+    if args.scope == SettingsScope::Project {
+        return print_output(
+            crate::setup::run_project_setup(
+                args,
+                host.services.explicit_route_selection(),
+                configuration.is_some(),
+            )?,
+            host.output_format,
+        );
+    }
+    if args.additional_metadata.is_none() {
+        args.additional_metadata = crate::env::var("BRAINTRUST_ADDITIONAL_METADATA");
+    }
+    if args.tags.is_empty() {
+        args.tags = crate::env::var("BRAINTRUST_TAGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
     let mut route = resolve_command_route(
         host,
         RouteRequirements {
@@ -699,6 +725,26 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
     match args.command {
         TraceCommand::Setup(args) => run_setup_command(args, &host, None).await,
         TraceCommand::Enable(args) => {
+            if args.scope == SettingsScope::Project {
+                if args.additional_metadata.is_some()
+                    || !args.tags.is_empty()
+                    || !args.plugin.is_empty()
+                    || host.services.has_explicit_route_selection()
+                {
+                    let setup = crate::SetupArgs {
+                        scope: args.scope,
+                        agent: args.agent,
+                        additional_metadata: args.additional_metadata,
+                        tags: args.tags,
+                        plugin: args.plugin,
+                    };
+                    return run_setup_command(setup, &host, Some("updated")).await;
+                }
+                return print_output(
+                    crate::setup::run_scoped_toggle(args.agent, args.scope, true)?,
+                    host.output_format,
+                );
+            }
             let configured = crate::setup::has_saved_setup(args.agent)?;
             if !enable_needs_setup(
                 configured,
@@ -708,6 +754,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 print_output(run_enable(args.agent)?, host.output_format)
             } else {
                 let setup = crate::SetupArgs {
+                    scope: args.scope,
                     agent: args.agent,
                     additional_metadata: args
                         .additional_metadata
@@ -733,9 +780,19 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             }
         }
         TraceCommand::Disable(disable_args) => {
-            print_output(run_disable(disable_args.agent)?, host.output_format)
+            if disable_args.scope == SettingsScope::Project {
+                print_output(
+                    crate::setup::run_scoped_toggle(disable_args.agent, disable_args.scope, false)?,
+                    host.output_format,
+                )
+            } else {
+                print_output(run_disable(disable_args.agent)?, host.output_format)
+            }
         }
         TraceCommand::Uninstall(args) => {
+            if args.scope != SettingsScope::User {
+                anyhow::bail!("uninstall applies only to user scope");
+            }
             print_output(crate::run_uninstall(args.agent)?, host.output_format)
         }
         TraceCommand::Update(update_args) => {
@@ -769,8 +826,12 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                     )
                     .await;
                 }
-                let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
-                run_hook_command(hook_args, &host, settings).await
+                let payload = crate::hook::read_project_hook_payload(&hook_args)?;
+                let settings = crate::settings::AgentSettings::load_for_hook_payload(
+                    &hook_args.source,
+                    payload.as_ref(),
+                )?;
+                run_hook_command_with_payload(hook_args, &host, settings, payload).await
             }
             .await;
             if let Some(response) = response {
@@ -847,20 +908,36 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
     }
 }
 
+#[cfg(test)]
 async fn run_hook_command(
     hook_args: crate::HookArgs,
     host: &TraceHostContext,
     settings: crate::settings::AgentSettings,
+) -> anyhow::Result<()> {
+    run_hook_command_with_payload(hook_args, host, settings, None).await
+}
+
+async fn run_hook_command_with_payload(
+    hook_args: crate::HookArgs,
+    host: &TraceHostContext,
+    settings: crate::settings::AgentSettings,
+    payload: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
     if !settings.tracing_enabled() {
         return Ok(());
     }
     crate::hook::with_hook_capture_timeout(hook_args.capture_timeout_ms, async {
         let route = match settings.route {
+            Some(mut route) if route.destination.is_none() => {
+                route.destination = resolve_host_route(host, RouteRequirements::default())
+                    .await?
+                    .destination;
+                route
+            }
             Some(route) => route,
             None => resolve_host_route(host, RouteRequirements::default()).await?,
         };
-        crate::hook::run_hook_with_route(hook_args, route, host_info(host)).await
+        crate::hook::run_hook_with_payload(hook_args, route, host_info(host), payload).await
     })
     .await
 }
@@ -877,6 +954,7 @@ mod tests {
     #[test]
     fn enable_uses_setup_only_when_missing_or_explicitly_changed() {
         let mut args = crate::EnableArgs {
+            scope: SettingsScope::User,
             agent: SetupAgent::Pi,
             additional_metadata: None,
             tags: vec![],
@@ -900,6 +978,7 @@ mod tests {
         const CHILD_ENV: &str = "BRAINTRUST_TEST_RESUME_EXISTING";
         if std::env::var_os(CHILD_ENV).is_some() {
             let args = crate::EnableArgs {
+                scope: SettingsScope::User,
                 agent: SetupAgent::Pi,
                 additional_metadata: None,
                 tags: vec![],
@@ -917,7 +996,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("braintrust.json");
-        let original = serde_json::json!({"trace_to_braintrust": false, "tracing_disabled": true, "route": {"destination": {"type": "project_logs", "project_name": "saved"}, "auth": {"profile": "saved"}}, "other": "kept"});
+        let original = serde_json::json!({"trace_to_braintrust": false, "route": {"destination": {"type": "project_logs", "project_name": "saved"}, "auth": {"profile": "saved"}}, "other": "kept"});
         std::fs::write(&path, original.to_string()).unwrap();
         let output = crate::subprocess::interactive_command(std::env::current_exe().unwrap())
             .args(["--exact", "trace_runtime::tests::plain_enable_resumes_without_host_resolution_or_route_changes", "--nocapture"])
@@ -936,7 +1015,6 @@ mod tests {
         assert_eq!(updated["route"], original["route"]);
         assert_eq!(updated["other"], original["other"]);
         assert_eq!(updated["trace_to_braintrust"], true);
-        assert!(updated.get("tracing_disabled").is_none());
         assert!(String::from_utf8_lossy(&output.stdout).contains(r#""command":"enable""#));
     }
 
@@ -946,6 +1024,7 @@ mod tests {
         if let Ok(mode) = std::env::var(CHILD_ENV) {
             let services = Arc::new(RecordingHost::new(None, None));
             let args = crate::EnableArgs {
+                scope: SettingsScope::User,
                 agent: SetupAgent::OpenCode,
                 additional_metadata: None,
                 tags: if mode == "updated" {
@@ -1203,6 +1282,7 @@ mod tests {
         for (command, persistent_auth, destination_required) in [
             (
                 TraceCommand::Setup(SetupArgs {
+                    scope: SettingsScope::User,
                     agent: SetupAgent::OpenCode,
                     additional_metadata: None,
                     tags: Default::default(),
@@ -1435,7 +1515,19 @@ mod tests {
             if user_hook {
                 child.env(crate::setup::cursor::USER_HOOK_ENV, "1");
             }
-            let output = child.output().unwrap();
+            use std::io::Write;
+            child
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut process = child.spawn().unwrap();
+            process
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"workspace_roots":[]}"#)
+                .unwrap();
+            let output = process.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "user_hook={user_hook}: {}\n{}",

@@ -25,16 +25,13 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
 });
 
-it("applies the global pause to OpenCode 2 and permits a managed run", async () => {
+it("applies the project opt-out to OpenCode 2 and permits a managed run", async () => {
   const global = join(directory, "config", "opencode");
   const project = join(directory, ".opencode");
   mkdirSync(global, { recursive: true });
   mkdirSync(project, { recursive: true });
-  writeFileSync(
-    join(global, "braintrust.json"),
-    JSON.stringify({ trace_to_braintrust: false, tracing_disabled: true }),
-  );
-  writeFileSync(join(project, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+  writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+  writeFileSync(join(project, "braintrust.json"), JSON.stringify({ trace_to_braintrust: false }));
   const hook = vi.fn(async () => {});
   const subscribe = vi.fn(async function* () {});
   const ctx = {

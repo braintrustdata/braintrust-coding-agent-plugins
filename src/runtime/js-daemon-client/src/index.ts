@@ -1,13 +1,15 @@
 import { spawnBackground } from "./background-process.ts"
 import { createHash } from "node:crypto"
+import { existsSync } from "node:fs"
 import { createConnection, type Socket } from "node:net"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 
 export const DAEMON_PROTOCOL_VERSION = 1
 
 export interface DaemonSessionRoute {
   auth?: {
+    source?: "auto" | "saved_profile" | "environment"
     /** Immutable saved-profile identifier. Preferred over legacy `profile`. */
     profile_id?: string
     /** Mutable display name retained to read settings written before profile IDs. */
@@ -18,12 +20,24 @@ export interface DaemonSessionRoute {
   flush_mode?: "fire_and_forget" | "flush_on_turn_end"
   additional_metadata?: Record<string, unknown>
   span_plugins?: string[]
+  tags?: string[]
 }
 
 export interface DaemonTraceSettings {
   trace_to_braintrust?: boolean
-  tracing_disabled?: boolean
   route?: DaemonSessionRoute
+}
+
+/** Find project settings at the Git root, or in the starting directory outside Git. */
+export function projectSettingsPath(directory: string, configDir: string): string {
+  const start = resolve(directory)
+  let current = start
+  while (true) {
+    if (existsSync(join(current, ".git"))) return join(current, configDir, "braintrust.json")
+    const parent = dirname(current)
+    if (parent === current) return join(start, configDir, "braintrust.json")
+    current = parent
+  }
 }
 
 const MANAGED_INSTANCE_CLAIMS = Symbol.for("braintrust.coding-agent.managed-instance-claims")
@@ -57,11 +71,7 @@ export function resolveDaemonTraceSettings(
   env: NodeJS.ProcessEnv = process.env,
 ): DaemonTraceSettings {
   const raw = env.BT_TRACE_INVOCATION_SETTINGS
-  if (raw === undefined) {
-    return persistent.tracing_disabled === true
-      ? { ...persistent, trace_to_braintrust: false }
-      : persistent
-  }
+  if (raw === undefined) return persistent
   try {
     const invocation = JSON.parse(raw) as DaemonTraceSettings
     if (
