@@ -75,8 +75,8 @@ or `.cursor/braintrust.json` in each selected repository:
 The hook uses the closest project file within the Git repository, including when
 Claude Code starts in a subdirectory. For Cursor workspaces with multiple roots,
 the first root containing a project file supplies the settings for the session.
-Project settings override user settings; omitted top-level fields inherit from the
-user settings. A project `route` replaces the user route. A managed `bt trace run` takes precedence over both. `bt trace doctor`
+Project settings can select `trace_to_braintrust` and `project`; other route
+settings, including span plugins, come from the user settings. A managed `bt trace run` takes precedence over both. `bt trace doctor`
 reports user-level settings, not the settings of a particular repository.
 
 ## Per-agent plugin settings

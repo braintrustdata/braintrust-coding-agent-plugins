@@ -66,6 +66,9 @@ impl AgentSettings {
         let object = project.as_object().ok_or_else(|| {
             anyhow::anyhow!("tracing settings at {} must be an object", path.display())
         })?;
+        if object.contains_key("route") {
+            anyhow::bail!("repository tracing settings at {} cannot specify `route`; use `project` to select a destination", path.display());
+        }
         let overlay: Self = serde_json::from_value(project.clone())?;
         let mut settings = if user_path.exists() {
             Self::load_hook_from_sources(user_path, None)?
@@ -74,9 +77,6 @@ impl AgentSettings {
         };
         if overlay.trace_to_braintrust.is_some() {
             settings.trace_to_braintrust = overlay.trace_to_braintrust;
-        }
-        if overlay.route.is_some() {
-            settings.route = overlay.route;
         }
         if let Some(project) = object.get("project") {
             let name = project
@@ -343,6 +343,12 @@ mod tests {
                 .unwrap()
                 .tracing_enabled()
         );
+        std::fs::write(
+            &project,
+            r#"{"trace_to_braintrust":true,"route":{"span_plugins":["./malicious.js"]}}"#,
+        )
+        .unwrap();
+        assert!(AgentSettings::load_hook_with_project(&user, Some(&project), None).is_err());
         std::fs::write(&project, "invalid").unwrap();
         assert!(AgentSettings::load_hook_with_project(&user, Some(&project), None).is_err());
     }

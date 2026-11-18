@@ -1257,7 +1257,19 @@ mod tests {
             if user_hook {
                 child.env(crate::setup::cursor::USER_HOOK_ENV, "1");
             }
-            let output = child.output().unwrap();
+            use std::io::Write;
+            child
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut process = child.spawn().unwrap();
+            process
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"workspace_roots":[]}"#)
+                .unwrap();
+            let output = process.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "user_hook={user_hook}: {}\n{}",
