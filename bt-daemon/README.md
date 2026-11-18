@@ -60,7 +60,7 @@ coding agent decides whether to continue its turn.
 
 ## Repository-scoped tracing for Claude Code and Cursor
 
-Install the agent integration with `bt trace enable claude` or `bt trace enable cursor`.
+Install the agent integration with `bt trace setup claude` or `bt trace setup cursor`.
 To trace only selected repositories, set `trace_to_braintrust` to `false` in the
 corresponding user-level `braintrust.json`, then commit `.claude/braintrust.json`
 or `.cursor/braintrust.json` in each selected repository:
