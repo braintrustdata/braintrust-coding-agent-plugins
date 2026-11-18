@@ -77,7 +77,7 @@ bt trace disable claude
 
 `doctor` shows which configuration is in use and whether the running tracing
 daemon can authenticate it. `status` reports trace delivery.
-`disable` pauses tracing and keeps your settings. Use `enable` to resume, or `uninstall` to remove the plugin and its settings.
+`disable` pauses tracing and keeps your settings. Use `enable` to resume; it also sets up tracing when needed or when you pass new settings. Use `uninstall` to remove the plugin and its settings.
 
 For command hooks, `bt trace hook` exits nonzero when it cannot capture an
 event. Exit `0` means the daemon accepted the event into its journal; delivery

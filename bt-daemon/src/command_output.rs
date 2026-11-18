@@ -59,6 +59,8 @@ pub struct SetupCommandOutput {
     pub display_name: String,
     pub settings_path: PathBuf,
     pub restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,6 +199,7 @@ impl TraceCommandOutput {
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
+            configuration: None,
         })
     }
 
@@ -210,6 +213,7 @@ impl TraceCommandOutput {
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
+            configuration: Some("reused"),
         })
     }
 
@@ -231,6 +235,7 @@ impl TraceCommandOutput {
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
+            configuration: None,
         })
     }
 
@@ -244,6 +249,7 @@ impl TraceCommandOutput {
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
+            configuration: None,
         })
     }
 
@@ -329,13 +335,17 @@ impl TraceCommandOutput {
                 }
                 Ok(rendered)
             }
+            Self::Enable(setup) if setup.configuration.is_some_and(|value| value != "reused") => Ok(format!(
+                "Braintrust tracing configuration {} for {} in {}.\nRestart the coding agent to load the tracing plugin.",
+                setup.configuration.unwrap_or_default(), setup.display_name, setup.settings_path.display()
+            )),
             Self::Setup(setup) => Ok(format!(
                 "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.",
                 setup.display_name,
                 setup.settings_path.display()
             )),
             Self::Enable(enable) => Ok(format!(
-                "Braintrust tracing is enabled for {} in {}.\nRestart the coding agent to apply the change.",
+                "Braintrust tracing is enabled for {} using the existing configuration in {}.\nRestart the coding agent to apply the change.",
                 enable.display_name, enable.settings_path.display()
             )),
             Self::Disable(disable) => Ok(format!(
@@ -467,6 +477,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&output.render(OutputFormat::Json).unwrap()).unwrap();
         assert_eq!(json["command"], "enable");
+        assert_eq!(json["configuration"], "reused");
         assert!(output
             .render(OutputFormat::Human)
             .unwrap()

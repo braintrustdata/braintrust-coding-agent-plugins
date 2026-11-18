@@ -22,7 +22,7 @@ pub struct TraceArgs {
 pub enum TraceCommand {
     /// Install and configure the Braintrust tracing plugin for a coding agent.
     Setup(SetupArgs),
-    /// Resume tracing with the existing configuration.
+    /// Enable tracing, setting it up when needed or when settings are supplied.
     Enable(EnableArgs),
     /// Disable tracing while preserving the plugin and its configuration.
     Disable(DisableArgs),
@@ -119,6 +119,15 @@ pub struct SetupArgs {
 pub struct EnableArgs {
     #[command(subcommand)]
     pub agent: SetupAgent,
+    /// JSON object merged into root-span metadata.
+    #[arg(long, global = true)]
+    pub additional_metadata: Option<String>,
+    /// Tag applied to each root span. May be repeated or comma-separated.
+    #[arg(long = "tag", global = true, value_delimiter = ',')]
+    pub tags: Vec<String>,
+    /// JavaScript span transform to persist. May be repeated.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub plugin: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -402,15 +411,16 @@ mod tests {
     }
 
     #[test]
-    fn enable_only_accepts_an_agent() {
+    fn enable_accepts_explicit_tracing_settings() {
         let parsed = Cli::try_parse_from(["bt", "enable", "pi"]).unwrap();
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Enable(EnableArgs {
-                agent: SetupAgent::Pi
+                agent: SetupAgent::Pi,
+                ..
             })
         ));
-        assert!(Cli::try_parse_from(["bt", "enable", "pi", "--tag", "changed"]).is_err());
+        assert!(Cli::try_parse_from(["bt", "enable", "pi", "--tag", "changed"]).is_ok());
     }
 
     #[test]

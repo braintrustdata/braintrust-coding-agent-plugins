@@ -264,7 +264,10 @@ BRAINTRUST_TAGS=ci,release-validation bt trace run codex -- "summarize this chan
 ```
 
 Use `bt trace disable <agent>` to pause tracing while keeping the plugin and settings.
-Use `bt trace enable <agent>` to resume, or `bt trace uninstall <agent>` to remove
+Use `bt trace enable <agent>` to resume. If there is no saved setup, or you provide
+explicit configuration options, `enable` runs setup and reports the result. Environment
+defaults do not change an existing configuration during a plain `enable`.
+Use `bt trace uninstall <agent>` to remove
 the plugin and its Braintrust settings. Use `bt trace setup <agent>` to install or
 change the configuration.
 

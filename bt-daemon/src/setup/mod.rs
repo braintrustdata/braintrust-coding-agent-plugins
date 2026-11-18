@@ -76,6 +76,41 @@ pub fn run_setup(args: SetupArgs, route: SessionRoute) -> anyhow::Result<TraceCo
     ))
 }
 
+/// Check whether there is a usable saved configuration, without overwriting errors.
+pub(crate) fn has_saved_setup(agent: SetupAgent) -> anyhow::Result<bool> {
+    let path = paths::agent_settings_path(agent.identity().id, None);
+    saved_setup_at(&path)
+}
+
+fn saved_setup_at(path: &Path) -> anyhow::Result<bool> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let value: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid tracing settings at {}", path.display()))?;
+    let object = value.as_object().ok_or_else(|| {
+        anyhow::anyhow!("tracing settings at {} must be an object", path.display())
+    })?;
+    if !object
+        .get("trace_to_braintrust")
+        .is_some_and(Value::is_boolean)
+    {
+        anyhow::bail!(
+            "tracing settings at {} have no valid `trace_to_braintrust`",
+            path.display()
+        );
+    }
+    if let Some(route) = object.get("route") {
+        let _: SessionRoute = serde_json::from_value(route.clone())
+            .with_context(|| format!("invalid tracing route at {}", path.display()))?;
+    }
+    Ok(!(object.len() == 2
+        && object.get("trace_to_braintrust") == Some(&Value::Bool(false))
+        && object.get("tracing_disabled") == Some(&Value::Bool(true))))
+}
+
 /// Resume tracing without reinstalling the adapter or replacing its route.
 pub fn run_enable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
     let identity = agent.identity();
@@ -284,6 +319,26 @@ mod tests {
         let created: Value = serde_json::from_slice(&std::fs::read(&missing).unwrap()).unwrap();
         assert_eq!(created["tracing_disabled"], true);
         assert_eq!(created["trace_to_braintrust"], false);
+    }
+
+    #[test]
+    fn saved_setup_detection_preserves_errors_and_distinguishes_pause_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        assert!(!saved_setup_at(&path).unwrap());
+        disable_tracing_at(&path).unwrap();
+        assert!(!saved_setup_at(&path).unwrap());
+        std::fs::write(&path, r#"{"trace_to_braintrust":false,"route":{"destination":{"type":"project_logs","project_name":"saved"}}}"#).unwrap();
+        assert!(saved_setup_at(&path).unwrap());
+        std::fs::write(&path, "broken").unwrap();
+        assert!(saved_setup_at(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+        std::fs::write(
+            &path,
+            r#"{"trace_to_braintrust":true,"route":{"destination":"invalid"}}"#,
+        )
+        .unwrap();
+        assert!(saved_setup_at(&path).is_err());
     }
 
     #[test]
