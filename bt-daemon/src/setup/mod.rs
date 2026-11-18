@@ -94,11 +94,9 @@ pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
 }
 
 fn disable_tracing_at(path: &Path) -> anyhow::Result<()> {
-    common::edit_object(path, FileAccess::OwnerOnly, |settings, exists| {
-        if exists {
-            settings.insert("trace_to_braintrust".into(), Value::Bool(false));
-            settings.insert("tracing_disabled".into(), Value::Bool(true));
-        }
+    common::edit_object(path, FileAccess::OwnerOnly, |settings, _| {
+        settings.insert("trace_to_braintrust".into(), Value::Bool(false));
+        settings.insert("tracing_disabled".into(), Value::Bool(true));
         Ok(())
     })
 }
@@ -249,7 +247,9 @@ mod tests {
         assert_eq!(enabled["route"]["tags"][0], "saved");
         let missing = temp.path().join("missing/braintrust.json");
         disable_tracing_at(&missing).unwrap();
-        assert!(!missing.exists());
+        let created: Value = serde_json::from_slice(&std::fs::read(&missing).unwrap()).unwrap();
+        assert_eq!(created["tracing_disabled"], true);
+        assert_eq!(created["trace_to_braintrust"], false);
     }
 
     #[test]
