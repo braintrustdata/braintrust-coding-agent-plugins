@@ -16,16 +16,21 @@ export async function readPluginConfig(input: {
       path.join(configHome, "opencode", "braintrust.json"),
       path.join(input.directory, ".opencode", "braintrust.json"),
     ];
-    for (const configPath of configPaths) {
+    let globallyDisabled = false;
+    for (const [index, configPath] of configPaths.entries()) {
       try {
         if (fs.existsSync(configPath)) {
-          const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as PluginConfig;
+          const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as PluginConfig & {
+            tracing_disabled?: boolean;
+          };
+          if (index === 0) globallyDisabled = parsed.tracing_disabled === true;
           pluginConfig = pluginConfig ? { ...pluginConfig, ...parsed } : parsed;
         }
       } catch {
         // Malformed optional config is fail-open; continue to the next layer.
       }
     }
+    if (globallyDisabled) pluginConfig = { ...pluginConfig, trace_to_braintrust: false };
   } catch {
     // Config loading failed; invocation settings can still enable tracing.
   }

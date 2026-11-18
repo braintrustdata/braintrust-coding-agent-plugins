@@ -125,6 +125,37 @@ describe("BraintrustPlugin", () => {
     expect(hooks.tool).toBeUndefined();
   });
 
+  it("honors a global pause over project opt-in and allows managed runs", async () => {
+    const global = join(directory, ".config", "opencode");
+    const project = join(directory, ".opencode");
+    mkdirSync(global, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(
+      join(global, "braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: false, tracing_disabled: true }),
+    );
+    writeFileSync(
+      join(project, "braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: true, tracing_disabled: false }),
+    );
+    const { BraintrustPlugin } = await import("./index");
+    const paused = await BraintrustPlugin(createInput(directory));
+    expect(paused.event).toBeUndefined();
+    expect(paused.tool).toBeDefined();
+    // Re-enabling removes the pause marker; project opt-in applies again.
+    writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
+    writeFileSync(
+      join(global, "braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: false, tracing_disabled: true }),
+    );
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: { destination: { type: "project_logs", project_name: "managed" } },
+    });
+    expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
+  });
+
   it("provides a trace-only managed entrypoint without data tools", async () => {
     process.env.BT_TRACE_MANAGED_RUN_ID = `trace-only-${Date.now()}`;
     process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
