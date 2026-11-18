@@ -101,14 +101,15 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
     },
   };
 
-  applyConfig(config, readConfig(join(homedir(), ".pi", "agent", "braintrust.json")));
+  const userConfig = readConfig(join(homedir(), ".pi", "agent", "braintrust.json"));
+  applyConfig(config, userConfig);
   applyConfig(config, readConfig(join(cwd, PROJECT_CONFIG_DIR_NAME, "braintrust.json")));
 
   config.showUi = boolean(process.env.BRAINTRUST_SHOW_UI) ?? config.showUi;
   config.showTraceLink = boolean(process.env.BRAINTRUST_SHOW_TRACE_LINK) ?? config.showTraceLink;
 
   const traceSettings = resolveDaemonTraceSettings({
-    trace_to_braintrust: config.enabled,
+    trace_to_braintrust: userConfig?.tracing_disabled === true ? false : config.enabled,
     route: config.route,
   });
   config.enabled = traceSettings.trace_to_braintrust === true;

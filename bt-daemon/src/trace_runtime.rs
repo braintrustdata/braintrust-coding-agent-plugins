@@ -291,6 +291,21 @@ async fn resolve_command_route(
     Ok(route)
 }
 
+fn merge_saved_auth(mut selected: AuthSelection, saved: AuthSelection) -> AuthSelection {
+    let selected_profile = selected.source != AuthSource::Auto
+        || selected.profile_id.is_some()
+        || selected.profile.is_some();
+    if !selected_profile {
+        selected.source = saved.source;
+        selected.profile_id = saved.profile_id;
+        selected.profile = saved.profile;
+        if selected.org_name.is_none() {
+            selected.org_name = saved.org_name;
+        }
+    }
+    selected
+}
+
 fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Result<()> {
     println!("{}", output.render(format)?);
     Ok(())
@@ -672,7 +687,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
             if route.destination.is_none() {
                 if let Some(saved) = saved {
                     route.destination = saved.destination;
-                    route.auth = saved.auth;
+                    route.auth = merge_saved_auth(route.auth, saved.auth);
                 }
             }
             let lease = host
@@ -835,6 +850,33 @@ mod tests {
     use crate::{ImportArgs, ImportSource, RunArgs, RunSource, StatusArgs, TraceCommand};
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    #[test]
+    fn saved_auth_fills_only_unselected_credentials() {
+        let saved = AuthSelection {
+            source: AuthSource::SavedProfile,
+            profile: Some("old".into()),
+            org_name: Some("old-org".into()),
+            ..Default::default()
+        };
+        let selected = AuthSelection {
+            source: AuthSource::SavedProfile,
+            profile: Some("new".into()),
+            ..Default::default()
+        };
+        assert_eq!(merge_saved_auth(selected.clone(), saved.clone()), selected);
+        let org = AuthSelection {
+            org_name: Some("new-org".into()),
+            ..Default::default()
+        };
+        let merged = merge_saved_auth(org, saved.clone());
+        assert_eq!(merged.profile.as_deref(), Some("old"));
+        assert_eq!(merged.org_name.as_deref(), Some("new-org"));
+        assert_eq!(
+            merge_saved_auth(AuthSelection::default(), saved.clone()),
+            saved
+        );
+    }
 
     #[test]
     fn mounted_child_commands_preserve_the_host_prefix() {
