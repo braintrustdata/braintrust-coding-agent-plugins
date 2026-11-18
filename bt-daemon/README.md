@@ -76,7 +76,8 @@ The hook uses the closest project file within the Git repository, including when
 Claude Code starts in a subdirectory. For Cursor workspaces with multiple roots,
 the first root containing a project file supplies the settings for the session.
 Project settings can select `trace_to_braintrust` and `project`; other route
-settings, including span plugins, come from the user settings. A managed `bt trace run` takes precedence over both. `bt trace doctor`
+settings, including span plugins, come from the user settings. An explicit `bt trace disable` pauses persistent tracing even in opted-in
+repositories; a managed `bt trace run` takes precedence over both. `bt trace doctor`
 reports user-level settings, not the settings of a particular repository.
 
 ## Per-agent plugin settings

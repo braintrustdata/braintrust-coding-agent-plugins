@@ -91,6 +91,13 @@ impl AgentSettings {
                 project_name: Some(name.to_owned()),
             });
         }
+        // An explicit user pause must remain effective even when a repository opts in.
+        if user_path.exists() {
+            let user: Value = serde_json::from_str(&std::fs::read_to_string(user_path)?)?;
+            if user.get("tracing_disabled").and_then(Value::as_bool) == Some(true) {
+                settings.trace_to_braintrust = Some(false);
+            }
+        }
         if settings.trace_to_braintrust.is_none() {
             anyhow::bail!(
                 "tracing settings at {} have no `trace_to_braintrust` value",
@@ -330,6 +337,23 @@ mod tests {
                 .unwrap()
                 .tracing_enabled()
         );
+        std::fs::write(
+            &user,
+            r#"{"trace_to_braintrust":false,"tracing_disabled":true}"#,
+        )
+        .unwrap();
+        assert!(
+            !AgentSettings::load_hook_with_project(&user, Some(&project), None)
+                .unwrap()
+                .tracing_enabled()
+        );
+        assert!(AgentSettings::load_hook_with_project(
+            &user,
+            Some(&project),
+            Some(r#"{"trace_to_braintrust":true,"route":{}}"#)
+        )
+        .unwrap()
+        .tracing_enabled());
         std::fs::write(&project, r#"{"trace_to_braintrust":false}"#).unwrap();
         assert!(
             !AgentSettings::load_hook_with_project(&user, Some(&project), None)

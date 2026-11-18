@@ -207,6 +207,13 @@ fn project_settings_control_hook_capture_from_native_payload() {
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     let user = temp.path().join("user.json");
+    #[cfg(unix)]
+    let socket = temp.path().join("missing.sock");
+    #[cfg(windows)]
+    let socket = std::path::PathBuf::from(format!(
+        r"\\.\pipe\missing-bt-daemon-{}",
+        uuid::Uuid::new_v4()
+    ));
     std::fs::write(&user, r#"{"trace_to_braintrust":false}"#).unwrap();
     for (source, dir, payload) in [
         (
@@ -243,6 +250,7 @@ fn project_settings_control_hook_capture_from_native_payload() {
                     },
                 ])
                 .env("BRAINTRUST_DAEMON_CONFIG", &user)
+                .env("BRAINTRUST_DAEMON_SOCKET", &socket)
                 .env("HOME", temp.path())
                 .env_remove("BT_TRACE_INVOCATION_SETTINGS")
                 .env_remove("_BT_TRACE_MANAGED_RUN")
