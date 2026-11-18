@@ -58,6 +58,27 @@ or `bt trace doctor <agent>` for configuration, authentication, and recent
 session diagnostics. Hook exit codes can be observed by the caller while the
 coding agent decides whether to continue its turn.
 
+## Repository-scoped tracing for Claude Code and Cursor
+
+Install the agent integration with `bt trace enable claude` or `bt trace enable cursor`.
+To trace only selected repositories, set `trace_to_braintrust` to `false` in the
+corresponding user-level `braintrust.json`, then commit `.claude/braintrust.json`
+or `.cursor/braintrust.json` in each selected repository:
+
+```json
+{
+  "trace_to_braintrust": true,
+  "project": "my-braintrust-project"
+}
+```
+
+The hook uses the closest project file within the Git repository, including when
+Claude Code starts in a subdirectory. For Cursor workspaces with multiple roots,
+the first root containing a project file supplies the settings for the session.
+Project settings override user settings; omitted top-level fields inherit from the
+user settings. A project `route` replaces the user route. A managed `bt trace run` takes precedence over both. `bt trace doctor`
+reports user-level settings, not the settings of a particular repository.
+
 ## Per-agent plugin settings
 
 Each coding agent reads an independent non-credential `braintrust.json` file:

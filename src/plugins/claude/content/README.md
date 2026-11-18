@@ -116,3 +116,5 @@ bt trace disable claude
 
 See the [tracing plugin guide](plugins/trace-claude-code/README.md) for the
 capture architecture and supported surfaces.
+
+For repository-scoped tracing, see the [daemon configuration guide](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/bt-daemon/README.md#repository-scoped-tracing-for-claude-code-and-cursor).

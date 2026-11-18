@@ -707,8 +707,12 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                     )
                     .await;
                 }
-                let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
-                run_hook_command(hook_args, &host, settings).await
+                let payload = crate::hook::read_project_hook_payload(&hook_args)?;
+                let settings = crate::settings::AgentSettings::load_for_hook_payload(
+                    &hook_args.source,
+                    payload.as_ref(),
+                )?;
+                run_hook_command_with_payload(hook_args, &host, settings, payload).await
             }
             .await;
             if let Some(response) = response {
@@ -785,10 +789,20 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
     }
 }
 
+#[cfg(test)]
 async fn run_hook_command(
     hook_args: crate::HookArgs,
     host: &TraceHostContext,
     settings: crate::settings::AgentSettings,
+) -> anyhow::Result<()> {
+    run_hook_command_with_payload(hook_args, host, settings, None).await
+}
+
+async fn run_hook_command_with_payload(
+    hook_args: crate::HookArgs,
+    host: &TraceHostContext,
+    settings: crate::settings::AgentSettings,
+    payload: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
     if !settings.tracing_enabled() {
         return Ok(());
@@ -798,7 +812,7 @@ async fn run_hook_command(
             Some(route) => route,
             None => resolve_host_route(host, RouteRequirements::default()).await?,
         };
-        crate::hook::run_hook_with_route(hook_args, route, host_info(host)).await
+        crate::hook::run_hook_with_payload(hook_args, route, host_info(host), payload).await
     })
     .await
 }

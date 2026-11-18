@@ -6,12 +6,12 @@
 //! persistent agent configuration.
 
 use crate::paths;
-use crate::wire::SessionRoute;
+use crate::wire::{SessionRoute, TraceDestination};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) const INVOCATION_SETTINGS_ENV: &str = "BT_TRACE_INVOCATION_SETTINGS";
 
@@ -38,15 +38,66 @@ pub(crate) struct AgentSettings {
 }
 
 impl AgentSettings {
-    /// Hook invocations must report broken configuration instead of treating
-    /// it as a successful event. A managed run's invocation route is complete
-    /// and intentionally supersedes any persistent settings file.
-    pub(crate) fn load_for_hook(source: &str) -> anyhow::Result<Self> {
+    pub(crate) fn load_for_hook_payload(
+        source: &str,
+        payload: Option<&Value>,
+    ) -> anyhow::Result<Self> {
         let invocation = std::env::var(INVOCATION_SETTINGS_ENV).ok();
-        Self::load_hook_from_sources(
-            &paths::agent_settings_path(source, None),
-            invocation.as_deref(),
-        )
+        let user_path = paths::agent_settings_path(source, None);
+        let project_path = payload.and_then(|payload| project_settings_path(source, payload));
+        Self::load_hook_with_project(&user_path, project_path.as_deref(), invocation.as_deref())
+    }
+
+    fn load_hook_with_project(
+        user_path: &Path,
+        project_path: Option<&Path>,
+        invocation: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let path = match (invocation, project_path) {
+            (Some(_), _) | (_, None) => return Self::load_hook_from_sources(user_path, invocation),
+            (None, Some(path)) => path,
+        };
+        let raw = std::fs::read_to_string(path).map_err(|error| {
+            anyhow::anyhow!("read tracing settings at {}: {error}", path.display())
+        })?;
+        let project: Value = serde_json::from_str(&raw).map_err(|error| {
+            anyhow::anyhow!("parse tracing settings at {}: {error}", path.display())
+        })?;
+        let object = project.as_object().ok_or_else(|| {
+            anyhow::anyhow!("tracing settings at {} must be an object", path.display())
+        })?;
+        let overlay: Self = serde_json::from_value(project.clone())?;
+        let mut settings = if user_path.exists() {
+            Self::load_hook_from_sources(user_path, None)?
+        } else {
+            Self::default()
+        };
+        if overlay.trace_to_braintrust.is_some() {
+            settings.trace_to_braintrust = overlay.trace_to_braintrust;
+        }
+        if overlay.route.is_some() {
+            settings.route = overlay.route;
+        }
+        if let Some(project) = object.get("project") {
+            let name = project
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("project in {} must be a nonempty string", path.display())
+                })?;
+            let route = settings.route.get_or_insert_with(SessionRoute::default);
+            route.destination = Some(TraceDestination::ProjectLogs {
+                project_id: None,
+                project_name: Some(name.to_owned()),
+            });
+        }
+        if settings.trace_to_braintrust.is_none() {
+            anyhow::bail!(
+                "tracing settings at {} have no `trace_to_braintrust` value",
+                path.display()
+            );
+        }
+        Ok(settings)
     }
 
     fn load_hook_from_sources(path: &Path, invocation: Option<&str>) -> anyhow::Result<Self> {
@@ -123,6 +174,46 @@ impl AgentSettings {
     pub(crate) fn tracing_enabled(&self) -> bool {
         self.trace_to_braintrust.unwrap_or(false)
     }
+}
+
+fn project_settings_path(source: &str, payload: &Value) -> Option<PathBuf> {
+    let directory = match source {
+        "claude" | "claude-code" => ".claude",
+        "cursor" => ".cursor",
+        _ => return None,
+    };
+    let roots: Vec<&str> = if source == "cursor" {
+        payload
+            .get("workspace_roots")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    } else {
+        payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect()
+    };
+    roots
+        .into_iter()
+        .filter_map(|root| {
+            let root = Path::new(root);
+            if !root.is_absolute() {
+                return None;
+            }
+            let boundary = root
+                .ancestors()
+                .find(|dir| dir.join(".git").exists())
+                .unwrap_or(root);
+            root.ancestors()
+                .take_while(|dir| dir.starts_with(boundary))
+                .map(|dir| dir.join(directory).join("braintrust.json"))
+                .find(|path| path.is_file())
+        })
+        .next()
 }
 
 /// Replace a still-matching name-only route with the host-canonical route.
@@ -210,6 +301,75 @@ fn write_json_atomic(path: &Path, settings: &Map<String, Value>) -> anyhow::Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_settings_override_user_and_managed_run_overrides_both() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user.json");
+        let project = temp.path().join("project.json");
+        std::fs::write(
+            &user,
+            r#"{"trace_to_braintrust":false,"route":{"tags":["saved"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"trace_to_braintrust":true,"project":"repo-project"}"#,
+        )
+        .unwrap();
+        let settings = AgentSettings::load_hook_with_project(&user, Some(&project), None).unwrap();
+        assert!(settings.tracing_enabled());
+        let route = settings.route.unwrap();
+        assert!(route.tags.contains("saved"));
+        assert!(
+            matches!(route.destination, Some(TraceDestination::ProjectLogs { project_name: Some(ref name), .. }) if name == "repo-project")
+        );
+        let invocation = r#"{"trace_to_braintrust":false,"route":{}}"#;
+        assert!(
+            !AgentSettings::load_hook_with_project(&user, Some(&project), Some(invocation))
+                .unwrap()
+                .tracing_enabled()
+        );
+        std::fs::write(&project, r#"{"trace_to_braintrust":false}"#).unwrap();
+        assert!(
+            !AgentSettings::load_hook_with_project(&user, Some(&project), None)
+                .unwrap()
+                .tracing_enabled()
+        );
+        std::fs::remove_file(&user).unwrap();
+        std::fs::write(&project, r#"{"trace_to_braintrust":true,"project":"new"}"#).unwrap();
+        assert!(
+            AgentSettings::load_hook_with_project(&user, Some(&project), None)
+                .unwrap()
+                .tracing_enabled()
+        );
+        std::fs::write(&project, "invalid").unwrap();
+        assert!(AgentSettings::load_hook_with_project(&user, Some(&project), None).is_err());
+    }
+
+    #[test]
+    fn finds_repo_settings_for_nested_claude_and_cursor_workspaces() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let nested = repo.join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        for (source, dir) in [("claude", ".claude"), ("cursor", ".cursor")] {
+            std::fs::create_dir(repo.join(dir)).unwrap();
+            let path = repo.join(dir).join("braintrust.json");
+            std::fs::write(&path, "{}").unwrap();
+            let payload = if source == "claude" {
+                serde_json::json!({"cwd": nested})
+            } else {
+                serde_json::json!({"workspace_roots": [nested]})
+            };
+            assert_eq!(project_settings_path(source, &payload), Some(path));
+        }
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        assert!(project_settings_path("claude", &serde_json::json!({"cwd": outside})).is_none());
+    }
     use super::*;
 
     #[test]
