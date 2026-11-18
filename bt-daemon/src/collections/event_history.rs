@@ -7,8 +7,6 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
 
-const MAX_DELTAS: usize = 8;
-
 // Native hooks already fuse prior responses into the captured history.
 // Limit this optimization to the usual history fields and leave other
 // payloads as self-contained snapshots.
@@ -39,11 +37,10 @@ pub(super) fn encode(
     if input.is_empty() || snapshot_bytes < 1024 {
         return Ok(None);
     }
-    let Some((previous, depth)) = load(db, base, MAX_DELTAS)? else {
+    let Some(previous) = load(db, base)? else {
         return Ok(None);
     };
-    if depth == MAX_DELTAS
-        || previous.source != event.source
+    if previous.source != event.source
         || previous.session_id != event.session_id
         || previous.event != event.event
     {
@@ -79,71 +76,100 @@ pub(super) fn encode(
     Ok((bytes.len() < snapshot_bytes).then_some(bytes))
 }
 
-fn load(
-    db: &Connection,
-    id: u64,
-    remaining: usize,
-) -> anyhow::Result<Option<(RedactedEnvelope, usize)>> {
-    let row: Option<(bool, Vec<u8>, Option<u64>)> = db
+type Row = (bool, Vec<u8>, Option<u64>);
+
+fn row(db: &Connection, id: u64) -> anyhow::Result<Option<Row>> {
+    Ok(db
         .query_row(
             "SELECT control,value,base FROM events WHERE id=?",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .optional()?;
-    match row {
-        Some((false, value, Some(base))) => expand(db, id, base, &value, remaining).map(Some),
-        Some((false, value, None)) => Ok(Some((serde_json::from_slice(&value)?, 0))),
+        .optional()?)
+}
+
+fn load(db: &Connection, id: u64) -> anyhow::Result<Option<RedactedEnvelope>> {
+    match row(db, id)? {
+        Some((false, value, Some(base))) => expand(db, id, base, &value).map(Some),
+        Some((false, value, None)) => Ok(Some(serde_json::from_slice(&value)?)),
         _ => Ok(None),
     }
 }
 
-fn expand(
-    db: &Connection,
-    id: u64,
-    base: u64,
-    bytes: &[u8],
-    remaining: usize,
-) -> anyhow::Result<(RedactedEnvelope, usize)> {
+fn delta(bytes: &[u8]) -> anyhow::Result<(RedactedEnvelope, String, Vec<Value>)> {
+    let stored: StoredDelta<'_> = serde_json::from_slice(bytes)?;
     ensure!(
-        base < id && remaining > 0,
-        "invalid event history dependency"
-    );
-    let delta: StoredDelta<'_> = serde_json::from_slice(bytes)?;
-    ensure!(
-        HISTORIES.contains(&delta.path),
+        HISTORIES.contains(&stored.path),
         "invalid event history path"
     );
-    let (mut previous, depth) =
-        load(db, base, remaining - 1)?.context("missing event history base")?;
-    let mut event: RedactedEnvelope = serde_json::from_str(delta.envelope.get())?;
+    let event: RedactedEnvelope = serde_json::from_str(stored.envelope.get())?;
     ensure!(
-        event.source == previous.source
-            && event.session_id == previous.session_id
-            && event.event == previous.event,
-        "event history crossed streams"
+        event
+            .payload
+            .pointer(stored.path)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "nonempty or missing event history placeholder"
     );
-    let target = event
-        .payload
-        .pointer_mut(delta.path)
-        .and_then(Value::as_array_mut)
-        .context("missing history array")?;
-    ensure!(target.is_empty(), "nonempty event history placeholder");
-    let prefix = previous
-        .payload
-        .pointer_mut(delta.path)
-        .and_then(Value::as_array_mut)
-        .context("missing base history")?;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Delta<'a> {
+    struct Input<'a> {
         #[serde(borrow)]
         input_delta: &'a RawValue,
     }
-    let delta: Delta<'_> = serde_json::from_str(delta.history.get())?;
-    *target = std::mem::take(prefix);
-    target.extend(serde_json::from_str::<Vec<Value>>(delta.input_delta.get())?);
-    Ok((event, depth + 1))
+    let input: Input<'_> = serde_json::from_str(stored.history.get())?;
+    Ok((
+        event,
+        stored.path.to_owned(),
+        serde_json::from_str(input.input_delta.get())?,
+    ))
+}
+
+fn expand(
+    db: &Connection,
+    mut id: u64,
+    mut base: u64,
+    bytes: &[u8],
+) -> anyhow::Result<RedactedEnvelope> {
+    let (mut event, path, suffix) = delta(bytes)?;
+    let mut parts = vec![suffix];
+    let mut messages = loop {
+        ensure!(base < id, "invalid event history dependency");
+        let (control, value, parent) = row(db, base)?.context("missing event history base")?;
+        ensure!(!control, "event history references a control");
+        let mut previous = if let Some(parent) = parent {
+            let (previous, previous_path, suffix) = delta(&value)?;
+            ensure!(previous_path == path, "event history path changed");
+            parts.push(suffix);
+            id = base;
+            base = parent;
+            previous
+        } else {
+            serde_json::from_slice::<RedactedEnvelope>(&value)?
+        };
+        ensure!(
+            event.source == previous.source
+                && event.session_id == previous.session_id
+                && event.event == previous.event,
+            "event history crossed streams"
+        );
+        if parent.is_none() {
+            break std::mem::take(
+                previous
+                    .payload
+                    .pointer_mut(&path)
+                    .and_then(Value::as_array_mut)
+                    .context("missing base history")?,
+            );
+        }
+    };
+    messages.extend(parts.into_iter().rev().flatten());
+    *event
+        .payload
+        .pointer_mut(&path)
+        .and_then(Value::as_array_mut)
+        .context("missing history array")? = messages;
+    Ok(event)
 }
 
 pub(super) fn decode(
@@ -152,7 +178,7 @@ pub(super) fn decode(
     base: u64,
     bytes: &[u8],
 ) -> anyhow::Result<(RedactedEnvelope, usize)> {
-    let (event, _) = expand(db, id, base, bytes, MAX_DELTAS)?;
+    let event = expand(db, id, base, bytes)?;
     // IDs grow by the original serialized size, even for delta rows.
     let size = usize::try_from(id - base - 1)?;
     Ok((event, size))
@@ -169,7 +195,7 @@ pub(super) fn remove_through(db: &Connection, through: u64) -> anyhow::Result<()
         )
         .optional()?;
     if let Some(id) = survivor {
-        let (event, _) = load(db, id, MAX_DELTAS)?.context("missing surviving history")?;
+        let event = load(db, id)?.context("missing surviving history")?;
         db.execute(
             "UPDATE events SET value=?,base=NULL WHERE id=?",
             params![serde_json::to_vec(&event)?, id],

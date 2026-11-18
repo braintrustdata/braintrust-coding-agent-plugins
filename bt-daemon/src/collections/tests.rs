@@ -532,3 +532,87 @@ async fn pending_history_deltas_survive_pruning_and_reopen() {
         records[2..]
     );
 }
+
+#[tokio::test]
+async fn pending_history_has_no_periodic_snapshot_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = SessionStorage::at(&temp.path().join("chain.sqlite"))
+        .await
+        .unwrap();
+    let mut messages = vec![json!({"content":"history".repeat(2048)})];
+    let mut first = 0;
+    let mut last = 0;
+    for i in 0..32 {
+        messages.push(json!({"content":i}));
+        last = storage
+            .append(
+                &event("debug", "session", "model", json!({"messages":messages})),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .through;
+        if i == 0 {
+            first = last;
+        }
+    }
+    storage
+        .run(|db| {
+            assert_eq!(
+                db.one::<u64>("SELECT count(*) FROM events WHERE base IS NULL", [])?,
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    storage
+        .commit_translation(Translated {
+            input: first,
+            observation: true,
+            ops: vec![],
+            roots: Default::default(),
+            state: None,
+        })
+        .await
+        .unwrap();
+    let rows: Vec<_> = storage
+        .read(first, last)
+        .events()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(rows.last().unwrap().payload["messages"], json!(messages));
+
+    // Exercise a chain long enough to overflow recursive reconstruction without
+    // making capture repeatedly materialize every earlier input in this fixture.
+    storage
+        .write(move |tx| {
+            let encoded: Vec<u8> = tx.one("SELECT value FROM events WHERE id=?", [last])?;
+            let mut delta: serde_json::Value = serde_json::from_slice(&encoded)?;
+            delta["history"] = json!({"input_delta":[]});
+            let encoded = serde_json::to_vec(&delta)?;
+            let mut base = last;
+            for _ in 0..10_000 {
+                let id = base + 100_000;
+                tx.execute(
+                    "INSERT INTO events(id,control,value,base) VALUES(?,0,?,?)",
+                    rusqlite::params![id, encoded, base],
+                )?;
+                base = id;
+            }
+            tx.execute("UPDATE session SET event_tail=? WHERE id=1", [base])?;
+            super::event_history::remove_through(tx, base - 1)?;
+            let stored: Vec<u8> = tx.one(
+                "SELECT value FROM events WHERE id=? AND base IS NULL",
+                [base],
+            )?;
+            let recovered: crate::wire::RedactedEnvelope = serde_json::from_slice(&stored)?;
+            assert_eq!(recovered.payload["messages"], json!(messages));
+            assert_eq!(tx.one::<u64>("SELECT count(*) FROM events", [])?, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
