@@ -711,9 +711,9 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                     agent: args.agent,
                     additional_metadata: args
                         .additional_metadata
-                        .or_else(|| std::env::var("BRAINTRUST_ADDITIONAL_METADATA").ok()),
+                        .or_else(|| crate::env::var("BRAINTRUST_ADDITIONAL_METADATA")),
                     tags: if args.tags.is_empty() {
-                        std::env::var("BRAINTRUST_TAGS")
+                        crate::env::var("BRAINTRUST_TAGS")
                             .unwrap_or_default()
                             .split(',')
                             .filter(|s| !s.is_empty())
