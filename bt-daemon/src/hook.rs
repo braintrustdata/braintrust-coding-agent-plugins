@@ -111,7 +111,16 @@ pub async fn run_hook(args: HookArgs, route: SessionRoute, host: HostInfo) -> an
         if !settings.tracing_enabled() {
             return Ok(());
         }
-        run_hook_with_payload(args, settings.route.unwrap_or(route), host, payload).await
+        let selected = match settings.route {
+            Some(mut selected) => {
+                if selected.destination.is_none() {
+                    selected.destination = route.destination;
+                }
+                selected
+            }
+            None => route,
+        };
+        run_hook_with_payload(args, selected, host, payload).await
     }
     .await;
     if let Some(response) = response {
