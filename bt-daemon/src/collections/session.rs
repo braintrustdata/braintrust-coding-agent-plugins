@@ -203,7 +203,7 @@ impl SessionStorage {
                      continuation=coalesce(?,continuation) WHERE id=1",
                     params![input, new_tail, roots, state],
                 )?;
-                tx.execute("DELETE FROM events WHERE id<=?", [input])?;
+                super::event_history::remove_through(tx, input)?;
                 prune(tx)?;
                 super::store::touch(tx)?;
                 Ok((new_tail, positions))

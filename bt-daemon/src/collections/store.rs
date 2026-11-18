@@ -15,7 +15,7 @@ use weak_table::WeakValueHashMap;
 /// blobs. Schema 8 adds the event collection, replacing NDJSON capture, and
 /// one session row that makes each event-to-SpanOp handoff a single
 /// transaction.
-pub(super) const SCHEMA: u32 = 8;
+pub(super) const SCHEMA: u32 = 9;
 
 /// The current time in milliseconds, as SQL.
 pub(super) const NOW_MS: &str = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";

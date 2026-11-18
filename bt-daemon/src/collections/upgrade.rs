@@ -115,6 +115,12 @@ pub(super) fn migrate(db: &Connection) -> anyhow::Result<()> {
             CREATE INDEX captured_at ON captured(at_ms);",
         )?;
     }
+    if version < 9 {
+        db.execute_batch(
+            "ALTER TABLE events ADD COLUMN base INTEGER;
+                          CREATE INDEX event_base ON events(base) WHERE base IS NOT NULL;",
+        )?;
+    }
     if version < SCHEMA {
         // Opening an up-to-date store writes nothing, so it keeps its age.
         db.execute_batch(&format!("PRAGMA user_version={SCHEMA}"))?;

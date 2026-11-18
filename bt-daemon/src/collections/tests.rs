@@ -434,3 +434,101 @@ async fn compaction_returns_deleted_space_to_the_file_system() {
     assert_eq!(pragma("freelist_count"), 0);
     assert!(size() < bloated / 4, "{} of {bloated} bytes remain", size());
 }
+
+#[tokio::test]
+async fn pending_history_deltas_survive_pruning_and_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let storage = SessionStorage::at(&path).await.unwrap();
+    let message = "retained history ".repeat(1024);
+    let records = [
+        json!({"messages":[{"content":message}]}),
+        json!({"messages":[{"content":message},{"content":"second"}]}),
+        json!({"messages":[{"content":message},{"content":"second"},{"content":"third"}]}),
+        json!({"messages":[{"content":message},{"content":"edited"}]}),
+    ];
+    let mut ids = Vec::new();
+    for payload in &records {
+        let span = storage
+            .append(&event("debug", "session", "model", payload.clone()), None)
+            .await
+            .unwrap()
+            .unwrap();
+        ids.push(span.through);
+    }
+    let second = ids[1];
+    let stored: Vec<u8> = storage
+        .run(move |db| {
+            Ok(db.one(
+                "SELECT value FROM events WHERE id=? AND base IS NOT NULL",
+                [second],
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(stored.len() < 1024);
+    let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+    assert_eq!(
+        stored["history"],
+        json!({"input_delta":[{"content":"second"}]})
+    );
+
+    storage
+        .commit_translation(Translated {
+            input: ids[0],
+            observation: true,
+            ops: vec![],
+            roots: Default::default(),
+            state: None,
+        })
+        .await
+        .unwrap();
+    let first = ids[0];
+    let fourth = ids[3];
+    storage
+        .run(move |db| {
+            assert_eq!(
+                db.one::<u64>("SELECT count(*) FROM events WHERE id<=?", [first])?,
+                0
+            );
+            assert_eq!(
+                db.one::<u64>(
+                    "SELECT count(*) FROM events WHERE base IS NULL AND id IN (?,?)",
+                    [second, fourth]
+                )?,
+                2
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    drop(storage);
+
+    let storage = SessionStorage::at(&path).await.unwrap();
+    let pending: Vec<_> = storage
+        .read(first, fourth)
+        .events()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        pending
+            .into_iter()
+            .map(|event| event.payload)
+            .collect::<Vec<_>>(),
+        records[1..]
+    );
+    let from_middle: Vec<_> = storage
+        .read(second, fourth)
+        .events()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        from_middle
+            .into_iter()
+            .map(|event| event.payload)
+            .collect::<Vec<_>>(),
+        records[2..]
+    );
+}
