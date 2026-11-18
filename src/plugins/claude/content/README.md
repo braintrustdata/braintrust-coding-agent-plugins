@@ -33,7 +33,7 @@ Authenticate and install the published tracing plugin:
 
 ```bash
 bt login
-bt trace enable claude --project my-coding-agent
+bt trace setup claude --project my-coding-agent
 ```
 
 Setup adds the marketplace and installs or enables `trace-claude-code`.
@@ -66,7 +66,7 @@ Braintrust. Redaction cannot remove data that has already been delivered.
 
 ## Additional root metadata
 
-For a persistent route, pass a JSON object to `bt trace enable claude
+For a persistent route, pass a JSON object to `bt trace setup claude
 --additional-metadata '<JSON>'` to tag the root span of every Claude Code
 session. Standard session metadata takes precedence if keys conflict.
 
@@ -82,7 +82,7 @@ route. Tags can be persisted with setup, supplied to one invocation, or added
 while importing a transcript:
 
 ```bash
-bt trace enable claude --tag ci --tag release-validation
+bt trace setup claude --tag ci --tag release-validation
 bt trace run claude --tag ci -- "review this change"
 bt trace import claude session-id --tag historical-import
 ```

@@ -6,7 +6,7 @@ This plugin synchronously forwards Claude Code lifecycle payloads to:
 bt trace hook --source claude-code
 ```
 
-Use `bt trace enable claude --project <project>` to install and configure it.
+Use `bt trace setup claude --project <project>` to install and configure it.
 Claude Code directly executes the configured `bt` CLI for each hook; it does
 not launch a shell or an intermediate forwarding script. The plugin is
 credential-free; the `bt` CLI and shared daemon own authentication, event
@@ -18,7 +18,7 @@ This plugin supports Claude Code CLI and Claude Code mode in the desktop app.
 Cursor automatically imports installed Claude plugins when third-party imports
 are enabled. This plugin includes a Cursor manifest with no hooks so that
 Cursor uses the native Braintrust Cursor integration for tracing. Enable that
-integration with `bt trace enable cursor --project <project>`.
+integration with `bt trace setup cursor --project <project>`.
 
 It does not support the Cowork tab. Cowork executes hooks in a separate VM that
 does not inherit the host's `bt` binary, saved Braintrust route, or credentials,
@@ -26,9 +26,9 @@ so installing this plugin there does not enable tracing.
 
 To add fields to each root trace span, pass a JSON object (as
 `--additional-metadata` or `BRAINTRUST_ADDITIONAL_METADATA`) to
-`bt trace enable claude` for a persistent configuration, or to
+`bt trace setup claude` for a persistent configuration, or to
 `bt trace run claude` for one invocation. The hook itself never reads that
-environment variable — only `bt trace enable`, `bt trace run`, and
+environment variable — only `bt trace setup`, `bt trace run`, and
 `bt trace import` do.
 
 ## Tags and diagnostics
@@ -37,7 +37,7 @@ Use repeatable `--tag` flags for filterable root-span tags. Inspect the effectiv
 configuration with `doctor` and delivery state with `status`:
 
 ```bash
-bt trace enable claude --tag coding-agent --tag development
+bt trace setup claude --tag coding-agent --tag development
 bt trace doctor claude
 bt trace status
 ```

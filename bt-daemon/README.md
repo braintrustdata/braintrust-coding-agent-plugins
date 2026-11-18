@@ -146,7 +146,7 @@ Register both transforms persistently for ordinary Codex sessions. The
 redactor runs first and its returned span becomes the tagger's input:
 
 ```bash
-bt trace enable codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
+bt trace setup codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
 ```
 
 `run` and `import` plugins apply only to that command. They replace, rather than
@@ -228,12 +228,12 @@ or provide it for one invocation with `bt trace run`. Both accept
 `--additional-metadata` or `BRAINTRUST_ADDITIONAL_METADATA`:
 
 ```bash
-bt trace enable claude --additional-metadata '{"team":"platform"}'
+bt trace setup claude --additional-metadata '{"team":"platform"}'
 BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"'"$JOB_ID"'"}' \
   bt trace run codex -- "summarize this change"
 ```
 
-`bt trace enable`, `bt trace run`, and `bt trace import` are explicit,
+`bt trace setup`, `bt trace run`, and `bt trace import` are explicit,
 user-invoked commands, so all three accept routing (profile, organization,
 project, destination) and `additional_metadata` from either a flag or the
 matching `BRAINTRUST_*` environment variable, with the flag winning if both
@@ -251,7 +251,7 @@ span produced by a route. The option is available on persistent setup, one-off
 runs, and transcript imports.
 
 ```bash
-bt trace enable claude --tag ci --tag release-validation
+bt trace setup claude --tag ci --tag release-validation
 bt trace run codex --tag ci -- "summarize this change"
 bt trace import claude session-id --tag historical-import
 ```
@@ -265,8 +265,8 @@ BRAINTRUST_TAGS=ci,release-validation bt trace run codex -- "summarize this chan
 
 Use `bt trace disable <agent>` to pause tracing while keeping the plugin and settings.
 Use `bt trace enable <agent>` to resume, or `bt trace uninstall <agent>` to remove
-the plugin and its Braintrust settings. `bt trace setup <agent>` remains an alias for `bt trace
-enable <agent>` for backwards compatibility.
+the plugin and its Braintrust settings. Use `bt trace setup <agent>` to install or
+change the configuration.
 
 ## Build and test
 

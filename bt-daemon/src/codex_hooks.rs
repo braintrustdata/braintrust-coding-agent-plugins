@@ -90,7 +90,7 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
                 });
             anyhow::ensure!(
                 installed,
-                "Codex tracing plugin is not installed and enabled; rerun `bt trace enable codex`"
+                "Codex tracing plugin is not installed and enabled; rerun `bt trace setup codex`"
             );
             let hooks = request(
                 &mut stdin,

@@ -291,21 +291,6 @@ async fn resolve_command_route(
     Ok(route)
 }
 
-fn merge_saved_auth(mut selected: AuthSelection, saved: AuthSelection) -> AuthSelection {
-    let selected_profile = selected.source != AuthSource::Auto
-        || selected.profile_id.is_some()
-        || selected.profile.is_some();
-    if !selected_profile {
-        selected.source = saved.source;
-        selected.profile_id = saved.profile_id;
-        selected.profile = saved.profile;
-        if selected.org_name.is_none() {
-            selected.org_name = saved.org_name;
-        }
-    }
-    selected
-}
-
 fn print_output(output: TraceCommandOutput, format: OutputFormat) -> anyhow::Result<()> {
     println!("{}", output.render(format)?);
     Ok(())
@@ -542,7 +527,7 @@ async fn doctor_output_at(
 
     if !settings_present {
         warnings.push(format!(
-            "settings file is missing; run `bt trace enable {source}`"
+            "settings file is missing; run `bt trace setup {source}`"
         ));
     } else if !enabled {
         warnings.push(format!(
@@ -667,48 +652,28 @@ async fn doctor_output_at(
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
     match args.command {
         TraceCommand::Setup(enable_args) => {
-            let saved = crate::settings::AgentSettings::load_from(&paths::agent_settings_path(
-                enable_args.agent.identity().id,
-                None,
-            ))
-            .route;
-            let mut route = resolve_host_route(
+            let mut route = resolve_command_route(
                 &host,
                 RouteRequirements {
-                    destination_required: saved
-                        .as_ref()
-                        .and_then(|route| route.destination.as_ref())
-                        .is_none(),
+                    destination_required: true,
                     interactive_auth: true,
                     persistent_auth: true,
                 },
             )
             .await?;
-            if route.destination.is_none() {
-                if let Some(saved) = saved {
-                    route.destination = saved.destination;
-                    route.auth = merge_saved_auth(route.auth, saved.auth);
-                }
-            }
-            let lease = host
-                .services
-                .resolve_auth(&route.auth, AuthResolveReason::Initial)
-                .await?;
-            let org_name = require_resolved_org(&route, &lease)?;
-            route.auth = lease.selection;
-            route.auth.org_name = Some(org_name);
             apply_additional_metadata(&mut route, enable_args.additional_metadata.as_deref())?;
             apply_tags(&mut route, &enable_args.tags)?;
             if !enable_args.plugin.is_empty() {
                 route.span_plugins = resolve_span_plugin_paths(&enable_args.plugin)?;
             }
             let codex = matches!(enable_args.agent, SetupAgent::Codex);
-            let output = run_enable(enable_args, route)?;
+            let output = crate::run_setup(enable_args, route)?;
             if codex {
                 crate::codex_hooks::activate().await?;
             }
             print_output(output, host.output_format)
         }
+        TraceCommand::Enable(args) => print_output(run_enable(args.agent)?, host.output_format),
         TraceCommand::Disable(disable_args) => {
             print_output(run_disable(disable_args.agent)?, host.output_format)
         }
@@ -850,33 +815,6 @@ mod tests {
     use crate::{ImportArgs, ImportSource, RunArgs, RunSource, StatusArgs, TraceCommand};
     use std::path::PathBuf;
     use std::sync::Mutex;
-
-    #[test]
-    fn saved_auth_fills_only_unselected_credentials() {
-        let saved = AuthSelection {
-            source: AuthSource::SavedProfile,
-            profile: Some("old".into()),
-            org_name: Some("old-org".into()),
-            ..Default::default()
-        };
-        let selected = AuthSelection {
-            source: AuthSource::SavedProfile,
-            profile: Some("new".into()),
-            ..Default::default()
-        };
-        assert_eq!(merge_saved_auth(selected.clone(), saved.clone()), selected);
-        let org = AuthSelection {
-            org_name: Some("new-org".into()),
-            ..Default::default()
-        };
-        let merged = merge_saved_auth(org, saved.clone());
-        assert_eq!(merged.profile.as_deref(), Some("old"));
-        assert_eq!(merged.org_name.as_deref(), Some("new-org"));
-        assert_eq!(
-            merge_saved_auth(AuthSelection::default(), saved.clone()),
-            saved
-        );
-    }
 
     #[test]
     fn mounted_child_commands_preserve_the_host_prefix() {
@@ -1397,7 +1335,7 @@ mod tests {
             _: AuthResolveReason,
         ) -> anyhow::Result<AuthLease> {
             anyhow::bail!(
-                "saved profile ID 'daemon-only' no longer exists; run `bt trace enable` to select a profile"
+                "saved profile ID 'daemon-only' no longer exists; run `bt trace setup` to select a profile"
             )
         }
     }

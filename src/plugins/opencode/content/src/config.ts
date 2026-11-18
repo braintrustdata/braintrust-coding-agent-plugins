@@ -74,7 +74,7 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
     if (pluginConfig.org_name) defaults.orgName = pluginConfig.org_name;
     if (pluginConfig.project) defaults.projectName = pluginConfig.project;
     // A nested route is canonical. Top-level fields are a compatibility
-    // fallback only for files that `bt trace enable` has not migrated yet.
+    // fallback only for files that `bt trace setup` has not migrated yet.
     if (auth?.profile) defaults.profile = auth.profile;
     if (auth?.org_name) defaults.orgName = auth.org_name;
     if (

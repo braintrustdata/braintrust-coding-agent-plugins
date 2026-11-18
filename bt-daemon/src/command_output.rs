@@ -168,6 +168,7 @@ pub struct DoctorCommandOutput {
 pub enum TraceCommandOutput {
     Status(StatusCommandOutput),
     Doctor(Box<DoctorCommandOutput>),
+    Setup(SetupCommandOutput),
     Enable(SetupCommandOutput),
     Disable(SetupCommandOutput),
     Uninstall(SetupCommandOutput),
@@ -191,8 +192,21 @@ impl TraceCommandOutput {
         settings_path: impl Into<PathBuf>,
     ) -> Self {
         let source = source.into();
-        Self::Enable(SetupCommandOutput {
+        Self::Setup(SetupCommandOutput {
             source,
+            display_name: display_name.into(),
+            settings_path: settings_path.into(),
+            restart_required: true,
+        })
+    }
+
+    pub fn enable(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::Enable(SetupCommandOutput {
+            source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
@@ -315,10 +329,14 @@ impl TraceCommandOutput {
                 }
                 Ok(rendered)
             }
-            Self::Enable(setup) => Ok(format!(
+            Self::Setup(setup) => Ok(format!(
                 "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.",
                 setup.display_name,
                 setup.settings_path.display()
+            )),
+            Self::Enable(enable) => Ok(format!(
+                "Braintrust tracing is enabled for {} in {}.\nRestart the coding agent to apply the change.",
+                enable.display_name, enable.settings_path.display()
             )),
             Self::Disable(disable) => Ok(format!(
                 "Braintrust tracing is disabled for {} in {}.\nRestart the coding agent to apply the change.",
@@ -437,10 +455,22 @@ mod tests {
         );
         let rendered = output.render(OutputFormat::Json).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(value["command"], "enable");
+        assert_eq!(value["command"], "setup");
         assert_eq!(value["source"], "opencode");
         assert_eq!(value["restart_required"], true);
         assert!(!rendered.contains("installed for"));
+    }
+
+    #[test]
+    fn resume_output_reports_enable() {
+        let output = TraceCommandOutput::enable("pi", "Pi", PathBuf::from("braintrust.json"));
+        let json: serde_json::Value =
+            serde_json::from_str(&output.render(OutputFormat::Json).unwrap()).unwrap();
+        assert_eq!(json["command"], "enable");
+        assert!(output
+            .render(OutputFormat::Human)
+            .unwrap()
+            .contains("tracing is enabled"));
     }
 
     #[test]

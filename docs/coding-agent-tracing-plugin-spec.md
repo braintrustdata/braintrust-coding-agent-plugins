@@ -397,8 +397,10 @@ translator rather than separate trace builders.
 
 ### 8.1 Persistent setup
 
-`bt trace enable <agent>` MUST install or update capture idempotently and store
+`bt trace setup <agent>` MUST install or update capture idempotently and store
 only non-secret route settings. It MUST preserve unrelated user configuration.
+
+`bt trace enable <agent>` MUST resume an existing configuration without changing its route or reinstalling capture.
 
 `bt trace disable <agent>` MUST preserve the adapter and configuration while disabling tracing.
 `bt trace uninstall <agent>` MUST remove only Braintrust-managed state. Both MUST be safe when repeated.

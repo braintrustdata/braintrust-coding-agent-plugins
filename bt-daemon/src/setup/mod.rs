@@ -16,7 +16,7 @@ pub(crate) mod pi;
 
 use crate::agents::{registrar, Agent};
 use crate::paths;
-use crate::trace_command::{EnableArgs, SetupAgent};
+use crate::trace_command::{SetupAgent, SetupArgs};
 use crate::wire::SessionRoute;
 use crate::TraceCommandOutput;
 use anyhow::Context;
@@ -64,7 +64,7 @@ pub(crate) fn update_warning(source: &str) -> Option<String> {
 
 /// Install or refresh one agent's published tracing adapter and persist its
 /// non-secret route selection.
-pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<TraceCommandOutput> {
+pub fn run_setup(args: SetupArgs, route: SessionRoute) -> anyhow::Result<TraceCommandOutput> {
     let agent = adapter(args.agent);
     agent.enable(&mut SystemCommandRunner)?;
     let identity = agent.identity();
@@ -76,9 +76,40 @@ pub fn run_enable(args: EnableArgs, route: SessionRoute) -> anyhow::Result<Trace
     ))
 }
 
-/// Backwards-compatible library entry point for hosts that used the former setup name.
-pub fn run_setup(args: EnableArgs, route: SessionRoute) -> anyhow::Result<TraceCommandOutput> {
-    run_enable(args, route)
+/// Resume tracing without reinstalling the adapter or replacing its route.
+pub fn run_enable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
+    let identity = agent.identity();
+    let path = paths::agent_settings_path(identity.id, None);
+    enable_existing_at(&path)?;
+    Ok(TraceCommandOutput::enable(
+        identity.id,
+        identity.display_name,
+        path,
+    ))
+}
+
+fn enable_existing_at(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        anyhow::bail!(
+            "tracing is not configured at {}; run `bt trace setup` first",
+            path.display()
+        );
+    }
+    common::edit_object(path, FileAccess::OwnerOnly, |settings, exists| {
+        if !exists
+            || !settings
+                .get("trace_to_braintrust")
+                .is_some_and(Value::is_boolean)
+        {
+            anyhow::bail!(
+                "tracing is not configured at {}; run `bt trace setup` first",
+                path.display()
+            );
+        }
+        settings.insert("trace_to_braintrust".into(), Value::Bool(true));
+        settings.remove("tracing_disabled");
+        Ok(())
+    })
 }
 
 /// Disable tracing while retaining the installed adapter and saved route.
@@ -230,7 +261,7 @@ mod tests {
         let path = temp.path().join("braintrust.json");
         std::fs::write(
             &path,
-            r#"{"trace_to_braintrust":true,"route":{"tags":["saved"]},"custom":1}"#,
+            r#"{"trace_to_braintrust":true,"route":{"auth":{"profile":"saved-profile","org_name":"saved-org"},"destination":{"type":"project_logs","project_name":"saved-project"},"tags":["saved"],"span_plugins":["/tmp/plugin.js"]},"custom":1}"#,
         )
         .unwrap();
         disable_tracing_at(&path).unwrap();
@@ -240,12 +271,15 @@ mod tests {
         assert_eq!(value["tracing_disabled"], true);
         assert_eq!(value["route"]["tags"][0], "saved");
         assert_eq!(value["custom"], 1);
-        enable_tracing_at(&path, SessionRoute::default()).unwrap();
+        enable_existing_at(&path).unwrap();
         let enabled: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(enabled["trace_to_braintrust"], true);
         assert!(enabled.get("tracing_disabled").is_none());
-        assert_eq!(enabled["route"]["tags"][0], "saved");
+        assert_eq!(enabled["route"], value["route"]);
+        assert_eq!(enabled["custom"], value["custom"]);
         let missing = temp.path().join("missing/braintrust.json");
+        assert!(enable_existing_at(&missing).is_err());
+        assert!(!missing.exists());
         disable_tracing_at(&missing).unwrap();
         let created: Value = serde_json::from_slice(&std::fs::read(&missing).unwrap()).unwrap();
         assert_eq!(created["tracing_disabled"], true);

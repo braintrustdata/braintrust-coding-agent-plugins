@@ -20,9 +20,10 @@ pub struct TraceArgs {
 // clearer than boxing individual command variants for stack-size savings.
 #[allow(clippy::large_enum_variant)]
 pub enum TraceCommand {
-    /// Install or enable the published Braintrust tracing plugin for a coding agent.
-    #[command(name = "enable", alias = "setup")]
-    Setup(EnableArgs),
+    /// Install and configure the Braintrust tracing plugin for a coding agent.
+    Setup(SetupArgs),
+    /// Resume tracing with the existing configuration.
+    Enable(EnableArgs),
     /// Disable tracing while preserving the plugin and its configuration.
     Disable(DisableArgs),
     /// Uninstall the tracing plugin and remove its saved configuration.
@@ -94,7 +95,7 @@ impl DoctorAgent {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct EnableArgs {
+pub struct SetupArgs {
     #[command(subcommand)]
     pub agent: SetupAgent,
     /// JSON object persisted in this agent's tracing route and merged into root-span metadata.
@@ -114,8 +115,11 @@ pub struct EnableArgs {
     pub plugin: Vec<PathBuf>,
 }
 
-/// Backwards-compatible API name for hosts that mounted the former setup command.
-pub type SetupArgs = EnableArgs;
+#[derive(Debug, Clone, Args)]
+pub struct EnableArgs {
+    #[command(subcommand)]
+    pub agent: SetupAgent,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct DisableArgs {
@@ -353,8 +357,8 @@ mod tests {
 
     #[test]
     fn antigravity_uses_shared_enable_and_disable_commands() {
-        for command in ["enable", "setup"] {
-            let parsed = Cli::try_parse_from(["bt", command, "antigravity"]).unwrap();
+        {
+            let parsed = Cli::try_parse_from(["bt", "setup", "antigravity"]).unwrap();
             assert!(matches!(
                 parsed.trace.command,
                 TraceCommand::Setup(SetupArgs {
@@ -377,8 +381,8 @@ mod tests {
 
     #[test]
     fn grok_uses_shared_enable_and_disable_commands() {
-        for command in ["enable", "setup"] {
-            let parsed = Cli::try_parse_from(["bt", command, "grok"]).unwrap();
+        {
+            let parsed = Cli::try_parse_from(["bt", "setup", "grok"]).unwrap();
             assert!(matches!(
                 parsed.trace.command,
                 TraceCommand::Setup(SetupArgs {
@@ -395,6 +399,18 @@ mod tests {
                 agent: SetupAgent::Grok
             })
         ));
+    }
+
+    #[test]
+    fn enable_only_accepts_an_agent() {
+        let parsed = Cli::try_parse_from(["bt", "enable", "pi"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Enable(EnableArgs {
+                agent: SetupAgent::Pi
+            })
+        ));
+        assert!(Cli::try_parse_from(["bt", "enable", "pi", "--tag", "changed"]).is_err());
     }
 
     #[test]

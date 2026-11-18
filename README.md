@@ -33,7 +33,7 @@ then authenticate and enable tracing. For example:
 
 ```bash
 bt login
-bt trace enable claude --project my-coding-agent
+bt trace setup claude --project my-coding-agent
 ```
 
 Replace `claude` with your agent's CLI name below. Restart the agent after
@@ -41,7 +41,7 @@ setup and follow any plugin or hook trust prompts.
 
 ## Supported agents
 
-All six support `bt trace enable`, `update`, `disable`, and `doctor`.
+All six support `bt trace setup`, `enable`, `update`, `disable`, and `doctor`.
 
 | Agent and setup guide | CLI name | One-off traced run | Import / live attach | Distribution |
 |---|---|---|---|---|

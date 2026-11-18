@@ -18,7 +18,7 @@ Install:
 
 ```bash
 bt login
-bt trace enable grok --project my-coding-agent
+bt trace setup grok --project my-coding-agent
 ```
 
 Setup installs and enables the published plugin and saves non-secret routing
