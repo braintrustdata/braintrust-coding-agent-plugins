@@ -106,6 +106,73 @@ fn standalone_hook_exit_status_distinguishes_capture_failures_from_disabled_trac
 }
 
 #[test]
+fn all_hook_integrations_honor_pause_and_managed_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = temp.path().join("braintrust.json");
+    std::fs::write(
+        &settings,
+        r#"{"trace_to_braintrust":false,"tracing_disabled":true}"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    let socket = temp.path().join("absent.sock");
+    #[cfg(windows)]
+    let socket = std::path::PathBuf::from(format!(
+        r"\\.\pipe\missing-bt-daemon-{}",
+        uuid::Uuid::new_v4()
+    ));
+    for source in [
+        "antigravity",
+        "claude-code",
+        "codex",
+        "cursor",
+        "grok",
+        "muse",
+    ] {
+        for managed in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_bt-daemon"));
+            command
+                .args(["hook", "--source", source, "--no-spawn", "--socket"])
+                .arg(&socket)
+                .env("BRAINTRUST_DAEMON_CONFIG", &settings)
+                .env_remove("BT_TRACE_INVOCATION_SETTINGS")
+                .env_remove("_BT_TRACE_MANAGED_RUN")
+                .env_remove("CURSOR_PLUGIN_ROOT")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if managed {
+                command.env("BT_TRACE_INVOCATION_SETTINGS", r#"{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"test"}}}"#);
+            }
+            let mut child = command.spawn().unwrap();
+            let _ = child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"session_id":"test","hook_event_name":"SessionStart"}"#);
+            let output = child.wait_with_output().unwrap();
+            if managed {
+                assert!(
+                    !output.status.success(),
+                    "{source}: managed run did not attempt capture"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("--no-spawn is set"),
+                    "{source}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{source}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn standalone_hook_honors_deprecated_bt_env_names() {
     let temp = tempfile::tempdir().unwrap();
     let old_config = temp.path().join("old.json");

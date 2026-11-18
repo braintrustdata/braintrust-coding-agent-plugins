@@ -20,9 +20,7 @@ export async function readPluginConfig(input: {
     for (const [index, configPath] of configPaths.entries()) {
       try {
         if (fs.existsSync(configPath)) {
-          const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as PluginConfig & {
-            tracing_disabled?: boolean;
-          };
+          const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as PluginConfig;
           if (index === 0) globallyDisabled = parsed.tracing_disabled === true;
           pluginConfig = pluginConfig ? { ...pluginConfig, ...parsed } : parsed;
         }
@@ -30,7 +28,7 @@ export async function readPluginConfig(input: {
         // Malformed optional config is fail-open; continue to the next layer.
       }
     }
-    if (globallyDisabled) pluginConfig = { ...pluginConfig, trace_to_braintrust: false };
+    if (pluginConfig) pluginConfig.tracing_disabled = globallyDisabled;
   } catch {
     // Config loading failed; invocation settings can still enable tracing.
   }

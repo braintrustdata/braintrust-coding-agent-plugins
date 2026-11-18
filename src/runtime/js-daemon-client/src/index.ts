@@ -22,6 +22,7 @@ export interface DaemonSessionRoute {
 
 export interface DaemonTraceSettings {
   trace_to_braintrust?: boolean
+  tracing_disabled?: boolean
   route?: DaemonSessionRoute
 }
 
@@ -56,7 +57,11 @@ export function resolveDaemonTraceSettings(
   env: NodeJS.ProcessEnv = process.env,
 ): DaemonTraceSettings {
   const raw = env.BT_TRACE_INVOCATION_SETTINGS
-  if (raw === undefined) return persistent
+  if (raw === undefined) {
+    return persistent.tracing_disabled === true
+      ? { ...persistent, trace_to_braintrust: false }
+      : persistent
+  }
   try {
     const invocation = JSON.parse(raw) as DaemonTraceSettings
     if (

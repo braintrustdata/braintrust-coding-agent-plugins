@@ -22,6 +22,7 @@ export interface PluginConfig {
   org_name?: string;
   project?: string;
   trace_to_braintrust?: boolean;
+  tracing_disabled?: boolean;
   enable_tools?: boolean;
   debug?: boolean;
   additional_metadata?: Record<string, unknown>;
@@ -113,6 +114,7 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
     persistentRoute.additional_metadata = defaults.additionalMetadata;
   const traceSettings = resolveDaemonTraceSettings({
     trace_to_braintrust: defaults.tracingEnabled,
+    tracing_disabled: pluginConfig?.tracing_disabled,
     route: persistentRoute,
   });
   const route = traceSettings.route ?? persistentRoute;

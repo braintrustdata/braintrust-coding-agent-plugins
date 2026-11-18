@@ -109,7 +109,8 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
   config.showTraceLink = boolean(process.env.BRAINTRUST_SHOW_TRACE_LINK) ?? config.showTraceLink;
 
   const traceSettings = resolveDaemonTraceSettings({
-    trace_to_braintrust: userConfig?.tracing_disabled === true ? false : config.enabled,
+    trace_to_braintrust: config.enabled,
+    tracing_disabled: userConfig?.tracing_disabled === true,
     route: config.route,
   });
   config.enabled = traceSettings.trace_to_braintrust === true;
