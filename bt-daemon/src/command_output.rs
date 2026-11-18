@@ -170,6 +170,7 @@ pub enum TraceCommandOutput {
     Doctor(Box<DoctorCommandOutput>),
     Enable(SetupCommandOutput),
     Disable(SetupCommandOutput),
+    Uninstall(SetupCommandOutput),
     Update(UpdateCommandOutput),
     Stop(StopCommandOutput),
     Import { summaries: Vec<ImportSummary> },
@@ -212,6 +213,19 @@ impl TraceCommandOutput {
         settings_path: impl Into<PathBuf>,
     ) -> Self {
         Self::Disable(SetupCommandOutput {
+            source: source.into(),
+            display_name: display_name.into(),
+            settings_path: settings_path.into(),
+            restart_required: true,
+        })
+    }
+
+    pub fn uninstall(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::Uninstall(SetupCommandOutput {
             source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
@@ -307,9 +321,13 @@ impl TraceCommandOutput {
                 setup.settings_path.display()
             )),
             Self::Disable(disable) => Ok(format!(
-                "The Braintrust tracing plugin and configuration were removed for {} from {}.\nRestart the coding agent to apply the change.",
+                "Braintrust tracing is disabled for {} in {}.\nRestart the coding agent to apply the change.",
                 disable.display_name,
                 disable.settings_path.display()
+            )),
+            Self::Uninstall(uninstall) => Ok(format!(
+                "The Braintrust tracing plugin and configuration were removed for {} from {}.\nRestart the coding agent to apply the change.",
+                uninstall.display_name, uninstall.settings_path.display()
             )),
             Self::Update(update) => Ok(format!(
                 "The Braintrust tracing plugin was updated for {}.\nRestart the coding agent to load the update.",
@@ -438,7 +456,7 @@ mod tests {
         assert!(output
             .render(OutputFormat::Human)
             .unwrap()
-            .contains("removed for Google Antigravity"));
+            .contains("disabled for Google Antigravity"));
     }
 
     #[test]

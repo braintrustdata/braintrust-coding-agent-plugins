@@ -102,7 +102,7 @@ impl AgentSettings {
         settings
     }
 
-    fn load_from(path: &Path) -> Self {
+    pub(crate) fn load_from(path: &Path) -> Self {
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Self::default(),

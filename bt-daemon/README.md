@@ -263,8 +263,9 @@ one of those commands:
 BRAINTRUST_TAGS=ci,release-validation bt trace run codex -- "summarize this change"
 ```
 
-Use `bt trace disable <agent>` to remove the installed tracing plugin and its
-Braintrust settings. `bt trace setup <agent>` remains an alias for `bt trace
+Use `bt trace disable <agent>` to pause tracing while keeping the plugin and settings.
+Use `bt trace enable <agent>` to resume, or `bt trace uninstall <agent>` to remove
+the plugin and its Braintrust settings. `bt trace setup <agent>` remains an alias for `bt trace
 enable <agent>` for backwards compatibility.
 
 ## Build and test

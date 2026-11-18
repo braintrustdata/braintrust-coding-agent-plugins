@@ -400,8 +400,8 @@ translator rather than separate trace builders.
 `bt trace enable <agent>` MUST install or update capture idempotently and store
 only non-secret route settings. It MUST preserve unrelated user configuration.
 
-`bt trace disable <agent>` MUST remove only Braintrust-managed state and MUST be
-safe when repeated.
+`bt trace disable <agent>` MUST preserve the adapter and configuration while disabling tracing.
+`bt trace uninstall <agent>` MUST remove only Braintrust-managed state. Both MUST be safe when repeated.
 
 Doctor/status output SHOULD diagnose:
 
@@ -611,7 +611,7 @@ features that require native evidence remain conditional under section 3.
 | 4. Correlation        | CORR-01  | Cross-agent parent-child linking            | Process ancestry and native evidence can link child coding-agent sessions beneath spawning tools, including concurrent, recursive, and restart cases, while ambiguity fails safe.      |
 | 4. Operations         | OPS-01   | Daemon status and delivery diagnostics      | Operators can inspect daemon reachability, active sessions, pending delivery, last error, compatibility, and permalink without exposing credentials or payloads.                       |
 | 4. Operations         | OPS-02   | Opt-in sensitive diagnostics                | Raw event and transcript diagnostics are private, bounded, clearly documented as sensitive, and disabled unless explicitly requested.                                                  |
-| 5. Product            | SETUP-01 | Persistent enable and disable               | Setup installs or updates capture idempotently, stores only non-secret routing, preserves unrelated configuration, and removes only Braintrust-managed state.                          |
+| 5. Product            | SETUP-01 | Persistent enable and disable               | Setup installs or updates capture idempotently, stores only non-secret routing, preserves unrelated configuration, and supports disabling and uninstalling.                          |
 | 5. Product            | SETUP-02 | Agent-specific doctor/status                | Diagnostics cover agent installation, capture activation, plugin and daemon compatibility, route validity, credential availability, and restart or reload requirements.                |
 | 5. Product            | RUN-01   | Invocation-local managed run                | One process tree receives an isolated route and temporary capture without mutating persistent configuration or duplicating inherited capture.                                          |
 | 5. Product            | HIST-01  | Historical transcript import                | Stable native sessions can be located safely and replayed through the production translator with project, experiment, or parent overrides.                                             |

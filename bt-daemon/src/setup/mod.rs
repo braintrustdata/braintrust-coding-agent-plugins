@@ -81,14 +81,35 @@ pub fn run_setup(args: EnableArgs, route: SessionRoute) -> anyhow::Result<TraceC
     run_enable(args, route)
 }
 
-/// Uninstall an agent's tracing adapter and remove its Braintrust-owned settings.
+/// Disable tracing while retaining the installed adapter and saved route.
 pub fn run_disable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
+    let identity = agent.identity();
+    let path = paths::agent_settings_path(identity.id, None);
+    disable_tracing_at(&path)?;
+    Ok(TraceCommandOutput::disable(
+        identity.id,
+        identity.display_name,
+        path,
+    ))
+}
+
+fn disable_tracing_at(path: &Path) -> anyhow::Result<()> {
+    common::edit_object(path, FileAccess::OwnerOnly, |settings, exists| {
+        if exists {
+            settings.insert("trace_to_braintrust".into(), Value::Bool(false));
+        }
+        Ok(())
+    })
+}
+
+/// Uninstall an agent's tracing adapter and remove its Braintrust-owned settings.
+pub fn run_uninstall(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
     let agent = adapter(agent);
     let adapter_result = agent.disable(&mut SystemCommandRunner);
     let identity = agent.identity();
     let settings_path = paths::agent_settings_path(identity.id, None);
     finish_disable(adapter_result, &settings_path)?;
-    Ok(TraceCommandOutput::disable(
+    Ok(TraceCommandOutput::uninstall(
         identity.id,
         identity.display_name,
         settings_path,
@@ -201,6 +222,26 @@ mod tests {
         ] {
             assert_eq!(adapter(agent).identity().id, agent.identity().id);
         }
+    }
+
+    #[test]
+    fn disable_preserves_route_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        std::fs::write(
+            &path,
+            r#"{"trace_to_braintrust":true,"route":{"tags":["saved"]},"custom":1}"#,
+        )
+        .unwrap();
+        disable_tracing_at(&path).unwrap();
+        disable_tracing_at(&path).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["trace_to_braintrust"], false);
+        assert_eq!(value["route"]["tags"][0], "saved");
+        assert_eq!(value["custom"], 1);
+        let missing = temp.path().join("missing/braintrust.json");
+        disable_tracing_at(&missing).unwrap();
+        assert!(!missing.exists());
     }
 
     #[test]

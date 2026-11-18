@@ -80,7 +80,7 @@ pub use server::{
     braintrust_serve_options, debug_serve_options, run_serve, AuthLease, AuthProvider,
     AuthResolveReason, ServeOptions,
 };
-pub use setup::{run_disable, run_enable, run_setup, run_update};
+pub use setup::{run_disable, run_enable, run_setup, run_uninstall, run_update};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
 pub use trace_command::{
     DisableArgs, DoctorAgent, DoctorArgs, EnableArgs, SetupAgent, SetupArgs, StopArgs, TraceArgs,

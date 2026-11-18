@@ -652,15 +652,36 @@ async fn doctor_output_at(
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
     match args.command {
         TraceCommand::Setup(enable_args) => {
-            let mut route = resolve_command_route(
+            let saved = crate::settings::AgentSettings::load_from(&paths::agent_settings_path(
+                enable_args.agent.identity().id,
+                None,
+            ))
+            .route;
+            let mut route = resolve_host_route(
                 &host,
                 RouteRequirements {
-                    destination_required: true,
+                    destination_required: saved
+                        .as_ref()
+                        .and_then(|route| route.destination.as_ref())
+                        .is_none(),
                     interactive_auth: true,
                     persistent_auth: true,
                 },
             )
             .await?;
+            if route.destination.is_none() {
+                if let Some(saved) = saved {
+                    route.destination = saved.destination;
+                    route.auth = saved.auth;
+                }
+            }
+            let lease = host
+                .services
+                .resolve_auth(&route.auth, AuthResolveReason::Initial)
+                .await?;
+            let org_name = require_resolved_org(&route, &lease)?;
+            route.auth = lease.selection;
+            route.auth.org_name = Some(org_name);
             apply_additional_metadata(&mut route, enable_args.additional_metadata.as_deref())?;
             apply_tags(&mut route, &enable_args.tags)?;
             if !enable_args.plugin.is_empty() {
@@ -675,6 +696,9 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         }
         TraceCommand::Disable(disable_args) => {
             print_output(run_disable(disable_args.agent)?, host.output_format)
+        }
+        TraceCommand::Uninstall(args) => {
+            print_output(crate::run_uninstall(args.agent)?, host.output_format)
         }
         TraceCommand::Update(update_args) => {
             let codex = matches!(update_args.agent, SetupAgent::Codex);

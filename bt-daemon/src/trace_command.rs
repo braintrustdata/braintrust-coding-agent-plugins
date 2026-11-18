@@ -23,8 +23,10 @@ pub enum TraceCommand {
     /// Install or enable the published Braintrust tracing plugin for a coding agent.
     #[command(name = "enable", alias = "setup")]
     Setup(EnableArgs),
-    /// Uninstall the Braintrust tracing plugin and remove its saved configuration.
+    /// Disable tracing while preserving the plugin and its configuration.
     Disable(DisableArgs),
+    /// Uninstall the tracing plugin and remove its saved configuration.
+    Uninstall(DisableArgs),
     /// Update an already installed Braintrust tracing plugin without changing its configuration.
     Update(UpdateArgs),
     /// Run the tracing daemon (foreground).
@@ -391,6 +393,17 @@ mod tests {
             parsed.trace.command,
             TraceCommand::Disable(DisableArgs {
                 agent: SetupAgent::Grok
+            })
+        ));
+    }
+
+    #[test]
+    fn uninstall_accepts_an_agent() {
+        let parsed = Cli::try_parse_from(["bt", "uninstall", "pi"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Uninstall(DisableArgs {
+                agent: SetupAgent::Pi
             })
         ));
     }
