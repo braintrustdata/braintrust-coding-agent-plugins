@@ -498,6 +498,7 @@ async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace()
             json!({"type":"user","timestamp":"2026-01-01T00:00:01Z","sessionId":"claude-parent","message":{"content":"delegate"}}),
             json!({"type":"assistant","timestamp":"2026-01-01T00:00:02Z","sessionId":"claude-parent","message":{"id":"main-call","model":"claude-test","content":[{"type":"tool_use","id":"spawn-call","name":"Agent","input":{"subagent_type":"reviewer"}}],"usage":{"input_tokens":3,"output_tokens":1}}}),
             json!({"type":"user","timestamp":"2026-01-01T00:00:05Z","sessionId":"claude-parent","toolUseResult":{"agentId":"child-a"},"message":{"content":[{"type":"tool_result","tool_use_id":"spawn-call","content":"reviewed"}]}}),
+            json!({"type":"api-request-blob","sessionId":"claude-parent","message":{"id":"main-call","content":[{"type":"tool_use","id":"spawn-call","name":"Agent","input":{"subagent_type":"reviewer"}}]}}),
             json!({"type":"assistant","timestamp":"2026-01-01T00:00:06Z","sessionId":"claude-parent","message":{"id":"main-final","model":"claude-test","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":4,"output_tokens":1}}}),
         ],
     );
@@ -561,6 +562,7 @@ async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace()
         child_merge.pointer("/Merge/output").and_then(Value::as_str),
         Some("The review report delivered to the caller.")
     );
+    assert!(child_merge.pointer("/Merge/end_ms").is_some());
     let handback_tool = inserts
         .iter()
         .find(|row| row.get("name").and_then(Value::as_str) == Some("SubagentHandback"))
