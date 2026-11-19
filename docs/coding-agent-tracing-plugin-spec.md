@@ -397,18 +397,23 @@ translator rather than separate trace builders.
 
 ### 8.1 Persistent setup
 
-`bt trace setup <agent>` MUST install or update capture idempotently and store
+`bt trace install <agent>` (with `setup` as an alias) MUST install or update capture idempotently and store
 only non-secret route settings. It MUST preserve unrelated user configuration.
 
 `bt trace enable <agent>` MUST resume an existing configuration without changing its route or reinstalling capture when no settings are explicitly supplied. If configuration is absent or settings are explicitly supplied, enable MUST run setup.
 
 Setup, enable, and disable support user and project scope. Project settings overlay
 user settings field by field; managed-run settings take precedence over both.
-Project setup writes only explicitly selected fields and enables tracing without
-installing a global adapter. Project files cannot select executable span plugins.
+Project install writes only explicitly selected fields and enables tracing without
+installing a global adapter. It MUST explain that each user needs a user-level
+installation and credentials. `install --disable` installs the user integration
+with tracing disabled by default. Project objects merge recursively and arrays
+replace inherited arrays. Project files cannot select executable span plugins.
 
 `bt trace disable <agent>` MUST preserve the adapter and configuration while disabling tracing.
 `bt trace uninstall <agent>` MUST remove only Braintrust-managed state. Both MUST be safe when repeated.
+
+Doctor SHOULD include the current repository settings and effective values.
 
 Doctor/status output SHOULD diagnose:
 

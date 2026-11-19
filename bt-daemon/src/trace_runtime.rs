@@ -501,16 +501,63 @@ fn daemon_warnings(
 
 async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorCommandOutput {
     let source = args.agent.identity().id;
-    let settings = crate::settings::AgentSettings::load(source);
+    let resolved = std::env::current_dir().and_then(|cwd| {
+        crate::settings::AgentSettings::load_for_directory(source, &cwd)
+            .map_err(std::io::Error::other)
+    });
+    let (settings, project_path, error) = match resolved {
+        Ok((settings, path)) => (settings, path, None),
+        Err(error) => (
+            crate::settings::AgentSettings::default(),
+            None,
+            Some(error.to_string()),
+        ),
+    };
     let socket = paths::socket_path(None);
-    doctor_output_at(
+    let mut output = doctor_output_at(
         host,
         args,
         &socket,
         paths::agent_settings_path(source, None),
         settings,
     )
-    .await
+    .await;
+    if let Some(path) = project_path {
+        fn collect_fields(prefix: &str, value: &serde_json::Value, fields: &mut Vec<String>) {
+            if let Some(object) = value.as_object().filter(|object| !object.is_empty()) {
+                for (key, child) in object {
+                    let name = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    collect_fields(&name, child, fields);
+                }
+            } else {
+                fields.push(prefix.to_owned());
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str(&raw) {
+                collect_fields("", &value, &mut output.project_settings_fields);
+            }
+        }
+        output.project_settings_path = Some(path);
+        if output.route_source == "settings_file" {
+            output.route_source = if output.settings_present {
+                "user_and_project_settings"
+            } else {
+                "project_settings"
+            }
+            .into();
+        }
+    }
+    if let Some(error) = error {
+        output
+            .warnings
+            .push(format!("effective settings could not be read: {error}"));
+    }
+    output
 }
 
 async fn doctor_output_at(
@@ -638,6 +685,8 @@ async fn doctor_output_at(
         display_name: args.agent.identity().display_name.into(),
         settings_path,
         settings_present,
+        project_settings_path: None,
+        project_settings_fields: Vec::new(),
         enabled,
         route_source,
         route,
@@ -749,6 +798,7 @@ pub async fn run_trace_with_matches(
                     || has_explicit
                 {
                     let setup = crate::SetupArgs {
+                        disable: false,
                         scope: args.scope,
                         agent: args.agent,
                         additional_metadata: args.additional_metadata,
@@ -767,6 +817,7 @@ pub async fn run_trace_with_matches(
                 print_output(run_enable(args.agent)?, host.output_format)
             } else {
                 let setup = crate::SetupArgs {
+                    disable: false,
                     scope: args.scope,
                     agent: args.agent,
                     additional_metadata: args
@@ -899,16 +950,83 @@ pub async fn run_trace_with_matches(
         }
         TraceCommand::Run(run_args) => {
             run_args.validate_parent()?;
-            let mut route = resolve_command_route(
-                &host,
-                RouteRequirements {
-                    destination_required: run_args.parent.is_none(),
-                    interactive_auth: true,
-                    persistent_auth: false,
-                },
-            )
-            .await?;
+            let requirements = RouteRequirements {
+                destination_required: run_args.parent.is_none(),
+                interactive_auth: true,
+                persistent_auth: false,
+            };
+            let inherited = if run_args.inherit {
+                crate::settings::AgentSettings::load_for_directory(
+                    run_args.source.identity().id,
+                    &std::env::current_dir()?,
+                )?
+                .0
+                .route
+            } else {
+                None
+            };
+            let mut route = if let Some(mut route) = inherited {
+                if let Some(profile) = &selection.auth.profile {
+                    route.auth.source = crate::wire::AuthSource::SavedProfile;
+                    route.auth.profile_id = None;
+                    route.auth.profile = Some(profile.clone());
+                }
+                if let Some(org) = &selection.auth.org_name {
+                    route.auth.org_name = Some(org.clone());
+                }
+                if let Some(project) = &selection.project_name {
+                    route.destination = Some(crate::wire::TraceDestination::ProjectLogs {
+                        project_id: None,
+                        project_name: Some(project.clone()),
+                    });
+                }
+                let needs_auth = route.auth.source == crate::wire::AuthSource::Auto
+                    && route.auth.profile.is_none()
+                    && route.auth.profile_id.is_none();
+                let needs_destination = route.destination.is_none() && run_args.parent.is_none();
+                if needs_auth || needs_destination {
+                    let defaults = resolve_host_route(
+                        &host,
+                        RouteRequirements {
+                            destination_required: needs_destination,
+                            ..requirements
+                        },
+                    )
+                    .await?;
+                    if needs_auth {
+                        let selected_org = route.auth.org_name.take();
+                        route.auth = defaults.auth;
+                        if selected_org.is_some() {
+                            route.auth.org_name = selected_org;
+                        }
+                    }
+                    if needs_destination {
+                        route.destination = defaults.destination;
+                    }
+                }
+                let lease = host
+                    .services
+                    .resolve_auth(&route.auth, AuthResolveReason::Initial)
+                    .await?;
+                let org = require_resolved_org(&route, &lease)?;
+                route.auth = lease.selection;
+                route.auth.org_name = Some(org);
+                route
+            } else {
+                resolve_command_route(&host, requirements).await?
+            };
+            let inherited_metadata = if run_args.inherit {
+                route.additional_metadata.take()
+            } else {
+                None
+            };
             apply_additional_metadata(&mut route, run_args.additional_metadata.as_deref())?;
+            if let Some(mut metadata) = inherited_metadata {
+                if let Some(overlay) = route.additional_metadata.take() {
+                    crate::settings::merge_json(&mut metadata, overlay);
+                }
+                route.additional_metadata = Some(metadata);
+            }
             apply_tags(&mut route, &run_args.tags)?;
             let hook_command = child_command(&host.command, "hook");
             let status =
@@ -1279,6 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn setup_and_run_request_a_destination_only_when_needed() {
         let run = RunArgs {
+            inherit: false,
             source: RunSource::Codex,
             parent: None,
             additional_metadata: None,
@@ -1296,6 +1415,7 @@ mod tests {
         for (command, persistent_auth, destination_required) in [
             (
                 TraceCommand::Setup(SetupArgs {
+                    disable: false,
                     scope: SettingsScope::User,
                     agent: SetupAgent::OpenCode,
                     additional_metadata: None,
@@ -1338,6 +1458,7 @@ mod tests {
         )
         .unwrap();
         let args = RunArgs {
+            inherit: false,
             source: RunSource::Claude,
             parent: Some(parent),
             additional_metadata: None,

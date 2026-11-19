@@ -146,6 +146,35 @@ describe("BraintrustPlugin", () => {
     expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
   });
 
+  it("recursively merges project metadata and replaces arrays", async () => {
+    const global = join(directory, ".config", "opencode");
+    const project = join(directory, ".opencode");
+    mkdirSync(global, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(
+      join(global, "braintrust.json"),
+      JSON.stringify({
+        trace_to_braintrust: false,
+        route: {
+          destination: { type: "project_logs", project_name: "global" },
+          additional_metadata: { nested: { a: 1, b: 2 }, list: [1, 2] },
+        },
+      }),
+    );
+    writeFileSync(
+      join(project, "braintrust.json"),
+      JSON.stringify({
+        trace_to_braintrust: true,
+        route: { additional_metadata: { nested: { b: 3 }, list: [4] } },
+      }),
+    );
+    const { readPluginConfig } = await import("./tracing/plugin");
+    const { loadConfig } = await import("./config");
+    const config = loadConfig(await readPluginConfig({ directory }));
+    expect(config.tracingEnabled).toBe(true);
+    expect(config.route.additional_metadata).toEqual({ nested: { a: 1, b: 3 }, list: [4] });
+  });
+
   it("inherits the user route while applying explicit project selections", async () => {
     const global = join(directory, ".config", "opencode");
     const project = join(directory, ".opencode");

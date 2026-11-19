@@ -21,6 +21,7 @@ pub struct TraceArgs {
 #[allow(clippy::large_enum_variant)]
 pub enum TraceCommand {
     /// Install and configure the Braintrust tracing plugin for a coding agent.
+    #[command(name = "install", visible_alias = "setup")]
     Setup(SetupArgs),
     /// Enable tracing, setting it up when needed or when settings are supplied.
     Enable(EnableArgs),
@@ -103,6 +104,9 @@ pub enum SettingsScope {
 
 #[derive(Debug, Clone, Args)]
 pub struct SetupArgs {
+    /// Install with tracing disabled until explicitly enabled.
+    #[arg(long, global = true)]
+    pub disable: bool,
     /// Where the tracing settings are stored.
     #[arg(long, global = true, value_enum, default_value_t = SettingsScope::User)]
     pub scope: SettingsScope,
@@ -339,6 +343,7 @@ mod tests {
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Run(RunArgs {
+                inherit: false,
                 source: crate::RunSource::Cursor,
                 parent: Some(ref parent),
                 ref agent_args,
@@ -397,7 +402,7 @@ mod tests {
             })
         ));
 
-        assert!(Cli::try_parse_from(["bt", "setup", "antigravity", "--disable"]).is_err());
+        assert!(Cli::try_parse_from(["bt", "install", "antigravity", "--disable"]).is_ok());
     }
 
     #[test]
@@ -425,7 +430,7 @@ mod tests {
 
     #[test]
     fn scoped_commands_accept_project_before_or_after_agent() {
-        for command in ["setup", "enable", "disable"] {
+        for command in ["install", "setup", "enable", "disable"] {
             for args in [
                 vec!["bt", command, "--scope", "project", "claude"],
                 vec!["bt", command, "claude", "--scope", "project"],

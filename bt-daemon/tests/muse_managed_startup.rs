@@ -57,6 +57,7 @@ if [ "$1" = "--version" ]; then echo 'Muse Code 1.4.11'; exit 0; fi
     let _marker = Env::set("MUSE_TEST_MARKER", &marker);
     let result = run_traced_with_host(
         RunArgs {
+            inherit: false,
             source: RunSource::Muse,
             parent: None,
             additional_metadata: None,

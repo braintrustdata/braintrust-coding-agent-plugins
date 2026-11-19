@@ -107,7 +107,8 @@ pub(crate) fn run_project_setup(
     let existed = path.exists();
     write_project_setup_at(&path, &args, &selection)?;
     let id = args.agent.identity();
-    let output = TraceCommandOutput::project_setup(id.id, id.display_name, path);
+    let output =
+        TraceCommandOutput::project_setup(id.id, id.display_name, path).with_enabled(!args.disable);
     Ok(if as_enable {
         output.into_enable(if existed { "updated" } else { "created" })
     } else {
@@ -124,7 +125,7 @@ fn write_project_setup_at(
         anyhow::bail!("project configuration cannot select executable span plugins");
     }
     common::edit_object(path, FileAccess::OwnerOnly, |settings, _| {
-        settings.insert("trace_to_braintrust".into(), Value::Bool(true));
+        settings.insert("trace_to_braintrust".into(), Value::Bool(!args.disable));
         for (key, value) in [
             ("project", selection.project_name.as_deref()),
             ("profile", selection.auth.profile.as_deref()),
@@ -155,12 +156,11 @@ pub fn run_setup(args: SetupArgs, route: SessionRoute) -> anyhow::Result<TraceCo
     let agent = adapter(args.agent);
     agent.enable(&mut SystemCommandRunner)?;
     let identity = agent.identity();
-    let settings_path = enable_tracing(identity.id, route)?;
-    Ok(TraceCommandOutput::setup(
-        identity.id,
-        identity.display_name,
-        settings_path,
-    ))
+    let settings_path = enable_tracing(identity.id, route, !args.disable)?;
+    Ok(
+        TraceCommandOutput::setup(identity.id, identity.display_name, settings_path)
+            .with_enabled(!args.disable),
+    )
 }
 
 /// Check whether there is a usable saved configuration, without overwriting errors.
@@ -276,16 +276,21 @@ pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
     ))
 }
 
-fn enable_tracing(source: &str, route: SessionRoute) -> anyhow::Result<PathBuf> {
+fn enable_tracing(source: &str, route: SessionRoute, enabled: bool) -> anyhow::Result<PathBuf> {
     let path = paths::agent_settings_path(source, None);
-    enable_tracing_at(&path, route)?;
+    write_tracing_at(&path, route, enabled)?;
     Ok(path)
 }
 
 /// Write the route to an agent's Braintrust settings, keeping saved metadata,
 /// tags, and span plugins unless the new route replaces them, and dropping
 /// keys from earlier settings formats.
-fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()> {
+#[cfg(test)]
+fn enable_tracing_at(path: &Path, route: SessionRoute) -> anyhow::Result<()> {
+    write_tracing_at(path, route, true)
+}
+
+fn write_tracing_at(path: &Path, mut route: SessionRoute, enabled: bool) -> anyhow::Result<()> {
     let mut settings = load_object(path)?;
     if route.additional_metadata.is_none() {
         route.additional_metadata = settings
@@ -316,7 +321,7 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
             .and_then(|plugins| serde_json::from_value(plugins.clone()).ok())
             .unwrap_or_default();
     }
-    settings.insert("trace_to_braintrust".into(), Value::Bool(true));
+    settings.insert("trace_to_braintrust".into(), Value::Bool(enabled));
     settings.insert("route".into(), serde_json::to_value(route)?);
     for key in [
         "traceToBraintrust",
@@ -377,6 +382,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(".claude/braintrust.json");
         let mut args = SetupArgs {
+            disable: false,
             scope: SettingsScope::Project,
             agent: SetupAgent::Claude,
             additional_metadata: None,

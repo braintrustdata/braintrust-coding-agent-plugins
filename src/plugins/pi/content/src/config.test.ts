@@ -105,6 +105,25 @@ describe("loadConfig", () => {
     });
   });
 
+  it("merges nested project metadata and replaces arrays", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: false,
+      route: {
+        destination: { type: "project_logs", project_name: "global" },
+        additional_metadata: { nested: { a: 1, b: 2 }, list: [1, 2] },
+      },
+    });
+    writeJson(join(cwd, ".pi", "braintrust.json"), {
+      trace_to_braintrust: true,
+      route: { additional_metadata: { nested: { b: 3 }, list: [4] } },
+    });
+    expect(loadConfig(cwd).route.additional_metadata).toEqual({
+      nested: { a: 1, b: 3 },
+      list: [4],
+    });
+    expect(loadConfig(cwd).enabled).toBe(true);
+  });
+
   it("prefers a canonical route over stale top-level routing", () => {
     writeJson(join(home, ".pi", "agent", "braintrust.json"), {
       trace_to_braintrust: true,

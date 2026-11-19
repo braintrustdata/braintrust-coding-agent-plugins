@@ -115,7 +115,9 @@ async fn run_traced_inner(
     if let Some(components) = args.parent {
         route.destination = Some(wire::TraceDestination::ParentSpan { components });
     }
-    apply_run_span_plugins(&mut route, &args.plugin)?;
+    if !args.inherit || !args.plugin.is_empty() {
+        apply_run_span_plugins(&mut route, &args.plugin)?;
+    }
     let name = args.source.identity().id;
     let agent = registrar()
         .run
@@ -392,6 +394,7 @@ mod tests {
     async fn managed_run_rejects_a_missing_destination_before_launch() {
         let error = run_traced(
             RunArgs {
+                inherit: false,
                 source: RunSource::Codex,
                 parent: None,
                 additional_metadata: None,
@@ -412,6 +415,7 @@ mod tests {
     async fn codex_managed_run_rejects_global_hook_trust_bypass_before_launch() {
         let error = run_traced(
             RunArgs {
+                inherit: false,
                 source: RunSource::Codex,
                 parent: None,
                 additional_metadata: None,

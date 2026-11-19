@@ -16,6 +16,23 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const INVOCATION_SETTINGS_ENV: &str = "BT_TRACE_INVOCATION_SETTINGS";
 
+/// Recursively overlay objects; every other value, including arrays, replaces.
+pub(crate) fn merge_json(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Object(base), Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_json(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
 /// Non-secret settings scoped to one `bt trace run` process tree.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct InvocationSettings {
@@ -49,6 +66,25 @@ impl AgentSettings {
         Self::load_hook_with_project(&user_path, project_path.as_deref(), invocation.as_deref())
     }
 
+    /// Resolve persistent settings for commands running in a repository.
+    pub(crate) fn load_for_directory(
+        source: &str,
+        cwd: &Path,
+    ) -> anyhow::Result<(Self, Option<PathBuf>)> {
+        let user = paths::agent_settings_path(source, None);
+        let project = paths::project_settings_path(source, cwd)
+            .ok()
+            .filter(|path| path.is_file());
+        let settings = if project.is_some() {
+            Self::load_hook_with_project(&user, project.as_deref(), None)?
+        } else if user.exists() {
+            Self::load_hook_from_sources(&user, None)?
+        } else {
+            Self::default()
+        };
+        Ok((settings, project))
+    }
+
     fn load_hook_with_project(
         user_path: &Path,
         project_path: Option<&Path>,
@@ -67,17 +103,59 @@ impl AgentSettings {
         let object = project.as_object().ok_or_else(|| {
             anyhow::anyhow!("tracing settings at {} must be an object", path.display())
         })?;
-        if object.contains_key("route") {
-            anyhow::bail!("repository tracing settings at {} cannot specify `route`; use `project` to select a destination", path.display());
-        }
-        let overlay: Self = serde_json::from_value(project.clone())?;
         let mut settings = if user_path.exists() {
             Self::load_hook_from_sources(user_path, None)?
         } else {
             Self::default()
         };
-        if overlay.trace_to_braintrust.is_some() {
-            settings.trace_to_braintrust = overlay.trace_to_braintrust;
+        if let Some(project_route) = object.get("route") {
+            let project_route = project_route.as_object().ok_or_else(|| {
+                anyhow::anyhow!("project route in {} must be an object", path.display())
+            })?;
+            if project_route
+                .get("span_plugins")
+                .is_some_and(|plugins| !plugins.as_array().is_some_and(Vec::is_empty))
+            {
+                anyhow::bail!(
+                    "repository tracing settings at {} cannot select executable span plugins",
+                    path.display()
+                );
+            }
+            let mut route = serde_json::to_value(settings.route.take().unwrap_or_default())?;
+            if project_route
+                .get("auth")
+                .and_then(Value::as_object)
+                .is_some_and(|auth| {
+                    auth.contains_key("profile") && !auth.contains_key("profile_id")
+                })
+            {
+                if let Some(auth) = route.get_mut("auth").and_then(Value::as_object_mut) {
+                    auth.remove("profile_id");
+                    auth.insert("source".into(), Value::String("saved_profile".into()));
+                }
+            }
+            if project_route
+                .get("destination")
+                .and_then(Value::as_object)
+                .is_some_and(|destination| {
+                    destination.contains_key("project_name")
+                        && !destination.contains_key("project_id")
+                })
+            {
+                if let Some(destination) =
+                    route.get_mut("destination").and_then(Value::as_object_mut)
+                {
+                    destination.remove("project_id");
+                }
+            }
+            merge_json(&mut route, Value::Object(project_route.clone()));
+            settings.route = Some(
+                serde_json::from_value(route)
+                    .with_context(|| format!("invalid project route at {}", path.display()))?,
+            );
+        }
+        if let Some(value) = object.get("trace_to_braintrust") {
+            settings.trace_to_braintrust = Some(serde_json::from_value(value.clone())?);
         }
         if let Some(project) = object.get("project") {
             let name = project
@@ -122,10 +200,11 @@ impl AgentSettings {
             if !metadata.is_object() {
                 anyhow::bail!("project metadata at {} must be an object", path.display());
             }
-            settings
-                .route
-                .get_or_insert_with(SessionRoute::default)
-                .additional_metadata = Some(metadata.clone());
+            let route = settings.route.get_or_insert_with(SessionRoute::default);
+            match &mut route.additional_metadata {
+                Some(existing) => merge_json(existing, metadata.clone()),
+                None => route.additional_metadata = Some(metadata.clone()),
+            }
         }
         Ok(settings)
     }
@@ -155,14 +234,7 @@ impl AgentSettings {
         Ok(settings)
     }
 
-    pub(crate) fn load(source: &str) -> Self {
-        let invocation = std::env::var(INVOCATION_SETTINGS_ENV).ok();
-        Self::load_from_sources(
-            &paths::agent_settings_path(source, None),
-            invocation.as_deref(),
-        )
-    }
-
+    #[cfg(test)]
     fn load_from_sources(path: &Path, invocation: Option<&str>) -> Self {
         let mut settings = Self::load_from(path);
         if let Some(raw) = invocation {
@@ -183,6 +255,7 @@ impl AgentSettings {
         settings
     }
 
+    #[cfg(test)]
     fn load_from(path: &Path) -> Self {
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
@@ -397,6 +470,31 @@ mod tests {
         assert!(AgentSettings::load_hook_with_project(&user, Some(&project), None).is_err());
         std::fs::write(&project, "invalid").unwrap();
         assert!(AgentSettings::load_hook_with_project(&user, Some(&project), None).is_err());
+    }
+
+    #[test]
+    fn project_route_recursively_overlays_user_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user.json");
+        let project = temp.path().join("project.json");
+        std::fs::write(&user, r#"{"trace_to_braintrust":false,"route":{"auth":{"profile_id":"old","org_name":"org"},"destination":{"type":"project_logs","project_id":"old","project_name":"global"},"tags":["user"],"span_plugins":["trusted"],"additional_metadata":{"nested":{"one":1,"two":2},"list":[1,2]}}}"#).unwrap();
+        std::fs::write(&project, r#"{"trace_to_braintrust":true,"route":{"auth":{"profile":"local"},"destination":{"project_name":"new"},"tags":["project"],"span_plugins":[],"additional_metadata":{"nested":{"two":3},"list":[4]}}}"#).unwrap();
+        let route = AgentSettings::load_hook_with_project(&user, Some(&project), None)
+            .unwrap()
+            .route
+            .unwrap();
+        assert!(route.span_plugins.is_empty());
+        assert_eq!(route.auth.profile_id, None);
+        assert_eq!(route.auth.profile.as_deref(), Some("local"));
+        assert_eq!(route.auth.org_name.as_deref(), Some("org"));
+        assert!(
+            matches!(route.destination, Some(TraceDestination::ProjectLogs { project_id: None, project_name: Some(ref name) }) if name == "new")
+        );
+        assert_eq!(route.tags.into_iter().collect::<Vec<_>>(), ["project"]);
+        assert_eq!(
+            route.additional_metadata,
+            Some(serde_json::json!({"nested":{"one":1,"two":3},"list":[4]}))
+        );
     }
 
     #[test]

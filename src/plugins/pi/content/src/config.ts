@@ -4,6 +4,8 @@ import { join } from "node:path";
 import {
   type DaemonSessionRoute,
   projectSettingsPath,
+  mergeConfigObjects,
+  mergeProjectRoute,
   resolveDaemonTraceSettings,
 } from "./runtime/daemon-client.ts";
 import { runningPiPackage } from "./pi-package.ts";
@@ -75,7 +77,13 @@ function applyConfig(config: PiConfig, source: ConfigRecord | undefined): void {
   config.orgName = orgName ?? config.orgName;
   config.projectName = projectName ?? config.projectName;
   config.enabled = boolean(source.trace_to_braintrust) ?? config.enabled;
-  config.additionalMetadata = record(source.additional_metadata) ?? config.additionalMetadata;
+  const metadata = record(source.additional_metadata);
+  config.additionalMetadata = metadata
+    ? mergeConfigObjects(
+        config.additionalMetadata ?? config.route.additional_metadata ?? {},
+        metadata,
+      )
+    : config.additionalMetadata;
   config.showUi = boolean(source.show_ui) ?? config.showUi;
   config.showTraceLink = boolean(source.show_trace_link) ?? config.showTraceLink;
 
@@ -93,7 +101,11 @@ function applyConfig(config: PiConfig, source: ConfigRecord | undefined): void {
   if (projectName) {
     config.route.destination = { type: "project_logs", project_name: projectName };
   }
-  if (additionalMetadata) config.route.additional_metadata = additionalMetadata;
+  if (additionalMetadata)
+    config.route.additional_metadata = mergeConfigObjects(
+      config.route.additional_metadata ?? {},
+      additionalMetadata,
+    );
 }
 
 export function loadConfig(cwd = process.cwd()): PiConfig {
@@ -115,7 +127,12 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
     (PROJECT_CONFIG_DIR_NAME === ".pi" ? undefined : readConfig(projectSettingsPath(cwd, ".pi")));
   if (projectConfig) {
     // Repository settings must not select executable span plugins.
-    const { route: _route, ...safeProjectConfig } = projectConfig;
+    const { route: projectRoute, ...safeProjectConfig } = projectConfig;
+    if (record(projectRoute)) {
+      config.route =
+        mergeProjectRoute(config.route, projectRoute as DaemonSessionRoute) ?? config.route;
+      applyConfig(config, { route: config.route });
+    }
     if (nonEmptyString(safeProjectConfig.profile) && config.route.auth) {
       delete config.route.auth.profile_id;
       config.route.auth.source = "saved_profile";

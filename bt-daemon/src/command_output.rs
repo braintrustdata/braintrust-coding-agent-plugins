@@ -62,6 +62,10 @@ pub struct SetupCommandOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration: Option<&'static str>,
     pub scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +160,10 @@ pub struct DoctorCommandOutput {
     pub display_name: String,
     pub settings_path: PathBuf,
     pub settings_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_settings_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub project_settings_fields: Vec<String>,
     pub enabled: bool,
     pub route_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,6 +210,8 @@ impl TraceCommandOutput {
             restart_required: true,
             configuration: None,
             scope: "user",
+            enabled: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -217,6 +227,8 @@ impl TraceCommandOutput {
             restart_required: true,
             configuration: Some("reused"),
             scope: "user",
+            enabled: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -225,7 +237,11 @@ impl TraceCommandOutput {
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
-        Self::setup(source, display_name, settings_path).with_scope("project")
+        let mut output = Self::setup(source, display_name, settings_path).with_scope("project");
+        if let Self::Setup(setup) = &mut output {
+            setup.warnings.push("Settings not specified here must be supplied by each user's configuration. Each user needs a user-level installation and usable Braintrust credentials for their sessions to be captured.".into());
+        }
+        output
     }
 
     pub(crate) fn with_scope(mut self, scope: &'static str) -> Self {
@@ -235,6 +251,13 @@ impl TraceCommandOutput {
             | Self::Disable(output)
             | Self::Uninstall(output) => output.scope = scope,
             _ => {}
+        }
+        self
+    }
+
+    pub(crate) fn with_enabled(mut self, enabled: bool) -> Self {
+        if let Self::Setup(output) = &mut self {
+            output.enabled = Some(enabled);
         }
         self
     }
@@ -272,6 +295,8 @@ impl TraceCommandOutput {
             restart_required: true,
             configuration: None,
             scope: "user",
+            enabled: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -287,6 +312,8 @@ impl TraceCommandOutput {
             restart_required: true,
             configuration: None,
             scope: "user",
+            enabled: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -330,6 +357,12 @@ impl TraceCommandOutput {
                     doctor.route_source,
                     route,
                 );
+                if let Some(path) = &doctor.project_settings_path {
+                    rendered.push_str(&format!("\nProject settings: {}", path.display()));
+                    if !doctor.project_settings_fields.is_empty() {
+                        rendered.push_str(&format!("\nProject overrides: {}", doctor.project_settings_fields.join(", ")));
+                    }
+                }
                 push_auth_lines(&mut rendered, "", &doctor.auth);
                 let daemon = &doctor.daemon;
                 let status = match daemon.status {
@@ -377,12 +410,13 @@ impl TraceCommandOutput {
                 setup.configuration.unwrap_or_default(), setup.display_name, setup.scope, setup.settings_path.display()
             )),
             Self::Setup(setup) if setup.scope == "project" => Ok(format!(
-                "Project tracing settings for {} were written to {}.", setup.display_name, setup.settings_path.display()
+                "Project tracing settings for {} were written to {}.\nTracing is {}.\n{}", setup.display_name, setup.settings_path.display(), if setup.enabled == Some(false) { "disabled" } else { "enabled" }, setup.warnings.join("\n")
             )),
             Self::Setup(setup) => Ok(format!(
-                "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.",
+                "The Braintrust tracing plugin is installed for {} and configured in {}.{}\nRestart the coding agent to load the tracing plugin.",
                 setup.display_name,
-                setup.settings_path.display()
+                setup.settings_path.display(),
+                if setup.enabled == Some(false) { " Tracing is disabled by default." } else { "" },
             )),
             Self::Enable(enable) => Ok(format!(
                 "Braintrust tracing is enabled for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
@@ -641,6 +675,8 @@ mod tests {
             display_name: "Codex".into(),
             settings_path: PathBuf::from("/tmp/braintrust.json"),
             settings_present: true,
+            project_settings_path: None,
+            project_settings_fields: Vec::new(),
             enabled: true,
             route_source: "settings_file".into(),
             route: Some(SessionRoute::default()),

@@ -1,6 +1,11 @@
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import { loadConfig, type PluginConfig } from "../config";
-import { claimManagedTracingInstance, projectSettingsPath } from "../runtime/daemon-client";
+import {
+  claimManagedTracingInstance,
+  mergeConfigObjects,
+  mergeProjectRoute,
+  projectSettingsPath,
+} from "../runtime/daemon-client";
 import { createDaemonTracingHooks } from "./daemon";
 
 export async function readPluginConfig(input: {
@@ -24,8 +29,14 @@ export async function readPluginConfig(input: {
             pluginConfig = parsed;
           } else {
             // Project files cannot select executable span plugins.
-            const { route: _route, ...safe } = parsed;
-            const userRoute = pluginConfig?.route;
+            const { route: projectRoute, ...safe } = parsed;
+            const userRoute = mergeProjectRoute(pluginConfig?.route, projectRoute);
+            if (safe.additional_metadata) {
+              safe.additional_metadata = mergeConfigObjects(
+                userRoute?.additional_metadata ?? pluginConfig?.additional_metadata ?? {},
+                safe.additional_metadata,
+              );
+            }
             const auth = userRoute?.auth;
             const projectAuth =
               safe.profile || safe.org_name

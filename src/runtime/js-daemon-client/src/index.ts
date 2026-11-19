@@ -40,6 +40,35 @@ export function projectSettingsPath(directory: string, configDir: string): strin
   }
 }
 
+/** Recursively overlay objects while replacing arrays and scalar values. */
+export function mergeConfigObjects(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...base }
+  for (const [key, value] of Object.entries(overlay)) {
+    const prior = Object.hasOwn(result, key) ? result[key] : undefined
+    const merged = prior !== null && typeof prior === "object" && !Array.isArray(prior) && value !== null && typeof value === "object" && !Array.isArray(value)
+      ? mergeConfigObjects(prior as Record<string, unknown>, value as Record<string, unknown>)
+      : value
+    Object.defineProperty(result, key, { value: merged, enumerable: true, writable: true, configurable: true })
+  }
+  return result
+}
+
+/** Merge a repository route without allowing it to introduce executable plugins. */
+export function mergeProjectRoute(base: DaemonSessionRoute | undefined, overlay: DaemonSessionRoute | undefined): DaemonSessionRoute | undefined {
+  if (!overlay) return base
+  const { span_plugins: plugins, ...fields } = overlay
+  const safe = plugins?.length === 0 ? { ...fields, span_plugins: [] } : fields
+  const original = structuredClone(base ?? { destination: undefined }) as DaemonSessionRoute
+  if (safe.auth?.profile && !safe.auth.profile_id && original.auth) {
+    delete original.auth.profile_id
+    original.auth.source = "saved_profile"
+  }
+  const nextDestination = safe.destination as Record<string, unknown> | undefined
+  const oldDestination = original.destination as Record<string, unknown> | undefined
+  if (nextDestination?.project_name && !nextDestination.project_id && oldDestination) delete oldDestination.project_id
+  return mergeConfigObjects(original as unknown as Record<string, unknown>, safe as unknown as Record<string, unknown>) as unknown as DaemonSessionRoute
+}
+
 const MANAGED_INSTANCE_CLAIMS = Symbol.for("braintrust.coding-agent.managed-instance-claims")
 
 /** Keep one live forwarding adapter when a managed run loads both its

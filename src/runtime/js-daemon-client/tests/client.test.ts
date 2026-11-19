@@ -8,8 +8,28 @@ import {
   claimManagedTracingInstance,
   DaemonClient,
   daemonSocketPath,
+  mergeProjectRoute,
+  mergeConfigObjects,
   resolveDaemonTraceSettings,
 } from "../src/index.ts"
+
+describe("project route overlay", () => {
+  test("preserves special JSON keys without changing object prototypes", () => {
+    const overlay = JSON.parse('{"__proto__":{"polluted":true},"nested":{"list":[3]}}')
+    const merged = mergeConfigObjects({ nested: { keep: 1, list: [1, 2] } }, overlay)
+    assert.equal(Object.getPrototypeOf(merged), Object.prototype)
+    assert.deepEqual(merged["__proto__"], { polluted: true })
+    assert.deepEqual(merged.nested, { keep: 1, list: [3] })
+  })
+  test("replaces arrays without accepting executable project plugins", () => {
+    const base = { destination: { type: "project_logs", project_name: "global" }, span_plugins: ["trusted"], tags: ["global"] }
+    const cleared = mergeProjectRoute(base, { destination: base.destination, span_plugins: [], tags: [] })!
+    assert.deepEqual(cleared.span_plugins, [])
+    assert.deepEqual(cleared.tags, [])
+    const blocked = mergeProjectRoute(base, { destination: base.destination, span_plugins: ["untrusted"] })!
+    assert.deepEqual(blocked.span_plugins, ["trusted"])
+  })
+})
 
 describe("managed adapter claims", () => {
   test("deduplicates only the same source and managed run", () => {

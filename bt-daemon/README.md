@@ -60,26 +60,35 @@ coding agent decides whether to continue its turn.
 
 ## Project-scoped tracing
 
-First install the integration with `bt trace setup <agent>`. To configure a Git
-repository independently, run these commands from anywhere inside it:
+Each developer installs the agent integration once. To trace only repositories
+that opt in, install it with tracing disabled by default:
 
 ```bash
-bt trace setup claude --scope project
+bt trace install claude --disable --project my-default-project
+```
+
+A repository owner can configure tracing from anywhere inside the Git repository:
+
+```bash
+bt trace install claude --scope project --project my-repository-project
 bt trace disable claude --scope project
 bt trace enable claude --scope project
 ```
 
-Project setup writes `.claude/braintrust.json` at the repository root. Other
-agents use their own project configuration directory. The project file initially
-contains only `trace_to_braintrust`; explicitly supplied project, profile,
-organization, tags, and metadata settings are also saved. Missing fields inherit
-the user configuration. Project files cannot select executable span plugins.
+Project install writes `.claude/braintrust.json` at the repository root; other
+agents use their own project configuration directory. The file contains the
+tracing switch and explicitly supplied settings. Commit it to share the opt-in.
+Each developer still needs a user-level installation and usable credentials.
+Credentials are never stored in project files.
 
-A managed `bt trace run` takes precedence over project settings, which take
-precedence over user settings. When no setting enables tracing, it is disabled.
-Project enable and disable change only the project file and do not install an
-adapter. For multi-root Cursor and Antigravity workspaces, the first root with
-a project file supplies the settings. `bt trace doctor` reports user settings.
+Project settings overlay user settings recursively: missing fields inherit,
+objects merge by field, and arrays and other explicitly supplied values replace
+those inherited. Repository settings cannot select executable span plugins.
+Managed `bt trace run` takes precedence over both; `bt trace run --inherit`
+starts from user and project settings before applying invocation options.
+`bt trace doctor <agent>` shows the current repository's effective configuration.
+For multi-root Cursor and Antigravity workspaces, the first root with a project
+file supplies the settings. `setup` remains an alias for `install`.
 
 ## Per-agent plugin settings
 

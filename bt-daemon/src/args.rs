@@ -297,6 +297,9 @@ impl ImportArgs {
 #[derive(Debug, Clone, Args)]
 #[command(trailing_var_arg = true)]
 pub struct RunArgs {
+    /// Inherit user and project tracing settings for this invocation.
+    #[arg(long)]
+    pub inherit: bool,
     /// Coding agent to launch.
     #[arg(value_enum)]
     pub source: RunSource,
