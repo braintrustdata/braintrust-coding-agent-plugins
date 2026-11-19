@@ -196,7 +196,17 @@ pub(super) fn envelopes(
         })
         .collect::<Vec<_>>();
     // Lifecycle boundaries follow native file order, not wall-clock order.
-    subagent_events.sort_by_key(|(index, _, _)| *index);
+    subagent_events.sort_by_key(|(index, start, agent)| {
+        (
+            *index,
+            if *start { 0 } else { 1 },
+            if *start {
+                agent.depth
+            } else {
+                usize::MAX - agent.depth
+            },
+        )
+    });
     let mut events = vec![import_envelope(
         source_version.clone(),
         &session_id,
@@ -278,7 +288,9 @@ pub(super) fn envelopes(
                 "transcript_path": transcript_path,
                 "agent_id": subagent.agent_id,
                 "agent_type": subagent.agent_type,
-                "agent_transcript_path": subagent.path
+                "agent_transcript_path": subagent.path,
+                "_bt_import_parent_agent_id": subagent.parent_agent_id,
+                "_bt_import_parent_tool_id": subagent.parent_tool_id
             });
             if !is_start {
                 payload["last_assistant_message"] = json!(subagent
@@ -344,6 +356,9 @@ struct Subagent {
     end_ms: i64,
     last_assistant_message: Option<Value>,
     handback_message: Option<Value>,
+    parent_agent_id: Option<String>,
+    parent_tool_id: Option<String>,
+    depth: usize,
 }
 
 fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
@@ -438,9 +453,20 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
     }
     children.sort_by(|left, right| left.3.cmp(&right.3).then_with(|| left.0.cmp(&right.0)));
 
-    let subagents = children
-        .into_iter()
+    let mut subagents: Vec<Subagent> = children
+        .iter()
+        .cloned()
         .filter_map(|(subagent_path, agent_id, subagent_records, child_start)| {
+            // Nested and workflow transcripts require their own native links.
+            if subagent_path.parent() != Some(directory.as_path())
+                || std::fs::read(subagent_path.with_extension("meta.json"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|meta| string_at(&meta, "/parentAgentId"))
+                    .is_some()
+            {
+                return None;
+            }
             // A completed tool result is the strongest parent/child link. If
             // the session was interrupted first, Claude still leaves both the
             // Agent call and a sidechain whose initial prompt matches that call.
@@ -498,9 +524,133 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 handback_message: crate::translate::successful_subagent_handback_message(
                     &subagent_records,
                 ),
+                parent_agent_id: None,
+                parent_tool_id: None,
+                depth: 0,
             })
         })
         .collect::<Vec<_>>();
+    // Workflow agents are anchored by the native Workflow result's run ID.
+    let mut workflows = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        let Some(run_id) = string_at(record, "/toolUseResult/runId") else {
+            continue;
+        };
+        let Some(call_id) = record
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(Value::as_str) == Some("tool_result"))
+                        .then(|| string_at(block, "/tool_use_id"))
+                        .flatten()
+                })
+            })
+        else {
+            continue;
+        };
+        let start = records.iter().position(|row| {
+            row.get("type").and_then(Value::as_str) == Some("assistant")
+                && row
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("id").and_then(Value::as_str) == Some(call_id.as_str())
+                                && block.get("name").and_then(Value::as_str) == Some("Workflow")
+                        })
+                    })
+        });
+        if let Some(start) = start {
+            workflows.insert(run_id, (start, index, call_id));
+        }
+    }
+    let mut linked: HashSet<String> = subagents
+        .iter()
+        .map(|agent| agent.agent_id.clone())
+        .collect();
+    // Repeated passes admit only descendants of an already linked agent.
+    loop {
+        let mut added = false;
+        for (path, agent_id, child_records, child_start) in &children {
+            if linked.contains(agent_id) {
+                continue;
+            }
+            let meta = std::fs::read(path.with_extension("meta.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .unwrap_or(Value::Null);
+            let parent_id = string_at(&meta, "/parentAgentId");
+            let nested = parent_id.as_ref().and_then(|id| {
+                let parent = subagents.iter().find(|agent| &agent.agent_id == id)?;
+                let call_id = string_at(&meta, "/toolUseId")?;
+                let parent_records = children
+                    .iter()
+                    .find(|(_, child_id, _, _)| child_id == id)
+                    .map(|(_, _, records, _)| records)?;
+                let found = parent_records.iter().any(|record| {
+                    record.get("type").and_then(Value::as_str) == Some("assistant")
+                        && record
+                            .pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|blocks| {
+                                blocks.iter().any(|block| {
+                                    block.get("id").and_then(Value::as_str)
+                                        == Some(call_id.as_str())
+                                        && block.get("name").and_then(Value::as_str)
+                                            == Some("Agent")
+                                })
+                            })
+                });
+                found.then(|| {
+                    (
+                        parent.start_index,
+                        parent.record_index,
+                        parent.depth + 1,
+                        None,
+                    )
+                })
+            });
+            let workflow = parent_id
+                .is_none()
+                .then(|| path.parent())
+                .flatten()
+                .and_then(|run| {
+                    if run.parent()? != directory.join("workflows") {
+                        return None;
+                    }
+                    let run_id = run.file_name()?.to_str()?;
+                    let (start, end, call_id) = workflows.get(run_id)?;
+                    Some((*start, *end, 0, Some(call_id.clone())))
+                });
+            let Some((start_index, record_index, depth, parent_tool_id)) = nested.or(workflow)
+            else {
+                continue;
+            };
+            let (_, child_end) = timestamp_bounds(child_records);
+            subagents.push(Subagent {
+                agent_id: agent_id.clone(),
+                agent_type: string_at(&meta, "/agentType"),
+                path: path.to_string_lossy().into_owned(),
+                start_index,
+                record_index,
+                start_ms: *child_start,
+                end_ms: child_end,
+                last_assistant_message: last_assistant_text(child_records),
+                handback_message: crate::translate::successful_subagent_handback_message(
+                    child_records,
+                ),
+                parent_agent_id: parent_id,
+                parent_tool_id,
+                depth,
+            });
+            linked.insert(agent_id.clone());
+            added = true;
+        }
+        if !added {
+            break;
+        }
+    }
     Ok(subagents)
 }
 
