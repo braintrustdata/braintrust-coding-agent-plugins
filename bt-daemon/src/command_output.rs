@@ -192,7 +192,10 @@ pub enum TraceCommandOutput {
     Uninstall(SetupCommandOutput),
     Update(UpdateCommandOutput),
     Stop(StopCommandOutput),
-    Import { summaries: Vec<ImportSummary> },
+    Import {
+        /// Summaries for the imported sessions.
+        summaries: Vec<ImportSummary>,
+    },
 }
 
 impl TraceCommandOutput {
